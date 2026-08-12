@@ -11,7 +11,7 @@ use serde_json::json;
 use tokio::{io::AsyncWriteExt, process::Command, time::Duration};
 
 use crate::{
-    carry::CarryState,
+    context::{ContextItem, ContextState},
     log::RunLogger,
     openai::{ModelReply, OpenAiClient, Usage},
     protocol::{ActionKind, Step},
@@ -21,7 +21,13 @@ const SYSTEM_PROMPT: &str = r#"You are a coding agent operating in a repository 
 
 Each response is one structured Step. Use a shell action to inspect, edit, and test the repository. Use a finish action only when the task is complete or no further useful work is possible.
 
-Carry is your complete persistent working memory. Existing carry entries survive only when their IDs appear in carry.keep. Omit entries you no longer expect to need. Never copy retained entry text into carry.add. Add only concise information that will matter after the current action. The original task is always available and does not need to be carried.
+You control persistent context with context_management:
+- retain_ids is the complete list of existing item IDs to include in the next step. Any existing item omitted from retain_ids expires after this response.
+- The latest tool result is included automatically for this step only. Retain its t-prefixed ID if its exact bounded output should remain available in later steps.
+- add_memories creates new concise, model-authored memory items. Use it for durable conclusions, not copies of retained text or tool output. Added memories appear in the next step with harness-assigned m-prefixed IDs.
+- Retained tool results and memories share the displayed content-byte budget. Item byte sizes are displayed. Drop items as soon as they are no longer useful.
+
+The original task and this system prompt are always available and must not be added as memories.
 
 The shell is noninteractive. Prefer commands that terminate on their own. Work only within the assigned repository. Test your work before finishing."#;
 
@@ -35,7 +41,7 @@ pub struct RunConfig {
     pub max_steps: usize,
     pub shell_timeout_secs: u64,
     pub max_tool_output_bytes: usize,
-    pub carry_budget_bytes: usize,
+    pub context_budget_bytes: usize,
 }
 
 pub enum Backend {
@@ -130,15 +136,22 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             "task_file": config.task_file,
             "model": config.model,
             "max_steps": config.max_steps,
-            "carry_budget_bytes": config.carry_budget_bytes
+            "context_budget_bytes": config.context_budget_bytes
         }),
         &format!("run started in {}", config.cwd.display()),
     )?;
 
-    let mut carry = CarryState::default();
-    let mut recent = "No shell actions have run yet.".to_owned();
+    let mut context_state = ContextState::default();
+    let mut latest_tool_result: Option<ContextItem> = None;
+    let mut protocol_feedback: Option<String> = None;
     for step_index in 1..=config.max_steps {
-        let context = render_context(step_index, &carry, &recent);
+        let context = render_context(
+            step_index,
+            &context_state,
+            latest_tool_result.as_ref(),
+            protocol_feedback.as_deref(),
+            config.context_budget_bytes,
+        );
         let request = backend.request_body(&config.task, &context);
         logger.raw_event(
             "model_request",
@@ -172,47 +185,54 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
         )?;
 
         if let Err(error) = reply.step.action.validate() {
-            recent = format!(
+            let feedback = format!(
                 "Protocol error: {error}. No action was executed. Submit a corrected Step."
             );
+            protocol_feedback = Some(feedback.clone());
             logger.raw_event(
                 "protocol_error",
                 json!({"step": step_index, "error": error.to_string()}),
-                &recent,
+                &feedback,
             )?;
             continue;
         }
 
-        let carry_change = match carry.apply(&reply.step.carry, config.carry_budget_bytes) {
+        let context_change = match context_state.apply(
+            &reply.step.context_management,
+            latest_tool_result.as_ref(),
+            config.context_budget_bytes,
+        ) {
             Ok(change) => change,
             Err(error) => {
-                recent = format!(
+                let feedback = format!(
                     "Protocol error: {error}. No action was executed. Submit a corrected Step."
                 );
+                protocol_feedback = Some(feedback.clone());
                 logger.raw_event(
                     "protocol_error",
                     json!({"step": step_index, "error": error.to_string()}),
-                    &recent,
+                    &feedback,
                 )?;
                 continue;
             }
         };
+        protocol_feedback = None;
         logger.event(
-            "carry_updated",
-            &carry_change,
+            "context_updated",
+            &context_change,
             &format!(
-                "  carry kept={} dropped={} added={} bytes={}",
-                carry_change.kept.len(),
-                carry_change.dropped.len(),
-                carry_change.added.len(),
-                carry_change.bytes
+                "  context retained={} dropped={} added={} bytes={}",
+                context_change.retained.len(),
+                context_change.dropped.len(),
+                context_change.added.len(),
+                context_change.bytes
             ),
         )?;
 
         match reply.step.action.kind {
             ActionKind::Shell => {
                 let command = reply.step.action.command.as_deref().unwrap();
-                let call_id = format!("c{step_index:04}");
+                let call_id = format!("t{step_index:04}");
                 logger.raw_event(
                     "shell_started",
                     json!({"step": step_index, "call_id": call_id, "command": command}),
@@ -227,7 +247,10 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                     config.max_tool_output_bytes,
                 )
                 .await?;
-                recent = render_recent_result(&result);
+                latest_tool_result = Some(ContextItem::tool_result(
+                    result.call_id.clone(),
+                    render_tool_result(&result),
+                ));
                 logger.event(
                     "shell_finished",
                     &result,
@@ -245,7 +268,11 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                 let answer = reply.step.action.answer;
                 logger.raw_event(
                     "run_finished",
-                    json!({"step": step_index, "answer": answer, "carry": carry.snapshot()}),
+                    json!({
+                        "step": step_index,
+                        "answer": answer,
+                        "retained_context": context_state.snapshot()
+                    }),
                     &format!("finished after {step_index} steps"),
                 )?;
                 write_final_artifacts(&config, true, answer.as_deref()).await?;
@@ -271,10 +298,19 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
     })
 }
 
-fn render_context(step: usize, carry: &CarryState, recent: &str) -> String {
+fn render_context(
+    step: usize,
+    state: &ContextState,
+    latest: Option<&ContextItem>,
+    protocol_feedback: Option<&str>,
+    context_budget_bytes: usize,
+) -> String {
+    let feedback = protocol_feedback.unwrap_or("(none)");
     format!(
-        "<carry>\n{}\n</carry>\n\n<current_step>{step}</current_step>\n\n<recent>\n{recent}\n</recent>",
-        carry.render()
+        "<context_state>\n<retention_budget used_bytes=\"{}\" max_bytes=\"{context_budget_bytes}\" accounting=\"item_content_only\" />\n\n<retained_items>\n{}\n</retained_items>\n\n<latest_tool_result>\n{}\n</latest_tool_result>\n</context_state>\n\n<current_step>{step}</current_step>\n\n<protocol_feedback>\n{feedback}\n</protocol_feedback>",
+        state.retained_bytes(),
+        state.render_retained(),
+        ContextState::render_latest(latest)
     )
 }
 
@@ -365,7 +401,7 @@ fn clip(bytes: &[u8], budget: usize) -> String {
     )
 }
 
-fn render_recent_result(result: &ShellResult) -> String {
+fn render_tool_result(result: &ShellResult) -> String {
     format!(
         "[{}] shell: {}\nexit_code={:?} timed_out={} duration_ms={}\nfull stdout: {}\nfull stderr: {}\n\n{}",
         result.call_id,

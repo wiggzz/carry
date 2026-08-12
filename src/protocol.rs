@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Step {
     pub action: Action,
-    pub carry: CarryUpdate,
+    pub context_management: ContextManagement,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -23,9 +23,9 @@ pub enum ActionKind {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct CarryUpdate {
-    pub keep: Vec<String>,
-    pub add: Vec<String>,
+pub struct ContextManagement {
+    pub retain_ids: Vec<String>,
+    pub add_memories: Vec<String>,
 }
 
 impl Action {
@@ -66,17 +66,26 @@ pub fn step_schema() -> Value {
                 "required": ["kind", "command", "answer"],
                 "additionalProperties": false
             },
-            "carry": {
+            "context_management": {
                 "type": "object",
+                "description": "Explicitly control which context items remain available after this response.",
                 "properties": {
-                    "keep": { "type": "array", "items": { "type": "string" } },
-                    "add": { "type": "array", "items": { "type": "string" } }
+                    "retain_ids": {
+                        "type": "array",
+                        "description": "Complete set of existing retained-item and latest-tool-result IDs to include in the next step. Omitted existing IDs expire.",
+                        "items": { "type": "string" }
+                    },
+                    "add_memories": {
+                        "type": "array",
+                        "description": "New concise durable conclusions to add as memory items. Do not copy tool output or text already retained by ID.",
+                        "items": { "type": "string" }
+                    }
                 },
-                "required": ["keep", "add"],
+                "required": ["retain_ids", "add_memories"],
                 "additionalProperties": false
             }
         },
-        "required": ["action", "carry"],
+        "required": ["action", "context_management"],
         "additionalProperties": false
     })
 }

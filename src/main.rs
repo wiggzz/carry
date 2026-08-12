@@ -1,4 +1,4 @@
-mod carry;
+mod context;
 mod log;
 mod openai;
 mod protocol;
@@ -86,9 +86,9 @@ struct RunArgs {
     #[arg(long, default_value_t = 32_000)]
     max_tool_output_bytes: usize,
 
-    /// Maximum total UTF-8 bytes in model-managed carry memory.
+    /// Maximum total UTF-8 bytes in explicitly retained context items.
     #[arg(long, default_value_t = 8_000)]
-    carry_budget_bytes: usize,
+    context_budget_bytes: usize,
 
     /// JSONL Step objects to use instead of calling a model (integration tests).
     #[arg(long)]
@@ -139,7 +139,7 @@ async fn run_command(args: RunArgs) -> Result<()> {
         max_steps: args.max_steps,
         shell_timeout_secs: args.shell_timeout_secs,
         max_tool_output_bytes: args.max_tool_output_bytes,
-        carry_budget_bytes: args.carry_budget_bytes,
+        context_budget_bytes: args.context_budget_bytes,
     };
 
     let outcome = run::run(config, backend).await?;
