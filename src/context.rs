@@ -1,53 +1,71 @@
 use std::collections::HashSet;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use serde_json::{Value, json};
 
 use crate::protocol::ContextManagement;
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ContextItemKind {
     Memory,
-    ToolResult,
+    ToolInteraction,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+/// One selectable unit of context. Its native Responses input items are replayed
+/// unchanged and in creation order whenever the model retains its ID.
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub(crate) struct ContextItem {
     pub id: String,
     pub kind: ContextItemKind,
-    pub content: String,
+    pub bytes: usize,
+    pub input_items: Vec<Value>,
 }
 
 impl ContextItem {
-    pub fn tool_result(id: String, content: String) -> Self {
-        Self {
-            id,
-            kind: ContextItemKind::ToolResult,
-            content,
+    pub fn tool_interaction(
+        id: String,
+        function_call: Value,
+        function_call_output: Value,
+    ) -> Result<Self> {
+        if function_call["type"].as_str() != Some("function_call") {
+            bail!("tool interaction assistant item is not a function_call");
         }
+        if function_call_output["type"].as_str() != Some("function_call_output") {
+            bail!("tool interaction result item is not a function_call_output");
+        }
+        let call_id = function_call["call_id"]
+            .as_str()
+            .context("function_call has no call_id")?;
+        if function_call_output["call_id"].as_str() != Some(call_id) {
+            bail!("function call and output call_id values do not match");
+        }
+        let input_items = vec![function_call, function_call_output];
+        Ok(Self {
+            id,
+            kind: ContextItemKind::ToolInteraction,
+            bytes: serialized_bytes(&input_items),
+            input_items,
+        })
     }
 
     fn memory(id: String, content: String) -> Self {
+        let input_items = vec![json!({
+            "role": "user",
+            "content": format!("[retained memory {id}]\n{content}")
+        })];
         Self {
             id,
             kind: ContextItemKind::Memory,
-            content,
+            bytes: serialized_bytes(&input_items),
+            input_items,
         }
     }
+}
 
-    fn render(&self) -> String {
-        let kind = match self.kind {
-            ContextItemKind::Memory => "memory",
-            ContextItemKind::ToolResult => "tool_result",
-        };
-        format!(
-            "<item id=\"{}\" kind=\"{kind}\" bytes=\"{}\">\n{}\n</item>",
-            self.id,
-            self.content.len(),
-            self.content
-        )
-    }
+fn serialized_bytes(items: &[Value]) -> usize {
+    serde_json::to_vec(items).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -65,27 +83,21 @@ pub(crate) struct ContextChange {
 }
 
 impl ContextState {
-    pub fn render_retained(&self) -> String {
-        if self.retained.is_empty() {
-            return "(empty)".to_owned();
+    pub fn input_items(&self, latest: Option<&ContextItem>) -> Vec<Value> {
+        let mut input = Vec::new();
+        for item in &self.retained {
+            input.extend(item.input_items.iter().cloned());
         }
-        self.retained
-            .iter()
-            .map(ContextItem::render)
-            .collect::<Vec<_>>()
-            .join("\n")
+        if let Some(item) = latest
+            && !self.retained.iter().any(|retained| retained.id == item.id)
+        {
+            input.extend(item.input_items.iter().cloned());
+        }
+        input
     }
 
-    pub fn render_latest(item: Option<&ContextItem>) -> String {
-        match item {
-            Some(item) => format!(
-                "<item id=\"{}\" kind=\"tool_result\" bytes=\"{}\" retention=\"automatic_for_this_step_only\">\n{}\n</item>",
-                item.id,
-                item.content.len(),
-                item.content
-            ),
-            None => "(none; no shell action has run yet)".to_owned(),
-        }
+    pub fn retained_ids(&self) -> Vec<&str> {
+        self.retained.iter().map(|item| item.id.as_str()).collect()
     }
 
     pub fn snapshot(&self) -> &[ContextItem] {
@@ -93,11 +105,11 @@ impl ContextState {
     }
 
     pub fn retained_bytes(&self) -> usize {
-        self.retained.iter().map(|item| item.content.len()).sum()
+        self.retained.iter().map(|item| item.bytes).sum()
     }
 
     /// `retain_ids` is the complete set of existing items that survives.
-    /// The latest tool result is eligible for retention even though it is not yet retained.
+    /// The latest tool interaction is eligible even though it is not yet retained.
     pub fn apply(
         &mut self,
         update: &ContextManagement,
@@ -160,10 +172,7 @@ impl ContextState {
             added.push(id);
         }
 
-        let bytes = candidate
-            .iter()
-            .map(|item| item.content.len())
-            .sum::<usize>();
+        let bytes = candidate.iter().map(|item| item.bytes).sum::<usize>();
         if bytes > budget {
             bail!("retained context would use {bytes} bytes, exceeding the {budget}-byte budget");
         }
@@ -183,10 +192,29 @@ impl ContextState {
 mod tests {
     use super::*;
 
+    fn tool(id: &str) -> ContextItem {
+        ContextItem::tool_interaction(
+            id.into(),
+            json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "shell",
+                "arguments": "{\"command\":\"cat file\"}"
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "exact output"
+            }),
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn retains_exact_tool_results_and_memories_by_id() {
+    fn replays_exact_tool_pair_and_memory_in_order() {
         let mut state = ContextState::default();
-        let tool = ContextItem::tool_result("t0001".into(), "exact output".into());
+        let tool = tool("t0001");
+        let original = tool.input_items.clone();
         let first = state
             .apply(
                 &ContextManagement {
@@ -194,10 +222,13 @@ mod tests {
                     add_memories: vec!["a conclusion".into()],
                 },
                 Some(&tool),
-                100,
+                10_000,
             )
             .unwrap();
         assert_eq!(first.added, vec!["m0001"]);
+        let replay = state.input_items(None);
+        assert_eq!(&replay[..2], original.as_slice());
+        assert_eq!(replay[2]["role"], "user");
 
         state
             .apply(
@@ -206,11 +237,10 @@ mod tests {
                     add_memories: vec![],
                 },
                 None,
-                100,
+                10_000,
             )
             .unwrap();
-        assert!(state.render_retained().contains("exact output"));
-        assert!(!state.render_retained().contains("a conclusion"));
+        assert_eq!(state.input_items(None), original);
     }
 
     #[test]

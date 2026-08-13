@@ -5,7 +5,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::protocol::{Step, step_schema};
+use crate::protocol::{Step, tool_definitions};
 
 #[derive(Clone, Debug)]
 pub struct OpenAiClient {
@@ -34,6 +34,8 @@ pub struct Usage {
 pub struct ModelReply {
     pub response_id: String,
     pub step: Step,
+    /// The native assistant function-call item, retained byte-for-byte for replay.
+    pub function_call: Value,
     pub usage: Usage,
     pub latency_ms: u64,
     pub raw: Value,
@@ -50,29 +52,42 @@ impl OpenAiClient {
         }
     }
 
-    pub fn request_body(&self, system: &str, task: &str, context: &str) -> Value {
+    pub fn request_body(
+        &self,
+        system: &str,
+        task: &str,
+        history: &[Value],
+        control: &str,
+    ) -> Value {
+        let mut input = vec![
+            json!({ "role": "system", "content": system }),
+            json!({ "role": "user", "content": task }),
+        ];
+        input.extend_from_slice(history);
+        input.push(json!({ "role": "user", "content": control }));
+
         json!({
             "model": self.model,
             "store": false,
-            "input": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": task },
-                { "role": "user", "content": context }
-            ],
-            "reasoning": { "effort": self.reasoning_effort },
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "carry_step",
-                    "strict": true,
-                    "schema": step_schema()
-                }
-            }
+            "input": input,
+            "reasoning": {
+                "effort": self.reasoning_effort,
+                "context": "current_turn"
+            },
+            "tools": tool_definitions(),
+            "tool_choice": "required",
+            "parallel_tool_calls": false
         })
     }
 
-    pub async fn step(&self, system: &str, task: &str, context: &str) -> Result<ModelReply> {
-        let body = self.request_body(system, task, context);
+    pub async fn step(
+        &self,
+        system: &str,
+        task: &str,
+        history: &[Value],
+        control: &str,
+    ) -> Result<ModelReply> {
+        let body = self.request_body(system, task, history, control);
 
         let started = Instant::now();
         let response = self
@@ -92,15 +107,20 @@ impl OpenAiClient {
             bail!("Responses API returned {status}: {raw}");
         }
 
-        let text = extract_output_text(&raw)
-            .context("Responses API response contained no output_text item")?;
-        let step: Step = serde_json::from_str(text)
-            .with_context(|| format!("structured response was not a valid Step: {text}"))?;
-        step.action.validate()?;
+        let calls = function_calls(&raw);
+        if calls.len() != 1 {
+            bail!(
+                "Responses API returned {} function calls; expected exactly one",
+                calls.len()
+            );
+        }
+        let function_call = calls[0].clone();
+        let step = Step::from_function_call(&function_call)?;
 
         Ok(ModelReply {
             response_id: raw["id"].as_str().unwrap_or("unknown").to_owned(),
             step,
+            function_call,
             usage: extract_usage(&raw),
             latency_ms: started.elapsed().as_millis() as u64,
             raw,
@@ -108,15 +128,13 @@ impl OpenAiClient {
     }
 }
 
-fn extract_output_text(raw: &Value) -> Option<&str> {
-    raw.get("output")?
-        .as_array()?
-        .iter()
-        .filter_map(|item| item.get("content")?.as_array())
+fn function_calls(raw: &Value) -> Vec<&Value> {
+    raw.get("output")
+        .and_then(Value::as_array)
+        .into_iter()
         .flatten()
-        .find(|content| content.get("type").and_then(Value::as_str) == Some("output_text"))?
-        .get("text")?
-        .as_str()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .collect()
 }
 
 fn extract_usage(raw: &Value) -> Usage {
@@ -139,9 +157,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_message_text_and_usage() {
+    fn extracts_one_function_call_and_usage() {
         let raw = json!({
-            "output": [{"type":"message","content":[{"type":"output_text","text":"{}"}]}],
+            "output": [
+                {"type":"reasoning","encrypted_content":"opaque"},
+                {
+                    "type":"function_call",
+                    "call_id":"call_1",
+                    "name":"finish",
+                    "arguments":"{\"answer\":\"done\",\"context_management\":{\"retain_ids\":[],\"add_memories\":[]}}"
+                }
+            ],
             "usage": {
                 "input_tokens": 10,
                 "input_tokens_details": {"cached_tokens": 4},
@@ -150,9 +176,31 @@ mod tests {
                 "total_tokens": 13
             }
         });
-        assert_eq!(extract_output_text(&raw), Some("{}"));
+        assert_eq!(function_calls(&raw).len(), 1);
         let usage = extract_usage(&raw);
         assert_eq!(usage.cached_input_tokens, 4);
         assert_eq!(usage.reasoning_tokens, 1);
+    }
+
+    #[test]
+    fn request_keeps_static_prefix_and_native_history_order() {
+        let client = OpenAiClient::new(
+            "https://example.invalid/v1".into(),
+            "secret".into(),
+            "gpt-5.6-luna".into(),
+            "medium".into(),
+        );
+        let history = vec![
+            json!({"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}),
+            json!({"type":"function_call_output","call_id":"call_1","output":"verbatim"}),
+        ];
+        let body = client.request_body("system", "task", &history, "control");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input[1]["content"], "task");
+        assert_eq!(input[2..4], history);
+        assert_eq!(input[4]["content"], "control");
+        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["parallel_tool_calls"], false);
     }
 }

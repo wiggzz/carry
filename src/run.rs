@@ -17,19 +17,13 @@ use crate::{
     protocol::{ActionKind, Step},
 };
 
-const SYSTEM_PROMPT: &str = r#"You are a coding agent operating in a repository through a shell.
+const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
-Each response is one structured Step. Use a shell action to inspect, edit, and test the repository. Use a finish action only when the task is complete or no further useful work is possible.
+At each step, select exactly one available action. Investigate, implement, and verify the requested change before finishing.
 
-You control persistent context with context_management:
-- retain_ids is the complete list of existing item IDs to include in the next step. Any existing item omitted from retain_ids expires after this response.
-- The latest tool result is included automatically for this step only. Retain its t-prefixed ID if its exact bounded output should remain available in later steps.
-- add_memories creates new concise, model-authored memory items. Use it for durable conclusions, not copies of retained text or tool output. Added memories appear in the next step with harness-assigned m-prefixed IDs.
-- Retained tool results and memories share the displayed content-byte budget. Item byte sizes are displayed. Drop items as soon as they are no longer useful.
+You select the knowledge that carries forward through the investigation. The latest tool interaction is available for one decision. Anything not explicitly selected for retention is removed from subsequent context and cannot be used in further work. Preserve exact evidence when its details matter; preserve concise conclusions when they do not.
 
-The original task and this system prompt are always available and must not be added as memories.
-
-The shell is noninteractive. Prefer commands that terminate on their own. Work only within the assigned repository. Test your work before finishing."#;
+Work only within the assigned repository. Do not perform destructive or external actions."#;
 
 #[derive(Clone, Debug)]
 pub struct RunConfig {
@@ -99,25 +93,40 @@ impl Backend {
         Ok(Self::Scripted { steps, emitted: 0 })
     }
 
-    fn request_body(&self, task: &str, context: &str) -> Option<serde_json::Value> {
+    fn request_body(
+        &self,
+        task: &str,
+        history: &[serde_json::Value],
+        control: &str,
+    ) -> Option<serde_json::Value> {
         match self {
-            Self::OpenAi(client) => Some(client.request_body(SYSTEM_PROMPT, task, context)),
+            Self::OpenAi(client) => {
+                Some(client.request_body(SYSTEM_PROMPT, task, history, control))
+            }
             Self::Scripted { .. } => None,
         }
     }
 
-    async fn step(&mut self, task: &str, context: &str) -> Result<ModelReply> {
+    async fn step(
+        &mut self,
+        task: &str,
+        history: &[serde_json::Value],
+        control: &str,
+    ) -> Result<ModelReply> {
         match self {
-            Self::OpenAi(client) => client.step(SYSTEM_PROMPT, task, context).await,
+            Self::OpenAi(client) => client.step(SYSTEM_PROMPT, task, history, control).await,
             Self::Scripted { steps, emitted } => {
                 let step = steps
                     .pop_front()
                     .context("scripted backend ran out of Step objects")?;
                 *emitted += 1;
+                let function_call =
+                    step.synthetic_function_call(&format!("scripted-call-{emitted:04}"))?;
                 Ok(ModelReply {
                     response_id: format!("scripted-{emitted:04}"),
                     raw: serde_json::to_value(&step)?,
                     step,
+                    function_call,
                     usage: Usage::default(),
                     latency_ms: 0,
                 })
@@ -145,24 +154,30 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
     let mut latest_tool_result: Option<ContextItem> = None;
     let mut protocol_feedback: Option<String> = None;
     for step_index in 1..=config.max_steps {
-        let context = render_context(
+        let history = context_state.input_items(latest_tool_result.as_ref());
+        let control = render_control(
             step_index,
             &context_state,
             latest_tool_result.as_ref(),
             protocol_feedback.as_deref(),
             config.context_budget_bytes,
         );
-        let request = backend.request_body(&config.task, &context);
+        let request = backend.request_body(&config.task, &history, &control);
         logger.raw_event(
             "model_request",
-            json!({"step": step_index, "context": context, "request": request}),
+            json!({
+                "step": step_index,
+                "history": history,
+                "control": control,
+                "request": request
+            }),
             &format!(
                 "[{step_index:02}/{}] requesting next step",
                 config.max_steps
             ),
         )?;
 
-        let reply = backend.step(&config.task, &context).await?;
+        let reply = backend.step(&config.task, &history, &control).await?;
         logger.raw_event(
             "model_response",
             json!({
@@ -183,19 +198,6 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                 reply.usage.reasoning_tokens
             ),
         )?;
-
-        if let Err(error) = reply.step.action.validate() {
-            let feedback = format!(
-                "Protocol error: {error}. No action was executed. Submit a corrected Step."
-            );
-            protocol_feedback = Some(feedback.clone());
-            logger.raw_event(
-                "protocol_error",
-                json!({"step": step_index, "error": error.to_string()}),
-                &feedback,
-            )?;
-            continue;
-        }
 
         let context_change = match context_state.apply(
             &reply.step.context_management,
@@ -247,10 +249,12 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                     config.max_tool_output_bytes,
                 )
                 .await?;
-                latest_tool_result = Some(ContextItem::tool_result(
+                let function_call_output = function_call_output(&reply.function_call, &result)?;
+                latest_tool_result = Some(ContextItem::tool_interaction(
                     result.call_id.clone(),
-                    render_tool_result(&result),
-                ));
+                    reply.function_call.clone(),
+                    function_call_output,
+                )?);
                 logger.event(
                     "shell_finished",
                     &result,
@@ -298,7 +302,7 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
     })
 }
 
-fn render_context(
+fn render_control(
     step: usize,
     state: &ContextState,
     latest: Option<&ContextItem>,
@@ -306,11 +310,12 @@ fn render_context(
     context_budget_bytes: usize,
 ) -> String {
     let feedback = protocol_feedback.unwrap_or("(none)");
+    let retained_ids = state.retained_ids();
+    let latest_id = latest.map_or("none", |item| item.id.as_str());
     format!(
-        "<context_state>\n<retention_budget used_bytes=\"{}\" max_bytes=\"{context_budget_bytes}\" accounting=\"item_content_only\" />\n\n<retained_items>\n{}\n</retained_items>\n\n<latest_tool_result>\n{}\n</latest_tool_result>\n</context_state>\n\n<current_step>{step}</current_step>\n\n<protocol_feedback>\n{feedback}\n</protocol_feedback>",
+        "Context status for step {step}: retained_ids={retained_ids:?}; latest_automatic_id={latest_id}; retained_bytes={}/{}; protocol_feedback={feedback}. Select exactly one next action.",
         state.retained_bytes(),
-        state.render_retained(),
-        ContextState::render_latest(latest)
+        context_budget_bytes
     )
 }
 
@@ -402,17 +407,32 @@ fn clip(bytes: &[u8], budget: usize) -> String {
 }
 
 fn render_tool_result(result: &ShellResult) -> String {
-    format!(
-        "[{}] shell: {}\nexit_code={:?} timed_out={} duration_ms={}\nfull stdout: {}\nfull stderr: {}\n\n{}",
-        result.call_id,
-        result.command,
-        result.exit_code,
-        result.timed_out,
-        result.duration_ms,
-        result.stdout_path.display(),
-        result.stderr_path.display(),
-        result.prompt_output
-    )
+    serde_json::to_string_pretty(&json!({
+        "context_id": result.call_id,
+        "exit_code": result.exit_code,
+        "timed_out": result.timed_out,
+        "duration_ms": result.duration_ms,
+        "stdout_bytes": result.stdout_bytes,
+        "stderr_bytes": result.stderr_bytes,
+        "full_stdout_path": result.stdout_path,
+        "full_stderr_path": result.stderr_path,
+        "output": result.prompt_output
+    }))
+    .expect("serializing a shell result cannot fail")
+}
+
+fn function_call_output(
+    function_call: &serde_json::Value,
+    result: &ShellResult,
+) -> Result<serde_json::Value> {
+    let call_id = function_call["call_id"]
+        .as_str()
+        .context("shell function call has no call_id")?;
+    Ok(json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": render_tool_result(result)
+    }))
 }
 
 async fn write_final_artifacts(

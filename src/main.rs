@@ -86,7 +86,7 @@ struct RunArgs {
     #[arg(long, default_value_t = 32_000)]
     max_tool_output_bytes: usize,
 
-    /// Maximum total UTF-8 bytes in explicitly retained context items.
+    /// Maximum serialized JSON bytes in explicitly retained context items.
     #[arg(long, default_value_t = 8_000)]
     context_budget_bytes: usize,
 
