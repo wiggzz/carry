@@ -34,8 +34,6 @@ pub struct RunConfig {
     pub model: String,
     pub max_steps: usize,
     pub shell_timeout_secs: u64,
-    pub max_tool_output_bytes: usize,
-    pub context_budget_bytes: usize,
 }
 
 pub enum Backend {
@@ -144,8 +142,7 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             "cwd": config.cwd,
             "task_file": config.task_file,
             "model": config.model,
-            "max_steps": config.max_steps,
-            "context_budget_bytes": config.context_budget_bytes
+            "max_steps": config.max_steps
         }),
         &format!("run started in {}", config.cwd.display()),
     )?;
@@ -160,7 +157,6 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             &context_state,
             latest_tool_result.as_ref(),
             protocol_feedback.as_deref(),
-            config.context_budget_bytes,
         );
         let request = backend.request_body(&config.task, &history, &control);
         logger.raw_event(
@@ -199,11 +195,9 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             ),
         )?;
 
-        let context_change = match context_state.apply(
-            &reply.step.context_management,
-            latest_tool_result.as_ref(),
-            config.context_budget_bytes,
-        ) {
+        let context_change = match context_state
+            .apply(&reply.step.context_management, latest_tool_result.as_ref())
+        {
             Ok(change) => change,
             Err(error) => {
                 let feedback = format!(
@@ -246,7 +240,6 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                     call_id,
                     command,
                     config.shell_timeout_secs,
-                    config.max_tool_output_bytes,
                 )
                 .await?;
                 let function_call_output = function_call_output(&reply.function_call, &result)?;
@@ -307,15 +300,13 @@ fn render_control(
     state: &ContextState,
     latest: Option<&ContextItem>,
     protocol_feedback: Option<&str>,
-    context_budget_bytes: usize,
 ) -> String {
     let feedback = protocol_feedback.unwrap_or("(none)");
     let retained_ids = state.retained_ids();
     let latest_id = latest.map_or("none", |item| item.id.as_str());
     format!(
-        "Context status for step {step}: retained_ids={retained_ids:?}; latest_automatic_id={latest_id}; retained_bytes={}/{}; protocol_feedback={feedback}. Select exactly one next action.",
-        state.retained_bytes(),
-        context_budget_bytes
+        "Context status for step {step}: retained_ids={retained_ids:?}; latest_automatic_id={latest_id}; retained_bytes={}; protocol_feedback={feedback}. Select exactly one next action.",
+        state.retained_bytes()
     )
 }
 
@@ -325,7 +316,6 @@ async fn execute_shell(
     call_id: String,
     command: &str,
     timeout_secs: u64,
-    max_prompt_bytes: usize,
 ) -> Result<ShellResult> {
     let started = Instant::now();
     let mut child = Command::new("/bin/sh");
@@ -352,7 +342,7 @@ async fn execute_shell(
     write_bytes(&stdout_path, &stdout).await?;
     write_bytes(&stderr_path, &stderr).await?;
 
-    let prompt_output = bounded_output(&stdout, &stderr, max_prompt_bytes);
+    let prompt_output = combined_output(&stdout, &stderr);
     Ok(ShellResult {
         call_id,
         command: command.to_owned(),
@@ -373,36 +363,13 @@ async fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn bounded_output(stdout: &[u8], stderr: &[u8], budget: usize) -> String {
+fn combined_output(stdout: &[u8], stderr: &[u8]) -> String {
     let header = format!("STDOUT ({} bytes):\n", stdout.len());
     let middle = format!("\nSTDERR ({} bytes):\n", stderr.len());
-    let overhead = header.len() + middle.len();
-    let available = budget.saturating_sub(overhead);
-    let stdout_budget = available / 2;
-    let stderr_budget = available - stdout_budget;
     format!(
         "{header}{}{middle}{}",
-        clip(stdout, stdout_budget),
-        clip(stderr, stderr_budget)
-    )
-}
-
-fn clip(bytes: &[u8], budget: usize) -> String {
-    if bytes.len() <= budget {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let marker = b"\n...[cut]...\n";
-    if budget < marker.len() + 2 {
-        return String::from_utf8_lossy(&bytes[..budget.min(bytes.len())]).into_owned();
-    }
-    let remaining = budget.saturating_sub(marker.len());
-    let head = remaining / 2;
-    let tail = remaining - head;
-    format!(
-        "{}{}{}",
-        String::from_utf8_lossy(&bytes[..head]),
-        String::from_utf8_lossy(marker),
-        String::from_utf8_lossy(&bytes[bytes.len() - tail..])
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
     )
 }
 
@@ -470,10 +437,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clipping_preserves_both_ends() {
-        let bytes = b"abcdefghijklmnopqrstuvwxyz";
-        let clipped = clip(bytes, 20);
-        assert!(clipped.starts_with("a"));
-        assert!(clipped.ends_with("z"));
+    fn combined_output_includes_complete_streams() {
+        let output = combined_output(b"all stdout", b"all stderr");
+        assert!(output.contains("STDOUT (10 bytes):\nall stdout"));
+        assert!(output.contains("STDERR (10 bytes):\nall stderr"));
     }
 }

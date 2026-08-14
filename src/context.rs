@@ -114,7 +114,6 @@ impl ContextState {
         &mut self,
         update: &ContextManagement,
         latest: Option<&ContextItem>,
-        budget: usize,
     ) -> Result<ContextChange> {
         let mut available = self
             .retained
@@ -173,9 +172,6 @@ impl ContextState {
         }
 
         let bytes = candidate.iter().map(|item| item.bytes).sum::<usize>();
-        if bytes > budget {
-            bail!("retained context would use {bytes} bytes, exceeding the {budget}-byte budget");
-        }
 
         self.retained = candidate;
         self.next_memory_id = next_memory_id;
@@ -222,7 +218,6 @@ mod tests {
                     add_memories: vec!["a conclusion".into()],
                 },
                 Some(&tool),
-                10_000,
             )
             .unwrap();
         assert_eq!(first.added, vec!["m0001"]);
@@ -237,14 +232,13 @@ mod tests {
                     add_memories: vec![],
                 },
                 None,
-                10_000,
             )
             .unwrap();
         assert_eq!(state.input_items(None), original);
     }
 
     #[test]
-    fn rejects_unknown_ids_and_budget_overflow() {
+    fn rejects_unknown_ids() {
         let mut state = ContextState::default();
         assert!(
             state
@@ -254,19 +248,6 @@ mod tests {
                         add_memories: vec![],
                     },
                     None,
-                    100,
-                )
-                .is_err()
-        );
-        assert!(
-            state
-                .apply(
-                    &ContextManagement {
-                        retain_ids: vec![],
-                        add_memories: vec!["too long".into()],
-                    },
-                    None,
-                    3,
                 )
                 .is_err()
         );
