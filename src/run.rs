@@ -65,6 +65,29 @@ struct ShellResult {
     prompt_output: String,
 }
 
+#[derive(Debug, Default, Serialize)]
+struct RunMetrics {
+    usage: Usage,
+    model_latency_ms: u64,
+}
+
+impl RunMetrics {
+    fn record(&mut self, usage: &Usage, latency_ms: u64) {
+        self.usage.input_tokens = self.usage.input_tokens.saturating_add(usage.input_tokens);
+        self.usage.cached_input_tokens = self
+            .usage
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens);
+        self.usage.output_tokens = self.usage.output_tokens.saturating_add(usage.output_tokens);
+        self.usage.reasoning_tokens = self
+            .usage
+            .reasoning_tokens
+            .saturating_add(usage.reasoning_tokens);
+        self.usage.total_tokens = self.usage.total_tokens.saturating_add(usage.total_tokens);
+        self.model_latency_ms = self.model_latency_ms.saturating_add(latency_ms);
+    }
+}
+
 impl Backend {
     pub fn openai(client: OpenAiClient) -> Self {
         Self::OpenAi(client)
@@ -134,6 +157,7 @@ impl Backend {
 }
 
 pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> {
+    let run_started = Instant::now();
     tokio::fs::create_dir_all(config.run_dir.join("tools")).await?;
     let mut logger = RunLogger::create(&config.run_dir)?;
     logger.raw_event(
@@ -150,6 +174,7 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
     let mut context_state = ContextState::default();
     let mut latest_tool_result: Option<ContextItem> = None;
     let mut protocol_feedback: Option<String> = None;
+    let mut metrics = RunMetrics::default();
     for step_index in 1..=config.max_steps {
         let history = context_state.input_items(latest_tool_result.as_ref());
         let control = render_control(
@@ -174,6 +199,7 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
         )?;
 
         let reply = backend.step(&config.task, &history, &control).await?;
+        metrics.record(&reply.usage, reply.latency_ms);
         logger.raw_event(
             "model_response",
             json!({
@@ -272,7 +298,14 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                     }),
                     &format!("finished after {step_index} steps"),
                 )?;
-                write_final_artifacts(&config, true, answer.as_deref()).await?;
+                write_final_artifacts(
+                    &config,
+                    true,
+                    answer.as_deref(),
+                    &metrics,
+                    run_started.elapsed().as_millis() as u64,
+                )
+                .await?;
                 return Ok(RunOutcome {
                     completed: true,
                     answer,
@@ -287,7 +320,14 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
         json!({"reason": "max_steps", "max_steps": config.max_steps}),
         &format!("stopped after reaching {} steps", config.max_steps),
     )?;
-    write_final_artifacts(&config, false, None).await?;
+    write_final_artifacts(
+        &config,
+        false,
+        None,
+        &metrics,
+        run_started.elapsed().as_millis() as u64,
+    )
+    .await?;
     Ok(RunOutcome {
         completed: false,
         answer: None,
@@ -406,6 +446,8 @@ async fn write_final_artifacts(
     config: &RunConfig,
     completed: bool,
     answer: Option<&str>,
+    metrics: &RunMetrics,
+    elapsed_ms: u64,
 ) -> Result<()> {
     let patch = Command::new("git")
         .args(["diff", "--binary", "--no-ext-diff"])
@@ -422,7 +464,10 @@ async fn write_final_artifacts(
         "answer": answer,
         "model": config.model,
         "steps_limit": config.max_steps,
-        "patch_bytes": patch.len()
+        "patch_bytes": patch.len(),
+        "usage": &metrics.usage,
+        "model_latency_ms": metrics.model_latency_ms,
+        "elapsed_ms": elapsed_ms
     });
     tokio::fs::write(
         config.run_dir.join("result.json"),
@@ -441,5 +486,80 @@ mod tests {
         let output = combined_output(b"all stdout", b"all stderr");
         assert!(output.contains("STDOUT (10 bytes):\nall stdout"));
         assert!(output.contains("STDERR (10 bytes):\nall stderr"));
+    }
+
+    #[test]
+    fn run_metrics_accumulate_usage_and_model_latency() {
+        let mut metrics = RunMetrics::default();
+        metrics.record(
+            &Usage {
+                input_tokens: 10,
+                cached_input_tokens: 4,
+                output_tokens: 3,
+                reasoning_tokens: 1,
+                total_tokens: 13,
+            },
+            25,
+        );
+        metrics.record(
+            &Usage {
+                input_tokens: 7,
+                cached_input_tokens: 2,
+                output_tokens: 5,
+                reasoning_tokens: 2,
+                total_tokens: 12,
+            },
+            15,
+        );
+
+        assert_eq!(metrics.usage.input_tokens, 17);
+        assert_eq!(metrics.usage.cached_input_tokens, 6);
+        assert_eq!(metrics.usage.output_tokens, 8);
+        assert_eq!(metrics.usage.reasoning_tokens, 3);
+        assert_eq!(metrics.usage.total_tokens, 25);
+        assert_eq!(metrics.model_latency_ms, 40);
+    }
+
+    #[tokio::test]
+    async fn scripted_run_writes_aggregate_metrics_to_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let run_dir = temp.path().join("run");
+        let task_file = temp.path().join("task.md");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(&task_file, "Finish the task.")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &steps_file,
+            r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context_management":{"retain_ids":[],"add_memories":[]}}"#,
+        )
+        .await
+        .unwrap();
+
+        let outcome = run(
+            RunConfig {
+                cwd: workspace,
+                task: "Finish the task.".into(),
+                task_file,
+                run_dir: run_dir.clone(),
+                model: "scripted".into(),
+                max_steps: 1,
+                shell_timeout_secs: 1,
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.completed);
+        let result: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(run_dir.join("result.json")).await.unwrap())
+                .unwrap();
+        assert_eq!(result["usage"]["input_tokens"], 0);
+        assert_eq!(result["usage"]["output_tokens"], 0);
+        assert_eq!(result["model_latency_ms"], 0);
+        assert!(result["elapsed_ms"].is_u64());
     }
 }
