@@ -41,7 +41,7 @@ Every action's strict function arguments contain:
 
 Requests are ordered for prefix reuse: stable system prompt, stable task, retained native history in chronological order, the latest automatic interaction, then a small changing context-status message. Carry uses `store: false` and `reasoning.context: "current_turn"`; it does not implicitly preserve prior reasoning or unselected response items.
 
-The run directory contains `trace.jsonl`, a concise `trace.log`, complete shell outputs, `result.json`, and `final.patch`. Each live `model_request` event in `trace.jsonl` includes the complete JSON request body sent to the Responses API (excluding HTTP headers and the API key).
+The run directory contains `trace.jsonl`, a concise `trace.log`, complete shell outputs, `result.json`, and `final.patch`. `result.json` includes aggregate Responses API token usage, cumulative model latency, and total run elapsed time. Each live `model_request` event in `trace.jsonl` includes the complete JSON request body sent to the Responses API (excluding HTTP headers and the API key).
 
 To inspect every model request from a run:
 
