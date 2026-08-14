@@ -103,7 +103,7 @@ impl ContextState {
             input.extend(item.input_items.iter().cloned());
             // Preserve each old checkpoint as the prefix grows; moving a single
             // frontier would remove the previous request's readable breakpoint.
-            if item.retention_rounds >= 2 {
+            if item.kind == ContextItemKind::Memory || item.retention_rounds >= 2 {
                 input.push(cache_checkpoint());
             }
         }
@@ -261,6 +261,29 @@ mod tests {
         let replay = state.input_items(None);
         assert_eq!(&replay[..2], original.as_slice());
         assert_eq!(replay[2]["role"], "developer");
+    }
+
+    #[test]
+    fn checkpoints_new_memories_immediately() {
+        let mut state = ContextState::default();
+        state
+            .apply(
+                &ContextManagement {
+                    retain_ids: vec![],
+                    add_memories: vec!["a durable conclusion".into()],
+                },
+                None,
+            )
+            .unwrap();
+
+        let replay = state.input_items(None);
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0]["role"], "user");
+        assert_eq!(replay[1]["role"], "developer");
+        assert_eq!(
+            replay[1]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
     }
 
     #[test]
