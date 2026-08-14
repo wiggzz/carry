@@ -42,7 +42,7 @@ impl ContextItem {
         if function_call_output["call_id"].as_str() != Some(call_id) {
             bail!("function call and output call_id values do not match");
         }
-        let input_items = vec![function_call, function_call_output];
+        let input_items = vec![function_call, function_call_output, cache_checkpoint()];
         Ok(Self {
             id,
             kind: ContextItemKind::ToolInteraction,
@@ -55,7 +55,11 @@ impl ContextItem {
     fn memory(id: String, content: String) -> Self {
         let input_items = vec![json!({
             "role": "user",
-            "content": format!("[retained memory {id}]\n{content}")
+            "content": [{
+                "type": "input_text",
+                "text": format!("[retained memory {id}]\n{content}"),
+                "prompt_cache_breakpoint": { "mode": "explicit" }
+            }]
         })];
         Self {
             id,
@@ -72,7 +76,7 @@ fn cache_checkpoint() -> Value {
         "role": "developer",
         "content": [{
             "type": "input_text",
-            "text": "The preceding retained context remains relevant.",
+            "text": "[cache checkpoint]",
             "prompt_cache_breakpoint": { "mode": "explicit" }
         }]
     })
@@ -101,11 +105,6 @@ impl ContextState {
         let mut input = Vec::new();
         for item in &self.retained {
             input.extend(item.input_items.iter().cloned());
-            // Preserve each old checkpoint as the prefix grows; moving a single
-            // frontier would remove the previous request's readable breakpoint.
-            if item.kind == ContextItemKind::Memory || item.retention_rounds >= 2 {
-                input.push(cache_checkpoint());
-            }
         }
         if let Some(item) = latest
             && !self.retained.iter().any(|retained| retained.id == item.id)
@@ -246,8 +245,8 @@ mod tests {
             .unwrap();
         assert_eq!(first.added, vec!["m0001"]);
         let replay = state.input_items(None);
-        assert_eq!(&replay[..2], original.as_slice());
-        assert_eq!(replay[2]["role"], "user");
+        assert_eq!(&replay[..original.len()], original.as_slice());
+        assert_eq!(replay[original.len()]["role"], "user");
 
         state
             .apply(
@@ -259,8 +258,7 @@ mod tests {
             )
             .unwrap();
         let replay = state.input_items(None);
-        assert_eq!(&replay[..2], original.as_slice());
-        assert_eq!(replay[2]["role"], "developer");
+        assert_eq!(replay, original);
     }
 
     #[test]
@@ -277,13 +275,38 @@ mod tests {
             .unwrap();
 
         let replay = state.input_items(None);
-        assert_eq!(replay.len(), 2);
+        assert_eq!(replay.len(), 1);
         assert_eq!(replay[0]["role"], "user");
-        assert_eq!(replay[1]["role"], "developer");
         assert_eq!(
-            replay[1]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            replay[0]["content"][0]["prompt_cache_breakpoint"]["mode"],
             "explicit"
         );
+    }
+
+    #[test]
+    fn latest_tool_segment_is_checkpointed_immediately_and_stable_when_retained() {
+        let mut state = ContextState::default();
+        let latest = tool("t0001");
+
+        let first_appearance = state.input_items(Some(&latest));
+        assert_eq!(first_appearance.len(), 3);
+        assert_eq!(first_appearance[2]["role"], "developer");
+        assert_eq!(
+            first_appearance[2]["content"][0]["text"],
+            "[cache checkpoint]"
+        );
+
+        state
+            .apply(
+                &ContextManagement {
+                    retain_ids: vec!["t0001".into()],
+                    add_memories: vec![],
+                },
+                Some(&latest),
+            )
+            .unwrap();
+
+        assert_eq!(state.input_items(None), first_appearance);
     }
 
     #[test]
@@ -303,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn promotes_context_after_surviving_two_tool_rounds() {
+    fn retention_aging_does_not_change_tool_segment_serialization() {
         let mut state = ContextState::default();
         let first = tool("t0001");
         state
@@ -315,7 +338,7 @@ mod tests {
                 Some(&first),
             )
             .unwrap();
-        assert_eq!(state.input_items(None).len(), 2);
+        let first_replay = state.input_items(None);
 
         state
             .apply(
@@ -326,20 +349,11 @@ mod tests {
                 None,
             )
             .unwrap();
-        let latest = tool("t0002");
-        let input = state.input_items(Some(&latest));
-
-        assert_eq!(input.len(), 5);
-        assert_eq!(input[2]["role"], "developer");
-        assert_eq!(
-            input[2]["content"][0]["prompt_cache_breakpoint"]["mode"],
-            "explicit"
-        );
-        assert_eq!(input[3..], latest.input_items);
+        assert_eq!(state.input_items(None), first_replay);
     }
 
     #[test]
-    fn preserves_breakpoints_as_the_promoted_prefix_grows() {
+    fn preserves_breakpoints_as_the_retained_prefix_grows() {
         let mut state = ContextState::default();
         let first = tool("t0001");
         state
