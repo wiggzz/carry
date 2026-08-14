@@ -78,6 +78,10 @@ impl RunMetrics {
             .usage
             .cached_input_tokens
             .saturating_add(usage.cached_input_tokens);
+        self.usage.cache_write_input_tokens = self
+            .usage
+            .cache_write_input_tokens
+            .saturating_add(usage.cache_write_input_tokens);
         self.usage.output_tokens = self.usage.output_tokens.saturating_add(usage.output_tokens);
         self.usage.reasoning_tokens = self
             .usage
@@ -495,6 +499,7 @@ mod tests {
             &Usage {
                 input_tokens: 10,
                 cached_input_tokens: 4,
+                cache_write_input_tokens: 5,
                 output_tokens: 3,
                 reasoning_tokens: 1,
                 total_tokens: 13,
@@ -505,6 +510,7 @@ mod tests {
             &Usage {
                 input_tokens: 7,
                 cached_input_tokens: 2,
+                cache_write_input_tokens: 3,
                 output_tokens: 5,
                 reasoning_tokens: 2,
                 total_tokens: 12,
@@ -514,6 +520,7 @@ mod tests {
 
         assert_eq!(metrics.usage.input_tokens, 17);
         assert_eq!(metrics.usage.cached_input_tokens, 6);
+        assert_eq!(metrics.usage.cache_write_input_tokens, 8);
         assert_eq!(metrics.usage.output_tokens, 8);
         assert_eq!(metrics.usage.reasoning_tokens, 3);
         assert_eq!(metrics.usage.total_tokens, 25);

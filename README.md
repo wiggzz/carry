@@ -39,6 +39,8 @@ Every action's strict function arguments contain:
 
 `retain_ids` is the complete retention set: any existing item omitted from it expires. Tool-interaction IDs begin with `t`; model-authored memory IDs begin with `m`. Carry does not impose a separate retained-context budget or truncate tool output; explicit retention is the context-limiting mechanism. Serialized retained bytes are still reported for observation.
 
+On GPT-5.6, Carry caches the stable task prefix. A context item that remains retained across two later tool rounds gains an explicit cache checkpoint; older checkpoints remain in place as the retained prefix grows, allowing the API to reuse the longest matching prefix while young or dropped context stays uncached. OpenAI can write the latest four new breakpoints per request and considers the latest 50 for reads, so unusually large retained histories may receive diminishing cache benefit.
+
 Requests are ordered for prefix reuse: stable system prompt, stable task, retained native history in chronological order, the latest automatic interaction, then a small changing context-status message. Carry uses `store: false` and `reasoning.context: "current_turn"`; it does not implicitly preserve prior reasoning or unselected response items.
 
 The run directory contains `trace.jsonl`, a concise `trace.log`, complete shell outputs, `result.json`, and `final.patch`. `result.json` includes aggregate Responses API token usage, cumulative model latency, and total run elapsed time. Each live `model_request` event in `trace.jsonl` includes the complete JSON request body sent to the Responses API (excluding HTTP headers and the API key).

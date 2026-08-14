@@ -20,6 +20,7 @@ pub(crate) struct ContextItem {
     pub id: String,
     pub kind: ContextItemKind,
     pub bytes: usize,
+    pub retention_rounds: usize,
     pub input_items: Vec<Value>,
 }
 
@@ -46,6 +47,7 @@ impl ContextItem {
             id,
             kind: ContextItemKind::ToolInteraction,
             bytes: serialized_bytes(&input_items),
+            retention_rounds: 0,
             input_items,
         })
     }
@@ -59,9 +61,21 @@ impl ContextItem {
             id,
             kind: ContextItemKind::Memory,
             bytes: serialized_bytes(&input_items),
+            retention_rounds: 1,
             input_items,
         }
     }
+}
+
+fn cache_checkpoint() -> Value {
+    json!({
+        "role": "developer",
+        "content": [{
+            "type": "input_text",
+            "text": "The preceding retained context remains relevant.",
+            "prompt_cache_breakpoint": { "mode": "explicit" }
+        }]
+    })
 }
 
 fn serialized_bytes(items: &[Value]) -> usize {
@@ -87,6 +101,11 @@ impl ContextState {
         let mut input = Vec::new();
         for item in &self.retained {
             input.extend(item.input_items.iter().cloned());
+            // Preserve each old checkpoint as the prefix grows; moving a single
+            // frontier would remove the previous request's readable breakpoint.
+            if item.retention_rounds >= 2 {
+                input.push(cache_checkpoint());
+            }
         }
         if let Some(item) = latest
             && !self.retained.iter().any(|retained| retained.id == item.id)
@@ -151,11 +170,16 @@ impl ContextState {
             .filter(|item| retain.contains(item.id.as_str()))
             .cloned()
             .collect::<Vec<_>>();
+        for item in &mut candidate {
+            item.retention_rounds = item.retention_rounds.saturating_add(1);
+        }
         if let Some(item) = latest
             && retain.contains(item.id.as_str())
             && !candidate.iter().any(|existing| existing.id == item.id)
         {
-            candidate.push(item.clone());
+            let mut item = item.clone();
+            item.retention_rounds = 1;
+            candidate.push(item);
         }
 
         let mut added = Vec::new();
@@ -234,7 +258,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(state.input_items(None), original);
+        let replay = state.input_items(None);
+        assert_eq!(&replay[..2], original.as_slice());
+        assert_eq!(replay[2]["role"], "developer");
     }
 
     #[test]
@@ -251,5 +277,95 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn promotes_context_after_surviving_two_tool_rounds() {
+        let mut state = ContextState::default();
+        let first = tool("t0001");
+        state
+            .apply(
+                &ContextManagement {
+                    retain_ids: vec!["t0001".into()],
+                    add_memories: vec![],
+                },
+                Some(&first),
+            )
+            .unwrap();
+        assert_eq!(state.input_items(None).len(), 2);
+
+        state
+            .apply(
+                &ContextManagement {
+                    retain_ids: vec!["t0001".into()],
+                    add_memories: vec![],
+                },
+                None,
+            )
+            .unwrap();
+        let latest = tool("t0002");
+        let input = state.input_items(Some(&latest));
+
+        assert_eq!(input.len(), 5);
+        assert_eq!(input[2]["role"], "developer");
+        assert_eq!(
+            input[2]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(input[3..], latest.input_items);
+    }
+
+    #[test]
+    fn preserves_breakpoints_as_the_promoted_prefix_grows() {
+        let mut state = ContextState::default();
+        let first = tool("t0001");
+        state
+            .apply(
+                &ContextManagement {
+                    retain_ids: vec!["t0001".into()],
+                    add_memories: vec![],
+                },
+                Some(&first),
+            )
+            .unwrap();
+        let second = ContextItem::tool_interaction(
+            "t0002".into(),
+            json!({
+                "type": "function_call",
+                "call_id": "call_2",
+                "name": "shell",
+                "arguments": "{\"command\":\"cat other\"}"
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_2",
+                "output": "other output"
+            }),
+        )
+        .unwrap();
+        state
+            .apply(
+                &ContextManagement {
+                    retain_ids: vec!["t0001".into(), "t0002".into()],
+                    add_memories: vec![],
+                },
+                Some(&second),
+            )
+            .unwrap();
+        state
+            .apply(
+                &ContextManagement {
+                    retain_ids: vec!["t0001".into(), "t0002".into()],
+                    add_memories: vec![],
+                },
+                None,
+            )
+            .unwrap();
+        let input = state.input_items(None);
+        let breakpoints = input
+            .iter()
+            .filter(|item| item["content"][0]["prompt_cache_breakpoint"]["mode"] == "explicit")
+            .count();
+        assert_eq!(breakpoints, 2);
     }
 }
