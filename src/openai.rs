@@ -73,13 +73,13 @@ impl OpenAiClient {
             }),
         ];
         input.extend_from_slice(history);
-        input.push(json!({ "role": "user", "content": control }));
+        input.push(json!({ "role": "developer", "content": control }));
 
         json!({
             "model": self.model,
             "store": false,
             "prompt_cache_key": prompt_cache_key(&self.model, system, task),
-            "prompt_cache_options": { "mode": "explicit" },
+            "prompt_cache_options": { "mode": "implicit" },
             "input": input,
             "reasoning": {
                 "effort": self.reasoning_effort,
@@ -229,13 +229,14 @@ mod tests {
         assert_eq!(input[0]["role"], "system");
         assert_eq!(input[1]["content"][0]["text"], "task");
         assert_eq!(input[2..4], history);
+        assert_eq!(input[4]["role"], "developer");
         assert_eq!(input[4]["content"], "control");
         assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[test]
-    fn request_marks_the_stable_task_prefix_for_explicit_caching() {
+    fn request_combines_implicit_caching_with_the_explicit_task_fallback() {
         let client = OpenAiClient::new(
             "https://example.invalid/v1".into(),
             "secret".into(),
@@ -247,7 +248,7 @@ mod tests {
         let same_task = client.request_body("system", "stable task", &[], "other control");
         let other_task = client.request_body("system", "other task", &[], "changing control");
 
-        assert_eq!(body["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(body["prompt_cache_options"]["mode"], "implicit");
         assert_eq!(
             body["input"][1]["content"][0]["prompt_cache_breakpoint"]["mode"],
             "explicit"

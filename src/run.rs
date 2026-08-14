@@ -21,7 +21,7 @@ const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an 
 
 At each step, select exactly one available action. Investigate, implement, and verify the requested change before finishing.
 
-You select the knowledge that carries forward through the investigation. The latest tool interaction is available for one decision. Anything not explicitly selected for retention is removed from subsequent context and cannot be used in further work. Preserve exact evidence when its details matter; preserve concise conclusions when they do not.
+You manage context in two generations. The latest tool interaction is available for one decision. Volatile items survive only when explicitly retained and promote after several consecutive rounds. Stable items persist automatically: release them only when stale, contradicted, redundant, or context pressure makes them no longer worth their cost. Preserve exact evidence when its details matter; preserve concise conclusions when it does not.
 
 Work only within the assigned repository. Do not perform destructive or external actions."#;
 
@@ -34,6 +34,8 @@ pub struct RunConfig {
     pub model: String,
     pub max_steps: usize,
     pub shell_timeout_secs: u64,
+    pub promotion_age: usize,
+    pub collection_interval: usize,
 }
 
 pub enum Backend {
@@ -170,7 +172,9 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             "cwd": config.cwd,
             "task_file": config.task_file,
             "model": config.model,
-            "max_steps": config.max_steps
+            "max_steps": config.max_steps,
+            "promotion_age": config.promotion_age,
+            "collection_interval": config.collection_interval
         }),
         &format!("run started in {}", config.cwd.display()),
     )?;
@@ -186,6 +190,8 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             &context_state,
             latest_tool_result.as_ref(),
             protocol_feedback.as_deref(),
+            config.promotion_age,
+            config.collection_interval,
         );
         let request = backend.request_body(&config.task, &history, &control);
         logger.raw_event(
@@ -225,9 +231,12 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             ),
         )?;
 
-        let context_change = match context_state
-            .apply(&reply.step.context_management, latest_tool_result.as_ref())
-        {
+        let context_change = match context_state.apply(
+            &reply.step.context_management,
+            latest_tool_result.as_ref(),
+            config.promotion_age,
+            config.collection_interval,
+        ) {
             Ok(change) => change,
             Err(error) => {
                 let feedback = format!(
@@ -247,9 +256,12 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             "context_updated",
             &context_change,
             &format!(
-                "  context retained={} dropped={} added={} bytes={}",
-                context_change.retained.len(),
+                "  context stable={} volatile={} promoted={} dropped={} released={} added={} bytes={}",
+                context_change.stable.len(),
+                context_change.volatile.len(),
+                context_change.promoted.len(),
                 context_change.dropped.len(),
+                context_change.released.len(),
                 context_change.added.len(),
                 context_change.bytes
             ),
@@ -344,12 +356,19 @@ fn render_control(
     state: &ContextState,
     latest: Option<&ContextItem>,
     protocol_feedback: Option<&str>,
+    promotion_age: usize,
+    collection_interval: usize,
 ) -> String {
     let feedback = protocol_feedback.unwrap_or("(none)");
-    let retained_ids = state.retained_ids();
+    let stable_ids = state.stable_ids();
+    let volatile = state.volatile_status();
     let latest_id = latest.map_or("none", |item| item.id.as_str());
     format!(
-        "Context status for step {step}: retained_ids={retained_ids:?}; latest_automatic_id={latest_id}; retained_bytes={}; protocol_feedback={feedback}. Select exactly one next action.",
+        "Context status for step {step}: stable_ids={stable_ids:?} (kept by default; release only when stale, redundant, contradicted, or under context pressure); volatile_ids_and_ages={volatile:?} (must be retained explicitly); latest_automatic_id={latest_id} (retain only when this is an actual tNNNN ID; if none, use no placeholder); promotion_age={}; collection_interval={}; stable_bytes={}; volatile_bytes={}; retained_bytes={}; protocol_feedback={feedback}. Select exactly one next action.",
+        promotion_age,
+        collection_interval,
+        state.stable_bytes(),
+        state.volatile_bytes(),
         state.retained_bytes()
     )
 }
@@ -468,6 +487,8 @@ async fn write_final_artifacts(
         "answer": answer,
         "model": config.model,
         "steps_limit": config.max_steps,
+        "promotion_age": config.promotion_age,
+        "collection_interval": config.collection_interval,
         "patch_bytes": patch.len(),
         "usage": &metrics.usage,
         "model_latency_ms": metrics.model_latency_ms,
@@ -540,7 +561,7 @@ mod tests {
             .unwrap();
         tokio::fs::write(
             &steps_file,
-            r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context_management":{"retain_ids":[],"add_memories":[]}}"#,
+            r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#,
         )
         .await
         .unwrap();
@@ -554,6 +575,8 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: 1,
                 shell_timeout_secs: 1,
+                promotion_age: 3,
+                collection_interval: 3,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )

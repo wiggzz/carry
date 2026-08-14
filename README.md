@@ -2,7 +2,7 @@
 
 Carry is an intentionally small coding-agent harness for experimenting with model-managed context. Each model turn emits exactly one required function call—`shell` or `finish`—whose strict arguments include an explicit context-management update.
 
-The latest tool interaction is automatically visible for one step. The model can retain that interaction by ID, retain older interactions, drop items by omission, and add concise durable memories. A retained interaction replays the native assistant `function_call` item and its complete `function_call_output` verbatim.
+The latest tool interaction is automatically visible for one step. New interactions and memories enter a volatile generation and survive only when explicitly retained. After a configurable number of consecutive retention rounds they promote into a stable generation, where they persist until the model explicitly releases them. A retained interaction replays the native assistant `function_call` item and its complete `function_call_output` verbatim.
 
 This is an early experiment. Its shell tool is not a security sandbox; run it only in a disposable checkout or container.
 
@@ -31,17 +31,18 @@ Every action's strict function arguments contain:
 {
   "command": "...",
   "context_management": {
-    "retain_ids": ["t0001", "m0001"],
+    "retain_volatile_ids": ["t0001", "m0001"],
+    "release_stable_ids": [],
     "add_memories": ["Concise durable conclusion"]
   }
 }
 ```
 
-`retain_ids` is the complete retention set: any existing item omitted from it expires. Tool-interaction IDs begin with `t`; model-authored memory IDs begin with `m`. Carry does not impose a separate retained-context budget or truncate tool output; explicit retention is the context-limiting mechanism. Serialized retained bytes are still reported for observation.
+`retain_volatile_ids` is the complete volatile survival set. Stable items are kept by default and appear in `release_stable_ids` only when stale, contradicted, redundant, or no longer worth their context cost. Tool-interaction IDs begin with `t`; model-authored memory IDs begin with `m`. The default promotion age is three rounds and can be changed with `--promotion-age`; deterministic collection cycles are independently tunable with `--collection-interval` (also default `3`) so eligible items promote in batches rather than inserting a new marker every turn.
 
-On GPT-5.6, Carry caches the stable task prefix and builds one deterministic, cache-efficient history. Every selectable item is an immutable serialized segment with a checkpoint from its first appearance: durable memories carry breakpoint metadata directly on their text, while native tool-call/output pairs end with a minimal eligible checkpoint item. Retention removes items but never reorders or rewrites survivors. If every old segment survives, the previous history is a prefix of the next one; when an item is dropped, caching naturally falls back to the checkpoint before the first divergence. OpenAI can write the latest four new breakpoints per request and considers the latest 50 for reads, so unusually large retained histories may eventually need boundary coalescing.
+On GPT-5.6, Carry combines implicit caching with explicit stable-generation checkpoints. Every context item is an immutable serialized segment. Promotion advances only through the oldest contiguous volatile prefix and appends a checkpoint after the promoted batch; earlier generation checkpoints remain unchanged. Exact-growing volatile history therefore uses the latest implicit breakpoint, while volatile collection falls back to the stable frontier and stable collection can fall back to an older generation marker. OpenAI considers only a bounded number of recent breakpoints, so unusually long runs may eventually need marker coalescing.
 
-Requests are ordered for prefix reuse: stable system prompt, stable task, retained native history in chronological order, the latest automatic interaction, then a small changing context-status message. Carry uses `store: false` and `reasoning.context: "current_turn"`; it does not implicitly preserve prior reasoning or unselected response items.
+Requests are ordered for prefix reuse: stable system prompt, stable task, stable generations, volatile history, the latest automatic interaction, then a small changing `developer` context-status message. Carry uses `store: false` and `reasoning.context: "current_turn"`; it does not implicitly preserve prior reasoning or unselected response items.
 
 The run directory contains `trace.jsonl`, a concise `trace.log`, complete shell outputs, `result.json`, and `final.patch`. `result.json` includes aggregate Responses API token usage, cumulative model latency, and total run elapsed time. Each live `model_request` event in `trace.jsonl` includes the complete JSON request body sent to the Responses API (excluding HTTP headers and the API key).
 
