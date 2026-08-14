@@ -23,6 +23,8 @@ pub struct Usage {
     #[serde(default)]
     pub cached_input_tokens: u64,
     #[serde(default)]
+    pub cache_write_input_tokens: u64,
+    #[serde(default)]
     pub output_tokens: u64,
     #[serde(default)]
     pub reasoning_tokens: u64,
@@ -61,7 +63,14 @@ impl OpenAiClient {
     ) -> Value {
         let mut input = vec![
             json!({ "role": "system", "content": system }),
-            json!({ "role": "user", "content": task }),
+            json!({
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": task,
+                    "prompt_cache_breakpoint": { "mode": "explicit" }
+                }]
+            }),
         ];
         input.extend_from_slice(history);
         input.push(json!({ "role": "user", "content": control }));
@@ -69,6 +78,8 @@ impl OpenAiClient {
         json!({
             "model": self.model,
             "store": false,
+            "prompt_cache_key": prompt_cache_key(&self.model, system, task),
+            "prompt_cache_options": { "mode": "explicit" },
             "input": input,
             "reasoning": {
                 "effort": self.reasoning_effort,
@@ -144,12 +155,30 @@ fn extract_usage(raw: &Value) -> Usage {
         cached_input_tokens: usage["input_tokens_details"]["cached_tokens"]
             .as_u64()
             .unwrap_or_default(),
+        cache_write_input_tokens: usage["input_tokens_details"]["cache_write_tokens"]
+            .as_u64()
+            .unwrap_or_default(),
         output_tokens: usage["output_tokens"].as_u64().unwrap_or_default(),
         reasoning_tokens: usage["output_tokens_details"]["reasoning_tokens"]
             .as_u64()
             .unwrap_or_default(),
         total_tokens: usage["total_tokens"].as_u64().unwrap_or_default(),
     }
+}
+
+fn prompt_cache_key(model: &str, system: &str, task: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in model
+        .bytes()
+        .chain([0])
+        .chain(system.bytes())
+        .chain([0])
+        .chain(task.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("carry-{hash:016x}")
 }
 
 #[cfg(test)]
@@ -170,7 +199,7 @@ mod tests {
             ],
             "usage": {
                 "input_tokens": 10,
-                "input_tokens_details": {"cached_tokens": 4},
+                "input_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 6},
                 "output_tokens": 3,
                 "output_tokens_details": {"reasoning_tokens": 1},
                 "total_tokens": 13
@@ -179,6 +208,7 @@ mod tests {
         assert_eq!(function_calls(&raw).len(), 1);
         let usage = extract_usage(&raw);
         assert_eq!(usage.cached_input_tokens, 4);
+        assert_eq!(usage.cache_write_input_tokens, 6);
         assert_eq!(usage.reasoning_tokens, 1);
     }
 
@@ -197,10 +227,33 @@ mod tests {
         let body = client.request_body("system", "task", &history, "control");
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["role"], "system");
-        assert_eq!(input[1]["content"], "task");
+        assert_eq!(input[1]["content"][0]["text"], "task");
         assert_eq!(input[2..4], history);
         assert_eq!(input[4]["content"], "control");
         assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn request_marks_the_stable_task_prefix_for_explicit_caching() {
+        let client = OpenAiClient::new(
+            "https://example.invalid/v1".into(),
+            "secret".into(),
+            "gpt-5.6-luna".into(),
+            "medium".into(),
+        );
+
+        let body = client.request_body("system", "stable task", &[], "changing control");
+        let same_task = client.request_body("system", "stable task", &[], "other control");
+        let other_task = client.request_body("system", "other task", &[], "changing control");
+
+        assert_eq!(body["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(
+            body["input"][1]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(body["input"][1]["content"][0]["text"], "stable task");
+        assert_eq!(body["prompt_cache_key"], same_task["prompt_cache_key"]);
+        assert_ne!(body["prompt_cache_key"], other_task["prompt_cache_key"]);
     }
 }
