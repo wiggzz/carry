@@ -2,14 +2,14 @@
 set -eu
 
 if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-  echo "usage: $0 <clamp|slugify|median> [live|scripted]" >&2
+  echo "usage: $0 <clamp|slugify|median|release-plan|config-loader> [live|scripted]" >&2
   exit 2
 fi
 
 task_name=$1
 mode=${2:-live}
 case "$task_name" in
-  clamp|slugify|median) ;;
+  clamp|slugify|median|release-plan|config-loader) ;;
   *) echo "unknown task: $task_name" >&2; exit 2 ;;
 esac
 case "$mode" in
@@ -32,6 +32,7 @@ workspace="$run_root/workspace"
 artifacts="$run_root/artifacts"
 mkdir -p "$workspace" "$artifacts"
 cp -R "$repo_root/fixtures/repo/." "$workspace/"
+find "$workspace" -type f -name '*.pyc' -delete
 python3 "$repo_root/fixtures/setup.py" "$task_name" "$workspace"
 git -C "$workspace" init -q
 git -C "$workspace" add .

@@ -69,6 +69,13 @@ Run a live fixture:
 OPENAI_API_KEY=... ./scripts/run-fixture.sh clamp live
 OPENAI_API_KEY=... ./scripts/run-fixture.sh slugify live
 OPENAI_API_KEY=... ./scripts/run-fixture.sh median live
+OPENAI_API_KEY=... ./scripts/run-fixture.sh release-plan live
+OPENAI_API_KEY=... ./scripts/run-fixture.sh config-loader live
 ```
 
-Each invocation creates a fresh Git repository under `runs/`, makes only the selected function incomplete, runs Carry inside the container, and grades the resulting checkout with tests that were not mounted into the agent container.
+The first three are small single-function checks. `release-plan` and
+`config-loader` are longer-horizon fixtures that require coordinated changes
+across two modules. Each invocation creates a fresh Git repository under
+`runs/`, makes only the selected implementation incomplete, runs Carry inside
+the container, and grades the resulting checkout with tests that were not
+mounted into the agent container.
