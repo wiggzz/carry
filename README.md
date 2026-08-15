@@ -79,7 +79,7 @@ Live fixtures require `OPENAI_API_KEY`. Codex fixture comparisons require a sepa
 
 ## Benchmark planning
 
-The manually dispatched **Benchmark plan** workflow builds a requested Carry branch, tag, or commit and emits five deterministic shards from the frozen 50-instance SWE-bench selection. It does not run agents or require model credentials. The live Carry/Codex benchmark worker will be added separately after its isolated execution and protected credential path are reviewed.
+The manually dispatched **Benchmark plan** workflow builds a requested Carry branch, tag, or commit and emits five deterministic shards from the frozen 50-instance SWE-bench selection. It does not run agents or require model credentials. The live Carry/Codex/Pi benchmark worker will be added separately after its external isolated execution and protected credential path are reviewed.
 
 ## Releases and contributions
 

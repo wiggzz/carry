@@ -17,7 +17,7 @@ from typing import Any, Iterable
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_SELECTION = ROOT / "benchmarks" / "swe-bench-verified-50.json"
 DEFAULT_VERIFIED_CONFIG = ROOT / "benchmarks" / "swe-bench-verified.json"
-METHODS = ("carry", "codex")
+METHODS = ("carry", "codex", "pi")
 
 
 def sha256_file(path: pathlib.Path) -> str:

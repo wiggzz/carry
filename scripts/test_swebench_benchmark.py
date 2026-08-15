@@ -78,6 +78,16 @@ class BenchmarkConfigurationTests(unittest.TestCase):
         self.assertEqual([item["instance_id"] for shard in shards for item in shard], selection)
         self.assertEqual(self.runner.sha256_file(self.runner.DEFAULT_SELECTION), "d26efa7d55df331566a69aa15c4cbc78c044100f6c6c73610f0d7a0b19bb3877")
 
+    def test_default_denominator_has_all_three_agent_methods(self):
+        self.assertEqual(self.runner.METHODS, ("carry", "codex", "pi"))
+        tasks = [{"instance_id": "one"}, {"instance_id": "two"}]
+        records = [
+            {"instance_id": task["instance_id"], "method": method}
+            for task in tasks
+            for method in self.runner.METHODS
+        ]
+        self.runner.validate_merged_records(tasks, records)
+
     def test_merged_records_reject_duplicate_or_missing_pairs(self):
         tasks = [{"instance_id": "one"}, {"instance_id": "two"}]
         records = [
