@@ -19,7 +19,7 @@ use crate::{
 
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
-At each step, select exactly one available action. Investigate, implement, and verify the requested change before finishing.
+At each step, select exactly one available action. Investigate, implement, and verify the requested change before finishing. Before editing, establish a minimal failing reproduction where practical. When behavior has competing inputs or sources, use distinct values to verify provenance; when a task cites a regression or prior change, search cited identifiers and subsequent fixes in repository history. Before finishing, run the affected tests.
 
 You manage context in two generations. The latest tool interaction is available for one decision. Volatile items survive only when explicitly retained and promote after several consecutive rounds. Stable items persist automatically: release them only when stale, contradicted, redundant, or context pressure makes them no longer worth their cost. Preserve exact evidence when its details matter; preserve concise conclusions when it does not.
 
@@ -509,6 +509,15 @@ async fn write_final_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_prompt_requires_reproduction_provenance_and_history_checks() {
+        assert!(SYSTEM_PROMPT.contains("minimal failing reproduction"));
+        assert!(SYSTEM_PROMPT.contains("distinct values"));
+        assert!(SYSTEM_PROMPT.contains("repository history"));
+        assert!(SYSTEM_PROMPT.contains("search cited identifiers"));
+        assert!(SYSTEM_PROMPT.contains("affected tests"));
+    }
 
     #[test]
     fn combined_output_includes_complete_streams() {
