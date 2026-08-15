@@ -23,7 +23,7 @@ cargo run -- run \
   --run-dir runs/my-run
 ```
 
-The default model is `gpt-5.6-luna`. Override it with `--model` or `OPENAI_MODEL`.
+The default model is `gpt-5.6-luna`. Override it with `--model` or `OPENAI_MODEL`. Runs have no default step limit; pass `--max-steps N` only when an explicit model-decision cap is desired.
 
 Every action's strict function arguments contain:
 

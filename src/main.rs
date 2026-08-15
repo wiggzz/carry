@@ -74,9 +74,9 @@ struct RunArgs {
     #[arg(long, value_enum, default_value = "medium")]
     reasoning_effort: ReasoningEffort,
 
-    /// Stop after this many model steps.
-    #[arg(long, default_value_t = 30)]
-    max_steps: usize,
+    /// Stop after this many model steps. Omit for no step limit.
+    #[arg(long)]
+    max_steps: Option<usize>,
 
     /// Timeout for each shell command.
     #[arg(long, default_value_t = 300)]

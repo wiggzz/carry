@@ -32,7 +32,7 @@ pub struct RunConfig {
     pub task_file: PathBuf,
     pub run_dir: PathBuf,
     pub model: String,
-    pub max_steps: usize,
+    pub max_steps: Option<usize>,
     pub shell_timeout_secs: u64,
     pub promotion_age: usize,
     pub collection_interval: usize,
@@ -183,7 +183,34 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
     let mut latest_tool_result: Option<ContextItem> = None;
     let mut protocol_feedback: Option<String> = None;
     let mut metrics = RunMetrics::default();
-    for step_index in 1..=config.max_steps {
+    let steps_limit = config
+        .max_steps
+        .map_or_else(|| "unlimited".to_owned(), |limit| limit.to_string());
+    let mut step_index = 0;
+    loop {
+        if let Some(max_steps) = config.max_steps
+            && step_index >= max_steps
+        {
+            logger.raw_event(
+                "run_failed",
+                json!({"reason": "max_steps", "max_steps": max_steps}),
+                &format!("stopped after reaching {max_steps} steps"),
+            )?;
+            write_final_artifacts(
+                &config,
+                false,
+                None,
+                &metrics,
+                run_started.elapsed().as_millis() as u64,
+            )
+            .await?;
+            return Ok(RunOutcome {
+                completed: false,
+                answer: None,
+                run_dir: config.run_dir,
+            });
+        }
+        step_index += 1;
         let history = context_state.input_items(latest_tool_result.as_ref());
         let control = render_control(
             step_index,
@@ -202,10 +229,7 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                 "control": control,
                 "request": request
             }),
-            &format!(
-                "[{step_index:02}/{}] requesting next step",
-                config.max_steps
-            ),
+            &format!("[{step_index:02}/{steps_limit}] requesting next step"),
         )?;
 
         let reply = backend.step(&config.task, &history, &control).await?;
@@ -221,8 +245,7 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                 "raw": reply.raw
             }),
             &format!(
-                "[{step_index:02}/{}] model {}ms in={} cached={} out={} reasoning={}",
-                config.max_steps,
+                "[{step_index:02}/{steps_limit}] model {}ms in={} cached={} out={} reasoning={}",
                 reply.latency_ms,
                 reply.usage.input_tokens,
                 reply.usage.cached_input_tokens,
@@ -330,25 +353,6 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             }
         }
     }
-
-    logger.raw_event(
-        "run_failed",
-        json!({"reason": "max_steps", "max_steps": config.max_steps}),
-        &format!("stopped after reaching {} steps", config.max_steps),
-    )?;
-    write_final_artifacts(
-        &config,
-        false,
-        None,
-        &metrics,
-        run_started.elapsed().as_millis() as u64,
-    )
-    .await?;
-    Ok(RunOutcome {
-        completed: false,
-        answer: None,
-        run_dir: config.run_dir,
-    })
 }
 
 fn render_control(
@@ -573,7 +577,7 @@ mod tests {
                 task_file,
                 run_dir: run_dir.clone(),
                 model: "scripted".into(),
-                max_steps: 1,
+                max_steps: Some(1),
                 shell_timeout_secs: 1,
                 promotion_age: 3,
                 collection_interval: 3,
@@ -591,5 +595,106 @@ mod tests {
         assert_eq!(result["usage"]["output_tokens"], 0);
         assert_eq!(result["model_latency_ms"], 0);
         assert!(result["elapsed_ms"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn unlimited_scripted_run_can_finish_after_thirty_shell_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let run_dir = temp.path().join("run");
+        let task_file = temp.path().join("task.md");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(&task_file, "Finish the task.")
+            .await
+            .unwrap();
+
+        let shell_step = format!(
+            "{}\n",
+            r#"{"action":{"kind":"shell","command":"true","answer":null},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#
+        );
+        let mut steps = shell_step.repeat(31);
+        steps.push_str(r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#);
+        steps.push('\n');
+        tokio::fs::write(&steps_file, steps).await.unwrap();
+
+        let outcome = run(
+            RunConfig {
+                cwd: workspace,
+                task: "Finish the task.".into(),
+                task_file,
+                run_dir: run_dir.clone(),
+                model: "scripted".into(),
+                max_steps: None,
+                shell_timeout_secs: 1,
+                promotion_age: 3,
+                collection_interval: 3,
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.completed);
+        let result: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(run_dir.join("result.json")).await.unwrap())
+                .unwrap();
+        assert!(result["steps_limit"].is_null());
+        let trace = tokio::fs::read_to_string(run_dir.join("trace.log"))
+            .await
+            .unwrap();
+        assert!(trace.contains("[01/unlimited] requesting next step"));
+    }
+
+    #[tokio::test]
+    async fn explicit_step_limit_stops_before_the_next_model_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let run_dir = temp.path().join("run");
+        let task_file = temp.path().join("task.md");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(&task_file, "Finish the task.")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"shell","command":"true","answer":null},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#,
+                "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#,
+                "\n"
+            ),
+        )
+        .await
+        .unwrap();
+
+        let outcome = run(
+            RunConfig {
+                cwd: workspace,
+                task: "Finish the task.".into(),
+                task_file,
+                run_dir: run_dir.clone(),
+                model: "scripted".into(),
+                max_steps: Some(1),
+                shell_timeout_secs: 1,
+                promotion_age: 3,
+                collection_interval: 3,
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.completed);
+        let result: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(run_dir.join("result.json")).await.unwrap())
+                .unwrap();
+        assert_eq!(result["steps_limit"], 1);
+        assert!(!result["completed"].as_bool().unwrap());
+        let trace = tokio::fs::read_to_string(run_dir.join("trace.jsonl"))
+            .await
+            .unwrap();
+        assert!(trace.contains(r#""reason":"max_steps""#));
     }
 }
