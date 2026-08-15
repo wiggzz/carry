@@ -16,11 +16,30 @@ from typing import Any, Iterable
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_SELECTION = ROOT / "benchmarks" / "swe-bench-verified-50.json"
+DEFAULT_VERIFIED_CONFIG = ROOT / "benchmarks" / "swe-bench-verified.json"
 METHODS = ("carry", "codex")
 
 
 def sha256_file(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_verified_config(path: pathlib.Path = DEFAULT_VERIFIED_CONFIG) -> dict[str, Any]:
+    config = json.loads(path.read_text(encoding="utf-8"))
+    dataset = config.get("dataset") if isinstance(config, dict) else None
+    presets = config.get("presets") if isinstance(config, dict) else None
+    if not isinstance(dataset, dict) or not isinstance(presets, dict):
+        raise ValueError("verified benchmark config requires dataset and presets objects")
+    if dataset.get("name") != "princeton-nlp/SWE-bench_Verified":
+        raise ValueError("verified benchmark config has an unexpected dataset")
+    if not isinstance(dataset.get("revision"), str) or not dataset["revision"]:
+        raise ValueError("verified benchmark config requires an immutable dataset revision")
+    if dataset.get("task_count") != 500:
+        raise ValueError("verified benchmark config must declare 500 tasks")
+    required_presets = {"smoke-5", "selected-50", "verified-full"}
+    if set(presets) != required_presets:
+        raise ValueError("verified benchmark config has unexpected presets")
+    return config
 
 
 def load_selection(path: pathlib.Path = DEFAULT_SELECTION) -> list[str]:
@@ -33,6 +52,24 @@ def load_selection(path: pathlib.Path = DEFAULT_SELECTION) -> list[str]:
     if len(set(ids)) != len(ids):
         raise ValueError("selection contains duplicate instance IDs")
     return ids
+
+
+def select_seeded_subset(instance_ids: Iterable[str], *, task_count: int, seed: str) -> list[str]:
+    """Select an order-independent deterministic subset using a published seed."""
+    ids = list(instance_ids)
+    if not isinstance(seed, str) or not seed:
+        raise ValueError("selection seed must be a non-empty string")
+    if any(not isinstance(instance_id, str) or not instance_id for instance_id in ids):
+        raise ValueError("instance IDs contain an invalid value")
+    if len(set(ids)) != len(ids):
+        raise ValueError("instance IDs contain a duplicate")
+    if not 1 <= task_count <= len(ids):
+        raise ValueError(f"task count must be between 1 and {len(ids)}")
+    ranked = sorted(
+        ids,
+        key=lambda instance_id: (hashlib.sha256(f"{seed}\0{instance_id}".encode("utf-8")).hexdigest(), instance_id),
+    )
+    return ranked[:task_count]
 
 
 def select_shard(tasks: list[dict[str, Any]], index: int, count: int) -> list[dict[str, Any]]:

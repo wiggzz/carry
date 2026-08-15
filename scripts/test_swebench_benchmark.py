@@ -33,6 +33,24 @@ class BenchmarkConfigurationTests(unittest.TestCase):
         ]
         self.runner.validate_merged_records(tasks, records, ("carry", "codex"))
 
+    def test_verified_config_pins_the_canonical_dataset_revision(self):
+        config = self.runner.load_verified_config()
+        self.assertEqual(config["dataset"]["name"], "princeton-nlp/SWE-bench_Verified")
+        self.assertEqual(config["dataset"]["revision"], "c104f840cc67f8b6eec6f759ebc8b2693d585d4a")
+        self.assertEqual(config["dataset"]["task_count"], 500)
+        self.assertEqual(set(config["presets"]), {"smoke-5", "selected-50", "verified-full"})
+
+    def test_seeded_subset_is_deterministic_and_independent_of_input_order(self):
+        ids = ["zeta", "alpha", "gamma", "beta"]
+        expected = self.runner.select_seeded_subset(ids, task_count=2, seed="carry-v1")
+        self.assertEqual(expected, self.runner.select_seeded_subset(list(reversed(ids)), task_count=2, seed="carry-v1"))
+        self.assertEqual(len(expected), 2)
+        self.assertTrue(set(expected).issubset(ids))
+
+    def test_seeded_subset_rejects_out_of_range_task_count(self):
+        with self.assertRaisesRegex(ValueError, "task count"):
+            self.runner.select_seeded_subset(["one"], task_count=2, seed="carry-v1")
+
     def test_merged_records_reject_duplicate_task_input(self):
         tasks = [{"instance_id": "same"}, {"instance_id": "same"}]
         records = [
