@@ -1,6 +1,6 @@
 # Carry
 
-Carry is a small experimental coding-agent harness for evaluating model-managed context. Each model turn must produce one structured `shell` or `finish` function call and an explicit context-management update.
+Carry is an experimental agentic coding harness that aims to minimize token use and cost while maintaining performance comparable to state-of-the-art harnesses. It lets the model dynamically retain only necessary context, reducing conversation-history bloat and avoiding regular compaction during long-running tasks. Each model turn must produce one structured `shell` or `finish` function call and an explicit context-management update.
 
 > **Security:** Carry's shell tool is not a security boundary. Run it only in a disposable checkout or another isolation mechanism you control. Never give an agent a workspace containing secrets or unrelated source trees.
 
