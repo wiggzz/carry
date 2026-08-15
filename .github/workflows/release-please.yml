@@ -1,0 +1,55 @@
+---
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@8b8fd2cc23b2e18957157a9d923d75aa0c6f6ad5
+        with:
+          release-type: rust
+
+  publish-linux-binary:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build Linux binary
+        run: cargo +stable build --release --locked
+
+      - name: Package release assets
+        env:
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          asset_dir="carry-${TAG_NAME}-x86_64-unknown-linux-gnu"
+          mkdir "$asset_dir"
+          install -m 0755 target/release/carry "$asset_dir/carry"
+          tar -C "$asset_dir" -czf "$asset_dir.tar.gz" carry
+          sha256sum "$asset_dir.tar.gz" > SHA256SUMS
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release upload "$TAG_NAME" "carry-${TAG_NAME}-x86_64-unknown-linux-gnu.tar.gz" SHA256SUMS --clobber
