@@ -1,8 +1,8 @@
 {
   "schema": "carry.swe-bench-verified.v1",
   "dataset": {
-    "name": "SWE-bench/SWE-bench_Verified",
-    "revision": "03e151cf5560b1af6a4363c6a9d766deaaea6b56",
+    "name": "princeton-nlp/SWE-bench_Verified",
+    "revision": "c104f840cc67f8b6eec6f759ebc8b2693d585d4a",
     "split": "test",
     "task_count": 500
   },

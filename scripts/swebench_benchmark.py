@@ -30,7 +30,7 @@ def load_verified_config(path: pathlib.Path = DEFAULT_VERIFIED_CONFIG) -> dict[s
     presets = config.get("presets") if isinstance(config, dict) else None
     if not isinstance(dataset, dict) or not isinstance(presets, dict):
         raise ValueError("verified benchmark config requires dataset and presets objects")
-    if dataset.get("name") != "SWE-bench/SWE-bench_Verified":
+    if dataset.get("name") != "princeton-nlp/SWE-bench_Verified":
         raise ValueError("verified benchmark config has an unexpected dataset")
     if not isinstance(dataset.get("revision"), str) or not dataset["revision"]:
         raise ValueError("verified benchmark config requires an immutable dataset revision")
