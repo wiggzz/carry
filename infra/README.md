@@ -93,8 +93,10 @@ apply. Never retry with a hand-edited state file or `-auto-approve`.
 Every taggable resource receives `Application=Carry`,
 `Repository=wiggzz/carry`, and `Component=swebench-benchmark`. Workers and
 volumes additionally have the canonical lifecycle tags used by IAM cleanup
-checks: `ManagedBy=carry-swebench`, `Project=carry-swebench`, and
-`Purpose=benchmark-worker`.
+checks: `ManagedBy=carry-swebench`, `Project=carry-swebench`,
+`Purpose=benchmark-worker`, and a per-dispatch `RunId` (`gh-*`). The `RunId`
+correlates one manual workflow run for narrow recovery; exact instance-ID cleanup
+remains the normal path.
 
 ## Runtime contract for the later workflow
 

@@ -273,9 +273,15 @@ data "aws_iam_policy_document" "github_dispatch" {
     }
 
     condition {
+      test     = "StringLike"
+      variable = "aws:RequestTag/RunId"
+      values   = ["gh-*"]
+    }
+
+    condition {
       test     = "ForAllValues:StringEquals"
       variable = "aws:TagKeys"
-      values   = ["Application", "Component", "ExpiresAt", "ManagedBy", "Project", "Purpose", "Repository"]
+      values   = ["Application", "Component", "ExpiresAt", "ManagedBy", "Project", "Purpose", "Repository", "RunId"]
     }
   }
 
@@ -316,9 +322,15 @@ data "aws_iam_policy_document" "github_dispatch" {
     }
 
     condition {
+      test     = "StringLike"
+      variable = "aws:RequestTag/RunId"
+      values   = ["gh-*"]
+    }
+
+    condition {
       test     = "ForAllValues:StringEquals"
       variable = "aws:TagKeys"
-      values   = ["Application", "Component", "ExpiresAt", "ManagedBy", "Project", "Purpose", "Repository"]
+      values   = ["Application", "Component", "ExpiresAt", "ManagedBy", "Project", "Purpose", "Repository", "RunId"]
     }
   }
 

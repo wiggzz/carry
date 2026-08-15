@@ -85,6 +85,12 @@ class BenchmarkInfraContractTests(unittest.TestCase):
         readme = self.read("README.md")
         self.assertIn("pre-signed", readme)
         self.assertIn("model credentials", readme)
+    def test_dispatch_requires_run_id_on_every_worker_resource(self):
+        main = self.read("main.tf")
+        dispatch = main.split('data "aws_iam_policy_document" "github_dispatch" {', 1)[1].split('resource "aws_iam_role_policy" "github_dispatch"', 1)[0]
+        self.assertGreaterEqual(dispatch.count('variable = "aws:RequestTag/RunId"'), 2)
+        self.assertGreaterEqual(dispatch.count('values   = ["gh-*"]'), 2)
+        self.assertIn('"RunId"]', dispatch)
 
 
 if __name__ == "__main__":
