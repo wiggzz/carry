@@ -35,8 +35,8 @@ class BenchmarkConfigurationTests(unittest.TestCase):
 
     def test_verified_config_pins_the_canonical_dataset_revision(self):
         config = self.runner.load_verified_config()
-        self.assertEqual(config["dataset"]["name"], "princeton-nlp/SWE-bench_Verified")
-        self.assertEqual(config["dataset"]["revision"], "c104f840cc67f8b6eec6f759ebc8b2693d585d4a")
+        self.assertEqual(config["dataset"]["name"], "SWE-bench/SWE-bench_Verified")
+        self.assertEqual(config["dataset"]["revision"], "03e151cf5560b1af6a4363c6a9d766deaaea6b56")
         self.assertEqual(config["dataset"]["task_count"], 500)
         self.assertEqual(set(config["presets"]), {"smoke-5", "selected-50", "verified-full"})
 
