@@ -13,6 +13,11 @@ output "worker_launch_template_id" {
   value       = aws_launch_template.worker.id
 }
 
+output "worker_launch_template_version" {
+  description = "Numeric launch-template version to pin in the protected dispatch workflow."
+  value       = aws_launch_template.worker.latest_version
+}
+
 output "artifact_session_role_arn" {
   description = "Run-scoped S3 role; dispatch assumes it with exactly one RunId session tag."
   value       = aws_iam_role.artifact_session.arn

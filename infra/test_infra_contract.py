@@ -45,10 +45,13 @@ class BenchmarkInfraContractTests(unittest.TestCase):
 
     def test_worker_termination_uses_the_instance_shutdown_path_only(self):
         main = self.read("main.tf")
+        outputs = self.read("outputs.tf")
         self.assertIn('instance_initiated_shutdown_behavior = "terminate"', main)
         self.assertFalse((ROOT / "watchdog.tf").exists())
         self.assertFalse((ROOT / "lambda" / "watchdog.py").exists())
         self.assertFalse((ROOT / "test_watchdog.py").exists())
+        self.assertIn('output "worker_launch_template_version"', outputs)
+        self.assertIn('aws_launch_template.worker.latest_version', outputs)
 
     def test_artifact_access_is_scoped_to_an_assumed_run_session(self):
         main = self.read("main.tf")
