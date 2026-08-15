@@ -52,6 +52,30 @@ jobs:
         run: cargo +stable build --release --locked
         working-directory: carry-source
 
+      - name: Record build provenance
+        env:
+          REQUESTED_CARRY_REF: ${{ inputs.carry_ref || github.event.pull_request.head.sha }}
+        run: |
+          export CARRY_COMMIT="$(git -C carry-source rev-parse HEAD)"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          Path("artifacts").mkdir(exist_ok=True)
+          Path("artifacts/carry-provenance.json").write_text(
+              json.dumps(
+                  {
+                      "requested_ref": os.environ["REQUESTED_CARRY_REF"],
+                      "resolved_commit": os.environ["CARRY_COMMIT"],
+                  },
+                  indent=2,
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+
       - name: Materialize deterministic shard plan
         run: |
           python3 scripts/swebench_benchmark.py \
@@ -64,5 +88,5 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: benchmark-plan-${{ matrix.shard }}
-          path: artifacts/shard-${{ matrix.shard }}.json
+          path: artifacts/
           retention-days: 7

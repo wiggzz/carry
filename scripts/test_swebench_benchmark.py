@@ -42,6 +42,24 @@ class BenchmarkConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate task"):
             self.runner.validate_merged_records(tasks, records, ("carry", "codex"))
 
+    def test_merged_records_reject_duplicate_method_input(self):
+        tasks = [{"instance_id": "one"}]
+        records = [{"instance_id": "one", "method": "carry"}]
+        with self.assertRaisesRegex(ValueError, "duplicate method"):
+            self.runner.validate_merged_records(tasks, records, ("carry", "carry"))
+
+    def test_merged_records_reject_malformed_record(self):
+        tasks = [{"instance_id": "one"}]
+        with self.assertRaisesRegex(ValueError, "invalid instance_id"):
+            self.runner.validate_merged_records(tasks, [{"instance_id": [], "method": "carry"}], ("carry",))
+
+    def test_committed_selection_has_five_ordered_ten_task_shards(self):
+        selection = self.runner.load_selection()
+        shards = [self.runner.select_shard([{"instance_id": task} for task in selection], index, 5) for index in range(5)]
+        self.assertEqual([len(shard) for shard in shards], [10, 10, 10, 10, 10])
+        self.assertEqual([item["instance_id"] for shard in shards for item in shard], selection)
+        self.assertEqual(self.runner.sha256_file(self.runner.DEFAULT_SELECTION), "d26efa7d55df331566a69aa15c4cbc78c044100f6c6c73610f0d7a0b19bb3877")
+
     def test_merged_records_reject_duplicate_or_missing_pairs(self):
         tasks = [{"instance_id": "one"}, {"instance_id": "two"}]
         records = [

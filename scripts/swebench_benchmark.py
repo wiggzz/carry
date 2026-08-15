@@ -55,7 +55,16 @@ def validate_merged_records(
     if len(set(methods)) != len(methods):
         raise ValueError("method input contains a duplicate method")
     expected = {(instance_id, method) for instance_id in task_ids for method in methods}
-    actual = [(record.get("instance_id"), record.get("method")) for record in records]
+    actual: list[tuple[str, str]] = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("record input must be an object")
+        instance_id, method = record.get("instance_id"), record.get("method")
+        if not isinstance(instance_id, str) or not instance_id:
+            raise ValueError("record input contains an invalid instance_id")
+        if not isinstance(method, str) or not method:
+            raise ValueError("record input contains an invalid method")
+        actual.append((instance_id, method))
     counts = Counter(actual)
     if len(actual) != len(expected) or set(actual) != expected or any(count != 1 for count in counts.values()):
         raise ValueError(
