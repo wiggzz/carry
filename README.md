@@ -92,7 +92,7 @@ The manually dispatched **EC2 benchmark bootstrap** workflow is the safe deploye
 
 It archives the explicitly selected source ref, uses the run-scoped artifact role to upload it under `runs/<RunId>/`, starts one canonical zero-AWS-permission worker, and gives that worker only a short-lived pre-signed download URL. The worker verifies the archive and self-terminates; the GitHub job also has an `if: always()` exact-instance cleanup step. It accepts **no model credential** and executes no agent/model code.
 
-A live Carry/Codex/Pi benchmark remains intentionally blocked until its protected credential broker and reviewed external agent-container boundary land. Bubblewrap is defense in depth, not the primary boundary. The later live mode must preserve the same protected-environment, explicit-ref, run-scoped-artifact, and always-cleanup boundaries.
+A live Carry/Codex/Pi benchmark remains intentionally blocked until its protected credential broker and separately reviewed **external isolation boundary** land. Every credential-bearing agent harness—Carry, Codex, Pi, or another alternative—must run inside a disposable container or equivalent sandbox that limits its filesystem, process, and network reach. Carry Bubblewrap support is useful defense in depth, but is not the sole security boundary. The later mode must preserve the protected-environment, explicit-ref, run-scoped-artifact, and always-cleanup boundaries.
 
 ## Releases and contributions
 

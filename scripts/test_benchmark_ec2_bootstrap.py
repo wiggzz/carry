@@ -44,6 +44,14 @@ class BenchmarkEc2BootstrapContracts(unittest.TestCase):
     def test_ci_runs_the_bootstrap_workflow_contracts(self):
         ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("scripts/test_benchmark_ec2_bootstrap.py", ci)
+    def test_isolation_policy_requires_an_external_boundary_for_every_agent_harness(self):
+        policy = ROOT / "docs" / "benchmark-isolation.md"
+        self.assertTrue(policy.is_file(), "missing benchmark isolation policy")
+        text = policy.read_text(encoding="utf-8")
+        self.assertIn("external isolation boundary", text)
+        self.assertIn("Carry, Codex", text)
+        self.assertIn("must not receive model credentials", text)
+        self.assertIn("Docker socket", text)
 
 
 if __name__ == "__main__":
