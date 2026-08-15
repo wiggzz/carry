@@ -54,6 +54,9 @@ jobs:
       - name: Benchmark planner tests
         run: python3 -m unittest -v scripts/test_swebench_benchmark.py
 
+      - name: Benchmark workflow contract tests
+        run: python3 -m unittest -v scripts/test_benchmark_ec2_bootstrap.py
+
       - name: Release build
         run: cargo build --release --locked
 

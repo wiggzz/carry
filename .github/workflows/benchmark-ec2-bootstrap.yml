@@ -1,0 +1,154 @@
+---
+name: EC2 benchmark bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      carry_ref:
+        description: Carry branch, tag, or commit to stage for the worker
+        required: true
+        default: main
+        type: string
+      bootstrap_wait_seconds:
+        description: Seconds the credential-free worker remains up after verifying its source bundle (1-300)
+        required: true
+        default: "30"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap-worker:
+    name: bootstrap ${{ inputs.carry_ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: swe-bench
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.BENCHMARK_AWS_REGION }}
+      ARTIFACT_BUCKET: ${{ vars.BENCHMARK_ARTIFACT_BUCKET }}
+      ARTIFACT_SESSION_ROLE_ARN: ${{ vars.BENCHMARK_ARTIFACT_SESSION_ROLE_ARN }}
+      LAUNCH_TEMPLATE_ID: ${{ vars.BENCHMARK_WORKER_LAUNCH_TEMPLATE_ID }}
+      BOOTSTRAP_WAIT_SECONDS: ${{ inputs.bootstrap_wait_seconds }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.carry_ref }}
+          persist-credentials: false
+
+      - name: Configure protected AWS dispatch identity
+        uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8
+        with:
+          role-to-assume: ${{ vars.BENCHMARK_DISPATCH_ROLE_ARN }}
+          aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
+          role-session-name: carry-bootstrap-${{ github.run_id }}
+          mask-aws-account-id: true
+
+      - name: Stage the selected source in its run-scoped prefix
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          for required in AWS_REGION ARTIFACT_BUCKET ARTIFACT_SESSION_ROLE_ARN LAUNCH_TEMPLATE_ID; do
+            [[ -n "${!required}" ]] || { echo "missing protected Environment variable: $required" >&2; exit 1; }
+          done
+          [[ "$BOOTSTRAP_WAIT_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] && (( BOOTSTRAP_WAIT_SECONDS <= 300 )) || {
+            echo "bootstrap_wait_seconds must be an integer from 1 through 300" >&2; exit 1;
+          }
+          RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          SOURCE_COMMIT=$(git rev-parse HEAD)
+          git archive --format=tar.gz --output=carry-source.tar.gz "$SOURCE_COMMIT"
+          SOURCE_SHA256=$(sha256sum carry-source.tar.gz | awk '{print $1}')
+
+          ASSUMED=$(aws sts assume-role \
+            --role-arn "$ARTIFACT_SESSION_ROLE_ARN" \
+            --role-session-name "carry-artifact-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --tags "Key=RunId,Value=$RUN_ID" \
+            --query Credentials --output json)
+          python3 - "$ASSUMED" "$RUNNER_TEMP/artifact-session.env" <<'PY'
+          import json
+          import os
+          import sys
+          credentials = json.loads(sys.argv[1])
+          mappings = {
+              "AWS_ACCESS_KEY_ID": credentials["AccessKeyId"],
+              "AWS_SECRET_ACCESS_KEY": credentials["SecretAccessKey"],
+              "AWS_SESSION_TOKEN": credentials["SessionToken"],
+          }
+          for value in mappings.values():
+              print(f"::add-mask::{value}")
+          with open(sys.argv[2], "w", encoding="utf-8") as env_file:
+              for key, value in mappings.items():
+                  env_file.write(f"{key}={value}\n")
+          os.chmod(sys.argv[2], 0o600)
+          PY
+          set -a
+          source "$RUNNER_TEMP/artifact-session.env"
+          set +a
+          aws s3 cp carry-source.tar.gz "s3://$ARTIFACT_BUCKET/runs/$RUN_ID/carry-source.tar.gz" --only-show-errors
+          SOURCE_URL=$(aws s3 presign "s3://$ARTIFACT_BUCKET/runs/$RUN_ID/carry-source.tar.gz" --expires-in 3600)
+          rm -f "$RUNNER_TEMP/artifact-session.env"
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+          echo "::add-mask::$SOURCE_URL"
+          {
+            echo "run_id=$RUN_ID"
+            echo "source_commit=$SOURCE_COMMIT"
+            echo "source_sha256=$SOURCE_SHA256"
+            echo "source_url=$SOURCE_URL"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Launch a credential-free worker bootstrap
+        id: launch
+        shell: bash
+        env:
+          RUN_ID: ${{ steps.stage.outputs.run_id }}
+          SOURCE_SHA256: ${{ steps.stage.outputs.source_sha256 }}
+          SOURCE_URL: ${{ steps.stage.outputs.source_url }}
+        run: |
+          set -euo pipefail
+          SOURCE_URL_B64=$(printf '%s' "$SOURCE_URL" | base64 -w0)
+          cat > worker-user-data.sh <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          trap 'shutdown -h now' EXIT
+          mkdir -p /opt/carry-bootstrap
+          SOURCE_URL="\$(printf '%s' '$SOURCE_URL_B64' | base64 -d)"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "\$SOURCE_URL" -o /opt/carry-bootstrap/carry-source.tar.gz
+          printf '%s  %s\n' '$SOURCE_SHA256' /opt/carry-bootstrap/carry-source.tar.gz | sha256sum -c -
+          tar -tzf /opt/carry-bootstrap/carry-source.tar.gz >/dev/null
+          sleep '$BOOTSTRAP_WAIT_SECONDS'
+          EOF
+          EXPIRES_AT=$(date -u -d '+1 hour' +'%Y-%m-%dT%H:%M:%SZ')
+          TAGS="Tags=[{Key=Application,Value=Carry},{Key=Component,Value=swebench-benchmark},{Key=ExpiresAt,Value=$EXPIRES_AT},{Key=ManagedBy,Value=carry-swebench},{Key=Project,Value=carry-swebench},{Key=Purpose,Value=benchmark-worker},{Key=Repository,Value=wiggzz/carry}]"
+          WORKER_INSTANCE_ID=$(aws ec2 run-instances \
+            --launch-template "LaunchTemplateId=$LAUNCH_TEMPLATE_ID" \
+            --client-token "$RUN_ID" \
+            --user-data file://worker-user-data.sh \
+            --tag-specifications "ResourceType=instance,$TAGS" "ResourceType=volume,$TAGS" \
+            --query 'Instances[0].InstanceId' --output text)
+          [[ "$WORKER_INSTANCE_ID" =~ ^i-[0-9a-f]+$ ]] || { echo "invalid worker instance ID" >&2; exit 1; }
+          echo "WORKER_INSTANCE_ID=$WORKER_INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "instance_id=$WORKER_INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the worker self-terminates
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ec2 wait instance-terminated --instance-ids "$WORKER_INSTANCE_ID"
+
+      - name: Terminate the exact worker on any outcome
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${WORKER_INSTANCE_ID:-}" ]]; then
+            exit 0
+          fi
+          state=$(aws ec2 describe-instances --instance-ids "$WORKER_INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || true)
+          case "$state" in
+            pending|running|stopping|stopped) aws ec2 terminate-instances --instance-ids "$WORKER_INSTANCE_ID" --no-cli-pager >/dev/null ;;
+            *) exit 0 ;;
+          esac

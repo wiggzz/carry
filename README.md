@@ -81,6 +81,18 @@ Live fixtures require `OPENAI_API_KEY`. Codex fixture comparisons require a sepa
 
 The manually dispatched **Benchmark plan** workflow builds a requested Carry branch, tag, or commit and emits five deterministic shards from the frozen 50-instance SWE-bench selection. It does not run agents or require model credentials. The live Carry/Codex/Pi benchmark worker will be added separately after its external isolated execution and protected credential path are reviewed.
 
+The manually dispatched **EC2 benchmark bootstrap** workflow is the safe deployed-infrastructure canary. It requires the Terraform deployment first, then these protected `swe-bench` GitHub Environment variables:
+
+- `BENCHMARK_AWS_REGION`
+- `BENCHMARK_DISPATCH_ROLE_ARN`
+- `BENCHMARK_ARTIFACT_BUCKET`
+- `BENCHMARK_ARTIFACT_SESSION_ROLE_ARN`
+- `BENCHMARK_WORKER_LAUNCH_TEMPLATE_ID`
+
+It archives the explicitly selected source ref, uses the run-scoped artifact role to upload it under `runs/<RunId>/`, starts one canonical zero-AWS-permission worker, and gives that worker only a short-lived pre-signed download URL. The worker verifies the archive and self-terminates; the GitHub job also has an `if: always()` exact-instance cleanup step. It accepts **no model credential** and executes no agent/model code.
+
+A live Carry/Codex/Pi benchmark remains intentionally blocked until its protected credential broker and reviewed external agent-container boundary land. Bubblewrap is defense in depth, not the primary boundary. The later live mode must preserve the same protected-environment, explicit-ref, run-scoped-artifact, and always-cleanup boundaries.
+
 ## Releases and contributions
 
 Use Conventional Commits. CI runs formatting, Clippy, unit tests, a release build, and the scripted fixture on pull requests and `main`. Release Please opens a release PR from conventional commits; merging that PR creates a GitHub Release with a Linux x86_64 binary and checksum.
