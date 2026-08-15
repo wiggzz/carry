@@ -1,0 +1,10 @@
+{
+  "schema": "carry.swe-bench-selection.v1",
+  "source_dataset": "princeton-nlp/SWE-bench_Verified",
+  "source_manifest_sha256": "e0604e07c3520297dffe03b7213fb99dd966cd7e2f80cf54611e8c2a21777962",
+  "instance_ids": [
+    "django__django-16612", "django__django-15503", "django__django-17029", "django__django-14787", "django__django-16899", "django__django-15930", "django__django-16502", "django__django-16569", "django__django-14999", "django__django-15368", "django__django-16819", "django__django-14771", "django__django-16263", "django__django-15554", "django__django-15814", "django__django-16662", "django__django-16139", "django__django-15104", "django__django-16527", "django__django-16901", "django__django-15382", "django__django-15277", "django__django-15098", "django__django-15561", "django__django-15280",
+    "sympy__sympy-22456", "sympy__sympy-23824", "sympy__sympy-24562", "sympy__sympy-21379", "sympy__sympy-24213", "sympy__sympy-20428", "sympy__sympy-19637", "sympy__sympy-18211", "sympy__sympy-20154", "sympy__sympy-23950", "sympy__sympy-24066", "sympy__sympy-21930", "sympy__sympy-18189", "sympy__sympy-22914", "sympy__sympy-20801",
+    "pydata__xarray-6938", "pydata__xarray-7233", "pydata__xarray-6461", "pydata__xarray-6721", "pydata__xarray-7393", "pytest-dev__pytest-7205", "pytest-dev__pytest-7490", "pytest-dev__pytest-7521", "pytest-dev__pytest-7236", "psf__requests-6028"
+  ]
+}
