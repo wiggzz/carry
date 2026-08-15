@@ -18,11 +18,6 @@ output "artifact_session_role_arn" {
   value       = aws_iam_role.artifact_session.arn
 }
 
-output "worker_watchdog_lambda_arn" {
-  description = "Lambda invoked every five minutes to enforce the EC2 LaunchTime runtime ceiling."
-  value       = aws_lambda_function.worker_watchdog.arn
-}
-
 output "worker_security_group_id" {
   description = "Security group with no inbound access and only HTTPS/DNS egress."
   value       = aws_security_group.worker.id

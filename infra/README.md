@@ -17,10 +17,7 @@ canonical SWE-bench Verified runs. It creates no running EC2 instance during
   `wiggzz/carry` `swe-bench` Environment. It can launch/tag/observe/terminate
   only designated benchmark workers;
 - a session-tagged artifact role: the dispatch job must assume it with one
-  `RunId`, which restricts S3 read/write/list operations to `runs/<RunId>/*`;
-- a periodic EventBridge → Lambda watchdog. It independently verifies canonical
-  tags and terminates workers that exceed the fixed LaunchTime runtime ceiling.
-  It is serverless only (no running EC2 or persistent runner) and its logs expire.
+  `RunId`, which restricts S3 read/write/list operations to `runs/<RunId>/*`.
 
 The later workflow will use short-lived **pre-signed** URLs for the worker
 manifest and result uploads. The worker instance role intentionally has no AWS
@@ -68,10 +65,10 @@ backend before applying:
 4. `terraform validate`
 5. `terraform plan -out=tfplan`
 
-Review that the plan creates a bucket, four narrowly scoped roles, one instance
-profile, one security group, one launch template, one Lambda, and one periodic
-EventBridge rule—**not** an `aws_instance` or a persistent runner. Apply only
-from a trusted operator environment.
+Review that the plan creates a bucket, three narrowly scoped roles, one instance
+profile, one security group, and one launch template—**not** an `aws_instance`,
+Lambda, EventBridge rule, or persistent runner. Apply only from a trusted
+operator environment.
 
 ## Operator apply steps
 
@@ -95,7 +92,7 @@ apply. Never retry with a hand-edited state file or `-auto-approve`.
 
 Every taggable resource receives `Application=Carry`,
 `Repository=wiggzz/carry`, and `Component=swebench-benchmark`. Workers and
-volumes additionally have the canonical lifecycle tags used by IAM/watchdog
+volumes additionally have the canonical lifecycle tags used by IAM cleanup
 checks: `ManagedBy=carry-swebench`, `Project=carry-swebench`, and
 `Purpose=benchmark-worker`.
 
@@ -105,13 +102,11 @@ The protected dispatch job assumes `github_dispatch_role_arn` with GitHub OIDC,
 then assumes `artifact_session_role_arn` with exactly one `RunId` session tag
 before it writes `runs/<RunId>/...` or signs worker URLs. It launches the
 Terraform-managed launch template with the canonical `ManagedBy`, `Project`, and
-`Purpose` tags plus a UTC `ExpiresAt` tag. The independent watchdog runs every
-five minutes and terminates matching workers no later than
-`worker_max_runtime_minutes` after EC2 `LaunchTime`, regardless of a malformed
-or future-dated `ExpiresAt` value.
+`Purpose` tags plus a UTC `ExpiresAt` tag.
 
-The worker must also self-shutdown on success/failure; the GitHub job has a
-final tagged-instance termination step for cancellation/timeout. Those are
-defense in depth—the independent watchdog prevents a broken worker or cancelled
-workflow from leaving compute running. Results must be strictly validated before
-a separate GitHub reporting job posts any PR comment.
+Workers use EC2 instance-initiated shutdown with `terminate`, and their root
+volumes delete on termination. For the initial manually observed runs, there is
+intentionally no persistent cloud watchdog. The later protected dispatch workflow
+must have an `if: always()` final step that terminates its exact tagged worker
+instance by ID after success, failure, cancellation, or job timeout. Results must
+be strictly validated before a separate GitHub reporting job posts any PR comment.

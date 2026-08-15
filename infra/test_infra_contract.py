@@ -43,15 +43,12 @@ class BenchmarkInfraContractTests(unittest.TestCase):
         self.assertIn('repo:${var.github_repository}:environment:${var.github_environment}', main)
         self.assertNotIn('repo:${var.github_repository}:pull_request', main)
 
-    def test_watchdog_is_independent_of_worker_shutdown(self):
-        watchdog = self.read("watchdog.tf")
-        source = self.read("lambda/watchdog.py")
-        self.assertIn('resource "aws_cloudwatch_event_rule" "worker_watchdog"', watchdog)
-        self.assertIn('resource "aws_lambda_function" "worker_watchdog"', watchdog)
-        self.assertIn('rate(5 minutes)', watchdog)
-        self.assertIn('worker_max_runtime_minutes', watchdog)
-        self.assertIn('LaunchTime', source)
-        self.assertIn('terminate_instances', source)
+    def test_worker_termination_uses_the_instance_shutdown_path_only(self):
+        main = self.read("main.tf")
+        self.assertIn('instance_initiated_shutdown_behavior = "terminate"', main)
+        self.assertFalse((ROOT / "watchdog.tf").exists())
+        self.assertFalse((ROOT / "lambda" / "watchdog.py").exists())
+        self.assertFalse((ROOT / "test_watchdog.py").exists())
 
     def test_artifact_access_is_scoped_to_an_assumed_run_session(self):
         main = self.read("main.tf")

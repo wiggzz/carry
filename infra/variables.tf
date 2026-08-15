@@ -36,17 +36,6 @@ variable "github_environment" {
   default     = "swe-bench"
 }
 
-variable "watchdog_log_retention_days" {
-  description = "CloudWatch retention for one-shot worker watchdog invocations."
-  type        = number
-  default     = 14
-
-  validation {
-    condition     = contains([1, 3, 5, 7, 14, 30, 60, 90], var.watchdog_log_retention_days)
-    error_message = "watchdog_log_retention_days must be a supported CloudWatch retention value."
-  }
-}
-
 variable "worker_ami_id" {
   description = "Pinned x86_64 worker AMI ID. Build and review this image separately; never use a moving latest-AMI lookup for benchmark runs."
   type        = string
@@ -61,17 +50,6 @@ variable "worker_instance_type" {
   description = "x86_64 instance type used by the immutable worker launch template."
   type        = string
   default     = "m7i.2xlarge"
-}
-
-variable "worker_max_runtime_minutes" {
-  description = "Hard upper bound enforced by the independent watchdog from EC2 LaunchTime."
-  type        = number
-  default     = 720
-
-  validation {
-    condition     = var.worker_max_runtime_minutes >= 30 && var.worker_max_runtime_minutes <= 1440
-    error_message = "worker_max_runtime_minutes must be between 30 minutes and 24 hours."
-  }
 }
 
 variable "worker_root_volume_gib" {

@@ -30,8 +30,8 @@ jobs:
           terraform -chdir=infra init -backend=false -input=false
           terraform -chdir=infra validate
 
-      - name: Test infrastructure contracts and watchdog
-        run: python3 -m unittest -v infra/test_infra_contract.py infra/test_watchdog.py
+      - name: Test infrastructure contracts
+        run: python3 -m unittest -v infra/test_infra_contract.py
 
   test:
     runs-on: ubuntu-latest
