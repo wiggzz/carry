@@ -88,6 +88,7 @@ The manually dispatched **EC2 benchmark bootstrap** workflow is the safe deploye
 - `BENCHMARK_ARTIFACT_BUCKET`
 - `BENCHMARK_ARTIFACT_SESSION_ROLE_ARN`
 - `BENCHMARK_WORKER_LAUNCH_TEMPLATE_ID`
+- `BENCHMARK_WORKER_LAUNCH_TEMPLATE_VERSION` (the numeric `worker_launch_template_version` Terraform output)
 
 It archives the explicitly selected source ref, uses the run-scoped artifact role to upload it under `runs/<RunId>/`, starts one canonical zero-AWS-permission worker, and gives that worker only a short-lived pre-signed download URL. The worker verifies the archive and self-terminates; the GitHub job also has an `if: always()` exact-instance cleanup step. It accepts **no model credential** and executes no agent/model code.
 
