@@ -24,7 +24,8 @@ pub enum ActionKind {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ContextManagement {
-    pub retain_ids: Vec<String>,
+    pub retain_volatile_ids: Vec<String>,
+    pub release_stable_ids: Vec<String>,
     pub add_memories: Vec<String>,
 }
 
@@ -136,20 +137,25 @@ impl Step {
 fn context_management_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Controls the complete persistent context for the next decision. Context not explicitly retained is lost and unavailable to future work.",
+        "description": "Controls generational context. Stable items persist by default; volatile items survive only when retained.",
         "properties": {
-            "retain_ids": {
+            "retain_volatile_ids": {
                 "type": "array",
-                "description": "The complete set of existing context IDs to preserve verbatim. Include a t-prefixed tool-interaction ID to replay both its original assistant function call and its function result exactly. Include an m-prefixed memory ID to keep that memory. Omitted IDs are permanently dropped. The latest tool interaction is visible for the current decision without being listed, but must be listed here to remain visible afterward.",
-                "items": { "type": "string" }
+                "description": "The complete set of volatile context IDs to preserve. Copy only exact tNNNN or mNNNN IDs shown as available in the context status. Use [] when none exist; never emit a placeholder. The latest automatic tool interaction must be listed to survive after this decision.",
+                "items": { "type": "string", "pattern": "^[tm][0-9]{4,}$" }
+            },
+            "release_stable_ids": {
+                "type": "array",
+                "description": "Stable context IDs to release because they are stale, contradicted, redundant, or context pressure justifies collection. Use [] when none should be released; never emit an empty string. Stable items otherwise persist automatically.",
+                "items": { "type": "string", "pattern": "^[tm][0-9]{4,}$" }
             },
             "add_memories": {
                 "type": "array",
-                "description": "Concise new conclusions worth preserving when verbatim evidence is unnecessary. The harness assigns each one an m-prefixed ID in the next request. Do not copy content already preserved through retain_ids.",
+                "description": "Concise new conclusions worth preserving when verbatim evidence is unnecessary. The harness assigns each one an m-prefixed ID in the next request. Do not copy content already preserved in stable context or through retain_volatile_ids.",
                 "items": { "type": "string" }
             }
         },
-        "required": ["retain_ids", "add_memories"],
+        "required": ["retain_volatile_ids", "release_stable_ids", "add_memories"],
         "additionalProperties": false
     })
 }
@@ -206,17 +212,23 @@ mod tests {
             "type": "function_call",
             "name": "shell",
             "call_id": "call_1",
-            "arguments": r#"{"command":"cargo test","context_management":{"retain_ids":["t0001"],"add_memories":[]}}"#
+            "arguments": r#"{"command":"cargo test","context_management":{"retain_volatile_ids":["t0001"],"release_stable_ids":[],"add_memories":[]}}"#
         });
         let parsed = Step::from_function_call(&shell).unwrap();
         assert_eq!(parsed.action.kind, ActionKind::Shell);
         assert_eq!(parsed.action.command.as_deref(), Some("cargo test"));
+        let schema = tool_definitions();
+        assert_eq!(
+            schema[0]["parameters"]["properties"]["context_management"]["properties"]["retain_volatile_ids"]
+                ["items"]["pattern"],
+            "^[tm][0-9]{4,}$"
+        );
 
         let finish = json!({
             "type": "function_call",
             "name": "finish",
             "call_id": "call_2",
-            "arguments": r#"{"answer":"done","context_management":{"retain_ids":[],"add_memories":[]}}"#
+            "arguments": r#"{"answer":"done","context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#
         });
         assert_eq!(
             Step::from_function_call(&finish)

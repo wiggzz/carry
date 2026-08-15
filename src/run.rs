@@ -19,9 +19,9 @@ use crate::{
 
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
-At each step, select exactly one available action. Investigate, implement, and verify the requested change before finishing.
+At each step, select exactly one available action. Investigate, implement, and verify the requested change before finishing. Before editing, establish a minimal failing reproduction where practical. When behavior has competing inputs or sources, use distinct values to verify provenance; when a task cites a regression or prior change, search cited identifiers and subsequent fixes in repository history. Before finishing, run the affected tests.
 
-You select the knowledge that carries forward through the investigation. The latest tool interaction is available for one decision. Anything not explicitly selected for retention is removed from subsequent context and cannot be used in further work. Preserve exact evidence when its details matter; preserve concise conclusions when they do not.
+You manage context in two generations. The latest tool interaction is available for one decision. Volatile items survive only when explicitly retained and promote after several consecutive rounds. Stable items persist automatically: release them only when stale, contradicted, redundant, or context pressure makes them no longer worth their cost. Preserve exact evidence when its details matter; preserve concise conclusions when it does not.
 
 Work only within the assigned repository. Do not perform destructive or external actions."#;
 
@@ -32,8 +32,10 @@ pub struct RunConfig {
     pub task_file: PathBuf,
     pub run_dir: PathBuf,
     pub model: String,
-    pub max_steps: usize,
+    pub max_steps: Option<usize>,
     pub shell_timeout_secs: u64,
+    pub promotion_age: usize,
+    pub collection_interval: usize,
 }
 
 pub enum Backend {
@@ -78,6 +80,10 @@ impl RunMetrics {
             .usage
             .cached_input_tokens
             .saturating_add(usage.cached_input_tokens);
+        self.usage.cache_write_input_tokens = self
+            .usage
+            .cache_write_input_tokens
+            .saturating_add(usage.cache_write_input_tokens);
         self.usage.output_tokens = self.usage.output_tokens.saturating_add(usage.output_tokens);
         self.usage.reasoning_tokens = self
             .usage
@@ -166,7 +172,9 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             "cwd": config.cwd,
             "task_file": config.task_file,
             "model": config.model,
-            "max_steps": config.max_steps
+            "max_steps": config.max_steps,
+            "promotion_age": config.promotion_age,
+            "collection_interval": config.collection_interval
         }),
         &format!("run started in {}", config.cwd.display()),
     )?;
@@ -175,13 +183,42 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
     let mut latest_tool_result: Option<ContextItem> = None;
     let mut protocol_feedback: Option<String> = None;
     let mut metrics = RunMetrics::default();
-    for step_index in 1..=config.max_steps {
+    let steps_limit = config
+        .max_steps
+        .map_or_else(|| "unlimited".to_owned(), |limit| limit.to_string());
+    let mut step_index = 0;
+    loop {
+        if let Some(max_steps) = config.max_steps
+            && step_index >= max_steps
+        {
+            logger.raw_event(
+                "run_failed",
+                json!({"reason": "max_steps", "max_steps": max_steps}),
+                &format!("stopped after reaching {max_steps} steps"),
+            )?;
+            write_final_artifacts(
+                &config,
+                false,
+                None,
+                &metrics,
+                run_started.elapsed().as_millis() as u64,
+            )
+            .await?;
+            return Ok(RunOutcome {
+                completed: false,
+                answer: None,
+                run_dir: config.run_dir,
+            });
+        }
+        step_index += 1;
         let history = context_state.input_items(latest_tool_result.as_ref());
         let control = render_control(
             step_index,
             &context_state,
             latest_tool_result.as_ref(),
             protocol_feedback.as_deref(),
+            config.promotion_age,
+            config.collection_interval,
         );
         let request = backend.request_body(&config.task, &history, &control);
         logger.raw_event(
@@ -192,10 +229,7 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                 "control": control,
                 "request": request
             }),
-            &format!(
-                "[{step_index:02}/{}] requesting next step",
-                config.max_steps
-            ),
+            &format!("[{step_index:02}/{steps_limit}] requesting next step"),
         )?;
 
         let reply = backend.step(&config.task, &history, &control).await?;
@@ -211,8 +245,7 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                 "raw": reply.raw
             }),
             &format!(
-                "[{step_index:02}/{}] model {}ms in={} cached={} out={} reasoning={}",
-                config.max_steps,
+                "[{step_index:02}/{steps_limit}] model {}ms in={} cached={} out={} reasoning={}",
                 reply.latency_ms,
                 reply.usage.input_tokens,
                 reply.usage.cached_input_tokens,
@@ -221,9 +254,12 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             ),
         )?;
 
-        let context_change = match context_state
-            .apply(&reply.step.context_management, latest_tool_result.as_ref())
-        {
+        let context_change = match context_state.apply(
+            &reply.step.context_management,
+            latest_tool_result.as_ref(),
+            config.promotion_age,
+            config.collection_interval,
+        ) {
             Ok(change) => change,
             Err(error) => {
                 let feedback = format!(
@@ -243,9 +279,12 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             "context_updated",
             &context_change,
             &format!(
-                "  context retained={} dropped={} added={} bytes={}",
-                context_change.retained.len(),
+                "  context stable={} volatile={} promoted={} dropped={} released={} added={} bytes={}",
+                context_change.stable.len(),
+                context_change.volatile.len(),
+                context_change.promoted.len(),
                 context_change.dropped.len(),
+                context_change.released.len(),
                 context_change.added.len(),
                 context_change.bytes
             ),
@@ -314,25 +353,6 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             }
         }
     }
-
-    logger.raw_event(
-        "run_failed",
-        json!({"reason": "max_steps", "max_steps": config.max_steps}),
-        &format!("stopped after reaching {} steps", config.max_steps),
-    )?;
-    write_final_artifacts(
-        &config,
-        false,
-        None,
-        &metrics,
-        run_started.elapsed().as_millis() as u64,
-    )
-    .await?;
-    Ok(RunOutcome {
-        completed: false,
-        answer: None,
-        run_dir: config.run_dir,
-    })
 }
 
 fn render_control(
@@ -340,12 +360,19 @@ fn render_control(
     state: &ContextState,
     latest: Option<&ContextItem>,
     protocol_feedback: Option<&str>,
+    promotion_age: usize,
+    collection_interval: usize,
 ) -> String {
     let feedback = protocol_feedback.unwrap_or("(none)");
-    let retained_ids = state.retained_ids();
+    let stable_ids = state.stable_ids();
+    let volatile = state.volatile_status();
     let latest_id = latest.map_or("none", |item| item.id.as_str());
     format!(
-        "Context status for step {step}: retained_ids={retained_ids:?}; latest_automatic_id={latest_id}; retained_bytes={}; protocol_feedback={feedback}. Select exactly one next action.",
+        "Context status for step {step}: stable_ids={stable_ids:?} (kept by default; release only when stale, redundant, contradicted, or under context pressure); volatile_ids_and_ages={volatile:?} (must be retained explicitly); latest_automatic_id={latest_id} (retain only when this is an actual tNNNN ID; if none, use no placeholder); promotion_age={}; collection_interval={}; stable_bytes={}; volatile_bytes={}; retained_bytes={}; protocol_feedback={feedback}. Select exactly one next action.",
+        promotion_age,
+        collection_interval,
+        state.stable_bytes(),
+        state.volatile_bytes(),
         state.retained_bytes()
     )
 }
@@ -464,6 +491,8 @@ async fn write_final_artifacts(
         "answer": answer,
         "model": config.model,
         "steps_limit": config.max_steps,
+        "promotion_age": config.promotion_age,
+        "collection_interval": config.collection_interval,
         "patch_bytes": patch.len(),
         "usage": &metrics.usage,
         "model_latency_ms": metrics.model_latency_ms,
@@ -482,6 +511,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn system_prompt_requires_reproduction_provenance_and_history_checks() {
+        assert!(SYSTEM_PROMPT.contains("minimal failing reproduction"));
+        assert!(SYSTEM_PROMPT.contains("distinct values"));
+        assert!(SYSTEM_PROMPT.contains("repository history"));
+        assert!(SYSTEM_PROMPT.contains("search cited identifiers"));
+        assert!(SYSTEM_PROMPT.contains("affected tests"));
+    }
+
+    #[test]
     fn combined_output_includes_complete_streams() {
         let output = combined_output(b"all stdout", b"all stderr");
         assert!(output.contains("STDOUT (10 bytes):\nall stdout"));
@@ -495,6 +533,7 @@ mod tests {
             &Usage {
                 input_tokens: 10,
                 cached_input_tokens: 4,
+                cache_write_input_tokens: 5,
                 output_tokens: 3,
                 reasoning_tokens: 1,
                 total_tokens: 13,
@@ -505,6 +544,7 @@ mod tests {
             &Usage {
                 input_tokens: 7,
                 cached_input_tokens: 2,
+                cache_write_input_tokens: 3,
                 output_tokens: 5,
                 reasoning_tokens: 2,
                 total_tokens: 12,
@@ -514,6 +554,7 @@ mod tests {
 
         assert_eq!(metrics.usage.input_tokens, 17);
         assert_eq!(metrics.usage.cached_input_tokens, 6);
+        assert_eq!(metrics.usage.cache_write_input_tokens, 8);
         assert_eq!(metrics.usage.output_tokens, 8);
         assert_eq!(metrics.usage.reasoning_tokens, 3);
         assert_eq!(metrics.usage.total_tokens, 25);
@@ -533,7 +574,7 @@ mod tests {
             .unwrap();
         tokio::fs::write(
             &steps_file,
-            r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context_management":{"retain_ids":[],"add_memories":[]}}"#,
+            r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#,
         )
         .await
         .unwrap();
@@ -545,8 +586,10 @@ mod tests {
                 task_file,
                 run_dir: run_dir.clone(),
                 model: "scripted".into(),
-                max_steps: 1,
+                max_steps: Some(1),
                 shell_timeout_secs: 1,
+                promotion_age: 3,
+                collection_interval: 3,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -561,5 +604,106 @@ mod tests {
         assert_eq!(result["usage"]["output_tokens"], 0);
         assert_eq!(result["model_latency_ms"], 0);
         assert!(result["elapsed_ms"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn unlimited_scripted_run_can_finish_after_thirty_shell_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let run_dir = temp.path().join("run");
+        let task_file = temp.path().join("task.md");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(&task_file, "Finish the task.")
+            .await
+            .unwrap();
+
+        let shell_step = format!(
+            "{}\n",
+            r#"{"action":{"kind":"shell","command":"true","answer":null},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#
+        );
+        let mut steps = shell_step.repeat(31);
+        steps.push_str(r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#);
+        steps.push('\n');
+        tokio::fs::write(&steps_file, steps).await.unwrap();
+
+        let outcome = run(
+            RunConfig {
+                cwd: workspace,
+                task: "Finish the task.".into(),
+                task_file,
+                run_dir: run_dir.clone(),
+                model: "scripted".into(),
+                max_steps: None,
+                shell_timeout_secs: 1,
+                promotion_age: 3,
+                collection_interval: 3,
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.completed);
+        let result: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(run_dir.join("result.json")).await.unwrap())
+                .unwrap();
+        assert!(result["steps_limit"].is_null());
+        let trace = tokio::fs::read_to_string(run_dir.join("trace.log"))
+            .await
+            .unwrap();
+        assert!(trace.contains("[01/unlimited] requesting next step"));
+    }
+
+    #[tokio::test]
+    async fn explicit_step_limit_stops_before_the_next_model_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let run_dir = temp.path().join("run");
+        let task_file = temp.path().join("task.md");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(&task_file, "Finish the task.")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"shell","command":"true","answer":null},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#,
+                "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#,
+                "\n"
+            ),
+        )
+        .await
+        .unwrap();
+
+        let outcome = run(
+            RunConfig {
+                cwd: workspace,
+                task: "Finish the task.".into(),
+                task_file,
+                run_dir: run_dir.clone(),
+                model: "scripted".into(),
+                max_steps: Some(1),
+                shell_timeout_secs: 1,
+                promotion_age: 3,
+                collection_interval: 3,
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.completed);
+        let result: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(run_dir.join("result.json")).await.unwrap())
+                .unwrap();
+        assert_eq!(result["steps_limit"], 1);
+        assert!(!result["completed"].as_bool().unwrap());
+        let trace = tokio::fs::read_to_string(run_dir.join("trace.jsonl"))
+            .await
+            .unwrap();
+        assert!(trace.contains(r#""reason":"max_steps""#));
     }
 }
