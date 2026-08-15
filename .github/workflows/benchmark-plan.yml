@@ -2,6 +2,15 @@
 name: Benchmark plan
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/benchmark-plan.yml"
+      - "benchmarks/swe-bench-verified-50.json"
+      - "scripts/swebench_benchmark.py"
+      - "scripts/test_swebench_benchmark.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
   workflow_dispatch:
     inputs:
       carry_ref:
@@ -15,7 +24,7 @@ permissions:
 
 jobs:
   build-and-plan:
-    name: build ${{ inputs.carry_ref }} / shard ${{ matrix.shard }}
+    name: build ${{ inputs.carry_ref || github.event.pull_request.head.sha }} / shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -32,7 +41,7 @@ jobs:
       - name: Check out requested Carry source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.carry_ref }}
+          ref: ${{ inputs.carry_ref || github.event.pull_request.head.sha }}
           path: carry-source
           persist-credentials: false
 
