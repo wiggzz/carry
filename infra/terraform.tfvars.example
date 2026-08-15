@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars locally. Do not commit the copy.
+aws_region              = "us-west-2"
+artifact_bucket_name    = "carry-swebench-artifacts-CHANGE-ME"
+github_oidc_provider_arn = "arn:aws:iam::YOUR_ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+worker_ami_id           = "ami-CHANGE-ME"
+worker_subnet_id        = "subnet-CHANGE-ME"
+# worker_instance_type      = "m7i.2xlarge"
+# worker_max_runtime_minutes = 720
+# worker_root_volume_gib     = 150
+# artifact_retention_days = 14
