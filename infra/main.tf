@@ -212,86 +212,45 @@ resource "aws_iam_role" "github_dispatch" {
 }
 
 data "aws_iam_policy_document" "github_dispatch" {
-  # RunInstances authorizes each request resource separately. This dedicated
-  # statement permits only the canonical launch template itself; the following
-  # statement constrains every resulting request resource to that same template.
+  # RunInstances authorizes every request resource independently. AWS's
+  # launch-template policy pattern requires a separate network/subnet statement:
+  # IsLaunchTemplateResource is evaluated for those resources but not for every
+  # resource that RunInstances touches.
   statement {
-    sid       = "UseOnlyTheCanonicalLaunchTemplate"
-    effect    = "Allow"
-    actions   = ["ec2:RunInstances"]
-    resources = [aws_launch_template.worker.arn]
+    sid     = "LaunchOnlyFromCanonicalTemplate"
+    effect  = "Allow"
+    actions = ["ec2:RunInstances"]
+    not_resources = [
+      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:network-interface/*",
+      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:subnet/*",
+    ]
+
+    condition {
+      test     = "ArnLike"
+      variable = "ec2:LaunchTemplate"
+      values   = [aws_launch_template.worker.arn]
+    }
   }
 
   statement {
-    sid       = "LaunchTaggedBenchmarkWorkers"
-    effect    = "Allow"
-    actions   = ["ec2:RunInstances"]
-    resources = ["*"]
+    sid     = "LaunchNetworkOnlyFromCanonicalTemplate"
+    effect  = "Allow"
+    actions = ["ec2:RunInstances"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:network-interface/*",
+      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:subnet/*",
+    ]
 
     condition {
-      test     = "Bool"
-      variable = "ec2:IsLaunchTemplateResource"
-      values   = ["true"]
-    }
-
-    condition {
-      test     = "StringEquals"
+      test     = "ArnLike"
       variable = "ec2:LaunchTemplate"
       values   = [aws_launch_template.worker.arn]
     }
 
     condition {
-      test     = "StringEquals"
-      variable = "ec2:Region"
-      values   = [var.aws_region]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "ec2:InstanceType"
-      values   = [var.worker_instance_type]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "ec2:Tenancy"
-      values   = ["default"]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/ManagedBy"
-      values   = ["carry-swebench"]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/Project"
-      values   = ["carry-swebench"]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/Purpose"
-      values   = ["benchmark-worker"]
-    }
-
-    condition {
-      test     = "StringLike"
-      variable = "aws:RequestTag/ExpiresAt"
-      values   = ["????-??-??T??:??:??Z"]
-    }
-
-    condition {
-      test     = "StringLike"
-      variable = "aws:RequestTag/RunId"
-      values   = ["gh-*"]
-    }
-
-    condition {
-      test     = "ForAllValues:StringEquals"
-      variable = "aws:TagKeys"
-      values   = ["Application", "Component", "ExpiresAt", "ManagedBy", "Project", "Purpose", "Repository", "RunId"]
+      test     = "Bool"
+      variable = "ec2:IsLaunchTemplateResource"
+      values   = ["true"]
     }
   }
 
