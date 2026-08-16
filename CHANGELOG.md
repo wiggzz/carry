@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/wiggzz/carry/compare/v0.2.0...v0.2.1) (2026-08-16)
+
+
+### Bug Fixes
+
+* trust GitHub immutable OIDC subjects ([#18](https://github.com/wiggzz/carry/issues/18)) ([f174bac](https://github.com/wiggzz/carry/commit/f174bac18ff192c95dfe159de59002b442c78c41))
+
 ## [0.2.0](https://github.com/wiggzz/carry/compare/v0.1.1...v0.2.0) (2026-08-16)
 
 
