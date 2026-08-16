@@ -19,14 +19,14 @@ variable "github_oidc_provider_arn" {
   type        = string
 }
 
-variable "github_repository" {
-  description = "GitHub repository allowed to assume the dispatch role."
+variable "github_oidc_subject_prefix" {
+  description = "Exact GitHub OIDC subject prefix for this repository. Obtain it from GitHub's OIDC customization API; the environment suffix is added separately."
   type        = string
-  default     = "wiggzz/carry"
+  default     = "repo:wiggzz@7453026/carry@1333773140"
 
   validation {
-    condition     = can(regex("^[^/ ]+/[^/ ]+$", var.github_repository))
-    error_message = "github_repository must be in owner/repository form."
+    condition     = can(regex("^repo:[^[:space:]]+$", var.github_oidc_subject_prefix))
+    error_message = "github_oidc_subject_prefix must be a non-empty GitHub OIDC subject prefix beginning with repo:."
   }
 }
 
