@@ -156,6 +156,7 @@ impl Backend {
                     function_call,
                     usage: Usage::default(),
                     latency_ms: 0,
+                    response_retries: 0,
                 })
             }
         }
@@ -240,13 +241,15 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                 "step": step_index,
                 "response_id": reply.response_id,
                 "latency_ms": reply.latency_ms,
+                "response_retries": reply.response_retries,
                 "usage": reply.usage,
                 "parsed": reply.step,
                 "raw": reply.raw
             }),
             &format!(
-                "[{step_index:02}/{steps_limit}] model {}ms in={} cached={} out={} reasoning={}",
+                "[{step_index:02}/{steps_limit}] model {}ms retries={} in={} cached={} out={} reasoning={}",
                 reply.latency_ms,
+                reply.response_retries,
                 reply.usage.input_tokens,
                 reply.usage.cached_input_tokens,
                 reply.usage.output_tokens,

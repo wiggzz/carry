@@ -36,7 +36,7 @@ carry run \
   --run-dir runs/my-run
 ```
 
-The default model is `gpt-5.6-luna`; override it with `--model` or `OPENAI_MODEL`. Runs have no default step limit. Use `--max-steps N` only when an explicit cap is required.
+The default model is `gpt-5.6-luna`; override it with `--model` or `OPENAI_MODEL`. Runs have no default step limit. Use `--max-steps N` only when an explicit cap is required. Responses API `429` and `5xx` responses are retried up to five times with the server's `Retry-After-Ms`/`Retry-After` delay (capped at 30 seconds), or bounded exponential backoff when no valid delay is supplied. Each retry resends the identical request body and is recorded in the run log.
 
 A run directory contains `trace.jsonl`, `trace.log`, shell outputs, `result.json`, and `final.patch`. Model request traces exclude HTTP headers and the API key.
 
