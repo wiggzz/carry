@@ -1,0 +1,92 @@
+---
+name: Benchmark plan
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/benchmark-plan.yml"
+      - "benchmarks/swe-bench-verified-50.json"
+      - "scripts/swebench_benchmark.py"
+      - "scripts/test_swebench_benchmark.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+  workflow_dispatch:
+    inputs:
+      carry_ref:
+        description: Carry branch, tag, or immutable commit to build and plan
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-plan:
+    name: build ${{ inputs.carry_ref || github.event.pull_request.head.sha }} / shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        shard: [0, 1, 2, 3, 4]
+    steps:
+      - name: Check out benchmark harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Check out requested Carry source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.carry_ref || github.event.pull_request.head.sha }}
+          path: carry-source
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build requested Carry source
+        run: cargo +stable build --release --locked
+        working-directory: carry-source
+
+      - name: Record build provenance
+        env:
+          REQUESTED_CARRY_REF: ${{ inputs.carry_ref || github.event.pull_request.head.sha }}
+        run: |
+          export CARRY_COMMIT="$(git -C carry-source rev-parse HEAD)"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          Path("artifacts").mkdir(exist_ok=True)
+          Path("artifacts/carry-provenance.json").write_text(
+              json.dumps(
+                  {
+                      "requested_ref": os.environ["REQUESTED_CARRY_REF"],
+                      "resolved_commit": os.environ["CARRY_COMMIT"],
+                  },
+                  indent=2,
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Materialize deterministic shard plan
+        run: |
+          python3 scripts/swebench_benchmark.py \
+            --plan \
+            --shard-index '${{ matrix.shard }}' \
+            --shard-count 5 \
+            --output "artifacts/shard-${{ matrix.shard }}.json"
+
+      - name: Upload shard plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: benchmark-plan-${{ matrix.shard }}
+          path: artifacts/
+          retention-days: 7

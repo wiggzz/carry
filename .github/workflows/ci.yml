@@ -51,6 +51,9 @@ jobs:
       - name: Unit tests
         run: cargo test
 
+      - name: Benchmark planner tests
+        run: python3 -m unittest -v scripts/test_swebench_benchmark.py
+
       - name: Release build
         run: cargo build --release --locked
 

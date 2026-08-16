@@ -1,0 +1,24 @@
+{
+  "schema": "carry.swe-bench-verified.v1",
+  "dataset": {
+    "name": "princeton-nlp/SWE-bench_Verified",
+    "revision": "c104f840cc67f8b6eec6f759ebc8b2693d585d4a",
+    "split": "test",
+    "task_count": 500
+  },
+  "selection_seed": "carry-swe-bench-v1",
+  "presets": {
+    "smoke-5": {
+      "source": "verified",
+      "task_count": 5
+    },
+    "selected-50": {
+      "source": "frozen",
+      "selection_file": "benchmarks/swe-bench-verified-50.json"
+    },
+    "verified-full": {
+      "source": "verified",
+      "task_count": "all"
+    }
+  }
+}
