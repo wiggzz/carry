@@ -42,6 +42,9 @@ permissions, so agent-created processes cannot obtain useful AWS credentials.
 1. An existing GitHub Actions OIDC provider for
    `token.actions.githubusercontent.com` in the target account. The deploy script
    derives and verifies its ARN; it does not create a duplicate global provider.
+   The dispatch role is bound to this repository's immutable GitHub OIDC subject
+   prefix and the `swe-bench` Environment; update that input if the repository is
+   transferred or recreated.
 2. AWS credentials allowed to create/read S3, VPC/EC2, IAM, and the Terraform
    resources. No model credential is used.
 3. A default VPC with a public subnet, or `WORKER_SUBNET_ID` set for an existing
