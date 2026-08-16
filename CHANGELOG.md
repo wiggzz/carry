@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.0](https://github.com/wiggzz/carry/compare/v0.2.1...v0.3.0) (2026-08-16)
+
+
+### Features
+
+* add protected official benchmark mode ([99e3a69](https://github.com/wiggzz/carry/commit/99e3a69d944ef631d3570487400ac37d9c2b2f0e))
+* add protected official benchmark mode ([5b6ba0a](https://github.com/wiggzz/carry/commit/5b6ba0a8d55f4e555c3f71f7ae1ba1f95bc674fc))
+* add protected official benchmark mode ([#32](https://github.com/wiggzz/carry/issues/32)) ([99e3a69](https://github.com/wiggzz/carry/commit/99e3a69d944ef631d3570487400ac37d9c2b2f0e))
+
+
+### Bug Fixes
+
+* aggregate response retry metrics ([a509f23](https://github.com/wiggzz/carry/commit/a509f23d0b2a04205ab42210637746edf5d3506d))
+* authorize canonical launch template resource ([#24](https://github.com/wiggzz/carry/issues/24)) ([4fe9644](https://github.com/wiggzz/carry/commit/4fe9644e3505ffcaa591535a0befaf0677dd6ba7))
+* authorize launch-template network resources ([#25](https://github.com/wiggzz/carry/issues/25)) ([2d64829](https://github.com/wiggzz/carry/commit/2d64829131cc2609f63872968f380ea185e8538e))
+* authorize launches by launch template ARN ([#22](https://github.com/wiggzz/carry/issues/22)) ([399e966](https://github.com/wiggzz/carry/commit/399e966db63e28494ce3cc4a9d4311a19173c1e2))
+* honor bounded rate-limit delays ([e1a42fa](https://github.com/wiggzz/carry/commit/e1a42fa0d097823469c151953249a25ba33ce089))
+* honor bounded rate-limit delays ([#31](https://github.com/wiggzz/carry/issues/31)) ([9b97370](https://github.com/wiggzz/carry/commit/9b973709f8eb2e635b748c2ce540f20774209944))
+* retry transient Responses API failures ([9b97370](https://github.com/wiggzz/carry/commit/9b973709f8eb2e635b748c2ce540f20774209944))
+* retry transient Responses API failures ([dd1f284](https://github.com/wiggzz/carry/commit/dd1f2846d48d79dd81c9731b1675a4b1e4e3c45d))
+* use supported EC2 launch count option ([#20](https://github.com/wiggzz/carry/issues/20)) ([0d6d113](https://github.com/wiggzz/carry/commit/0d6d113b0ed8a1f1066a7096ca95e720682a0d2f))
+* wait through pending worker startup ([#26](https://github.com/wiggzz/carry/issues/26)) ([2fe7539](https://github.com/wiggzz/carry/commit/2fe75399c0c840d37489cdc8d1c255b21c0c17d1))
+
 ## [0.2.1](https://github.com/wiggzz/carry/compare/v0.2.0...v0.2.1) (2026-08-16)
 
 
