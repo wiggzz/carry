@@ -38,19 +38,19 @@ git -C "$workspace" init -q
 git -C "$workspace" add .
 git -C "$workspace" -c commit.gpgsign=false -c user.name=Carry -c user.email=carry@example.invalid commit -qm baseline
 
+task_prompt=$(cat "$repo_root/fixtures/tasks/$task_name.md")
 set -- docker run --rm \
   --user "$(id -u):$(id -g)" \
   --volume "$workspace:/workspace" \
-  --volume "$artifacts:/run" \
-  --volume "$repo_root/fixtures/tasks/$task_name.md:/task.md:ro"
+  --volume "$artifacts:/run"
 
 if [ "$mode" = live ]; then
-  set -- "$@" --env OPENAI_API_KEY carry:dev run \
-    --cwd /workspace --task-file /task.md --run-dir /run
+  set -- "$@" --env OPENAI_API_KEY carry:dev \
+    --cwd /workspace --session-dir /run -p "$task_prompt"
 else
   set -- "$@" \
     --volume "$repo_root/fixtures/scripted/clamp.jsonl:/steps.jsonl:ro" \
-    carry:dev run --cwd /workspace --task-file /task.md --run-dir /run \
+    carry:dev --cwd /workspace --session-dir /run -p "$task_prompt" \
     --scripted-steps /steps.jsonl
 fi
 

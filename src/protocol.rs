@@ -5,13 +5,15 @@ use serde_json::{Value, json};
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Step {
     pub action: Action,
-    pub context_management: ContextManagement,
+    pub context: ContextManagement,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Action {
     pub kind: ActionKind,
     pub command: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
     pub answer: Option<String>,
 }
 
@@ -24,9 +26,9 @@ pub enum ActionKind {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ContextManagement {
-    pub retain_volatile_ids: Vec<String>,
-    pub release_stable_ids: Vec<String>,
-    pub add_memories: Vec<String>,
+    pub keep: Vec<u64>,
+    pub drop: Vec<u64>,
+    pub remember: Vec<String>,
 }
 
 impl Action {
@@ -38,8 +40,11 @@ impl Action {
                 }
             }
             ActionKind::Finish => {
-                if self.answer.as_deref().is_none_or(str::is_empty) || self.command.is_some() {
-                    bail!("finish action requires answer and no command");
+                if self.answer.as_deref().is_none_or(str::is_empty)
+                    || self.command.is_some()
+                    || self.message.is_some()
+                {
+                    bail!("finish action requires answer and no command or message");
                 }
             }
         }
@@ -50,13 +55,15 @@ impl Action {
 #[derive(Deserialize, Serialize)]
 struct ShellArguments {
     command: String,
-    context_management: ContextManagement,
+    #[serde(default)]
+    message: Option<String>,
+    context: ContextManagement,
 }
 
 #[derive(Deserialize, Serialize)]
 struct FinishArguments {
     answer: String,
-    context_management: ContextManagement,
+    context: ContextManagement,
 }
 
 impl Step {
@@ -76,9 +83,10 @@ impl Step {
                     action: Action {
                         kind: ActionKind::Shell,
                         command: Some(args.command),
+                        message: args.message.filter(|message| !message.trim().is_empty()),
                         answer: None,
                     },
-                    context_management: args.context_management,
+                    context: args.context,
                 })
             }
             "finish" => {
@@ -91,9 +99,10 @@ impl Step {
                     action: Action {
                         kind: ActionKind::Finish,
                         command: None,
+                        message: None,
                         answer: Some(args.answer),
                     },
-                    context_management: args.context_management,
+                    context: args.context,
                 })
             }
             other => bail!("unknown function call {other}"),
@@ -110,7 +119,8 @@ impl Step {
                         .command
                         .clone()
                         .context("shell command missing")?,
-                    context_management: self.context_management.clone(),
+                    message: self.action.message.clone(),
+                    context: self.context.clone(),
                 })?,
             ),
             ActionKind::Finish => (
@@ -121,7 +131,7 @@ impl Step {
                         .answer
                         .clone()
                         .context("finish answer missing")?,
-                    context_management: self.context_management.clone(),
+                    context: self.context.clone(),
                 })?,
             ),
         };
@@ -134,34 +144,34 @@ impl Step {
     }
 }
 
-fn context_management_schema() -> Value {
+fn context_schema() -> Value {
     json!({
         "type": "object",
         "description": "Controls generational context. Stable items persist by default; volatile items survive only when retained.",
         "properties": {
-            "retain_volatile_ids": {
+            "keep": {
                 "type": "array",
-                "description": "The complete set of volatile context IDs to preserve. Copy only exact tNNNN or mNNNN IDs shown as available in the context status. Use [] when none exist; never emit a placeholder. The latest automatic tool interaction must be listed to survive after this decision.",
-                "items": { "type": "string", "pattern": "^[tm][0-9]{4,}$" }
+                "description": "The complete set of volatile integer context IDs to preserve. Omitted volatile items are dropped. Use [] when none should survive.",
+                "items": { "type": "integer", "minimum": 1 }
             },
-            "release_stable_ids": {
+            "drop": {
                 "type": "array",
-                "description": "Stable context IDs to release because they are stale, contradicted, redundant, or context pressure justifies collection. Use [] when none should be released; never emit an empty string. Stable items otherwise persist automatically.",
-                "items": { "type": "string", "pattern": "^[tm][0-9]{4,}$" }
+                "description": "Stable integer context IDs to drop because they are satisfied, superseded, stale, contradicted, or redundant. Stable items otherwise persist automatically.",
+                "items": { "type": "integer", "minimum": 1 }
             },
-            "add_memories": {
+            "remember": {
                 "type": "array",
-                "description": "Concise new conclusions worth preserving when verbatim evidence is unnecessary. The harness assigns each one an m-prefixed ID in the next request. Do not copy content already preserved in stable context or through retain_volatile_ids.",
+                "description": "Concise durable outcomes worth preserving when exact context is dropped. Preserve conclusions, constraints, evidence, decisions, and unresolved questions, not chain-of-thought. Do not duplicate retained context.",
                 "items": { "type": "string" }
             }
         },
-        "required": ["retain_volatile_ids", "release_stable_ids", "add_memories"],
+        "required": ["keep", "drop", "remember"],
         "additionalProperties": false
     })
 }
 
 pub fn tool_definitions() -> Value {
-    let context = context_management_schema();
+    let context = context_schema();
     json!([
         {
             "type": "function",
@@ -175,9 +185,13 @@ pub fn tool_definitions() -> Value {
                         "type": "string",
                         "description": "The complete shell command to execute. It may contain pipes, conditionals, or a heredoc when useful."
                     },
-                    "context_management": context.clone()
+                    "message": {
+                        "type": ["string", "null"],
+                        "description": "Optional concise commentary shown before the command, explaining what is being done and why."
+                    },
+                    "context": context.clone()
                 },
-                "required": ["command", "context_management"],
+                "required": ["command", "message", "context"],
                 "additionalProperties": false
             }
         },
@@ -193,9 +207,9 @@ pub fn tool_definitions() -> Value {
                         "type": "string",
                         "description": "A concise final report of the completed work and verification, or the reason work cannot continue."
                     },
-                    "context_management": context
+                    "context": context
                 },
-                "required": ["answer", "context_management"],
+                "required": ["answer", "context"],
                 "additionalProperties": false
             }
         }
@@ -212,23 +226,32 @@ mod tests {
             "type": "function_call",
             "name": "shell",
             "call_id": "call_1",
-            "arguments": r#"{"command":"cargo test","context_management":{"retain_volatile_ids":["t0001"],"release_stable_ids":[],"add_memories":[]}}"#
+            "arguments": r#"{"command":"cargo test","message":"Checking the focused tests first.","context":{"keep":[1],"drop":[],"remember":[]}}"#
         });
         let parsed = Step::from_function_call(&shell).unwrap();
         assert_eq!(parsed.action.kind, ActionKind::Shell);
         assert_eq!(parsed.action.command.as_deref(), Some("cargo test"));
+        assert_eq!(
+            parsed.action.message.as_deref(),
+            Some("Checking the focused tests first.")
+        );
+        assert_eq!(parsed.context.keep, vec![1]);
         let schema = tool_definitions();
         assert_eq!(
-            schema[0]["parameters"]["properties"]["context_management"]["properties"]["retain_volatile_ids"]
-                ["items"]["pattern"],
-            "^[tm][0-9]{4,}$"
+            schema[0]["parameters"]["properties"]["context"]["properties"]["keep"]["items"]["type"],
+            "integer"
+        );
+        assert!(
+            schema[0]["parameters"]["properties"]
+                .get("message")
+                .is_some()
         );
 
         let finish = json!({
             "type": "function_call",
             "name": "finish",
             "call_id": "call_2",
-            "arguments": r#"{"answer":"done","context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#
+            "arguments": r#"{"answer":"done","context":{"keep":[],"drop":[],"remember":[]}}"#
         });
         assert_eq!(
             Step::from_function_call(&finish)

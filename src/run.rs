@@ -8,10 +8,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::json;
-use tokio::{io::AsyncWriteExt, process::Command, time::Duration};
+use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc, time::Duration};
 
 use crate::{
-    context::{ContextItem, ContextState},
+    context::ContextState,
     log::RunLogger,
     openai::{ModelReply, OpenAiClient, Usage},
     protocol::{ActionKind, Step},
@@ -19,18 +19,17 @@ use crate::{
 
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
-At each step, select exactly one available action. Investigate, implement, and verify the requested change before finishing. Before editing, establish a minimal failing reproduction where practical. When behavior has competing inputs or sources, use distinct values to verify provenance; when a task cites a regression or prior change, search cited identifiers and subsequent fixes in repository history. Before finishing, run the affected tests.
+At each step, select exactly one available action. Investigate, implement, and verify the requested change before finishing. Before editing, establish a minimal failing reproduction where practical. When behavior has competing inputs or sources, use distinct values to verify provenance; when a task cites a regression or prior change, search cited identifiers and subsequent fixes in repository history. Before finishing, run the affected tests. Use the optional shell message to give the human concise, useful progress commentary.
 
-You manage context in two generations. The latest tool interaction is available for one decision. Volatile items survive only when explicitly retained and promote after several consecutive rounds. Stable items persist automatically: release them only when stale, contradicted, redundant, or context pressure makes them no longer worth their cost. Preserve exact evidence when its details matter; preserve concise conclusions when it does not.
+Context is a chronological ledger. Each item is followed by an immutable marker in the form [integer kind stable|volatile]. Stable items persist unless listed in context.drop. Volatile items disappear unless listed in context.keep. Human messages are authoritative stable instructions; drop one only when it is satisfied or explicitly superseded. Before dropping exact context with useful reasoning outcomes, preserve durable conclusions, constraints, evidence, decisions, or unresolved questions with context.remember. Preserve outcomes, not chain-of-thought.
 
 Work only within the assigned repository. Do not perform destructive or external actions."#;
 
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub cwd: PathBuf,
-    pub task: String,
-    pub task_file: PathBuf,
-    pub run_dir: PathBuf,
+    pub prompt: String,
+    pub session_dir: PathBuf,
     pub model: String,
     pub max_steps: Option<usize>,
     pub shell_timeout_secs: u64,
@@ -50,7 +49,13 @@ pub enum Backend {
 pub struct RunOutcome {
     pub completed: bool,
     pub answer: Option<String>,
-    pub run_dir: PathBuf,
+    pub session_dir: PathBuf,
+}
+
+#[derive(Debug)]
+pub enum UserInput {
+    Message(String),
+    Exit,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -122,28 +127,16 @@ impl Backend {
         Ok(Self::Scripted { steps, emitted: 0 })
     }
 
-    fn request_body(
-        &self,
-        task: &str,
-        history: &[serde_json::Value],
-        control: &str,
-    ) -> Option<serde_json::Value> {
+    fn request_body(&self, history: &[serde_json::Value]) -> Option<serde_json::Value> {
         match self {
-            Self::OpenAi(client) => {
-                Some(client.request_body(SYSTEM_PROMPT, task, history, control))
-            }
+            Self::OpenAi(client) => Some(client.request_body(SYSTEM_PROMPT, history)),
             Self::Scripted { .. } => None,
         }
     }
 
-    async fn step(
-        &mut self,
-        task: &str,
-        history: &[serde_json::Value],
-        control: &str,
-    ) -> Result<ModelReply> {
+    async fn step(&mut self, history: &[serde_json::Value]) -> Result<ModelReply> {
         match self {
-            Self::OpenAi(client) => client.step(SYSTEM_PROMPT, task, history, control).await,
+            Self::OpenAi(client) => client.step(SYSTEM_PROMPT, history).await,
             Self::Scripted { steps, emitted } => {
                 let step = steps
                     .pop_front()
@@ -155,6 +148,7 @@ impl Backend {
                     response_id: format!("scripted-{emitted:04}"),
                     raw: serde_json::to_value(&step)?,
                     step,
+                    output_items: vec![function_call.clone()],
                     function_call,
                     usage: Usage::default(),
                     latency_ms: 0,
@@ -166,14 +160,30 @@ impl Backend {
 }
 
 pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> {
+    run_loop(config, &mut backend, None).await
+}
+
+pub async fn run_interactive(
+    config: RunConfig,
+    mut backend: Backend,
+    input: mpsc::UnboundedReceiver<UserInput>,
+) -> Result<RunOutcome> {
+    run_loop(config, &mut backend, Some(input)).await
+}
+
+async fn run_loop(
+    config: RunConfig,
+    backend: &mut Backend,
+    mut input: Option<mpsc::UnboundedReceiver<UserInput>>,
+) -> Result<RunOutcome> {
     let run_started = Instant::now();
-    tokio::fs::create_dir_all(config.run_dir.join("tools")).await?;
-    let mut logger = RunLogger::create(&config.run_dir)?;
+    tokio::fs::create_dir_all(config.session_dir.join("tools")).await?;
+    let mut logger = RunLogger::create(&config.session_dir)?;
     logger.raw_event(
         "run_started",
         json!({
             "cwd": config.cwd,
-            "task_file": config.task_file,
+            "prompt": config.prompt,
             "model": config.model,
             "max_steps": config.max_steps,
             "promotion_age": config.promotion_age,
@@ -182,17 +192,16 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
         &format!("run started in {}", config.cwd.display()),
     )?;
 
-    let mut context_state = ContextState::default();
-    let mut latest_tool_result: Option<ContextItem> = None;
-    let mut protocol_feedback: Option<String> = None;
+    let mut context_state = ContextState::new(config.prompt.clone());
     let mut metrics = RunMetrics::default();
     let steps_limit = config
         .max_steps
         .map_or_else(|| "unlimited".to_owned(), |limit| limit.to_string());
     let mut step_index = 0;
+    let mut turn_step = 0;
     loop {
         if let Some(max_steps) = config.max_steps
-            && step_index >= max_steps
+            && turn_step >= max_steps
         {
             logger.raw_event(
                 "run_failed",
@@ -210,32 +219,24 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             return Ok(RunOutcome {
                 completed: false,
                 answer: None,
-                run_dir: config.run_dir,
+                session_dir: config.session_dir,
             });
         }
         step_index += 1;
-        let history = context_state.input_items(latest_tool_result.as_ref());
-        let control = render_control(
-            step_index,
-            &context_state,
-            latest_tool_result.as_ref(),
-            protocol_feedback.as_deref(),
-            config.promotion_age,
-            config.collection_interval,
-        );
-        let request = backend.request_body(&config.task, &history, &control);
+        turn_step += 1;
+        let history = context_state.input_items();
+        let request = backend.request_body(&history);
         logger.raw_event(
             "model_request",
             json!({
                 "step": step_index,
                 "history": history,
-                "control": control,
                 "request": request
             }),
-            &format!("[{step_index:02}/{steps_limit}] requesting next step"),
+            &format!("[{turn_step:02}/{steps_limit}] requesting next step"),
         )?;
 
-        let reply = backend.step(&config.task, &history, &control).await?;
+        let reply = backend.step(&history).await?;
         metrics.record(&reply.usage, reply.latency_ms, reply.response_retries);
         logger.raw_event(
             "model_response",
@@ -245,11 +246,11 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                 "latency_ms": reply.latency_ms,
                 "response_retries": reply.response_retries,
                 "usage": reply.usage,
-                "parsed": reply.step,
+                "parsed": &reply.step,
                 "raw": reply.raw
             }),
             &format!(
-                "[{step_index:02}/{steps_limit}] model {}ms retries={} in={} cached={} out={} reasoning={}",
+                "[{turn_step:02}/{steps_limit}] model {}ms retries={} in={} cached={} out={} reasoning={}",
                 reply.latency_ms,
                 reply.response_retries,
                 reply.usage.input_tokens,
@@ -259,46 +260,31 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
             ),
         )?;
 
-        let context_change = match context_state.apply(
-            &reply.step.context_management,
-            latest_tool_result.as_ref(),
-            config.promotion_age,
-            config.collection_interval,
-        ) {
-            Ok(change) => change,
-            Err(error) => {
-                let feedback = format!(
-                    "Protocol error: {error}. No action was executed. Submit a corrected Step."
-                );
-                protocol_feedback = Some(feedback.clone());
-                logger.raw_event(
-                    "protocol_error",
-                    json!({"step": step_index, "error": error.to_string()}),
-                    &feedback,
-                )?;
-                continue;
-            }
-        };
-        protocol_feedback = None;
-        logger.event(
-            "context_updated",
-            &context_change,
-            &format!(
-                "  context stable={} volatile={} promoted={} dropped={} released={} added={} bytes={}",
-                context_change.stable.len(),
-                context_change.volatile.len(),
-                context_change.promoted.len(),
-                context_change.dropped.len(),
-                context_change.released.len(),
-                context_change.added.len(),
-                context_change.bytes
-            ),
-        )?;
+        if let Err(error) = context_state.validate(&reply.step.context, &[]) {
+            let feedback = format!(
+                "Protocol error: {error}. No action was executed. Submit a corrected action."
+            );
+            let output = function_output(&reply.function_call, &feedback)?;
+            context_state.add_tool(reply.output_items.clone(), output)?;
+            logger.raw_event(
+                "protocol_error",
+                json!({"step": step_index, "error": error.to_string()}),
+                &feedback,
+            )?;
+            continue;
+        }
 
         match reply.step.action.kind {
             ActionKind::Shell => {
+                if let Some(message) = reply.step.action.message.as_deref() {
+                    logger.raw_event(
+                        "assistant_message",
+                        json!({"step": step_index, "message": message}),
+                        &format!("  {message}"),
+                    )?;
+                }
                 let command = reply.step.action.command.as_deref().unwrap();
-                let call_id = format!("t{step_index:04}");
+                let call_id = format!("tool-{step_index}");
                 logger.raw_event(
                     "shell_started",
                     json!({"step": step_index, "call_id": call_id, "command": command}),
@@ -306,18 +292,14 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                 )?;
                 let result = execute_shell(
                     &config.cwd,
-                    &config.run_dir,
+                    &config.session_dir,
                     call_id,
                     command,
                     config.shell_timeout_secs,
                 )
                 .await?;
-                let function_call_output = function_call_output(&reply.function_call, &result)?;
-                latest_tool_result = Some(ContextItem::tool_interaction(
-                    result.call_id.clone(),
-                    reply.function_call.clone(),
-                    function_call_output,
-                )?);
+                let output = function_call_output(&reply.function_call, &result)?;
+                let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
                 logger.event(
                     "shell_finished",
                     &result,
@@ -330,11 +312,52 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                         if result.timed_out { " timed-out" } else { "" }
                     ),
                 )?;
+                let context_change = context_state.apply(
+                    &reply.step.context,
+                    &[item_id],
+                    config.promotion_age,
+                    config.collection_interval,
+                )?;
+                log_context_change(&mut logger, &context_change)?;
+
+                if let Some(receiver) = input.as_mut()
+                    && drain_user_input(receiver, &mut context_state, &mut logger)?
+                {
+                    write_final_artifacts(
+                        &config,
+                        true,
+                        None,
+                        &metrics,
+                        run_started.elapsed().as_millis() as u64,
+                    )
+                    .await?;
+                    return Ok(RunOutcome {
+                        completed: true,
+                        answer: None,
+                        session_dir: config.session_dir,
+                    });
+                }
             }
             ActionKind::Finish => {
-                let answer = reply.step.action.answer;
+                let answer = reply.step.action.answer.clone();
+                let output = function_output(
+                    &reply.function_call,
+                    "The answer was delivered to the human; the session may continue.",
+                )?;
+                let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
+                let context_change = context_state.apply(
+                    &reply.step.context,
+                    &[item_id],
+                    config.promotion_age,
+                    config.collection_interval,
+                )?;
+                log_context_change(&mut logger, &context_change)?;
                 logger.raw_event(
-                    "run_finished",
+                    if input.is_some() {
+                        "turn_finished"
+                    } else {
+                        "run_finished"
+                    },
                     json!({
                         "step": step_index,
                         "answer": answer,
@@ -342,6 +365,24 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                     }),
                     &format!("finished after {step_index} steps"),
                 )?;
+                if let Some(receiver) = input.as_mut() {
+                    println!("{}", answer.as_deref().unwrap_or_default());
+                    let mut should_exit =
+                        drain_user_input(receiver, &mut context_state, &mut logger)?;
+                    if !should_exit {
+                        match receiver.recv().await {
+                            Some(UserInput::Message(message)) => {
+                                append_user_message(&mut context_state, &mut logger, message)?;
+                            }
+                            Some(UserInput::Exit) | None => should_exit = true,
+                        }
+                    }
+                    if !should_exit {
+                        turn_step = 0;
+                        continue;
+                    }
+                }
+
                 write_final_artifacts(
                     &config,
                     true,
@@ -353,32 +394,61 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
                 return Ok(RunOutcome {
                     completed: true,
                     answer,
-                    run_dir: config.run_dir,
+                    session_dir: config.session_dir,
                 });
             }
         }
     }
 }
 
-fn render_control(
-    step: usize,
-    state: &ContextState,
-    latest: Option<&ContextItem>,
-    protocol_feedback: Option<&str>,
-    promotion_age: usize,
-    collection_interval: usize,
-) -> String {
-    let feedback = protocol_feedback.unwrap_or("(none)");
-    let stable_ids = state.stable_ids();
-    let volatile = state.volatile_status();
-    let latest_id = latest.map_or("none", |item| item.id.as_str());
-    format!(
-        "Context status for step {step}: stable_ids={stable_ids:?} (kept by default; release only when stale, redundant, contradicted, or under context pressure); volatile_ids_and_ages={volatile:?} (must be retained explicitly); latest_automatic_id={latest_id} (retain only when this is an actual tNNNN ID; if none, use no placeholder); promotion_age={}; collection_interval={}; stable_bytes={}; volatile_bytes={}; retained_bytes={}; protocol_feedback={feedback}. Select exactly one next action.",
-        promotion_age,
-        collection_interval,
-        state.stable_bytes(),
-        state.volatile_bytes(),
-        state.retained_bytes()
+fn drain_user_input(
+    receiver: &mut mpsc::UnboundedReceiver<UserInput>,
+    state: &mut ContextState,
+    logger: &mut RunLogger,
+) -> Result<bool> {
+    let mut should_exit = false;
+    while let Ok(input) = receiver.try_recv() {
+        match input {
+            UserInput::Message(message) => {
+                append_user_message(state, logger, message)?;
+            }
+            UserInput::Exit => should_exit = true,
+        }
+    }
+    Ok(should_exit)
+}
+
+fn append_user_message(
+    state: &mut ContextState,
+    logger: &mut RunLogger,
+    message: String,
+) -> Result<()> {
+    let id = state.add_user(message.clone());
+    logger.raw_event(
+        "human_message",
+        json!({"context_id": id, "message": message}),
+        &format!("  steering [{id}] queued"),
+    )
+}
+
+fn log_context_change(
+    logger: &mut RunLogger,
+    change: &crate::context::ContextChange,
+) -> Result<()> {
+    logger.event(
+        "context_updated",
+        change,
+        &format!(
+            "  context stable={} volatile={} frontier={:?} promoted={} dropped_volatile={} dropped_stable={} added={} bytes={}",
+            change.stable.len(),
+            change.volatile.len(),
+            change.stable_frontier,
+            change.promoted.len(),
+            change.dropped_volatile.len(),
+            change.dropped_stable.len(),
+            change.added.len(),
+            change.bytes
+        ),
     )
 }
 
@@ -474,6 +544,17 @@ fn function_call_output(
     }))
 }
 
+fn function_output(function_call: &serde_json::Value, output: &str) -> Result<serde_json::Value> {
+    let call_id = function_call["call_id"]
+        .as_str()
+        .context("function call has no call_id")?;
+    Ok(json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": output
+    }))
+}
+
 async fn write_final_artifacts(
     config: &RunConfig,
     completed: bool,
@@ -490,7 +571,7 @@ async fn write_final_artifacts(
         Ok(output) if output.status.success() => output.stdout,
         _ => Vec::new(),
     };
-    write_bytes(&config.run_dir.join("final.patch"), &patch).await?;
+    write_bytes(&config.session_dir.join("final.patch"), &patch).await?;
     let result = json!({
         "completed": completed,
         "answer": answer,
@@ -505,7 +586,7 @@ async fn write_final_artifacts(
         "elapsed_ms": elapsed_ms
     });
     tokio::fs::write(
-        config.run_dir.join("result.json"),
+        config.session_dir.join("result.json"),
         serde_json::to_vec_pretty(&result)?,
     )
     .await?;
@@ -574,16 +655,12 @@ mod tests {
     async fn scripted_run_writes_aggregate_metrics_to_result() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
-        let run_dir = temp.path().join("run");
-        let task_file = temp.path().join("task.md");
+        let session_dir = temp.path().join("run");
         let steps_file = temp.path().join("steps.jsonl");
         tokio::fs::create_dir(&workspace).await.unwrap();
-        tokio::fs::write(&task_file, "Finish the task.")
-            .await
-            .unwrap();
         tokio::fs::write(
             &steps_file,
-            r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#,
+            r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"keep":[],"drop":[],"remember":[]}}"#,
         )
         .await
         .unwrap();
@@ -591,9 +668,8 @@ mod tests {
         let outcome = run(
             RunConfig {
                 cwd: workspace,
-                task: "Finish the task.".into(),
-                task_file,
-                run_dir: run_dir.clone(),
+                prompt: "Finish the task.".into(),
+                session_dir: session_dir.clone(),
                 model: "scripted".into(),
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
@@ -606,9 +682,12 @@ mod tests {
         .unwrap();
 
         assert!(outcome.completed);
-        let result: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(run_dir.join("result.json")).await.unwrap())
-                .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(session_dir.join("result.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(result["usage"]["input_tokens"], 0);
         assert_eq!(result["usage"]["output_tokens"], 0);
         assert_eq!(result["model_latency_ms"], 0);
@@ -620,29 +699,24 @@ mod tests {
     async fn unlimited_scripted_run_can_finish_after_thirty_shell_actions() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
-        let run_dir = temp.path().join("run");
-        let task_file = temp.path().join("task.md");
+        let session_dir = temp.path().join("run");
         let steps_file = temp.path().join("steps.jsonl");
         tokio::fs::create_dir(&workspace).await.unwrap();
-        tokio::fs::write(&task_file, "Finish the task.")
-            .await
-            .unwrap();
 
         let shell_step = format!(
             "{}\n",
-            r#"{"action":{"kind":"shell","command":"true","answer":null},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#
+            r#"{"action":{"kind":"shell","command":"true","answer":null},"context":{"keep":[],"drop":[],"remember":[]}}"#
         );
         let mut steps = shell_step.repeat(31);
-        steps.push_str(r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#);
+        steps.push_str(r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"keep":[],"drop":[],"remember":[]}}"#);
         steps.push('\n');
         tokio::fs::write(&steps_file, steps).await.unwrap();
 
         let outcome = run(
             RunConfig {
                 cwd: workspace,
-                task: "Finish the task.".into(),
-                task_file,
-                run_dir: run_dir.clone(),
+                prompt: "Finish the task.".into(),
+                session_dir: session_dir.clone(),
                 model: "scripted".into(),
                 max_steps: None,
                 shell_timeout_secs: 1,
@@ -655,11 +729,14 @@ mod tests {
         .unwrap();
 
         assert!(outcome.completed);
-        let result: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(run_dir.join("result.json")).await.unwrap())
-                .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(session_dir.join("result.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert!(result["steps_limit"].is_null());
-        let trace = tokio::fs::read_to_string(run_dir.join("trace.log"))
+        let trace = tokio::fs::read_to_string(session_dir.join("trace.log"))
             .await
             .unwrap();
         assert!(trace.contains("[01/unlimited] requesting next step"));
@@ -669,19 +746,15 @@ mod tests {
     async fn explicit_step_limit_stops_before_the_next_model_request() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
-        let run_dir = temp.path().join("run");
-        let task_file = temp.path().join("task.md");
+        let session_dir = temp.path().join("run");
         let steps_file = temp.path().join("steps.jsonl");
         tokio::fs::create_dir(&workspace).await.unwrap();
-        tokio::fs::write(&task_file, "Finish the task.")
-            .await
-            .unwrap();
         tokio::fs::write(
             &steps_file,
             concat!(
-                r#"{"action":{"kind":"shell","command":"true","answer":null},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#,
+                r#"{"action":{"kind":"shell","command":"true","answer":null},"context":{"keep":[],"drop":[],"remember":[]}}"#,
                 "\n",
-                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context_management":{"retain_volatile_ids":[],"release_stable_ids":[],"add_memories":[]}}"#,
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"keep":[],"drop":[],"remember":[]}}"#,
                 "\n"
             ),
         )
@@ -691,9 +764,8 @@ mod tests {
         let outcome = run(
             RunConfig {
                 cwd: workspace,
-                task: "Finish the task.".into(),
-                task_file,
-                run_dir: run_dir.clone(),
+                prompt: "Finish the task.".into(),
+                session_dir: session_dir.clone(),
                 model: "scripted".into(),
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
@@ -706,14 +778,86 @@ mod tests {
         .unwrap();
 
         assert!(!outcome.completed);
-        let result: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(run_dir.join("result.json")).await.unwrap())
-                .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(session_dir.join("result.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(result["steps_limit"], 1);
         assert!(!result["completed"].as_bool().unwrap());
-        let trace = tokio::fs::read_to_string(run_dir.join("trace.jsonl"))
+        let trace = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
             .await
             .unwrap();
         assert!(trace.contains(r#""reason":"max_steps""#));
+    }
+
+    #[tokio::test]
+    async fn interactive_steering_is_appended_after_the_completed_tool_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("session");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"shell","command":"true","message":"Checking first.","answer":null},"context":{"keep":[],"drop":[],"remember":[]}}"#,
+                "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"keep":[2],"drop":[],"remember":[]}}"#,
+                "\n"
+            ),
+        )
+        .await
+        .unwrap();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        sender
+            .send(UserInput::Message("do not change the JSON format".into()))
+            .unwrap();
+        drop(sender);
+
+        let outcome = run_interactive(
+            RunConfig {
+                cwd: workspace,
+                prompt: "initial task".into(),
+                session_dir: session_dir.clone(),
+                model: "scripted".into(),
+                max_steps: None,
+                shell_timeout_secs: 1,
+                promotion_age: 3,
+                collection_interval: 3,
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+            receiver,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.completed);
+        let events = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| event["event"] == "human_message"));
+        let requests = events
+            .iter()
+            .filter(|event| event["event"] == "model_request")
+            .collect::<Vec<_>>();
+        let history = requests[1]["data"]["history"].as_array().unwrap();
+        let tool_marker = history
+            .iter()
+            .position(|item| item["content"][0]["text"] == "[2 tool volatile]")
+            .unwrap();
+        let steering = history
+            .iter()
+            .position(|item| item["content"][0]["text"] == "do not change the JSON format")
+            .unwrap();
+        assert!(tool_marker < steering);
+        assert_eq!(
+            history[steering + 1]["content"][0]["text"],
+            "[3 user stable]"
+        );
     }
 }

@@ -26,38 +26,41 @@ cargo build --release --locked
 
 ## Use
 
-Set an OpenAI API key only in the process environment, then run Carry against a disposable repository checkout.
+Set an OpenAI API key only in the process environment, then run Carry against a disposable repository checkout. Prompt words can be passed directly or with `-p` when the text contains option-like values.
 
 ```sh
 export OPENAI_API_KEY=...
-carry run \
-  --cwd /path/to/disposable/repo \
-  --task-file task.md \
-  --run-dir runs/my-run
+carry --cwd /path/to/disposable/repo fix the failing tests
+carry --cwd /path/to/disposable/repo -p "explain why --release is failing"
 ```
 
-The default model is `gpt-5.6-luna`; override it with `--model` or `OPENAI_MODEL`. Runs have no default step limit. Use `--max-steps N` only when an explicit cap is required. Responses API `429` responses with `error.code=rate_limit_exceeded` are retried up to five times. Carry honors `Retry-After-Ms`, numeric `Retry-After`, and HTTP-date `Retry-After`; the total wait budget is 60 seconds, and Carry stops rather than sending earlier when the server requests a longer delay. Missing or invalid delay headers use bounded exponential backoff. Retries resend the identical request body; successful model-response events include the retry count, and exhausted errors include the retry/wait summary. Quota failures and ambiguous `5xx` POST failures are not replayed.
+Run `carry` without a prompt to start an interactive session, or add `--interactive` to continue after an initial prompt. Input remains active while the model and shell commands run; steering is queued and appended immediately after the current action completes. Use `/help`, `/quit`, or `/exit` at the prompt.
 
-A run directory contains `trace.jsonl`, `trace.log`, shell outputs, `result.json`, and `final.patch`. Model request traces exclude HTTP headers and the API key.
+The default model is `gpt-5.6-luna`; override it with `--model` or `OPENAI_MODEL`. Sessions have no default step limit. Use `--max-steps N` only when an explicit per-turn cap is required. Responses API `429` responses with `error.code=rate_limit_exceeded` are retried up to five times. Carry honors `Retry-After-Ms`, numeric `Retry-After`, and HTTP-date `Retry-After`; the total wait budget is 60 seconds, and Carry stops rather than sending earlier when the server requests a longer delay. Missing or invalid delay headers use bounded exponential backoff. Retries resend the identical request body; successful model-response events include the retry count, and exhausted errors include the retry/wait summary. Quota failures and ambiguous `5xx` POST failures are not replayed.
+
+Session data is written beneath `$CARRY_HOME/sessions` or `~/.carry/sessions` by default. Use `--session-home` to select another parent or `--session-dir` to choose the exact directory. A session contains `trace.jsonl`, `trace.log`, shell outputs, `result.json`, and `final.patch`. Model request traces exclude HTTP headers and the API key.
 
 ## Context policy
 
-New tool interactions and memories begin volatile. They survive only when the model explicitly retains them. Volatile items promote into a stable generation after the configured retention age; stable items persist until explicitly released. Carry uses immutable history segments and stable-generation cache checkpoints to preserve reusable request prefixes.
+Carry keeps one strictly chronological context ledger. Human messages enter stable retention; tool interactions and memories begin volatile. Stable items persist unless explicitly dropped, while volatile items survive only when explicitly kept. Promotions are evidence-based and never reorder history. The stable cache frontier is the longest chronological prefix made entirely of stable items; later stable human messages remain durable without forcing earlier volatile items to promote.
+
+Every item has a compact integer ID and an immutable marker such as `[2 tool volatile]`. Carry preserves all native Responses API output items—including reasoning items—alongside function results. Between collections, retained history grows by exact appends for prompt-cache reuse. Dropping, promotion, or explicit stable removal rebuilds the generation and moves the cache frontier when chronology permits.
 
 Each action includes context management:
 
 ```json
 {
   "command": "...",
-  "context_management": {
-    "retain_volatile_ids": ["t0001", "m0001"],
-    "release_stable_ids": [],
-    "add_memories": ["Concise durable conclusion"]
+  "message": "Checking the focused tests first.",
+  "context": {
+    "keep": [2, 3],
+    "drop": [],
+    "remember": ["Concise durable reasoning outcome"]
   }
 }
 ```
 
-`retain_volatile_ids` is the complete volatile survival set. Stable items are retained by default and are released only through `release_stable_ids`.
+`keep` is the complete volatile survival set. `drop` removes stable items that are satisfied, superseded, stale, or redundant. Before dropping exact context, `remember` can preserve its useful conclusions, constraints, evidence, decisions, or unresolved questions without retaining chain-of-thought.
 
 ## Development
 
