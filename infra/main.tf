@@ -212,6 +212,16 @@ resource "aws_iam_role" "github_dispatch" {
 }
 
 data "aws_iam_policy_document" "github_dispatch" {
+  # RunInstances authorizes each request resource separately. This dedicated
+  # statement permits only the canonical launch template itself; the following
+  # statement constrains every resulting request resource to that same template.
+  statement {
+    sid       = "UseOnlyTheCanonicalLaunchTemplate"
+    effect    = "Allow"
+    actions   = ["ec2:RunInstances"]
+    resources = [aws_launch_template.worker.arn]
+  }
+
   statement {
     sid       = "LaunchTaggedBenchmarkWorkers"
     effect    = "Allow"
