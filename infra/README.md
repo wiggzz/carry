@@ -54,41 +54,27 @@ permissions, so agent-created processes cannot obtain useful AWS credentials.
    local automation identity is intentionally too restricted to inspect or
    create IAM OIDC resources, so apply with the account’s infrastructure role.
 
-## Validate and plan
+## One-command deploy
 
-Copy the example locally, fill the account-specific values, then use a remote
-backend before applying:
+The Terraform state bucket must exist **once** before Terraform can initialize its
+S3 backend. It is deliberately separate from the benchmark artifact bucket. This
+is the only AWS resource to create outside this configuration; Terraform cannot
+create the bucket it needs as its own backend.
 
-1. `cp terraform.tfvars.example terraform.tfvars`
-2. `terraform init -backend-config=...`
-3. `terraform fmt -check -recursive`
-4. `terraform validate`
-5. `terraform plan -out=tfplan`
+1. Create one private S3 state bucket in the target account, with versioning and
+   encryption enabled. Do not use the benchmark artifact bucket.
+2. Copy `backend.hcl.example` to ignored `backend.hcl` and set that state bucket.
+3. Copy `terraform.tfvars.example` to ignored `terraform.tfvars` and set the
+   pinned AMI, existing public subnet, GitHub OIDC provider ARN, and artifact
+   bucket name.
+4. Run the only deployment command from the repository root:
 
-Review that the plan creates a bucket, three narrowly scoped roles, one instance
-profile, one security group, and one launch template—**not** an `aws_instance`,
-Lambda, EventBridge rule, or persistent runner. Apply only from a trusted
-operator environment.
+   ```sh
+   infra/scripts/apply.sh
+   ```
 
-## Operator apply steps
-
-The scripts are deliberately manual: none uses `-auto-approve`, and `apply.sh`
-requires typing `APPLY` after rendering the saved plan.
-
-1. Create a private local `infra/backend.hcl` from `backend.hcl.example`, using a
-   **pre-existing, separate** Terraform-state bucket. Do not use the benchmark
-   artifact bucket for state.
-2. Create `infra/terraform.tfvars` from `terraform.tfvars.example`; supply a
-   pinned AMI ID, a public-subnet ID, the existing GitHub OIDC-provider ARN, and
-   a globally unique artifact-bucket name. No model credential belongs here.
-3. From the repository root, run `infra/scripts/preflight.sh`.
-4. Initialize the chosen remote state: `infra/scripts/init.sh infra/backend.hcl`.
-5. Create and inspect the saved plan: `infra/scripts/plan.sh`.
-6. Apply that exact reviewed plan: `infra/scripts/apply.sh`.
-
-If apply fails, retain the terminal output and the saved plan if it is still
-valid; correct the Terraform/configuration issue and rerun preflight → plan →
-apply. Never retry with a hand-edited state file or `-auto-approve`.
+The script initializes the configured backend and applies non-interactively. It
+never reads credentials or model keys from files in this repository.
 
 Every taggable resource receives `Application=Carry`,
 `Repository=wiggzz/carry`, and `Component=swebench-benchmark`. Workers and

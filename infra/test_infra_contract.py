@@ -68,14 +68,12 @@ class BenchmarkInfraContractTests(unittest.TestCase):
         self.assertIn('Repository  = "wiggzz/carry"', main)
         self.assertIn("default_tags", versions)
 
-    def test_operator_scripts_are_safe_and_documented(self):
-        backend = self.read("backend.hcl.example")
-        plan = self.read("scripts/plan.sh")
+    def test_apply_script_is_the_single_noninteractive_deployment_command(self):
         apply = self.read("scripts/apply.sh")
-        self.assertIn('use_lockfile = true', backend)
-        self.assertIn('terraform -chdir="$INFRA_DIR" plan', plan)
-        self.assertIn('terraform -chdir="$INFRA_DIR" apply', apply)
-        self.assertNotIn("-auto-approve", apply)
+        self.assertIn('BACKEND_CONFIG="$INFRA_DIR/backend.hcl"', apply)
+        self.assertIn('terraform -chdir="$INFRA_DIR" init -reconfigure -input=false -backend-config="$BACKEND_CONFIG"', apply)
+        self.assertIn('terraform -chdir="$INFRA_DIR" apply -input=false -auto-approve', apply)
+        self.assertNotIn("read -r", apply)
 
     def test_worker_has_an_empty_instance_role_and_uses_presigned_artifacts(self):
         main = self.read("main.tf")

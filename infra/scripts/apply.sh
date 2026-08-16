@@ -3,10 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 INFRA_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
-PLAN_FILE=${PLAN_FILE:-"$INFRA_DIR/tfplan"}
+BACKEND_CONFIG="$INFRA_DIR/backend.hcl"
+TFVARS="$INFRA_DIR/terraform.tfvars"
 
-[[ -f "$PLAN_FILE" ]] || { echo "saved plan not found: $PLAN_FILE; run scripts/plan.sh first" >&2; exit 66; }
-terraform -chdir="$INFRA_DIR" show "$PLAN_FILE"
-read -r -p "Type APPLY to apply this reviewed plan: " confirmation
-[[ "$confirmation" == "APPLY" ]] || { echo "apply cancelled"; exit 0; }
-terraform -chdir="$INFRA_DIR" apply "$PLAN_FILE"
+[[ -f "$BACKEND_CONFIG" ]] || { echo "missing $BACKEND_CONFIG (copy backend.hcl.example and set the existing state bucket)" >&2; exit 66; }
+[[ -f "$TFVARS" ]] || { echo "missing $TFVARS (copy terraform.tfvars.example and set account-specific values)" >&2; exit 66; }
+
+terraform -chdir="$INFRA_DIR" init -reconfigure -input=false -backend-config="$BACKEND_CONFIG"
+terraform -chdir="$INFRA_DIR" apply -input=false -auto-approve
