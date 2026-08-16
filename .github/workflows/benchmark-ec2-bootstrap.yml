@@ -150,9 +150,7 @@ jobs:
 
       - name: Verify the worker self-terminates
         shell: bash
-        run: |
-          set -euo pipefail
-          aws ec2 wait instance-terminated --instance-ids "$WORKER_INSTANCE_ID"
+        run: scripts/wait_for_ec2_termination.sh "$WORKER_INSTANCE_ID"
 
       - name: Terminate the exact worker on any outcome
         if: always()
