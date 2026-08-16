@@ -79,10 +79,10 @@ Live fixtures require `OPENAI_API_KEY`. Codex fixture comparisons require a sepa
 
 ## Benchmark planning
 
-The manually dispatched **Benchmark plan** workflow builds a requested Carry branch, tag, or commit and emits five deterministic shards from the frozen 50-instance SWE-bench selection. It does not run agents or require model credentials. The live Carry/Codex/Pi benchmark worker will be added separately after its external isolated execution and protected credential path are reviewed.
+The manually dispatched **Benchmark plan** workflow emits five deterministic shards from the frozen 50-instance SWE-bench selection without running agents or requiring model credentials. The protected EC2 workflow below consumes the same immutable selection.
 
 The manually dispatched **EC2 benchmark bootstrap** workflow has a credential-free
-`bootstrap` default and an executable `smoke-5` preset. It requires the Terraform
+`bootstrap` default plus protected `smoke-5` and `official-50` modes. It requires the Terraform
 deployment first, then these protected `swe-bench` GitHub Environment values:
 
 - `BENCHMARK_AWS_REGION`
@@ -91,7 +91,7 @@ deployment first, then these protected `swe-bench` GitHub Environment values:
 - `BENCHMARK_ARTIFACT_SESSION_ROLE_ARN`
 - `BENCHMARK_WORKER_LAUNCH_TEMPLATE_ID`
 - `BENCHMARK_WORKER_LAUNCH_TEMPLATE_VERSION` (the numeric `worker_launch_template_version` Terraform output)
-- secret `OPENAI_API_KEY` (smoke only)
+- secret `OPENAI_API_KEY` (protected benchmark modes only)
 - optional `BENCHMARK_MODEL` (defaults to `gpt-5.6-luna`) and
   `BENCHMARK_REASONING` (defaults to `medium`)
 
@@ -102,15 +102,38 @@ publishing pipeline or additional protected configuration is needed.
 
 Dispatch the workflow on the reviewed branch and use that same branch in `carry_ref`;
 the workflow checks out the dispatch event's immutable commit and rejects a different
-candidate ref. Leave `mode=bootstrap` for the existing canary, or
-choose `smoke-5` for the first five IDs of the frozen selected-50 across Carry/Codex/Pi
-(15 mandatory records). To stay inside the initial run's one-hour chained-role
-capability lifetime, this nonofficial plumbing baseline caps each agent slot at six
-minutes, runs five agent slots concurrently, and caps each evaluator container at five
-minutes. Those caps are recorded in provenance and are not the settings for the later
-official comparison. The smoke incurs EC2, model-token, storage, and image-build costs.
-The workflow uploads a `swebench-smoke-5-*` artifact containing predictions, all slot
-metadata/traces, official outputs, canonical records, and the report.
+candidate ref. Leave `mode=bootstrap` for the canary, choose `smoke-5` for the first
+five frozen IDs (15 mandatory records), or choose `official-50` for all 50 frozen IDs
+across Carry/Codex/Pi (150 mandatory records). Apply the Terraform change that raises
+the protected dispatch role's maximum session to six hours before dispatching the
+official mode. Automation never applies Terraform.
+
+The official mode uses one disposable worker and builds each run-local method image
+once. It executes five ordered ten-task agent shards at concurrency three, removes each
+shard's working checkouts after patch capture, deletes the model key before grading,
+and evaluates each method in ten-task shards with `swebench==4.1.0`. It writes the full
+150-slot `not-run` checkpoint before image builds and checkpoints after every agent and
+evaluator shard, so infrastructure failure cannot silently shrink the denominator. Carry's
+aggregate Responses API retry count is copied into each slot record and method summary.
+Each agent slot remains capped at six minutes. The limit is also passed into each named
+agent container; host-side cleanup retries and verifies exact-container absence, failing
+the worker closed if Docker cannot prove it stopped. Official execution reserves 190
+minutes for agents, 90 minutes for grading at evaluator concurrency ten, and 20 minutes
+for setup inside a five-hour wall clock that starts before package/source setup. Evaluator
+shards have a 345-second outer cap, leaving 225 seconds of phase-level orchestration
+margin. After every evaluator return path, exact-run containers receive verified cleanup
+because SWE-bench may suppress its own stop/remove failures. Queued agent
+slots become explicit budget-exhausted diagnostics rather than silently disappearing.
+The controller permits twenty minutes for EC2 launch/boot around the worker clock and
+reserves the remaining forty minutes of its six-hour job for termination and exact cleanup.
+All limits and image identities are recorded in provenance.
+
+The smoke uses one-hour S3 capabilities. During the longer official mode, the protected
+controller rotates exact-run presigned control/result capabilities every 25 minutes;
+the zero-permission worker receives only those opaque capabilities and never AWS
+credentials. The workflow uploads a `swebench-<mode>-*` artifact containing predictions,
+all slot metadata/traces, official outputs, canonical records, and the report. Both live
+modes incur EC2, model-token, storage, and image-build costs.
 
 The key is encrypted in a run-scoped S3 object, fetched through a short-lived presigned
 URL into root-only `/dev/shm`, and injected into agent containers only by environment
@@ -130,10 +153,9 @@ distinct external agent/evaluator container contracts. A manual protected
 workflow can invoke one selected task/method with digest-pinned external
 containers. It forwards `OPENAI_API_KEY` only to the agent by environment name;
 the evaluator gets neither that key nor model configuration or agent output.
-Scaling to 50 remains blocked on measured capacity/cost, longer presigned URL and job
-timeouts, concurrency design, cache strategy, and successful smoke evidence. The
-selected-50 planning and 150-record denominator remain unchanged. See
-`docs/benchmark-isolation.md`.
+The selected-50 planning and 150-record denominator remain unchanged. Official execution
+is deliberately manual and protected; review the immutable source commit and expected
+cost before dispatch. See `docs/benchmark-isolation.md`.
 Every credential-bearing agent harness—Carry, Codex, Pi, or another
 alternative—must run inside a disposable container or equivalent sandbox that
 limits its filesystem, process, and network reach. Carry Bubblewrap support is

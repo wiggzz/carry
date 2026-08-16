@@ -10,11 +10,11 @@ on:
         default: main
         type: string
       mode:
-        description: Bootstrap, executable 5-task baseline, or exact-run artifact sanitization
+        description: Bootstrap, protected benchmark, or exact-run artifact sanitization
         required: true
         default: bootstrap
         type: choice
-        options: [bootstrap, smoke-5, cleanup]
+        options: [bootstrap, smoke-5, official-50, cleanup]
       cleanup_run_id:
         description: Exact gh-RUN_ID-ATTEMPT to sanitize when mode=cleanup
         required: false
@@ -40,7 +40,7 @@ jobs:
     environment: swe-bench
     permissions:
       contents: read
-      id-token: write
+      id-token: write # Needed only for the protected short-lived AWS OIDC session.
     env:
       AWS_REGION: ${{ vars.BENCHMARK_AWS_REGION }}
       ARTIFACT_BUCKET: ${{ vars.BENCHMARK_ARTIFACT_BUCKET }}
@@ -86,6 +86,7 @@ jobs:
           role-to-assume: ${{ vars.BENCHMARK_DISPATCH_ROLE_ARN }}
           aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
           role-session-name: carry-bootstrap-${{ github.run_id }}
+          role-duration-seconds: 21600
           mask-aws-account-id: true
 
       - name: Sanitize exact prior run objects
@@ -113,7 +114,7 @@ jobs:
           PY
           )"
           : > "$RUNNER_TEMP/empty"
-          for object in carry-source.tar.gz openai-key results.tar.gz; do
+          for object in carry-source.tar.gz openai-key results.tar.gz control.json; do
             aws s3 cp "$RUNNER_TEMP/empty" "s3://$ARTIFACT_BUCKET/runs/$TARGET_RUN_ID/$object" --sse AES256 --only-show-errors
             size=$(aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key "runs/$TARGET_RUN_ID/$object" --query ContentLength --output text)
             [[ "$size" == 0 ]] || { echo "failed to sanitize $object" >&2; exit 1; }
@@ -121,7 +122,7 @@ jobs:
           echo "sanitized exact run prefix $TARGET_RUN_ID"
 
       - name: Install pinned pre-signing client
-        if: inputs.mode == 'smoke-5'
+        if: inputs.mode == 'smoke-5' || inputs.mode == 'official-50'
         shell: bash
         run: |
           set -euo pipefail
@@ -135,7 +136,7 @@ jobs:
         shell: bash
         env:
           SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
-          OPENAI_API_KEY: ${{ inputs.mode == 'smoke-5' && secrets.OPENAI_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ (inputs.mode == 'smoke-5' || inputs.mode == 'official-50') && secrets.OPENAI_API_KEY || '' }}
         run: |
           set -euo pipefail
           for required in AWS_REGION ARTIFACT_BUCKET ARTIFACT_SESSION_ROLE_ARN LAUNCH_TEMPLATE_ID LAUNCH_TEMPLATE_VERSION SOURCE_COMMIT; do
@@ -145,9 +146,9 @@ jobs:
           [[ "$BOOTSTRAP_WAIT_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] && (( BOOTSTRAP_WAIT_SECONDS <= 300 )) || {
             echo "bootstrap_wait_seconds must be an integer from 1 through 300" >&2; exit 1;
           }
-          if [[ "$BENCHMARK_MODE" == smoke-5 ]]; then
+          if [[ "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == official-50 ]]; then
             for required in OPENAI_API_KEY MODEL REASONING; do
-              [[ -n "${!required}" ]] || { echo "missing smoke configuration: $required" >&2; exit 1; }
+              [[ -n "${!required}" ]] || { echo "missing benchmark configuration: $required" >&2; exit 1; }
             done
           fi
           RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -166,21 +167,35 @@ jobs:
           set -a; source "$RUNNER_TEMP/artifact-session.env"; set +a
           PREFIX="runs/$RUN_ID"
           aws s3 cp carry-source.tar.gz "s3://$ARTIFACT_BUCKET/$PREFIX/carry-source.tar.gz" --sse AES256 --only-show-errors
-          if [[ "$BENCHMARK_MODE" == smoke-5 ]]; then
+          if [[ "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == official-50 ]]; then
             printf '%s' "$OPENAI_API_KEY" | aws s3 cp - "s3://$ARTIFACT_BUCKET/$PREFIX/openai-key" --sse AES256 --only-show-errors
             KEY_URL=$(aws s3 presign "s3://$ARTIFACT_BUCKET/$PREFIX/openai-key" --expires-in 3600)
-            RESULT_URL=$(python3 scripts/presign_s3.py put "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 21600)
-            RESULT_GET_URL=$(python3 scripts/presign_s3.py get "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 21600)
+            RESULT_URL=$(python3 scripts/presign_s3.py put "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 3600)
+            RESULT_GET_URL=$(python3 scripts/presign_s3.py get "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 3600)
+            if [[ "$BENCHMARK_MODE" == official-50 ]]; then
+              CONTROL_URL=$(python3 scripts/presign_s3.py get "$ARTIFACT_BUCKET" "$PREFIX/control.json" --expires 3600)
+              CONTROL_URL="$CONTROL_URL" RESULT_URL="$RESULT_URL" python3 - "$RUNNER_TEMP/control.json" <<'PY'
+          import json, os, sys
+          with open(sys.argv[1], 'w', encoding='utf-8') as stream:
+              json.dump({'control_get_url': os.environ['CONTROL_URL'], 'result_put_url': os.environ['RESULT_URL']}, stream)
+          os.chmod(sys.argv[1], 0o600)
+          PY
+              aws s3 cp "$RUNNER_TEMP/control.json" "s3://$ARTIFACT_BUCKET/$PREFIX/control.json" --sse AES256 --only-show-errors
+              rm -f "$RUNNER_TEMP/control.json"
+            else
+              CONTROL_URL=""
+            fi
           else
-            KEY_URL=""; RESULT_URL=""; RESULT_GET_URL=""
+            KEY_URL=""; RESULT_URL=""; RESULT_GET_URL=""; CONTROL_URL=""
           fi
           SOURCE_URL=$(aws s3 presign "s3://$ARTIFACT_BUCKET/$PREFIX/carry-source.tar.gz" --expires-in 3600)
           rm -f "$RUNNER_TEMP/artifact-session.env"
           unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN OPENAI_API_KEY
-          for url in "$SOURCE_URL" "$KEY_URL" "$RESULT_URL" "$RESULT_GET_URL"; do [[ -z "$url" ]] || echo "::add-mask::$url"; done
+          for url in "$SOURCE_URL" "$KEY_URL" "$RESULT_URL" "$RESULT_GET_URL" "$CONTROL_URL"; do [[ -z "$url" ]] || echo "::add-mask::$url"; done
           {
             echo "run_id=$RUN_ID"; echo "prefix=$PREFIX"; echo "source_url=$SOURCE_URL"
             echo "key_url=$KEY_URL"; echo "result_url=$RESULT_URL"; echo "result_get_url=$RESULT_GET_URL"
+            echo "control_url=$CONTROL_URL"
           } >> "$GITHUB_OUTPUT"
 
       - name: Launch zero-permission disposable worker
@@ -194,15 +209,17 @@ jobs:
           SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
           KEY_URL: ${{ steps.stage.outputs.key_url }}
           RESULT_URL: ${{ steps.stage.outputs.result_url }}
+          CONTROL_URL: ${{ steps.stage.outputs.control_url }}
         run: |
           set -euo pipefail
           encode() { printf '%s' "$1" | base64 -w0; }
-          SOURCE_URL_B64=$(encode "$SOURCE_URL"); KEY_URL_B64=$(encode "$KEY_URL"); RESULT_URL_B64=$(encode "$RESULT_URL")
+          SOURCE_URL_B64=$(encode "$SOURCE_URL"); KEY_URL_B64=$(encode "$KEY_URL"); RESULT_URL_B64=$(encode "$RESULT_URL"); CONTROL_URL_B64=$(encode "$CONTROL_URL")
           {
             printf '#!/usr/bin/env bash\n'
             printf 'SOURCE_URL_B64=%q\n' "$SOURCE_URL_B64"
             printf 'KEY_URL_B64=%q\n' "$KEY_URL_B64"
             printf 'RESULT_URL_B64=%q\n' "$RESULT_URL_B64"
+            printf 'CONTROL_URL_B64=%q\n' "$CONTROL_URL_B64"
             printf 'SOURCE_SHA256=%q\n' "$SOURCE_SHA256"
             printf 'SOURCE_COMMIT=%q\n' "$SOURCE_COMMIT"
             printf 'BENCHMARK_MODE=%q\n' "$BENCHMARK_MODE"
@@ -221,17 +238,56 @@ jobs:
           [[ "$WORKER_INSTANCE_ID" =~ ^i-[0-9a-f]+$ ]] || { echo "invalid worker instance ID" >&2; exit 1; }
           echo "WORKER_INSTANCE_ID=$WORKER_INSTANCE_ID" >> "$GITHUB_ENV"
 
-      - name: Wait for smoke result without long-lived AWS credentials
-        if: inputs.mode == 'smoke-5'
+      - name: Wait for protected benchmark result
+        if: inputs.mode == 'smoke-5' || inputs.mode == 'official-50'
         shell: bash
         env:
           RESULT_GET_URL: ${{ steps.stage.outputs.result_get_url }}
+          PREFIX: ${{ steps.stage.outputs.prefix }}
         run: |
           set -euo pipefail
           mkdir -p benchmark-artifact
-          # Chained-role S3 capabilities expire with the one-hour STS session.
-          # Keep this cost-controlled smoke inside that hard lifetime.
-          deadline=$((SECONDS + 3300))
+          if [[ "$BENCHMARK_MODE" == official-50 ]]; then
+            # Allow twenty minutes for EC2 launch/boot around the worker's
+            # five-hour wall clock; preserve forty minutes of the six-hour job.
+            deadline=$((SECONDS + 19200))
+            next_rotation=$((SECONDS + 1500))
+          else
+            deadline=$((SECONDS + 3300))
+            next_rotation=$deadline
+          fi
+          BASE_AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+          BASE_AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+          BASE_AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN
+          rotate_capabilities() {
+            export AWS_ACCESS_KEY_ID=$BASE_AWS_ACCESS_KEY_ID
+            export AWS_SECRET_ACCESS_KEY=$BASE_AWS_SECRET_ACCESS_KEY
+            export AWS_SESSION_TOKEN=$BASE_AWS_SESSION_TOKEN
+            ASSUMED=$(aws sts assume-role --role-arn "$ARTIFACT_SESSION_ROLE_ARN" \
+              --role-session-name "carry-rotate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              --tags "Key=RunId,Value=gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              --query Credentials --output json) || return
+            eval "$(python3 - "$ASSUMED" <<'PY'
+          import json, shlex, sys
+          c=json.loads(sys.argv[1])
+          for key, field in [('AWS_ACCESS_KEY_ID','AccessKeyId'),('AWS_SECRET_ACCESS_KEY','SecretAccessKey'),('AWS_SESSION_TOKEN','SessionToken')]:
+              print(f'export {key}={shlex.quote(c[field])}')
+          PY
+            )"
+            local result_put control_get
+            result_put=$(python3 scripts/presign_s3.py put "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 3600) || return
+            RESULT_GET_URL=$(python3 scripts/presign_s3.py get "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 3600) || return
+            control_get=$(python3 scripts/presign_s3.py get "$ARTIFACT_BUCKET" "$PREFIX/control.json" --expires 3600) || return
+            for url in "$result_put" "$RESULT_GET_URL" "$control_get"; do echo "::add-mask::$url"; done
+            CONTROL_URL="$control_get" RESULT_URL="$result_put" python3 - "$RUNNER_TEMP/control.json" <<'PY'
+          import json, os, sys
+          with open(sys.argv[1], 'w', encoding='utf-8') as stream:
+              json.dump({'control_get_url': os.environ['CONTROL_URL'], 'result_put_url': os.environ['RESULT_URL']}, stream)
+          os.chmod(sys.argv[1], 0o600)
+          PY
+            aws s3 cp "$RUNNER_TEMP/control.json" "s3://$ARTIFACT_BUCKET/$PREFIX/control.json" --sse AES256 --only-show-errors || return
+            rm -f "$RUNNER_TEMP/control.json"
+          }
           while (( SECONDS < deadline )); do
             if curl --proto '=https' --tlsv1.2 --fail --silent \
               "$RESULT_GET_URL" -o benchmark-artifact/results.tar.gz.tmp; then
@@ -239,13 +295,21 @@ jobs:
               exit 0
             fi
             rm -f benchmark-artifact/results.tar.gz.tmp
+            if [[ "$BENCHMARK_MODE" == official-50 ]] && (( SECONDS >= next_rotation )); then
+              if rotate_capabilities; then
+                next_rotation=$((SECONDS + 1500))
+              else
+                echo "capability rotation failed; retrying in 30 seconds" >&2
+                next_rotation=$((SECONDS + 30))
+              fi
+            fi
             sleep 30
           done
-          echo "timed out waiting for smoke result" >&2
+          echo "timed out waiting for benchmark result" >&2
           exit 1
 
-      - name: Refresh protected AWS dispatch identity after smoke
-        if: always() && inputs.mode == 'smoke-5'
+      - name: Refresh protected AWS dispatch identity after benchmark
+        if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'official-50')
         uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8
         with:
           role-to-assume: ${{ vars.BENCHMARK_DISPATCH_ROLE_ARN }}
@@ -257,30 +321,40 @@ jobs:
         if: always() && inputs.mode != 'cleanup'
         shell: bash
         env:
-          TIMEOUT_SECONDS: "900"
+          TIMEOUT_SECONDS: "600"
         run: scripts/wait_for_ec2_termination.sh "$WORKER_INSTANCE_ID"
 
-      - name: Validate smoke results
-        if: always() && inputs.mode == 'smoke-5'
+      - name: Validate fixed-denominator results
+        if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'official-50')
         shell: bash
         run: |
           set -euo pipefail
           test -s benchmark-artifact/results.tar.gz
           tar -xzf benchmark-artifact/results.tar.gz -C benchmark-artifact
+          [[ "$(<benchmark-artifact/worker-exit-status)" == 0 ]] || {
+            echo "benchmark worker exited unsuccessfully" >&2
+            exit 1
+          }
           python3 - <<'PY'
-          import json
+          import json, os
           records=json.load(open('benchmark-artifact/records.json', encoding='utf-8'))
           pairs={(r.get('instance_id'),r.get('method')) for r in records}
-          selected=json.load(open('benchmarks/swe-bench-verified-50.json', encoding='utf-8'))['instance_ids'][:5]
+          frozen=json.load(open('benchmarks/swe-bench-verified-50.json', encoding='utf-8'))['instance_ids']
+          selected=frozen if os.environ['BENCHMARK_MODE']=='official-50' else frozen[:5]
           expected={(instance_id, method) for instance_id in selected for method in ('carry','codex','pi')}
-          assert len(records)==15 and pairs==expected, 'artifact does not contain exact smoke-5 denominator'
+          assert len(records)==len(expected) and pairs==expected, 'artifact does not contain exact fixed denominator'
+          report=json.load(open('benchmark-artifact/report.json', encoding='utf-8'))
+          assert report['denominator']==len(expected), 'canonical report denominator does not match records'
+          assert report['provenance']['phase']=='complete', 'benchmark did not complete official grading'
+          blocked={'not-run', 'evaluator-failed'}
+          assert not any(r.get('status') in blocked for r in records), 'benchmark has unexecuted or ungraded slots'
           PY
 
       - name: Upload results and diagnostics
-        if: always() && inputs.mode == 'smoke-5'
+        if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'official-50')
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
-          name: swebench-smoke-5-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swebench-${{ inputs.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: benchmark-artifact
           if-no-files-found: warn
           retention-days: 14
@@ -292,12 +366,21 @@ jobs:
           PREFIX: ${{ steps.stage.outputs.prefix }}
         run: |
           set -euo pipefail
-          if [[ -n "${WORKER_INSTANCE_ID:-}" ]]; then
-            state=$(aws ec2 describe-instances --instance-ids "$WORKER_INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || true)
-            case "$state" in pending|running|stopping|stopped) aws ec2 terminate-instances --instance-ids "$WORKER_INSTANCE_ID" --no-cli-pager >/dev/null ;; esac
+          RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          worker_ids=()
+          if [[ "${WORKER_INSTANCE_ID:-}" =~ ^i-[0-9a-f]+$ ]]; then
+            worker_ids+=("$WORKER_INSTANCE_ID")
+          else
+            mapfile -t worker_ids < <(aws ec2 describe-instances \
+              --filters "Name=tag:RunId,Values=$RUN_ID" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query 'Reservations[].Instances[].InstanceId' --output text | tr '\t' '\n' | grep -E '^i-[0-9a-f]+$' || true)
           fi
-          if [[ -n "${PREFIX:-}" ]]; then
-            RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          for worker_id in "${worker_ids[@]}"; do
+            state=$(aws ec2 describe-instances --instance-ids "$worker_id" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || true)
+            case "$state" in pending|running|stopping|stopped) aws ec2 terminate-instances --instance-ids "$worker_id" --no-cli-pager >/dev/null ;; esac
+          done
+          PREFIX=${PREFIX:-"runs/$RUN_ID"}
+          if [[ -n "$PREFIX" ]]; then
             ASSUMED=$(aws sts assume-role --role-arn "$ARTIFACT_SESSION_ROLE_ARN" --role-session-name "carry-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --tags "Key=RunId,Value=$RUN_ID" --query Credentials --output json) || exit 0
             eval "$(python3 - "$ASSUMED" <<'PY'
           import json, shlex, sys
@@ -306,7 +389,7 @@ jobs:
           PY
             )"
             : > "$RUNNER_TEMP/empty"
-            for object in carry-source.tar.gz openai-key results.tar.gz; do
+            for object in carry-source.tar.gz openai-key results.tar.gz control.json; do
               # PutObject is always available for this exact run. Sanitizing first
               # removes secret/result bytes even where DeleteObject is not granted.
               aws s3 cp "$RUNNER_TEMP/empty" "s3://$ARTIFACT_BUCKET/$PREFIX/$object" --sse AES256 --only-show-errors || true
