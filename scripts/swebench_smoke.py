@@ -204,12 +204,12 @@ def build_images(*, source: pathlib.Path, run_id: str, config: Mapping[str, str]
     result = {}
     for method, spec in specifications.items():
         tag = f"swebench-{run_id}-{method}"
-        command = ["docker", "build", "--pull", "--file", str(spec["dockerfile"]), "--tag", tag,
+        command = ["docker", "build", "--pull", "--progress=plain", "--file", str(spec["dockerfile"]), "--tag", tag,
                    "--build-arg", f"BASE_IMAGE={spec['base']}"]
         for argument in spec["args"]:
             command.extend(("--build-arg", argument))
         command.append(str(spec["context"]))
-        execute(command, check=True, text=True, capture_output=True)
+        execute(command, check=True, text=True)
         inspected = execute(["docker", "image", "inspect", "--format", "{{.Id}}", tag], check=True, text=True, capture_output=True)
         result[method] = {
             "tag": tag, "image_id": inspected.stdout.strip(), "base_resolved_digest": spec["base"],
