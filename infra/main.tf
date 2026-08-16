@@ -227,7 +227,7 @@ data "aws_iam_policy_document" "github_dispatch" {
     condition {
       test     = "StringEquals"
       variable = "ec2:LaunchTemplate"
-      values   = [aws_launch_template.worker.id]
+      values   = [aws_launch_template.worker.arn]
     }
 
     condition {
