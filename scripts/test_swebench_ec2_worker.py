@@ -28,7 +28,11 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             fake_bin.mkdir()
             for command in ("dnf", "systemctl"):
                 path = fake_bin / command
-                path.write_text("#!/bin/sh\nexit 0\n")
+                body = "#!/bin/sh\n"
+                if command == "dnf":
+                    body += 'printf "%s\\n" "$*" > "$FAKE_DNF_LOG"\n'
+                body += "exit 0\n"
+                path.write_text(body)
                 path.chmod(0o755)
             curl = fake_bin / "curl"
             curl.write_text(
@@ -58,11 +62,15 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 PYTHON_BIN="python3",
                 SKIP_SHUTDOWN="1",
                 FAKE_SOURCE_ARCHIVE=str(archive),
+                FAKE_DNF_LOG=str(root / "dnf.log"),
             )
             run = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual((carry_root / "source" / "marker.txt").read_text(), "immutable source\n")
             self.assertFalse((root / "secret").exists())
+            packages = (root / "dnf.log").read_text(encoding="utf-8").split()
+            self.assertIn("python3.11", packages)
+            self.assertNotIn("curl", packages)
 
 
 if __name__ == "__main__":

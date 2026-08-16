@@ -37,7 +37,7 @@ trap finish EXIT
 mkdir -p "$CARRY_ROOT/results" "$CARRY_ROOT/source" "$CARRY_ROOT/work"
 exec > >(tee -a "$CARRY_ROOT/results/worker.log") 2>&1
 if command -v dnf >/dev/null 2>&1; then
-  dnf install -y ca-certificates curl git python3.11 python3.11-pip docker tar gzip
+  dnf install -y ca-certificates git python3.11 python3.11-pip docker tar gzip
   : "${PYTHON_BIN:=python3.11}"
 elif command -v apt-get >/dev/null 2>&1; then
   # The worker security group permits HTTPS, not plaintext package mirrors.
