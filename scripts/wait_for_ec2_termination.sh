@@ -17,7 +17,7 @@ while (( SECONDS < deadline )); do
       printf 'instance %s terminated\n' "$INSTANCE_ID"
       exit 0
       ;;
-    pending|running|stopping|stopped)
+    pending|running|stopping|shutting-down|stopped)
       sleep "$POLL_SECONDS"
       ;;
     *)
