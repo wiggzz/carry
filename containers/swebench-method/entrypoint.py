@@ -61,20 +61,45 @@ if os.environ.get("AGENT_METHOD") == "pi":
     (config / "models.json").write_text(json.dumps(models) + "\n", encoding="utf-8")
 
 trace_path = output / "trace.log"
+agent_env = os.environ.copy()
 with trace_path.open("w", encoding="utf-8") as trace:
-    try:
-        result = subprocess.run(
-            command,
-            cwd=workspace,
-            stdout=trace,
-            stderr=subprocess.STDOUT,
-            check=False,
-            timeout=int(os.environ.get("AGENT_TIMEOUT_SECONDS", "1200")),
-        )
-        returncode = result.returncode
-    except subprocess.TimeoutExpired:
-        trace.write("\nagent timed out\n")
-        returncode = 124
+    returncode = 0
+    if os.environ.get("AGENT_METHOD") == "codex":
+        try:
+            login = subprocess.run(
+                [os.environ.get("CODEX_BINARY", "codex"), "login", "--with-api-key"],
+                input=os.environ["OPENAI_API_KEY"],
+                cwd=workspace,
+                env=agent_env,
+                stdout=trace,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            returncode = login.returncode
+            if returncode == 0:
+                # Codex now reads its run-scoped auth file from the tmpfs HOME.
+                # Do not expose the key to model-controlled child shell commands.
+                agent_env.pop("OPENAI_API_KEY", None)
+        except subprocess.TimeoutExpired:
+            trace.write("\ncodex login timed out\n")
+            returncode = 124
+    if returncode == 0:
+        try:
+            result = subprocess.run(
+                command,
+                cwd=workspace,
+                env=agent_env,
+                stdout=trace,
+                stderr=subprocess.STDOUT,
+                check=False,
+                timeout=int(os.environ.get("AGENT_TIMEOUT_SECONDS", "1200")),
+            )
+            returncode = result.returncode
+        except subprocess.TimeoutExpired:
+            trace.write("\nagent timed out\n")
+            returncode = 124
 
 patch_path = output / "final.patch"
 subprocess.run(["git", "add", "-N", "--", "."], cwd=workspace, check=True)

@@ -89,7 +89,7 @@ export CODEX_VERSION='0.147.0'
 export PI_VERSION='0.84.2'
 export AGENT_TIMEOUT_SECONDS=360
 export EVALUATOR_TIMEOUT_SECONDS=300
-export AGENT_CONCURRENCY=5
+export AGENT_CONCURRENCY=3
 export EVALUATOR_CONCURRENCY=5
 
 timeout --signal=TERM --kill-after=30s 3000 python3 "$CARRY_ROOT/source/scripts/swebench_smoke.py" \
