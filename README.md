@@ -81,7 +81,9 @@ Live fixtures require `OPENAI_API_KEY`. Codex fixture comparisons require a sepa
 
 The manually dispatched **Benchmark plan** workflow builds a requested Carry branch, tag, or commit and emits five deterministic shards from the frozen 50-instance SWE-bench selection. It does not run agents or require model credentials. The live Carry/Codex/Pi benchmark worker will be added separately after its external isolated execution and protected credential path are reviewed.
 
-The manually dispatched **EC2 benchmark bootstrap** workflow is the safe deployed-infrastructure canary. It requires the Terraform deployment first, then these protected `swe-bench` GitHub Environment variables:
+The manually dispatched **EC2 benchmark bootstrap** workflow has a credential-free
+`bootstrap` default and an executable `smoke-5` preset. It requires the Terraform
+deployment first, then these protected `swe-bench` GitHub Environment values:
 
 - `BENCHMARK_AWS_REGION`
 - `BENCHMARK_DISPATCH_ROLE_ARN`
@@ -89,10 +91,55 @@ The manually dispatched **EC2 benchmark bootstrap** workflow is the safe deploye
 - `BENCHMARK_ARTIFACT_SESSION_ROLE_ARN`
 - `BENCHMARK_WORKER_LAUNCH_TEMPLATE_ID`
 - `BENCHMARK_WORKER_LAUNCH_TEMPLATE_VERSION` (the numeric `worker_launch_template_version` Terraform output)
+- secret `OPENAI_API_KEY` (smoke only)
+- optional `BENCHMARK_MODEL` (defaults to `gpt-5.6-luna`) and
+  `BENCHMARK_REASONING` (defaults to `medium`)
 
-It archives the explicitly selected source ref, uses the run-scoped artifact role to upload it under `runs/<RunId>/`, starts one canonical zero-AWS-permission worker, and gives that worker only a short-lived pre-signed download URL. The worker verifies the archive and self-terminates; the GitHub job also has an `if: always()` exact-instance cleanup step. It accepts **no model credential** and executes no agent/model code.
+The reviewed worker code pins Node 22.19 and Rust base-image manifest digests,
+`@openai/codex@0.147.0`, and `@earendil-works/pi-coding-agent@0.84.2`.
+It builds all three run-local images once on the disposable worker; no registry
+publishing pipeline or additional protected configuration is needed.
 
-A live Carry/Codex/Pi benchmark remains intentionally blocked until its protected credential broker and separately reviewed **external isolation boundary** land. Every credential-bearing agent harness—Carry, Codex, Pi, or another alternative—must run inside a disposable container or equivalent sandbox that limits its filesystem, process, and network reach. Carry Bubblewrap support is useful defense in depth, but is not the sole security boundary. The later mode must preserve the protected-environment, explicit-ref, run-scoped-artifact, and always-cleanup boundaries.
+Dispatch the workflow on the reviewed branch and use that same branch in `carry_ref`;
+the workflow checks out the dispatch event's immutable commit and rejects a different
+candidate ref. Leave `mode=bootstrap` for the existing canary, or
+choose `smoke-5` for the first five IDs of the frozen selected-50 across Carry/Codex/Pi
+(15 mandatory records). To stay inside the initial run's one-hour chained-role
+capability lifetime, this nonofficial plumbing baseline caps each agent slot at six
+minutes, runs five agent slots concurrently, and caps each evaluator container at five
+minutes. Those caps are recorded in provenance and are not the settings for the later
+official comparison. The smoke incurs EC2, model-token, storage, and image-build costs.
+The workflow uploads a `swebench-smoke-5-*` artifact containing predictions, all slot
+metadata/traces, official outputs, canonical records, and the report.
+
+The key is encrypted in a run-scoped S3 object, fetched through a short-lived presigned
+URL into root-only `/dev/shm`, and injected into agent containers only by environment
+name. The host transiently holds it in the Actions secret environment, the encrypted
+upload stream, worker process environment, and tmpfs. It is deleted before evaluation.
+The worker has no AWS credentials and uploads through a presigned PUT; it self-terminates,
+while the controller retains exact-instance and exact-object cleanup.
+
+A reviewable live-run manifest is available without executing a model:
+
+```sh
+python3 scripts/swebench_live_runner.py plan --run-id review-1 --output live-plan.json
+```
+
+It fixes the denominator at 50 tasks × Carry/Codex/Pi = 150 records and records
+distinct external agent/evaluator container contracts. A manual protected
+workflow can invoke one selected task/method with digest-pinned external
+containers. It forwards `OPENAI_API_KEY` only to the agent by environment name;
+the evaluator gets neither that key nor model configuration or agent output.
+Scaling to 50 remains blocked on measured capacity/cost, longer presigned URL and job
+timeouts, concurrency design, cache strategy, and successful smoke evidence. The
+selected-50 planning and 150-record denominator remain unchanged. See
+`docs/benchmark-isolation.md`.
+Every credential-bearing agent harness—Carry, Codex, Pi, or another
+alternative—must run inside a disposable container or equivalent sandbox that
+limits its filesystem, process, and network reach. Carry Bubblewrap support is
+useful defense in depth, but is not the sole security boundary. The later mode
+must preserve the protected-environment, explicit-ref, run-scoped-artifact, and
+always-cleanup boundaries. See `docs/benchmark-isolation.md` for the v1 contract.
 
 ## Releases and contributions
 

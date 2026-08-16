@@ -1,0 +1,37 @@
+---
+name: SWE-bench live readiness
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Reviewable run identifier (letters, digits, dot, underscore, dash)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: protected live-run readiness check
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: swe-bench
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Test worker invocation contracts without credentials
+        run: python3 -m unittest -v scripts/test_swebench_benchmark.py scripts/test_swebench_live_runner.py
+
+      - name: Materialize the fixed 150-slot plan
+        env:
+          BENCHMARK_RUN_ID: ${{ inputs.run_id }}
+        run: python3 scripts/swebench_live_runner.py plan --run-id "$BENCHMARK_RUN_ID" --output artifacts/live-plan.json
+
+      # Live invoke intentionally occurs only inside the short-lived EC2 worker
+      # launched by the reviewed dispatcher. This hosted control-plane workflow
+      # never receives model credentials and never registers a persistent runner.
