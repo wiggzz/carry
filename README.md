@@ -92,7 +92,22 @@ The manually dispatched **EC2 benchmark bootstrap** workflow is the safe deploye
 
 It archives the explicitly selected source ref, uses the run-scoped artifact role to upload it under `runs/<RunId>/`, starts one canonical zero-AWS-permission worker, and gives that worker only a short-lived pre-signed download URL. The worker verifies the archive and self-terminates; the GitHub job also has an `if: always()` exact-instance cleanup step. It accepts **no model credential** and executes no agent/model code.
 
-A live Carry/Codex/Pi benchmark remains intentionally blocked until its protected credential broker and separately reviewed **external isolation boundary** land. Every credential-bearing agent harness—Carry, Codex, Pi, or another alternative—must run inside a disposable container or equivalent sandbox that limits its filesystem, process, and network reach. Carry Bubblewrap support is useful defense in depth, but is not the sole security boundary. The later mode must preserve the protected-environment, explicit-ref, run-scoped-artifact, and always-cleanup boundaries.
+A reviewable live-run manifest is available without executing a model:
+
+```sh
+python3 scripts/swebench_live_runner.py plan --run-id review-1 --output live-plan.json
+python3 scripts/swebench_live_runner.py authorize-live  # intentionally fails
+```
+
+It fixes the denominator at 50 tasks × Carry/Codex/Pi = 150 records and records
+distinct external agent/evaluator container contracts. Live execution remains
+intentionally blocked until its protected credential broker and launcher land.
+Every credential-bearing agent harness—Carry, Codex, Pi, or another
+alternative—must run inside a disposable container or equivalent sandbox that
+limits its filesystem, process, and network reach. Carry Bubblewrap support is
+useful defense in depth, but is not the sole security boundary. The later mode
+must preserve the protected-environment, explicit-ref, run-scoped-artifact, and
+always-cleanup boundaries. See `docs/benchmark-isolation.md` for the v1 contract.
 
 ## Releases and contributions
 
