@@ -96,12 +96,15 @@ A reviewable live-run manifest is available without executing a model:
 
 ```sh
 python3 scripts/swebench_live_runner.py plan --run-id review-1 --output live-plan.json
-python3 scripts/swebench_live_runner.py authorize-live  # intentionally fails
 ```
 
 It fixes the denominator at 50 tasks × Carry/Codex/Pi = 150 records and records
-distinct external agent/evaluator container contracts. Live execution remains
-intentionally blocked until its protected credential broker and launcher land.
+distinct external agent/evaluator container contracts. A manual protected
+workflow can invoke one selected task/method with digest-pinned external
+containers. It forwards `OPENAI_API_KEY` only to the agent by environment name;
+the evaluator gets neither that key nor model configuration or agent output.
+Runtime remains blocked on reviewed images, task bundles, and a Docker-capable
+disposable worker AMI; see `docs/benchmark-isolation.md`.
 Every credential-bearing agent harness—Carry, Codex, Pi, or another
 alternative—must run inside a disposable container or equivalent sandbox that
 limits its filesystem, process, and network reach. Carry Bubblewrap support is

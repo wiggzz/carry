@@ -1,5 +1,5 @@
 ---
-name: SWE-bench live (blocked)
+name: SWE-bench live single invocation
 
 on:
   workflow_dispatch:
@@ -8,22 +8,33 @@ on:
         description: Reviewable run identifier (letters, digits, dot, underscore, dash)
         required: true
         type: string
+      instance_id:
+        description: One instance from the frozen selected-50 set
+        required: true
+        type: string
+      method:
+        description: Reviewed agent method
+        required: true
+        default: carry
+        type: choice
+        options: [carry, codex, pi]
 
 permissions:
   contents: read
 
 jobs:
-  review-live-plan:
-    name: review blocked live plan
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  invoke-one:
+    name: protected disposable worker invocation
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, swebench-disposable]
+    timeout-minutes: 120
     environment: swe-bench
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
 
-      - name: Test the credential-free runner contracts
+      - name: Test worker contracts without credentials
         run: python3 -m unittest scripts/test_swebench_benchmark.py scripts/test_swebench_live_runner.py
 
       - name: Materialize the fixed 150-slot plan
@@ -31,13 +42,22 @@ jobs:
           BENCHMARK_RUN_ID: ${{ inputs.run_id }}
         run: python3 scripts/swebench_live_runner.py plan --run-id "$BENCHMARK_RUN_ID" --output artifacts/live-plan.json
 
-      - name: Verify live execution remains blocked without a credential broker
+      - name: Invoke one selected task and method
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AGENT_IMAGE: ${{ vars.SWEBENCH_AGENT_IMAGE }}
+          EVALUATOR_IMAGE: ${{ vars.SWEBENCH_EVALUATOR_IMAGE }}
+          BENCHMARK_RUN_ID: ${{ inputs.run_id }}
+          INSTANCE_ID: ${{ inputs.instance_id }}
+          METHOD: ${{ inputs.method }}
         run: |
-          if python3 scripts/swebench_live_runner.py authorize-live; then
-            echo "live execution unexpectedly bypassed the credential-broker gate" >&2
-            exit 1
-          fi
-
-      # No model, container, cloud, credential, or evaluator step may be added
-      # after this point until authorize-live is backed by a separately reviewed
-      # broker protocol and external-boundary implementation.
+          set -euo pipefail
+          install -d -m 0700 "/opt/swebench-runs/$BENCHMARK_RUN_ID"
+          python3 scripts/swebench_live_runner.py invoke \
+            --run-id "$BENCHMARK_RUN_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --method "$METHOD" \
+            --task-dir "/opt/swebench-tasks/$INSTANCE_ID" \
+            --output-dir "/opt/swebench-runs/$BENCHMARK_RUN_ID" \
+            --agent-image "$AGENT_IMAGE" \
+            --evaluator-image "$EVALUATOR_IMAGE"

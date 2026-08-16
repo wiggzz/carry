@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import pathlib
+import os
 import subprocess
 import sys
 import tempfile
@@ -34,7 +35,7 @@ class LiveRunnerTests(unittest.TestCase):
         )
         self.assertEqual([slot["ordinal"] for slot in slots], list(range(150)))
 
-    def test_boundaries_separate_agents_from_evaluation_and_expose_only_named_inputs(self):
+    def test_boundaries_separate_agents_from_evaluation_and_expose_only_task_and_output(self):
         boundaries = self.runner.build_boundaries()
         agents = boundaries["agents"]
         evaluator = boundaries["evaluator"]
@@ -43,12 +44,13 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertEqual(evaluator["kind"], "external-container")
         self.assertEqual(
             {mount["target"] for mount in agents["mounts"]},
-            {"/benchmark/repo", "/benchmark/task.json", "/benchmark/output"},
+            {"/benchmark/task", "/benchmark/output"},
         )
         self.assertEqual(
             {mount["target"] for mount in evaluator["mounts"]},
-            {"/benchmark/repo", "/benchmark/task.json", "/benchmark/patch.diff", "/benchmark/output"},
+            {"/benchmark/task", "/benchmark/output"},
         )
+        self.assertEqual(agents["environment"], ["OPENAI_API_KEY"])
         self.assertEqual(evaluator["environment"], [])
 
     def test_boundary_validation_rejects_host_and_credential_exposure(self):
@@ -60,7 +62,7 @@ class LiveRunnerTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaisesRegex(ValueError, "forbidden host path"):
                 self.runner.validate_boundaries(bad)
 
-        for name in ["AWS_ACCESS_KEY_ID", "OPENAI_API_KEY", "STAGING_TOKEN"]:
+        for name in ["AWS_ACCESS_KEY_ID", "OPENAI_API_KEY", "OPENAI_MODEL", "STAGING_TOKEN"]:
             bad = json.loads(json.dumps(boundaries))
             bad["evaluator"]["environment"].append(name)
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, "evaluator environment"):
@@ -91,16 +93,115 @@ class LiveRunnerTests(unittest.TestCase):
             self.assertEqual(manifest["task_count"], 50)
             self.assertEqual(manifest["record_count"], 150)
 
-    def test_live_gate_fails_closed_before_accepting_any_model_credential(self):
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT), "authorize-live"],
-            text=True,
-            capture_output=True,
-            check=False,
-            env={},
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("credential broker", result.stderr.lower())
+    def test_worker_invocation_uses_pinned_images_and_forwards_secret_by_name_only(self):
+        instance_id = self.runner.benchmark.load_selection()[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            task = root / "task"
+            output = root / "output"
+            task.mkdir()
+            output.mkdir()
+            (task / "task.json").write_text(json.dumps({"instance_id": instance_id}), encoding="utf-8")
+            argv_log = root / "docker.argv"
+            docker = root / "docker"
+            docker.write_text(
+                """#!/bin/sh
+if [ -n "${OPENAI_API_KEY:-}" ]; then
+  printf '%s\n' KEY_PRESENT >> "$FAKE_DOCKER_ARGV"
+else
+  printf '%s\n' KEY_ABSENT >> "$FAKE_DOCKER_ARGV"
+fi
+previous=
+for argument do
+  printf '%s\n' "$argument" >> "$FAKE_DOCKER_ARGV"
+  if [ "$previous" = --mount ]; then
+    case "$argument" in
+      *,dst=/benchmark/output)
+        source=${argument#type=bind,src=}
+        source=${source%,dst=/benchmark/output}
+        case "$source" in */agent) : > "$source/final.patch" ;; esac
+        ;;
+    esac
+  fi
+  previous=$argument
+done
+""",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            secret = "test-openai-secret-never-log"
+            agent_image = "ghcr.io/example/agent@sha256:" + "a" * 64
+            evaluator_image = "ghcr.io/example/evaluator@sha256:" + "b" * 64
+            env = {
+                "PATH": os.environ["PATH"],
+                "OPENAI_API_KEY": secret,
+                "FAKE_DOCKER_ARGV": str(argv_log),
+            }
+            result = subprocess.run(
+                [
+                    sys.executable, str(SCRIPT), "invoke", "--run-id", "review-3",
+                    "--instance-id", instance_id, "--method", "carry",
+                    "--task-dir", str(task), "--output-dir", str(output),
+                    "--agent-image", agent_image, "--evaluator-image", evaluator_image,
+                    "--docker-command", str(docker),
+                ],
+                text=True, capture_output=True, check=False, env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            argv = argv_log.read_text(encoding="utf-8")
+            self.assertEqual(argv.count("OPENAI_API_KEY"), 1)
+            self.assertEqual(argv.count("KEY_PRESENT"), 1)
+            self.assertEqual(argv.count("KEY_ABSENT"), 1)
+            self.assertNotIn(secret, argv + result.stdout + result.stderr)
+            self.assertIn(agent_image, argv)
+            self.assertIn(evaluator_image, argv)
+            self.assertNotIn("/var/run/docker.sock", argv)
+            self.assertNotIn(str(pathlib.Path.cwd()), argv)
+            self.assertEqual(argv.count(f"type=bind,src={task.resolve()},dst=/benchmark/task,readonly"), 1)
+            self.assertIn(f"type=bind,src={output.resolve() / 'evaluator-task'},dst=/benchmark/task,readonly", argv)
+            self.assertIn(f"type=bind,src={output.resolve() / 'agent'},dst=/benchmark/output", argv)
+            self.assertIn(f"type=bind,src={output.resolve() / 'evaluator'},dst=/benchmark/output", argv)
+
+            metadata = json.loads((output / "run-metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["instance_id"], instance_id)
+            self.assertEqual(metadata["method"], "carry")
+            self.assertEqual(metadata["images"], {"agent": agent_image, "evaluator": evaluator_image})
+            self.assertNotIn(secret, json.dumps(metadata))
+
+    def test_invocation_rejects_nonselected_task_mutable_image_and_missing_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            task = root / "task"
+            output = root / "output"
+            task.mkdir()
+            output.mkdir()
+            (task / "task.json").write_text(json.dumps({"instance_id": "not-selected"}), encoding="utf-8")
+            base = [
+                sys.executable, str(SCRIPT), "invoke", "--run-id", "review-4",
+                "--instance-id", "not-selected", "--method", "carry",
+                "--task-dir", str(task), "--output-dir", str(output),
+                "--agent-image", "agent:latest",
+                "--evaluator-image", "evaluator:latest",
+                "--docker-command", "/does/not/matter",
+            ]
+            result = subprocess.run(base, text=True, capture_output=True, check=False, env={"OPENAI_API_KEY": "x"})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("selected-50", result.stderr)
+
+            selected = self.runner.benchmark.load_selection()[0]
+            (task / "task.json").write_text(json.dumps({"instance_id": selected}), encoding="utf-8")
+            mutable = [selected if item == "not-selected" else item for item in base]
+            result = subprocess.run(mutable, text=True, capture_output=True, check=False, env={"OPENAI_API_KEY": "x"})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("digest", result.stderr)
+
+            pinned = [
+                ("image@sha256:" + "c" * 64) if item in {"agent:latest", "evaluator:latest"} else item
+                for item in mutable
+            ]
+            result = subprocess.run(pinned, text=True, capture_output=True, check=False, env={})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("OPENAI_API_KEY", result.stderr)
 
 
 if __name__ == "__main__":

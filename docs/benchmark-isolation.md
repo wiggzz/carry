@@ -2,55 +2,57 @@
 
 ## Required boundary
 
-Every credential-bearing benchmark agent harness must run behind a separately
-reviewed **external isolation boundary**. This applies uniformly to Carry, Codex, and any future
-harness; an in-process or harness-specific guard is not the sole containment mechanism.
+Every credential-bearing harness runs as a separately reviewed external Docker
+container. The agent container receives exactly a read-only task bundle and a
+writable output directory. It receives no Docker socket, host home, Actions
+temporary directory, runner source checkout, AWS credentials, or staging mount.
 
-The agent container/sandbox must have only the benchmark checkout and explicit
-scratch/output paths writable. It must not mount the worker home directory,
-cloud credentials, workflow temporary directories, or the host's Docker socket.
-Model credentials, when enabled later, are injected only into that confined
-agent boundary through the credential broker and never into the evaluator lane.
-Raw model, AWS, or staging credentials are not container inputs. The broker
-endpoint itself must vend run-scoped, short-lived access without exposing its
-upstream credential to the worker or its artifacts.
+The protected GitHub Environment's `OPENAI_API_KEY` is forwarded by variable
+name directly into the agent container. Its value is never placed in a Docker
+argument, manifest, report, or evaluator environment.
 
-## Separation of duties
+## Separation and denominator
 
-The model-agent lane may produce a patch and compact run records. The evaluator
-lane receives only the patch and required benchmark inputs; it **must not receive model credentials**.
-SWE-bench's Docker testbed remains the evaluator's reproducibility boundary, not the agent's primary security boundary.
+`scripts/swebench_live_runner.py` reuses the live planner to validate the frozen
+50-task selection and all Carry/Codex/Pi pairs as exactly 150 records before a
+single invocation. The agent and evaluator have distinct external-container
+specifications:
 
-## Reviewable v1 contract
+- the agent receives the task bundle, its output directory, and only
+  `OPENAI_API_KEY`; and
+- the evaluator receives a copied task bundle containing the produced patch and
+  its own output directory. It has an empty environment contract and never
+  mounts agent output.
 
-`scripts/swebench_live_runner.py plan` materializes the frozen 50-task by
-Carry/Codex/Pi matrix as exactly 150 immutable slots. It reuses
-`swebench_benchmark.py` for the selection hash, method set, and exact-denominator
-validation. The manifest also describes two distinct external-container
-contracts:
+Both images require immutable `@sha256:` references. Docker receives the key as
+`--env OPENAI_API_KEY`, copying the inherited value without putting it in the
+command line. The evaluator Docker client is launched with that variable removed.
+Run metadata contains only public identifiers, the selection hash, completion
+status, and the two pinned image references.
 
-- agents receive only a checkout, one public task record, an output directory,
-  and a broker socket name; and
-- the evaluator receives only an independent checkout, that task record, the
-  produced patch, and an output directory. Its environment is empty.
+## Manual protected workflow
 
-The manifest uses logical mount names, not host paths. A later implementation
-must resolve those names in a disposable worker without mounting a host home,
-the Docker socket, workflow temporary storage, or cloud/staging credentials.
+The live workflow has only a `workflow_dispatch` trigger, uses the protected
+`swe-bench` Environment, and targets a self-hosted worker labeled
+`swebench-disposable`; it cannot run as push or pull-request CI. One dispatch
+invokes one selected task/method. Its task must already exist at
+`/opt/swebench-tasks/<instance-id>`, and the workflow does not mount its checkout.
 
-The manually dispatched `SWE-bench live (blocked)` workflow uses the protected
-`swe-bench` Environment, tests these contracts, and produces the plan locally.
-It then calls `authorize-live`, which unconditionally fails because v1 contains
-no credential broker. There is deliberately no secret input or execution
-bypass. Do not add model invocation, Docker, AWS, or evaluation steps until a
-separately reviewed broker protocol and container launcher replace that gate
-with behavior tests proving isolation and credential non-disclosure.
+## Remaining runtime blockers
 
-## Defense in depth and verification
+This layer is reviewable but not deployable until operators:
 
-Carry Bubblewrap is useful defense in depth, but does not replace the external
-boundary. Before enabling model credentials, test the selected container/sandbox
-with negative checks showing that the agent cannot read host-only files, access
-instance metadata or the Docker socket, or retain/recover model credentials from
-artifacts or logs. The workflow must retain its protected Environment, exact
-source ref, run-scoped artifact access, and `if: always()` worker cleanup.
+- build and review dedicated agent and evaluator images, including Carry and the
+  `/opt/swebench/evaluate-task` adapter;
+- publish them and set immutable digest references in protected Environment
+  variables `SWEBENCH_AGENT_IMAGE` and `SWEBENCH_EVALUATOR_IMAGE`;
+- install Docker in the disposable worker AMI and register that worker with only
+  the `swebench-disposable` label;
+- materialize selected task bundles containing the public record, prompt,
+  disposable repository, and task-bundled evaluator testbed; and
+- negative-test metadata-service access, host file access, operation without a
+  Docker socket, and key retention in container outputs and logs.
+
+The Dockerfiles require an explicit `BASE_IMAGE` build argument, preventing an
+accidental build from a floating default. Building or reviewing images and
+provisioning the worker are intentionally outside this change.
