@@ -9,8 +9,14 @@ on:
         required: true
         default: main
         type: string
+      mode:
+        description: Credential-free bootstrap or executable 5-task baseline
+        required: true
+        default: bootstrap
+        type: choice
+        options: [bootstrap, smoke-5]
       bootstrap_wait_seconds:
-        description: Seconds the credential-free worker remains up after verifying its source bundle (1-300)
+        description: Bootstrap-only wait in seconds (1-300)
         required: true
         default: "30"
         type: string
@@ -20,9 +26,9 @@ permissions:
 
 jobs:
   bootstrap-worker:
-    name: bootstrap ${{ inputs.carry_ref }}
+    name: ${{ inputs.mode }} ${{ inputs.carry_ref }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 360
     concurrency:
       group: swe-bench-bootstrap
       cancel-in-progress: false
@@ -37,19 +43,30 @@ jobs:
       LAUNCH_TEMPLATE_ID: ${{ vars.BENCHMARK_WORKER_LAUNCH_TEMPLATE_ID }}
       LAUNCH_TEMPLATE_VERSION: ${{ vars.BENCHMARK_WORKER_LAUNCH_TEMPLATE_VERSION }}
       BOOTSTRAP_WAIT_SECONDS: ${{ inputs.bootstrap_wait_seconds }}
+      BENCHMARK_MODE: ${{ inputs.mode }}
+      BASE_IMAGE: ${{ vars.BENCHMARK_NODE_BASE_IMAGE }}
+      CARRY_BASE_IMAGE: ${{ vars.BENCHMARK_RUST_BASE_IMAGE }}
+      CODEX_VERSION: ${{ vars.BENCHMARK_CODEX_VERSION || '0.146.0' }}
+      PI_VERSION: "0.84.2"
+      CODEX_COMMAND: ${{ vars.BENCHMARK_CODEX_COMMAND }}
+      PI_COMMAND: ${{ vars.BENCHMARK_PI_COMMAND }}
+      MODEL: ${{ vars.BENCHMARK_MODEL || 'gpt-5.6-luna' }}
+      REASONING: ${{ vars.BENCHMARK_REASONING || 'medium' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.carry_ref }}
           persist-credentials: false
 
-      - name: Resolve selected source before acquiring cloud credentials
+      - name: Resolve and archive selected source before AWS authentication
         id: source
         shell: bash
         run: |
           set -euo pipefail
           SOURCE_COMMIT=$(git rev-parse HEAD)
+          git archive --format=tar.gz --output=carry-source.tar.gz "$SOURCE_COMMIT"
           echo "source_commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "source_sha256=$(sha256sum carry-source.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Configure protected AWS dispatch identity
         uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8
@@ -59,11 +76,12 @@ jobs:
           role-session-name: carry-bootstrap-${{ github.run_id }}
           mask-aws-account-id: true
 
-      - name: Stage the selected source in its run-scoped prefix
+      - name: Stage run-scoped inputs and output capability
         id: stage
         shell: bash
         env:
           SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          OPENAI_API_KEY: ${{ inputs.mode == 'smoke-5' && secrets.OPENAI_API_KEY || '' }}
         run: |
           set -euo pipefail
           for required in AWS_REGION ARTIFACT_BUCKET ARTIFACT_SESSION_ROLE_ARN LAUNCH_TEMPLATE_ID LAUNCH_TEMPLATE_VERSION SOURCE_COMMIT; do
@@ -73,95 +91,169 @@ jobs:
           [[ "$BOOTSTRAP_WAIT_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] && (( BOOTSTRAP_WAIT_SECONDS <= 300 )) || {
             echo "bootstrap_wait_seconds must be an integer from 1 through 300" >&2; exit 1;
           }
+          if [[ "$BENCHMARK_MODE" == smoke-5 ]]; then
+            for required in OPENAI_API_KEY BASE_IMAGE CARRY_BASE_IMAGE CODEX_VERSION CODEX_COMMAND PI_COMMAND MODEL REASONING; do
+              [[ -n "${!required}" ]] || { echo "missing smoke configuration: $required" >&2; exit 1; }
+            done
+          fi
           RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          git archive --format=tar.gz --output=carry-source.tar.gz "$SOURCE_COMMIT"
-          SOURCE_SHA256=$(sha256sum carry-source.tar.gz | awk '{print $1}')
-
-          ASSUMED=$(aws sts assume-role \
-            --role-arn "$ARTIFACT_SESSION_ROLE_ARN" \
+          ASSUMED=$(aws sts assume-role --role-arn "$ARTIFACT_SESSION_ROLE_ARN" \
             --role-session-name "carry-artifact-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --tags "Key=RunId,Value=$RUN_ID" \
-            --query Credentials --output json)
+            --tags "Key=RunId,Value=$RUN_ID" --query Credentials --output json)
           python3 - "$ASSUMED" "$RUNNER_TEMP/artifact-session.env" <<'PY'
-          import json
-          import os
-          import sys
+          import json, os, sys
           credentials = json.loads(sys.argv[1])
-          mappings = {
-              "AWS_ACCESS_KEY_ID": credentials["AccessKeyId"],
-              "AWS_SECRET_ACCESS_KEY": credentials["SecretAccessKey"],
-              "AWS_SESSION_TOKEN": credentials["SessionToken"],
-          }
-          for value in mappings.values():
-              print(f"::add-mask::{value}")
-          with open(sys.argv[2], "w", encoding="utf-8") as env_file:
-              for key, value in mappings.items():
-                  env_file.write(f"{key}={value}\n")
+          values = {"AWS_ACCESS_KEY_ID": credentials["AccessKeyId"], "AWS_SECRET_ACCESS_KEY": credentials["SecretAccessKey"], "AWS_SESSION_TOKEN": credentials["SessionToken"]}
+          for value in values.values(): print(f"::add-mask::{value}")
+          with open(sys.argv[2], "w", encoding="utf-8") as stream:
+              for key, value in values.items(): stream.write(f"{key}={value}\n")
           os.chmod(sys.argv[2], 0o600)
           PY
-          set -a
-          source "$RUNNER_TEMP/artifact-session.env"
-          set +a
-          aws s3 cp carry-source.tar.gz "s3://$ARTIFACT_BUCKET/runs/$RUN_ID/carry-source.tar.gz" --only-show-errors
-          SOURCE_URL=$(aws s3 presign "s3://$ARTIFACT_BUCKET/runs/$RUN_ID/carry-source.tar.gz" --expires-in 3600)
+          set -a; source "$RUNNER_TEMP/artifact-session.env"; set +a
+          PREFIX="runs/$RUN_ID"
+          aws s3 cp carry-source.tar.gz "s3://$ARTIFACT_BUCKET/$PREFIX/carry-source.tar.gz" --sse AES256 --only-show-errors
+          if [[ "$BENCHMARK_MODE" == smoke-5 ]]; then
+            printf '%s' "$OPENAI_API_KEY" | aws s3 cp - "s3://$ARTIFACT_BUCKET/$PREFIX/openai-key" --sse AES256 --only-show-errors
+            KEY_URL=$(aws s3 presign "s3://$ARTIFACT_BUCKET/$PREFIX/openai-key" --expires-in 3600)
+            RESULT_URL=$(aws s3 presign "s3://$ARTIFACT_BUCKET/$PREFIX/results.tar.gz" --expires-in 21600 --http-method PUT)
+          else
+            KEY_URL=""; RESULT_URL=""
+          fi
+          SOURCE_URL=$(aws s3 presign "s3://$ARTIFACT_BUCKET/$PREFIX/carry-source.tar.gz" --expires-in 3600)
           rm -f "$RUNNER_TEMP/artifact-session.env"
-          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-          echo "::add-mask::$SOURCE_URL"
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN OPENAI_API_KEY
+          for url in "$SOURCE_URL" "$KEY_URL" "$RESULT_URL"; do [[ -z "$url" ]] || echo "::add-mask::$url"; done
           {
-            echo "run_id=$RUN_ID"
-            echo "source_commit=$SOURCE_COMMIT"
-            echo "source_sha256=$SOURCE_SHA256"
-            echo "source_url=$SOURCE_URL"
+            echo "run_id=$RUN_ID"; echo "prefix=$PREFIX"; echo "source_url=$SOURCE_URL"
+            echo "key_url=$KEY_URL"; echo "result_url=$RESULT_URL"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Launch a credential-free worker bootstrap
+      - name: Launch zero-permission disposable worker
         id: launch
         shell: bash
         env:
           RUN_ID: ${{ steps.stage.outputs.run_id }}
-          SOURCE_SHA256: ${{ steps.stage.outputs.source_sha256 }}
           SOURCE_URL: ${{ steps.stage.outputs.source_url }}
+          SOURCE_SHA256: ${{ steps.source.outputs.source_sha256 }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          KEY_URL: ${{ steps.stage.outputs.key_url }}
+          RESULT_URL: ${{ steps.stage.outputs.result_url }}
         run: |
           set -euo pipefail
-          SOURCE_URL_B64=$(printf '%s' "$SOURCE_URL" | base64 -w0)
+          encode() { printf '%s' "$1" | base64 -w0; }
+          SOURCE_URL_B64=$(encode "$SOURCE_URL"); KEY_URL_B64=$(encode "$KEY_URL"); RESULT_URL_B64=$(encode "$RESULT_URL")
+          CODEX_COMMAND_B64=$(encode "$CODEX_COMMAND"); PI_COMMAND_B64=$(encode "$PI_COMMAND")
           cat > worker-user-data.sh <<EOF
           #!/usr/bin/env bash
           set -euo pipefail
-          trap 'shutdown -h now' EXIT
-          mkdir -p /opt/carry-bootstrap
-          SOURCE_URL="\$(printf '%s' '$SOURCE_URL_B64' | base64 -d)"
-          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "\$SOURCE_URL" -o /opt/carry-bootstrap/carry-source.tar.gz
-          printf '%s  %s\n' '$SOURCE_SHA256' /opt/carry-bootstrap/carry-source.tar.gz | sha256sum -c -
-          tar -tzf /opt/carry-bootstrap/carry-source.tar.gz >/dev/null
-          sleep '$BOOTSTRAP_WAIT_SECONDS'
+          umask 077
+          result_url=$(printf '%s' '$RESULT_URL_B64' | base64 -d)
+          finish() {
+            status=$?
+            rm -f /dev/shm/carry-openai-key
+            if [[ -n "$result_url" && -d /opt/carry/results ]]; then
+              printf '%s\n' "$status" > /opt/carry/results/worker-exit-status
+              tar -C /opt/carry/results -czf /opt/carry/results.tar.gz . || true
+              curl --proto '=https' --tlsv1.2 --fail --silent --show-error -X PUT -T /opt/carry/results.tar.gz "$result_url" || true
+            fi
+            shutdown -h now
+            exit $status
+          }
+          trap finish EXIT
+          mkdir -p /opt/carry/results
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl git python3 python3-venv docker.io
+          systemctl enable --now docker
+          mkdir -p /opt/carry/source /opt/carry/work
+          source_url=$(printf '%s' '$SOURCE_URL_B64' | base64 -d)
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 "$source_url" -o /opt/carry/source.tar.gz
+          printf '%s  %s\n' '$SOURCE_SHA256' /opt/carry/source.tar.gz | sha256sum -c -
+          tar -xzf /opt/carry/source.tar.gz -C /opt/carry/source
+          if [[ '$BENCHMARK_MODE' == bootstrap ]]; then sleep '$BOOTSTRAP_WAIT_SECONDS'; exit 0; fi
+          key_url=$(printf '%s' '$KEY_URL_B64' | base64 -d)
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location "$key_url" -o /dev/shm/carry-openai-key
+          chmod 0600 /dev/shm/carry-openai-key
+          export OPENAI_API_KEY=$(cat /dev/shm/carry-openai-key)
+          export OPENAI_SECRET_FILE=/dev/shm/carry-openai-key
+          python3 -m venv /opt/carry/venv
+          /opt/carry/venv/bin/pip install --disable-pip-version-check 'swebench==4.1.0' 'datasets>=2.19,<4'
+          export PATH=/opt/carry/venv/bin:$PATH RUN_ID='$RUN_ID' SOURCE_COMMIT='$SOURCE_COMMIT'
+          export BASE_IMAGE='$BASE_IMAGE' CARRY_BASE_IMAGE='$CARRY_BASE_IMAGE' CODEX_VERSION='$CODEX_VERSION' PI_VERSION='0.84.2'
+          export MODEL='$MODEL' REASONING='$REASONING'
+          export CODEX_COMMAND=$(printf '%s' '$CODEX_COMMAND_B64' | base64 -d)
+          export PI_COMMAND=$(printf '%s' '$PI_COMMAND_B64' | base64 -d)
+          python3 /opt/carry/source/scripts/swebench_smoke.py --run --source /opt/carry/source --work /opt/carry/work --output /opt/carry/results
           EOF
-          EXPIRES_AT=$(date -u -d '+1 hour' +'%Y-%m-%dT%H:%M:%SZ')
+          EXPIRES_AT=$(date -u -d '+6 hours' +'%Y-%m-%dT%H:%M:%SZ')
           TAGS="Tags=[{Key=Application,Value=Carry},{Key=Component,Value=swebench-benchmark},{Key=ExpiresAt,Value=$EXPIRES_AT},{Key=ManagedBy,Value=carry-swebench},{Key=Project,Value=carry-swebench},{Key=Purpose,Value=benchmark-worker},{Key=Repository,Value=wiggzz/carry},{Key=RunId,Value=$RUN_ID}]"
-          WORKER_INSTANCE_ID=$(aws ec2 run-instances \
-            --launch-template "LaunchTemplateId=$LAUNCH_TEMPLATE_ID,Version=$LAUNCH_TEMPLATE_VERSION" \
-            --count 1 \
-            --client-token "$RUN_ID" \
-            --user-data file://worker-user-data.sh \
+          WORKER_INSTANCE_ID=$(aws ec2 run-instances --launch-template "LaunchTemplateId=$LAUNCH_TEMPLATE_ID,Version=$LAUNCH_TEMPLATE_VERSION" \
+            --count 1 --client-token "$RUN_ID" --user-data file://worker-user-data.sh \
             --tag-specifications "ResourceType=instance,$TAGS" "ResourceType=volume,$TAGS" \
             --query 'Instances[0].InstanceId' --output text)
           [[ "$WORKER_INSTANCE_ID" =~ ^i-[0-9a-f]+$ ]] || { echo "invalid worker instance ID" >&2; exit 1; }
           echo "WORKER_INSTANCE_ID=$WORKER_INSTANCE_ID" >> "$GITHUB_ENV"
-          echo "instance_id=$WORKER_INSTANCE_ID" >> "$GITHUB_OUTPUT"
 
       - name: Verify the worker self-terminates
         shell: bash
         run: scripts/wait_for_ec2_termination.sh "$WORKER_INSTANCE_ID"
 
-      - name: Terminate the exact worker on any outcome
-        if: always()
+      - name: Download smoke results through artifact role
+        if: always() && inputs.mode == 'smoke-5'
         shell: bash
+        env:
+          RUN_ID: ${{ steps.stage.outputs.run_id }}
+          PREFIX: ${{ steps.stage.outputs.prefix }}
         run: |
           set -euo pipefail
-          if [[ -z "${WORKER_INSTANCE_ID:-}" ]]; then
-            exit 0
+          ASSUMED=$(aws sts assume-role --role-arn "$ARTIFACT_SESSION_ROLE_ARN" --role-session-name "carry-download-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --tags "Key=RunId,Value=$RUN_ID" --query Credentials --output json)
+          eval "$(python3 - "$ASSUMED" <<'PY'
+          import json, shlex, sys
+          c=json.loads(sys.argv[1]);
+          for key, field in [('AWS_ACCESS_KEY_ID','AccessKeyId'),('AWS_SECRET_ACCESS_KEY','SecretAccessKey'),('AWS_SESSION_TOKEN','SessionToken')]: print(f'export {key}={shlex.quote(c[field])}')
+          PY
+          )"
+          mkdir -p benchmark-artifact
+          aws s3 cp "s3://$ARTIFACT_BUCKET/$PREFIX/results.tar.gz" benchmark-artifact/results.tar.gz --only-show-errors
+          tar -xzf benchmark-artifact/results.tar.gz -C benchmark-artifact
+          python3 - <<'PY'
+          import json
+          records=json.load(open('benchmark-artifact/records.json', encoding='utf-8'))
+          pairs={(r.get('instance_id'),r.get('method')) for r in records}
+          selected=json.load(open('benchmarks/swe-bench-verified-50.json', encoding='utf-8'))['instance_ids'][:5]
+          expected={(instance_id, method) for instance_id in selected for method in ('carry','codex','pi')}
+          assert len(records)==15 and pairs==expected, 'artifact does not contain exact smoke-5 denominator'
+          PY
+
+      - name: Upload results and diagnostics
+        if: always() && inputs.mode == 'smoke-5'
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: swebench-smoke-5-${{ github.run_id }}-${{ github.run_attempt }}
+          path: benchmark-artifact
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Terminate the exact worker and delete exact run objects
+        if: always()
+        shell: bash
+        env:
+          PREFIX: ${{ steps.stage.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${WORKER_INSTANCE_ID:-}" ]]; then
+            state=$(aws ec2 describe-instances --instance-ids "$WORKER_INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || true)
+            case "$state" in pending|running|stopping|stopped) aws ec2 terminate-instances --instance-ids "$WORKER_INSTANCE_ID" --no-cli-pager >/dev/null ;; esac
           fi
-          state=$(aws ec2 describe-instances --instance-ids "$WORKER_INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || true)
-          case "$state" in
-            pending|running|stopping|stopped) aws ec2 terminate-instances --instance-ids "$WORKER_INSTANCE_ID" --no-cli-pager >/dev/null ;;
-            *) exit 0 ;;
-          esac
+          if [[ -n "${PREFIX:-}" ]]; then
+            RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            ASSUMED=$(aws sts assume-role --role-arn "$ARTIFACT_SESSION_ROLE_ARN" --role-session-name "carry-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --tags "Key=RunId,Value=$RUN_ID" --query Credentials --output json) || exit 0
+            eval "$(python3 - "$ASSUMED" <<'PY'
+          import json, shlex, sys
+          c=json.loads(sys.argv[1]);
+          for key, field in [('AWS_ACCESS_KEY_ID','AccessKeyId'),('AWS_SECRET_ACCESS_KEY','SecretAccessKey'),('AWS_SESSION_TOKEN','SessionToken')]: print(f'export {key}={shlex.quote(c[field])}')
+          PY
+            )"
+            for object in carry-source.tar.gz openai-key results.tar.gz; do
+              aws s3 rm "s3://$ARTIFACT_BUCKET/$PREFIX/$object" --only-show-errors || true
+            done
+          fi

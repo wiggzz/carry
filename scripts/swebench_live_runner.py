@@ -103,10 +103,16 @@ def validate_boundaries(boundaries: dict[str, dict[str, Any]]) -> None:
         raise ValueError("evaluator mounts do not match the reviewed input contract")
 
 
-def build_manifest(*, run_id: str) -> dict[str, Any]:
+def build_manifest(*, run_id: str, preset: str = "selected-50") -> dict[str, Any]:
     if not run_id or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for character in run_id):
         raise ValueError("run ID must contain only letters, digits, dot, underscore, and dash")
-    instance_ids = benchmark.load_selection()
+    selected = benchmark.load_selection()
+    if preset == "smoke-5":
+        instance_ids = selected[:5]
+    elif preset == "selected-50":
+        instance_ids = selected
+    else:
+        raise ValueError("preset must be smoke-5 or selected-50")
     slots = [
         {"ordinal": ordinal, "instance_id": instance_id, "method": method}
         for ordinal, (instance_id, method) in enumerate(
@@ -122,9 +128,11 @@ def build_manifest(*, run_id: str) -> dict[str, Any]:
     return {
         "schema": "carry.swe-bench-live-plan.v1",
         "run_id": run_id,
+        "preset": preset,
         "selection": str(benchmark.DEFAULT_SELECTION.relative_to(ROOT)),
         "selection_sha256": benchmark.sha256_file(benchmark.DEFAULT_SELECTION),
         "task_count": len(instance_ids),
+        "instance_ids": instance_ids,
         "methods": list(benchmark.METHODS),
         "record_count": len(slots),
         "slots": slots,
@@ -217,6 +225,7 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     plan_parser = commands.add_parser("plan", help="write the fixed 150-slot run manifest")
     plan_parser.add_argument("--run-id", required=True)
+    plan_parser.add_argument("--preset", choices=("smoke-5", "selected-50"), default="selected-50")
     plan_parser.add_argument("--output", type=pathlib.Path, required=True)
     invoke_parser = commands.add_parser("invoke", help="run one reviewed task/method on a disposable Docker worker")
     invoke_parser.add_argument("--run-id", required=True)
@@ -231,7 +240,7 @@ def main() -> int:
 
     try:
         if args.command == "plan":
-            payload = build_manifest(run_id=args.run_id)
+            payload = build_manifest(run_id=args.run_id, preset=args.preset)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         else:

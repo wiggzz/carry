@@ -35,6 +35,21 @@ class LiveRunnerTests(unittest.TestCase):
         )
         self.assertEqual([slot["ordinal"] for slot in slots], list(range(150)))
 
+    def test_smoke_manifest_is_first_five_frozen_tasks_and_exactly_fifteen_slots(self):
+        manifest = self.runner.build_manifest(run_id="smoke-1", preset="smoke-5")
+        selected = self.runner.benchmark.load_selection()
+        self.assertEqual(manifest["instance_ids"], selected[:5])
+        self.assertEqual(manifest["task_count"], 5)
+        self.assertEqual(manifest["record_count"], 15)
+        self.assertEqual(
+            [(slot["instance_id"], slot["method"]) for slot in manifest["slots"]],
+            [(instance_id, method) for instance_id in selected[:5] for method in ("carry", "codex", "pi")],
+        )
+
+    def test_smoke_manifest_rejects_unknown_preset(self):
+        with self.assertRaisesRegex(ValueError, "preset"):
+            self.runner.build_manifest(run_id="smoke-2", preset="quick")
+
     def test_boundaries_separate_agents_from_evaluation_and_expose_only_task_and_output(self):
         boundaries = self.runner.build_boundaries()
         agents = boundaries["agents"]

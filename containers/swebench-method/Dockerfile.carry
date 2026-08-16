@@ -1,0 +1,13 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS build
+WORKDIR /source
+COPY . .
+RUN cargo build --release --locked
+
+FROM ${BASE_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git python3 && rm -rf /var/lib/apt/lists/*
+COPY --from=build /source/target/release/carry /usr/local/bin/carry
+COPY containers/swebench-method/entrypoint.py /usr/local/bin/swebench-method
+RUN chmod 0555 /usr/local/bin/swebench-method
+ENV AGENT_COMMAND="carry run --cwd /workspace --task-file {prompt} --run-dir {output} --model {model}"
+ENTRYPOINT ["/usr/local/bin/swebench-method"]

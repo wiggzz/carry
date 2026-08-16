@@ -32,32 +32,32 @@ status, and the two pinned image references.
 
 ## Manual protected workflow
 
-The readiness workflow has only a `workflow_dispatch` trigger and uses the
-protected `swe-bench` Environment, but it is deliberately **credential-free**:
-it writes and validates the 150-slot plan on a GitHub-hosted control-plane
-runner. It cannot run as push or pull-request CI.
+The existing default-branch workflow has only `workflow_dispatch`, uses the protected
+`swe-bench` Environment, and preserves credential-free `bootstrap` as its default.
+`smoke-5` resolves and archives the requested commit before AWS authentication, then
+runs exactly the first five frozen IDs across three methods. It fails artifact validation
+unless all 15 records exist, including explicit failed records with empty patches.
 
 The `invoke` command is worker-side code. A future reviewed extension to the
 existing EC2 dispatcher must copy it to the short-lived worker and invoke it
 there; the dispatcher must terminate the instance after the slot/lane finishes.
 No self-hosted or persistent GitHub runner is permitted.
 
-## Remaining runtime blockers
+The worker builds each run-local method image once. Carry is built from the archived
+commit; Codex defaults to `@openai/codex@0.146.0`; Pi is fixed at
+`@earendil-works/pi-coding-agent@0.84.2`. Base images require digest references, and the
+Node base must provide Node >=22.19. Since this repository does not prove the current
+noninteractive Codex/Pi syntax, protected command templates are mandatory and missing
+templates fail closed.
 
-This layer is reviewable but not deployable until operators:
+The canonical dataset is loaded at revision
+`c104f840cc67f8b6eec6f759ebc8b2693d585d4a` and materialized as local JSON for
+`swebench==4.1.0`. Official reports alone determine resolution. Evaluator processes have
+all `OPENAI_*` variables removed and may use only host Docker and canonical task data.
 
-- build and review dedicated agent images/adapters for **each** Carry, Codex, and
-  Pi lane, plus the evaluator image containing the `/opt/swebench/evaluate-task`
-  adapter (the included entrypoint currently implements Carry only);
-- publish reviewed agent/evaluator images and make their immutable digest
-  references available to the reviewed dispatcher as nonsecret run configuration;
-- install Docker in the pinned disposable-worker AMI or its reviewed bootstrap,
-  without registering a GitHub self-hosted runner;
-- materialize selected task bundles containing the public record, prompt,
-  disposable repository, and task-bundled evaluator testbed; and
-- negative-test metadata-service access, host file access, operation without a
-  Docker socket, and key retention in container outputs and logs.
+## Remaining scaling blockers
 
-The Dockerfiles require an explicit `BASE_IMAGE` build argument, preventing an
-accidental build from a floating default. Building or reviewing images and
-provisioning the worker are intentionally outside this change.
+Do not expand to the full 50 until smoke data establishes instance sizing, wall time,
+token spend, evaluator image/cache pressure, and safe URL/job timeouts. A 50-task design
+also needs reviewed concurrency and artifact aggregation while retaining the exact
+150-record denominator and no selective retry/replacement policy.

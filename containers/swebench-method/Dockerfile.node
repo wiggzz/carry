@@ -1,0 +1,10 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG PACKAGE
+ARG PACKAGE_VERSION
+ARG AGENT_COMMAND
+RUN npm install --global "${PACKAGE}@${PACKAGE_VERSION}"
+ENV AGENT_COMMAND=${AGENT_COMMAND}
+COPY entrypoint.py /usr/local/bin/swebench-method
+RUN chmod 0555 /usr/local/bin/swebench-method
+ENTRYPOINT ["/usr/local/bin/swebench-method"]
