@@ -1,5 +1,5 @@
 ---
-name: EC2 benchmark bootstrap
+name: Run SWE-bench
 
 on:
   workflow_dispatch:
@@ -51,6 +51,9 @@ jobs:
       BENCHMARK_MODE: ${{ inputs.mode }}
       MODEL: ${{ vars.BENCHMARK_MODEL || 'gpt-5.6-luna' }}
       REASONING: ${{ vars.BENCHMARK_REASONING || 'medium' }}
+      BENCHMARK_INPUT_USD_PER_MILLION: ${{ vars.BENCHMARK_INPUT_USD_PER_MILLION }}
+      BENCHMARK_CACHED_INPUT_USD_PER_MILLION: ${{ vars.BENCHMARK_CACHED_INPUT_USD_PER_MILLION }}
+      BENCHMARK_OUTPUT_USD_PER_MILLION: ${{ vars.BENCHMARK_OUTPUT_USD_PER_MILLION }}
     steps:
       - name: Bind candidate source to the reviewed workflow ref
         shell: bash
@@ -227,6 +230,9 @@ jobs:
             printf 'RUN_ID=%q\n' "$RUN_ID"
             printf 'MODEL=%q\n' "$MODEL"
             printf 'REASONING=%q\n' "$REASONING"
+            printf 'BENCHMARK_INPUT_USD_PER_MILLION=%q\n' "$BENCHMARK_INPUT_USD_PER_MILLION"
+            printf 'BENCHMARK_CACHED_INPUT_USD_PER_MILLION=%q\n' "$BENCHMARK_CACHED_INPUT_USD_PER_MILLION"
+            printf 'BENCHMARK_OUTPUT_USD_PER_MILLION=%q\n' "$BENCHMARK_OUTPUT_USD_PER_MILLION"
             cat scripts/swebench_ec2_worker.sh
           } > worker-user-data.sh
           EXPIRES_AT=$(date -u -d '+6 hours' +'%Y-%m-%dT%H:%M:%SZ')
@@ -288,13 +294,21 @@ jobs:
             aws s3 cp "$RUNNER_TEMP/control.json" "s3://$ARTIFACT_BUCKET/$PREFIX/control.json" --sse AES256 --only-show-errors || return
             rm -f "$RUNNER_TEMP/control.json"
           }
+          stream_progress() {
+            aws ec2 get-console-output --instance-id "$WORKER_INSTANCE_ID" --latest \
+              --query Output --output text 2>/dev/null \
+              | python3 scripts/benchmark_progress.py --state "$RUNNER_TEMP/benchmark-progress-seen.json" \
+              || true
+          }
           while (( SECONDS < deadline )); do
             if curl --proto '=https' --tlsv1.2 --fail --silent \
               "$RESULT_GET_URL" -o benchmark-artifact/results.tar.gz.tmp; then
               mv benchmark-artifact/results.tar.gz.tmp benchmark-artifact/results.tar.gz
+              stream_progress
               exit 0
             fi
             rm -f benchmark-artifact/results.tar.gz.tmp
+            stream_progress
             if [[ "$BENCHMARK_MODE" == official-50 ]] && (( SECONDS >= next_rotation )); then
               if rotate_capabilities; then
                 next_rotation=$((SECONDS + 1500))
@@ -349,6 +363,16 @@ jobs:
           blocked={'not-run', 'evaluator-failed'}
           assert not any(r.get('status') in blocked for r in records), 'benchmark has unexecuted or ungraded slots'
           PY
+
+      - name: Publish benchmark performance summary
+        if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'official-50')
+        shell: bash
+        run: |
+          if [[ -f benchmark-artifact/report.md ]]; then
+            cat benchmark-artifact/report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '# SWE-bench report\n\nNo report was produced. See the worker diagnostics artifact.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload results and diagnostics
         if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'official-50')

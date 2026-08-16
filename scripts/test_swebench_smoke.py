@@ -89,6 +89,98 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertIn("Completed: 1", summary)
             self.assertIn("Resolved: 1", summary)
 
+    def test_agent_usage_is_normalized_from_each_harness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            carry = root / "carry"
+            carry.mkdir()
+            (carry / "result.json").write_text(json.dumps({"usage": {
+                "input_tokens": 100, "cached_input_tokens": 40,
+                "cache_write_input_tokens": 10, "output_tokens": 20,
+                "reasoning_tokens": 5, "total_tokens": 120,
+            }}))
+            codex = root / "codex"
+            codex.mkdir()
+            (codex / "trace.log").write_text("\n".join((
+                json.dumps({"type": "turn.completed", "usage": {
+                    "input_tokens": 200, "cached_input_tokens": 150,
+                    "cache_write_input_tokens": 40, "output_tokens": 30,
+                    "reasoning_output_tokens": 7,
+                }}),
+                json.dumps({"type": "unrelated", "usage": {"input_tokens": 999}}),
+            )))
+            pi = root / "pi"
+            pi.mkdir()
+            (pi / "trace.log").write_text("\n".join((
+                json.dumps({"type": "message_end", "message": {"role": "assistant", "usage": {
+                    "input": 3, "cacheRead": 4, "cacheWrite": 5,
+                    "output": 6, "reasoning": 2, "totalTokens": 18,
+                }}}),
+                json.dumps({"type": "message_end", "message": {"role": "assistant", "usage": {
+                    "input": 7, "cacheRead": 8, "cacheWrite": 9,
+                    "output": 10, "reasoning": 3, "totalTokens": 34,
+                }}}),
+            )))
+
+            self.assertEqual(self.worker.load_agent_usage("carry", carry), {
+                "input_tokens": 100, "cached_input_tokens": 40,
+                "cache_write_input_tokens": 10, "output_tokens": 20,
+                "reasoning_tokens": 5, "total_tokens": 120,
+            })
+            self.assertEqual(self.worker.load_agent_usage("codex", codex), {
+                "input_tokens": 200, "cached_input_tokens": 150,
+                "cache_write_input_tokens": 40, "output_tokens": 30,
+                "reasoning_tokens": 7, "total_tokens": 230,
+            })
+            self.assertEqual(self.worker.load_agent_usage("pi", pi), {
+                "input_tokens": 36, "cached_input_tokens": 12,
+                "cache_write_input_tokens": 14, "output_tokens": 16,
+                "reasoning_tokens": 5, "total_tokens": 52,
+            })
+
+    def test_configured_pricing_estimates_cost_without_guessing(self):
+        pricing = self.worker.pricing_from_config({
+            "BENCHMARK_INPUT_USD_PER_MILLION": "10",
+            "BENCHMARK_CACHED_INPUT_USD_PER_MILLION": "1",
+            "BENCHMARK_OUTPUT_USD_PER_MILLION": "20",
+        })
+        usage = {"input_tokens": 100, "cached_input_tokens": 40,
+                 "cache_write_input_tokens": 10, "output_tokens": 20,
+                 "reasoning_tokens": 5, "total_tokens": 120}
+        self.assertEqual(self.worker.estimate_cost_usd(usage, pricing), 0.00104)
+        self.assertIsNone(self.worker.pricing_from_config({}))
+        with self.assertRaisesRegex(ValueError, "all three"):
+            self.worker.pricing_from_config({"BENCHMARK_INPUT_USD_PER_MILLION": "10"})
+
+    def test_finalize_reports_per_agent_time_tokens_and_configured_cost(self):
+        tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
+        records = []
+        for task_number, task in enumerate(tasks):
+            for index, method in enumerate(("carry", "codex", "pi"), 1):
+                records.append({
+                    "instance_id": task["instance_id"], "method": method, "status": "evaluated",
+                    "patch": "", "error": None,
+                    "resolved": task_number == 0 and method == "carry",
+                    "elapsed_seconds": index + 0.25 if task_number == 0 else 0,
+                    "estimated_cost_usd": index / 10 if task_number == 0 else 0,
+                    "usage": {"input_tokens": index * 10 if task_number == 0 else 0,
+                              "cached_input_tokens": index if task_number == 0 else 0,
+                              "cache_write_input_tokens": 0,
+                              "output_tokens": index * 2 if task_number == 0 else 0,
+                              "reasoning_tokens": index if task_number == 0 else 0,
+                              "total_tokens": index * 12 if task_number == 0 else 0},
+                })
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            self.worker.finalize(tasks=tasks, records=records, output=output, provenance={})
+            report = json.loads((output / "report.json").read_text())
+            self.assertEqual(report["methods"]["carry"]["elapsed_seconds"], 1.25)
+            self.assertEqual(report["methods"]["codex"]["usage"]["input_tokens"], 20)
+            self.assertEqual(report["methods"]["pi"]["estimated_cost_usd"], 0.3)
+            summary = (output / "report.md").read_text()
+            self.assertIn("## Agent runs", summary)
+            self.assertIn("| task-0 | carry | evaluated | yes | 1.250 | 12 | $0.100000 |", summary)
+
     def test_finalize_rejects_missing_duplicate_or_replaced_slots(self):
         tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
         records = [
@@ -313,19 +405,33 @@ class SmokeWorkerTests(unittest.TestCase):
             def fake_run(*_args, **_kwargs):
                 (root / "output" / "final.patch").write_text("diff --git a/a b/a\n", encoding="utf-8")
                 (root / "output" / "result.json").write_text(
-                    json.dumps({"response_retries": 4}), encoding="utf-8"
+                    json.dumps({"response_retries": 4, "usage": {
+                        "input_tokens": 100, "cached_input_tokens": 40,
+                        "cache_write_input_tokens": 10, "output_tokens": 20,
+                        "reasoning_tokens": 5, "total_tokens": 120,
+                    }}), encoding="utf-8"
                 )
 
-            with mock.patch.object(self.worker.subprocess, "run", side_effect=fake_run):
+            pricing = {"input": 10.0, "cached_input": 1.0, "output": 20.0}
+            with mock.patch.object(self.worker.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(self.worker.time, "monotonic", side_effect=[10.0, 12.5]), \
+                    mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as stdout:
                 record = self.worker.run_agent(
                     instance_id="task-1", method="carry", image="carry:run",
                     repo=root / "repo", task_input=root / "input", output=root / "output",
-                    model="gpt-5.6-luna", reasoning="medium",
+                    model="gpt-5.6-luna", reasoning="medium", pricing=pricing,
                 )
 
             self.assertEqual(record["status"], "agent-completed")
             self.assertEqual(record["retries"], 0)
             self.assertEqual(record["response_retries"], 4)
+            self.assertEqual(record["elapsed_seconds"], 2.5)
+            self.assertEqual(record["usage"]["total_tokens"], 120)
+            self.assertEqual(record["estimated_cost_usd"], 0.00104)
+            progress = [json.loads(line.removeprefix("BENCHMARK_PROGRESS "))
+                        for line in stdout.getvalue().splitlines()]
+            self.assertEqual([event["state"] for event in progress], ["started", "completed"])
+            self.assertEqual(progress[-1]["instance_id"], "task-1")
 
     def test_run_agent_force_removes_the_exact_container_after_host_timeout(self):
         with tempfile.TemporaryDirectory() as directory:
