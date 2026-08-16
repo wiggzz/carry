@@ -51,8 +51,8 @@ jobs:
       - name: Unit tests
         run: cargo test
 
-      - name: Benchmark planner and bootstrap lifecycle tests
-        run: python3 -m unittest -v scripts/test_swebench_benchmark.py scripts/test_wait_for_ec2_termination.py
+      - name: Benchmark planning, live-contract, and bootstrap lifecycle tests
+        run: python3 -m unittest -v scripts/test_swebench_benchmark.py scripts/test_swebench_live_runner.py scripts/test_wait_for_ec2_termination.py
 
       - name: Release build
         run: cargo build --release --locked

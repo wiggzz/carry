@@ -1,0 +1,43 @@
+---
+name: SWE-bench live (blocked)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Reviewable run identifier (letters, digits, dot, underscore, dash)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  review-live-plan:
+    name: review blocked live plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: swe-bench
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Test the credential-free runner contracts
+        run: python3 -m unittest scripts/test_swebench_benchmark.py scripts/test_swebench_live_runner.py
+
+      - name: Materialize the fixed 150-slot plan
+        env:
+          BENCHMARK_RUN_ID: ${{ inputs.run_id }}
+        run: python3 scripts/swebench_live_runner.py plan --run-id "$BENCHMARK_RUN_ID" --output artifacts/live-plan.json
+
+      - name: Verify live execution remains blocked without a credential broker
+        run: |
+          if python3 scripts/swebench_live_runner.py authorize-live; then
+            echo "live execution unexpectedly bypassed the credential-broker gate" >&2
+            exit 1
+          fi
+
+      # No model, container, cloud, credential, or evaluator step may be added
+      # after this point until authorize-live is backed by a separately reviewed
+      # broker protocol and external-boundary implementation.
