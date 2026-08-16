@@ -45,7 +45,7 @@ class WaitForEc2TerminationTests(unittest.TestCase):
             )
 
     def test_waits_through_pending_and_running_until_terminated(self):
-        result = self.run_waiter(["pending", "running", "stopping", "terminated"])
+        result = self.run_waiter(["pending", "running", "stopping", "shutting-down", "terminated"])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("terminated", result.stdout)
 
