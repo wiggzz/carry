@@ -40,41 +40,41 @@ permissions, so agent-created processes cannot obtain useful AWS credentials.
 ## Prerequisites
 
 1. An existing GitHub Actions OIDC provider for
-   `token.actions.githubusercontent.com` in the target AWS account. This
-   account already appears to use that pattern elsewhere; it is referenced, not
-   recreated, to avoid a duplicate global IAM provider.
-2. An existing **public** subnet with an internet route. The security group
-   has no inbound rules; the public address is solely for outbound TLS through
-   the internet gateway.
-3. A remote Terraform-state backend chosen and configured by the operator.
-   Do not commit a local `.tfstate` or credentials. This configuration does not
-   bootstrap a state bucket because Terraform cannot safely use a bucket it is
-   simultaneously creating as its own backend.
-4. Apply credentials with IAM/VPC/EC2/S3 permission. The currently available
-   local automation identity is intentionally too restricted to inspect or
-   create IAM OIDC resources, so apply with the account’s infrastructure role.
+   `token.actions.githubusercontent.com` in the target account. The deploy script
+   derives and verifies its ARN; it does not create a duplicate global provider.
+2. AWS credentials allowed to create/read S3, VPC/EC2, IAM, and the Terraform
+   resources. No model credential is used.
+3. A default VPC with a public subnet, or `WORKER_SUBNET_ID` set for an existing
+   public subnet with outbound internet access. The worker security group has no
+   inbound rules.
 
 ## One-command deploy
 
-The Terraform state bucket must exist **once** before Terraform can initialize its
-S3 backend. It is deliberately separate from the benchmark artifact bucket. This
-is the only AWS resource to create outside this configuration; Terraform cannot
-create the bucket it needs as its own backend.
+From the repository root:
 
-1. Create one private S3 state bucket in the target account, with versioning and
-   encryption enabled. Do not use the benchmark artifact bucket.
-2. Copy `backend.hcl.example` to ignored `backend.hcl` and set that state bucket.
-3. Copy `terraform.tfvars.example` to ignored `terraform.tfvars` and set the
-   pinned AMI, existing public subnet, GitHub OIDC provider ARN, and artifact
-   bucket name.
-4. Run the only deployment command from the repository root:
+```sh
+infra/scripts/apply.sh
+```
 
-   ```sh
-   infra/scripts/apply.sh
-   ```
+With no configuration files or prompts, the script derives the account and OIDC
+provider, creates a separate private/versioned/encrypted Terraform-state bucket,
+calculates an artifact-bucket name, selects a public subnet from the default VPC,
+and resolves a concrete Amazon Linux x86_64 AMI/root device. It writes the ignored
+local `backend.hcl` and `terraform.tfvars`, then initializes Terraform and applies
+it non-interactively. The generated values stay pinned in `terraform.tfvars` for
+later applies.
 
-The script initializes the configured backend and applies non-interactively. It
-never reads credentials or model keys from files in this repository.
+Optional first-run overrides:
+
+```sh
+AWS_REGION=us-west-2 STAGE=swebench infra/scripts/apply.sh
+WORKER_SUBNET_ID=subnet-... WORKER_AMI_ID=ami-... infra/scripts/apply.sh
+```
+
+`AWS_REGION` otherwise comes from the configured AWS CLI profile (then defaults to
+`us-west-2`); `STAGE` defaults to `swebench`. The automatic Amazon Linux AMI is
+sufficient for the credential-free bootstrap canary. Set `WORKER_AMI_ID` to a
+reviewed worker image before enabling the future external-container live runner.
 
 Every taggable resource receives `Application=Carry`,
 `Repository=wiggzz/carry`, and `Component=swebench-benchmark`. Workers and

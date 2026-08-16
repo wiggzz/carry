@@ -1,6 +1,0 @@
-# This bucket must already exist and must not be the benchmark artifact bucket.
-bucket       = "YOUR_EXISTING_TERRAFORM_STATE_BUCKET"
-key          = "carry/swebench-benchmark-infra.tfstate"
-region       = "us-west-2"
-encrypt      = true
-use_lockfile = true

@@ -37,7 +37,7 @@ variable "github_environment" {
 }
 
 variable "worker_ami_id" {
-  description = "Pinned x86_64 worker AMI ID. Build and review this image separately; never use a moving latest-AMI lookup for benchmark runs."
+  description = "Concrete x86_64 worker AMI ID. apply.sh resolves and pins a default once; override it with a reviewed image before live agent runs."
   type        = string
 }
 

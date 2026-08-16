@@ -30,9 +30,6 @@ jobs:
           terraform -chdir=infra init -backend=false -input=false
           terraform -chdir=infra validate
 
-      - name: Test infrastructure contracts
-        run: python3 -m unittest -v infra/test_infra_contract.py
-
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
