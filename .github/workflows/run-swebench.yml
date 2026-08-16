@@ -51,9 +51,6 @@ jobs:
       BENCHMARK_MODE: ${{ inputs.mode }}
       MODEL: ${{ vars.BENCHMARK_MODEL || 'gpt-5.6-luna' }}
       REASONING: ${{ vars.BENCHMARK_REASONING || 'medium' }}
-      BENCHMARK_INPUT_USD_PER_MILLION: ${{ vars.BENCHMARK_INPUT_USD_PER_MILLION }}
-      BENCHMARK_CACHED_INPUT_USD_PER_MILLION: ${{ vars.BENCHMARK_CACHED_INPUT_USD_PER_MILLION }}
-      BENCHMARK_OUTPUT_USD_PER_MILLION: ${{ vars.BENCHMARK_OUTPUT_USD_PER_MILLION }}
     steps:
       - name: Bind candidate source to the reviewed workflow ref
         shell: bash
@@ -230,9 +227,6 @@ jobs:
             printf 'RUN_ID=%q\n' "$RUN_ID"
             printf 'MODEL=%q\n' "$MODEL"
             printf 'REASONING=%q\n' "$REASONING"
-            printf 'BENCHMARK_INPUT_USD_PER_MILLION=%q\n' "$BENCHMARK_INPUT_USD_PER_MILLION"
-            printf 'BENCHMARK_CACHED_INPUT_USD_PER_MILLION=%q\n' "$BENCHMARK_CACHED_INPUT_USD_PER_MILLION"
-            printf 'BENCHMARK_OUTPUT_USD_PER_MILLION=%q\n' "$BENCHMARK_OUTPUT_USD_PER_MILLION"
             cat scripts/swebench_ec2_worker.sh
           } > worker-user-data.sh
           EXPIRES_AT=$(date -u -d '+6 hours' +'%Y-%m-%dT%H:%M:%SZ')

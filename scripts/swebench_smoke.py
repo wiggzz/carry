@@ -17,6 +17,14 @@ from collections import Counter
 from typing import Any, Mapping
 
 METHODS = ("carry", "codex", "pi")
+MODEL_PRICING_USD_PER_MILLION = {
+    "gpt-5.6-luna": {
+        "input": 0.20,
+        "cached_input": 0.02,
+        "cache_write_input": 0.25,
+        "output": 1.20,
+    },
+}
 USAGE_KEYS = (
     "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
     "output_tokens", "reasoning_tokens", "total_tokens",
@@ -93,34 +101,23 @@ def load_agent_usage(method: str, output: pathlib.Path) -> dict[str, int]:
     return usage
 
 
-def pricing_from_config(config: Mapping[str, str]) -> dict[str, float] | None:
-    names = {
-        "input": "BENCHMARK_INPUT_USD_PER_MILLION",
-        "cached_input": "BENCHMARK_CACHED_INPUT_USD_PER_MILLION",
-        "output": "BENCHMARK_OUTPUT_USD_PER_MILLION",
-    }
-    values = {key: config.get(name, "").strip() for key, name in names.items()}
-    if not any(values.values()):
-        return None
-    if not all(values.values()):
-        raise ValueError("all three benchmark pricing values must be configured")
-    try:
-        pricing = {key: float(value) for key, value in values.items()}
-    except ValueError as error:
-        raise ValueError("benchmark pricing values must be numbers") from error
-    if any(not math.isfinite(value) or value < 0 for value in pricing.values()):
-        raise ValueError("benchmark pricing values must be finite and nonnegative")
-    return pricing
+def pricing_for_model(model: str) -> dict[str, float] | None:
+    pricing = MODEL_PRICING_USD_PER_MILLION.get(model)
+    return dict(pricing) if pricing is not None else None
 
 
 def estimate_cost_usd(usage: Mapping[str, int], pricing: Mapping[str, float] | None) -> float | None:
     if pricing is None:
         return None
     cached = min(usage["cached_input_tokens"], usage["input_tokens"])
-    uncached = usage["input_tokens"] - cached
+    cache_write = min(
+        usage["cache_write_input_tokens"], usage["input_tokens"] - cached,
+    )
+    ordinary = usage["input_tokens"] - cached - cache_write
     cost = (
-        uncached * pricing["input"]
+        ordinary * pricing["input"]
         + cached * pricing["cached_input"]
+        + cache_write * pricing["cache_write_input"]
         + usage["output_tokens"] * pricing["output"]
     ) / 1_000_000
     return round(cost, 6)
@@ -622,7 +619,7 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
 def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathlib.Path,
                       config: Mapping[str, str]) -> None:
     validated = validate_config(config)
-    pricing = pricing_from_config(config)
+    pricing = pricing_for_model(validated["MODEL"])
     mode = config.get("BENCHMARK_MODE", "smoke-5")
     phase_limits = official_phase_limits(config) if mode == "official-50" else None
     frozen_ids = json.loads(

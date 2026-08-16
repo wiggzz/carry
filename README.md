@@ -92,10 +92,6 @@ deployment first, then these protected `swe-bench` GitHub Environment values:
 - secret `OPENAI_API_KEY` (protected benchmark modes only)
 - optional `BENCHMARK_MODEL` (defaults to `gpt-5.6-luna`) and
   `BENCHMARK_REASONING` (defaults to `medium`)
-- optional input, cached-input, and output prices in USD per million tokens:
-  `BENCHMARK_INPUT_USD_PER_MILLION`, `BENCHMARK_CACHED_INPUT_USD_PER_MILLION`, and
-  `BENCHMARK_OUTPUT_USD_PER_MILLION`. Configure all three or none; costs remain explicitly
-  unavailable when prices are omitted.
 
 The reviewed worker code pins Node 22.19 and Rust base-image manifest digests,
 `@openai/codex@0.147.0`, and `@earendil-works/pi-coding-agent@0.84.2`.
@@ -128,7 +124,9 @@ because SWE-bench may suppress its own stop/remove failures. Queued agent
 slots become explicit budget-exhausted diagnostics rather than silently disappearing.
 The controller permits twenty minutes for EC2 launch/boot around the worker clock and
 reserves the remaining forty minutes of its six-hour job for termination and exact cleanup.
-All limits, configured pricing, and image identities are recorded in provenance. The workflow
+All limits, model-derived pricing, and image identities are recorded in provenance. Pricing is
+looked up by exact model ID in the reviewed benchmark code and accounts separately for ordinary
+input, cache reads, cache writes, and output; unknown models report cost as unavailable. The workflow
 streams deduplicated slot start/completion/grading events from the worker's EC2 console and
 publishes the final method and per-slot performance/time/token/cost table in the GitHub run
 summary. The same data remains in `records.json`, `report.json`, and `report.md` in the artifact.

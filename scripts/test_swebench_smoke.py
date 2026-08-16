@@ -138,19 +138,13 @@ class SmokeWorkerTests(unittest.TestCase):
                 "reasoning_tokens": 5, "total_tokens": 52,
             })
 
-    def test_configured_pricing_estimates_cost_without_guessing(self):
-        pricing = self.worker.pricing_from_config({
-            "BENCHMARK_INPUT_USD_PER_MILLION": "10",
-            "BENCHMARK_CACHED_INPUT_USD_PER_MILLION": "1",
-            "BENCHMARK_OUTPUT_USD_PER_MILLION": "20",
-        })
-        usage = {"input_tokens": 100, "cached_input_tokens": 40,
-                 "cache_write_input_tokens": 10, "output_tokens": 20,
-                 "reasoning_tokens": 5, "total_tokens": 120}
-        self.assertEqual(self.worker.estimate_cost_usd(usage, pricing), 0.00104)
-        self.assertIsNone(self.worker.pricing_from_config({}))
-        with self.assertRaisesRegex(ValueError, "all three"):
-            self.worker.pricing_from_config({"BENCHMARK_INPUT_USD_PER_MILLION": "10"})
+    def test_model_pricing_accounts_for_reads_writes_and_output(self):
+        pricing = self.worker.pricing_for_model("gpt-5.6-luna")
+        usage = {"input_tokens": 1_000_000, "cached_input_tokens": 400_000,
+                 "cache_write_input_tokens": 200_000, "output_tokens": 100_000,
+                 "reasoning_tokens": 5, "total_tokens": 1_100_000}
+        self.assertEqual(self.worker.estimate_cost_usd(usage, pricing), 0.258)
+        self.assertIsNone(self.worker.pricing_for_model("unknown-model"))
 
     def test_finalize_reports_per_agent_time_tokens_and_configured_cost(self):
         tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
@@ -412,7 +406,7 @@ class SmokeWorkerTests(unittest.TestCase):
                     }}), encoding="utf-8"
                 )
 
-            pricing = {"input": 10.0, "cached_input": 1.0, "output": 20.0}
+            pricing = self.worker.pricing_for_model("gpt-5.6-luna")
             with mock.patch.object(self.worker.subprocess, "run", side_effect=fake_run), \
                     mock.patch.object(self.worker.time, "monotonic", side_effect=[10.0, 12.5]), \
                     mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as stdout:
@@ -427,7 +421,7 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertEqual(record["response_retries"], 4)
             self.assertEqual(record["elapsed_seconds"], 2.5)
             self.assertEqual(record["usage"]["total_tokens"], 120)
-            self.assertEqual(record["estimated_cost_usd"], 0.00104)
+            self.assertEqual(record["estimated_cost_usd"], 0.000037)
             progress = [json.loads(line.removeprefix("BENCHMARK_PROGRESS "))
                         for line in stdout.getvalue().splitlines()]
             self.assertEqual([event["state"] for event in progress], ["started", "completed"])
