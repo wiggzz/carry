@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/wiggzz/carry/compare/v0.1.1...v0.2.0) (2026-08-16)
+
+
+### Features
+
+* add protected EC2 benchmark bootstrap ([#7](https://github.com/wiggzz/carry/issues/7)) ([#15](https://github.com/wiggzz/carry/issues/15)) ([3983db5](https://github.com/wiggzz/carry/commit/3983db59f09216eb9aefd34e7a7ca8cefffc3bb5))
+
 ## [0.1.1](https://github.com/wiggzz/carry/compare/v0.1.0...v0.1.1) (2026-08-16)
 
 
