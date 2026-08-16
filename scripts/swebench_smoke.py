@@ -17,6 +17,110 @@ from collections import Counter
 from typing import Any, Mapping
 
 METHODS = ("carry", "codex", "pi")
+MODEL_PRICING_USD_PER_MILLION = {
+    "gpt-5.6-luna": {
+        "input": 0.20,
+        "cached_input": 0.02,
+        "cache_write_input": 0.25,
+        "output": 1.20,
+    },
+}
+USAGE_KEYS = (
+    "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+    "output_tokens", "reasoning_tokens", "total_tokens",
+)
+
+
+def empty_usage() -> dict[str, int]:
+    return {key: 0 for key in USAGE_KEYS}
+
+
+def _nonnegative_int(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def load_agent_usage(method: str, output: pathlib.Path) -> dict[str, int]:
+    """Normalize cumulative token usage emitted by each pinned harness."""
+    usage = empty_usage()
+    if method == "carry":
+        path = output / "result.json"
+        if not path.is_file():
+            return usage
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8")).get("usage", {})
+        except (OSError, json.JSONDecodeError):
+            return usage
+        if isinstance(raw, dict):
+            return {key: _nonnegative_int(raw.get(key)) for key in USAGE_KEYS}
+        return usage
+
+    path = output / "trace.log"
+    if not path.is_file():
+        return usage
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return usage
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if method == "codex" and event.get("type") == "turn.completed":
+            raw = event.get("usage", {})
+            if isinstance(raw, dict):
+                usage = {
+                    "input_tokens": _nonnegative_int(raw.get("input_tokens")),
+                    "cached_input_tokens": _nonnegative_int(raw.get("cached_input_tokens")),
+                    "cache_write_input_tokens": _nonnegative_int(raw.get("cache_write_input_tokens")),
+                    "output_tokens": _nonnegative_int(raw.get("output_tokens")),
+                    "reasoning_tokens": _nonnegative_int(raw.get("reasoning_output_tokens")),
+                    "total_tokens": 0,
+                }
+                usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+        elif method == "pi" and event.get("type") == "message_end":
+            message = event.get("message", {})
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            raw = message.get("usage", {})
+            if not isinstance(raw, dict):
+                continue
+            input_tokens = sum(_nonnegative_int(raw.get(key)) for key in ("input", "cacheRead", "cacheWrite"))
+            additions = {
+                "input_tokens": input_tokens,
+                "cached_input_tokens": _nonnegative_int(raw.get("cacheRead")),
+                "cache_write_input_tokens": _nonnegative_int(raw.get("cacheWrite")),
+                "output_tokens": _nonnegative_int(raw.get("output")),
+                "reasoning_tokens": _nonnegative_int(raw.get("reasoning")),
+                "total_tokens": _nonnegative_int(raw.get("totalTokens")),
+            }
+            for key in USAGE_KEYS:
+                usage[key] += additions[key]
+    return usage
+
+
+def pricing_for_model(model: str) -> dict[str, float] | None:
+    pricing = MODEL_PRICING_USD_PER_MILLION.get(model)
+    return dict(pricing) if pricing is not None else None
+
+
+def estimate_cost_usd(usage: Mapping[str, int], pricing: Mapping[str, float] | None) -> float | None:
+    if pricing is None:
+        return None
+    cached = min(usage["cached_input_tokens"], usage["input_tokens"])
+    cache_write = min(
+        usage["cache_write_input_tokens"], usage["input_tokens"] - cached,
+    )
+    ordinary = usage["input_tokens"] - cached - cache_write
+    cost = (
+        ordinary * pricing["input"]
+        + cached * pricing["cached_input"]
+        + cache_write * pricing["cache_write_input"]
+        + usage["output_tokens"] * pricing["output"]
+    ) / 1_000_000
+    return round(cost, 6)
 
 
 class ContainerCleanupError(RuntimeError):
@@ -130,7 +234,8 @@ def agent_docker_command(*, image: str, method: str, repo: pathlib.Path, task_in
 
 def run_agent(*, instance_id: str, method: str, image: str, repo: pathlib.Path,
               task_input: pathlib.Path, output: pathlib.Path, model: str, reasoning: str,
-              timeout_seconds: int | None = None) -> dict[str, Any]:
+              timeout_seconds: int | None = None,
+              pricing: Mapping[str, float] | None = None) -> dict[str, Any]:
     slot_timeout = (
         timeout_seconds if timeout_seconds is not None
         else int(os.environ.get("AGENT_TIMEOUT_SECONDS", "1200"))
@@ -145,6 +250,10 @@ def run_agent(*, instance_id: str, method: str, image: str, repo: pathlib.Path,
         model=model, reasoning=reasoning, container_name=container_name,
         agent_timeout_seconds=in_container_timeout,
     )
+    started = time.monotonic()
+    print("BENCHMARK_PROGRESS " + json.dumps({
+        "instance_id": instance_id, "method": method, "state": "started",
+    }, sort_keys=True), flush=True)
     try:
         subprocess.run(command, check=True, timeout=slot_timeout)
         patch_file = output / "final.patch"
@@ -161,17 +270,27 @@ def run_agent(*, instance_id: str, method: str, image: str, repo: pathlib.Path,
             if (isinstance(response_retries, bool) or not isinstance(response_retries, int)
                     or response_retries < 0):
                 raise RuntimeError("Carry result.json has invalid response_retries")
-        return {"instance_id": instance_id, "method": method, "status": "agent-completed", "patch": patch,
-                "error": None, "attempts": 1, "retries": 0, "response_retries": response_retries}
+        record = {"instance_id": instance_id, "method": method, "status": "agent-completed",
+                  "patch": patch, "error": None, "attempts": 1, "retries": 0,
+                  "response_retries": response_retries}
     except (OSError, RuntimeError, json.JSONDecodeError,
             subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         if isinstance(error, subprocess.TimeoutExpired):
             force_remove_container(container_name, exact_name=True)
         patch_file = output / "final.patch"
         patch = patch_file.read_text(encoding="utf-8") if patch_file.is_file() else ""
-        return {"instance_id": instance_id, "method": method, "status": "agent-failed", "patch": patch,
-                "error": str(error), "attempts": 1, "retries": 0, "response_retries": 0,
-                "timed_out": isinstance(error, subprocess.TimeoutExpired)}
+        record = {"instance_id": instance_id, "method": method, "status": "agent-failed",
+                  "patch": patch, "error": str(error), "attempts": 1, "retries": 0,
+                  "response_retries": 0,
+                  "timed_out": isinstance(error, subprocess.TimeoutExpired)}
+    record["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    record["usage"] = load_agent_usage(method, output)
+    record["estimated_cost_usd"] = estimate_cost_usd(record["usage"], pricing)
+    print("BENCHMARK_PROGRESS " + json.dumps({
+        "elapsed_seconds": record["elapsed_seconds"], "instance_id": instance_id,
+        "method": method, "state": "completed", "status": record["status"],
+    }, sort_keys=True), flush=True)
+    return record
 
 
 def cleanup_evaluator_containers(run_id: str) -> None:
@@ -406,10 +525,25 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
         item.setdefault("error", None)
         item.setdefault("resolved", False)
         item.setdefault("response_retries", 0)
+        item.setdefault("elapsed_seconds", 0.0)
+        item.setdefault("estimated_cost_usd", None)
+        item.setdefault("usage", empty_usage())
         if (isinstance(item["response_retries"], bool)
                 or not isinstance(item["response_retries"], int)
                 or item["response_retries"] < 0):
             raise ValueError("response_retries must be a nonnegative integer")
+        if (isinstance(item["elapsed_seconds"], bool)
+                or not isinstance(item["elapsed_seconds"], (int, float))
+                or item["elapsed_seconds"] < 0):
+            raise ValueError("elapsed_seconds must be nonnegative")
+        if (item["estimated_cost_usd"] is not None
+                and (isinstance(item["estimated_cost_usd"], bool)
+                     or not isinstance(item["estimated_cost_usd"], (int, float))
+                     or item["estimated_cost_usd"] < 0)):
+            raise ValueError("estimated_cost_usd must be null or nonnegative")
+        if not isinstance(item["usage"], dict):
+            raise ValueError("usage must be an object")
+        item["usage"] = {key: _nonnegative_int(item["usage"].get(key)) for key in USAGE_KEYS}
         normalized.append(item)
         predictions.append({
             "instance_id": item["instance_id"],
@@ -427,11 +561,19 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
     methods = {}
     for method in METHODS:
         method_records = [item for item in normalized if item["method"] == method]
+        costs = [item["estimated_cost_usd"] for item in method_records
+                 if item["estimated_cost_usd"] is not None]
         methods[method] = {
             "denominator": task_count,
             "completed": sum(item["status"] == "evaluated" for item in method_records),
             "resolved": sum(bool(item["resolved"]) for item in method_records),
             "response_retries": sum(item["response_retries"] for item in method_records),
+            "elapsed_seconds": round(sum(item["elapsed_seconds"] for item in method_records), 3),
+            "usage": {
+                key: sum(item["usage"][key] for item in method_records) for key in USAGE_KEYS
+            },
+            "estimated_cost_usd": round(sum(costs), 6) if costs else None,
+            "costed_slots": len(costs),
             "statuses": dict(sorted(Counter(item["status"] for item in method_records).items())),
         }
     report = {
@@ -439,14 +581,37 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
         "methods": methods, "provenance": provenance,
     }
     (output / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    def cost_text(value: float | None) -> str:
+        return "unavailable" if value is None else f"${value:.6f}"
+
+    def method_cost_text(values: dict[str, Any]) -> str:
+        rendered = cost_text(values["estimated_cost_usd"])
+        if values["estimated_cost_usd"] is not None and values["costed_slots"] < values["denominator"]:
+            rendered += f" ({values['costed_slots']}/{values['denominator']} slots)"
+        return rendered
+
+    method_lines = "\n".join(
+        f"- {method}: {values['resolved']}/{values['denominator']} resolved; "
+        f"{values['completed']} completed; {values['denominator'] - values['completed']} failed/incomplete; "
+        f"{values['response_retries']} response retries; "
+        f"{values['elapsed_seconds']:.3f}s agent time; "
+        f"{values['usage']['total_tokens']} tokens; {method_cost_text(values)} estimated"
+        for method, values in methods.items()
+    )
+    slot_lines = "\n".join(
+        f"| {item['instance_id']} | {item['method']} | {item['status']} | "
+        f"{'yes' if item['resolved'] else 'no'} | {item['elapsed_seconds']:.3f} | "
+        f"{item['usage']['total_tokens']} | {cost_text(item['estimated_cost_usd'])} |"
+        for item in normalized
+    )
     (output / "report.md").write_text(
         "# SWE-bench Verified baseline\n\n"
         f"- Denominator: {denominator}\n- Completed: {completed}\n- Resolved: {resolved}\n\n"
-        + "\n".join(
-            f"- {method}: {values['resolved']}/{values['denominator']} resolved; "
-            f"{values['completed']} completed; {values['response_retries']} response retries"
-            for method, values in methods.items()
-        ) + "\n",
+        + method_lines
+        + "\n\n## Agent runs\n\n"
+        + "| Task | Agent | Status | Resolved | Agent seconds | Tokens | Estimated cost |\n"
+        + "|---|---|---|---:|---:|---:|---:|\n"
+        + slot_lines + "\n",
         encoding="utf-8",
     )
 
@@ -454,6 +619,7 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
 def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathlib.Path,
                       config: Mapping[str, str]) -> None:
     validated = validate_config(config)
+    pricing = pricing_for_model(validated["MODEL"])
     mode = config.get("BENCHMARK_MODE", "smoke-5")
     phase_limits = official_phase_limits(config) if mode == "official-50" else None
     frozen_ids = json.loads(
@@ -491,6 +657,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "swebench_version": "4.1.0", "model": validated["MODEL"],
         "reasoning": validated["REASONING"], "images": {},
         "mode": mode, "phase": "planned",
+        "pricing_usd_per_million": pricing,
     }
     tasks = [{
         "instance_id": record["instance_id"], "repo": record["repo"],
@@ -572,7 +739,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 image=provenance[method]["tag"], repo=task_root / method / "repo",
                 task_input=task_root / "input", output=slot_output,
                 model=validated["MODEL"], reasoning=validated["REASONING"],
-                timeout_seconds=slot_timeout,
+                timeout_seconds=slot_timeout, pricing=pricing,
             )
             record["model"] = validated["MODEL"]
             record["reasoning"] = validated["REASONING"]
@@ -621,6 +788,10 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 "instance_id": record["instance_id"], "model_name_or_path": method,
                 "model_patch": record["patch"],
             }, sort_keys=True) + "\n" for record in shard_records), encoding="utf-8")
+            for record in shard_records:
+                print("BENCHMARK_PROGRESS " + json.dumps({
+                    "instance_id": record["instance_id"], "method": method, "state": "grading",
+                }, sort_keys=True), flush=True)
             try:
                 process_timeout = None
                 if evaluation_deadline is not None:
@@ -647,6 +818,11 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 for record in shard_records:
                     record["status"] = "evaluator-failed"
                     record["error"] = str(error)
+            for record in shard_records:
+                print("BENCHMARK_PROGRESS " + json.dumps({
+                    "instance_id": record["instance_id"], "method": method,
+                    "state": "graded", "status": record["status"],
+                }, sort_keys=True), flush=True)
             finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload)
     provenance_payload["phase"] = "complete"
     finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload)

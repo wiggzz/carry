@@ -77,11 +77,9 @@ docker build --tag carry:dev .
 
 Live fixtures require `OPENAI_API_KEY`. Codex fixture comparisons require a separately configured Codex CLI session; neither runs in CI.
 
-## Benchmark planning
+## Running SWE-bench
 
-The manually dispatched **Benchmark plan** workflow emits five deterministic shards from the frozen 50-instance SWE-bench selection without running agents or requiring model credentials. The protected EC2 workflow below consumes the same immutable selection.
-
-The manually dispatched **EC2 benchmark bootstrap** workflow has a credential-free
+The manually dispatched **Run SWE-bench** workflow has a credential-free
 `bootstrap` default plus protected `smoke-5` and `official-50` modes. It requires the Terraform
 deployment first, then these protected `swe-bench` GitHub Environment values:
 
@@ -126,7 +124,12 @@ because SWE-bench may suppress its own stop/remove failures. Queued agent
 slots become explicit budget-exhausted diagnostics rather than silently disappearing.
 The controller permits twenty minutes for EC2 launch/boot around the worker clock and
 reserves the remaining forty minutes of its six-hour job for termination and exact cleanup.
-All limits and image identities are recorded in provenance.
+All limits, model-derived pricing, and image identities are recorded in provenance. Pricing is
+looked up by exact model ID in the reviewed benchmark code and accounts separately for ordinary
+input, cache reads, cache writes, and output; unknown models report cost as unavailable. The workflow
+streams deduplicated slot start/completion/grading events from the worker's EC2 console and
+publishes the final method and per-slot performance/time/token/cost table in the GitHub run
+summary. The same data remains in `records.json`, `report.json`, and `report.md` in the artifact.
 
 The smoke uses one-hour S3 capabilities. During the longer official mode, the protected
 controller rotates exact-run presigned control/result capabilities every 25 minutes;

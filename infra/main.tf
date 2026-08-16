@@ -312,6 +312,7 @@ data "aws_iam_policy_document" "github_dispatch" {
       "ec2:DescribeInstanceStatus",
       "ec2:DescribeLaunchTemplates",
       "ec2:DescribeLaunchTemplateVersions",
+      "ec2:GetConsoleOutput",
     ]
     resources = ["*"]
   }
