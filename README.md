@@ -92,17 +92,23 @@ deployment first, then these protected `swe-bench` GitHub Environment values:
 - `BENCHMARK_WORKER_LAUNCH_TEMPLATE_ID`
 - `BENCHMARK_WORKER_LAUNCH_TEMPLATE_VERSION` (the numeric `worker_launch_template_version` Terraform output)
 - secret `OPENAI_API_KEY` (smoke only)
-- `BENCHMARK_NODE_BASE_IMAGE` (Node >=22.19 image pinned as `name@sha256:...`)
-- `BENCHMARK_RUST_BASE_IMAGE` (Rust build image pinned as `name@sha256:...`)
-- `BENCHMARK_CODEX_COMMAND` and `BENCHMARK_PI_COMMAND`, each containing literal
-  `{model}` and `{prompt}` placeholders and verified by operators against the pinned CLI
-- optional `BENCHMARK_CODEX_VERSION` (defaults to exact `0.146.0`),
-  `BENCHMARK_MODEL` (defaults to `gpt-5.6-luna`), and `BENCHMARK_REASONING`
+- optional `BENCHMARK_MODEL` (defaults to `gpt-5.6-luna`) and
+  `BENCHMARK_REASONING` (defaults to `medium`)
 
-Choose the branch in `carry_ref`, leave `mode=bootstrap` for the existing canary, or
+The reviewed worker code pins Node 22.19 and Rust base-image manifest digests,
+`@openai/codex@0.147.0`, and `@earendil-works/pi-coding-agent@0.84.2`.
+It builds all three run-local images once on the disposable worker; no registry
+publishing pipeline or additional protected configuration is needed.
+
+Dispatch the workflow on the reviewed branch and use that same branch in `carry_ref`;
+the workflow checks out the dispatch event's immutable commit and rejects a different
+candidate ref. Leave `mode=bootstrap` for the existing canary, or
 choose `smoke-5` for the first five IDs of the frozen selected-50 across Carry/Codex/Pi
-(15 mandatory records). Smoke commonly takes hours and incurs EC2, model-token, storage,
-and image-build costs; actual cost varies substantially with tasks and model behavior.
+(15 mandatory records). To stay inside the initial run's one-hour chained-role
+capability lifetime, this nonofficial plumbing baseline caps each agent slot at six
+minutes, runs five agent slots concurrently, and caps each evaluator container at five
+minutes. Those caps are recorded in provenance and are not the settings for the later
+official comparison. The smoke incurs EC2, model-token, storage, and image-build costs.
 The workflow uploads a `swebench-smoke-5-*` artifact containing predictions, all slot
 metadata/traces, official outputs, canonical records, and the report.
 

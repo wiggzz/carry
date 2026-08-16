@@ -29,13 +29,18 @@ permissions, so agent-created processes cannot obtain useful AWS credentials.
 - It does **not** create a VPC, NAT gateway, public ingress rule, SSH key, or a
   permanent self-hosted runner. A NAT gateway would create an avoidable idle
   charge; use an existing public subnet with no inbound security-group rules.
-- It does **not** create a model secret. Add `BENCHMARK_OPENAI_API_KEY` later to
-  the protected GitHub Environment only. Never put model credentials in EC2
-  user data, S3 objects, Terraform variables, state, Docker environments, or
-  task workspaces.
-- The AMI is a required explicit input, not a moving “latest” lookup. Its build
-  must pin Docker, Bubblewrap, the stable SWE-bench harness, and runner
-  dependencies before a live benchmark is enabled.
+- It does **not** create or store a model secret. The protected GitHub Environment
+  supplies `OPENAI_API_KEY` only for an explicitly selected smoke/live dispatch.
+  That workflow uploads it as an SSE-encrypted, automatically expiring run object
+  and gives the zero-permission worker a short-lived pre-signed GET. The worker
+  keeps it in root-only tmpfs, forwards it by environment name only to disposable
+  agent containers, deletes it before evaluation, and removes the run object in
+  controller cleanup. It never enters EC2 user data, Terraform state, task input,
+  evaluator configuration, or result metadata.
+- The AMI is a required explicit input, not a moving “latest” lookup. The initial
+  smoke path installs Docker and pinned harness dependencies at boot and records
+  run-local image identities; a prebuilt image pipeline can replace that later
+  without changing the benchmark contract.
 
 ## Prerequisites
 

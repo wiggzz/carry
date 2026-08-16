@@ -44,11 +44,10 @@ there; the dispatcher must terminate the instance after the slot/lane finishes.
 No self-hosted or persistent GitHub runner is permitted.
 
 The worker builds each run-local method image once. Carry is built from the archived
-commit; Codex defaults to `@openai/codex@0.146.0`; Pi is fixed at
-`@earendil-works/pi-coding-agent@0.84.2`. Base images require digest references, and the
-Node base must provide Node >=22.19. Since this repository does not prove the current
-noninteractive Codex/Pi syntax, protected command templates are mandatory and missing
-templates fail closed.
+commit; Codex is fixed at `@openai/codex@0.147.0`; Pi is fixed at
+`@earendil-works/pi-coding-agent@0.84.2`. Reviewed Node 22.19 and Rust base images are
+pinned by manifest digest. The noninteractive command adapters are versioned with this
+repository rather than supplied as mutable protected variables.
 
 The canonical dataset is loaded at revision
 `c104f840cc67f8b6eec6f759ebc8b2693d585d4a` and materialized as local JSON for

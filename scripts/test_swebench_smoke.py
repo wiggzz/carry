@@ -19,17 +19,15 @@ class SmokeWorkerTests(unittest.TestCase):
         assert spec.loader
         spec.loader.exec_module(cls.worker)
 
-    def test_config_requires_pinned_images_versions_and_explicit_cli_templates(self):
+    def test_config_requires_pinned_images_and_versions(self):
         valid = {
             "BASE_IMAGE": "node@sha256:" + "a" * 64,
             "CODEX_VERSION": "1.2.3", "PI_VERSION": "0.84.2",
-            "CODEX_COMMAND": "codex exec --model {model} {prompt}",
-            "PI_COMMAND": "pi --model {model} --prompt-file {prompt}",
             "MODEL": "gpt-5.6-luna", "REASONING": "medium",
         }
         config = self.worker.validate_config(valid)
         self.assertEqual(config["PI_VERSION"], "0.84.2")
-        for key, value in (("BASE_IMAGE", "node:22"), ("CODEX_VERSION", "latest"), ("CODEX_COMMAND", "")):
+        for key, value in (("BASE_IMAGE", "node:22"), ("CODEX_VERSION", "latest")):
             bad = dict(valid)
             bad[key] = value
             with self.subTest(key=key), self.assertRaises(ValueError):
@@ -53,6 +51,9 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertIn("dst=/workspace", rendered)
             self.assertIn("dst=/benchmark/input,readonly", rendered)
             self.assertIn("dst=/benchmark/output", rendered)
+            self.assertIn("HOME=/agent-home", rendered)
+            self.assertIn("/agent-home:rw", rendered)
+            self.assertIn("/tmp:rw", rendered)
 
     def test_finalize_preserves_failed_slots_and_writes_official_predictions(self):
         tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
@@ -74,6 +75,8 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertEqual(report["denominator"], 15)
             self.assertEqual(report["completed"], 1)
             self.assertEqual(report["resolved"], 1)
+            self.assertEqual(report["methods"]["carry"]["resolved"], 1)
+            self.assertEqual(report["methods"]["codex"]["statuses"], {"agent-failed": 5})
             summary = (output / "report.md").read_text()
             self.assertIn("Denominator: 15", summary)
             self.assertIn("Completed: 1", summary)
@@ -166,8 +169,6 @@ class SmokeWorkerTests(unittest.TestCase):
             "BASE_IMAGE": "node@sha256:" + "a" * 64,
             "CARRY_BASE_IMAGE": "rust@sha256:" + "b" * 64,
             "CODEX_VERSION": "1.2.3", "PI_VERSION": "0.84.2",
-            "CODEX_COMMAND": "codex exec --model {model} {prompt}",
-            "PI_COMMAND": "pi --model {model} --prompt-file {prompt}",
             "MODEL": "gpt-5.6-luna", "REASONING": "medium",
         }
         provenance = self.worker.build_images(
@@ -183,11 +184,13 @@ class SmokeWorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             (root / "report.json").write_text(json.dumps({
-                "resolved_ids": ["task-1"], "unresolved_ids": ["task-2"], "resolved": 1,
+                "completed_ids": ["task-1", "task-2"],
+                "resolved_ids": ["task-1"], "unresolved_ids": ["task-2"],
+                "empty_patch_ids": [], "error_ids": [],
             }))
             self.assertEqual(self.worker.load_resolved_ids(root), {"task-1"})
             (root / "report.json").write_text(json.dumps({"resolved": 2}))
-            with self.assertRaisesRegex(RuntimeError, "resolved IDs"):
+            with self.assertRaisesRegex(RuntimeError, "outcome ID sets"):
                 self.worker.load_resolved_ids(root)
 
 
