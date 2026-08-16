@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, StatusCode, header::HeaderMap};
@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::protocol::{Step, tool_definitions};
 
 const MAX_RESPONSE_RETRIES: usize = 5;
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+const MAX_TOTAL_RETRY_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub struct OpenAiClient {
@@ -106,6 +106,8 @@ impl OpenAiClient {
 
         let started = Instant::now();
         let mut retries = 0;
+        let mut retry_wait = Duration::ZERO;
+        let mut retry_stopped_reason = None;
         let raw = loop {
             let response = self
                 .http
@@ -125,21 +127,41 @@ impl OpenAiClient {
                 break serde_json::from_slice(&response_body)
                     .context("Responses API returned invalid JSON")?;
             }
-            if (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
-                && retries < MAX_RESPONSE_RETRIES
-            {
+            if retryable_rate_limit(status, &response_body) && retries < MAX_RESPONSE_RETRIES {
                 let delay = retry_delay(&headers, retries);
-                retries += 1;
-                eprintln!(
-                    "Responses API returned {status}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
-                    delay.as_millis(),
-                );
-                tokio::time::sleep(delay).await;
-                continue;
+                if delay > MAX_TOTAL_RETRY_WAIT.saturating_sub(retry_wait) {
+                    let reason = format!(
+                        "server backoff of {}ms exceeds the remaining retry wait budget",
+                        delay.as_millis()
+                    );
+                    eprintln!("Responses API returned {status}; {reason}");
+                    retry_stopped_reason = Some(reason);
+                } else {
+                    retries += 1;
+                    retry_wait += delay;
+                    eprintln!(
+                        "Responses API returned {status}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
+                        delay.as_millis(),
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
             }
             let raw = serde_json::from_slice::<Value>(&response_body).unwrap_or_else(|_| {
                 Value::String(String::from_utf8_lossy(&response_body).into_owned())
             });
+            if let Some(reason) = retry_stopped_reason {
+                bail!(
+                    "Responses API returned {status} after {retries} retries and {}ms waiting; {reason}: {raw}",
+                    retry_wait.as_millis()
+                );
+            }
+            if retries > 0 {
+                bail!(
+                    "Responses API returned {status} after {retries} retries and {}ms waiting: {raw}",
+                    retry_wait.as_millis()
+                );
+            }
             bail!("Responses API returned {status}: {raw}");
         };
 
@@ -165,7 +187,20 @@ impl OpenAiClient {
     }
 }
 
+fn retryable_rate_limit(status: StatusCode, response_body: &[u8]) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        && serde_json::from_slice::<Value>(response_body)
+            .ok()
+            .and_then(|body| body["error"]["code"].as_str().map(str::to_owned))
+            .as_deref()
+            == Some("rate_limit_exceeded")
+}
+
 fn retry_delay(headers: &HeaderMap, attempt: usize) -> Duration {
+    retry_delay_at(headers, attempt, SystemTime::now())
+}
+
+fn retry_delay_at(headers: &HeaderMap, attempt: usize, now: SystemTime) -> Duration {
     let server_delay = headers
         .get("retry-after-ms")
         .and_then(|value| value.to_str().ok())
@@ -174,7 +209,13 @@ fn retry_delay(headers: &HeaderMap, attempt: usize) -> Duration {
             headers
                 .get("retry-after")
                 .and_then(|value| value.to_str().ok())
-                .and_then(|value| parse_retry_delay(value, 1.0))
+                .and_then(|value| {
+                    parse_retry_delay(value, 1.0).or_else(|| {
+                        httpdate::parse_http_date(value)
+                            .ok()
+                            .map(|date| date.duration_since(now).unwrap_or(Duration::ZERO))
+                    })
+                })
         });
     server_delay.unwrap_or_else(|| Duration::from_secs(1_u64 << attempt.min(4)))
 }
@@ -184,9 +225,10 @@ fn parse_retry_delay(value: &str, units_per_second: f64) -> Option<Duration> {
     if !seconds.is_finite() || seconds < 0.0 {
         return None;
     }
-    Some(Duration::from_secs_f64(
-        seconds.min(MAX_RETRY_DELAY.as_secs_f64()),
-    ))
+    if seconds > MAX_TOTAL_RETRY_WAIT.as_secs_f64() {
+        return Some(MAX_TOTAL_RETRY_WAIT + Duration::from_millis(1));
+    }
+    Some(Duration::from_secs_f64(seconds))
 }
 
 fn function_calls(raw: &Value) -> Vec<&Value> {
@@ -235,23 +277,43 @@ fn prompt_cache_key(model: &str, system: &str, task: &str) -> String {
 mod tests {
     use super::*;
     use std::{
-        io::{Read, Write},
+        io::{ErrorKind, Read, Write},
         net::TcpListener,
         sync::mpsc,
         thread,
+        time::Instant as StdInstant,
     };
 
-    fn response_server(responses: Vec<String>) -> (String, mpsc::Receiver<Vec<u8>>) {
+    fn response_server(
+        responses: Vec<String>,
+    ) -> (String, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
+        let server = thread::spawn(move || {
             for response in responses {
-                let (mut stream, _) = listener.accept().unwrap();
+                let deadline = StdInstant::now() + Duration::from_secs(2);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error)
+                            if error.kind() == ErrorKind::WouldBlock
+                                && StdInstant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("test server accept failed: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
                 let mut request = Vec::new();
                 let mut chunk = [0_u8; 4096];
                 loop {
                     let read = stream.read(&mut chunk).unwrap();
+                    assert_ne!(read, 0, "client closed before sending a complete request");
                     request.extend_from_slice(&chunk[..read]);
                     let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
                     else {
@@ -276,7 +338,7 @@ mod tests {
                 stream.write_all(response.as_bytes()).unwrap();
             }
         });
-        (format!("http://{address}"), receiver)
+        (format!("http://{address}"), receiver, server)
     }
 
     fn http_response(status: &str, headers: &str, body: &Value) -> String {
@@ -299,44 +361,45 @@ mod tests {
             }],
             "usage": {}
         });
-        let (api_base, requests) = response_server(vec![
+        let (api_base, requests, server) = response_server(vec![
             http_response(
                 "429 Too Many Requests",
-                "Retry-After: 0\r\n",
+                "Retry-After-Ms: 20\r\nRetry-After: 30\r\n",
                 &json!({"error": {"code": "rate_limit_exceeded"}}),
             ),
             http_response("200 OK", "", &success),
         ]);
         let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
 
+        let started = Instant::now();
         let reply = client.step("system", "task", &[], "control").await.unwrap();
 
         assert_eq!(reply.response_id, "response-1");
         assert_eq!(reply.response_retries, 1);
-        assert_eq!(requests.recv().unwrap(), requests.recv().unwrap());
+        assert!(started.elapsed() >= Duration::from_millis(15));
+        assert_eq!(
+            requests.recv_timeout(Duration::from_secs(2)).unwrap(),
+            requests.recv_timeout(Duration::from_secs(2)).unwrap()
+        );
+        server.join().unwrap();
     }
 
     #[tokio::test]
-    async fn retries_transient_server_error() {
-        let success = json!({
-            "id": "response-after-503",
-            "output": [{
-                "type": "function_call",
-                "call_id": "call-1",
-                "name": "finish",
-                "arguments": "{\"answer\":\"done\",\"context_management\":{\"retain_volatile_ids\":[],\"release_stable_ids\":[],\"add_memories\":[]}}"
-            }],
-            "usage": {}
-        });
-        let (api_base, _requests) = response_server(vec![
+    async fn does_not_retry_ambiguous_server_error() {
+        let (api_base, requests, server) = response_server(vec![
             "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy".to_owned(),
-            http_response("200 OK", "", &success),
         ]);
         let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
 
-        let reply = client.step("system", "task", &[], "control").await.unwrap();
+        let error = client
+            .step("system", "task", &[], "control")
+            .await
+            .unwrap_err();
 
-        assert_eq!(reply.response_id, "response-after-503");
+        assert!(error.to_string().contains("busy"));
+        requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(requests.try_recv().is_err());
+        server.join().unwrap();
     }
 
     #[test]
@@ -347,6 +410,20 @@ mod tests {
         assert_eq!(retry_delay(&headers, 0), Duration::from_secs(1));
     }
 
+    #[test]
+    fn honors_http_date_retry_after() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            httpdate::fmt_http_date(now + Duration::from_secs(17))
+                .parse()
+                .unwrap(),
+        );
+
+        assert_eq!(retry_delay_at(&headers, 0, now), Duration::from_secs(17));
+    }
+
     #[tokio::test]
     async fn stops_after_five_response_retries() {
         let rate_limit = http_response(
@@ -354,7 +431,7 @@ mod tests {
             "Retry-After: 0\r\n",
             &json!({"error": {"code": "rate_limit_exceeded"}}),
         );
-        let (api_base, requests) = response_server(vec![rate_limit; 6]);
+        let (api_base, requests, server) = response_server(vec![rate_limit; 6]);
         let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
 
         let error = client
@@ -363,10 +440,56 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("429 Too Many Requests"));
+        assert!(error.to_string().contains("after 5 retries"));
         for _ in 0..6 {
-            requests.recv().unwrap();
+            requests.recv_timeout(Duration::from_secs(2)).unwrap();
         }
         assert!(requests.try_recv().is_err());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_quota_429() {
+        let (api_base, requests, server) = response_server(vec![http_response(
+            "429 Too Many Requests",
+            "Retry-After: 0\r\n",
+            &json!({"error": {"code": "insufficient_quota"}}),
+        )]);
+        let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
+
+        let error = client
+            .step("system", "task", &[], "control")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("insufficient_quota"));
+        requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(requests.try_recv().is_err());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn does_not_send_earlier_than_server_delay_budget() {
+        let (api_base, requests, server) = response_server(vec![http_response(
+            "429 Too Many Requests",
+            "Retry-After: 61\r\n",
+            &json!({"error": {"code": "rate_limit_exceeded"}}),
+        )]);
+        let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
+
+        let error = client
+            .step("system", "task", &[], "control")
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the remaining retry wait budget")
+        );
+        requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(requests.try_recv().is_err());
+        server.join().unwrap();
     }
 
     #[test]
