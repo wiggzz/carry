@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/wiggzz/carry/compare/v0.3.0...v0.4.0) (2026-08-16)
+
+
+### Features
+
+* **benchmarks:** add live progress and performance reports ([#33](https://github.com/wiggzz/carry/issues/33)) ([d9e7c5f](https://github.com/wiggzz/carry/commit/d9e7c5f1f79f69e3aa540beaffca74767e12a386))
+
 ## [0.3.0](https://github.com/wiggzz/carry/compare/v0.2.1...v0.3.0) (2026-08-16)
 
 
