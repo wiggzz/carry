@@ -32,22 +32,27 @@ status, and the two pinned image references.
 
 ## Manual protected workflow
 
-The live workflow has only a `workflow_dispatch` trigger, uses the protected
-`swe-bench` Environment, and targets a self-hosted worker labeled
-`swebench-disposable`; it cannot run as push or pull-request CI. One dispatch
-invokes one selected task/method. Its task must already exist at
-`/opt/swebench-tasks/<instance-id>`, and the workflow does not mount its checkout.
+The readiness workflow has only a `workflow_dispatch` trigger and uses the
+protected `swe-bench` Environment, but it is deliberately **credential-free**:
+it writes and validates the 150-slot plan on a GitHub-hosted control-plane
+runner. It cannot run as push or pull-request CI.
+
+The `invoke` command is worker-side code. A future reviewed extension to the
+existing EC2 dispatcher must copy it to the short-lived worker and invoke it
+there; the dispatcher must terminate the instance after the slot/lane finishes.
+No self-hosted or persistent GitHub runner is permitted.
 
 ## Remaining runtime blockers
 
 This layer is reviewable but not deployable until operators:
 
-- build and review dedicated agent and evaluator images, including Carry and the
-  `/opt/swebench/evaluate-task` adapter;
-- publish them and set immutable digest references in protected Environment
-  variables `SWEBENCH_AGENT_IMAGE` and `SWEBENCH_EVALUATOR_IMAGE`;
-- install Docker in the disposable worker AMI and register that worker with only
-  the `swebench-disposable` label;
+- build and review dedicated agent images/adapters for **each** Carry, Codex, and
+  Pi lane, plus the evaluator image containing the `/opt/swebench/evaluate-task`
+  adapter (the included entrypoint currently implements Carry only);
+- publish reviewed agent/evaluator images and make their immutable digest
+  references available to the reviewed dispatcher as nonsecret run configuration;
+- install Docker in the pinned disposable-worker AMI or its reviewed bootstrap,
+  without registering a GitHub self-hosted runner;
 - materialize selected task bundles containing the public record, prompt,
   disposable repository, and task-bundled evaluator testbed; and
 - negative-test metadata-service access, host file access, operation without a
