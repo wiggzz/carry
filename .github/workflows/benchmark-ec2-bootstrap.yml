@@ -139,8 +139,7 @@ jobs:
           TAGS="Tags=[{Key=Application,Value=Carry},{Key=Component,Value=swebench-benchmark},{Key=ExpiresAt,Value=$EXPIRES_AT},{Key=ManagedBy,Value=carry-swebench},{Key=Project,Value=carry-swebench},{Key=Purpose,Value=benchmark-worker},{Key=Repository,Value=wiggzz/carry},{Key=RunId,Value=$RUN_ID}]"
           WORKER_INSTANCE_ID=$(aws ec2 run-instances \
             --launch-template "LaunchTemplateId=$LAUNCH_TEMPLATE_ID,Version=$LAUNCH_TEMPLATE_VERSION" \
-            --min-count 1 \
-            --max-count 1 \
+            --count 1 \
             --client-token "$RUN_ID" \
             --user-data file://worker-user-data.sh \
             --tag-specifications "ResourceType=instance,$TAGS" "ResourceType=volume,$TAGS" \
