@@ -15,6 +15,7 @@ umask 077
 : "${REASONING:=medium}"
 : "${CARRY_ROOT:=/opt/carry}"
 : "${SECRET_FILE:=/dev/shm/carry-openai-key}"
+: "${PYTHON_BIN:=}"
 
 result_url=$(printf '%s' "$RESULT_URL_B64" | base64 -d)
 finish() {
@@ -34,8 +35,10 @@ finish() {
 trap finish EXIT
 
 mkdir -p "$CARRY_ROOT/results" "$CARRY_ROOT/source" "$CARRY_ROOT/work"
+exec > >(tee -a "$CARRY_ROOT/results/worker.log") 2>&1
 if command -v dnf >/dev/null 2>&1; then
-  dnf install -y ca-certificates curl git python3 python3-pip docker tar gzip
+  dnf install -y ca-certificates curl git python3.11 python3.11-pip docker tar gzip
+  : "${PYTHON_BIN:=python3.11}"
 elif command -v apt-get >/dev/null 2>&1; then
   # The worker security group permits HTTPS, not plaintext package mirrors.
   sed -i 's|http://|https://|g' /etc/apt/sources.list 2>/dev/null || true
@@ -43,11 +46,17 @@ elif command -v apt-get >/dev/null 2>&1; then
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     ca-certificates curl git python3 python3-venv docker.io
+  : "${PYTHON_BIN:=python3}"
 else
   echo "unsupported worker operating system: dnf or apt-get required" >&2
   exit 2
 fi
 systemctl enable --now docker
+"$PYTHON_BIN" - <<'PY'
+import sys
+if sys.version_info < (3, 10):
+    raise SystemExit(f"Python >=3.10 is required, found {sys.version.split()[0]}")
+PY
 
 source_url=$(printf '%s' "$SOURCE_URL_B64" | base64 -d)
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
@@ -69,7 +78,7 @@ export OPENAI_API_KEY
 OPENAI_API_KEY=$(cat "$SECRET_FILE")
 export OPENAI_SECRET_FILE="$SECRET_FILE"
 
-python3 -m venv "$CARRY_ROOT/venv"
+"$PYTHON_BIN" -m venv "$CARRY_ROOT/venv"
 "$CARRY_ROOT/venv/bin/pip" install --disable-pip-version-check \
   'swebench==4.1.0' 'datasets>=2.19,<4'
 export PATH="$CARRY_ROOT/venv/bin:$PATH"

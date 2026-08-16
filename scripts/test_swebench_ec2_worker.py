@@ -55,6 +55,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 RUN_ID="gh-test-1",
                 CARRY_ROOT=str(carry_root),
                 SECRET_FILE=str(root / "secret"),
+                PYTHON_BIN="python3",
                 SKIP_SHUTDOWN="1",
                 FAKE_SOURCE_ARCHIVE=str(archive),
             )

@@ -10,11 +10,16 @@ on:
         default: main
         type: string
       mode:
-        description: Credential-free bootstrap or executable 5-task baseline
+        description: Bootstrap, executable 5-task baseline, or exact-run artifact sanitization
         required: true
         default: bootstrap
         type: choice
-        options: [bootstrap, smoke-5]
+        options: [bootstrap, smoke-5, cleanup]
+      cleanup_run_id:
+        description: Exact gh-RUN_ID-ATTEMPT to sanitize when mode=cleanup
+        required: false
+        default: ""
+        type: string
       bootstrap_wait_seconds:
         description: Bootstrap-only wait in seconds (1-300)
         required: true
@@ -83,6 +88,38 @@ jobs:
           role-session-name: carry-bootstrap-${{ github.run_id }}
           mask-aws-account-id: true
 
+      - name: Sanitize exact prior run objects
+        if: inputs.mode == 'cleanup'
+        shell: bash
+        env:
+          TARGET_RUN_ID: ${{ inputs.cleanup_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_RUN_ID" =~ ^gh-[0-9]+-[1-9][0-9]*$ ]] || {
+            echo "cleanup_run_id must be an exact gh-RUN_ID-ATTEMPT" >&2
+            exit 1
+          }
+          for required in ARTIFACT_BUCKET ARTIFACT_SESSION_ROLE_ARN; do
+            [[ -n "${!required}" ]] || { echo "missing protected Environment variable: $required" >&2; exit 1; }
+          done
+          ASSUMED=$(aws sts assume-role --role-arn "$ARTIFACT_SESSION_ROLE_ARN" \
+            --role-session-name "carry-sanitize-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --tags "Key=RunId,Value=$TARGET_RUN_ID" --query Credentials --output json)
+          eval "$(python3 - "$ASSUMED" <<'PY'
+          import json, shlex, sys
+          c=json.loads(sys.argv[1])
+          for key, field in [('AWS_ACCESS_KEY_ID','AccessKeyId'),('AWS_SECRET_ACCESS_KEY','SecretAccessKey'),('AWS_SESSION_TOKEN','SessionToken')]:
+              print(f'export {key}={shlex.quote(c[field])}')
+          PY
+          )"
+          : > "$RUNNER_TEMP/empty"
+          for object in carry-source.tar.gz openai-key results.tar.gz; do
+            aws s3 cp "$RUNNER_TEMP/empty" "s3://$ARTIFACT_BUCKET/runs/$TARGET_RUN_ID/$object" --sse AES256 --only-show-errors
+            size=$(aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key "runs/$TARGET_RUN_ID/$object" --query ContentLength --output text)
+            [[ "$size" == 0 ]] || { echo "failed to sanitize $object" >&2; exit 1; }
+          done
+          echo "sanitized exact run prefix $TARGET_RUN_ID"
+
       - name: Install pinned pre-signing client
         if: inputs.mode == 'smoke-5'
         shell: bash
@@ -93,6 +130,7 @@ jobs:
           echo "$RUNNER_TEMP/presign-venv/bin" >> "$GITHUB_PATH"
 
       - name: Stage run-scoped inputs and output capability
+        if: inputs.mode != 'cleanup'
         id: stage
         shell: bash
         env:
@@ -146,6 +184,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Launch zero-permission disposable worker
+        if: inputs.mode != 'cleanup'
         id: launch
         shell: bash
         env:
@@ -215,7 +254,7 @@ jobs:
           mask-aws-account-id: true
 
       - name: Verify the worker self-terminates
-        if: always()
+        if: always() && inputs.mode != 'cleanup'
         shell: bash
         env:
           TIMEOUT_SECONDS: "900"
@@ -247,7 +286,7 @@ jobs:
           retention-days: 14
 
       - name: Terminate the exact worker and delete exact run objects
-        if: always()
+        if: always() && inputs.mode != 'cleanup'
         shell: bash
         env:
           PREFIX: ${{ steps.stage.outputs.prefix }}
@@ -266,7 +305,11 @@ jobs:
           for key, field in [('AWS_ACCESS_KEY_ID','AccessKeyId'),('AWS_SECRET_ACCESS_KEY','SecretAccessKey'),('AWS_SESSION_TOKEN','SessionToken')]: print(f'export {key}={shlex.quote(c[field])}')
           PY
             )"
+            : > "$RUNNER_TEMP/empty"
             for object in carry-source.tar.gz openai-key results.tar.gz; do
+              # PutObject is always available for this exact run. Sanitizing first
+              # removes secret/result bytes even where DeleteObject is not granted.
+              aws s3 cp "$RUNNER_TEMP/empty" "s3://$ARTIFACT_BUCKET/$PREFIX/$object" --sse AES256 --only-show-errors || true
               aws s3 rm "s3://$ARTIFACT_BUCKET/$PREFIX/$object" --only-show-errors || true
             done
           fi
