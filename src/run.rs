@@ -71,10 +71,11 @@ struct ShellResult {
 struct RunMetrics {
     usage: Usage,
     model_latency_ms: u64,
+    response_retries: usize,
 }
 
 impl RunMetrics {
-    fn record(&mut self, usage: &Usage, latency_ms: u64) {
+    fn record(&mut self, usage: &Usage, latency_ms: u64, response_retries: usize) {
         self.usage.input_tokens = self.usage.input_tokens.saturating_add(usage.input_tokens);
         self.usage.cached_input_tokens = self
             .usage
@@ -91,6 +92,7 @@ impl RunMetrics {
             .saturating_add(usage.reasoning_tokens);
         self.usage.total_tokens = self.usage.total_tokens.saturating_add(usage.total_tokens);
         self.model_latency_ms = self.model_latency_ms.saturating_add(latency_ms);
+        self.response_retries = self.response_retries.saturating_add(response_retries);
     }
 }
 
@@ -234,7 +236,7 @@ pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> 
         )?;
 
         let reply = backend.step(&config.task, &history, &control).await?;
-        metrics.record(&reply.usage, reply.latency_ms);
+        metrics.record(&reply.usage, reply.latency_ms, reply.response_retries);
         logger.raw_event(
             "model_response",
             json!({
@@ -499,6 +501,7 @@ async fn write_final_artifacts(
         "patch_bytes": patch.len(),
         "usage": &metrics.usage,
         "model_latency_ms": metrics.model_latency_ms,
+        "response_retries": metrics.response_retries,
         "elapsed_ms": elapsed_ms
     });
     tokio::fs::write(
@@ -542,6 +545,7 @@ mod tests {
                 total_tokens: 13,
             },
             25,
+            2,
         );
         metrics.record(
             &Usage {
@@ -553,6 +557,7 @@ mod tests {
                 total_tokens: 12,
             },
             15,
+            3,
         );
 
         assert_eq!(metrics.usage.input_tokens, 17);
@@ -562,6 +567,7 @@ mod tests {
         assert_eq!(metrics.usage.reasoning_tokens, 3);
         assert_eq!(metrics.usage.total_tokens, 25);
         assert_eq!(metrics.model_latency_ms, 40);
+        assert_eq!(metrics.response_retries, 5);
     }
 
     #[tokio::test]
@@ -606,6 +612,7 @@ mod tests {
         assert_eq!(result["usage"]["input_tokens"], 0);
         assert_eq!(result["usage"]["output_tokens"], 0);
         assert_eq!(result["model_latency_ms"], 0);
+        assert_eq!(result["response_retries"], 0);
         assert!(result["elapsed_ms"].is_u64());
     }
 
