@@ -2,6 +2,7 @@
 # Runs as EC2 user data after the workflow prepends immutable run configuration.
 set -euo pipefail
 umask 077
+worker_started_at=$(date +%s)
 
 : "${SOURCE_URL_B64:?}"
 : "${SOURCE_SHA256:?}"
@@ -11,6 +12,7 @@ umask 077
 : "${RUN_ID:?}"
 : "${RESULT_URL_B64:=}"
 : "${KEY_URL_B64:=}"
+: "${CONTROL_URL_B64:=}"
 : "${MODEL:=gpt-5.6-luna}"
 : "${REASONING:=medium}"
 : "${CARRY_ROOT:=/opt/carry}"
@@ -18,11 +20,20 @@ umask 077
 : "${PYTHON_BIN:=}"
 
 result_url=$(printf '%s' "$RESULT_URL_B64" | base64 -d)
+result_url_file=/dev/shm/carry-result-url
+capability_refresh_pid=""
 finish() {
   status=$?
   trap - EXIT
+  if [[ -n "$capability_refresh_pid" ]]; then
+    kill "$capability_refresh_pid" 2>/dev/null || true
+    wait "$capability_refresh_pid" 2>/dev/null || true
+  fi
+  if [[ -s "$result_url_file" ]]; then
+    result_url=$(<"$result_url_file")
+  fi
   unset OPENAI_API_KEY
-  rm -f "$SECRET_FILE"
+  rm -f "$SECRET_FILE" "$result_url_file"
   if [[ -n "$result_url" && -d "$CARRY_ROOT/results" ]]; then
     printf '%s\n' "$status" > "$CARRY_ROOT/results/worker-exit-status"
     tar -C "$CARRY_ROOT/results" -czf "$CARRY_ROOT/results.tar.gz" . || true
@@ -68,7 +79,19 @@ if [[ "$BENCHMARK_MODE" == bootstrap ]]; then
   sleep "$BOOTSTRAP_WAIT_SECONDS"
   exit 0
 fi
-[[ "$BENCHMARK_MODE" == smoke-5 ]] || { echo "unknown benchmark mode" >&2; exit 2; }
+case "$BENCHMARK_MODE" in
+  smoke-5|official-50) ;;
+  *) echo "unknown benchmark mode" >&2; exit 2 ;;
+esac
+
+control_url=$(printf '%s' "$CONTROL_URL_B64" | base64 -d)
+if [[ -n "$control_url" ]]; then
+  printf '%s' "$result_url" > "$result_url_file"
+  chmod 0600 "$result_url_file"
+  CONTROL_GET_URL="$control_url" RESULT_URL_FILE="$result_url_file" \
+    "$PYTHON_BIN" "$CARRY_ROOT/source/scripts/refresh_benchmark_capabilities.py" &
+  capability_refresh_pid=$!
+fi
 
 key_url=$(printf '%s' "$KEY_URL_B64" | base64 -d)
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
@@ -82,7 +105,7 @@ export OPENAI_SECRET_FILE="$SECRET_FILE"
 "$CARRY_ROOT/venv/bin/pip" install --disable-pip-version-check \
   'swebench==4.1.0' 'datasets>=2.19,<4'
 export PATH="$CARRY_ROOT/venv/bin:$PATH"
-export RUN_ID SOURCE_COMMIT MODEL REASONING
+export RUN_ID SOURCE_COMMIT MODEL REASONING BENCHMARK_MODE
 export BASE_IMAGE='node@sha256:afff6d8c97964a438d2e6a9c96509367e45d8bf93f790ad561a1eaea926303d9'
 export CARRY_BASE_IMAGE='rust@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff'
 export CODEX_VERSION='0.147.0'
@@ -90,7 +113,22 @@ export PI_VERSION='0.84.2'
 export AGENT_TIMEOUT_SECONDS=360
 export EVALUATOR_TIMEOUT_SECONDS=300
 export AGENT_CONCURRENCY=3
-export EVALUATOR_CONCURRENCY=5
 
-timeout --signal=TERM --kill-after=30s 3000 python3 "$CARRY_ROOT/source/scripts/swebench_smoke.py" \
+if [[ "$BENCHMARK_MODE" == official-50 ]]; then
+  export EVALUATOR_CONCURRENCY=10
+  export OFFICIAL_WORKER_SECONDS=18000
+  export OFFICIAL_AGENT_PHASE_SECONDS=11400
+  export OFFICIAL_EVALUATION_PHASE_SECONDS=5400
+  export OFFICIAL_SETUP_RESERVE_SECONDS=1200
+  worker_elapsed_seconds=$(( $(date +%s) - worker_started_at ))
+  OVERALL_TIMEOUT_SECONDS=$(( OFFICIAL_WORKER_SECONDS - worker_elapsed_seconds ))
+  (( OVERALL_TIMEOUT_SECONDS > 0 )) || {
+    echo "official worker budget exhausted during setup" >&2
+    exit 124
+  }
+else
+  export EVALUATOR_CONCURRENCY=5
+  OVERALL_TIMEOUT_SECONDS=3000
+fi
+timeout --signal=TERM --kill-after=30s "$OVERALL_TIMEOUT_SECONDS" python3 "$CARRY_ROOT/source/scripts/swebench_smoke.py" \
   --run --source "$CARRY_ROOT/source" --work "$CARRY_ROOT/work" --output "$CARRY_ROOT/results"

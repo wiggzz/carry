@@ -205,8 +205,9 @@ data "aws_iam_policy_document" "github_dispatch_assume" {
 }
 
 resource "aws_iam_role" "github_dispatch" {
-  name_prefix        = "${local.name_prefix}-github-dispatch-"
-  assume_role_policy = data.aws_iam_policy_document.github_dispatch_assume.json
+  name_prefix          = "${local.name_prefix}-github-dispatch-"
+  assume_role_policy   = data.aws_iam_policy_document.github_dispatch_assume.json
+  max_session_duration = 21600
 
   tags = local.common_tags
 }
