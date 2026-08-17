@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.0](https://github.com/wiggzz/carry/compare/v0.4.0...v0.5.0) (2026-08-17)
+
+
+### Features
+
+* add interactive CLI sessions ([#35](https://github.com/wiggzz/carry/issues/35)) ([70f8516](https://github.com/wiggzz/carry/commit/70f851680deadc4c3bc10f4754dfc3f04baa3267))
+
+
+### Performance Improvements
+
+* cache SWE-bench instance images ([#38](https://github.com/wiggzz/carry/issues/38)) ([8fc226d](https://github.com/wiggzz/carry/commit/8fc226d85b067ece830c0c4ac1ec567bc826ce1b))
+
 ## [0.4.0](https://github.com/wiggzz/carry/compare/v0.3.0...v0.4.0) (2026-08-16)
 
 
