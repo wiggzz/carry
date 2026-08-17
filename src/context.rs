@@ -9,7 +9,6 @@ use crate::protocol::ContextManagement;
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 const CACHE_READ_RATE: f64 = 0.10;
 const CACHE_WRITE_RATE: f64 = 1.25;
-pub(crate) const MIN_CACHE_TOKENS: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -160,6 +159,7 @@ pub(crate) struct ContextState {
     items: Vec<ContextItem>,
     next_id: u64,
     generation: u64,
+    max_read_breakpoints: usize,
     breakpoints: Vec<StoredBreakpoint>,
 }
 
@@ -172,13 +172,22 @@ struct StoredBreakpoint {
 }
 
 impl ContextState {
+    #[cfg(test)]
     pub fn new(initial_prompt: String) -> Self {
+        Self::new_with_max_read_breakpoints(initial_prompt, usize::MAX)
+    }
+
+    pub fn new_with_max_read_breakpoints(
+        initial_prompt: String,
+        max_read_breakpoints: usize,
+    ) -> Self {
         let items = vec![ContextItem::user(1, initial_prompt)];
         let rendered_prefix = Self::render_items(&items, &[1]);
         Self {
             items,
             next_id: 1,
             generation: 0,
+            max_read_breakpoints,
             breakpoints: vec![StoredBreakpoint {
                 generation: 0,
                 item_ids: vec![1],
@@ -266,14 +275,19 @@ impl ContextState {
     }
 
     fn compatible_breakpoint_frontiers(&self, items: &[ContextItem]) -> Vec<u64> {
-        self.breakpoints
+        let mut frontiers = self
+            .breakpoints
             .iter()
             .filter(|breakpoint| {
                 Self::render_items(items, &breakpoint.marker_frontiers)
                     .starts_with(&breakpoint.rendered_prefix)
             })
             .filter_map(|breakpoint| breakpoint.item_ids.last().copied())
-            .collect()
+            .collect::<Vec<_>>();
+        if frontiers.len() > self.max_read_breakpoints {
+            frontiers.drain(..frontiers.len() - self.max_read_breakpoints);
+        }
+        frontiers
     }
 
     fn render_with_compatible_breakpoints(&self, items: &[ContextItem]) -> Vec<Value> {
@@ -394,9 +408,7 @@ impl ContextState {
             else {
                 continue;
             };
-            if priced.cached_tokens < MIN_CACHE_TOKENS
-                || estimated_tokens(&stored.rendered_prefix) < MIN_CACHE_TOKENS
-            {
+            if priced.cached_tokens == 0 {
                 continue;
             }
             let dropped = removable
@@ -641,6 +653,21 @@ pub(crate) struct ContextChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_cache_capabilities_render_no_explicit_breakpoints() {
+        let state = ContextState::new_with_max_read_breakpoints("initial".into(), 0);
+        assert!(state.rendered_breakpoints().is_empty());
+        assert!(state.input_items().iter().all(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .is_none_or(|content| {
+                    content
+                        .iter()
+                        .all(|part| part.get("prompt_cache_breakpoint").is_none())
+                })
+        }));
+    }
 
     fn update(keep: &[u64], drop: &[u64], remember: &[&str]) -> ContextManagement {
         ContextManagement {

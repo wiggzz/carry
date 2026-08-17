@@ -11,11 +11,9 @@ use serde_json::json;
 use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc, time::Duration};
 
 use crate::{
-    context::{
-        CompactionPolicy, ContextState, MIN_CACHE_TOKENS, PricedBreakpoint, RenderedBreakpoint,
-    },
+    context::{CompactionPolicy, ContextState, PricedBreakpoint, RenderedBreakpoint},
     log::RunLogger,
-    openai::{ModelReply, OpenAiClient, Usage},
+    openai::{ModelReply, OpenAiClient, PromptCacheCapabilities, Usage},
     protocol::{ActionKind, Step},
 };
 
@@ -130,6 +128,7 @@ impl RunMetrics {
 
 #[derive(Debug, Default)]
 struct CacheTracker {
+    capabilities: Option<PromptCacheCapabilities>,
     implicit_activity: Option<Instant>,
     implicit_cached_tokens: usize,
     implicit_prefix: Vec<serde_json::Value>,
@@ -147,6 +146,13 @@ struct TrackedBreakpoint {
 }
 
 impl CacheTracker {
+    fn new(capabilities: Option<PromptCacheCapabilities>) -> Self {
+        Self {
+            capabilities,
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     fn begin_request(&mut self, breakpoints: Vec<RenderedBreakpoint>) {
         self.begin_request_with_tokens(breakpoints, 0);
@@ -183,9 +189,15 @@ impl CacheTracker {
     }
 
     fn observe(&mut self, usage: &Usage) {
+        let Some(capabilities) = self.capabilities else {
+            self.pending.clear();
+            self.pending_request_tokens = 0;
+            self.pending_history.clear();
+            return;
+        };
         let now = Instant::now();
         let cache_activity = usage.cached_input_tokens > 0 || usage.cache_write_input_tokens > 0;
-        if cache_activity {
+        if cache_activity && self.pending_request_tokens >= capabilities.minimum_prefix_tokens {
             self.implicit_activity = Some(now);
             self.implicit_cached_tokens = self.pending_request_tokens;
             self.implicit_prefix.clone_from(&self.pending_history);
@@ -194,7 +206,7 @@ impl CacheTracker {
             .pending
             .iter()
             .rev()
-            .take(50)
+            .take(capabilities.max_read_breakpoints)
             .filter(|breakpoint| breakpoint.prefix_tokens <= usage.cached_input_tokens as usize)
             .filter(|breakpoint| {
                 self.breakpoints
@@ -210,12 +222,18 @@ impl CacheTracker {
         }
 
         if usage.cache_write_input_tokens > 0 {
+            let explicit_write_slots =
+                capabilities
+                    .max_write_breakpoints
+                    .saturating_sub(usize::from(
+                        capabilities.implicit_breakpoint_uses_write_slot,
+                    ));
             for breakpoint in self
                 .pending
                 .iter()
-                .filter(|breakpoint| breakpoint.prefix_tokens >= MIN_CACHE_TOKENS)
+                .filter(|breakpoint| breakpoint.prefix_tokens >= capabilities.minimum_prefix_tokens)
                 .rev()
-                .take(3)
+                .take(explicit_write_slots)
             {
                 let tracked = self
                     .breakpoints
@@ -254,8 +272,11 @@ impl CacheTracker {
             })
             .collect::<Vec<_>>();
         breakpoints.sort_by_key(|breakpoint| breakpoint.generation);
-        if breakpoints.len() > 50 {
-            breakpoints.drain(..breakpoints.len() - 50);
+        let max_read_breakpoints = self
+            .capabilities
+            .map_or(0, |capabilities| capabilities.max_read_breakpoints);
+        if breakpoints.len() > max_read_breakpoints {
+            breakpoints.drain(..breakpoints.len() - max_read_breakpoints);
         }
         CompactionPolicy {
             implicit_cached_tokens: if implicit_prefix_compatible
@@ -314,6 +335,13 @@ impl Backend {
         Ok(Self::Scripted { steps, emitted: 0 })
     }
 
+    fn prompt_cache_capabilities(&self) -> Option<PromptCacheCapabilities> {
+        match self {
+            Self::OpenAi(client) => client.prompt_cache_capabilities(),
+            Self::Scripted { .. } => None,
+        }
+    }
+
     fn request_body(&self, history: &[serde_json::Value]) -> Option<serde_json::Value> {
         match self {
             Self::OpenAi(client) => Some(client.request_body(SYSTEM_PROMPT, history)),
@@ -364,6 +392,7 @@ async fn run_loop(
     mut input: Option<mpsc::UnboundedReceiver<UserInput>>,
 ) -> Result<RunOutcome> {
     let run_started = Instant::now();
+    let prompt_cache_capabilities = backend.prompt_cache_capabilities();
     tokio::fs::create_dir_all(config.session_dir.join("tools")).await?;
     let mut logger = RunLogger::create(&config.session_dir)?;
     logger.raw_event(
@@ -374,14 +403,18 @@ async fn run_loop(
             "model": config.model,
             "max_steps": config.max_steps,
             "cache_ttl_seconds": CACHE_TTL.as_secs(),
+            "prompt_cache_capabilities": prompt_cache_capabilities,
             "compaction_decision": "next_request"
         }),
         &format!("carry · {} · {}", config.model, config.cwd.display()),
     )?;
 
-    let mut context_state = ContextState::new(config.prompt.clone());
+    let mut context_state = ContextState::new_with_max_read_breakpoints(
+        config.prompt.clone(),
+        prompt_cache_capabilities.map_or(0, |capabilities| capabilities.max_read_breakpoints),
+    );
     let mut metrics = RunMetrics::default();
-    let mut cache = CacheTracker::default();
+    let mut cache = CacheTracker::new(prompt_cache_capabilities);
     let mut step_index = 0;
     let mut turn_step = 0;
     let mut protected_until_request = Vec::new();
@@ -975,6 +1008,73 @@ async fn write_final_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openai::PromptCacheCapabilities;
+
+    fn openai_cache_capabilities() -> PromptCacheCapabilities {
+        PromptCacheCapabilities {
+            minimum_prefix_tokens: 1_024,
+            max_read_breakpoints: 50,
+            max_write_breakpoints: 4,
+            implicit_breakpoint_uses_write_slot: true,
+        }
+    }
+
+    #[test]
+    fn tracker_respects_resolved_minimum_and_write_slots() {
+        let mut cache = CacheTracker::new(Some(PromptCacheCapabilities {
+            minimum_prefix_tokens: 2_000,
+            max_read_breakpoints: 7,
+            max_write_breakpoints: 2,
+            implicit_breakpoint_uses_write_slot: true,
+        }));
+        cache.begin_request(vec![
+            RenderedBreakpoint {
+                generation: 0,
+                prefix_tokens: 1_999,
+            },
+            RenderedBreakpoint {
+                generation: 1,
+                prefix_tokens: 2_100,
+            },
+            RenderedBreakpoint {
+                generation: 2,
+                prefix_tokens: 2_200,
+            },
+        ]);
+        cache.observe(&Usage {
+            cache_write_input_tokens: 9_000,
+            ..Usage::default()
+        });
+
+        assert_eq!(
+            cache.policy().breakpoints,
+            vec![PricedBreakpoint {
+                generation: 2,
+                cached_tokens: 2_200,
+            }]
+        );
+    }
+
+    #[test]
+    fn unknown_cache_capabilities_disable_cache_assumptions() {
+        let mut cache = CacheTracker::new(None);
+        cache.begin_request_with_tokens(
+            vec![RenderedBreakpoint {
+                generation: 1,
+                prefix_tokens: 4_000,
+            }],
+            4_000,
+        );
+        cache.observe(&Usage {
+            cached_input_tokens: 4_000,
+            cache_write_input_tokens: 4_000,
+            ..Usage::default()
+        });
+
+        let policy = cache.policy();
+        assert_eq!(policy.implicit_cached_tokens, 0);
+        assert!(policy.breakpoints.is_empty());
+    }
 
     #[test]
     fn system_prompt_requires_reproduction_and_history_checks() {
@@ -1118,7 +1218,7 @@ mod tests {
 
     #[test]
     fn policy_prices_the_exact_previous_implicit_prefix() {
-        let mut cache = CacheTracker::default();
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
         cache.begin_request_with_tokens(Vec::new(), 2_400);
         cache.observe(&Usage {
             cache_write_input_tokens: 2_400,
@@ -1130,7 +1230,7 @@ mod tests {
 
     #[test]
     fn policy_rejects_a_mutated_previous_implicit_prefix() {
-        let mut cache = CacheTracker::default();
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
         let original = vec![json!({"role": "user", "content": "original"})];
         cache.begin_request_with_history(Vec::new(), &original, 2_400);
         cache.observe(&Usage {
@@ -1152,7 +1252,7 @@ mod tests {
 
     #[test]
     fn eligible_explicit_breakpoint_writes_are_tracked_by_generation() {
-        let mut cache = CacheTracker::default();
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
         cache.begin_request(vec![
             RenderedBreakpoint {
                 generation: 0,
@@ -1191,7 +1291,7 @@ mod tests {
 
     #[test]
     fn one_explicit_write_is_not_divided_with_the_implicit_slot() {
-        let mut cache = CacheTracker::default();
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
         cache.begin_request(vec![RenderedBreakpoint {
             generation: 1,
             prefix_tokens: 1_200,
@@ -1212,7 +1312,7 @@ mod tests {
 
     #[test]
     fn implicit_slot_limits_explicit_writes_to_latest_three_generations() {
-        let mut cache = CacheTracker::default();
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
         cache.begin_request(
             (0..4)
                 .map(|generation| RenderedBreakpoint {
@@ -1237,13 +1337,17 @@ mod tests {
     }
 
     #[test]
-    fn planner_prices_only_the_latest_fifty_readable_breakpoints() {
+    fn planner_prices_only_the_resolved_number_of_readable_breakpoints() {
         let now = Instant::now();
         let cache = CacheTracker {
+            capabilities: Some(PromptCacheCapabilities {
+                max_read_breakpoints: 2,
+                ..openai_cache_capabilities()
+            }),
             implicit_activity: Some(now),
             implicit_cached_tokens: 1_500,
             implicit_prefix: Vec::new(),
-            breakpoints: (0..51)
+            breakpoints: (0..3)
                 .map(|generation| {
                     (
                         generation,
@@ -1267,12 +1371,13 @@ mod tests {
             .map(|breakpoint| breakpoint.generation)
             .collect::<Vec<_>>();
         generations.sort_unstable();
-        assert_eq!(generations, (1..51).collect::<Vec<_>>());
+        assert_eq!(generations, vec![1, 2]);
     }
 
     #[test]
     fn aggregate_reads_do_not_resurrect_an_expired_generation() {
         let mut cache = CacheTracker {
+            capabilities: Some(openai_cache_capabilities()),
             implicit_activity: None,
             implicit_cached_tokens: 0,
             implicit_prefix: Vec::new(),

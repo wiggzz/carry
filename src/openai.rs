@@ -14,6 +14,39 @@ const MAX_RESPONSE_RETRIES: usize = 5;
 const MAX_TOTAL_RETRY_WAIT: Duration = Duration::from_secs(60);
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct PromptCacheCapabilities {
+    pub minimum_prefix_tokens: usize,
+    pub max_read_breakpoints: usize,
+    pub max_write_breakpoints: usize,
+    pub implicit_breakpoint_uses_write_slot: bool,
+}
+
+const OPENAI_GPT_56_PROMPT_CACHE: PromptCacheCapabilities = PromptCacheCapabilities {
+    minimum_prefix_tokens: 1_024,
+    max_read_breakpoints: 50,
+    max_write_breakpoints: 4,
+    implicit_breakpoint_uses_write_slot: true,
+};
+
+pub(crate) fn prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabilities> {
+    exact_model_prompt_cache_capabilities(model)
+        .or_else(|| model_family_prompt_cache_capabilities(model))
+}
+
+fn exact_model_prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabilities> {
+    match model {
+        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" => Some(OPENAI_GPT_56_PROMPT_CACHE),
+        _ => None,
+    }
+}
+
+fn model_family_prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabilities> {
+    model
+        .starts_with("gpt-5.6-")
+        .then_some(OPENAI_GPT_56_PROMPT_CACHE)
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenAiClient {
     http: Client,
@@ -63,6 +96,10 @@ impl OpenAiClient {
             reasoning_effort,
             prompt_cache_key: new_prompt_cache_key(),
         }
+    }
+
+    pub(crate) fn prompt_cache_capabilities(&self) -> Option<PromptCacheCapabilities> {
+        prompt_cache_capabilities(&self.model)
     }
 
     pub fn request_body(&self, system: &str, history: &[Value]) -> Value {
@@ -310,6 +347,25 @@ fn new_prompt_cache_key() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_openai_models_resolve_prompt_cache_capabilities() {
+        let capabilities = prompt_cache_capabilities("gpt-5.6-luna").unwrap();
+        assert_eq!(capabilities.minimum_prefix_tokens, 1_024);
+        assert_eq!(capabilities.max_read_breakpoints, 50);
+        assert_eq!(capabilities.max_write_breakpoints, 4);
+        assert!(capabilities.implicit_breakpoint_uses_write_slot);
+        assert_eq!(
+            prompt_cache_capabilities("gpt-5.6-future"),
+            Some(capabilities)
+        );
+    }
+
+    #[test]
+    fn unknown_models_disable_prompt_cache_assumptions() {
+        assert_eq!(prompt_cache_capabilities("custom-model"), None);
+    }
+
     use std::{
         io::{ErrorKind, Read, Write},
         net::TcpListener,
