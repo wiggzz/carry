@@ -147,23 +147,23 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Advisory context signals. Signals persist until reversed or acted on; they do not immediately mutate history. Emit only new high-confidence opinions.",
+        "description": "Sparse context advice. Signals persist until reversed or acted on; they do not immediately mutate history.",
         "properties": {
             "keep": {
                 "type": "array",
-                "description": "Up to four context IDs whose exact contents the task cannot safely lose. Stable items already persist by default and normally need not be listed. A later keep reverses an earlier drop.",
+                "description": "Protect up to four volatile context IDs whose exact details still matter. Stable items persist without keep. A later keep also reverses an earlier drop.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "drop": {
                 "type": "array",
-                "description": "Up to four context IDs whose exact contents are no longer useful. This is advisory: Carry drops them only when a cache-aware minor or major compaction is economical. A later drop reverses an earlier keep.",
+                "description": "Make up to four stable context IDs removable because they are no longer useful. Volatile items are already removable unless kept. A later drop reverses an earlier keep.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "remember": {
                 "type": "array",
-                "description": "Exceptional escape hatch for at most one concise, unique, task-critical outcome that must survive removal of its source tool interaction. Never use for routine commands, edits, tests, retained observations, or a normal finish. Preserve the outcome, not chain-of-thought.",
+                "description": "At most one concise durable fact to retain instead of a large volatile source interaction. Use when a small useful outcome is buried in otherwise disposable tool output. Do not duplicate retained context or preserve chain-of-thought.",
                 "items": { "type": "string" },
                 "maxItems": 1
             }

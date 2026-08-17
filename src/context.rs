@@ -334,7 +334,7 @@ impl ContextState {
             .iter()
             .filter(|item| {
                 item.retention == Retention::Volatile
-                    && item.signal == RetentionSignal::Drop
+                    && item.signal != RetentionSignal::Keep
                     && !protected.contains(&item.id)
             })
             .map(|item| item.id)
@@ -342,7 +342,12 @@ impl ContextState {
         let major_drops = self
             .items
             .iter()
-            .filter(|item| item.signal == RetentionSignal::Drop && !protected.contains(&item.id))
+            .filter(|item| {
+                ((item.retention == Retention::Stable && item.signal == RetentionSignal::Drop)
+                    || (item.retention == Retention::Volatile
+                        && item.signal != RetentionSignal::Keep))
+                    && !protected.contains(&item.id)
+            })
             .map(|item| item.id)
             .collect::<Vec<_>>();
 
@@ -759,6 +764,7 @@ mod tests {
         let dropped = add_tool(&mut state);
         let retained = add_tool(&mut state);
         state.record_signals(&update(&[], &[dropped], &[]), retained);
+        state.record_signals(&update(&[retained], &[], &[]), retained);
 
         let short = state.plan_compaction(
             &[],
@@ -769,7 +775,6 @@ mod tests {
         );
         assert!(short.is_none());
 
-        state.record_signals(&update(&[retained], &[], &[]), retained);
         assert!(
             state
                 .plan_compaction(
@@ -777,6 +782,37 @@ mod tests {
                     CompactionPolicy {
                         implicit_cache_alive: true,
                         stable_cache_alive: true,
+                    },
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn neutral_volatile_items_are_removable_unless_kept() {
+        let mut state = ContextState::new("initial".into());
+        let disposable = add_tool(&mut state);
+
+        let plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cache_alive: false,
+                    stable_cache_alive: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(plan.kind, CompactionKind::Minor);
+        assert_eq!(plan.dropped, vec![disposable]);
+
+        state.record_signals(&update(&[disposable], &[], &[]), disposable);
+        assert!(
+            state
+                .plan_compaction(
+                    &[],
+                    CompactionPolicy {
+                        implicit_cache_alive: false,
+                        stable_cache_alive: false,
                     },
                 )
                 .is_none()
