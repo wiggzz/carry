@@ -147,22 +147,25 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Controls generational context. Stable items persist by default; volatile items survive only when retained.",
+        "description": "Advisory context signals. Signals persist until reversed or acted on; they do not immediately mutate history. Emit only new high-confidence opinions.",
         "properties": {
             "keep": {
                 "type": "array",
-                "description": "The complete set of volatile integer context IDs to preserve. Omitted volatile items are dropped. Use [] when none should survive.",
-                "items": { "type": "integer", "minimum": 1 }
+                "description": "Up to four context IDs whose exact contents the task cannot safely lose. Stable items already persist by default and normally need not be listed. A later keep reverses an earlier drop.",
+                "items": { "type": "integer", "minimum": 1 },
+                "maxItems": 4
             },
             "drop": {
                 "type": "array",
-                "description": "Stable integer context IDs to drop because they are satisfied, superseded, stale, contradicted, or redundant. Stable items otherwise persist automatically.",
-                "items": { "type": "integer", "minimum": 1 }
+                "description": "Up to four context IDs whose exact contents are no longer useful. This is advisory: Carry drops them only when a cache-aware minor or major compaction is economical. A later drop reverses an earlier keep.",
+                "items": { "type": "integer", "minimum": 1 },
+                "maxItems": 4
             },
             "remember": {
                 "type": "array",
-                "description": "Concise durable outcomes worth preserving when exact context is dropped. Preserve conclusions, constraints, evidence, decisions, and unresolved questions, not chain-of-thought. Do not duplicate retained context.",
-                "items": { "type": "string" }
+                "description": "Concise durable outcomes worth preserving when exact context may later be compacted. Preserve conclusions, constraints, evidence, decisions, and unresolved questions, not chain-of-thought. Do not duplicate retained context.",
+                "items": { "type": "string" },
+                "maxItems": 2
             }
         },
         "required": ["keep", "drop", "remember"],

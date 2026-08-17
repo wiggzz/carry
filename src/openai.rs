@@ -93,20 +93,67 @@ impl OpenAiClient {
         let mut retry_wait = Duration::ZERO;
         let mut retry_stopped_reason = None;
         let raw = loop {
-            let response = self
+            let response = match self
                 .http
                 .post(format!("{}/responses", self.api_base))
                 .bearer_auth(&self.api_key)
                 .json(&body)
                 .send()
                 .await
-                .context("Responses API request failed")?;
+            {
+                Ok(response) => response,
+                Err(error) if retries < MAX_RESPONSE_RETRIES => {
+                    let delay = transport_retry_delay(retries);
+                    if delay > MAX_TOTAL_RETRY_WAIT.saturating_sub(retry_wait) {
+                        return Err(error).context(format!(
+                            "Responses API request failed after {retries} retries and {}ms waiting",
+                            retry_wait.as_millis()
+                        ));
+                    }
+                    retries += 1;
+                    retry_wait += delay;
+                    eprintln!(
+                        "Responses API transport error: {error}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
+                        delay.as_millis(),
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).context(format!(
+                        "Responses API request failed after {retries} retries and {}ms waiting",
+                        retry_wait.as_millis()
+                    ));
+                }
+            };
             let status = response.status();
             let headers = response.headers().clone();
-            let response_body = response
-                .bytes()
-                .await
-                .context("Responses API response body read failed")?;
+            let response_body = match response.bytes().await {
+                Ok(body) => body,
+                Err(error) if retries < MAX_RESPONSE_RETRIES => {
+                    let delay = transport_retry_delay(retries);
+                    if delay > MAX_TOTAL_RETRY_WAIT.saturating_sub(retry_wait) {
+                        return Err(error).context(format!(
+                            "Responses API response body read failed after {retries} retries and {}ms waiting",
+                            retry_wait.as_millis()
+                        ));
+                    }
+                    retries += 1;
+                    retry_wait += delay;
+                    eprintln!(
+                        "Responses API response body read failed: {error}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
+                        delay.as_millis(),
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).context(format!(
+                        "Responses API response body read failed after {retries} retries and {}ms waiting",
+                        retry_wait.as_millis()
+                    ));
+                }
+            };
             if status.is_success() {
                 break serde_json::from_slice(&response_body)
                     .context("Responses API returned invalid JSON")?;
@@ -187,6 +234,10 @@ fn retryable_rate_limit(status: StatusCode, response_body: &[u8]) -> bool {
 
 fn retry_delay(headers: &HeaderMap, attempt: usize) -> Duration {
     retry_delay_at(headers, attempt, SystemTime::now())
+}
+
+fn transport_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(250 * (1_u64 << attempt.min(4)))
 }
 
 fn retry_delay_at(headers: &HeaderMap, attempt: usize, now: SystemTime) -> Duration {
@@ -289,6 +340,7 @@ mod tests {
                         Err(error) => panic!("test server accept failed: {error}"),
                     }
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -360,6 +412,33 @@ mod tests {
         assert_eq!(reply.response_id, "response-1");
         assert_eq!(reply.response_retries, 1);
         assert!(started.elapsed() >= Duration::from_millis(15));
+        assert_eq!(
+            requests.recv_timeout(Duration::from_secs(2)).unwrap(),
+            requests.recv_timeout(Duration::from_secs(2)).unwrap()
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_when_connection_closes_before_a_response() {
+        let success = json!({
+            "id": "response-after-disconnect",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "finish",
+                "arguments": "{\"answer\":\"done\",\"context\":{\"keep\":[],\"drop\":[],\"remember\":[]}}"
+            }],
+            "usage": {}
+        });
+        let (api_base, requests, server) =
+            response_server(vec![String::new(), http_response("200 OK", "", &success)]);
+        let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
+
+        let reply = client.step("system", &[]).await.unwrap();
+
+        assert_eq!(reply.response_id, "response-after-disconnect");
+        assert_eq!(reply.response_retries, 1);
         assert_eq!(
             requests.recv_timeout(Duration::from_secs(2)).unwrap(),
             requests.recv_timeout(Duration::from_secs(2)).unwrap()

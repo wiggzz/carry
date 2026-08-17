@@ -79,14 +79,6 @@ struct Cli {
     #[arg(long, default_value_t = 300)]
     shell_timeout_secs: u64,
 
-    /// Consecutive volatile retention rounds required for stable promotion.
-    #[arg(long, default_value_t = 3)]
-    promotion_age: usize,
-
-    /// Successful context updates between batched promotion collections.
-    #[arg(long, default_value_t = 3)]
-    collection_interval: usize,
-
     /// JSONL Step objects to use instead of calling a model.
     #[arg(long, hide = true)]
     scripted_steps: Option<PathBuf>,
@@ -119,9 +111,6 @@ async fn main() -> Result<()> {
 }
 
 async fn run_command(args: Cli) -> Result<()> {
-    if args.promotion_age == 0 || args.collection_interval == 0 {
-        bail!("--promotion-age and --collection-interval must be at least 1");
-    }
     let cwd = args
         .cwd
         .canonicalize()
@@ -148,6 +137,8 @@ async fn run_command(args: Cli) -> Result<()> {
             .context("failed to read prompt from stdin")?;
         prompt
     } else {
+        eprint!("carry> ");
+        let _ = std::io::stderr().flush();
         input = Some(spawn_input_reader());
         match input
             .as_mut()
@@ -192,8 +183,6 @@ async fn run_command(args: Cli) -> Result<()> {
         model: args.model,
         max_steps: args.max_steps,
         shell_timeout_secs: args.shell_timeout_secs,
-        promotion_age: args.promotion_age,
-        collection_interval: args.collection_interval,
     };
 
     let outcome = if interactive {
@@ -220,8 +209,6 @@ fn spawn_input_reader() -> mpsc::UnboundedReceiver<UserInput> {
         let stdin = std::io::stdin();
         let mut lines = stdin.lock().lines();
         loop {
-            eprint!("carry> ");
-            let _ = std::io::stderr().flush();
             let Some(line) = lines.next() else {
                 let _ = sender.send(UserInput::Exit);
                 break;

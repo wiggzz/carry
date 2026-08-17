@@ -1,6 +1,6 @@
 # Carry
 
-Carry is an experimental agentic coding harness that aims to minimize token use and cost while maintaining performance comparable to state-of-the-art harnesses. It lets the model dynamically retain only necessary context, reducing conversation-history bloat and avoiding regular compaction during long-running tasks. Each model turn must produce one structured `shell` or `finish` function call and an explicit context-management update.
+Carry is an experimental agentic coding harness that aims to minimize token use and cost while maintaining performance comparable to state-of-the-art harnesses. It lets the model signal which context matters while a cache-aware planner decides when compaction is worth its rewrite cost. Each model turn must produce one structured `shell` or `finish` function call and a sparse context-management update.
 
 > **Security:** Carry's shell tool is not a security boundary. Run it only in a disposable checkout or another isolation mechanism you control. Never give an agent a workspace containing secrets or unrelated source trees.
 
@@ -36,15 +36,17 @@ carry --cwd /path/to/disposable/repo -p "explain why --release is failing"
 
 Run `carry` without a prompt to start an interactive session, or add `--interactive` to continue after an initial prompt. Input remains active while the model and shell commands run; steering is queued and appended immediately after the current action completes. Use `/help`, `/quit`, or `/exit` at the prompt.
 
-The default model is `gpt-5.6-luna`; override it with `--model` or `OPENAI_MODEL`. Sessions have no default step limit. Use `--max-steps N` only when an explicit per-turn cap is required. Responses API `429` responses with `error.code=rate_limit_exceeded` are retried up to five times. Carry honors `Retry-After-Ms`, numeric `Retry-After`, and HTTP-date `Retry-After`; the total wait budget is 60 seconds, and Carry stops rather than sending earlier when the server requests a longer delay. Missing or invalid delay headers use bounded exponential backoff. Retries resend the identical request body; successful model-response events include the retry count, and exhausted errors include the retry/wait summary. Quota failures and ambiguous `5xx` POST failures are not replayed.
+The default model is `gpt-5.6-luna`; override it with `--model` or `OPENAI_MODEL`. Sessions have no default step limit. Use `--max-steps N` only when an explicit per-turn cap is required. Responses API `429` responses with `error.code=rate_limit_exceeded` and connection failures before a response is received are retried up to five times. Carry honors `Retry-After-Ms`, numeric `Retry-After`, and HTTP-date `Retry-After`; the total wait budget is 60 seconds, and Carry stops rather than sending earlier when the server requests a longer delay. Missing or invalid delay headers and transport failures use bounded exponential backoff. Retries resend the identical request body; successful model-response events include the retry count, and exhausted errors include the retry/wait summary. Quota failures and ambiguous `5xx` POST failures are not replayed.
 
 Session data is written beneath `$CARRY_HOME/sessions` or `~/.carry/sessions` by default. Use `--session-home` to select another parent or `--session-dir` to choose the exact directory. A session contains `trace.jsonl`, `trace.log`, shell outputs, `result.json`, and `final.patch`. Model request traces exclude HTTP headers and the API key.
 
+The terminal shows compact per-step input, cache-read, cache-write, and output token counts. Compactions are called out as `minor` or `major` with the dropped, retained, and rewritten token estimates; `result.json` records aggregate token usage and compaction counts.
+
 ## Context policy
 
-Carry keeps one strictly chronological context ledger. Human messages enter stable retention; tool interactions and memories begin volatile. Stable items persist unless explicitly dropped, while volatile items survive only when explicitly kept. Promotions are evidence-based and never reorder history. The stable cache frontier is the longest chronological prefix made entirely of stable items; later stable human messages remain durable without forcing earlier volatile items to promote.
+Carry keeps one strictly chronological context ledger. Human messages and memories enter stable retention; tool interactions begin volatile. Stable items persist by default, while volatile items remain present until a compaction planner decides that acting on the model's signals will save more than rewriting the cache costs. The stable cache frontier is the longest chronological prefix made entirely of stable items; later stable human messages remain durable without reordering history or forcing earlier volatile items to promote.
 
-Every item has a compact integer ID and an immutable marker such as `[2 tool volatile]`. Carry preserves all native Responses API output items—including reasoning items—alongside function results. Between collections, retained history grows by exact appends for prompt-cache reuse. Dropping, promotion, or explicit stable removal rebuilds the generation and moves the cache frontier when chronology permits.
+Every item has a compact integer ID and an immutable marker such as `[2 tool volatile]`. Carry preserves all native Responses API output items—including reasoning items—alongside function results. Between compactions, retained history grows by exact appends for prompt-cache reuse. A minor compaction acts only on volatile drop candidates; a major compaction may also remove stable drop candidates. Both preserve chronology, make the retained generation stable, and establish a new explicit cache frontier. Cache age participates in the decision, so an expired cache is rebuilt promptly instead of preserving a no-longer-useful prefix.
 
 Each action includes context management:
 
@@ -60,7 +62,7 @@ Each action includes context management:
 }
 ```
 
-`keep` is the complete volatile survival set. `drop` removes stable items that are satisfied, superseded, stale, or redundant. Before dropping exact context, `remember` can preserve its useful conclusions, constraints, evidence, decisions, or unresolved questions without retaining chain-of-thought.
+`keep` and `drop` are sparse, sticky advisory signals, limited to four IDs each per turn. `keep` marks exact items the task cannot safely lose; stable items already persist by default and normally need no vote. `drop` marks exact content that is no longer useful, but Carry may defer the deletion to preserve a valuable cached prefix. A later opposite signal reverses the prior opinion, and `keep` wins if both name the same ID in one response. Unknown or stale IDs are ignored. Before marking exact context for dropping, `remember` can preserve up to two useful conclusions, constraints, evidence, decisions, or unresolved questions without retaining chain-of-thought.
 
 ## Development
 

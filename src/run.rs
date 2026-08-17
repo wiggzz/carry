@@ -11,7 +11,7 @@ use serde_json::json;
 use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc, time::Duration};
 
 use crate::{
-    context::ContextState,
+    context::{CompactionKind, CompactionPolicy, ContextState},
     log::RunLogger,
     openai::{ModelReply, OpenAiClient, Usage},
     protocol::{ActionKind, Step},
@@ -21,7 +21,7 @@ const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an 
 
 At each step, select exactly one available action. Investigate, implement, and verify the requested change before finishing. Before editing, establish a minimal failing reproduction where practical. When behavior has competing inputs or sources, use distinct values to verify provenance; when a task cites a regression or prior change, search cited identifiers and subsequent fixes in repository history. Before finishing, run the affected tests. Use the optional shell message to give the human concise, useful progress commentary.
 
-Context is a chronological ledger. Each item is followed by an immutable marker in the form [integer kind stable|volatile]. Stable items persist unless listed in context.drop. Volatile items disappear unless listed in context.keep. Human messages are authoritative stable instructions; drop one only when it is satisfied or explicitly superseded. Before dropping exact context with useful reasoning outcomes, preserve durable conclusions, constraints, evidence, decisions, or unresolved questions with context.remember. Preserve outcomes, not chain-of-thought.
+Context is a chronological ledger. Each item is followed by an immutable marker in the form [integer kind stable|volatile]. Stable items persist by default. Context keep/drop arrays are sparse advisory signals, not immediate commands: keep marks exact items the task cannot safely lose, while drop marks exact items that are no longer useful. Emit only newly recognized high-confidence signals, at most four IDs in each array; omitted IDs keep their prior signal. Stable items normally do not need keep. Missing, stale, or wrong-class IDs are harmless. A later keep or drop reverses the earlier opinion, and keep wins if both name the same ID in one response. Carry decides when cache-aware minor or major compaction is economical. Human messages are authoritative; mark one drop only when it is satisfied or explicitly superseded. Before marking exact context drop, preserve durable conclusions, constraints, evidence, decisions, or unresolved questions with context.remember. Preserve outcomes, not chain-of-thought.
 
 Work only within the assigned repository. Do not perform destructive or external actions."#;
 
@@ -33,9 +33,10 @@ pub struct RunConfig {
     pub model: String,
     pub max_steps: Option<usize>,
     pub shell_timeout_secs: u64,
-    pub promotion_age: usize,
-    pub collection_interval: usize,
 }
+
+const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const COMPACTION_HORIZON_TURNS: usize = 8;
 
 pub enum Backend {
     OpenAi(OpenAiClient),
@@ -77,6 +78,8 @@ struct RunMetrics {
     usage: Usage,
     model_latency_ms: u64,
     response_retries: usize,
+    minor_compactions: usize,
+    major_compactions: usize,
 }
 
 impl RunMetrics {
@@ -99,6 +102,73 @@ impl RunMetrics {
         self.model_latency_ms = self.model_latency_ms.saturating_add(latency_ms);
         self.response_retries = self.response_retries.saturating_add(response_retries);
     }
+
+    fn record_compaction(&mut self, kind: CompactionKind) {
+        match kind {
+            CompactionKind::Minor => {
+                self.minor_compactions = self.minor_compactions.saturating_add(1)
+            }
+            CompactionKind::Major => {
+                self.major_compactions = self.major_compactions.saturating_add(1)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CacheTracker {
+    implicit_activity: Option<Instant>,
+    stable_checkpoint_activity: Option<Instant>,
+    checkpoint_pending: bool,
+}
+
+impl Default for CacheTracker {
+    fn default() -> Self {
+        Self {
+            implicit_activity: None,
+            stable_checkpoint_activity: None,
+            checkpoint_pending: true,
+        }
+    }
+}
+
+impl CacheTracker {
+    fn observe(&mut self, usage: &Usage) {
+        let now = Instant::now();
+        let cache_activity = usage.cached_input_tokens > 0 || usage.cache_write_input_tokens > 0;
+        if cache_activity {
+            self.implicit_activity = Some(now);
+        }
+        if self.checkpoint_pending {
+            self.stable_checkpoint_activity = cache_activity.then_some(now);
+            self.checkpoint_pending = false;
+        } else if usage.cached_input_tokens > 0 {
+            self.stable_checkpoint_activity = Some(now);
+        }
+    }
+
+    fn policy(&self) -> CompactionPolicy {
+        let now = Instant::now();
+        CompactionPolicy {
+            horizon_turns: COMPACTION_HORIZON_TURNS,
+            implicit_cache_alive: cache_alive(self.implicit_activity, now),
+            stable_cache_alive: cache_alive(self.stable_checkpoint_activity, now),
+        }
+    }
+
+    fn implicit_expired(&self) -> bool {
+        self.implicit_activity
+            .is_some_and(|activity| activity.elapsed() >= CACHE_TTL)
+    }
+
+    fn mark_compaction(&mut self) {
+        self.implicit_activity = None;
+        self.checkpoint_pending = true;
+    }
+}
+
+fn cache_alive(activity: Option<Instant>, now: Instant) -> bool {
+    activity.is_some_and(|activity| now.duration_since(activity) < CACHE_TTL)
 }
 
 impl Backend {
@@ -186,20 +256,28 @@ async fn run_loop(
             "prompt": config.prompt,
             "model": config.model,
             "max_steps": config.max_steps,
-            "promotion_age": config.promotion_age,
-            "collection_interval": config.collection_interval
+            "cache_ttl_seconds": CACHE_TTL.as_secs(),
+            "compaction_horizon_turns": COMPACTION_HORIZON_TURNS
         }),
-        &format!("run started in {}", config.cwd.display()),
+        &format!("carry · {} · {}", config.model, config.cwd.display()),
     )?;
 
     let mut context_state = ContextState::new(config.prompt.clone());
     let mut metrics = RunMetrics::default();
-    let steps_limit = config
-        .max_steps
-        .map_or_else(|| "unlimited".to_owned(), |limit| limit.to_string());
+    let mut cache = CacheTracker::default();
     let mut step_index = 0;
     let mut turn_step = 0;
     loop {
+        if cache.implicit_expired() {
+            maybe_compact(
+                &mut context_state,
+                &[],
+                &mut cache,
+                &mut metrics,
+                &mut logger,
+                "cache expired",
+            )?;
+        }
         if let Some(max_steps) = config.max_steps
             && turn_step >= max_steps
         {
@@ -226,18 +304,18 @@ async fn run_loop(
         turn_step += 1;
         let history = context_state.input_items();
         let request = backend.request_body(&history);
-        logger.raw_event(
+        logger.raw_event_silent(
             "model_request",
             json!({
                 "step": step_index,
                 "history": history,
                 "request": request
             }),
-            &format!("[{turn_step:02}/{steps_limit}] requesting next step"),
         )?;
 
         let reply = backend.step(&history).await?;
         metrics.record(&reply.usage, reply.latency_ms, reply.response_retries);
+        cache.observe(&reply.usage);
         logger.raw_event(
             "model_response",
             json!({
@@ -249,30 +327,13 @@ async fn run_loop(
                 "parsed": &reply.step,
                 "raw": reply.raw
             }),
-            &format!(
-                "[{turn_step:02}/{steps_limit}] model {}ms retries={} in={} cached={} out={} reasoning={}",
+            &terminal_usage(
+                turn_step,
                 reply.latency_ms,
                 reply.response_retries,
-                reply.usage.input_tokens,
-                reply.usage.cached_input_tokens,
-                reply.usage.output_tokens,
-                reply.usage.reasoning_tokens
+                &reply.usage,
             ),
         )?;
-
-        if let Err(error) = context_state.validate(&reply.step.context, &[]) {
-            let feedback = format!(
-                "Protocol error: {error}. No action was executed. Submit a corrected action."
-            );
-            let output = function_output(&reply.function_call, &feedback)?;
-            context_state.add_tool(reply.output_items.clone(), output)?;
-            logger.raw_event(
-                "protocol_error",
-                json!({"step": step_index, "error": error.to_string()}),
-                &feedback,
-            )?;
-            continue;
-        }
 
         match reply.step.action.kind {
             ActionKind::Shell => {
@@ -300,25 +361,17 @@ async fn run_loop(
                 .await?;
                 let output = function_call_output(&reply.function_call, &result)?;
                 let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
-                logger.event(
-                    "shell_finished",
-                    &result,
-                    &format!(
-                        "  exit={:?} {}ms stdout={}B stderr={}B{}",
-                        result.exit_code,
-                        result.duration_ms,
-                        result.stdout_bytes,
-                        result.stderr_bytes,
-                        if result.timed_out { " timed-out" } else { "" }
-                    ),
-                )?;
-                let context_change = context_state.apply(
-                    &reply.step.context,
+                logger.event("shell_finished", &result, &terminal_shell_result(&result))?;
+                let signals = context_state.record_signals(&reply.step.context);
+                logger.event_silent("context_signals", &signals)?;
+                maybe_compact(
+                    &mut context_state,
                     &[item_id],
-                    config.promotion_age,
-                    config.collection_interval,
+                    &mut cache,
+                    &mut metrics,
+                    &mut logger,
+                    "economic",
                 )?;
-                log_context_change(&mut logger, &context_change)?;
 
                 if let Some(receiver) = input.as_mut()
                     && drain_user_input(receiver, &mut context_state, &mut logger)?
@@ -345,13 +398,16 @@ async fn run_loop(
                     "The answer was delivered to the human; the session may continue.",
                 )?;
                 let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
-                let context_change = context_state.apply(
-                    &reply.step.context,
+                let signals = context_state.record_signals(&reply.step.context);
+                logger.event_silent("context_signals", &signals)?;
+                maybe_compact(
+                    &mut context_state,
                     &[item_id],
-                    config.promotion_age,
-                    config.collection_interval,
+                    &mut cache,
+                    &mut metrics,
+                    &mut logger,
+                    "economic",
                 )?;
-                log_context_change(&mut logger, &context_change)?;
                 logger.raw_event(
                     if input.is_some() {
                         "turn_finished"
@@ -363,13 +419,15 @@ async fn run_loop(
                         "answer": answer,
                         "retained_context": context_state.snapshot()
                     }),
-                    &format!("finished after {step_index} steps"),
+                    &terminal_finished(step_index, &metrics.usage),
                 )?;
                 if let Some(receiver) = input.as_mut() {
                     println!("{}", answer.as_deref().unwrap_or_default());
                     let mut should_exit =
                         drain_user_input(receiver, &mut context_state, &mut logger)?;
                     if !should_exit {
+                        eprint!("carry> ");
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
                         match receiver.recv().await {
                             Some(UserInput::Message(message)) => {
                                 append_user_message(&mut context_state, &mut logger, message)?;
@@ -431,25 +489,104 @@ fn append_user_message(
     )
 }
 
-fn log_context_change(
+fn maybe_compact(
+    state: &mut ContextState,
+    protected: &[u64],
+    cache: &mut CacheTracker,
+    metrics: &mut RunMetrics,
     logger: &mut RunLogger,
-    change: &crate::context::ContextChange,
-) -> Result<()> {
-    logger.event(
-        "context_updated",
-        change,
+    trigger: &str,
+) -> Result<bool> {
+    let Some(plan) = state.plan_compaction(protected, cache.policy()) else {
+        return Ok(false);
+    };
+    let change = state.compact(plan);
+    cache.mark_compaction();
+    metrics.record_compaction(change.kind);
+    logger.raw_event(
+        "context_compacted",
+        json!({"trigger": trigger, "compaction": &change}),
         &format!(
-            "  context stable={} volatile={} frontier={:?} promoted={} dropped_volatile={} dropped_stable={} added={} bytes={}",
-            change.stable.len(),
-            change.volatile.len(),
-            change.stable_frontier,
-            change.promoted.len(),
-            change.dropped_volatile.len(),
-            change.dropped_stable.len(),
-            change.added.len(),
-            change.bytes
+            "  compact {} · -{} items / ~{} tok · {} retained · {} rewritten · break-even {} turns",
+            change.kind.label(),
+            change.dropped.len(),
+            compact_number(change.dropped_tokens as u64),
+            compact_number(change.retained_tokens as u64),
+            compact_number(change.rewrite_tokens as u64),
+            change.break_even_turns,
         ),
+    )?;
+    Ok(true)
+}
+
+fn terminal_usage(step: usize, latency_ms: u64, retries: usize, usage: &Usage) -> String {
+    let retry = if retries == 0 {
+        String::new()
+    } else {
+        format!(" · {retries} retries")
+    };
+    format!(
+        "[{step:02}] {} · in {} ({} cached, {} write) · out {}{retry}",
+        compact_duration(latency_ms),
+        compact_number(usage.input_tokens),
+        compact_number(usage.cached_input_tokens),
+        compact_number(usage.cache_write_input_tokens),
+        compact_number(usage.output_tokens),
     )
+}
+
+fn terminal_shell_result(result: &ShellResult) -> String {
+    let status = if result.timed_out {
+        "timeout".to_owned()
+    } else {
+        result
+            .exit_code
+            .map_or_else(|| "signal".to_owned(), |code| format!("exit {code}"))
+    };
+    format!(
+        "  {status} · {} · {} stdout · {} stderr",
+        compact_duration(result.duration_ms),
+        compact_bytes(result.stdout_bytes),
+        compact_bytes(result.stderr_bytes),
+    )
+}
+
+fn terminal_finished(steps: usize, usage: &Usage) -> String {
+    format!(
+        "done · {steps} steps · {} input ({} cached, {} write) · {} output",
+        compact_number(usage.input_tokens),
+        compact_number(usage.cached_input_tokens),
+        compact_number(usage.cache_write_input_tokens),
+        compact_number(usage.output_tokens),
+    )
+}
+
+fn compact_duration(milliseconds: u64) -> String {
+    if milliseconds < 1_000 {
+        format!("{milliseconds}ms")
+    } else {
+        format!("{:.1}s", milliseconds as f64 / 1_000.0)
+    }
+}
+
+fn compact_number(value: u64) -> String {
+    if value < 1_000 {
+        value.to_string()
+    } else if value < 1_000_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+    }
+}
+
+fn compact_bytes(value: usize) -> String {
+    if value < 1_024 {
+        format!("{value}B")
+    } else if value < 1_048_576 {
+        format!("{:.1}KB", value as f64 / 1_024.0)
+    } else {
+        format!("{:.1}MB", value as f64 / 1_048_576.0)
+    }
 }
 
 async fn execute_shell(
@@ -577,12 +714,14 @@ async fn write_final_artifacts(
         "answer": answer,
         "model": config.model,
         "steps_limit": config.max_steps,
-        "promotion_age": config.promotion_age,
-        "collection_interval": config.collection_interval,
         "patch_bytes": patch.len(),
         "usage": &metrics.usage,
         "model_latency_ms": metrics.model_latency_ms,
         "response_retries": metrics.response_retries,
+        "compactions": {
+            "minor": metrics.minor_compactions,
+            "major": metrics.major_compactions
+        },
         "elapsed_ms": elapsed_ms
     });
     tokio::fs::write(
@@ -611,6 +750,38 @@ mod tests {
         let output = combined_output(b"all stdout", b"all stderr");
         assert!(output.contains("STDOUT (10 bytes):\nall stdout"));
         assert!(output.contains("STDERR (10 bytes):\nall stderr"));
+    }
+
+    #[test]
+    fn terminal_usage_is_compact_and_includes_cache_writes() {
+        let usage = Usage {
+            input_tokens: 12_345,
+            cached_input_tokens: 10_000,
+            cache_write_input_tokens: 2_000,
+            output_tokens: 678,
+            reasoning_tokens: 400,
+            total_tokens: 13_023,
+        };
+
+        assert_eq!(
+            terminal_usage(3, 1_250, 0, &usage),
+            "[03] 1.2s · in 12.3k (10.0k cached, 2.0k write) · out 678"
+        );
+    }
+
+    #[test]
+    fn cached_reads_refresh_the_stable_checkpoint_ttl() {
+        let mut cache = CacheTracker {
+            implicit_activity: None,
+            stable_checkpoint_activity: Some(Instant::now() - CACHE_TTL),
+            checkpoint_pending: false,
+        };
+        cache.observe(&Usage {
+            cached_input_tokens: 10,
+            ..Usage::default()
+        });
+
+        assert!(cache.policy().stable_cache_alive);
     }
 
     #[test]
@@ -673,8 +844,6 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
-                promotion_age: 3,
-                collection_interval: 3,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -720,8 +889,6 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: None,
                 shell_timeout_secs: 1,
-                promotion_age: 3,
-                collection_interval: 3,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -739,7 +906,7 @@ mod tests {
         let trace = tokio::fs::read_to_string(session_dir.join("trace.log"))
             .await
             .unwrap();
-        assert!(trace.contains("[01/unlimited] requesting next step"));
+        assert!(trace.contains("[01] 0ms · in 0 (0 cached, 0 write) · out 0"));
     }
 
     #[tokio::test]
@@ -769,8 +936,6 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
-                promotion_age: 3,
-                collection_interval: 3,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -824,8 +989,6 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: None,
                 shell_timeout_secs: 1,
-                promotion_age: 3,
-                collection_interval: 3,
             },
             Backend::scripted(&steps_file).await.unwrap(),
             receiver,
