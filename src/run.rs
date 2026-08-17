@@ -25,6 +25,8 @@ History is chronological, and tool results end with an immutable [integer stable
 
 Use remember instead of keep when only a small durable fact matters in a large volatile tool result and retaining the whole interaction would be wasteful. The memory gets its own stable ID, so do not also keep the source. Keep memories concise and preserve outcomes, not chain-of-thought.
 
+Large text shell results arrive as structured `output_head` and `output_tail` previews with an absolute `full_output_path`. Non-text output is omitted from the model payload and available only through its artifact paths. Read or slice those session files when omitted details matter.
+
 Work only within the assigned repository. Do not perform destructive or external actions."#;
 
 #[derive(Clone, Debug)]
@@ -60,6 +62,21 @@ pub enum UserInput {
     Exit,
 }
 
+const TOOL_OUTPUT_INLINE_BYTES: usize = 32 * 1024;
+const TOOL_OUTPUT_PREVIEW_BYTES: usize = 16 * 1024;
+const BINARY_OUTPUT_OMISSION_REASON: &str =
+    "Shell output is not UTF-8 text or appears binary; inspect full_output_path instead.";
+
+#[derive(Clone, Debug, Serialize)]
+struct ToolOutputPreview {
+    encoding: &'static str,
+    head: String,
+    tail: Option<String>,
+    omitted_bytes: usize,
+    omission_reason: Option<&'static str>,
+    offloaded: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct ShellResult {
     call_id: String,
@@ -71,7 +88,8 @@ struct ShellResult {
     timed_out: bool,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
-    prompt_output: String,
+    full_output_path: Option<PathBuf>,
+    prompt_output: ToolOutputPreview,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -613,8 +631,18 @@ async fn execute_shell(
     let stderr_path = run_dir.join("tools").join(format!("{call_id}.stderr"));
     write_bytes(&stdout_path, &stdout).await?;
     write_bytes(&stderr_path, &stderr).await?;
+    let stdout_path = tokio::fs::canonicalize(stdout_path).await?;
+    let stderr_path = tokio::fs::canonicalize(stderr_path).await?;
 
-    let prompt_output = combined_output(&stdout, &stderr);
+    let full_output = combined_output(&stdout, &stderr);
+    let prompt_output = preview_tool_output(&full_output);
+    let full_output_path = if prompt_output.offloaded {
+        let path = run_dir.join("tools").join(format!("{call_id}.output"));
+        write_bytes(&path, &full_output).await?;
+        Some(tokio::fs::canonicalize(path).await?)
+    } else {
+        None
+    };
     Ok(ShellResult {
         call_id,
         command: command.to_owned(),
@@ -625,6 +653,7 @@ async fn execute_shell(
         timed_out,
         stdout_path,
         stderr_path,
+        full_output_path,
         prompt_output,
     })
 }
@@ -635,18 +664,109 @@ async fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn combined_output(stdout: &[u8], stderr: &[u8]) -> String {
-    let header = format!("STDOUT ({} bytes):\n", stdout.len());
-    let middle = format!("\nSTDERR ({} bytes):\n", stderr.len());
-    format!(
-        "{header}{}{middle}{}",
-        String::from_utf8_lossy(stdout),
-        String::from_utf8_lossy(stderr)
-    )
+fn combined_output(stdout: &[u8], stderr: &[u8]) -> Vec<u8> {
+    let mut output = format!("STDOUT ({} bytes):\n", stdout.len()).into_bytes();
+    output.extend_from_slice(stdout);
+    output.extend_from_slice(format!("\nSTDERR ({} bytes):\n", stderr.len()).as_bytes());
+    output.extend_from_slice(stderr);
+    output
+}
+
+fn preview_tool_output(output: &[u8]) -> ToolOutputPreview {
+    let Ok(text) = std::str::from_utf8(output) else {
+        return omitted_binary_output(output.len());
+    };
+
+    if output.len() <= TOOL_OUTPUT_INLINE_BYTES
+        && json_string_size(text) <= TOOL_OUTPUT_INLINE_BYTES + 2
+    {
+        return ToolOutputPreview {
+            encoding: "utf-8",
+            head: text.to_owned(),
+            tail: None,
+            omitted_bytes: 0,
+            omission_reason: None,
+            offloaded: false,
+        };
+    }
+
+    let head_end = bounded_utf8_head_end(text);
+    let tail_start = bounded_utf8_tail_start(text);
+    if let (Some(head_end), Some(tail_start)) = (head_end, tail_start)
+        && head_end <= tail_start
+    {
+        return ToolOutputPreview {
+            encoding: "utf-8",
+            head: text[..head_end].to_owned(),
+            tail: Some(text[tail_start..].to_owned()),
+            omitted_bytes: tail_start - head_end,
+            omission_reason: None,
+            offloaded: true,
+        };
+    }
+
+    omitted_binary_output(output.len())
+}
+
+fn omitted_binary_output(output_bytes: usize) -> ToolOutputPreview {
+    ToolOutputPreview {
+        encoding: "binary",
+        head: String::new(),
+        tail: None,
+        omitted_bytes: output_bytes,
+        omission_reason: Some(BINARY_OUTPUT_OMISSION_REASON),
+        offloaded: true,
+    }
+}
+
+fn bounded_utf8_head_end(text: &str) -> Option<usize> {
+    let mut end = TOOL_OUTPUT_PREVIEW_BYTES.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    for _ in 0..=256 {
+        if json_string_size(&text[..end]) <= TOOL_OUTPUT_PREVIEW_BYTES + 2 {
+            return Some(end);
+        }
+        if end == 0 {
+            break;
+        }
+        end -= 1;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+    None
+}
+
+fn bounded_utf8_tail_start(text: &str) -> Option<usize> {
+    let mut start = text.len().saturating_sub(TOOL_OUTPUT_PREVIEW_BYTES);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    for _ in 0..=256 {
+        if json_string_size(&text[start..]) <= TOOL_OUTPUT_PREVIEW_BYTES + 2 {
+            return Some(start);
+        }
+        if start == text.len() {
+            break;
+        }
+        start += 1;
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+    }
+    None
+}
+
+fn json_string_size(value: &str) -> usize {
+    serde_json::to_string(value)
+        .expect("serializing a string cannot fail")
+        .len()
 }
 
 fn render_tool_result(result: &ShellResult) -> String {
-    serde_json::to_string_pretty(&json!({
+    let mut payload = json!({
         "context_id": result.call_id,
         "exit_code": result.exit_code,
         "timed_out": result.timed_out,
@@ -655,9 +775,32 @@ fn render_tool_result(result: &ShellResult) -> String {
         "stderr_bytes": result.stderr_bytes,
         "full_stdout_path": result.stdout_path,
         "full_stderr_path": result.stderr_path,
-        "output": result.prompt_output
-    }))
-    .expect("serializing a shell result cannot fail")
+        "output_truncated": result.prompt_output.offloaded,
+    });
+    if let Some(reason) = result.prompt_output.omission_reason {
+        payload["output_omitted_reason"] = json!(reason);
+        payload["output_omitted_bytes"] = json!(result.prompt_output.omitted_bytes);
+        payload["full_output_path"] = json!(
+            result
+                .full_output_path
+                .as_ref()
+                .expect("omitted shell output must have a full output path")
+        );
+    } else if let Some(tail) = result.prompt_output.tail.as_ref() {
+        payload["output_encoding"] = json!(result.prompt_output.encoding);
+        payload["output_head"] = json!(result.prompt_output.head);
+        payload["output_tail"] = json!(tail);
+        payload["output_omitted_bytes"] = json!(result.prompt_output.omitted_bytes);
+        payload["full_output_path"] = json!(
+            result
+                .full_output_path
+                .as_ref()
+                .expect("truncated shell output must have a full output path")
+        );
+    } else {
+        payload["output"] = json!(result.prompt_output.head);
+    }
+    serde_json::to_string_pretty(&payload).expect("serializing a shell result cannot fail")
 }
 
 fn function_call_output(
@@ -738,10 +881,118 @@ mod tests {
     }
 
     #[test]
-    fn combined_output_includes_complete_streams() {
-        let output = combined_output(b"all stdout", b"all stderr");
-        assert!(output.contains("STDOUT (10 bytes):\nall stdout"));
-        assert!(output.contains("STDERR (10 bytes):\nall stderr"));
+    fn small_combined_output_stays_inline() {
+        let full = combined_output(b"all stdout", b"all stderr");
+        let preview = preview_tool_output(&full);
+        assert_eq!(preview.encoding, "utf-8");
+        assert_eq!(preview.head, String::from_utf8(full).unwrap());
+        assert!(preview.tail.is_none());
+        assert_eq!(preview.omitted_bytes, 0);
+    }
+
+    #[test]
+    fn exact_inline_byte_boundary_is_not_offloaded() {
+        let exact = vec![b'x'; TOOL_OUTPUT_INLINE_BYTES];
+        assert!(preview_tool_output(&exact).tail.is_none());
+
+        let over = vec![b'x'; TOOL_OUTPUT_INLINE_BYTES + 1];
+        assert!(preview_tool_output(&over).tail.is_some());
+    }
+
+    #[test]
+    fn utf8_preview_boundaries_do_not_split_code_points() {
+        let full = "🦀".repeat((TOOL_OUTPUT_INLINE_BYTES / 4) + 1).into_bytes();
+        let preview = preview_tool_output(&full);
+        assert_eq!(preview.encoding, "utf-8");
+        let tail = preview.tail.as_ref().unwrap();
+        assert!(!preview.head.contains('�'));
+        assert!(!tail.contains('�'));
+        assert_eq!(
+            preview.head.len() + preview.omitted_bytes + tail.len(),
+            full.len()
+        );
+    }
+
+    #[test]
+    fn binary_output_is_omitted_from_the_model_payload() {
+        let full = vec![0; TOOL_OUTPUT_INLINE_BYTES + 1];
+        let preview = preview_tool_output(&full);
+        assert_eq!(preview.encoding, "binary");
+        assert!(preview.head.is_empty());
+        assert!(preview.tail.is_none());
+        assert_eq!(preview.omitted_bytes, full.len());
+        assert_eq!(preview.omission_reason, Some(BINARY_OUTPUT_OMISSION_REASON));
+        assert!(preview.offloaded);
+    }
+
+    #[test]
+    fn invalid_utf8_output_is_omitted_from_the_model_payload() {
+        let mut full = vec![b'x'; TOOL_OUTPUT_INLINE_BYTES + 1];
+        full[100] = 0xff;
+        let preview = preview_tool_output(&full);
+        assert_eq!(preview.encoding, "binary");
+        assert!(preview.head.is_empty());
+        assert!(preview.tail.is_none());
+        assert_eq!(preview.omitted_bytes, full.len());
+        assert_eq!(preview.omission_reason, Some(BINARY_OUTPUT_OMISSION_REASON));
+        assert!(preview.offloaded);
+    }
+
+    #[tokio::test]
+    async fn large_shell_output_is_offloaded_with_structured_head_and_tail() {
+        let current_dir = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(&current_dir).unwrap();
+        let relative_root = temp.path().strip_prefix(&current_dir).unwrap();
+        let run_dir = relative_root.join("session");
+        let workspace = temp.path().join("workspace");
+        tokio::fs::create_dir_all(run_dir.join("tools"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        let result = execute_shell(
+            &workspace,
+            &run_dir,
+            "tool-1".into(),
+            "python3 -c \"import sys; sys.stdout.write('h'*16384 + 'm'*4096 + 't'*16384)\"",
+            30,
+        )
+        .await
+        .unwrap();
+
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_tool_result(&result)).unwrap();
+        assert_eq!(rendered["output_truncated"], true);
+        assert_eq!(rendered["output_encoding"], "utf-8");
+        let head = rendered["output_head"].as_str().unwrap();
+        let tail = rendered["output_tail"].as_str().unwrap();
+        assert!(head.len() <= 16 * 1024 && head.len() > 15 * 1024);
+        assert!(tail.len() <= 16 * 1024 && tail.len() > 15 * 1024);
+        assert!(serde_json::to_string(head).unwrap().len() <= 16 * 1024 + 2);
+        assert!(serde_json::to_string(tail).unwrap().len() <= 16 * 1024 + 2);
+        assert!(rendered.get("output").is_none());
+        assert!(rendered["output_omitted_bytes"].as_u64().unwrap() > 0);
+        let full_path = rendered["full_output_path"].as_str().unwrap();
+        assert!(std::path::Path::new(full_path).is_absolute());
+        assert!(std::path::Path::new(rendered["full_stdout_path"].as_str().unwrap()).is_absolute());
+        assert!(std::path::Path::new(rendered["full_stderr_path"].as_str().unwrap()).is_absolute());
+        let full = tokio::fs::read(full_path).await.unwrap();
+        assert!(full.starts_with(b"STDOUT ("));
+        assert!(
+            full.windows(32)
+                .any(|window| window == b"mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm")
+        );
+        assert!(
+            !rendered["output_head"]
+                .as_str()
+                .unwrap()
+                .contains("truncat")
+        );
+        assert!(
+            !rendered["output_tail"]
+                .as_str()
+                .unwrap()
+                .contains("truncat")
+        );
     }
 
     #[test]
@@ -774,6 +1025,38 @@ mod tests {
         });
 
         assert!(cache.policy().stable_cache_alive);
+    }
+
+    #[tokio::test]
+    async fn binary_shell_output_is_only_exposed_through_artifact_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("session");
+        tokio::fs::create_dir_all(run_dir.join("tools"))
+            .await
+            .unwrap();
+        let result = execute_shell(
+            temp.path(),
+            &run_dir,
+            "tool-binary".into(),
+            "python3 -c \"import sys; sys.stdout.buffer.write(bytes([0xff, 0, 1]))\"",
+            30,
+        )
+        .await
+        .unwrap();
+
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_tool_result(&result)).unwrap();
+        assert_eq!(rendered["output_truncated"], true);
+        assert_eq!(
+            rendered["output_omitted_reason"],
+            BINARY_OUTPUT_OMISSION_REASON
+        );
+        assert!(rendered.get("output").is_none());
+        assert!(rendered.get("output_head").is_none());
+        assert!(rendered.get("output_tail").is_none());
+        let full_path = rendered["full_output_path"].as_str().unwrap();
+        let full = tokio::fs::read(full_path).await.unwrap();
+        assert!(full.windows(3).any(|window| window == [0xff, 0, 1]));
     }
 
     #[test]
