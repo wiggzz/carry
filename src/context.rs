@@ -60,6 +60,14 @@ pub(crate) struct ContextItem {
     pub signal: RetentionSignal,
     pub bytes: usize,
     pub input_items: Vec<Value>,
+    memory: Option<MemoryData>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct MemoryData {
+    content: String,
+    source_id: u64,
+    materialized: bool,
 }
 
 impl ContextItem {
@@ -75,16 +83,15 @@ impl ContextItem {
         )
     }
 
-    fn memory(id: u64, content: String) -> Self {
-        Self::new(
-            id,
-            ContextItemKind::Memory,
-            Retention::Stable,
-            vec![json!({
-                "role": "user",
-                "content": [{ "type": "input_text", "text": format!("[memory]\n{content}") }]
-            })],
-        )
+    fn memory(id: u64, source_id: u64, content: String) -> Self {
+        let mut item = Self::new(id, ContextItemKind::Memory, Retention::Stable, Vec::new());
+        item.bytes = content.len();
+        item.memory = Some(MemoryData {
+            content,
+            source_id,
+            materialized: false,
+        });
+        item
     }
 
     pub fn tool(id: u64, output_items: Vec<Value>, function_call_output: Value) -> Result<Self> {
@@ -118,6 +125,7 @@ impl ContextItem {
             signal: RetentionSignal::Neutral,
             bytes: serialized_bytes(&input_items),
             input_items,
+            memory: None,
         }
     }
 
@@ -137,8 +145,8 @@ impl ContextItem {
         json!({ "role": "developer", "content": [block] })
     }
 
-    fn estimated_tokens(&self) -> usize {
-        self.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN)
+    fn compact_marker(&self) -> String {
+        format!("[{} {}]", self.id, self.retention.label())
     }
 }
 
@@ -185,11 +193,60 @@ impl ContextState {
     }
 
     pub fn input_items(&self) -> Vec<Value> {
-        let frontier = self.stable_frontier_len();
+        Self::render_items(&self.items)
+    }
+
+    fn render_items(items: &[ContextItem]) -> Vec<Value> {
+        let frontier = items
+            .iter()
+            .take_while(|item| item.retention == Retention::Stable)
+            .count();
+        let present = items.iter().map(|item| item.id).collect::<HashSet<_>>();
         let mut input = Vec::new();
-        for (index, item) in self.items.iter().enumerate() {
-            input.extend(item.input_items.iter().cloned());
-            input.push(item.marker(frontier > 0 && index + 1 == frontier));
+        for (index, item) in items.iter().enumerate() {
+            let checkpoint = frontier > 0 && index + 1 == frontier;
+            match item.kind {
+                ContextItemKind::User => {
+                    input.extend(item.input_items.iter().cloned());
+                    input.push(item.marker(checkpoint));
+                }
+                ContextItemKind::Tool => {
+                    let mut native = item.input_items.clone();
+                    let output = native
+                        .last_mut()
+                        .expect("tool context always has a function output");
+                    let mut annotated = output["output"].as_str().unwrap_or_default().to_owned();
+                    annotated.push_str(&format!("\n{}", item.compact_marker()));
+                    for memory in items.iter().filter(|candidate| {
+                        candidate.memory.as_ref().is_some_and(|memory| {
+                            memory.source_id == item.id && !memory.materialized
+                        })
+                    }) {
+                        annotated
+                            .push_str(&format!("\n\n[memory stored]\n{}", memory.compact_marker()));
+                    }
+                    output["output"] = Value::String(annotated);
+                    input.extend(native);
+                    if checkpoint {
+                        input.push(cache_frontier_marker());
+                    }
+                }
+                ContextItemKind::Memory => {
+                    let memory = item.memory.as_ref().expect("memory metadata is present");
+                    if memory.materialized || !present.contains(&memory.source_id) {
+                        input.push(json!({
+                            "role": "assistant",
+                            "content": [{
+                                "type": "input_text",
+                                "text": format!("[memory]\n{}", memory.content)
+                            }]
+                        }));
+                        input.push(item.marker(checkpoint));
+                    } else if checkpoint {
+                        input.push(cache_frontier_marker());
+                    }
+                }
+            }
         }
         input
     }
@@ -217,10 +274,10 @@ impl ContextState {
     }
 
     pub fn estimated_tokens(&self) -> usize {
-        self.items.iter().map(ContextItem::estimated_tokens).sum()
+        estimated_tokens(&Self::render_items(&self.items))
     }
 
-    pub fn record_signals(&mut self, update: &ContextManagement) -> SignalChange {
+    pub fn record_signals(&mut self, update: &ContextManagement, source_id: u64) -> SignalChange {
         let mut keep = Vec::new();
         let mut drop = Vec::new();
         let mut ignored = Vec::new();
@@ -253,7 +310,8 @@ impl ContextState {
             .filter(|content| !content.is_empty())
         {
             let id = self.allocate_id();
-            self.items.push(ContextItem::memory(id, content.to_owned()));
+            self.items
+                .push(ContextItem::memory(id, source_id, content.to_owned()));
             added.push(id);
         }
 
@@ -317,48 +375,36 @@ impl ContextState {
     ) -> CompactionPlan {
         let dropped_set = dropped.iter().copied().collect::<HashSet<_>>();
         let current_tokens = self.estimated_tokens();
-        let dropped_tokens = self
+        let mut retained = self
             .items
             .iter()
-            .filter(|item| dropped_set.contains(&item.id))
-            .map(ContextItem::estimated_tokens)
-            .sum::<usize>();
-        let retained_tokens = current_tokens.saturating_sub(dropped_tokens);
-        let frontier_tokens = self
-            .items
-            .iter()
-            .take(self.stable_frontier_len())
-            .map(ContextItem::estimated_tokens)
-            .sum::<usize>()
-            .min(retained_tokens);
+            .filter(|item| !dropped_set.contains(&item.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for item in &mut retained {
+            item.retention = Retention::Stable;
+        }
+        let retained_tokens = estimated_tokens(&Self::render_items(&retained));
+        let dropped_tokens = current_tokens.saturating_sub(retained_tokens);
+        let frontier_tokens = estimated_tokens(&Self::render_items(
+            &self.items[..self.stable_frontier_len()],
+        ))
+        .min(retained_tokens);
         let rewrite_tokens = if kind == CompactionKind::Minor && policy.stable_cache_alive {
             retained_tokens.saturating_sub(frontier_tokens)
         } else {
             retained_tokens
         };
-        let horizon = policy.horizon_turns.max(1) as f64;
         let baseline_first_rate = if policy.implicit_cache_alive {
             CACHE_READ_RATE
         } else {
             CACHE_WRITE_RATE
         };
-        let baseline =
-            current_tokens as f64 * (baseline_first_rate + CACHE_READ_RATE * (horizon - 1.0));
+        let baseline = current_tokens as f64 * baseline_first_rate;
         let candidate_first = if kind == CompactionKind::Minor && policy.stable_cache_alive {
             frontier_tokens as f64 * CACHE_READ_RATE + rewrite_tokens as f64 * CACHE_WRITE_RATE
         } else {
             retained_tokens as f64 * CACHE_WRITE_RATE
-        };
-        let candidate =
-            candidate_first + retained_tokens as f64 * CACHE_READ_RATE * (horizon - 1.0);
-        let immediate_penalty = candidate_first - current_tokens as f64 * baseline_first_rate;
-        let future_savings = dropped_tokens as f64 * CACHE_READ_RATE;
-        let break_even_turns = if !policy.implicit_cache_alive || immediate_penalty <= 0.0 {
-            1
-        } else if future_savings > 0.0 {
-            (immediate_penalty / future_savings).ceil() as usize + 1
-        } else {
-            usize::MAX
         };
 
         CompactionPlan {
@@ -367,8 +413,7 @@ impl ContextState {
             dropped_tokens,
             retained_tokens,
             rewrite_tokens,
-            break_even_turns,
-            estimated_savings_input_units: baseline - candidate,
+            estimated_savings_input_units: baseline - candidate_first,
         }
     }
 
@@ -376,6 +421,11 @@ impl ContextState {
         let dropped = plan.dropped.iter().copied().collect::<HashSet<_>>();
         self.items.retain(|item| !dropped.contains(&item.id));
         for item in &mut self.items {
+            if let Some(memory) = item.memory.as_mut()
+                && dropped.contains(&memory.source_id)
+            {
+                memory.materialized = true;
+            }
             item.retention = Retention::Stable;
             if item.signal == RetentionSignal::Keep {
                 item.signal = RetentionSignal::Neutral;
@@ -389,7 +439,6 @@ impl ContextState {
             dropped_tokens: plan.dropped_tokens,
             retained_tokens: plan.retained_tokens,
             rewrite_tokens: plan.rewrite_tokens,
-            break_even_turns: plan.break_even_turns,
             estimated_savings_input_units: plan.estimated_savings_input_units,
             generation: self.generation,
             stable_frontier: self.stable_frontier_id(),
@@ -418,9 +467,23 @@ fn unique_ids(ids: &[u64]) -> Vec<u64> {
     ids.iter().copied().filter(|id| seen.insert(*id)).collect()
 }
 
+fn cache_frontier_marker() -> Value {
+    json!({
+        "role": "developer",
+        "content": [{
+            "type": "input_text",
+            "text": "[cache frontier]",
+            "prompt_cache_breakpoint": { "mode": "explicit" }
+        }]
+    })
+}
+
+fn estimated_tokens(items: &[Value]) -> usize {
+    serialized_bytes(items).div_ceil(ESTIMATED_BYTES_PER_TOKEN)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CompactionPolicy {
-    pub horizon_turns: usize,
     pub implicit_cache_alive: bool,
     pub stable_cache_alive: bool,
 }
@@ -448,7 +511,6 @@ pub(crate) struct CompactionPlan {
     pub dropped_tokens: usize,
     pub retained_tokens: usize,
     pub rewrite_tokens: usize,
-    pub break_even_turns: usize,
     pub estimated_savings_input_units: f64,
 }
 
@@ -467,7 +529,6 @@ pub(crate) struct ContextChange {
     pub dropped_tokens: usize,
     pub retained_tokens: usize,
     pub rewrite_tokens: usize,
-    pub break_even_turns: usize,
     pub estimated_savings_input_units: f64,
     pub generation: u64,
     pub stable_frontier: Option<u64>,
@@ -518,7 +579,12 @@ mod tests {
             .filter_map(|item| item["content"][0]["text"].as_str())
             .collect::<Vec<_>>();
         assert!(texts.contains(&"[1 user stable]"));
-        assert!(texts.contains(&format!("[{tool} tool volatile]").as_str()));
+        assert!(rendered.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["output"]
+                    .as_str()
+                    .is_some_and(|output| output.ends_with(&format!("[{tool} volatile]")))
+        }));
         assert!(texts.contains(&format!("[{steering} user stable]").as_str()));
         assert_eq!(
             rendered
@@ -530,10 +596,10 @@ mod tests {
     }
 
     #[test]
-    fn memory_starts_stable_without_reordering_history() {
+    fn memory_is_an_inline_stable_handle_without_duplicating_its_content() {
         let mut state = ContextState::new("initial".into());
         let tool = add_tool(&mut state);
-        let change = state.record_signals(&update(&[], &[], &["durable outcome"]));
+        let change = state.record_signals(&update(&[], &[], &["durable outcome"]), tool);
         let memory = change.added[0];
 
         assert_eq!(
@@ -542,6 +608,105 @@ mod tests {
         );
         assert_eq!(state.items[2].retention, Retention::Stable);
         assert_eq!(state.stable_frontier_len(), 1);
+
+        let rendered = state.input_items();
+        let tool_output = rendered
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap()["output"]
+            .as_str()
+            .unwrap();
+        assert!(tool_output.contains(&format!("[{tool} volatile]")));
+        assert!(tool_output.contains("[memory stored]"));
+        assert!(tool_output.contains(&format!("[{memory} stable]")));
+        assert!(!tool_output.contains("durable outcome"));
+        assert!(!rendered.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("[memory]"))
+        }));
+    }
+
+    #[test]
+    fn dropping_a_tool_materializes_its_stored_memory_with_the_same_memory_id() {
+        let mut state = ContextState::new("initial".into());
+        let tool = add_tool(&mut state);
+        let memory = state
+            .record_signals(&update(&[], &[tool], &["durable outcome"]), tool)
+            .added[0];
+
+        let plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cache_alive: false,
+                    stable_cache_alive: false,
+                },
+            )
+            .unwrap();
+        state.compact(plan);
+
+        let rendered = state.input_items();
+        assert!(
+            !rendered
+                .iter()
+                .any(|item| item["type"] == "function_call_output")
+        );
+        assert!(rendered.iter().any(|item| {
+            item["role"] == "assistant" && item["content"][0]["text"] == "[memory]\ndurable outcome"
+        }));
+        assert!(
+            rendered
+                .iter()
+                .any(|item| { item["content"][0]["text"] == format!("[{memory} memory stable]") })
+        );
+    }
+
+    #[test]
+    fn planner_prices_memory_materialization_before_dropping_its_source() {
+        let mut state = ContextState::new("initial".into());
+        let tool = add_tool(&mut state);
+        state.record_signals(&update(&[], &[tool], &[&"important ".repeat(2_000)]), tool);
+
+        assert!(
+            state
+                .plan_compaction(
+                    &[],
+                    CompactionPolicy {
+                        implicit_cache_alive: false,
+                        stable_cache_alive: false,
+                    },
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dropping_a_memory_with_its_source_does_not_materialize_it() {
+        let mut state = ContextState::new("initial".into());
+        let tool = add_tool(&mut state);
+        let memory = state
+            .record_signals(&update(&[], &[tool], &["temporary outcome"]), tool)
+            .added[0];
+        state.record_signals(&update(&[], &[memory], &[]), tool);
+
+        let plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cache_alive: false,
+                    stable_cache_alive: false,
+                },
+            )
+            .unwrap();
+        state.compact(plan);
+
+        assert!(!state.input_items().iter().any(|item| {
+            item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("temporary outcome"))
+        }));
     }
 
     #[test]
@@ -566,11 +731,11 @@ mod tests {
         let mut state = ContextState::new("initial".into());
         let tool = add_tool(&mut state);
 
-        state.record_signals(&update(&[], &[tool], &[]));
+        state.record_signals(&update(&[], &[tool], &[]), tool);
         assert_eq!(state.signal_for(tool), Some(RetentionSignal::Drop));
         assert!(state.snapshot().iter().any(|item| item.id == tool));
 
-        state.record_signals(&update(&[tool], &[], &[]));
+        state.record_signals(&update(&[tool], &[], &[]), tool);
         assert_eq!(state.signal_for(tool), Some(RetentionSignal::Keep));
         assert!(state.snapshot().iter().any(|item| item.id == tool));
     }
@@ -580,42 +745,40 @@ mod tests {
         let mut state = ContextState::new("initial".into());
         let tool = add_tool(&mut state);
 
-        let change = state.record_signals(&update(&[tool, 999], &[tool, 998], &[]));
+        let change = state.record_signals(&update(&[tool, 999], &[tool, 998], &[]), tool);
 
         assert_eq!(state.signal_for(tool), Some(RetentionSignal::Keep));
         assert_eq!(change.ignored, vec![998, 999]);
     }
 
     #[test]
-    fn warm_minor_compaction_waits_until_rewrite_cost_breaks_even() {
+    fn warm_minor_compaction_requires_savings_on_the_next_request() {
         let mut state = ContextState::new("initial".into());
         let dropped = add_tool(&mut state);
         let retained = add_tool(&mut state);
-        state.record_signals(&update(&[], &[dropped], &[]));
+        state.record_signals(&update(&[], &[dropped], &[]), retained);
 
         let short = state.plan_compaction(
             &[],
             CompactionPolicy {
-                horizon_turns: 1,
                 implicit_cache_alive: true,
                 stable_cache_alive: true,
             },
         );
         assert!(short.is_none());
 
-        state.record_signals(&update(&[retained], &[], &[]));
-        let long = state
-            .plan_compaction(
-                &[],
-                CompactionPolicy {
-                    horizon_turns: 100,
-                    implicit_cache_alive: true,
-                    stable_cache_alive: true,
-                },
-            )
-            .unwrap();
-        assert_eq!(long.kind, CompactionKind::Minor);
-        assert_eq!(long.dropped, vec![dropped]);
+        state.record_signals(&update(&[retained], &[], &[]), retained);
+        assert!(
+            state
+                .plan_compaction(
+                    &[],
+                    CompactionPolicy {
+                        implicit_cache_alive: true,
+                        stable_cache_alive: true,
+                    },
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -623,13 +786,12 @@ mod tests {
         let mut state = ContextState::new("initial".into());
         let dropped = add_tool(&mut state);
         let retained = add_tool(&mut state);
-        state.record_signals(&update(&[retained], &[dropped], &[]));
+        state.record_signals(&update(&[retained], &[dropped], &[]), retained);
 
         let plan = state
             .plan_compaction(
                 &[],
                 CompactionPolicy {
-                    horizon_turns: 1,
                     implicit_cache_alive: false,
                     stable_cache_alive: false,
                 },
@@ -654,13 +816,12 @@ mod tests {
         let old_tool = add_tool(&mut state);
         state.force_stable_for_test();
         let new_tool = add_tool(&mut state);
-        state.record_signals(&update(&[], &[old_tool, new_tool], &[]));
+        state.record_signals(&update(&[], &[old_tool, new_tool], &[]), new_tool);
 
         let plan = state
             .plan_compaction(
                 &[],
                 CompactionPolicy {
-                    horizon_turns: 1,
                     implicit_cache_alive: false,
                     stable_cache_alive: false,
                 },

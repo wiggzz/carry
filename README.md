@@ -46,7 +46,7 @@ The terminal shows compact per-step input, cache-read, cache-write, and output t
 
 Carry keeps one strictly chronological context ledger. Human messages and memories enter stable retention; tool interactions begin volatile. Stable items persist by default, while volatile items remain present until a compaction planner decides that acting on the model's signals will save more than rewriting the cache costs. The stable cache frontier is the longest chronological prefix made entirely of stable items; later stable human messages remain durable without reordering history or forcing earlier volatile items to promote.
 
-Every item has a compact integer ID and an immutable marker such as `[2 tool volatile]`. Carry preserves all native Responses API output items—including reasoning items—alongside function results. Between compactions, retained history grows by exact appends for prompt-cache reuse. A minor compaction acts only on volatile drop candidates; a major compaction may also remove stable drop candidates. Both preserve chronology, make the retained generation stable, and establish a new explicit cache frontier. Cache age participates in the decision, so an expired cache is rebuilt promptly instead of preserving a no-longer-useful prefix.
+Every item has a compact integer ID and an immutable retention marker; tool results end with markers such as `[2 volatile]`. Carry preserves all native Responses API output items—including reasoning items—alongside function results. Between compactions, retained history grows by exact appends for prompt-cache reuse. Immediately before each model request, the planner compares that request with and without compaction and rewrites only when the compacted request is already cheaper. A minor compaction acts only on volatile drop candidates; a major compaction may also remove stable drop candidates. Both preserve chronology, make the retained generation stable, and establish a new explicit cache frontier. Cache age participates in the decision, so an expired cache is rebuilt promptly instead of preserving a no-longer-useful prefix.
 
 Each action includes context management:
 
@@ -62,7 +62,9 @@ Each action includes context management:
 }
 ```
 
-`keep` and `drop` are sparse, sticky advisory signals, limited to four IDs each per turn. `keep` marks exact items the task cannot safely lose; stable items already persist by default and normally need no vote. `drop` marks exact content that is no longer useful, but Carry may defer the deletion to preserve a valuable cached prefix. A later opposite signal reverses the prior opinion, and `keep` wins if both name the same ID in one response. Unknown or stale IDs are ignored. Before marking exact context for dropping, `remember` can preserve up to two useful conclusions, constraints, evidence, decisions, or unresolved questions without retaining chain-of-thought.
+`keep` and `drop` are sparse, sticky advisory signals, limited to four IDs each per turn. `keep` marks exact items the task cannot safely lose; stable items already persist by default and normally need no vote. `drop` marks exact content that is no longer useful, but Carry may defer the deletion to preserve a valuable cached prefix. A later opposite signal reverses the prior opinion, and `keep` wins if both name the same ID in one response. Unknown or stale IDs are ignored.
+
+`remember` is limited to one rare, task-critical outcome that must outlive the exact tool interaction that established it. Its stable ID is stored inside that tool result without duplicating the memory text, which remains in the original function-call arguments. If compaction later removes the source tool but retains the memory, Carry materializes it as an assistant message with the same memory ID during that cache rewrite.
 
 ## Development
 

@@ -163,9 +163,9 @@ fn context_schema() -> Value {
             },
             "remember": {
                 "type": "array",
-                "description": "Concise durable outcomes worth preserving when exact context may later be compacted. Preserve conclusions, constraints, evidence, decisions, and unresolved questions, not chain-of-thought. Do not duplicate retained context.",
+                "description": "Exceptional escape hatch for at most one concise, unique, task-critical outcome that must survive removal of its source tool interaction. Never use for routine commands, edits, tests, retained observations, or a normal finish. Preserve the outcome, not chain-of-thought.",
                 "items": { "type": "string" },
-                "maxItems": 2
+                "maxItems": 1
             }
         },
         "required": ["keep", "drop", "remember"],

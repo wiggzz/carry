@@ -21,7 +21,9 @@ const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an 
 
 At each step, select exactly one available action. Investigate, implement, and verify the requested change before finishing. Before editing, establish a minimal failing reproduction where practical. When behavior has competing inputs or sources, use distinct values to verify provenance; when a task cites a regression or prior change, search cited identifiers and subsequent fixes in repository history. Before finishing, run the affected tests. Use the optional shell message to give the human concise, useful progress commentary.
 
-Context is a chronological ledger. Each item is followed by an immutable marker in the form [integer kind stable|volatile]. Stable items persist by default. Context keep/drop arrays are sparse advisory signals, not immediate commands: keep marks exact items the task cannot safely lose, while drop marks exact items that are no longer useful. Emit only newly recognized high-confidence signals, at most four IDs in each array; omitted IDs keep their prior signal. Stable items normally do not need keep. Missing, stale, or wrong-class IDs are harmless. A later keep or drop reverses the earlier opinion, and keep wins if both name the same ID in one response. Carry decides when cache-aware minor or major compaction is economical. Human messages are authoritative; mark one drop only when it is satisfied or explicitly superseded. Before marking exact context drop, preserve durable conclusions, constraints, evidence, decisions, or unresolved questions with context.remember. Preserve outcomes, not chain-of-thought.
+Context is a chronological ledger. Each item has an immutable integer marker and a stable or volatile retention class. Tool results end with [integer stable|volatile]. Stable items persist by default. Context keep/drop arrays are sparse advisory signals, not immediate commands: keep marks exact items the task cannot safely lose, while drop marks exact items that are no longer useful. Emit only newly recognized high-confidence signals, at most four IDs in each array; omitted IDs keep their prior signal. Stable items normally do not need keep. Missing or stale IDs are harmless. A later keep or drop reverses the earlier opinion, and keep wins if both name the same ID in one response. Carry decides immediately before each request whether a cache-aware minor or major compaction is economical. Human messages are authoritative; mark one drop only when it is satisfied or explicitly superseded.
+
+context.remember is an exceptional escape hatch for one concise, unique, task-critical outcome that must survive removal of the exact tool interaction that established it. Do not use it for routine commands, edits, test output, observations already present in retained context, or on a normal finish. A stored memory receives its own stable ID inside the tool result; it is retained independently, so do not keep the source tool merely to protect its memory. Carry materializes the memory as an assistant message only if compaction removes that source. Preserve outcomes, not chain-of-thought.
 
 Work only within the assigned repository. Do not perform destructive or external actions."#;
 
@@ -36,7 +38,6 @@ pub struct RunConfig {
 }
 
 const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
-const COMPACTION_HORIZON_TURNS: usize = 8;
 
 pub enum Backend {
     OpenAi(OpenAiClient),
@@ -150,7 +151,6 @@ impl CacheTracker {
     fn policy(&self) -> CompactionPolicy {
         let now = Instant::now();
         CompactionPolicy {
-            horizon_turns: COMPACTION_HORIZON_TURNS,
             implicit_cache_alive: cache_alive(self.implicit_activity, now),
             stable_cache_alive: cache_alive(self.stable_checkpoint_activity, now),
         }
@@ -257,7 +257,7 @@ async fn run_loop(
             "model": config.model,
             "max_steps": config.max_steps,
             "cache_ttl_seconds": CACHE_TTL.as_secs(),
-            "compaction_horizon_turns": COMPACTION_HORIZON_TURNS
+            "compaction_decision": "next_request"
         }),
         &format!("carry · {} · {}", config.model, config.cwd.display()),
     )?;
@@ -267,17 +267,8 @@ async fn run_loop(
     let mut cache = CacheTracker::default();
     let mut step_index = 0;
     let mut turn_step = 0;
+    let mut protected_until_request = Vec::new();
     loop {
-        if cache.implicit_expired() {
-            maybe_compact(
-                &mut context_state,
-                &[],
-                &mut cache,
-                &mut metrics,
-                &mut logger,
-                "cache expired",
-            )?;
-        }
         if let Some(max_steps) = config.max_steps
             && turn_step >= max_steps
         {
@@ -300,9 +291,23 @@ async fn run_loop(
                 session_dir: config.session_dir,
             });
         }
+        let trigger = if cache.implicit_expired() {
+            "cache expired"
+        } else {
+            "economic"
+        };
+        maybe_compact(
+            &mut context_state,
+            &protected_until_request,
+            &mut cache,
+            &mut metrics,
+            &mut logger,
+            trigger,
+        )?;
         step_index += 1;
         turn_step += 1;
         let history = context_state.input_items();
+        protected_until_request.clear();
         let request = backend.request_body(&history);
         logger.raw_event_silent(
             "model_request",
@@ -362,16 +367,10 @@ async fn run_loop(
                 let output = function_call_output(&reply.function_call, &result)?;
                 let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
                 logger.event("shell_finished", &result, &terminal_shell_result(&result))?;
-                let signals = context_state.record_signals(&reply.step.context);
+                let signals = context_state.record_signals(&reply.step.context, item_id);
+                protected_until_request.push(item_id);
+                protected_until_request.extend(signals.added.iter().copied());
                 logger.event_silent("context_signals", &signals)?;
-                maybe_compact(
-                    &mut context_state,
-                    &[item_id],
-                    &mut cache,
-                    &mut metrics,
-                    &mut logger,
-                    "economic",
-                )?;
 
                 if let Some(receiver) = input.as_mut()
                     && drain_user_input(receiver, &mut context_state, &mut logger)?
@@ -398,16 +397,10 @@ async fn run_loop(
                     "The answer was delivered to the human; the session may continue.",
                 )?;
                 let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
-                let signals = context_state.record_signals(&reply.step.context);
+                let signals = context_state.record_signals(&reply.step.context, item_id);
+                protected_until_request.push(item_id);
+                protected_until_request.extend(signals.added.iter().copied());
                 logger.event_silent("context_signals", &signals)?;
-                maybe_compact(
-                    &mut context_state,
-                    &[item_id],
-                    &mut cache,
-                    &mut metrics,
-                    &mut logger,
-                    "economic",
-                )?;
                 logger.raw_event(
                     if input.is_some() {
                         "turn_finished"
@@ -507,13 +500,13 @@ fn maybe_compact(
         "context_compacted",
         json!({"trigger": trigger, "compaction": &change}),
         &format!(
-            "  compact {} · -{} items / ~{} tok · {} retained · {} rewritten · break-even {} turns",
+            "  compact {} · -{} items / ~{} tok · {} retained · {} rewritten · next request saves ~{} input-equivalent tok",
             change.kind.label(),
             change.dropped.len(),
             compact_number(change.dropped_tokens as u64),
             compact_number(change.retained_tokens as u64),
             compact_number(change.rewrite_tokens as u64),
-            change.break_even_turns,
+            compact_number(change.estimated_savings_input_units.round().max(0.0) as u64),
         ),
     )?;
     Ok(true)
@@ -861,7 +854,43 @@ mod tests {
         assert_eq!(result["usage"]["output_tokens"], 0);
         assert_eq!(result["model_latency_ms"], 0);
         assert_eq!(result["response_retries"], 0);
+        assert_eq!(result["compactions"]["minor"], 0);
+        assert_eq!(result["compactions"]["major"], 0);
         assert!(result["elapsed_ms"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn finish_does_not_compact_without_another_model_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("run");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(
+            &steps_file,
+            r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"keep":[],"drop":[1],"remember":[]}}"#,
+        )
+        .await
+        .unwrap();
+
+        run(
+            RunConfig {
+                cwd: workspace,
+                prompt: "Finish the task.".into(),
+                session_dir: session_dir.clone(),
+                model: "scripted".into(),
+                max_steps: None,
+                shell_timeout_secs: 1,
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let trace = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap();
+        assert!(!trace.contains("context_compacted"));
     }
 
     #[tokio::test]
@@ -1009,15 +1038,20 @@ mod tests {
             .filter(|event| event["event"] == "model_request")
             .collect::<Vec<_>>();
         let history = requests[1]["data"]["history"].as_array().unwrap();
-        let tool_marker = history
+        let tool_result = history
             .iter()
-            .position(|item| item["content"][0]["text"] == "[2 tool volatile]")
+            .position(|item| {
+                item["type"] == "function_call_output"
+                    && item["output"]
+                        .as_str()
+                        .is_some_and(|output| output.ends_with("[2 volatile]"))
+            })
             .unwrap();
         let steering = history
             .iter()
             .position(|item| item["content"][0]["text"] == "do not change the JSON format")
             .unwrap();
-        assert!(tool_marker < steering);
+        assert!(tool_result < steering);
         assert_eq!(
             history[steering + 1]["content"][0]["text"],
             "[3 user stable]"
