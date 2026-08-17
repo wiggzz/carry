@@ -86,6 +86,7 @@ jobs:
           scripts/test_swebench_smoke.py
           scripts/test_swebench_method_entrypoint.py
           scripts/test_swebench_ec2_worker.py
+          scripts/test_docker_registry_login.py
           scripts/test_presign_s3.py
           scripts/test_wait_for_ec2_termination.py
 
