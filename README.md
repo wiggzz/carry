@@ -64,7 +64,7 @@ Each action includes context management:
 
 `keep` and `drop` are sparse, sticky advisory signals, limited to four IDs each per turn. `keep` protects volatile interactions whose exact details still matter. `drop` makes stable content removable; volatile content is already removable unless kept. Carry still defers deletion until the immediately upcoming request is cheaper with compaction. A later opposite signal reverses the prior opinion, and `keep` wins if both name the same ID in one response. Unknown or stale IDs are ignored.
 
-`remember` is limited to one concise durable fact per turn. It is useful when a small amount of valuable information is buried in a large, otherwise disposable tool result. Its stable ID is stored inside that tool result without duplicating the memory text, which remains in the original function-call arguments. If compaction later removes the source tool but retains the memory, Carry materializes it as an assistant message with the same memory ID during that cache rewrite.
+`remember` is limited to one concise durable fact per turn. Use it instead of `keep` when only a small amount of valuable information matters in a large, otherwise disposable tool result. Its stable ID is stored inside that tool result without duplicating the memory text, which remains in the original function-call arguments. If compaction later removes the source tool but retains the memory, Carry materializes it as an assistant message with the same memory ID during that cache rewrite.
 
 ## Development
 

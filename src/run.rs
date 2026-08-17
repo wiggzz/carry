@@ -19,11 +19,11 @@ use crate::{
 
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
-At each step, select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. When testing which of several inputs or sources wins, give them visibly different values so the result proves which one was used. For regressions, inspect repository history and search cited identifiers and later fixes. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
+At each step, select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. For regressions, inspect repository history and search cited identifiers and later fixes. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
 
 History is chronological, and tool results end with an immutable [integer stable|volatile] marker. Stable items stay by default; mark drop only when a stable item is no longer useful. Volatile items may be removed unless marked keep, so keep a volatile item while its exact details still matter. Signals are sparse advice, not immediate commands. Human messages are authoritative.
 
-Use remember when a small durable fact is buried in a large volatile tool result and retaining the whole interaction would be wasteful. The memory gets its own stable ID, so do not also keep the source merely to protect it. Keep memories concise and preserve outcomes, not chain-of-thought.
+Use remember instead of keep when only a small durable fact matters in a large volatile tool result and retaining the whole interaction would be wasteful. The memory gets its own stable ID, so do not also keep the source. Keep memories concise and preserve outcomes, not chain-of-thought.
 
 Work only within the assigned repository. Do not perform destructive or external actions."#;
 
@@ -730,9 +730,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn system_prompt_requires_reproduction_provenance_and_history_checks() {
+    fn system_prompt_requires_reproduction_and_history_checks() {
         assert!(SYSTEM_PROMPT.contains("minimal failing reproduction"));
-        assert!(SYSTEM_PROMPT.contains("visibly different values"));
         assert!(SYSTEM_PROMPT.contains("repository history"));
         assert!(SYSTEM_PROMPT.contains("search cited identifiers"));
         assert!(SYSTEM_PROMPT.contains("affected tests"));

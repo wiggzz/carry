@@ -163,7 +163,7 @@ fn context_schema() -> Value {
             },
             "remember": {
                 "type": "array",
-                "description": "At most one concise durable fact to retain instead of a large volatile source interaction. Use when a small useful outcome is buried in otherwise disposable tool output. Do not duplicate retained context or preserve chain-of-thought.",
+                "description": "At most one concise durable fact. Use remember instead of keep when only a small useful outcome matters in a large, otherwise disposable volatile tool result. Do not duplicate retained context or preserve chain-of-thought.",
                 "items": { "type": "string" },
                 "maxItems": 1
             }
