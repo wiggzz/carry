@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, StatusCode, header::HeaderMap};
@@ -9,6 +12,7 @@ use crate::protocol::{Step, tool_definitions};
 
 const MAX_RESPONSE_RETRIES: usize = 5;
 const MAX_TOTAL_RETRY_WAIT: Duration = Duration::from_secs(60);
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
 pub struct OpenAiClient {
@@ -17,6 +21,7 @@ pub struct OpenAiClient {
     api_key: String,
     model: String,
     reasoning_effort: String,
+    prompt_cache_key: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -39,7 +44,8 @@ pub struct Usage {
 pub struct ModelReply {
     pub response_id: String,
     pub step: Step,
-    /// The native assistant function-call item, retained byte-for-byte for replay.
+    /// Every native output item, retained byte-for-byte for manual continuation.
+    pub output_items: Vec<Value>,
     pub function_call: Value,
     pub usage: Usage,
     pub latency_ms: u64,
@@ -55,34 +61,18 @@ impl OpenAiClient {
             api_key,
             model,
             reasoning_effort,
+            prompt_cache_key: new_prompt_cache_key(),
         }
     }
 
-    pub fn request_body(
-        &self,
-        system: &str,
-        task: &str,
-        history: &[Value],
-        control: &str,
-    ) -> Value {
-        let mut input = vec![
-            json!({ "role": "system", "content": system }),
-            json!({
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": task,
-                    "prompt_cache_breakpoint": { "mode": "explicit" }
-                }]
-            }),
-        ];
+    pub fn request_body(&self, system: &str, history: &[Value]) -> Value {
+        let mut input = vec![json!({ "role": "system", "content": system })];
         input.extend_from_slice(history);
-        input.push(json!({ "role": "developer", "content": control }));
 
         json!({
             "model": self.model,
             "store": false,
-            "prompt_cache_key": prompt_cache_key(&self.model, system, task),
+            "prompt_cache_key": self.prompt_cache_key,
             "prompt_cache_options": { "mode": "implicit" },
             "input": input,
             "reasoning": {
@@ -95,34 +85,75 @@ impl OpenAiClient {
         })
     }
 
-    pub async fn step(
-        &self,
-        system: &str,
-        task: &str,
-        history: &[Value],
-        control: &str,
-    ) -> Result<ModelReply> {
-        let body = self.request_body(system, task, history, control);
+    pub async fn step(&self, system: &str, history: &[Value]) -> Result<ModelReply> {
+        let body = self.request_body(system, history);
 
         let started = Instant::now();
         let mut retries = 0;
         let mut retry_wait = Duration::ZERO;
         let mut retry_stopped_reason = None;
         let raw = loop {
-            let response = self
+            let response = match self
                 .http
                 .post(format!("{}/responses", self.api_base))
                 .bearer_auth(&self.api_key)
                 .json(&body)
                 .send()
                 .await
-                .context("Responses API request failed")?;
+            {
+                Ok(response) => response,
+                Err(error) if retries < MAX_RESPONSE_RETRIES => {
+                    let delay = transport_retry_delay(retries);
+                    if delay > MAX_TOTAL_RETRY_WAIT.saturating_sub(retry_wait) {
+                        return Err(error).context(format!(
+                            "Responses API request failed after {retries} retries and {}ms waiting",
+                            retry_wait.as_millis()
+                        ));
+                    }
+                    retries += 1;
+                    retry_wait += delay;
+                    eprintln!(
+                        "Responses API transport error: {error}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
+                        delay.as_millis(),
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).context(format!(
+                        "Responses API request failed after {retries} retries and {}ms waiting",
+                        retry_wait.as_millis()
+                    ));
+                }
+            };
             let status = response.status();
             let headers = response.headers().clone();
-            let response_body = response
-                .bytes()
-                .await
-                .context("Responses API response body read failed")?;
+            let response_body = match response.bytes().await {
+                Ok(body) => body,
+                Err(error) if retries < MAX_RESPONSE_RETRIES => {
+                    let delay = transport_retry_delay(retries);
+                    if delay > MAX_TOTAL_RETRY_WAIT.saturating_sub(retry_wait) {
+                        return Err(error).context(format!(
+                            "Responses API response body read failed after {retries} retries and {}ms waiting",
+                            retry_wait.as_millis()
+                        ));
+                    }
+                    retries += 1;
+                    retry_wait += delay;
+                    eprintln!(
+                        "Responses API response body read failed: {error}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
+                        delay.as_millis(),
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).context(format!(
+                        "Responses API response body read failed after {retries} retries and {}ms waiting",
+                        retry_wait.as_millis()
+                    ));
+                }
+            };
             if status.is_success() {
                 break serde_json::from_slice(&response_body)
                     .context("Responses API returned invalid JSON")?;
@@ -174,10 +205,15 @@ impl OpenAiClient {
         }
         let function_call = calls[0].clone();
         let step = Step::from_function_call(&function_call)?;
+        let output_items = raw["output"]
+            .as_array()
+            .context("Responses API response has no output array")?
+            .clone();
 
         Ok(ModelReply {
             response_id: raw["id"].as_str().unwrap_or("unknown").to_owned(),
             step,
+            output_items,
             function_call,
             usage: extract_usage(&raw),
             latency_ms: started.elapsed().as_millis() as u64,
@@ -198,6 +234,10 @@ fn retryable_rate_limit(status: StatusCode, response_body: &[u8]) -> bool {
 
 fn retry_delay(headers: &HeaderMap, attempt: usize) -> Duration {
     retry_delay_at(headers, attempt, SystemTime::now())
+}
+
+fn transport_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(250 * (1_u64 << attempt.min(4)))
 }
 
 fn retry_delay_at(headers: &HeaderMap, attempt: usize, now: SystemTime) -> Duration {
@@ -258,19 +298,13 @@ fn extract_usage(raw: &Value) -> Usage {
     }
 }
 
-fn prompt_cache_key(model: &str, system: &str, task: &str) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in model
-        .bytes()
-        .chain([0])
-        .chain(system.bytes())
-        .chain([0])
-        .chain(task.bytes())
-    {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("carry-{hash:016x}")
+fn new_prompt_cache_key() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+    format!("carry-{}-{now}-{sequence}", std::process::id())
 }
 
 #[cfg(test)]
@@ -306,6 +340,7 @@ mod tests {
                         Err(error) => panic!("test server accept failed: {error}"),
                     }
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -357,7 +392,7 @@ mod tests {
                 "type": "function_call",
                 "call_id": "call-1",
                 "name": "finish",
-                "arguments": "{\"answer\":\"done\",\"context_management\":{\"retain_volatile_ids\":[],\"release_stable_ids\":[],\"add_memories\":[]}}"
+                "arguments": "{\"answer\":\"done\",\"context\":{\"keep\":[],\"drop\":[],\"remember\":[]}}"
             }],
             "usage": {}
         });
@@ -372,11 +407,38 @@ mod tests {
         let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
 
         let started = Instant::now();
-        let reply = client.step("system", "task", &[], "control").await.unwrap();
+        let reply = client.step("system", &[]).await.unwrap();
 
         assert_eq!(reply.response_id, "response-1");
         assert_eq!(reply.response_retries, 1);
         assert!(started.elapsed() >= Duration::from_millis(15));
+        assert_eq!(
+            requests.recv_timeout(Duration::from_secs(2)).unwrap(),
+            requests.recv_timeout(Duration::from_secs(2)).unwrap()
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_when_connection_closes_before_a_response() {
+        let success = json!({
+            "id": "response-after-disconnect",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "finish",
+                "arguments": "{\"answer\":\"done\",\"context\":{\"keep\":[],\"drop\":[],\"remember\":[]}}"
+            }],
+            "usage": {}
+        });
+        let (api_base, requests, server) =
+            response_server(vec![String::new(), http_response("200 OK", "", &success)]);
+        let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
+
+        let reply = client.step("system", &[]).await.unwrap();
+
+        assert_eq!(reply.response_id, "response-after-disconnect");
+        assert_eq!(reply.response_retries, 1);
         assert_eq!(
             requests.recv_timeout(Duration::from_secs(2)).unwrap(),
             requests.recv_timeout(Duration::from_secs(2)).unwrap()
@@ -391,10 +453,7 @@ mod tests {
         ]);
         let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
 
-        let error = client
-            .step("system", "task", &[], "control")
-            .await
-            .unwrap_err();
+        let error = client.step("system", &[]).await.unwrap_err();
 
         assert!(error.to_string().contains("busy"));
         requests.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -434,10 +493,7 @@ mod tests {
         let (api_base, requests, server) = response_server(vec![rate_limit; 6]);
         let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
 
-        let error = client
-            .step("system", "task", &[], "control")
-            .await
-            .unwrap_err();
+        let error = client.step("system", &[]).await.unwrap_err();
 
         assert!(error.to_string().contains("429 Too Many Requests"));
         assert!(error.to_string().contains("after 5 retries"));
@@ -457,10 +513,7 @@ mod tests {
         )]);
         let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
 
-        let error = client
-            .step("system", "task", &[], "control")
-            .await
-            .unwrap_err();
+        let error = client.step("system", &[]).await.unwrap_err();
 
         assert!(error.to_string().contains("insufficient_quota"));
         requests.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -477,10 +530,7 @@ mod tests {
         )]);
         let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
 
-        let error = client
-            .step("system", "task", &[], "control")
-            .await
-            .unwrap_err();
+        let error = client.step("system", &[]).await.unwrap_err();
 
         assert!(
             error
@@ -501,7 +551,7 @@ mod tests {
                     "type":"function_call",
                     "call_id":"call_1",
                     "name":"finish",
-                    "arguments":"{\"answer\":\"done\",\"context_management\":{\"retain_ids\":[],\"add_memories\":[]}}"
+                    "arguments":"{\"answer\":\"done\",\"context\":{\"keep\":[],\"drop\":[],\"remember\":[]}}"
                 }
             ],
             "usage": {
@@ -531,19 +581,16 @@ mod tests {
             json!({"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}),
             json!({"type":"function_call_output","call_id":"call_1","output":"verbatim"}),
         ];
-        let body = client.request_body("system", "task", &history, "control");
+        let body = client.request_body("system", &history);
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["role"], "system");
-        assert_eq!(input[1]["content"][0]["text"], "task");
-        assert_eq!(input[2..4], history);
-        assert_eq!(input[4]["role"], "developer");
-        assert_eq!(input[4]["content"], "control");
+        assert_eq!(input[1..3], history);
         assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[test]
-    fn request_combines_implicit_caching_with_the_explicit_task_fallback() {
+    fn request_combines_implicit_caching_with_a_stable_session_key() {
         let client = OpenAiClient::new(
             "https://example.invalid/v1".into(),
             "secret".into(),
@@ -551,17 +598,18 @@ mod tests {
             "medium".into(),
         );
 
-        let body = client.request_body("system", "stable task", &[], "changing control");
-        let same_task = client.request_body("system", "stable task", &[], "other control");
-        let other_task = client.request_body("system", "other task", &[], "changing control");
+        let stable = vec![json!({"role":"user","content":"stable task"})];
+        let same_prefix = vec![
+            stable[0].clone(),
+            json!({"role":"developer","content":"appended"}),
+        ];
+        let other = vec![json!({"role":"user","content":"other task"})];
+        let body = client.request_body("system", &stable);
+        let same_task = client.request_body("system", &same_prefix);
+        let other_task = client.request_body("system", &other);
 
         assert_eq!(body["prompt_cache_options"]["mode"], "implicit");
-        assert_eq!(
-            body["input"][1]["content"][0]["prompt_cache_breakpoint"]["mode"],
-            "explicit"
-        );
-        assert_eq!(body["input"][1]["content"][0]["text"], "stable task");
         assert_eq!(body["prompt_cache_key"], same_task["prompt_cache_key"]);
-        assert_ne!(body["prompt_cache_key"], other_task["prompt_cache_key"]);
+        assert_eq!(body["prompt_cache_key"], other_task["prompt_cache_key"]);
     }
 }

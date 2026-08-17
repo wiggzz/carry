@@ -36,6 +36,19 @@ impl RunLogger {
     }
 
     pub fn event<T: Serialize>(&mut self, event: &str, data: &T, human: &str) -> Result<()> {
+        self.write_event(event, data, Some(human))
+    }
+
+    pub fn event_silent<T: Serialize>(&mut self, event: &str, data: &T) -> Result<()> {
+        self.write_event(event, data, None)
+    }
+
+    fn write_event<T: Serialize>(
+        &mut self,
+        event: &str,
+        data: &T,
+        human: Option<&str>,
+    ) -> Result<()> {
         self.seq += 1;
         let value = json!({
             "schema_version": 1,
@@ -48,14 +61,20 @@ impl RunLogger {
         serde_json::to_writer(&mut self.jsonl, &value)?;
         self.jsonl.write_all(b"\n")?;
         self.jsonl.flush()?;
-        writeln!(self.text, "{human}")?;
-        self.text.flush()?;
-        eprintln!("{human}");
+        if let Some(human) = human {
+            writeln!(self.text, "{human}")?;
+            self.text.flush()?;
+            eprintln!("{human}");
+        }
         Ok(())
     }
 
     pub fn raw_event(&mut self, event: &str, data: Value, human: &str) -> Result<()> {
         self.event(event, &data, human)
+    }
+
+    pub fn raw_event_silent(&mut self, event: &str, data: Value) -> Result<()> {
+        self.event_silent(event, &data)
     }
 }
 

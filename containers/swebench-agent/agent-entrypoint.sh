@@ -16,10 +16,11 @@ test -w /benchmark/output
 
 case "$method" in
   carry)
-    exec carry run \
+    task_prompt=$(cat /benchmark/task/task.md)
+    exec carry \
       --cwd /benchmark/task/repo \
-      --task-file /benchmark/task/task.md \
-      --run-dir /benchmark/output
+      --session-dir /benchmark/output \
+      -p "$task_prompt"
     ;;
   *)
     echo "agent image does not contain the requested method: $method" >&2

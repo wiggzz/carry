@@ -6,451 +6,867 @@ use serde_json::{Value, json};
 
 use crate::protocol::ContextManagement;
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
+const CACHE_READ_RATE: f64 = 0.10;
+const CACHE_WRITE_RATE: f64 = 1.25;
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ContextItemKind {
-    Memory,
-    ToolInteraction,
+pub(crate) enum Retention {
+    Stable,
+    Volatile,
 }
 
-/// One immutable selectable unit of context. Generation and checkpoint state
-/// live outside `input_items`, so promotion never rewrites the segment itself.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetentionSignal {
+    Neutral,
+    Keep,
+    Drop,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContextItemKind {
+    User,
+    Memory,
+    Tool,
+}
+
+impl ContextItemKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Memory => "memory",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+impl Retention {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Volatile => "volatile",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub(crate) struct ContextItem {
-    pub id: String,
+    pub id: u64,
     pub kind: ContextItemKind,
+    pub retention: Retention,
+    pub signal: RetentionSignal,
     pub bytes: usize,
-    pub retention_rounds: usize,
-    pub checkpoint_after: bool,
     pub input_items: Vec<Value>,
+    memory: Option<MemoryData>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct MemoryData {
+    content: String,
+    source_id: u64,
+    materialized: bool,
 }
 
 impl ContextItem {
-    pub fn tool_interaction(
-        id: String,
-        function_call: Value,
-        function_call_output: Value,
-    ) -> Result<Self> {
-        if function_call["type"].as_str() != Some("function_call") {
-            bail!("tool interaction assistant item is not a function_call");
-        }
-        if function_call_output["type"].as_str() != Some("function_call_output") {
-            bail!("tool interaction result item is not a function_call_output");
-        }
-        let call_id = function_call["call_id"]
-            .as_str()
-            .context("function_call has no call_id")?;
-        if function_call_output["call_id"].as_str() != Some(call_id) {
-            bail!("function call and output call_id values do not match");
-        }
-        let input_items = vec![function_call, function_call_output];
-        Ok(Self {
+    fn user(id: u64, content: String) -> Self {
+        Self::new(
             id,
-            kind: ContextItemKind::ToolInteraction,
-            bytes: serialized_bytes(&input_items),
-            retention_rounds: 0,
-            checkpoint_after: false,
-            input_items,
-        })
+            ContextItemKind::User,
+            Retention::Stable,
+            vec![json!({
+                "role": "user",
+                "content": [{ "type": "input_text", "text": content }]
+            })],
+        )
     }
 
-    fn memory(id: String, content: String) -> Self {
-        let input_items = vec![json!({
-            "role": "user",
-            "content": [{
-                "type": "input_text",
-                "text": format!("[retained memory {id}]\n{content}")
-            }]
-        })];
+    fn memory(id: u64, source_id: u64, content: String) -> Self {
+        let mut item = Self::new(id, ContextItemKind::Memory, Retention::Stable, Vec::new());
+        item.bytes = content.len();
+        item.memory = Some(MemoryData {
+            content,
+            source_id,
+            materialized: false,
+        });
+        item
+    }
+
+    pub fn tool(id: u64, output_items: Vec<Value>, function_call_output: Value) -> Result<Self> {
+        if function_call_output["type"].as_str() != Some("function_call_output") {
+            bail!("tool result item is not a function_call_output");
+        }
+        let call_id = function_call_output["call_id"]
+            .as_str()
+            .context("function call output has no call_id")?;
+        if !output_items.iter().any(|item| {
+            item["type"].as_str() == Some("function_call")
+                && item["call_id"].as_str() == Some(call_id)
+        }) {
+            bail!("response output has no matching function call");
+        }
+        let mut input_items = output_items;
+        input_items.push(function_call_output);
+        Ok(Self::new(
+            id,
+            ContextItemKind::Tool,
+            Retention::Volatile,
+            input_items,
+        ))
+    }
+
+    fn new(id: u64, kind: ContextItemKind, retention: Retention, input_items: Vec<Value>) -> Self {
         Self {
             id,
-            kind: ContextItemKind::Memory,
+            kind,
+            retention,
+            signal: RetentionSignal::Neutral,
             bytes: serialized_bytes(&input_items),
-            retention_rounds: 1,
-            checkpoint_after: false,
             input_items,
+            memory: None,
         }
     }
-}
 
-fn cache_checkpoint() -> Value {
-    json!({
-        "role": "developer",
-        "content": [{
+    fn marker(&self, checkpoint: bool) -> Value {
+        let mut block = json!({
             "type": "input_text",
-            "text": "[stable generation checkpoint]",
-            "prompt_cache_breakpoint": { "mode": "explicit" }
-        }]
-    })
+            "text": format!(
+                "[{} {} {}]",
+                self.id,
+                self.kind.label(),
+                self.retention.label()
+            )
+        });
+        if checkpoint {
+            block["prompt_cache_breakpoint"] = json!({ "mode": "explicit" });
+        }
+        json!({ "role": "developer", "content": [block] })
+    }
+
+    fn compact_marker(&self) -> String {
+        format!("[{} {}]", self.id, self.retention.label())
+    }
 }
 
 fn serialized_bytes(items: &[Value]) -> usize {
     serde_json::to_vec(items).map_or(usize::MAX, |bytes| bytes.len())
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct ContextState {
-    stable: Vec<ContextItem>,
-    volatile: Vec<ContextItem>,
-    next_memory_id: usize,
-    round: usize,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ContextChange {
-    pub stable: Vec<String>,
-    pub volatile: Vec<String>,
-    pub dropped: Vec<String>,
-    pub released: Vec<String>,
-    pub added: Vec<String>,
-    pub promoted: Vec<String>,
-    pub collection_round: bool,
-    pub stable_bytes: usize,
-    pub volatile_bytes: usize,
-    pub bytes: usize,
+    items: Vec<ContextItem>,
+    next_id: u64,
+    generation: u64,
 }
 
 impl ContextState {
-    pub fn input_items(&self, latest: Option<&ContextItem>) -> Vec<Value> {
+    pub fn new(initial_prompt: String) -> Self {
+        Self {
+            items: vec![ContextItem::user(1, initial_prompt)],
+            next_id: 1,
+            generation: 0,
+        }
+    }
+
+    pub fn add_user(&mut self, content: String) -> u64 {
+        let id = self.allocate_id();
+        self.items.push(ContextItem::user(id, content));
+        id
+    }
+
+    pub fn add_tool(
+        &mut self,
+        output_items: Vec<Value>,
+        function_call_output: Value,
+    ) -> Result<u64> {
+        let id = self.allocate_id();
+        self.items
+            .push(ContextItem::tool(id, output_items, function_call_output)?);
+        Ok(id)
+    }
+
+    fn allocate_id(&mut self) -> u64 {
+        self.next_id = self.next_id.saturating_add(1);
+        self.next_id
+    }
+
+    pub fn input_items(&self) -> Vec<Value> {
+        Self::render_items(&self.items)
+    }
+
+    fn render_items(items: &[ContextItem]) -> Vec<Value> {
+        let frontier = items
+            .iter()
+            .take_while(|item| item.retention == Retention::Stable)
+            .count();
+        let present = items.iter().map(|item| item.id).collect::<HashSet<_>>();
         let mut input = Vec::new();
-        for item in &self.stable {
-            input.extend(item.input_items.iter().cloned());
-            if item.checkpoint_after {
-                input.push(cache_checkpoint());
+        for (index, item) in items.iter().enumerate() {
+            let checkpoint = frontier > 0 && index + 1 == frontier;
+            match item.kind {
+                ContextItemKind::User => {
+                    input.extend(item.input_items.iter().cloned());
+                    input.push(item.marker(checkpoint));
+                }
+                ContextItemKind::Tool => {
+                    let mut native = item.input_items.clone();
+                    let output = native
+                        .last_mut()
+                        .expect("tool context always has a function output");
+                    let mut annotated = output["output"].as_str().unwrap_or_default().to_owned();
+                    annotated.push_str(&format!("\n{}", item.compact_marker()));
+                    for memory in items.iter().filter(|candidate| {
+                        candidate.memory.as_ref().is_some_and(|memory| {
+                            memory.source_id == item.id && !memory.materialized
+                        })
+                    }) {
+                        annotated
+                            .push_str(&format!("\n\n[memory stored]\n{}", memory.compact_marker()));
+                    }
+                    output["output"] = Value::String(annotated);
+                    input.extend(native);
+                    if checkpoint {
+                        input.push(cache_frontier_marker());
+                    }
+                }
+                ContextItemKind::Memory => {
+                    let memory = item.memory.as_ref().expect("memory metadata is present");
+                    if memory.materialized || !present.contains(&memory.source_id) {
+                        input.push(json!({
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": format!("[memory]\n{}", memory.content)
+                            }]
+                        }));
+                        input.push(item.marker(checkpoint));
+                    } else if checkpoint {
+                        input.push(cache_frontier_marker());
+                    }
+                }
             }
-        }
-        for item in &self.volatile {
-            input.extend(item.input_items.iter().cloned());
-        }
-        if let Some(item) = latest
-            && !self
-                .stable
-                .iter()
-                .chain(&self.volatile)
-                .any(|old| old.id == item.id)
-        {
-            input.extend(item.input_items.iter().cloned());
         }
         input
     }
 
-    pub fn stable_ids(&self) -> Vec<&str> {
-        self.stable.iter().map(|item| item.id.as_str()).collect()
-    }
-
-    pub fn volatile_status(&self) -> Vec<(&str, usize)> {
-        self.volatile
-            .iter()
-            .map(|item| (item.id.as_str(), item.retention_rounds))
-            .collect()
-    }
-
     pub fn snapshot(&self) -> Vec<&ContextItem> {
-        self.stable.iter().chain(&self.volatile).collect()
+        self.items.iter().collect()
     }
 
-    pub fn stable_bytes(&self) -> usize {
-        let checkpoint_bytes = serialized_bytes(&[cache_checkpoint()]);
-        self.stable
+    pub fn stable_frontier_len(&self) -> usize {
+        self.items
             .iter()
-            .map(|item| item.bytes + usize::from(item.checkpoint_after) * checkpoint_bytes)
-            .sum()
+            .take_while(|item| item.retention == Retention::Stable)
+            .count()
     }
 
-    pub fn volatile_bytes(&self) -> usize {
-        self.volatile.iter().map(|item| item.bytes).sum()
+    pub fn stable_frontier_id(&self) -> Option<u64> {
+        self.stable_frontier_len()
+            .checked_sub(1)
+            .and_then(|index| self.items.get(index))
+            .map(|item| item.id)
     }
 
     pub fn retained_bytes(&self) -> usize {
-        self.stable_bytes() + self.volatile_bytes()
+        self.items.iter().map(|item| item.bytes).sum()
     }
 
-    /// Stable items survive by default. Volatile items must be explicitly
-    /// retained, and only the oldest contiguous eligible volatile prefix can
-    /// promote so history order never changes.
-    pub fn apply(
-        &mut self,
-        update: &ContextManagement,
-        latest: Option<&ContextItem>,
-        promotion_age: usize,
-        collection_interval: usize,
-    ) -> Result<ContextChange> {
-        validate_unique("retain_volatile_ids", &update.retain_volatile_ids)?;
-        validate_unique("release_stable_ids", &update.release_stable_ids)?;
+    pub fn estimated_tokens(&self) -> usize {
+        estimated_tokens(&Self::render_items(&self.items))
+    }
 
-        let retain_available = self
-            .volatile
-            .iter()
-            .map(|item| item.id.as_str())
-            .chain(self.stable.iter().map(|item| item.id.as_str()))
-            .chain(latest.map(|item| item.id.as_str()))
-            .collect::<HashSet<_>>();
-        for id in &update.retain_volatile_ids {
-            if !retain_available.contains(id.as_str()) {
-                bail!("context_management.retain_volatile_ids references unknown ID {id}");
+    pub fn record_signals(&mut self, update: &ContextManagement, source_id: u64) -> SignalChange {
+        let mut keep = Vec::new();
+        let mut drop = Vec::new();
+        let mut ignored = Vec::new();
+
+        // Apply drops first so a contradictory same-turn keep wins conservatively.
+        for id in unique_ids(&update.drop) {
+            match self.items.iter_mut().find(|item| item.id == id) {
+                Some(item) => {
+                    item.signal = RetentionSignal::Drop;
+                    drop.push(id);
+                }
+                None => ignored.push(id),
             }
         }
-        let stable_available = self
-            .stable
-            .iter()
-            .map(|item| item.id.as_str())
-            .collect::<HashSet<_>>();
-        for id in &update.release_stable_ids {
-            if !stable_available.contains(id.as_str()) {
-                bail!(
-                    "context_management.release_stable_ids references non-stable or unknown ID {id}"
-                );
+        for id in unique_ids(&update.keep) {
+            match self.items.iter_mut().find(|item| item.id == id) {
+                Some(item) => {
+                    item.signal = RetentionSignal::Keep;
+                    keep.push(id);
+                }
+                None => ignored.push(id),
             }
-        }
-
-        let release = update
-            .release_stable_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        let retain = update
-            .retain_volatile_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-
-        let released = self
-            .stable
-            .iter()
-            .filter(|item| release.contains(item.id.as_str()))
-            .map(|item| item.id.clone())
-            .collect::<Vec<_>>();
-        let mut stable = self
-            .stable
-            .iter()
-            .filter(|item| !release.contains(item.id.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        let dropped = self
-            .volatile
-            .iter()
-            .filter(|item| !retain.contains(item.id.as_str()))
-            .map(|item| item.id.clone())
-            .collect::<Vec<_>>();
-        let mut volatile = self
-            .volatile
-            .iter()
-            .filter(|item| retain.contains(item.id.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        for item in &mut volatile {
-            item.retention_rounds = item.retention_rounds.saturating_add(1);
-        }
-        if let Some(item) = latest
-            && retain.contains(item.id.as_str())
-            && !volatile.iter().any(|old| old.id == item.id)
-        {
-            let mut item = item.clone();
-            item.retention_rounds = 1;
-            volatile.push(item);
         }
 
         let mut added = Vec::new();
-        let mut next_memory_id = self.next_memory_id;
-        for content in &update.add_memories {
-            let content = content.trim();
-            if content.is_empty() {
-                bail!("context_management.add_memories contains an empty item");
-            }
-            next_memory_id += 1;
-            let id = format!("m{next_memory_id:04}");
-            volatile.push(ContextItem::memory(id.clone(), content.to_owned()));
+        for content in update
+            .remember
+            .iter()
+            .map(|content| content.trim())
+            .filter(|content| !content.is_empty())
+        {
+            let id = self.allocate_id();
+            self.items
+                .push(ContextItem::memory(id, source_id, content.to_owned()));
             added.push(id);
         }
 
-        let age = promotion_age.max(1);
-        let next_round = self.round.saturating_add(1);
-        let collection_round = next_round.is_multiple_of(collection_interval.max(1));
-        let promote_count = if collection_round {
-            volatile
-                .iter()
-                .take_while(|item| item.retention_rounds >= age)
-                .count()
-        } else {
-            0
-        };
-        let mut promoted_items = volatile.drain(..promote_count).collect::<Vec<_>>();
-        let promoted = promoted_items
-            .iter()
-            .map(|item| item.id.clone())
-            .collect::<Vec<_>>();
-        if let Some(last) = promoted_items.last_mut() {
-            last.checkpoint_after = true;
-        }
-        stable.append(&mut promoted_items);
-
-        self.stable = stable;
-        self.volatile = volatile;
-        self.next_memory_id = next_memory_id;
-        self.round = next_round;
-        let stable_bytes = self.stable_bytes();
-        let volatile_bytes = self.volatile_bytes();
-        Ok(ContextChange {
-            stable: self.stable.iter().map(|item| item.id.clone()).collect(),
-            volatile: self.volatile.iter().map(|item| item.id.clone()).collect(),
-            dropped,
-            released,
+        SignalChange {
+            keep,
+            drop,
+            ignored: unique_ids(&ignored),
             added,
-            promoted,
-            collection_round,
-            stable_bytes,
-            volatile_bytes,
-            bytes: stable_bytes + volatile_bytes,
-        })
+        }
+    }
+
+    pub fn plan_compaction(
+        &self,
+        protected: &[u64],
+        policy: CompactionPolicy,
+    ) -> Option<CompactionPlan> {
+        let protected = protected.iter().copied().collect::<HashSet<_>>();
+        let minor_drops = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.retention == Retention::Volatile
+                    && item.signal != RetentionSignal::Keep
+                    && !protected.contains(&item.id)
+            })
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let major_drops = self
+            .items
+            .iter()
+            .filter(|item| {
+                ((item.retention == Retention::Stable && item.signal == RetentionSignal::Drop)
+                    || (item.retention == Retention::Volatile
+                        && item.signal != RetentionSignal::Keep))
+                    && !protected.contains(&item.id)
+            })
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+
+        let mut candidates = Vec::new();
+        if !minor_drops.is_empty() {
+            candidates.push(self.compaction_candidate(CompactionKind::Minor, minor_drops, policy));
+        }
+        if major_drops.iter().any(|id| {
+            self.items
+                .iter()
+                .any(|item| item.id == *id && item.retention == Retention::Stable)
+        }) {
+            candidates.push(self.compaction_candidate(CompactionKind::Major, major_drops, policy));
+        }
+
+        candidates
+            .into_iter()
+            .filter(|plan| plan.estimated_savings_input_units > 0.0)
+            .max_by(|left, right| {
+                left.estimated_savings_input_units
+                    .total_cmp(&right.estimated_savings_input_units)
+            })
+    }
+
+    fn compaction_candidate(
+        &self,
+        kind: CompactionKind,
+        dropped: Vec<u64>,
+        policy: CompactionPolicy,
+    ) -> CompactionPlan {
+        let dropped_set = dropped.iter().copied().collect::<HashSet<_>>();
+        let current_tokens = self.estimated_tokens();
+        let mut retained = self
+            .items
+            .iter()
+            .filter(|item| !dropped_set.contains(&item.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for item in &mut retained {
+            item.retention = Retention::Stable;
+        }
+        let retained_tokens = estimated_tokens(&Self::render_items(&retained));
+        let dropped_tokens = current_tokens.saturating_sub(retained_tokens);
+        let frontier_tokens = estimated_tokens(&Self::render_items(
+            &self.items[..self.stable_frontier_len()],
+        ))
+        .min(retained_tokens);
+        let rewrite_tokens = if kind == CompactionKind::Minor && policy.stable_cache_alive {
+            retained_tokens.saturating_sub(frontier_tokens)
+        } else {
+            retained_tokens
+        };
+        let baseline_first_rate = if policy.implicit_cache_alive {
+            CACHE_READ_RATE
+        } else {
+            CACHE_WRITE_RATE
+        };
+        let baseline = current_tokens as f64 * baseline_first_rate;
+        let candidate_first = if kind == CompactionKind::Minor && policy.stable_cache_alive {
+            frontier_tokens as f64 * CACHE_READ_RATE + rewrite_tokens as f64 * CACHE_WRITE_RATE
+        } else {
+            retained_tokens as f64 * CACHE_WRITE_RATE
+        };
+
+        CompactionPlan {
+            kind,
+            dropped,
+            dropped_tokens,
+            retained_tokens,
+            rewrite_tokens,
+            estimated_savings_input_units: baseline - candidate_first,
+        }
+    }
+
+    pub fn compact(&mut self, plan: CompactionPlan) -> ContextChange {
+        let dropped = plan.dropped.iter().copied().collect::<HashSet<_>>();
+        self.items.retain(|item| !dropped.contains(&item.id));
+        for item in &mut self.items {
+            if let Some(memory) = item.memory.as_mut()
+                && dropped.contains(&memory.source_id)
+            {
+                memory.materialized = true;
+            }
+            item.retention = Retention::Stable;
+            if item.signal == RetentionSignal::Keep {
+                item.signal = RetentionSignal::Neutral;
+            }
+        }
+        self.generation = self.generation.saturating_add(1);
+
+        ContextChange {
+            kind: plan.kind,
+            dropped: plan.dropped,
+            dropped_tokens: plan.dropped_tokens,
+            retained_tokens: plan.retained_tokens,
+            rewrite_tokens: plan.rewrite_tokens,
+            estimated_savings_input_units: plan.estimated_savings_input_units,
+            generation: self.generation,
+            stable_frontier: self.stable_frontier_id(),
+            retained_bytes: self.retained_bytes(),
+        }
+    }
+
+    #[cfg(test)]
+    fn signal_for(&self, id: u64) -> Option<RetentionSignal> {
+        self.items
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.signal)
+    }
+
+    #[cfg(test)]
+    fn force_stable_for_test(&mut self) {
+        for item in &mut self.items {
+            item.retention = Retention::Stable;
+        }
     }
 }
 
-fn validate_unique(field: &str, ids: &[String]) -> Result<()> {
+fn unique_ids(ids: &[u64]) -> Vec<u64> {
     let mut seen = HashSet::new();
-    for id in ids {
-        if !seen.insert(id) {
-            bail!("context_management.{field} contains duplicate ID {id}");
+    ids.iter().copied().filter(|id| seen.insert(*id)).collect()
+}
+
+fn cache_frontier_marker() -> Value {
+    json!({
+        "role": "developer",
+        "content": [{
+            "type": "input_text",
+            "text": "[cache frontier]",
+            "prompt_cache_breakpoint": { "mode": "explicit" }
+        }]
+    })
+}
+
+fn estimated_tokens(items: &[Value]) -> usize {
+    serialized_bytes(items).div_ceil(ESTIMATED_BYTES_PER_TOKEN)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CompactionPolicy {
+    pub implicit_cache_alive: bool,
+    pub stable_cache_alive: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompactionKind {
+    Minor,
+    Major,
+}
+
+impl CompactionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Minor => "minor",
+            Self::Major => "major",
         }
     }
-    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CompactionPlan {
+    pub kind: CompactionKind,
+    pub dropped: Vec<u64>,
+    pub dropped_tokens: usize,
+    pub retained_tokens: usize,
+    pub rewrite_tokens: usize,
+    pub estimated_savings_input_units: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SignalChange {
+    pub keep: Vec<u64>,
+    pub drop: Vec<u64>,
+    pub ignored: Vec<u64>,
+    pub added: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ContextChange {
+    pub kind: CompactionKind,
+    pub dropped: Vec<u64>,
+    pub dropped_tokens: usize,
+    pub retained_tokens: usize,
+    pub rewrite_tokens: usize,
+    pub estimated_savings_input_units: f64,
+    pub generation: u64,
+    pub stable_frontier: Option<u64>,
+    pub retained_bytes: usize,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tool(id: &str) -> ContextItem {
-        ContextItem::tool_interaction(
-            id.into(),
-            json!({"type":"function_call","call_id":id,"name":"shell","arguments":"{}"}),
-            json!({"type":"function_call_output","call_id":id,"output":"exact output"}),
-        )
-        .unwrap()
-    }
-
-    fn update(retain: &[&str], release: &[&str], memories: &[&str]) -> ContextManagement {
+    fn update(keep: &[u64], drop: &[u64], remember: &[&str]) -> ContextManagement {
         ContextManagement {
-            retain_volatile_ids: retain.iter().map(|value| (*value).into()).collect(),
-            release_stable_ids: release.iter().map(|value| (*value).into()).collect(),
-            add_memories: memories.iter().map(|value| (*value).into()).collect(),
+            keep: keep.to_vec(),
+            drop: drop.to_vec(),
+            remember: remember.iter().map(|value| (*value).into()).collect(),
         }
     }
 
-    #[test]
-    fn volatile_items_expire_when_omitted() {
-        let mut state = ContextState::default();
+    fn add_tool(state: &mut ContextState) -> u64 {
+        let next = state.next_id + 1;
         state
-            .apply(&update(&["t1"], &[], &[]), Some(&tool("t1")), 3, 3)
-            .unwrap();
-        assert_eq!(state.volatile_status(), vec![("t1", 1)]);
-        let change = state.apply(&update(&[], &[], &[]), None, 3, 3).unwrap();
-        assert_eq!(change.dropped, vec!["t1"]);
-        assert!(state.snapshot().is_empty());
+            .add_tool(
+                vec![json!({
+                    "type": "function_call",
+                    "call_id": format!("call-{next}"),
+                    "name": "shell",
+                    "arguments": "{}"
+                })],
+                json!({
+                    "type": "function_call_output",
+                    "call_id": format!("call-{next}"),
+                    "output": "exact output"
+                }),
+            )
+            .unwrap()
     }
 
     #[test]
-    fn promoted_stable_items_persist_until_explicitly_released() {
-        let mut state = ContextState::default();
-        state
-            .apply(&update(&["t1"], &[], &[]), Some(&tool("t1")), 3, 3)
-            .unwrap();
-        state.apply(&update(&["t1"], &[], &[]), None, 3, 3).unwrap();
-        let change = state.apply(&update(&["t1"], &[], &[]), None, 3, 3).unwrap();
-        assert_eq!(change.promoted, vec!["t1"]);
-        assert_eq!(state.stable_ids(), vec!["t1"]);
-        state.apply(&update(&[], &[], &[]), None, 3, 3).unwrap();
-        assert_eq!(state.stable_ids(), vec!["t1"]);
-        let change = state.apply(&update(&[], &["t1"], &[]), None, 3, 3).unwrap();
-        assert_eq!(change.released, vec!["t1"]);
-        assert!(state.stable_ids().is_empty());
-    }
+    fn stable_human_message_below_volatile_item_does_not_move_the_frontier() {
+        let mut state = ContextState::new("initial".into());
+        let tool = add_tool(&mut state);
+        let steering = state.add_user("steer here".into());
 
-    #[test]
-    fn only_contiguous_volatile_prefix_promotes_and_markers_are_preserved() {
-        let mut state = ContextState::default();
-        state
-            .apply(&update(&["t1"], &[], &[]), Some(&tool("t1")), 3, 3)
-            .unwrap();
-        state
-            .apply(&update(&["t1", "t2"], &[], &[]), Some(&tool("t2")), 3, 3)
-            .unwrap();
-        state
-            .apply(&update(&["t1", "t2"], &[], &[]), None, 3, 3)
-            .unwrap();
-        assert_eq!(state.stable_ids(), vec!["t1"]);
-        state.apply(&update(&["t2"], &[], &[]), None, 3, 3).unwrap();
-        assert_eq!(state.stable_ids(), vec!["t1"]);
-        state.apply(&update(&["t2"], &[], &[]), None, 3, 3).unwrap();
-        state.apply(&update(&["t2"], &[], &[]), None, 3, 3).unwrap();
-        assert_eq!(state.stable_ids(), vec!["t1", "t2"]);
-        let markers = state
-            .input_items(None)
+        assert_eq!(state.stable_frontier_len(), 1);
+        let rendered = state.input_items();
+        let texts = rendered
             .iter()
-            .filter(|item| item["content"][0]["text"] == "[stable generation checkpoint]")
-            .count();
-        assert_eq!(markers, 2);
+            .filter_map(|item| item["content"][0]["text"].as_str())
+            .collect::<Vec<_>>();
+        assert!(texts.contains(&"[1 user stable]"));
+        assert!(rendered.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["output"]
+                    .as_str()
+                    .is_some_and(|output| output.ends_with(&format!("[{tool} volatile]")))
+        }));
+        assert!(texts.contains(&format!("[{steering} user stable]").as_str()));
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|item| item["content"][0].get("prompt_cache_breakpoint").is_some())
+                .count(),
+            1
+        );
     }
 
     #[test]
-    fn younger_head_blocks_older_looking_tail_from_promotion() {
-        let mut state = ContextState {
-            volatile: vec![tool("young"), tool("old")],
-            ..ContextState::default()
-        };
-        state.volatile[0].retention_rounds = 1;
-        state.volatile[1].retention_rounds = 5;
-        state
-            .apply(&update(&["young", "old"], &[], &[]), None, 3, 3)
+    fn memory_is_an_inline_stable_handle_without_duplicating_its_content() {
+        let mut state = ContextState::new("initial".into());
+        let tool = add_tool(&mut state);
+        let change = state.record_signals(&update(&[], &[], &["durable outcome"]), tool);
+        let memory = change.added[0];
+
+        assert_eq!(
+            state.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![1, tool, memory]
+        );
+        assert_eq!(state.items[2].retention, Retention::Stable);
+        assert_eq!(state.stable_frontier_len(), 1);
+
+        let rendered = state.input_items();
+        let tool_output = rendered
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap()["output"]
+            .as_str()
             .unwrap();
-        assert!(state.stable_ids().is_empty());
-        assert_eq!(state.volatile_status(), vec![("young", 2), ("old", 6)]);
+        assert!(tool_output.contains(&format!("[{tool} volatile]")));
+        assert!(tool_output.contains("[memory stored]"));
+        assert!(tool_output.contains(&format!("[{memory} stable]")));
+        assert!(!tool_output.contains("durable outcome"));
+        assert!(!rendered.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("[memory]"))
+        }));
     }
 
     #[test]
-    fn promotion_age_and_collection_interval_are_independent() {
-        let mut state = ContextState::default();
-        state
-            .apply(&update(&["t1"], &[], &[]), Some(&tool("t1")), 2, 3)
-            .unwrap();
-        state.apply(&update(&["t1"], &[], &[]), None, 2, 3).unwrap();
-        assert!(state.stable_ids().is_empty());
-        let change = state.apply(&update(&["t1"], &[], &[]), None, 2, 3).unwrap();
-        assert_eq!(change.promoted, vec!["t1"]);
-    }
+    fn dropping_a_tool_materializes_its_stored_memory_with_the_same_memory_id() {
+        let mut state = ContextState::new("initial".into());
+        let tool = add_tool(&mut state);
+        let memory = state
+            .record_signals(&update(&[], &[tool], &["durable outcome"]), tool)
+            .added[0];
 
-    #[test]
-    fn new_memories_enter_volatile_tail_without_cache_metadata() {
-        let mut state = ContextState::default();
-        let change = state
-            .apply(&update(&[], &[], &["remember this"]), None, 3, 3)
+        let plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cache_alive: false,
+                    stable_cache_alive: false,
+                },
+            )
             .unwrap();
-        assert_eq!(change.added, vec!["m0001"]);
-        assert_eq!(state.volatile_status(), vec![("m0001", 1)]);
+        state.compact(plan);
+
+        let rendered = state.input_items();
         assert!(
-            state.input_items(None)[0]["content"][0]
-                .get("prompt_cache_breakpoint")
+            !rendered
+                .iter()
+                .any(|item| item["type"] == "function_call_output")
+        );
+        assert!(rendered.iter().any(|item| {
+            item["role"] == "assistant"
+                && item["content"][0]["type"] == "output_text"
+                && item["content"][0]["text"] == "[memory]\ndurable outcome"
+        }));
+        assert!(
+            rendered
+                .iter()
+                .any(|item| { item["content"][0]["text"] == format!("[{memory} memory stable]") })
+        );
+    }
+
+    #[test]
+    fn planner_prices_memory_materialization_before_dropping_its_source() {
+        let mut state = ContextState::new("initial".into());
+        let tool = add_tool(&mut state);
+        state.record_signals(&update(&[], &[tool], &[&"important ".repeat(2_000)]), tool);
+
+        assert!(
+            state
+                .plan_compaction(
+                    &[],
+                    CompactionPolicy {
+                        implicit_cache_alive: false,
+                        stable_cache_alive: false,
+                    },
+                )
                 .is_none()
         );
     }
 
     #[test]
-    fn redundant_stable_retains_are_harmless_but_invalid_releases_are_rejected() {
-        let mut state = ContextState::default();
-        state
-            .apply(&update(&["t1"], &[], &[]), Some(&tool("t1")), 1, 1)
+    fn dropping_a_memory_with_its_source_does_not_materialize_it() {
+        let mut state = ContextState::new("initial".into());
+        let tool = add_tool(&mut state);
+        let memory = state
+            .record_signals(&update(&[], &[tool], &["temporary outcome"]), tool)
+            .added[0];
+        state.record_signals(&update(&[], &[memory], &[]), tool);
+
+        let plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cache_alive: false,
+                    stable_cache_alive: false,
+                },
+            )
             .unwrap();
-        let change = state.apply(&update(&["t1"], &[], &[]), None, 3, 3).unwrap();
-        assert!(change.dropped.is_empty());
-        assert_eq!(state.stable_ids(), vec!["t1"]);
+        state.compact(plan);
+
+        assert!(!state.input_items().iter().any(|item| {
+            item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("temporary outcome"))
+        }));
+    }
+
+    #[test]
+    fn tool_item_preserves_all_native_response_output_items() {
+        let mut state = ContextState::new("initial".into());
+        let call =
+            json!({"type":"function_call","call_id":"call-2","name":"shell","arguments":"{}"});
+        let reasoning = json!({"type":"reasoning","encrypted_content":"opaque"});
+        let id = state
+            .add_tool(
+                vec![reasoning.clone(), call],
+                json!({"type":"function_call_output","call_id":"call-2","output":"ok"}),
+            )
+            .unwrap();
+        let item = state.items.iter().find(|item| item.id == id).unwrap();
+        assert_eq!(item.input_items[0], reasoning);
+        assert_eq!(item.input_items.len(), 3);
+    }
+
+    #[test]
+    fn keep_and_drop_are_sticky_advice_until_compaction() {
+        let mut state = ContextState::new("initial".into());
+        let tool = add_tool(&mut state);
+
+        state.record_signals(&update(&[], &[tool], &[]), tool);
+        assert_eq!(state.signal_for(tool), Some(RetentionSignal::Drop));
+        assert!(state.snapshot().iter().any(|item| item.id == tool));
+
+        state.record_signals(&update(&[tool], &[], &[]), tool);
+        assert_eq!(state.signal_for(tool), Some(RetentionSignal::Keep));
+        assert!(state.snapshot().iter().any(|item| item.id == tool));
+    }
+
+    #[test]
+    fn contradictory_and_unknown_signals_are_idempotent() {
+        let mut state = ContextState::new("initial".into());
+        let tool = add_tool(&mut state);
+
+        let change = state.record_signals(&update(&[tool, 999], &[tool, 998], &[]), tool);
+
+        assert_eq!(state.signal_for(tool), Some(RetentionSignal::Keep));
+        assert_eq!(change.ignored, vec![998, 999]);
+    }
+
+    #[test]
+    fn warm_minor_compaction_requires_savings_on_the_next_request() {
+        let mut state = ContextState::new("initial".into());
+        let dropped = add_tool(&mut state);
+        let retained = add_tool(&mut state);
+        state.record_signals(&update(&[], &[dropped], &[]), retained);
+        state.record_signals(&update(&[retained], &[], &[]), retained);
+
+        let short = state.plan_compaction(
+            &[],
+            CompactionPolicy {
+                implicit_cache_alive: true,
+                stable_cache_alive: true,
+            },
+        );
+        assert!(short.is_none());
+
         assert!(
             state
-                .apply(&update(&[], &["missing"], &[]), None, 3, 3)
-                .is_err()
+                .plan_compaction(
+                    &[],
+                    CompactionPolicy {
+                        implicit_cache_alive: true,
+                        stable_cache_alive: true,
+                    },
+                )
+                .is_none()
         );
-        let duplicate = ContextManagement {
-            retain_volatile_ids: vec!["x".into(), "x".into()],
-            ..ContextManagement::default()
-        };
-        assert!(state.apply(&duplicate, None, 3, 3).is_err());
+    }
+
+    #[test]
+    fn neutral_volatile_items_are_removable_unless_kept() {
+        let mut state = ContextState::new("initial".into());
+        let disposable = add_tool(&mut state);
+
+        let plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cache_alive: false,
+                    stable_cache_alive: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(plan.kind, CompactionKind::Minor);
+        assert_eq!(plan.dropped, vec![disposable]);
+
+        state.record_signals(&update(&[disposable], &[], &[]), disposable);
+        assert!(
+            state
+                .plan_compaction(
+                    &[],
+                    CompactionPolicy {
+                        implicit_cache_alive: false,
+                        stable_cache_alive: false,
+                    },
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn expired_cache_applies_drop_signals_and_builds_a_new_generation() {
+        let mut state = ContextState::new("initial".into());
+        let dropped = add_tool(&mut state);
+        let retained = add_tool(&mut state);
+        state.record_signals(&update(&[retained], &[dropped], &[]), retained);
+
+        let plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cache_alive: false,
+                    stable_cache_alive: false,
+                },
+            )
+            .unwrap();
+        let change = state.compact(plan);
+
+        assert_eq!(change.kind, CompactionKind::Minor);
+        assert_eq!(change.dropped, vec![dropped]);
+        assert!(
+            state
+                .snapshot()
+                .iter()
+                .all(|item| item.retention == Retention::Stable)
+        );
+        assert_eq!(state.signal_for(retained), Some(RetentionSignal::Neutral));
+    }
+
+    #[test]
+    fn major_compaction_can_remove_stable_drop_candidates() {
+        let mut state = ContextState::new("initial".into());
+        let old_tool = add_tool(&mut state);
+        state.force_stable_for_test();
+        let new_tool = add_tool(&mut state);
+        state.record_signals(&update(&[], &[old_tool, new_tool], &[]), new_tool);
+
+        let plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cache_alive: false,
+                    stable_cache_alive: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(plan.kind, CompactionKind::Major);
+        assert_eq!(plan.dropped, vec![old_tool, new_tool]);
     }
 }

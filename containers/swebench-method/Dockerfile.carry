@@ -12,5 +12,5 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/*.sources \
 COPY --from=build /source/target/release/carry /usr/local/bin/carry
 COPY containers/swebench-method/entrypoint.py /usr/local/bin/swebench-method
 RUN chmod 0555 /usr/local/bin/swebench-method
-ENV AGENT_COMMAND="carry run --cwd /workspace --task-file {prompt} --run-dir {output} --model {model} --max-steps 30"
+ENV AGENT_COMMAND="carry --cwd /workspace --session-dir {output} --model {model} --max-steps 30 -p {prompt_text}"
 ENTRYPOINT ["/usr/local/bin/swebench-method"]
