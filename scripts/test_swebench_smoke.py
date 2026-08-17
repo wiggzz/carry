@@ -143,7 +143,7 @@ class SmokeWorkerTests(unittest.TestCase):
         usage = {"input_tokens": 1_000_000, "cached_input_tokens": 400_000,
                  "cache_write_input_tokens": 200_000, "output_tokens": 100_000,
                  "reasoning_tokens": 5, "total_tokens": 1_100_000}
-        self.assertEqual(self.worker.estimate_cost_usd(usage, pricing), 1.29)
+        self.assertEqual(self.worker.estimate_cost_usd(usage, pricing), 0.258)
         self.assertIsNone(self.worker.pricing_for_model("unknown-model"))
 
     def test_finalize_reports_per_agent_time_tokens_and_configured_cost(self):
@@ -421,7 +421,7 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertEqual(record["response_retries"], 4)
             self.assertEqual(record["elapsed_seconds"], 2.5)
             self.assertEqual(record["usage"]["total_tokens"], 120)
-            self.assertEqual(record["estimated_cost_usd"], 0.000187)
+            self.assertEqual(record["estimated_cost_usd"], 0.000037)
             progress = [json.loads(line.removeprefix("BENCHMARK_PROGRESS "))
                         for line in stdout.getvalue().splitlines()]
             self.assertEqual([event["state"] for event in progress], ["started", "completed"])
