@@ -12,11 +12,14 @@ worker_started_at=$(date +%s)
 : "${RUN_ID:?}"
 : "${RESULT_URL_B64:=}"
 : "${KEY_URL_B64:=}"
+: "${DOCKER_AUTH_URL_B64:=}"
 : "${CONTROL_URL_B64:=}"
 : "${MODEL:=gpt-5.6-luna}"
 : "${REASONING:=medium}"
 : "${CARRY_ROOT:=/opt/carry}"
 : "${SECRET_FILE:=/dev/shm/carry-openai-key}"
+DOCKER_AUTH_FILE=/dev/shm/carry-dockerhub-auth
+DOCKER_CONFIG=/dev/shm/carry-docker-config
 : "${PYTHON_BIN:=}"
 
 result_url=$(printf '%s' "$RESULT_URL_B64" | base64 -d)
@@ -33,7 +36,8 @@ finish() {
     result_url=$(<"$result_url_file")
   fi
   unset OPENAI_API_KEY
-  rm -f "$SECRET_FILE" "$result_url_file"
+  rm -f "$SECRET_FILE" "$DOCKER_AUTH_FILE" "$result_url_file"
+  rm -rf "$DOCKER_CONFIG"
   if [[ -n "$result_url" && -d "$CARRY_ROOT/results" ]]; then
     printf '%s\n' "$status" > "$CARRY_ROOT/results/worker-exit-status"
     tar -C "$CARRY_ROOT/results" -czf "$CARRY_ROOT/results.tar.gz" . || true
@@ -83,6 +87,15 @@ case "$BENCHMARK_MODE" in
   smoke-5|official-50) ;;
   *) echo "unknown benchmark mode" >&2; exit 2 ;;
 esac
+
+docker_auth_url=$(printf '%s' "$DOCKER_AUTH_URL_B64" | base64 -d)
+[[ -n "$docker_auth_url" ]] || { echo "missing Docker Hub authentication capability" >&2; exit 2; }
+curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+  "$docker_auth_url" -o "$DOCKER_AUTH_FILE"
+chmod 0600 "$DOCKER_AUTH_FILE"
+export DOCKER_CONFIG
+"$PYTHON_BIN" "$CARRY_ROOT/source/scripts/docker_registry_login.py" \
+  "$DOCKER_AUTH_FILE" "$DOCKER_CONFIG"
 
 control_url=$(printf '%s' "$CONTROL_URL_B64" | base64 -d)
 if [[ -n "$control_url" ]]; then

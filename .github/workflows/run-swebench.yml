@@ -114,7 +114,7 @@ jobs:
           PY
           )"
           : > "$RUNNER_TEMP/empty"
-          for object in carry-source.tar.gz openai-key results.tar.gz control.json; do
+          for object in carry-source.tar.gz openai-key dockerhub-auth.json results.tar.gz control.json; do
             aws s3 cp "$RUNNER_TEMP/empty" "s3://$ARTIFACT_BUCKET/runs/$TARGET_RUN_ID/$object" --sse AES256 --only-show-errors
             size=$(aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key "runs/$TARGET_RUN_ID/$object" --query ContentLength --output text)
             [[ "$size" == 0 ]] || { echo "failed to sanitize $object" >&2; exit 1; }
@@ -137,6 +137,8 @@ jobs:
         env:
           SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
           OPENAI_API_KEY: ${{ (inputs.mode == 'smoke-5' || inputs.mode == 'official-50') && secrets.OPENAI_API_KEY || '' }}
+          DOCKERHUB_USERNAME: ${{ (inputs.mode == 'smoke-5' || inputs.mode == 'official-50') && secrets.DOCKERHUB_USERNAME || '' }}
+          DOCKERHUB_TOKEN: ${{ (inputs.mode == 'smoke-5' || inputs.mode == 'official-50') && secrets.DOCKERHUB_TOKEN || '' }}
         run: |
           set -euo pipefail
           for required in AWS_REGION ARTIFACT_BUCKET ARTIFACT_SESSION_ROLE_ARN LAUNCH_TEMPLATE_ID LAUNCH_TEMPLATE_VERSION SOURCE_COMMIT; do
@@ -147,7 +149,7 @@ jobs:
             echo "bootstrap_wait_seconds must be an integer from 1 through 300" >&2; exit 1;
           }
           if [[ "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == official-50 ]]; then
-            for required in OPENAI_API_KEY MODEL REASONING; do
+            for required in OPENAI_API_KEY DOCKERHUB_USERNAME DOCKERHUB_TOKEN MODEL REASONING; do
               [[ -n "${!required}" ]] || { echo "missing benchmark configuration: $required" >&2; exit 1; }
             done
           fi
@@ -169,7 +171,17 @@ jobs:
           aws s3 cp carry-source.tar.gz "s3://$ARTIFACT_BUCKET/$PREFIX/carry-source.tar.gz" --sse AES256 --only-show-errors
           if [[ "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == official-50 ]]; then
             printf '%s' "$OPENAI_API_KEY" | aws s3 cp - "s3://$ARTIFACT_BUCKET/$PREFIX/openai-key" --sse AES256 --only-show-errors
+            DOCKER_AUTH_FILE="$RUNNER_TEMP/dockerhub-auth.json"
+            python3 - "$DOCKER_AUTH_FILE" <<'PY'
+          import json, os, sys
+          with open(sys.argv[1], 'w', encoding='utf-8') as stream:
+              json.dump({'username': os.environ['DOCKERHUB_USERNAME'], 'token': os.environ['DOCKERHUB_TOKEN']}, stream)
+          os.chmod(sys.argv[1], 0o600)
+          PY
+            aws s3 cp "$DOCKER_AUTH_FILE" "s3://$ARTIFACT_BUCKET/$PREFIX/dockerhub-auth.json" --sse AES256 --only-show-errors
+            rm -f "$DOCKER_AUTH_FILE"
             KEY_URL=$(aws s3 presign "s3://$ARTIFACT_BUCKET/$PREFIX/openai-key" --expires-in 3600)
+            DOCKER_AUTH_URL=$(aws s3 presign "s3://$ARTIFACT_BUCKET/$PREFIX/dockerhub-auth.json" --expires-in 3600)
             RESULT_URL=$(python3 scripts/presign_s3.py put "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 3600)
             RESULT_GET_URL=$(python3 scripts/presign_s3.py get "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 3600)
             if [[ "$BENCHMARK_MODE" == official-50 ]]; then
@@ -186,15 +198,16 @@ jobs:
               CONTROL_URL=""
             fi
           else
-            KEY_URL=""; RESULT_URL=""; RESULT_GET_URL=""; CONTROL_URL=""
+            KEY_URL=""; DOCKER_AUTH_URL=""; RESULT_URL=""; RESULT_GET_URL=""; CONTROL_URL=""
           fi
           SOURCE_URL=$(aws s3 presign "s3://$ARTIFACT_BUCKET/$PREFIX/carry-source.tar.gz" --expires-in 3600)
           rm -f "$RUNNER_TEMP/artifact-session.env"
-          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN OPENAI_API_KEY
-          for url in "$SOURCE_URL" "$KEY_URL" "$RESULT_URL" "$RESULT_GET_URL" "$CONTROL_URL"; do [[ -z "$url" ]] || echo "::add-mask::$url"; done
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN OPENAI_API_KEY DOCKERHUB_USERNAME DOCKERHUB_TOKEN
+          for url in "$SOURCE_URL" "$KEY_URL" "$DOCKER_AUTH_URL" "$RESULT_URL" "$RESULT_GET_URL" "$CONTROL_URL"; do [[ -z "$url" ]] || echo "::add-mask::$url"; done
           {
             echo "run_id=$RUN_ID"; echo "prefix=$PREFIX"; echo "source_url=$SOURCE_URL"
-            echo "key_url=$KEY_URL"; echo "result_url=$RESULT_URL"; echo "result_get_url=$RESULT_GET_URL"
+            echo "key_url=$KEY_URL"; echo "docker_auth_url=$DOCKER_AUTH_URL"
+            echo "result_url=$RESULT_URL"; echo "result_get_url=$RESULT_GET_URL"
             echo "control_url=$CONTROL_URL"
           } >> "$GITHUB_OUTPUT"
 
@@ -208,16 +221,19 @@ jobs:
           SOURCE_SHA256: ${{ steps.source.outputs.source_sha256 }}
           SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
           KEY_URL: ${{ steps.stage.outputs.key_url }}
+          DOCKER_AUTH_URL: ${{ steps.stage.outputs.docker_auth_url }}
           RESULT_URL: ${{ steps.stage.outputs.result_url }}
           CONTROL_URL: ${{ steps.stage.outputs.control_url }}
         run: |
           set -euo pipefail
           encode() { printf '%s' "$1" | base64 -w0; }
-          SOURCE_URL_B64=$(encode "$SOURCE_URL"); KEY_URL_B64=$(encode "$KEY_URL"); RESULT_URL_B64=$(encode "$RESULT_URL"); CONTROL_URL_B64=$(encode "$CONTROL_URL")
+          SOURCE_URL_B64=$(encode "$SOURCE_URL"); KEY_URL_B64=$(encode "$KEY_URL"); DOCKER_AUTH_URL_B64=$(encode "$DOCKER_AUTH_URL")
+          RESULT_URL_B64=$(encode "$RESULT_URL"); CONTROL_URL_B64=$(encode "$CONTROL_URL")
           {
             printf '#!/usr/bin/env bash\n'
             printf 'SOURCE_URL_B64=%q\n' "$SOURCE_URL_B64"
             printf 'KEY_URL_B64=%q\n' "$KEY_URL_B64"
+            printf 'DOCKER_AUTH_URL_B64=%q\n' "$DOCKER_AUTH_URL_B64"
             printf 'RESULT_URL_B64=%q\n' "$RESULT_URL_B64"
             printf 'CONTROL_URL_B64=%q\n' "$CONTROL_URL_B64"
             printf 'SOURCE_SHA256=%q\n' "$SOURCE_SHA256"
