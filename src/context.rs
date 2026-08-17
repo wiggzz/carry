@@ -237,7 +237,7 @@ impl ContextState {
                         input.push(json!({
                             "role": "assistant",
                             "content": [{
-                                "type": "input_text",
+                                "type": "output_text",
                                 "text": format!("[memory]\n{}", memory.content)
                             }]
                         }));
@@ -654,7 +654,9 @@ mod tests {
                 .any(|item| item["type"] == "function_call_output")
         );
         assert!(rendered.iter().any(|item| {
-            item["role"] == "assistant" && item["content"][0]["text"] == "[memory]\ndurable outcome"
+            item["role"] == "assistant"
+                && item["content"][0]["type"] == "output_text"
+                && item["content"][0]["text"] == "[memory]\ndurable outcome"
         }));
         assert!(
             rendered
