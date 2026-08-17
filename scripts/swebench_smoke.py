@@ -327,6 +327,9 @@ def run_official_evaluation(*, predictions: pathlib.Path, canonical_dataset: pat
         "--run_id", run_id, "--report_dir", str(output),
         "--max_workers", os.environ.get("EVALUATOR_CONCURRENCY", "5"),
         "--timeout", os.environ.get("EVALUATOR_TIMEOUT_SECONDS", "300"),
+        # Every method grades the same frozen task set on one disposable worker.
+        # Keep per-instance images so later methods reuse the first method's build.
+        "--cache_level", "instance",
         "--instance_ids", *instance_ids,
     ]
     try:

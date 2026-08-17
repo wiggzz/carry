@@ -505,6 +505,7 @@ class SmokeWorkerTests(unittest.TestCase):
             command = captured["command"]
             self.assertIn("swebench.harness.run_evaluation", command)
             self.assertIn(str(canonical), command)
+            self.assertEqual(command[command.index("--cache_level") + 1], "instance")
             self.assertNotIn("--dataset_revision", command)
             self.assertNotIn("OPENAI_API_KEY", captured["kwargs"]["env"])
             self.assertNotIn("OPENAI_MODEL", captured["kwargs"]["env"])
