@@ -9,6 +9,7 @@ use crate::protocol::ContextManagement;
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 const CACHE_READ_RATE: f64 = 0.10;
 const CACHE_WRITE_RATE: f64 = 1.25;
+pub(crate) const MIN_CACHE_TOKENS: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -159,14 +160,31 @@ pub(crate) struct ContextState {
     items: Vec<ContextItem>,
     next_id: u64,
     generation: u64,
+    breakpoints: Vec<StoredBreakpoint>,
+}
+
+#[derive(Clone, Debug)]
+struct StoredBreakpoint {
+    generation: u64,
+    item_ids: Vec<u64>,
+    marker_frontiers: Vec<u64>,
+    rendered_prefix: Vec<Value>,
 }
 
 impl ContextState {
     pub fn new(initial_prompt: String) -> Self {
+        let items = vec![ContextItem::user(1, initial_prompt)];
+        let rendered_prefix = Self::render_items(&items, &[1]);
         Self {
-            items: vec![ContextItem::user(1, initial_prompt)],
+            items,
             next_id: 1,
             generation: 0,
+            breakpoints: vec![StoredBreakpoint {
+                generation: 0,
+                item_ids: vec![1],
+                marker_frontiers: vec![1],
+                rendered_prefix,
+            }],
         }
     }
 
@@ -193,18 +211,14 @@ impl ContextState {
     }
 
     pub fn input_items(&self) -> Vec<Value> {
-        Self::render_items(&self.items)
+        self.render_with_compatible_breakpoints(&self.items)
     }
 
-    fn render_items(items: &[ContextItem]) -> Vec<Value> {
-        let frontier = items
-            .iter()
-            .take_while(|item| item.retention == Retention::Stable)
-            .count();
+    fn render_items(items: &[ContextItem], breakpoint_frontiers: &[u64]) -> Vec<Value> {
         let present = items.iter().map(|item| item.id).collect::<HashSet<_>>();
         let mut input = Vec::new();
-        for (index, item) in items.iter().enumerate() {
-            let checkpoint = frontier > 0 && index + 1 == frontier;
+        for item in items {
+            let checkpoint = breakpoint_frontiers.contains(&item.id);
             match item.kind {
                 ContextItemKind::User => {
                     input.extend(item.input_items.iter().cloned());
@@ -251,6 +265,21 @@ impl ContextState {
         input
     }
 
+    fn compatible_breakpoint_frontiers(&self, items: &[ContextItem]) -> Vec<u64> {
+        self.breakpoints
+            .iter()
+            .filter(|breakpoint| {
+                Self::render_items(items, &breakpoint.marker_frontiers)
+                    .starts_with(&breakpoint.rendered_prefix)
+            })
+            .filter_map(|breakpoint| breakpoint.item_ids.last().copied())
+            .collect()
+    }
+
+    fn render_with_compatible_breakpoints(&self, items: &[ContextItem]) -> Vec<Value> {
+        Self::render_items(items, &self.compatible_breakpoint_frontiers(items))
+    }
+
     pub fn snapshot(&self) -> Vec<&ContextItem> {
         self.items.iter().collect()
     }
@@ -274,7 +303,19 @@ impl ContextState {
     }
 
     pub fn estimated_tokens(&self) -> usize {
-        estimated_tokens(&Self::render_items(&self.items))
+        estimated_tokens(&self.input_items())
+    }
+
+    pub fn rendered_breakpoints(&self) -> Vec<RenderedBreakpoint> {
+        let rendered = self.input_items();
+        self.breakpoints
+            .iter()
+            .filter(|breakpoint| rendered.starts_with(&breakpoint.rendered_prefix))
+            .map(|breakpoint| RenderedBreakpoint {
+                generation: breakpoint.generation,
+                prefix_tokens: estimated_tokens(&breakpoint.rendered_prefix),
+            })
+            .collect()
     }
 
     pub fn record_signals(&mut self, update: &ContextManagement, source_id: u64) -> SignalChange {
@@ -329,17 +370,7 @@ impl ContextState {
         policy: CompactionPolicy,
     ) -> Option<CompactionPlan> {
         let protected = protected.iter().copied().collect::<HashSet<_>>();
-        let minor_drops = self
-            .items
-            .iter()
-            .filter(|item| {
-                item.retention == Retention::Volatile
-                    && item.signal != RetentionSignal::Keep
-                    && !protected.contains(&item.id)
-            })
-            .map(|item| item.id)
-            .collect::<Vec<_>>();
-        let major_drops = self
+        let removable = self
             .items
             .iter()
             .filter(|item| {
@@ -352,15 +383,34 @@ impl ContextState {
             .collect::<Vec<_>>();
 
         let mut candidates = Vec::new();
-        if !minor_drops.is_empty() {
-            candidates.push(self.compaction_candidate(CompactionKind::Minor, minor_drops, policy));
+        if !removable.is_empty() {
+            candidates.push(self.compaction_candidate(removable.clone(), None, &policy));
         }
-        if major_drops.iter().any(|id| {
-            self.items
+        for priced in &policy.breakpoints {
+            let Some(stored) = self
+                .breakpoints
                 .iter()
-                .any(|item| item.id == *id && item.retention == Retention::Stable)
-        }) {
-            candidates.push(self.compaction_candidate(CompactionKind::Major, major_drops, policy));
+                .find(|breakpoint| breakpoint.generation == priced.generation)
+            else {
+                continue;
+            };
+            if priced.cached_tokens < MIN_CACHE_TOKENS
+                || estimated_tokens(&stored.rendered_prefix) < MIN_CACHE_TOKENS
+            {
+                continue;
+            }
+            let dropped = removable
+                .iter()
+                .copied()
+                .filter(|id| !stored.item_ids.contains(id))
+                .collect::<Vec<_>>();
+            if dropped.is_empty() {
+                continue;
+            }
+            let candidate = self.compaction_candidate(dropped, Some(priced), &policy);
+            if candidate.reused_generation == Some(priced.generation) {
+                candidates.push(candidate);
+            }
         }
 
         candidates
@@ -374,9 +424,9 @@ impl ContextState {
 
     fn compaction_candidate(
         &self,
-        kind: CompactionKind,
         dropped: Vec<u64>,
-        policy: CompactionPolicy,
+        reused: Option<&PricedBreakpoint>,
+        policy: &CompactionPolicy,
     ) -> CompactionPlan {
         let dropped_set = dropped.iter().copied().collect::<HashSet<_>>();
         let current_tokens = self.estimated_tokens();
@@ -389,35 +439,66 @@ impl ContextState {
         for item in &mut retained {
             item.retention = Retention::Stable;
         }
-        let retained_tokens = estimated_tokens(&Self::render_items(&retained));
+        let retained_rendered = self.render_with_compatible_breakpoints(&retained);
+        let retained_tokens = estimated_tokens(&retained_rendered);
         let dropped_tokens = current_tokens.saturating_sub(retained_tokens);
-        let frontier_tokens = estimated_tokens(&Self::render_items(
-            &self.items[..self.stable_frontier_len()],
-        ))
-        .min(retained_tokens);
-        let rewrite_tokens = if kind == CompactionKind::Minor && policy.stable_cache_alive {
-            retained_tokens.saturating_sub(frontier_tokens)
-        } else {
-            retained_tokens
-        };
-        let baseline_first_rate = if policy.implicit_cache_alive {
-            CACHE_READ_RATE
-        } else {
-            CACHE_WRITE_RATE
-        };
-        let baseline = current_tokens as f64 * baseline_first_rate;
-        let candidate_first = if kind == CompactionKind::Minor && policy.stable_cache_alive {
-            frontier_tokens as f64 * CACHE_READ_RATE + rewrite_tokens as f64 * CACHE_WRITE_RATE
-        } else {
-            retained_tokens as f64 * CACHE_WRITE_RATE
-        };
+        let reused_generation = reused.and_then(|priced| {
+            let stored = self
+                .breakpoints
+                .iter()
+                .find(|breakpoint| breakpoint.generation == priced.generation)?;
+            retained_rendered
+                .starts_with(&stored.rendered_prefix)
+                .then_some(priced.generation)
+        });
+        let reused_tokens = reused
+            .filter(|priced| reused_generation == Some(priced.generation))
+            .and_then(|priced| {
+                let prefix_tokens = self
+                    .breakpoints
+                    .iter()
+                    .find(|stored| stored.generation == priced.generation)
+                    .map(|stored| estimated_tokens(&stored.rendered_prefix))?;
+                Some(priced.cached_tokens.min(prefix_tokens).min(retained_tokens))
+            })
+            .unwrap_or_default();
+        let rewrite_tokens = retained_tokens.saturating_sub(reused_tokens);
+        let implicit_cached_tokens = policy.implicit_cached_tokens.min(current_tokens);
+        let baseline = implicit_cached_tokens as f64 * CACHE_READ_RATE
+            + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE;
+        let candidate_first =
+            reused_tokens as f64 * CACHE_READ_RATE + rewrite_tokens as f64 * CACHE_WRITE_RATE;
+        let invalidated_generations = policy
+            .breakpoints
+            .iter()
+            .filter(|priced| {
+                self.breakpoints
+                    .iter()
+                    .find(|stored| stored.generation == priced.generation)
+                    .is_none_or(|stored| !retained_rendered.starts_with(&stored.rendered_prefix))
+            })
+            .map(|priced| priced.generation)
+            .collect::<Vec<_>>();
+        let invalidated_cache_tokens = policy
+            .breakpoints
+            .iter()
+            .filter(|priced| invalidated_generations.contains(&priced.generation))
+            .map(|priced| priced.cached_tokens)
+            .sum();
 
         CompactionPlan {
-            kind,
             dropped,
             dropped_tokens,
             retained_tokens,
             rewrite_tokens,
+            reused_generation,
+            considered_generations: policy
+                .breakpoints
+                .iter()
+                .map(|breakpoint| breakpoint.generation)
+                .collect(),
+            invalidated_generations,
+            invalidated_cache_tokens,
             estimated_savings_input_units: baseline - candidate_first,
         }
     }
@@ -437,13 +518,28 @@ impl ContextState {
             }
         }
         self.generation = self.generation.saturating_add(1);
+        let item_ids = self.items.iter().map(|item| item.id).collect::<Vec<_>>();
+        let mut frontiers = self.compatible_breakpoint_frontiers(&self.items);
+        if let Some(frontier) = item_ids.last().copied() {
+            frontiers.push(frontier);
+        }
+        let rendered_prefix = Self::render_items(&self.items, &frontiers);
+        self.breakpoints.push(StoredBreakpoint {
+            generation: self.generation,
+            item_ids,
+            marker_frontiers: frontiers,
+            rendered_prefix,
+        });
 
         ContextChange {
-            kind: plan.kind,
             dropped: plan.dropped,
             dropped_tokens: plan.dropped_tokens,
             retained_tokens: plan.retained_tokens,
             rewrite_tokens: plan.rewrite_tokens,
+            reused_generation: plan.reused_generation,
+            considered_generations: plan.considered_generations,
+            invalidated_generations: plan.invalidated_generations,
+            invalidated_cache_tokens: plan.invalidated_cache_tokens,
             estimated_savings_input_units: plan.estimated_savings_input_units,
             generation: self.generation,
             stable_frontier: self.stable_frontier_id(),
@@ -487,35 +583,34 @@ fn estimated_tokens(items: &[Value]) -> usize {
     serialized_bytes(items).div_ceil(ESTIMATED_BYTES_PER_TOKEN)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CompactionPolicy {
-    pub implicit_cache_alive: bool,
-    pub stable_cache_alive: bool,
+    pub implicit_cached_tokens: usize,
+    pub breakpoints: Vec<PricedBreakpoint>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CompactionKind {
-    Minor,
-    Major,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PricedBreakpoint {
+    pub generation: u64,
+    pub cached_tokens: usize,
 }
 
-impl CompactionKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Minor => "minor",
-            Self::Major => "major",
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RenderedBreakpoint {
+    pub generation: u64,
+    pub prefix_tokens: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct CompactionPlan {
-    pub kind: CompactionKind,
     pub dropped: Vec<u64>,
     pub dropped_tokens: usize,
     pub retained_tokens: usize,
     pub rewrite_tokens: usize,
+    pub reused_generation: Option<u64>,
+    pub considered_generations: Vec<u64>,
+    pub invalidated_generations: Vec<u64>,
+    pub invalidated_cache_tokens: usize,
     pub estimated_savings_input_units: f64,
 }
 
@@ -529,11 +624,14 @@ pub(crate) struct SignalChange {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ContextChange {
-    pub kind: CompactionKind,
     pub dropped: Vec<u64>,
     pub dropped_tokens: usize,
     pub retained_tokens: usize,
     pub rewrite_tokens: usize,
+    pub reused_generation: Option<u64>,
+    pub considered_generations: Vec<u64>,
+    pub invalidated_generations: Vec<u64>,
+    pub invalidated_cache_tokens: usize,
     pub estimated_savings_input_units: f64,
     pub generation: u64,
     pub stable_frontier: Option<u64>,
@@ -645,8 +743,8 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
-                    implicit_cache_alive: false,
-                    stable_cache_alive: false,
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
                 },
             )
             .unwrap();
@@ -681,8 +779,8 @@ mod tests {
                 .plan_compaction(
                     &[],
                     CompactionPolicy {
-                        implicit_cache_alive: false,
-                        stable_cache_alive: false,
+                        implicit_cached_tokens: 0,
+                        breakpoints: Vec::new(),
                     },
                 )
                 .is_none()
@@ -702,8 +800,8 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
-                    implicit_cache_alive: false,
-                    stable_cache_alive: false,
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
                 },
             )
             .unwrap();
@@ -759,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn warm_minor_compaction_requires_savings_on_the_next_request() {
+    fn warm_compaction_requires_savings_on_the_next_request() {
         let mut state = ContextState::new("initial".into());
         let dropped = add_tool(&mut state);
         let retained = add_tool(&mut state);
@@ -769,8 +867,8 @@ mod tests {
         let short = state.plan_compaction(
             &[],
             CompactionPolicy {
-                implicit_cache_alive: true,
-                stable_cache_alive: true,
+                implicit_cached_tokens: usize::MAX,
+                breakpoints: Vec::new(),
             },
         );
         assert!(short.is_none());
@@ -780,12 +878,38 @@ mod tests {
                 .plan_compaction(
                     &[],
                     CompactionPolicy {
-                        implicit_cache_alive: true,
-                        stable_cache_alive: true,
+                        implicit_cached_tokens: usize::MAX,
+                        breakpoints: Vec::new(),
                     },
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn planner_selects_a_written_compatible_breakpoint_generation() {
+        let mut state = ContextState::new("initial ".repeat(800));
+        let dropped = add_tool(&mut state);
+        let retained = add_tool(&mut state);
+        state.record_signals(&update(&[], &[dropped], &[]), retained);
+        state.record_signals(&update(&[retained], &[], &[]), retained);
+
+        let plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: vec![PricedBreakpoint {
+                        generation: 0,
+                        cached_tokens: 1_200,
+                    }],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(plan.reused_generation, Some(0));
+        assert_eq!(plan.dropped, vec![dropped]);
+        assert!(plan.rewrite_tokens < plan.retained_tokens);
     }
 
     #[test]
@@ -797,12 +921,11 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
-                    implicit_cache_alive: false,
-                    stable_cache_alive: false,
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
                 },
             )
             .unwrap();
-        assert_eq!(plan.kind, CompactionKind::Minor);
         assert_eq!(plan.dropped, vec![disposable]);
 
         state.record_signals(&update(&[disposable], &[], &[]), disposable);
@@ -811,8 +934,8 @@ mod tests {
                 .plan_compaction(
                     &[],
                     CompactionPolicy {
-                        implicit_cache_alive: false,
-                        stable_cache_alive: false,
+                        implicit_cached_tokens: 0,
+                        breakpoints: Vec::new(),
                     },
                 )
                 .is_none()
@@ -830,14 +953,13 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
-                    implicit_cache_alive: false,
-                    stable_cache_alive: false,
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
                 },
             )
             .unwrap();
         let change = state.compact(plan);
 
-        assert_eq!(change.kind, CompactionKind::Minor);
         assert_eq!(change.dropped, vec![dropped]);
         assert!(
             state
@@ -849,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn major_compaction_can_remove_stable_drop_candidates() {
+    fn compaction_can_remove_stable_drop_candidates() {
         let mut state = ContextState::new("initial".into());
         let old_tool = add_tool(&mut state);
         state.force_stable_for_test();
@@ -860,13 +982,93 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
-                    implicit_cache_alive: false,
-                    stable_cache_alive: false,
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
                 },
             )
             .unwrap();
 
-        assert_eq!(plan.kind, CompactionKind::Major);
         assert_eq!(plan.dropped, vec![old_tool, new_tool]);
+    }
+
+    #[test]
+    fn later_generations_preserve_exact_compatible_older_breakpoints() {
+        let mut state = ContextState::new("initial ".repeat(800));
+        let first = state.input_items();
+        let disposable = add_tool(&mut state);
+        let retained = add_tool(&mut state);
+        state.record_signals(&update(&[], &[disposable], &[]), retained);
+        state.record_signals(&update(&[retained], &[], &[]), retained);
+        let plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                },
+            )
+            .unwrap();
+        state.compact(plan);
+
+        let later = state.input_items();
+        assert_eq!(&later[..first.len()], first.as_slice());
+        assert_eq!(
+            later
+                .iter()
+                .filter(|item| item["content"][0].get("prompt_cache_breakpoint").is_some())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn new_generation_does_not_embed_an_incompatible_older_breakpoint() {
+        let mut state = ContextState::new("initial ".repeat(800));
+        let disposable = add_tool(&mut state);
+        let first_retained = add_tool(&mut state);
+        state.record_signals(
+            &update(&[first_retained], &[disposable], &[]),
+            first_retained,
+        );
+        let first_plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                },
+            )
+            .unwrap();
+        state.compact(first_plan);
+
+        let latest = add_tool(&mut state);
+        state.record_signals(&update(&[latest], &[1], &[]), latest);
+        let second_plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                },
+            )
+            .unwrap();
+        state.compact(second_plan);
+
+        assert_eq!(
+            state
+                .input_items()
+                .iter()
+                .filter(|item| item["content"][0].get("prompt_cache_breakpoint").is_some())
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .rendered_breakpoints()
+                .iter()
+                .map(|breakpoint| breakpoint.generation)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
     time::Instant,
@@ -11,7 +11,9 @@ use serde_json::json;
 use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc, time::Duration};
 
 use crate::{
-    context::{CompactionKind, CompactionPolicy, ContextState},
+    context::{
+        CompactionPolicy, ContextState, MIN_CACHE_TOKENS, PricedBreakpoint, RenderedBreakpoint,
+    },
     log::RunLogger,
     openai::{ModelReply, OpenAiClient, Usage},
     protocol::{ActionKind, Step},
@@ -97,8 +99,7 @@ struct RunMetrics {
     usage: Usage,
     model_latency_ms: u64,
     response_retries: usize,
-    minor_compactions: usize,
-    major_compactions: usize,
+    compactions: usize,
 }
 
 impl RunMetrics {
@@ -122,55 +123,149 @@ impl RunMetrics {
         self.response_retries = self.response_retries.saturating_add(response_retries);
     }
 
-    fn record_compaction(&mut self, kind: CompactionKind) {
-        match kind {
-            CompactionKind::Minor => {
-                self.minor_compactions = self.minor_compactions.saturating_add(1)
-            }
-            CompactionKind::Major => {
-                self.major_compactions = self.major_compactions.saturating_add(1)
-            }
-        }
+    fn record_compaction(&mut self) {
+        self.compactions = self.compactions.saturating_add(1);
     }
+}
+
+#[derive(Debug, Default)]
+struct CacheTracker {
+    implicit_activity: Option<Instant>,
+    implicit_cached_tokens: usize,
+    implicit_prefix: Vec<serde_json::Value>,
+    breakpoints: HashMap<u64, TrackedBreakpoint>,
+    pending: Vec<RenderedBreakpoint>,
+    pending_request_tokens: usize,
+    pending_history: Vec<serde_json::Value>,
 }
 
 #[derive(Debug)]
-struct CacheTracker {
-    implicit_activity: Option<Instant>,
-    stable_checkpoint_activity: Option<Instant>,
-    checkpoint_pending: bool,
-}
-
-impl Default for CacheTracker {
-    fn default() -> Self {
-        Self {
-            implicit_activity: None,
-            stable_checkpoint_activity: None,
-            checkpoint_pending: true,
-        }
-    }
+struct TrackedBreakpoint {
+    prefix_tokens: usize,
+    cached_tokens: usize,
+    activity: Option<Instant>,
 }
 
 impl CacheTracker {
+    #[cfg(test)]
+    fn begin_request(&mut self, breakpoints: Vec<RenderedBreakpoint>) {
+        self.begin_request_with_tokens(breakpoints, 0);
+    }
+
+    #[cfg(test)]
+    fn begin_request_with_tokens(
+        &mut self,
+        breakpoints: Vec<RenderedBreakpoint>,
+        request_tokens: usize,
+    ) {
+        self.begin_request_with_history(breakpoints, &[], request_tokens);
+    }
+
+    fn begin_request_with_history(
+        &mut self,
+        breakpoints: Vec<RenderedBreakpoint>,
+        history: &[serde_json::Value],
+        request_tokens: usize,
+    ) {
+        for breakpoint in &breakpoints {
+            self.breakpoints
+                .entry(breakpoint.generation)
+                .and_modify(|tracked| tracked.prefix_tokens = breakpoint.prefix_tokens)
+                .or_insert(TrackedBreakpoint {
+                    prefix_tokens: breakpoint.prefix_tokens,
+                    cached_tokens: 0,
+                    activity: None,
+                });
+        }
+        self.pending = breakpoints;
+        self.pending_request_tokens = request_tokens;
+        self.pending_history = history.to_vec();
+    }
+
     fn observe(&mut self, usage: &Usage) {
         let now = Instant::now();
         let cache_activity = usage.cached_input_tokens > 0 || usage.cache_write_input_tokens > 0;
         if cache_activity {
             self.implicit_activity = Some(now);
+            self.implicit_cached_tokens = self.pending_request_tokens;
+            self.implicit_prefix.clone_from(&self.pending_history);
         }
-        if self.checkpoint_pending {
-            self.stable_checkpoint_activity = cache_activity.then_some(now);
-            self.checkpoint_pending = false;
-        } else if usage.cached_input_tokens > 0 {
-            self.stable_checkpoint_activity = Some(now);
+        let readable = self
+            .pending
+            .iter()
+            .rev()
+            .take(50)
+            .filter(|breakpoint| breakpoint.prefix_tokens <= usage.cached_input_tokens as usize)
+            .filter(|breakpoint| {
+                self.breakpoints
+                    .get(&breakpoint.generation)
+                    .is_some_and(|tracked| cache_alive(tracked.activity, now))
+            })
+            .max_by_key(|breakpoint| breakpoint.prefix_tokens)
+            .map(|breakpoint| breakpoint.generation);
+        if let Some(generation) = readable
+            && let Some(tracked) = self.breakpoints.get_mut(&generation)
+        {
+            tracked.activity = Some(now);
         }
+
+        if usage.cache_write_input_tokens > 0 {
+            for breakpoint in self
+                .pending
+                .iter()
+                .filter(|breakpoint| breakpoint.prefix_tokens >= MIN_CACHE_TOKENS)
+                .rev()
+                .take(3)
+            {
+                let tracked = self
+                    .breakpoints
+                    .get_mut(&breakpoint.generation)
+                    .expect("pending breakpoints are tracked");
+                tracked.cached_tokens = breakpoint.prefix_tokens;
+                tracked.activity = Some(now);
+            }
+        }
+        self.pending.clear();
+        self.pending_request_tokens = 0;
+        self.pending_history.clear();
     }
 
+    #[cfg(test)]
     fn policy(&self) -> CompactionPolicy {
+        self.policy_with_implicit_compatibility(true)
+    }
+
+    fn policy_for_history(&self, history: &[serde_json::Value]) -> CompactionPolicy {
+        self.policy_with_implicit_compatibility(history.starts_with(&self.implicit_prefix))
+    }
+
+    fn policy_with_implicit_compatibility(
+        &self,
+        implicit_prefix_compatible: bool,
+    ) -> CompactionPolicy {
         let now = Instant::now();
+        let mut breakpoints = self
+            .breakpoints
+            .iter()
+            .filter(|(_, tracked)| cache_alive(tracked.activity, now))
+            .map(|(generation, tracked)| PricedBreakpoint {
+                generation: *generation,
+                cached_tokens: tracked.cached_tokens,
+            })
+            .collect::<Vec<_>>();
+        breakpoints.sort_by_key(|breakpoint| breakpoint.generation);
+        if breakpoints.len() > 50 {
+            breakpoints.drain(..breakpoints.len() - 50);
+        }
         CompactionPolicy {
-            implicit_cache_alive: cache_alive(self.implicit_activity, now),
-            stable_cache_alive: cache_alive(self.stable_checkpoint_activity, now),
+            implicit_cached_tokens: if implicit_prefix_compatible
+                && cache_alive(self.implicit_activity, now)
+            {
+                self.implicit_cached_tokens
+            } else {
+                0
+            },
+            breakpoints,
         }
     }
 
@@ -179,9 +274,13 @@ impl CacheTracker {
             .is_some_and(|activity| activity.elapsed() >= CACHE_TTL)
     }
 
-    fn mark_compaction(&mut self) {
+    fn mark_compaction(&mut self, invalidated_generations: &[u64]) {
         self.implicit_activity = None;
-        self.checkpoint_pending = true;
+        self.implicit_cached_tokens = 0;
+        self.implicit_prefix.clear();
+        for generation in invalidated_generations {
+            self.breakpoints.remove(generation);
+        }
     }
 }
 
@@ -325,6 +424,11 @@ async fn run_loop(
         step_index += 1;
         turn_step += 1;
         let history = context_state.input_items();
+        cache.begin_request_with_history(
+            context_state.rendered_breakpoints(),
+            &history,
+            context_state.estimated_tokens(),
+        );
         protected_until_request.clear();
         let request = backend.request_body(&history);
         logger.raw_event_silent(
@@ -508,22 +612,25 @@ fn maybe_compact(
     logger: &mut RunLogger,
     trigger: &str,
 ) -> Result<bool> {
-    let Some(plan) = state.plan_compaction(protected, cache.policy()) else {
+    let policy = cache.policy_for_history(&state.input_items());
+    let Some(plan) = state.plan_compaction(protected, policy) else {
         return Ok(false);
     };
     let change = state.compact(plan);
-    cache.mark_compaction();
-    metrics.record_compaction(change.kind);
+    cache.mark_compaction(&change.invalidated_generations);
+    metrics.record_compaction();
     logger.raw_event(
         "context_compacted",
         json!({"trigger": trigger, "compaction": &change}),
         &format!(
-            "  compact {} · -{} items / ~{} tok · {} retained · {} rewritten · next request saves ~{} input-equivalent tok",
-            change.kind.label(),
+            "  compact · -{} items / ~{} tok · {} retained · {} rewritten · reuse {} · invalidate {} generations / {} cached tok · next request saves ~{} input-equivalent tok",
             change.dropped.len(),
             compact_number(change.dropped_tokens as u64),
             compact_number(change.retained_tokens as u64),
             compact_number(change.rewrite_tokens as u64),
+            change.reused_generation.map_or_else(|| "cold".to_owned(), |generation| generation.to_string()),
+            change.invalidated_generations.len(),
+            compact_number(change.invalidated_cache_tokens as u64),
             compact_number(change.estimated_savings_input_units.round().max(0.0) as u64),
         ),
     )?;
@@ -854,10 +961,7 @@ async fn write_final_artifacts(
         "usage": &metrics.usage,
         "model_latency_ms": metrics.model_latency_ms,
         "response_retries": metrics.response_retries,
-        "compactions": {
-            "minor": metrics.minor_compactions,
-            "major": metrics.major_compactions
-        },
+        "compactions": metrics.compactions,
         "elapsed_ms": elapsed_ms
     });
     tokio::fs::write(
@@ -1013,18 +1117,187 @@ mod tests {
     }
 
     #[test]
-    fn cached_reads_refresh_the_stable_checkpoint_ttl() {
-        let mut cache = CacheTracker {
-            implicit_activity: None,
-            stable_checkpoint_activity: Some(Instant::now() - CACHE_TTL),
-            checkpoint_pending: false,
-        };
+    fn policy_prices_the_exact_previous_implicit_prefix() {
+        let mut cache = CacheTracker::default();
+        cache.begin_request_with_tokens(Vec::new(), 2_400);
         cache.observe(&Usage {
-            cached_input_tokens: 10,
+            cache_write_input_tokens: 2_400,
             ..Usage::default()
         });
 
-        assert!(cache.policy().stable_cache_alive);
+        assert_eq!(cache.policy().implicit_cached_tokens, 2_400);
+    }
+
+    #[test]
+    fn policy_rejects_a_mutated_previous_implicit_prefix() {
+        let mut cache = CacheTracker::default();
+        let original = vec![json!({"role": "user", "content": "original"})];
+        cache.begin_request_with_history(Vec::new(), &original, 2_400);
+        cache.observe(&Usage {
+            cache_write_input_tokens: 2_400,
+            ..Usage::default()
+        });
+
+        let extended = vec![
+            json!({"role": "user", "content": "original"}),
+            json!({"type": "function_call_output", "output": "new"}),
+        ];
+        assert_eq!(
+            cache.policy_for_history(&extended).implicit_cached_tokens,
+            2_400
+        );
+        let mutated = vec![json!({"role": "user", "content": "changed"})];
+        assert_eq!(cache.policy_for_history(&mutated).implicit_cached_tokens, 0);
+    }
+
+    #[test]
+    fn eligible_explicit_breakpoint_writes_are_tracked_by_generation() {
+        let mut cache = CacheTracker::default();
+        cache.begin_request(vec![
+            RenderedBreakpoint {
+                generation: 0,
+                prefix_tokens: 1_023,
+            },
+            RenderedBreakpoint {
+                generation: 1,
+                prefix_tokens: 1_200,
+            },
+            RenderedBreakpoint {
+                generation: 2,
+                prefix_tokens: 1_400,
+            },
+        ]);
+        cache.observe(&Usage {
+            cache_write_input_tokens: 7_200,
+            ..Usage::default()
+        });
+
+        let mut priced = cache.policy().breakpoints;
+        priced.sort_by_key(|breakpoint| breakpoint.generation);
+        assert_eq!(
+            priced,
+            vec![
+                PricedBreakpoint {
+                    generation: 1,
+                    cached_tokens: 1_200,
+                },
+                PricedBreakpoint {
+                    generation: 2,
+                    cached_tokens: 1_400,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn one_explicit_write_is_not_divided_with_the_implicit_slot() {
+        let mut cache = CacheTracker::default();
+        cache.begin_request(vec![RenderedBreakpoint {
+            generation: 1,
+            prefix_tokens: 1_200,
+        }]);
+        cache.observe(&Usage {
+            cache_write_input_tokens: 1_200,
+            ..Usage::default()
+        });
+
+        assert_eq!(
+            cache.policy().breakpoints,
+            vec![PricedBreakpoint {
+                generation: 1,
+                cached_tokens: 1_200,
+            }]
+        );
+    }
+
+    #[test]
+    fn implicit_slot_limits_explicit_writes_to_latest_three_generations() {
+        let mut cache = CacheTracker::default();
+        cache.begin_request(
+            (0..4)
+                .map(|generation| RenderedBreakpoint {
+                    generation,
+                    prefix_tokens: 1_100,
+                })
+                .collect(),
+        );
+        cache.observe(&Usage {
+            cache_write_input_tokens: 8_000,
+            ..Usage::default()
+        });
+
+        let mut generations = cache
+            .policy()
+            .breakpoints
+            .iter()
+            .map(|breakpoint| breakpoint.generation)
+            .collect::<Vec<_>>();
+        generations.sort_unstable();
+        assert_eq!(generations, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn planner_prices_only_the_latest_fifty_readable_breakpoints() {
+        let now = Instant::now();
+        let cache = CacheTracker {
+            implicit_activity: Some(now),
+            implicit_cached_tokens: 1_500,
+            implicit_prefix: Vec::new(),
+            breakpoints: (0..51)
+                .map(|generation| {
+                    (
+                        generation,
+                        TrackedBreakpoint {
+                            prefix_tokens: 1_200,
+                            cached_tokens: 1_100,
+                            activity: Some(now),
+                        },
+                    )
+                })
+                .collect(),
+            pending: Vec::new(),
+            pending_request_tokens: 0,
+            pending_history: Vec::new(),
+        };
+
+        let mut generations = cache
+            .policy()
+            .breakpoints
+            .iter()
+            .map(|breakpoint| breakpoint.generation)
+            .collect::<Vec<_>>();
+        generations.sort_unstable();
+        assert_eq!(generations, (1..51).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn aggregate_reads_do_not_resurrect_an_expired_generation() {
+        let mut cache = CacheTracker {
+            implicit_activity: None,
+            implicit_cached_tokens: 0,
+            implicit_prefix: Vec::new(),
+            breakpoints: HashMap::from([(
+                7,
+                TrackedBreakpoint {
+                    prefix_tokens: 1_200,
+                    cached_tokens: 1_100,
+                    activity: Some(Instant::now() - CACHE_TTL),
+                },
+            )]),
+            pending: Vec::new(),
+            pending_request_tokens: 0,
+            pending_history: Vec::new(),
+        };
+        cache.begin_request(vec![RenderedBreakpoint {
+            generation: 7,
+            prefix_tokens: 1_200,
+        }]);
+        cache.observe(&Usage {
+            cached_input_tokens: 2_048,
+            ..Usage::default()
+        });
+
+        assert!(cache.policy().breakpoints.is_empty());
     }
 
     #[tokio::test]
@@ -1136,8 +1409,7 @@ mod tests {
         assert_eq!(result["usage"]["output_tokens"], 0);
         assert_eq!(result["model_latency_ms"], 0);
         assert_eq!(result["response_retries"], 0);
-        assert_eq!(result["compactions"]["minor"], 0);
-        assert_eq!(result["compactions"]["major"], 0);
+        assert_eq!(result["compactions"], 0);
         assert!(result["elapsed_ms"].is_u64());
     }
 
