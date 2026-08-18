@@ -37,6 +37,38 @@ class SmokeWorkerTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 self.worker.validate_config(bad)
 
+    def test_selected_method_defaults_to_carry_and_rejects_unknown(self):
+        self.assertEqual(self.worker.selected_methods({}), ("carry",))
+        for method in ("carry", "codex", "pi"):
+            with self.subTest(method=method):
+                self.assertEqual(
+                    self.worker.selected_methods({"BENCHMARK_METHOD": method}),
+                    (method,),
+                )
+        with self.assertRaisesRegex(ValueError, "BENCHMARK_METHOD"):
+            self.worker.selected_methods({"BENCHMARK_METHOD": "all"})
+
+    def test_run_cli_forwards_the_selected_method(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            argv = [
+                "swebench_smoke.py",
+                "--run",
+                "--source",
+                str(root / "source"),
+                "--work",
+                str(root / "work"),
+                "--output",
+                str(root / "output"),
+                "--method",
+                "pi",
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                self.worker, "execute_benchmark"
+            ) as execute:
+                self.assertEqual(self.worker.main(), 0)
+            self.assertEqual(execute.call_args.kwargs["config"]["BENCHMARK_METHOD"], "pi")
+
     def test_agent_command_mounts_only_workspace_prompt_and_output_and_key_by_name(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -61,6 +93,42 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertIn("carry-agent-codex-test", rendered)
             self.assertIn("/agent-home:rw", rendered)
             self.assertIn("/tmp:rw", rendered)
+
+    def test_finalize_accepts_one_selected_method_as_the_exact_denominator(self):
+        tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
+        records = [
+            {
+                "instance_id": task["instance_id"],
+                "method": "carry",
+                "status": "evaluated",
+                "patch": "",
+            }
+            for task in tasks
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            self.worker.finalize(
+                tasks=tasks,
+                records=records,
+                output=output,
+                provenance={},
+                methods=("carry",),
+            )
+            report = json.loads((output / "report.json").read_text())
+            self.assertEqual(report["denominator"], 5)
+            self.assertEqual(set(report["methods"]), {"carry"})
+            self.assertEqual(len(json.loads((output / "records.json").read_text())), 5)
+
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(
+            ValueError, "5 unique"
+        ):
+            self.worker.finalize(
+                tasks=tasks,
+                records=records + [{**records[0], "method": "codex"}],
+                output=pathlib.Path(directory),
+                provenance={},
+                methods=("carry",),
+            )
 
     def test_finalize_preserves_failed_slots_and_writes_official_predictions(self):
         tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
@@ -257,7 +325,7 @@ class SmokeWorkerTests(unittest.TestCase):
             "evaluation-error",
         )
 
-    def test_official_execution_builds_once_runs_five_agent_shards_and_grades_150_slots(self):
+    def test_official_execution_builds_once_runs_five_agent_shards_and_grades_selected_method(self):
         frozen = [f"task-{number:02d}" for number in range(50)]
         dataset = [
             {"instance_id": instance_id, "repo": "owner/repo", "base_commit": "a" * 40,
@@ -268,14 +336,14 @@ class SmokeWorkerTests(unittest.TestCase):
         materialized_shards = []
         evaluation_shards = []
 
-        def fake_materialize(*, records, selected_ids, root, clone):
+        def fake_materialize(*, records, selected_ids, root, clone, methods):
             materialized_shards.append(list(selected_ids))
             tasks = []
             for instance_id in selected_ids:
                 task = {"instance_id": instance_id, "repo": "owner/repo", "base_commit": "a" * 40,
                         "problem_statement": f"problem {instance_id}"}
                 tasks.append(task)
-                for method in ("carry", "codex", "pi"):
+                for method in methods:
                     (root / "tasks" / instance_id / method / "repo").mkdir(parents=True)
                 (root / "tasks" / instance_id / "input").mkdir(parents=True)
             return tasks
@@ -296,7 +364,8 @@ class SmokeWorkerTests(unittest.TestCase):
             }))
 
         config = {
-            "BENCHMARK_MODE": "official-50", "RUN_ID": "official-test",
+            "BENCHMARK_MODE": "official-50", "BENCHMARK_METHOD": "carry",
+            "RUN_ID": "official-test",
             "BASE_IMAGE": "node@sha256:" + "a" * 64,
             "CARRY_BASE_IMAGE": "rust@sha256:" + "b" * 64,
             "CODEX_VERSION": "1.2.3", "PI_VERSION": "0.84.2",
@@ -315,7 +384,7 @@ class SmokeWorkerTests(unittest.TestCase):
             with mock.patch.dict(sys.modules, {"datasets": fake_datasets}), \
                     mock.patch.object(self.worker, "materialize", side_effect=fake_materialize), \
                     mock.patch.object(self.worker, "build_images", return_value={
-                        method: {"tag": f"image:{method}"} for method in ("carry", "codex", "pi")
+                        "carry": {"tag": "image:carry"}
                     }) as build, \
                     mock.patch.object(self.worker, "run_agent", side_effect=fake_agent), \
                     mock.patch.object(self.worker, "run_official_evaluation", side_effect=fake_evaluation):
@@ -330,15 +399,16 @@ class SmokeWorkerTests(unittest.TestCase):
 
             self.assertEqual(build.call_count, 1)
             self.assertEqual([len(shard) for shard in materialized_shards], [10] * 5)
-            self.assertEqual(len(evaluation_shards), 15)
+            self.assertEqual(len(evaluation_shards), 5)
             self.assertTrue(all(len(shard) == 10 for shard in evaluation_shards))
             self.assertFalse(secret.exists())
             self.assertFalse((work / "agent-shards").exists())
             report = json.loads((output / "report.json").read_text())
-            self.assertEqual((report["denominator"], report["completed"]), (150, 150))
+            self.assertEqual((report["denominator"], report["completed"]), (50, 50))
+            self.assertEqual(set(report["methods"]), {"carry"})
             self.assertEqual(report["methods"]["carry"]["response_retries"], 100)
 
-    def test_official_build_failure_still_preserves_all_150_planned_slots(self):
+    def test_official_build_failure_still_preserves_all_selected_planned_slots(self):
         frozen = [f"task-{number:02d}" for number in range(50)]
         dataset = [
             {"instance_id": instance_id, "repo": "owner/repo", "base_commit": "a" * 40,
@@ -346,7 +416,8 @@ class SmokeWorkerTests(unittest.TestCase):
             for instance_id in frozen
         ]
         config = {
-            "BENCHMARK_MODE": "official-50", "RUN_ID": "official-test",
+            "BENCHMARK_MODE": "official-50", "BENCHMARK_METHOD": "carry",
+            "RUN_ID": "official-test",
             "BASE_IMAGE": "node@sha256:" + "a" * 64,
             "CARRY_BASE_IMAGE": "rust@sha256:" + "b" * 64,
             "CODEX_VERSION": "1.2.3", "PI_VERSION": "0.84.2",
@@ -368,7 +439,7 @@ class SmokeWorkerTests(unittest.TestCase):
                     )
             records = json.loads((output / "records.json").read_text())
             report = json.loads((output / "report.json").read_text())
-            self.assertEqual(len(records), 150)
+            self.assertEqual(len(records), 50)
             self.assertEqual({record["status"] for record in records}, {"not-run"})
             self.assertEqual(report["provenance"]["phase"], "planned")
 
@@ -607,6 +678,34 @@ class SmokeWorkerTests(unittest.TestCase):
                     process_timeout_seconds=345,
                 )
 
+    def test_materialization_clones_only_the_selected_method(self):
+        selected = [f"task-{number}" for number in range(5)]
+        records = [
+            {
+                "instance_id": instance_id,
+                "repo": "owner/repo",
+                "base_commit": f"commit-{number}",
+                "problem_statement": f"problem {number}",
+            }
+            for number, instance_id in enumerate(selected)
+        ]
+        clones = []
+
+        def clone(repo, commit, destination):
+            clones.append((repo, commit, destination))
+            destination.mkdir(parents=True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.worker.materialize(
+                records=records,
+                selected_ids=selected,
+                root=pathlib.Path(directory),
+                clone=clone,
+                methods=("carry",),
+            )
+        self.assertEqual(len(clones), 5)
+        self.assertTrue(all(destination.parts[-2:] == ("carry", "repo") for _, _, destination in clones))
+
     def test_materialization_keeps_gold_data_out_of_agent_inputs_and_clones_per_method(self):
         selected = [f"task-{number}" for number in range(5)]
         records = [
@@ -630,6 +729,34 @@ class SmokeWorkerTests(unittest.TestCase):
                 self.assertNotIn("gold patch", agent_input)
             canonical = json.loads((root / "canonical-dataset.json").read_text())
             self.assertEqual(canonical, records)
+
+    def test_builds_only_the_selected_method_image(self):
+        calls = []
+
+        def execute(command, **kwargs):
+            calls.append(command)
+            if command[:2] == ["docker", "image"]:
+                return mock.Mock(stdout="sha256:" + "c" * 64 + "\n")
+            return mock.Mock(stdout="")
+
+        config = {
+            "BASE_IMAGE": "node@sha256:" + "a" * 64,
+            "CARRY_BASE_IMAGE": "rust@sha256:" + "b" * 64,
+            "CODEX_VERSION": "1.2.3",
+            "PI_VERSION": "0.84.2",
+            "MODEL": "gpt-5.6-luna",
+            "REASONING": "medium",
+        }
+        provenance = self.worker.build_images(
+            source=SCRIPT.parents[1],
+            run_id="run1",
+            config=config,
+            execute=execute,
+            methods=("carry",),
+        )
+        builds = [command for command in calls if command[:2] == ["docker", "build"]]
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(set(provenance), {"carry"})
 
     def test_builds_each_method_once_and_records_local_image_identity(self):
         calls = []

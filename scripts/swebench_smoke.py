@@ -17,6 +17,15 @@ from collections import Counter
 from typing import Any, Mapping
 
 METHODS = ("carry", "codex", "pi")
+
+
+def selected_methods(values: Mapping[str, str]) -> tuple[str, ...]:
+    method = values.get("BENCHMARK_METHOD", "carry")
+    if method not in METHODS:
+        raise ValueError(f"BENCHMARK_METHOD must be one of {', '.join(METHODS)}")
+    return (method,)
+
+
 MODEL_PRICING_USD_PER_MILLION = {
     "gpt-5.6-luna": {
         "input": 0.20,
@@ -415,7 +424,7 @@ def _clone(repo: str, commit: str, destination: pathlib.Path, mirror: pathlib.Pa
 
 
 def materialize(*, records: list[dict[str, Any]], selected_ids: list[str], root: pathlib.Path,
-                clone: Any = None) -> list[dict[str, Any]]:
+                clone: Any = None, methods: tuple[str, ...] = METHODS) -> list[dict[str, Any]]:
     by_id = {record.get("instance_id"): record for record in records}
     if (not selected_ids or len(selected_ids) > 50 or len(set(selected_ids)) != len(selected_ids)
             or any(instance_id not in by_id for instance_id in selected_ids)):
@@ -455,13 +464,15 @@ def materialize(*, records: list[dict[str, Any]], selected_ids: list[str], root:
             + record["problem_statement"] + "\n",
             encoding="utf-8",
         )
-        for method in METHODS:
+        for method in methods:
             clone_impl(record["repo"], record["base_commit"], task_root / method / "repo")
         tasks.append(public)
     return tasks
 
 
-def build_images(*, source: pathlib.Path, run_id: str, config: Mapping[str, str], execute: Any = subprocess.run) -> dict[str, Any]:
+def build_images(*, source: pathlib.Path, run_id: str, config: Mapping[str, str],
+                 execute: Any = subprocess.run,
+                 methods: tuple[str, ...] = METHODS) -> dict[str, Any]:
     validated = validate_config(config)
     carry_base = config.get("CARRY_BASE_IMAGE", "")
     if not DIGEST_IMAGE.fullmatch(carry_base):
@@ -487,7 +498,8 @@ def build_images(*, source: pathlib.Path, run_id: str, config: Mapping[str, str]
         },
     }
     result = {}
-    for method, spec in specifications.items():
+    for method in methods:
+        spec = specifications[method]
         tag = f"swebench-{run_id}-{method}"
         command = ["docker", "build", "--pull", "--progress=plain", "--file", str(spec["dockerfile"]), "--tag", tag,
                    "--build-arg", f"BASE_IMAGE={spec['base']}"]
@@ -504,21 +516,25 @@ def build_images(*, source: pathlib.Path, run_id: str, config: Mapping[str, str]
     return result
 
 
-def _validate_records(tasks: list[dict[str, Any]], records: list[dict[str, Any]]) -> None:
+def _validate_records(
+    tasks: list[dict[str, Any]],
+    records: list[dict[str, Any]],
+    methods: tuple[str, ...] = METHODS,
+) -> None:
     task_count = len(tasks)
     if task_count not in (5, 50):
         raise ValueError("benchmark must contain exactly 5 or 50 tasks")
-    expected = {(task["instance_id"], method) for task in tasks for method in METHODS}
+    expected = {(task["instance_id"], method) for task in tasks for method in methods}
     actual = [(record.get("instance_id"), record.get("method")) for record in records]
-    expected_count = task_count * len(METHODS)
+    expected_count = task_count * len(methods)
     if (len(expected) != expected_count or len(actual) != expected_count
             or set(actual) != expected or len(set(actual)) != expected_count):
         raise ValueError(f"expected exactly {expected_count} unique task/method records")
 
 
 def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], output: pathlib.Path,
-             provenance: dict[str, Any]) -> None:
-    _validate_records(tasks, records)
+             provenance: dict[str, Any], methods: tuple[str, ...] = METHODS) -> None:
+    _validate_records(tasks, records, methods)
     output.mkdir(parents=True, exist_ok=True)
     normalized = []
     predictions = []
@@ -560,13 +576,13 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
     completed = sum(item["status"] == "evaluated" for item in normalized)
     resolved = sum(bool(item["resolved"]) for item in normalized)
     task_count = len(tasks)
-    denominator = task_count * len(METHODS)
-    methods = {}
-    for method in METHODS:
+    denominator = task_count * len(methods)
+    method_reports = {}
+    for method in methods:
         method_records = [item for item in normalized if item["method"] == method]
         costs = [item["estimated_cost_usd"] for item in method_records
                  if item["estimated_cost_usd"] is not None]
-        methods[method] = {
+        method_reports[method] = {
             "denominator": task_count,
             "completed": sum(item["status"] == "evaluated" for item in method_records),
             "resolved": sum(bool(item["resolved"]) for item in method_records),
@@ -581,7 +597,7 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
         }
     report = {
         "denominator": denominator, "completed": completed, "resolved": resolved,
-        "methods": methods, "provenance": provenance,
+        "methods": method_reports, "provenance": provenance,
     }
     (output / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     def cost_text(value: float | None) -> str:
@@ -599,7 +615,7 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
         f"{values['response_retries']} response retries; "
         f"{values['elapsed_seconds']:.3f}s agent time; "
         f"{values['usage']['total_tokens']} tokens; {method_cost_text(values)} estimated"
-        for method, values in methods.items()
+        for method, values in method_reports.items()
     )
     slot_lines = "\n".join(
         f"| {item['instance_id']} | {item['method']} | {item['status']} | "
@@ -622,6 +638,7 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
 def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathlib.Path,
                       config: Mapping[str, str]) -> None:
     validated = validate_config(config)
+    methods = selected_methods(config)
     pricing = pricing_for_model(validated["MODEL"])
     mode = config.get("BENCHMARK_MODE", "smoke-5")
     phase_limits = official_phase_limits(config) if mode == "official-50" else None
@@ -659,7 +676,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "dataset": DATASET, "dataset_revision": DATASET_REVISION,
         "swebench_version": "4.1.0", "model": validated["MODEL"],
         "reasoning": validated["REASONING"], "images": {},
-        "mode": mode, "phase": "planned",
+        "mode": mode, "methods": list(methods), "phase": "planned",
         "pricing_usd_per_million": pricing,
     }
     tasks = [{
@@ -671,12 +688,14 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "status": "not-run", "patch": "", "error": "slot did not complete before checkpoint",
         "attempts": 0, "retries": 0, "response_retries": 0, "resolved": False,
         "model": validated["MODEL"], "reasoning": validated["REASONING"],
-    } for task in tasks for method in METHODS]
+    } for task in tasks for method in methods]
     records_by_slot = {(record["instance_id"], record["method"]): record for record in records}
     # Persist the exact denominator before any model-bearing slot starts.
-    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload)
+    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, methods=methods)
 
-    provenance = build_images(source=source, run_id=config["RUN_ID"], config=config)
+    provenance = build_images(
+        source=source, run_id=config["RUN_ID"], config=config, methods=methods
+    )
     execution_limits: dict[str, Any] = {
         "agent_timeout_seconds": agent_timeout,
         "agent_concurrency": concurrency,
@@ -690,7 +709,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     provenance["execution_limits"] = execution_limits
     provenance_payload["images"] = provenance
     provenance_payload["phase"] = "agents"
-    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload)
+    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, methods=methods)
     agent_deadline = (
         time.monotonic() + phase_limits["agent_seconds"]
         if phase_limits is not None else None
@@ -713,12 +732,13 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     for shard_index, shard_ids in enumerate(selection_shards):
         shard_root = work / "agent-shards" / f"{shard_index:02d}"
         shard_tasks = materialize(
-            records=all_records, selected_ids=shard_ids, root=shard_root, clone=clone_one
+            records=all_records, selected_ids=shard_ids, root=shard_root, clone=clone_one,
+            methods=methods,
         )
         slots = []
         for task in shard_tasks:
             task_root = shard_root / "tasks" / task["instance_id"]
-            for method in METHODS:
+            for method in methods:
                 slot_output = output / "slots" / task["instance_id"] / method
                 slot_output.mkdir(parents=True, exist_ok=True)
                 slots.append((task, method, task_root, slot_output))
@@ -756,7 +776,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                         record["status"] == "agent-budget-exhausted"
                         or bool(record.get("timed_out"))
                     )
-            finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload)
+            finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, methods=methods)
         finally:
             # Agent workspaces are no longer needed after patch capture. Keeping only
             # mirrors and outputs bounds disk use before official evaluation starts.
@@ -772,14 +792,14 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
 
     # Preserve the complete fixed-denominator checkpoint before slower grading.
     provenance_payload["phase"] = "grading"
-    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload)
+    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, methods=methods)
     evaluation_deadline = (
         time.monotonic() + phase_limits["evaluation_seconds"]
         if phase_limits is not None else None
     )
     evaluation_budget_exhausted = False
     official_root = output / "official"
-    for method in METHODS:
+    for method in methods:
         for shard_index, shard_ids in enumerate(selection_shards):
             report_dir = official_root / method
             if len(selection_shards) > 1:
@@ -826,9 +846,9 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                     "instance_id": record["instance_id"], "method": method,
                     "state": "graded", "status": record["status"],
                 }, sort_keys=True), flush=True)
-            finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload)
+            finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, methods=methods)
     provenance_payload["phase"] = "complete"
-    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload)
+    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, methods=methods)
     for record in records:
         slot = output / "slots" / record["instance_id"] / record["method"]
         (slot / "metadata.json").write_text(
@@ -850,6 +870,7 @@ def main() -> int:
     parser.add_argument("--source", type=pathlib.Path)
     parser.add_argument("--work", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path)
+    parser.add_argument("--method", choices=METHODS, default="carry")
     args = parser.parse_args()
     if args.validate_records:
         payload = json.loads(args.validate_records.read_text(encoding="utf-8"))
@@ -857,7 +878,9 @@ def main() -> int:
     elif args.run:
         if not args.source or not args.work or not args.output:
             parser.error("--run requires --source, --work, and --output")
-        execute_benchmark(source=args.source, work=args.work, output=args.output, config=os.environ)
+        config = dict(os.environ)
+        config["BENCHMARK_METHOD"] = args.method
+        execute_benchmark(source=args.source, work=args.work, output=args.output, config=config)
     return 0
 
 

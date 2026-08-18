@@ -8,6 +8,7 @@ worker_started_at=$(date +%s)
 : "${SOURCE_SHA256:?}"
 : "${SOURCE_COMMIT:?}"
 : "${BENCHMARK_MODE:?}"
+: "${BENCHMARK_METHOD:=carry}"
 : "${BOOTSTRAP_WAIT_SECONDS:?}"
 : "${RUN_ID:?}"
 : "${RESULT_URL_B64:=}"
@@ -144,4 +145,5 @@ else
   OVERALL_TIMEOUT_SECONDS=3000
 fi
 timeout --signal=TERM --kill-after=30s "$OVERALL_TIMEOUT_SECONDS" python3 "$CARRY_ROOT/source/scripts/swebench_smoke.py" \
-  --run --source "$CARRY_ROOT/source" --work "$CARRY_ROOT/work" --output "$CARRY_ROOT/results"
+  --run --source "$CARRY_ROOT/source" --work "$CARRY_ROOT/work" --output "$CARRY_ROOT/results" \
+  --method "$BENCHMARK_METHOD"
