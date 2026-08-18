@@ -9,6 +9,9 @@ use crate::protocol::ContextManagement;
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 const CACHE_READ_RATE: f64 = 0.10;
 const CACHE_WRITE_RATE: f64 = 1.25;
+const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
+const NEUTRAL_TARGET_NUMERATOR: usize = 3;
+const NEUTRAL_TARGET_DENOMINATOR: usize = 4;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -320,6 +323,14 @@ impl ContextState {
         estimated_tokens(&self.input_items())
     }
 
+    #[cfg(test)]
+    fn item_estimated_tokens(&self, id: u64) -> usize {
+        self.items
+            .iter()
+            .find(|item| item.id == id)
+            .map_or(0, |item| item.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN))
+    }
+
     pub fn rendered_breakpoints(&self) -> Vec<RenderedBreakpoint> {
         let rendered = self.input_items();
         self.breakpoints
@@ -378,27 +389,96 @@ impl ContextState {
         }
     }
 
+    #[cfg(test)]
     pub fn plan_compaction(
         &self,
         protected: &[u64],
         policy: CompactionPolicy,
     ) -> Option<CompactionPlan> {
+        self.plan_compaction_with_neutral_budget(protected, policy, 0)
+    }
+
+    pub fn plan_compaction_with_neutral_budget(
+        &self,
+        protected: &[u64],
+        policy: CompactionPolicy,
+        neutral_budget_tokens: usize,
+    ) -> Option<CompactionPlan> {
         let protected = protected.iter().copied().collect::<HashSet<_>>();
+        let newest_id = self.items.last().map_or(0, |item| item.id);
+        // Explicit keep/drop signals remain authoritative. Neutral volatile items compete for
+        // a separate automatic budget using a monotone recency score; the shape can later gain
+        // other evidence without changing the packing or telemetry contract.
+        let mut neutral = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.retention == Retention::Volatile && item.signal == RetentionSignal::Neutral
+            })
+            .map(|item| NeutralRetentionDecision {
+                id: item.id,
+                tokens: item.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN),
+                score: NEUTRAL_RECENCY_SCORE_SCALE
+                    / newest_id.saturating_sub(item.id).saturating_add(1),
+            })
+            .collect::<Vec<_>>();
+        neutral.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+
+        let neutral_total_tokens = neutral
+            .iter()
+            .map(|decision| decision.tokens)
+            .fold(0usize, usize::saturating_add);
+        // Only cross the neutral high-water mark before collecting neutral items, then compact
+        // toward a lower target so one new result does not trigger another compaction next turn.
+        let neutral_target_tokens = neutral_budget_tokens.saturating_mul(NEUTRAL_TARGET_NUMERATOR)
+            / NEUTRAL_TARGET_DENOMINATOR;
+        let neutral_over_budget = neutral_total_tokens > neutral_budget_tokens;
+        let mut neutral_retained = Vec::new();
+        let mut neutral_retained_tokens = neutral
+            .iter()
+            .filter(|decision| protected.contains(&decision.id))
+            .map(|decision| decision.tokens)
+            .fold(0usize, usize::saturating_add);
+        let mut neutral_removable = HashSet::new();
+        for decision in neutral {
+            if protected.contains(&decision.id) {
+                neutral_retained.push(decision);
+            } else if !neutral_over_budget
+                || neutral_retained_tokens.saturating_add(decision.tokens) <= neutral_target_tokens
+            {
+                neutral_retained_tokens = neutral_retained_tokens.saturating_add(decision.tokens);
+                neutral_retained.push(decision);
+            } else {
+                neutral_removable.insert(decision.id);
+            }
+        }
+
         let removable = self
             .items
             .iter()
             .filter(|item| {
-                ((item.retention == Retention::Stable && item.signal == RetentionSignal::Drop)
-                    || (item.retention == Retention::Volatile
-                        && item.signal != RetentionSignal::Keep))
-                    && !protected.contains(&item.id)
+                !protected.contains(&item.id)
+                    && (item.signal == RetentionSignal::Drop
+                        || neutral_removable.contains(&item.id))
             })
             .map(|item| item.id)
             .collect::<Vec<_>>();
 
         let mut candidates = Vec::new();
         if !removable.is_empty() {
-            candidates.push(self.compaction_candidate(removable.clone(), None, &policy));
+            candidates.push(self.compaction_candidate(
+                removable.clone(),
+                neutral_retained.clone(),
+                neutral_budget_tokens,
+                neutral_target_tokens,
+                None,
+                &policy,
+            ));
         }
         for priced in &policy.breakpoints {
             let Some(stored) = self
@@ -419,7 +499,14 @@ impl ContextState {
             if dropped.is_empty() {
                 continue;
             }
-            let candidate = self.compaction_candidate(dropped, Some(priced), &policy);
+            let candidate = self.compaction_candidate(
+                dropped,
+                neutral_retained.clone(),
+                neutral_budget_tokens,
+                neutral_target_tokens,
+                Some(priced),
+                &policy,
+            );
             if candidate.reused_generation == Some(priced.generation) {
                 candidates.push(candidate);
             }
@@ -437,10 +524,17 @@ impl ContextState {
     fn compaction_candidate(
         &self,
         dropped: Vec<u64>,
+        neutral_retained: Vec<NeutralRetentionDecision>,
+        neutral_budget_tokens: usize,
+        neutral_target_tokens: usize,
         reused: Option<&PricedBreakpoint>,
         policy: &CompactionPolicy,
     ) -> CompactionPlan {
         let dropped_set = dropped.iter().copied().collect::<HashSet<_>>();
+        let neutral_retained_set = neutral_retained
+            .iter()
+            .map(|decision| decision.id)
+            .collect::<HashSet<_>>();
         let current_tokens = self.estimated_tokens();
         let mut retained = self
             .items
@@ -449,7 +543,9 @@ impl ContextState {
             .cloned()
             .collect::<Vec<_>>();
         for item in &mut retained {
-            item.retention = Retention::Stable;
+            if !neutral_retained_set.contains(&item.id) {
+                item.retention = Retention::Stable;
+            }
         }
         let retained_rendered = self.render_with_compatible_breakpoints(&retained);
         let retained_tokens = estimated_tokens(&retained_rendered);
@@ -500,6 +596,9 @@ impl ContextState {
 
         CompactionPlan {
             dropped,
+            neutral_retained,
+            neutral_budget_tokens,
+            neutral_target_tokens,
             dropped_tokens,
             retained_tokens,
             rewrite_tokens,
@@ -517,6 +616,11 @@ impl ContextState {
 
     pub fn compact(&mut self, plan: CompactionPlan) -> ContextChange {
         let dropped = plan.dropped.iter().copied().collect::<HashSet<_>>();
+        let neutral_retained = plan
+            .neutral_retained
+            .iter()
+            .map(|decision| decision.id)
+            .collect::<HashSet<_>>();
         self.items.retain(|item| !dropped.contains(&item.id));
         for item in &mut self.items {
             if let Some(memory) = item.memory.as_mut()
@@ -524,8 +628,12 @@ impl ContextState {
             {
                 memory.materialized = true;
             }
-            item.retention = Retention::Stable;
-            if item.signal == RetentionSignal::Keep {
+            if neutral_retained.contains(&item.id) {
+                item.retention = Retention::Volatile;
+            } else {
+                item.retention = Retention::Stable;
+            }
+            if item.signal == RetentionSignal::Keep && item.retention == Retention::Stable {
                 item.signal = RetentionSignal::Neutral;
             }
         }
@@ -545,6 +653,9 @@ impl ContextState {
 
         ContextChange {
             dropped: plan.dropped,
+            neutral_retained: plan.neutral_retained,
+            neutral_budget_tokens: plan.neutral_budget_tokens,
+            neutral_target_tokens: plan.neutral_target_tokens,
             dropped_tokens: plan.dropped_tokens,
             retained_tokens: plan.retained_tokens,
             rewrite_tokens: plan.rewrite_tokens,
@@ -616,6 +727,9 @@ pub(crate) struct RenderedBreakpoint {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct CompactionPlan {
     pub dropped: Vec<u64>,
+    pub neutral_retained: Vec<NeutralRetentionDecision>,
+    pub neutral_budget_tokens: usize,
+    pub neutral_target_tokens: usize,
     pub dropped_tokens: usize,
     pub retained_tokens: usize,
     pub rewrite_tokens: usize,
@@ -624,6 +738,13 @@ pub(crate) struct CompactionPlan {
     pub invalidated_generations: Vec<u64>,
     pub invalidated_cache_tokens: usize,
     pub estimated_savings_input_units: f64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct NeutralRetentionDecision {
+    pub id: u64,
+    pub tokens: usize,
+    pub score: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -637,6 +758,9 @@ pub(crate) struct SignalChange {
 #[derive(Debug, Serialize)]
 pub(crate) struct ContextChange {
     pub dropped: Vec<u64>,
+    pub neutral_retained: Vec<NeutralRetentionDecision>,
+    pub neutral_budget_tokens: usize,
+    pub neutral_target_tokens: usize,
     pub dropped_tokens: usize,
     pub retained_tokens: usize,
     pub rewrite_tokens: usize,
@@ -678,6 +802,10 @@ mod tests {
     }
 
     fn add_tool(state: &mut ContextState) -> u64 {
+        add_tool_with_output(state, "exact output")
+    }
+
+    fn add_tool_with_output(state: &mut ContextState, output: &str) -> u64 {
         let next = state.next_id + 1;
         state
             .add_tool(
@@ -690,10 +818,185 @@ mod tests {
                 json!({
                     "type": "function_call_output",
                     "call_id": format!("call-{next}"),
-                    "output": "exact output"
+                    "output": output
                 }),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn neutral_budget_retains_the_highest_recency_scores() {
+        let mut state = ContextState::new("initial".into());
+        let oldest = add_tool_with_output(&mut state, &"old ".repeat(100));
+        let middle = add_tool_with_output(&mut state, &"middle ".repeat(100));
+        let newest = add_tool_with_output(&mut state, &"new ".repeat(100));
+        let retained_target =
+            state.item_estimated_tokens(middle) + state.item_estimated_tokens(newest);
+        let budget = retained_target.saturating_mul(4).div_ceil(3);
+
+        let plan = state
+            .plan_compaction_with_neutral_budget(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                },
+                budget,
+            )
+            .unwrap();
+
+        assert_eq!(plan.dropped, vec![oldest]);
+        assert_eq!(
+            plan.neutral_retained
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![newest, middle]
+        );
+        assert!(plan.neutral_retained[0].score > plan.neutral_retained[1].score);
+    }
+
+    #[test]
+    fn budget_retained_neutral_items_remain_volatile_for_future_scoring() {
+        let mut state = ContextState::new("initial".into());
+        let oldest = add_tool_with_output(&mut state, &"old ".repeat(100));
+        let middle = add_tool_with_output(&mut state, &"middle ".repeat(100));
+        let newest = add_tool_with_output(&mut state, &"new ".repeat(100));
+        let retained_target =
+            state.item_estimated_tokens(middle) + state.item_estimated_tokens(newest);
+        let budget = retained_target.saturating_mul(4).div_ceil(3);
+
+        let plan = state
+            .plan_compaction_with_neutral_budget(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                },
+                budget,
+            )
+            .unwrap();
+        assert_eq!(plan.dropped, vec![oldest]);
+        state.compact(plan);
+
+        for id in [middle, newest] {
+            assert_eq!(
+                state
+                    .snapshot()
+                    .iter()
+                    .find(|item| item.id == id)
+                    .unwrap()
+                    .retention,
+                Retention::Volatile
+            );
+        }
+
+        let latest = add_tool_with_output(&mut state, &"latest ".repeat(100));
+        let next = state
+            .plan_compaction_with_neutral_budget(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                },
+                budget,
+            )
+            .unwrap();
+        assert_eq!(next.dropped, vec![middle]);
+        assert_eq!(
+            next.neutral_retained
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![latest, newest]
+        );
+    }
+
+    #[test]
+    fn crossing_the_neutral_budget_compacts_to_a_lower_target() {
+        let mut state = ContextState::new("initial".into());
+        let oldest = add_tool_with_output(&mut state, &"same ".repeat(100));
+        let middle = add_tool_with_output(&mut state, &"same ".repeat(100));
+        let newest = add_tool_with_output(&mut state, &"same ".repeat(100));
+        let each = state.item_estimated_tokens(newest);
+        let budget = each * 2 + each / 2;
+
+        let plan = state
+            .plan_compaction_with_neutral_budget(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                },
+                budget,
+            )
+            .unwrap();
+
+        assert_eq!(plan.neutral_target_tokens, budget * 3 / 4);
+        assert_eq!(plan.dropped, vec![oldest, middle]);
+        assert_eq!(
+            plan.neutral_retained
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![newest]
+        );
+    }
+
+    #[test]
+    fn budget_candidate_prices_the_same_volatile_markers_it_will_commit() {
+        for padding in 0..16 {
+            let mut state = ContextState::new("initial".into());
+            let oldest = add_tool_with_output(&mut state, &"old ".repeat(100));
+            let newest = add_tool_with_output(&mut state, &"x".repeat(padding));
+            let newest_tokens = state.item_estimated_tokens(newest);
+            let budget = newest_tokens.saturating_mul(4).div_ceil(3);
+
+            let plan = state
+                .plan_compaction_with_neutral_budget(
+                    &[],
+                    CompactionPolicy {
+                        implicit_cached_tokens: 0,
+                        breakpoints: Vec::new(),
+                    },
+                    budget,
+                )
+                .unwrap();
+            assert_eq!(plan.dropped, vec![oldest]);
+
+            let retained = state
+                .items
+                .iter()
+                .filter(|item| !plan.dropped.contains(&item.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let expected = estimated_tokens(&state.render_with_compatible_breakpoints(&retained));
+            assert_eq!(
+                plan.retained_tokens, expected,
+                "padding {padding} must price the volatile marker committed by compact"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_drop_is_collectable_inside_the_neutral_budget() {
+        let mut state = ContextState::new("initial".into());
+        let dropped = add_tool(&mut state);
+        state.record_signals(&update(&[], &[dropped], &[]), dropped);
+
+        let plan = state
+            .plan_compaction_with_neutral_budget(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                },
+                usize::MAX,
+            )
+            .unwrap();
+
+        assert_eq!(plan.dropped, vec![dropped]);
+        assert!(plan.neutral_retained.is_empty());
     }
 
     #[test]

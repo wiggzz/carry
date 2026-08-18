@@ -17,6 +17,10 @@ use crate::{
     protocol::{ActionKind, Step},
 };
 
+// Initial policy hypothesis: keep a meaningful recent working set while leaving ample room in
+// the model context. Hysteresis compacts this 32 Ki-token high-water mark toward 24 Ki tokens.
+const NEUTRAL_VOLATILE_BUDGET_TOKENS: usize = 32 * 1024;
+
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
 At each step, select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. For regressions, inspect repository history and search cited identifiers and later fixes. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
@@ -646,7 +650,11 @@ fn maybe_compact(
     trigger: &str,
 ) -> Result<bool> {
     let policy = cache.policy_for_history(&state.input_items());
-    let Some(plan) = state.plan_compaction(protected, policy) else {
+    let Some(plan) = state.plan_compaction_with_neutral_budget(
+        protected,
+        policy,
+        NEUTRAL_VOLATILE_BUDGET_TOKENS,
+    ) else {
         return Ok(false);
     };
     let change = state.compact(plan);
@@ -1591,6 +1599,11 @@ mod tests {
         )
         .unwrap();
         assert!(result["steps_limit"].is_null());
+        assert_eq!(result["compactions"], 0);
+        let trace_jsonl = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap();
+        assert!(!trace_jsonl.contains("context_compacted"));
         let trace = tokio::fs::read_to_string(session_dir.join("trace.log"))
             .await
             .unwrap();
