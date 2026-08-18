@@ -147,7 +147,7 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Sparse advice about learning from context. The neutral default is to leave an ID in neither keep nor drop when its future value is uncertain or ordinary. Signals persist until reversed or acted on; they do not immediately mutate history.",
+        "description": "Sparse advice about learning from context. Markers identify stable context, which neutral retention keeps by default, and volatile context, which neutral retention keeps in the recent working window until budget pressure; volatile does not itself mean drop. The neutral default is to leave an ID in neither keep nor drop when its future value is uncertain or ordinary. Signals persist until reversed or acted on; they do not immediately mutate history.",
         "properties": {
             "keep": {
                 "type": "array",

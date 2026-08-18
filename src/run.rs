@@ -25,7 +25,7 @@ const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an 
 
 At each step, select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. For regressions, inspect repository history and search cited identifiers and later fixes. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
 
-History is chronological, and context items carry an immutable [context integer] marker. Treat context as evidence and learning, not as a list of completed steps. The normal choice is neutral: leave an ID in neither keep nor drop when its future value is uncertain or ordinary. Mark keep when an item's exact details or an important learning may affect later work. Mark drop without remembering only when you learned nothing useful from the item, or when a newer retained result fully supersedes everything learned from it and the old information is no longer relevant. Do not drop merely because you consumed an item, completed its immediate action, changed course, or its command failed. Failures often establish important repository, environment, and approach constraints. Human messages are authoritative.
+History is chronological, and context items carry an immutable [context integer stable|volatile] marker. The lifecycle label describes the neutral retention default, not the item's relevance: neutral stable context stays by default, while neutral volatile context remains in the recent working window but may be collected automatically under budget pressure. A volatile label is not an instruction to drop the item. Treat context as evidence and learning, not as a list of completed steps. The normal choice is neutral: leave an ID in neither keep nor drop when its future value is uncertain or ordinary. Mark keep when an item's exact details or an important learning may affect later work. Mark drop without remembering only when you learned nothing useful from the item, or when a newer retained result fully supersedes everything learned from it and the old information is no longer relevant. Do not drop merely because you consumed an item, completed its immediate action, changed course, or its command failed. Failures often establish important repository, environment, and approach constraints. Human messages are authoritative.
 
 When useful learning remains but exact source details are no longer needed, preserve one concise outcome with remember and drop the source. Use keep instead when exact source details may matter again. Do not duplicate an existing memory or kept item; when newer evidence supersedes a memory, drop the old memory and remember the updated conclusion. Preserve outcomes, not chain-of-thought.
 
@@ -1716,7 +1716,7 @@ mod tests {
                 item["type"] == "function_call_output"
                     && item["output"]
                         .as_str()
-                        .is_some_and(|output| output.ends_with("[context 2]"))
+                        .is_some_and(|output| output.ends_with("[context 2 volatile]"))
             })
             .unwrap();
         let steering = history
@@ -1724,6 +1724,9 @@ mod tests {
             .position(|item| item["content"][0]["text"] == "do not change the JSON format")
             .unwrap();
         assert!(tool_result < steering);
-        assert_eq!(history[steering + 1]["content"][0]["text"], "[context 3]");
+        assert_eq!(
+            history[steering + 1]["content"][0]["text"],
+            "[context 3 stable]"
+        );
     }
 }
