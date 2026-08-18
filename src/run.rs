@@ -25,9 +25,9 @@ const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an 
 
 At each step, select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. For regressions, inspect repository history and search cited identifiers and later fixes. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
 
-History is chronological, and tool results end with an immutable [integer stable|volatile] marker. Stable items stay by default; mark drop only when a stable item is no longer useful. Volatile items may be removed unless marked keep, so keep a volatile item while its exact details still matter. Signals are sparse advice, not immediate commands. Human messages are authoritative.
+History is chronological, and context items carry an immutable [context integer] marker. Treat context as evidence and learning, not as a list of completed steps. The normal choice is neutral: leave an ID in neither keep nor drop when its future value is uncertain or ordinary. Mark keep when an item's exact details or an important learning may affect later work. Mark drop without remembering only when you learned nothing useful from the item, or when a newer retained result fully supersedes everything learned from it and the old information is no longer relevant. Do not drop merely because you consumed an item, completed its immediate action, changed course, or its command failed. Failures often establish important repository, environment, and approach constraints. Human messages are authoritative.
 
-Use remember instead of keep when only a small durable fact matters in a large volatile tool result and retaining the whole interaction would be wasteful. The memory gets its own stable ID, so do not also keep the source. Keep memories concise and preserve outcomes, not chain-of-thought.
+When useful learning remains but exact source details are no longer needed, preserve one concise outcome with remember and drop the source. Use keep instead when exact source details may matter again. Do not duplicate an existing memory or kept item; when newer evidence supersedes a memory, drop the old memory and remember the updated conclusion. Preserve outcomes, not chain-of-thought.
 
 Large text shell results arrive as structured `output_head` and `output_tail` previews with an absolute `full_output_path`. Non-text output is omitted from the model payload and available only through its artifact paths. Read or slice those session files when omitted details matter.
 
@@ -1716,7 +1716,7 @@ mod tests {
                 item["type"] == "function_call_output"
                     && item["output"]
                         .as_str()
-                        .is_some_and(|output| output.ends_with("[2 volatile]"))
+                        .is_some_and(|output| output.ends_with("[context 2]"))
             })
             .unwrap();
         let steering = history
@@ -1724,9 +1724,6 @@ mod tests {
             .position(|item| item["content"][0]["text"] == "do not change the JSON format")
             .unwrap();
         assert!(tool_result < steering);
-        assert_eq!(
-            history[steering + 1]["content"][0]["text"],
-            "[3 user stable]"
-        );
+        assert_eq!(history[steering + 1]["content"][0]["text"], "[context 3]");
     }
 }

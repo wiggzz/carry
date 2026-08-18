@@ -36,25 +36,6 @@ pub(crate) enum ContextItemKind {
     Tool,
 }
 
-impl ContextItemKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Memory => "memory",
-            Self::Tool => "tool",
-        }
-    }
-}
-
-impl Retention {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Stable => "stable",
-            Self::Volatile => "volatile",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub(crate) struct ContextItem {
     pub id: u64,
@@ -135,12 +116,7 @@ impl ContextItem {
     fn marker(&self, checkpoint: bool) -> Value {
         let mut block = json!({
             "type": "input_text",
-            "text": format!(
-                "[{} {} {}]",
-                self.id,
-                self.kind.label(),
-                self.retention.label()
-            )
+            "text": format!("[context {}]", self.id)
         });
         if checkpoint {
             block["prompt_cache_breakpoint"] = json!({ "mode": "explicit" });
@@ -149,7 +125,7 @@ impl ContextItem {
     }
 
     fn compact_marker(&self) -> String {
-        format!("[{} {}]", self.id, self.retention.label())
+        format!("[context {}]", self.id)
     }
 }
 
@@ -1011,14 +987,14 @@ mod tests {
             .iter()
             .filter_map(|item| item["content"][0]["text"].as_str())
             .collect::<Vec<_>>();
-        assert!(texts.contains(&"[1 user stable]"));
+        assert!(texts.contains(&"[context 1]"));
         assert!(rendered.iter().any(|item| {
             item["type"] == "function_call_output"
                 && item["output"]
                     .as_str()
-                    .is_some_and(|output| output.ends_with(&format!("[{tool} volatile]")))
+                    .is_some_and(|output| output.ends_with(&format!("[context {tool}]")))
         }));
-        assert!(texts.contains(&format!("[{steering} user stable]").as_str()));
+        assert!(texts.contains(&format!("[context {steering}]").as_str()));
         assert_eq!(
             rendered
                 .iter()
@@ -1026,6 +1002,21 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn rendered_context_markers_hide_internal_retention_lifecycle() {
+        let mut state = ContextState::new("initial".into());
+        let tool = add_tool(&mut state);
+        let steering = state.add_user("steer here".into());
+
+        let rendered = serde_json::to_string(&state.input_items()).unwrap();
+
+        assert!(rendered.contains("[context 1]"));
+        assert!(rendered.contains(&format!("[context {tool}]")));
+        assert!(rendered.contains(&format!("[context {steering}]")));
+        assert!(!rendered.contains("stable"));
+        assert!(!rendered.contains("volatile"));
     }
 
     #[test]
@@ -1049,9 +1040,9 @@ mod tests {
             .unwrap()["output"]
             .as_str()
             .unwrap();
-        assert!(tool_output.contains(&format!("[{tool} volatile]")));
+        assert!(tool_output.contains(&format!("[context {tool}]")));
         assert!(tool_output.contains("[memory stored]"));
-        assert!(tool_output.contains(&format!("[{memory} stable]")));
+        assert!(tool_output.contains(&format!("[context {memory}]")));
         assert!(!tool_output.contains("durable outcome"));
         assert!(!rendered.iter().any(|item| {
             item["role"] == "user"
@@ -1094,7 +1085,7 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .any(|item| { item["content"][0]["text"] == format!("[{memory} memory stable]") })
+                .any(|item| { item["content"][0]["text"] == format!("[context {memory}]") })
         );
     }
 

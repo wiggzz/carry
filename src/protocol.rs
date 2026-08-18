@@ -147,23 +147,23 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Sparse context advice. Signals persist until reversed or acted on; they do not immediately mutate history.",
+        "description": "Sparse advice about learning from context. The neutral default is to leave an ID in neither keep nor drop when its future value is uncertain or ordinary. Signals persist until reversed or acted on; they do not immediately mutate history.",
         "properties": {
             "keep": {
                 "type": "array",
-                "description": "Protect up to four volatile context IDs whose exact details still matter. Stable items persist without keep. A later keep also reverses an earlier drop.",
+                "description": "Protect up to four context IDs whose exact details or important learning may affect later work. Use remember instead when only a concise outcome remains useful. A later keep reverses an earlier drop.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "drop": {
                 "type": "array",
-                "description": "Make up to four stable context IDs removable because they are no longer useful. Volatile items are already removable unless kept. A later drop reverses an earlier keep.",
+                "description": "Mark up to four context IDs removable without remembering only when you learned nothing useful from them, or when newer retained context fully superseded everything learned and the old information is no longer relevant. Do not drop merely because an item was consumed, its immediate action completed, or its command failed. A later drop reverses an earlier keep.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "remember": {
                 "type": "array",
-                "description": "At most one concise durable fact. Use remember instead of keep when only a small useful outcome matters in a large, otherwise disposable volatile tool result. Do not duplicate retained context or preserve chain-of-thought.",
+                "description": "At most one concise durable learning for when useful information remains but exact source details are no longer needed. Drop the source rather than also keeping it. Do not duplicate an existing memory or kept item; preserve outcomes, not chain-of-thought.",
                 "items": { "type": "string" },
                 "maxItems": 1
             }
@@ -222,6 +222,28 @@ pub fn tool_definitions() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_schema_frames_retention_as_learning_with_a_neutral_default() {
+        let schema = tool_definitions();
+        let context = &schema[0]["parameters"]["properties"]["context"];
+        let description = context["description"].as_str().unwrap();
+        let keep = context["properties"]["keep"]["description"]
+            .as_str()
+            .unwrap();
+        let drop = context["properties"]["drop"]["description"]
+            .as_str()
+            .unwrap();
+        let remember = context["properties"]["remember"]["description"]
+            .as_str()
+            .unwrap();
+
+        assert!(description.contains("leave an ID in neither keep nor drop"));
+        assert!(keep.contains("important learning"));
+        assert!(drop.contains("learned nothing useful"));
+        assert!(drop.contains("fully superseded"));
+        assert!(remember.contains("exact source details are no longer needed"));
+    }
 
     #[test]
     fn parses_shell_and_finish_function_calls() {
