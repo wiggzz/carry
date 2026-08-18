@@ -23,13 +23,13 @@ class BenchmarkConfigurationTests(unittest.TestCase):
             [task["instance_id"] for task in tasks],
         )
 
-    def test_merged_records_require_exact_task_method_denominator(self):
+    def test_merged_records_require_exact_task_harness_denominator(self):
         tasks = [{"instance_id": "one"}, {"instance_id": "two"}]
         records = [
-            {"instance_id": "one", "method": "carry"},
-            {"instance_id": "one", "method": "codex"},
-            {"instance_id": "two", "method": "carry"},
-            {"instance_id": "two", "method": "codex"},
+            {"instance_id": "one", "harness": "carry"},
+            {"instance_id": "one", "harness": "codex"},
+            {"instance_id": "two", "harness": "carry"},
+            {"instance_id": "two", "harness": "codex"},
         ]
         self.runner.validate_merged_records(tasks, records, ("carry", "codex"))
 
@@ -54,22 +54,22 @@ class BenchmarkConfigurationTests(unittest.TestCase):
     def test_merged_records_reject_duplicate_task_input(self):
         tasks = [{"instance_id": "same"}, {"instance_id": "same"}]
         records = [
-            {"instance_id": "same", "method": "carry"},
-            {"instance_id": "same", "method": "codex"},
+            {"instance_id": "same", "harness": "carry"},
+            {"instance_id": "same", "harness": "codex"},
         ]
         with self.assertRaisesRegex(ValueError, "duplicate task"):
             self.runner.validate_merged_records(tasks, records, ("carry", "codex"))
 
-    def test_merged_records_reject_duplicate_method_input(self):
+    def test_merged_records_reject_duplicate_harness_input(self):
         tasks = [{"instance_id": "one"}]
-        records = [{"instance_id": "one", "method": "carry"}]
-        with self.assertRaisesRegex(ValueError, "duplicate method"):
+        records = [{"instance_id": "one", "harness": "carry"}]
+        with self.assertRaisesRegex(ValueError, "duplicate harness"):
             self.runner.validate_merged_records(tasks, records, ("carry", "carry"))
 
     def test_merged_records_reject_malformed_record(self):
         tasks = [{"instance_id": "one"}]
         with self.assertRaisesRegex(ValueError, "invalid instance_id"):
-            self.runner.validate_merged_records(tasks, [{"instance_id": [], "method": "carry"}], ("carry",))
+            self.runner.validate_merged_records(tasks, [{"instance_id": [], "harness": "carry"}], ("carry",))
 
     def test_committed_selection_has_five_ordered_ten_task_shards(self):
         selection = self.runner.load_selection()
@@ -78,22 +78,22 @@ class BenchmarkConfigurationTests(unittest.TestCase):
         self.assertEqual([item["instance_id"] for shard in shards for item in shard], selection)
         self.assertEqual(self.runner.sha256_file(self.runner.DEFAULT_SELECTION), "d26efa7d55df331566a69aa15c4cbc78c044100f6c6c73610f0d7a0b19bb3877")
 
-    def test_default_denominator_has_all_three_agent_methods(self):
-        self.assertEqual(self.runner.METHODS, ("carry", "codex", "pi"))
+    def test_default_denominator_has_all_three_agent_harnesses(self):
+        self.assertEqual(self.runner.HARNESSES, ("carry", "codex", "pi"))
         tasks = [{"instance_id": "one"}, {"instance_id": "two"}]
         records = [
-            {"instance_id": task["instance_id"], "method": method}
+            {"instance_id": task["instance_id"], "harness": harness}
             for task in tasks
-            for method in self.runner.METHODS
+            for harness in self.runner.HARNESSES
         ]
         self.runner.validate_merged_records(tasks, records)
 
     def test_merged_records_reject_duplicate_or_missing_pairs(self):
         tasks = [{"instance_id": "one"}, {"instance_id": "two"}]
         records = [
-            {"instance_id": "one", "method": "carry"},
-            {"instance_id": "one", "method": "carry"},
-            {"instance_id": "one", "method": "codex"},
+            {"instance_id": "one", "harness": "carry"},
+            {"instance_id": "one", "harness": "carry"},
+            {"instance_id": "one", "harness": "codex"},
         ]
         with self.assertRaisesRegex(ValueError, "expected exactly"):
             self.runner.validate_merged_records(tasks, records, ("carry", "codex"))

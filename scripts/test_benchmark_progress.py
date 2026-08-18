@@ -14,10 +14,10 @@ SCRIPT = pathlib.Path(__file__).with_name("benchmark_progress.py")
 class BenchmarkProgressTests(unittest.TestCase):
     def test_renders_only_new_valid_progress_events_across_polls(self):
         started = "BENCHMARK_PROGRESS " + json.dumps({
-            "instance_id": "task-1", "method": "carry", "state": "started",
+            "instance_id": "task-1", "harness": "carry", "state": "started",
         }, sort_keys=True)
         completed = "BENCHMARK_PROGRESS " + json.dumps({
-            "elapsed_seconds": 2.5, "instance_id": "task-1", "method": "carry",
+            "elapsed_seconds": 2.5, "instance_id": "task-1", "harness": "carry",
             "state": "completed", "status": "agent-completed",
         }, sort_keys=True)
         with tempfile.TemporaryDirectory() as directory:

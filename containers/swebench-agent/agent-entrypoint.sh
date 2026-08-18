@@ -3,8 +3,8 @@ set -eu
 
 test "${1:-}" = run
 shift
-test "${1:-}" = --method
-method=${2:-}
+test "${1:-}" = --harness
+harness=${2:-}
 shift 2
 test "${1:-}" = --instance-id
 instance_id=${2:-}
@@ -14,7 +14,7 @@ test -r /benchmark/task/task.json
 test -d /benchmark/task/repo
 test -w /benchmark/output
 
-case "$method" in
+case "$harness" in
   carry)
     task_prompt=$(cat /benchmark/task/task.md)
     exec carry \
@@ -23,7 +23,7 @@ case "$method" in
       -p "$task_prompt"
     ;;
   *)
-    echo "agent image does not contain the requested method: $method" >&2
+    echo "agent image does not contain the requested harness: $harness" >&2
     exit 64
     ;;
 esac
