@@ -23,14 +23,15 @@ class LiveRunnerTests(unittest.TestCase):
 
     def test_manifest_has_the_frozen_150_slot_denominator(self):
         manifest = self.runner.build_manifest(run_id="review-1")
+        self.assertEqual(manifest["schema"], "carry.swe-bench-live-plan.v2")
         slots = manifest["slots"]
         self.assertEqual(len(slots), 150)
         self.assertEqual(
-            {(slot["instance_id"], slot["method"]) for slot in slots},
+            {(slot["instance_id"], slot["harness"]) for slot in slots},
             {
-                (instance_id, method)
+                (instance_id, harness)
                 for instance_id in self.runner.benchmark.load_selection()
-                for method in self.runner.benchmark.METHODS
+                for harness in self.runner.benchmark.HARNESSES
             },
         )
         self.assertEqual([slot["ordinal"] for slot in slots], list(range(150)))
@@ -42,8 +43,8 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertEqual(manifest["task_count"], 5)
         self.assertEqual(manifest["record_count"], 15)
         self.assertEqual(
-            [(slot["instance_id"], slot["method"]) for slot in manifest["slots"]],
-            [(instance_id, method) for instance_id in selected[:5] for method in ("carry", "codex", "pi")],
+            [(slot["instance_id"], slot["harness"]) for slot in manifest["slots"]],
+            [(instance_id, harness) for instance_id in selected[:5] for harness in ("carry", "codex", "pi")],
         )
 
     def test_smoke_manifest_rejects_unknown_preset(self):
@@ -155,7 +156,7 @@ done
             result = subprocess.run(
                 [
                     sys.executable, str(SCRIPT), "invoke", "--run-id", "review-3",
-                    "--instance-id", instance_id, "--method", "carry",
+                    "--instance-id", instance_id, "--harness", "carry",
                     "--task-dir", str(task), "--output-dir", str(output),
                     "--agent-image", agent_image, "--evaluator-image", evaluator_image,
                     "--docker-command", str(docker),
@@ -178,8 +179,9 @@ done
             self.assertIn(f"type=bind,src={output.resolve() / 'evaluator'},dst=/benchmark/output", argv)
 
             metadata = json.loads((output / "run-metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["schema"], "carry.swe-bench-live-invocation.v2")
             self.assertEqual(metadata["instance_id"], instance_id)
-            self.assertEqual(metadata["method"], "carry")
+            self.assertEqual(metadata["harness"], "carry")
             self.assertEqual(metadata["images"], {"agent": agent_image, "evaluator": evaluator_image})
             self.assertNotIn(secret, json.dumps(metadata))
 
@@ -193,7 +195,7 @@ done
             (task / "task.json").write_text(json.dumps({"instance_id": "not-selected"}), encoding="utf-8")
             base = [
                 sys.executable, str(SCRIPT), "invoke", "--run-id", "review-4",
-                "--instance-id", "not-selected", "--method", "carry",
+                "--instance-id", "not-selected", "--harness", "carry",
                 "--task-dir", str(task), "--output-dir", str(output),
                 "--agent-image", "agent:latest",
                 "--evaluator-image", "evaluator:latest",

@@ -37,7 +37,7 @@ baseline = subprocess.check_output(
     ["git", "rev-parse", "HEAD"], cwd=workspace, text=True
 ).strip()
 
-if os.environ.get("AGENT_METHOD") == "pi":
+if os.environ.get("AGENT_HARNESS") == "pi":
     config = pathlib.Path(os.environ["HOME"]) / ".pi" / "agent"
     config.mkdir(parents=True, exist_ok=True)
     models = {
@@ -64,7 +64,7 @@ trace_path = output / "trace.log"
 agent_env = os.environ.copy()
 with trace_path.open("w", encoding="utf-8") as trace:
     returncode = 0
-    if os.environ.get("AGENT_METHOD") == "codex":
+    if os.environ.get("AGENT_HARNESS") == "codex":
         try:
             login = subprocess.run(
                 [os.environ.get("CODEX_BINARY", "codex"), "login", "--with-api-key"],

@@ -35,15 +35,16 @@ status, and the two pinned image references.
 The existing default-branch workflow has only `workflow_dispatch`, uses the protected
 `swe-bench` Environment, and preserves credential-free `bootstrap` as its default.
 `smoke-5` resolves and archives the requested commit before AWS authentication, then
-runs exactly the first five frozen IDs across three methods. It fails artifact validation
-unless all 15 records exist, including explicit failed records with empty patches.
+runs exactly the first five frozen IDs with the selected harness. It fails artifact
+validation unless all five records exist, including explicit failed records with empty
+patches. Comparing multiple harnesses requires separate workflow dispatches.
 
 The `invoke` command is worker-side code. A future reviewed extension to the
 existing EC2 dispatcher must copy it to the short-lived worker and invoke it
 there; the dispatcher must terminate the instance after the slot/lane finishes.
 No self-hosted or persistent GitHub runner is permitted.
 
-The worker builds each run-local method image once. Carry is built from the archived
+The worker builds only the selected run-local harness image. Carry is built from the archived
 commit; Codex is fixed at `@openai/codex@0.147.0`; Pi is fixed at
 `@earendil-works/pi-coding-agent@0.84.2`. Reviewed Node 22.19 and Rust base images are
 pinned by manifest digest. The noninteractive command adapters are versioned with this
@@ -59,4 +60,4 @@ all `OPENAI_*` variables removed and may use only host Docker and canonical task
 Do not expand to the full 50 until smoke data establishes instance sizing, wall time,
 token spend, evaluator image/cache pressure, and safe URL/job timeouts. A 50-task design
 also needs reviewed concurrency and artifact aggregation while retaining the exact
-150-record denominator and no selective retry/replacement policy.
+50-record per-dispatch denominator and no selective retry/replacement policy.

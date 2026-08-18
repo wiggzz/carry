@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavior tests for the run-scoped method image adapter."""
+"""Behavior tests for the run-scoped harness image adapter."""
 import os
 import pathlib
 import re
@@ -8,10 +8,10 @@ import tempfile
 import unittest
 
 
-ENTRYPOINT = pathlib.Path(__file__).parents[1] / "containers" / "swebench-method" / "entrypoint.py"
+ENTRYPOINT = pathlib.Path(__file__).parents[1] / "containers" / "swebench-harness" / "entrypoint.py"
 
 
-class MethodEntrypointTests(unittest.TestCase):
+class HarnessEntrypointTests(unittest.TestCase):
     def test_codex_logs_in_from_stdin_then_removes_key_from_agent_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -41,7 +41,7 @@ class MethodEntrypointTests(unittest.TestCase):
             env = dict(
                 os.environ,
                 OPENAI_API_KEY="unit-test-secret",
-                AGENT_METHOD="codex",
+                AGENT_HARNESS="codex",
                 CODEX_BINARY=str(login),
                 LOGIN_CAPTURE=str(capture),
                 AGENT_COMMAND=f"python3 {agent} {{prompt_text}}",

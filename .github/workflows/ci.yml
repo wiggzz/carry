@@ -84,7 +84,7 @@ jobs:
           scripts/test_swebench_benchmark.py
           scripts/test_swebench_live_runner.py
           scripts/test_swebench_smoke.py
-          scripts/test_swebench_method_entrypoint.py
+          scripts/test_swebench_harness_entrypoint.py
           scripts/test_swebench_ec2_worker.py
           scripts/test_docker_registry_login.py
           scripts/test_presign_s3.py

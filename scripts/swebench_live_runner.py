@@ -114,11 +114,11 @@ def build_manifest(*, run_id: str, preset: str = "selected-50") -> dict[str, Any
     else:
         raise ValueError("preset must be smoke-5 or selected-50")
     slots = [
-        {"ordinal": ordinal, "instance_id": instance_id, "method": method}
-        for ordinal, (instance_id, method) in enumerate(
-            (instance_id, method)
+        {"ordinal": ordinal, "instance_id": instance_id, "harness": harness}
+        for ordinal, (instance_id, harness) in enumerate(
+            (instance_id, harness)
             for instance_id in instance_ids
-            for method in benchmark.METHODS
+            for harness in benchmark.HARNESSES
         )
     ]
     benchmark.validate_merged_records(
@@ -126,14 +126,14 @@ def build_manifest(*, run_id: str, preset: str = "selected-50") -> dict[str, Any
         slots,
     )
     return {
-        "schema": "carry.swe-bench-live-plan.v1",
+        "schema": "carry.swe-bench-live-plan.v2",
         "run_id": run_id,
         "preset": preset,
         "selection": str(benchmark.DEFAULT_SELECTION.relative_to(ROOT)),
         "selection_sha256": benchmark.sha256_file(benchmark.DEFAULT_SELECTION),
         "task_count": len(instance_ids),
         "instance_ids": instance_ids,
-        "methods": list(benchmark.METHODS),
+        "harnesses": list(benchmark.HARNESSES),
         "record_count": len(slots),
         "slots": slots,
         "boundaries": build_boundaries(),
@@ -155,15 +155,15 @@ def _docker_base(*, task_dir: pathlib.Path, output_dir: pathlib.Path) -> list[st
     ]
 
 
-def invoke(*, run_id: str, instance_id: str, method: str, task_dir: pathlib.Path,
+def invoke(*, run_id: str, instance_id: str, harness: str, task_dir: pathlib.Path,
            output_dir: pathlib.Path, agent_image: str, evaluator_image: str,
            docker_command: str = "docker") -> None:
-    """Run one selected task/method through distinct external containers."""
+    """Run one selected task/harness through distinct external containers."""
     build_manifest(run_id=run_id)  # Revalidate the frozen 50 x 3 denominator.
     if instance_id not in benchmark.load_selection():
         raise ValueError("instance ID is not in the frozen selected-50 denominator")
-    if method not in benchmark.METHODS:
-        raise ValueError("method is not in the reviewed method denominator")
+    if harness not in benchmark.HARNESSES:
+        raise ValueError("harness is not in the reviewed harness denominator")
     _validate_image(agent_image)
     _validate_image(evaluator_image)
     if not os.environ.get("OPENAI_API_KEY"):
@@ -185,7 +185,7 @@ def invoke(*, run_id: str, instance_id: str, method: str, task_dir: pathlib.Path
         docker_command,
         *_docker_base(task_dir=task_dir, output_dir=agent_output),
         "--env", "OPENAI_API_KEY",
-        agent_image, "run", "--method", method, "--instance-id", instance_id,
+        agent_image, "run", "--harness", harness, "--instance-id", instance_id,
     ]
     subprocess.run(agent_command, check=True)
 
@@ -207,10 +207,10 @@ def invoke(*, run_id: str, instance_id: str, method: str, task_dir: pathlib.Path
     evaluator_env = {key: value for key, value in os.environ.items() if key != "OPENAI_API_KEY"}
     subprocess.run(evaluator_command, check=True, env=evaluator_env)
     metadata = {
-        "schema": "carry.swe-bench-live-invocation.v1",
+        "schema": "carry.swe-bench-live-invocation.v2",
         "run_id": run_id,
         "instance_id": instance_id,
-        "method": method,
+        "harness": harness,
         "selection_sha256": benchmark.sha256_file(benchmark.DEFAULT_SELECTION),
         "images": {"agent": agent_image, "evaluator": evaluator_image},
         "status": "containers-completed",
@@ -227,10 +227,10 @@ def main() -> int:
     plan_parser.add_argument("--run-id", required=True)
     plan_parser.add_argument("--preset", choices=("smoke-5", "selected-50"), default="selected-50")
     plan_parser.add_argument("--output", type=pathlib.Path, required=True)
-    invoke_parser = commands.add_parser("invoke", help="run one reviewed task/method on a disposable Docker worker")
+    invoke_parser = commands.add_parser("invoke", help="run one reviewed task/harness on a disposable Docker worker")
     invoke_parser.add_argument("--run-id", required=True)
     invoke_parser.add_argument("--instance-id", required=True)
-    invoke_parser.add_argument("--method", choices=benchmark.METHODS, required=True)
+    invoke_parser.add_argument("--harness", choices=benchmark.HARNESSES, required=True)
     invoke_parser.add_argument("--task-dir", type=pathlib.Path, required=True)
     invoke_parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     invoke_parser.add_argument("--agent-image", required=True)
@@ -245,7 +245,7 @@ def main() -> int:
             args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         else:
             invoke(
-                run_id=args.run_id, instance_id=args.instance_id, method=args.method,
+                run_id=args.run_id, instance_id=args.instance_id, harness=args.harness,
                 task_dir=args.task_dir, output_dir=args.output_dir,
                 agent_image=args.agent_image, evaluator_image=args.evaluator_image,
                 docker_command=args.docker_command,

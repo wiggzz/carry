@@ -17,7 +17,7 @@ from typing import Any, Iterable
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_SELECTION = ROOT / "benchmarks" / "swe-bench-verified-50.json"
 DEFAULT_VERIFIED_CONFIG = ROOT / "benchmarks" / "swe-bench-verified.json"
-METHODS = ("carry", "codex", "pi")
+HARNESSES = ("carry", "codex", "pi")
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -82,34 +82,34 @@ def select_shard(tasks: list[dict[str, Any]], index: int, count: int) -> list[di
 
 
 def validate_merged_records(
-    tasks: list[dict[str, Any]], records: Iterable[dict[str, Any]], methods: tuple[str, ...] = METHODS
+    tasks: list[dict[str, Any]], records: Iterable[dict[str, Any]], harnesses: tuple[str, ...] = HARNESSES
 ) -> None:
     task_ids = [task.get("instance_id") for task in tasks]
     if any(not isinstance(instance_id, str) or not instance_id for instance_id in task_ids):
         raise ValueError("task input contains an invalid instance ID")
     if len(set(task_ids)) != len(task_ids):
         raise ValueError("task input contains a duplicate task ID")
-    if len(set(methods)) != len(methods):
-        raise ValueError("method input contains a duplicate method")
-    expected = {(instance_id, method) for instance_id in task_ids for method in methods}
+    if len(set(harnesses)) != len(harnesses):
+        raise ValueError("harness input contains a duplicate harness")
+    expected = {(instance_id, harness) for instance_id in task_ids for harness in harnesses}
     actual: list[tuple[str, str]] = []
     for record in records:
         if not isinstance(record, dict):
             raise ValueError("record input must be an object")
-        instance_id, method = record.get("instance_id"), record.get("method")
+        instance_id, harness = record.get("instance_id"), record.get("harness")
         if not isinstance(instance_id, str) or not instance_id:
             raise ValueError("record input contains an invalid instance_id")
-        if not isinstance(method, str) or not method:
-            raise ValueError("record input contains an invalid method")
-        actual.append((instance_id, method))
+        if not isinstance(harness, str) or not harness:
+            raise ValueError("record input contains an invalid harness")
+        actual.append((instance_id, harness))
     counts = Counter(actual)
     if len(actual) != len(expected) or set(actual) != expected or any(count != 1 for count in counts.values()):
         raise ValueError(
-            f"expected exactly {len(expected)} unique task/method records; got {len(actual)} records and {len(set(actual))} unique pairs"
+            f"expected exactly {len(expected)} unique task/harness records; got {len(actual)} records and {len(set(actual))} unique pairs"
         )
 
 
-def plan(selection: pathlib.Path, shard_index: int, shard_count: int, methods: tuple[str, ...]) -> dict[str, Any]:
+def plan(selection: pathlib.Path, shard_index: int, shard_count: int, harnesses: tuple[str, ...]) -> dict[str, Any]:
     ids = load_selection(selection)
     tasks = [{"instance_id": instance_id} for instance_id in ids]
     shard = select_shard(tasks, shard_index, shard_count)
@@ -119,7 +119,7 @@ def plan(selection: pathlib.Path, shard_index: int, shard_count: int, methods: t
         "task_count": len(ids),
         "shard_index": shard_index,
         "shard_count": shard_count,
-        "methods": list(methods),
+        "harnesses": list(harnesses),
         "instance_ids": [task["instance_id"] for task in shard],
     }
 
@@ -132,14 +132,14 @@ def main() -> int:
     parser.add_argument("--selection", type=pathlib.Path, default=DEFAULT_SELECTION)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--shard-count", type=int, default=5)
-    parser.add_argument("--method", choices=METHODS, action="append", dest="methods")
+    parser.add_argument("--harness", choices=HARNESSES, action="append", dest="harnesses")
     parser.add_argument("--records", type=pathlib.Path, action="append", default=[])
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
-    methods = tuple(args.methods or METHODS)
+    harnesses = tuple(args.harnesses or HARNESSES)
 
     if args.plan:
-        payload = plan(args.selection, args.shard_index, args.shard_count, methods)
+        payload = plan(args.selection, args.shard_index, args.shard_count, harnesses)
     else:
         records: list[dict[str, Any]] = []
         for path in args.records:
@@ -148,12 +148,12 @@ def main() -> int:
                 raise ValueError(f"{path} does not contain a JSON record array")
             records.extend(loaded)
         tasks = [{"instance_id": instance_id} for instance_id in load_selection(args.selection)]
-        validate_merged_records(tasks, records, methods)
+        validate_merged_records(tasks, records, harnesses)
         payload = {
             "selection": str(args.selection),
             "selection_sha256": sha256_file(args.selection),
             "task_count": len(tasks),
-            "methods": list(methods),
+            "harnesses": list(harnesses),
             "records": records,
         }
     args.output.parent.mkdir(parents=True, exist_ok=True)

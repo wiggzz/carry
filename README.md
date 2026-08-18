@@ -107,19 +107,21 @@ publishing pipeline or additional protected configuration is needed.
 
 Dispatch the workflow on the reviewed branch and use that same branch in `carry_ref`;
 the workflow checks out the dispatch event's immutable commit and rejects a different
-candidate ref. Leave `mode=bootstrap` for the canary, choose `smoke-5` for the first
-five frozen IDs (15 mandatory records), or choose `official-50` for all 50 frozen IDs
-across Carry/Codex/Pi (150 mandatory records). Apply the Terraform change that raises
+candidate ref. Leave `mode=bootstrap` for the canary, then select one `harness`
+(`carry`, `codex`, or `pi`). Choose `smoke-5` for the first five frozen IDs
+(5 mandatory records), or choose `official-50` for all 50 frozen IDs
+(50 mandatory records). Dispatch separate runs when comparing multiple harnesses. Apply
+the Terraform change that raises
 the protected dispatch role's maximum session to six hours before dispatching the
 official mode. Automation never applies Terraform.
 
-The official mode uses one disposable worker and builds each run-local method image
-once. It executes five ordered ten-task agent shards at concurrency three, removes each
+The official mode uses one disposable worker and builds the selected run-local harness
+image once. It executes five ordered ten-task agent shards at concurrency three, removes each
 shard's working checkouts after patch capture, deletes the model key before grading,
-and evaluates each method in ten-task shards with `swebench==4.1.0`. It writes the full
-150-slot `not-run` checkpoint before image builds and checkpoints after every agent and
+and evaluates the selected harness in ten-task shards with `swebench==4.1.0`. It writes the full
+50-slot `not-run` checkpoint before image builds and checkpoints after every agent and
 evaluator shard, so infrastructure failure cannot silently shrink the denominator. Carry's
-aggregate Responses API retry count is copied into each slot record and method summary.
+aggregate Responses API retry count is copied into each slot record and harness summary.
 Each agent slot remains capped at six minutes. The limit is also passed into each named
 agent container; host-side cleanup retries and verifies exact-container absence, failing
 the worker closed if Docker cannot prove it stopped. Official execution reserves 190
@@ -135,13 +137,13 @@ All limits, model-derived pricing, and image identities are recorded in provenan
 looked up by exact model ID in the reviewed benchmark code and accounts separately for ordinary
 input, cache reads, cache writes, and output; unknown models report cost as unavailable. The workflow
 streams deduplicated slot start/completion/grading events from the worker's EC2 console and
-publishes the final method and per-slot performance/time/token/cost table in the GitHub run
+publishes the final harness and per-slot performance/time/token/cost table in the GitHub run
 summary. The same data remains in `records.json`, `report.json`, and `report.md` in the artifact.
 
 The smoke uses one-hour S3 capabilities. During the longer official mode, the protected
 controller rotates exact-run presigned control/result capabilities every 25 minutes;
 the zero-permission worker receives only those opaque capabilities and never AWS
-credentials. The workflow uploads a `swebench-<mode>-*` artifact containing predictions,
+credentials. The workflow uploads a `swebench-<mode>-<harness>-*` artifact containing predictions,
 all slot metadata/traces, official outputs, canonical records, and the report. Both live
 modes incur EC2, model-token, storage, and image-build costs.
 
@@ -160,7 +162,7 @@ python3 scripts/swebench_live_runner.py plan --run-id review-1 --output live-pla
 
 It fixes the denominator at 50 tasks × Carry/Codex/Pi = 150 records and records
 distinct external agent/evaluator container contracts. A manual protected
-workflow can invoke one selected task/method with digest-pinned external
+workflow can invoke one selected task/harness with digest-pinned external
 containers. It forwards `OPENAI_API_KEY` only to the agent by environment name;
 the evaluator gets neither that key nor model configuration or agent output.
 The selected-50 planning and 150-record denominator remain unchanged. Official execution

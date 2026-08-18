@@ -10,9 +10,9 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/*.sources \
     && apt-get install -y --no-install-recommends ca-certificates git python3 python3-pip python3-venv ripgrep \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /source/target/release/carry /usr/local/bin/carry
-COPY containers/swebench-method/entrypoint.py /usr/local/bin/swebench-method
-RUN chmod 0555 /usr/local/bin/swebench-method
+COPY containers/swebench-harness/entrypoint.py /usr/local/bin/swebench-harness
+RUN chmod 0555 /usr/local/bin/swebench-harness
 # The adapter enforces AGENT_TIMEOUT_SECONDS across the complete task. Keep
 # Carry's optional --max-steps unset so trajectory shape cannot end a task.
 ENV AGENT_COMMAND="carry --cwd /workspace --session-dir {output} --model {model} -p {prompt_text}"
-ENTRYPOINT ["/usr/local/bin/swebench-method"]
+ENTRYPOINT ["/usr/local/bin/swebench-harness"]

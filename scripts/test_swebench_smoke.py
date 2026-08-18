@@ -37,13 +37,45 @@ class SmokeWorkerTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 self.worker.validate_config(bad)
 
+    def test_selected_harness_defaults_to_carry_and_rejects_unknown(self):
+        self.assertEqual(self.worker.selected_harnesses({}), ("carry",))
+        for harness in ("carry", "codex", "pi"):
+            with self.subTest(harness=harness):
+                self.assertEqual(
+                    self.worker.selected_harnesses({"BENCHMARK_HARNESS": harness}),
+                    (harness,),
+                )
+        with self.assertRaisesRegex(ValueError, "BENCHMARK_HARNESS"):
+            self.worker.selected_harnesses({"BENCHMARK_HARNESS": "all"})
+
+    def test_run_cli_forwards_the_selected_harness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            argv = [
+                "swebench_smoke.py",
+                "--run",
+                "--source",
+                str(root / "source"),
+                "--work",
+                str(root / "work"),
+                "--output",
+                str(root / "output"),
+                "--harness",
+                "pi",
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                self.worker, "execute_benchmark"
+            ) as execute:
+                self.assertEqual(self.worker.main(), 0)
+            self.assertEqual(execute.call_args.kwargs["config"]["BENCHMARK_HARNESS"], "pi")
+
     def test_agent_command_mounts_only_workspace_prompt_and_output_and_key_by_name(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             for name in ("repo", "input", "output"):
                 (root / name).mkdir()
             command = self.worker.agent_docker_command(
-                image="smoke-codex:run", method="codex", repo=root / "repo",
+                image="smoke-codex:run", harness="codex", repo=root / "repo",
                 task_input=root / "input", output=root / "output", model="gpt-5.6-luna",
                 reasoning="medium", container_name="carry-agent-codex-test",
                 agent_timeout_seconds=315,
@@ -62,11 +94,47 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertIn("/agent-home:rw", rendered)
             self.assertIn("/tmp:rw", rendered)
 
+    def test_finalize_accepts_one_selected_harness_as_the_exact_denominator(self):
+        tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
+        records = [
+            {
+                "instance_id": task["instance_id"],
+                "harness": "carry",
+                "status": "evaluated",
+                "patch": "",
+            }
+            for task in tasks
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            self.worker.finalize(
+                tasks=tasks,
+                records=records,
+                output=output,
+                provenance={},
+                harnesses=("carry",),
+            )
+            report = json.loads((output / "report.json").read_text())
+            self.assertEqual(report["denominator"], 5)
+            self.assertEqual(set(report["harnesses"]), {"carry"})
+            self.assertEqual(len(json.loads((output / "records.json").read_text())), 5)
+
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(
+            ValueError, "5 unique"
+        ):
+            self.worker.finalize(
+                tasks=tasks,
+                records=records + [{**records[0], "harness": "codex"}],
+                output=pathlib.Path(directory),
+                provenance={},
+                harnesses=("carry",),
+            )
+
     def test_finalize_preserves_failed_slots_and_writes_official_predictions(self):
         tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
         slots = [
-            {"instance_id": task["instance_id"], "method": method, "status": "agent-failed", "patch": "", "error": "failed"}
-            for task in tasks for method in ("carry", "codex", "pi")
+            {"instance_id": task["instance_id"], "harness": harness, "status": "agent-failed", "patch": "", "error": "failed"}
+            for task in tasks for harness in ("carry", "codex", "pi")
         ]
         slots[0].update(status="evaluated", patch="diff --git a/a b/a\n", resolved=True, error=None)
         with tempfile.TemporaryDirectory() as directory:
@@ -82,8 +150,8 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertEqual(report["denominator"], 15)
             self.assertEqual(report["completed"], 1)
             self.assertEqual(report["resolved"], 1)
-            self.assertEqual(report["methods"]["carry"]["resolved"], 1)
-            self.assertEqual(report["methods"]["codex"]["statuses"], {"agent-failed": 5})
+            self.assertEqual(report["harnesses"]["carry"]["resolved"], 1)
+            self.assertEqual(report["harnesses"]["codex"]["statuses"], {"agent-failed": 5})
             summary = (output / "report.md").read_text()
             self.assertIn("Denominator: 15", summary)
             self.assertIn("Completed: 1", summary)
@@ -150,11 +218,11 @@ class SmokeWorkerTests(unittest.TestCase):
         tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
         records = []
         for task_number, task in enumerate(tasks):
-            for index, method in enumerate(("carry", "codex", "pi"), 1):
+            for index, harness in enumerate(("carry", "codex", "pi"), 1):
                 records.append({
-                    "instance_id": task["instance_id"], "method": method, "status": "evaluated",
+                    "instance_id": task["instance_id"], "harness": harness, "status": "evaluated",
                     "patch": "", "error": None,
-                    "resolved": task_number == 0 and method == "carry",
+                    "resolved": task_number == 0 and harness == "carry",
                     "elapsed_seconds": index + 0.25 if task_number == 0 else 0,
                     "estimated_cost_usd": index / 10 if task_number == 0 else 0,
                     "usage": {"input_tokens": index * 10 if task_number == 0 else 0,
@@ -168,9 +236,9 @@ class SmokeWorkerTests(unittest.TestCase):
             output = pathlib.Path(directory)
             self.worker.finalize(tasks=tasks, records=records, output=output, provenance={})
             report = json.loads((output / "report.json").read_text())
-            self.assertEqual(report["methods"]["carry"]["elapsed_seconds"], 1.25)
-            self.assertEqual(report["methods"]["codex"]["usage"]["input_tokens"], 20)
-            self.assertEqual(report["methods"]["pi"]["estimated_cost_usd"], 0.3)
+            self.assertEqual(report["harnesses"]["carry"]["elapsed_seconds"], 1.25)
+            self.assertEqual(report["harnesses"]["codex"]["usage"]["input_tokens"], 20)
+            self.assertEqual(report["harnesses"]["pi"]["estimated_cost_usd"], 0.3)
             summary = (output / "report.md").read_text()
             self.assertIn("## Agent runs", summary)
             self.assertIn("| task-0 | carry | evaluated | yes | 1.250 | 12 | $0.100000 |", summary)
@@ -178,8 +246,8 @@ class SmokeWorkerTests(unittest.TestCase):
     def test_finalize_rejects_missing_duplicate_or_replaced_slots(self):
         tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
         records = [
-            {"instance_id": task["instance_id"], "method": method, "status": "failed", "patch": ""}
-            for task in tasks for method in ("carry", "codex", "pi")
+            {"instance_id": task["instance_id"], "harness": harness, "status": "failed", "patch": ""}
+            for task in tasks for harness in ("carry", "codex", "pi")
         ]
         for broken in (records[:-1], records[:-1] + [records[0]], records[:-1] + [{**records[-1], "instance_id": "replacement"}]):
             with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(ValueError, "15 unique"):
@@ -188,15 +256,15 @@ class SmokeWorkerTests(unittest.TestCase):
     def test_official_finalize_requires_exactly_150_slots(self):
         tasks = [{"instance_id": f"task-{number:02d}"} for number in range(50)]
         records = [
-            {"instance_id": task["instance_id"], "method": method, "status": "agent-failed", "patch": ""}
-            for task in tasks for method in ("carry", "codex", "pi")
+            {"instance_id": task["instance_id"], "harness": harness, "status": "agent-failed", "patch": ""}
+            for task in tasks for harness in ("carry", "codex", "pi")
         ]
         with tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory)
             self.worker.finalize(tasks=tasks, records=records, output=output, provenance={})
             report = json.loads((output / "report.json").read_text())
             self.assertEqual(report["denominator"], 150)
-            self.assertEqual({method: values["denominator"] for method, values in report["methods"].items()}, {
+            self.assertEqual({harness: values["denominator"] for harness, values in report["harnesses"].items()}, {
                 "carry": 50, "codex": 50, "pi": 50,
             })
             self.assertEqual(len(json.loads((output / "records.json").read_text())), 150)
@@ -257,7 +325,7 @@ class SmokeWorkerTests(unittest.TestCase):
             "evaluation-error",
         )
 
-    def test_official_execution_builds_once_runs_five_agent_shards_and_grades_150_slots(self):
+    def test_official_execution_builds_once_runs_five_agent_shards_and_grades_selected_harness(self):
         frozen = [f"task-{number:02d}" for number in range(50)]
         dataset = [
             {"instance_id": instance_id, "repo": "owner/repo", "base_commit": "a" * 40,
@@ -268,23 +336,23 @@ class SmokeWorkerTests(unittest.TestCase):
         materialized_shards = []
         evaluation_shards = []
 
-        def fake_materialize(*, records, selected_ids, root, clone):
+        def fake_materialize(*, records, selected_ids, root, clone, harnesses):
             materialized_shards.append(list(selected_ids))
             tasks = []
             for instance_id in selected_ids:
                 task = {"instance_id": instance_id, "repo": "owner/repo", "base_commit": "a" * 40,
                         "problem_statement": f"problem {instance_id}"}
                 tasks.append(task)
-                for method in ("carry", "codex", "pi"):
-                    (root / "tasks" / instance_id / method / "repo").mkdir(parents=True)
+                for harness in harnesses:
+                    (root / "tasks" / instance_id / harness / "repo").mkdir(parents=True)
                 (root / "tasks" / instance_id / "input").mkdir(parents=True)
             return tasks
 
         def fake_agent(**kwargs):
-            return {"instance_id": kwargs["instance_id"], "method": kwargs["method"],
+            return {"instance_id": kwargs["instance_id"], "harness": kwargs["harness"],
                     "status": "agent-completed", "patch": "", "error": None,
                     "attempts": 1, "retries": 0,
-                    "response_retries": 2 if kwargs["method"] == "carry" else 0}
+                    "response_retries": 2 if kwargs["harness"] == "carry" else 0}
 
         def fake_evaluation(*, instance_ids, output, **kwargs):
             evaluation_shards.append(list(instance_ids))
@@ -296,7 +364,8 @@ class SmokeWorkerTests(unittest.TestCase):
             }))
 
         config = {
-            "BENCHMARK_MODE": "official-50", "RUN_ID": "official-test",
+            "BENCHMARK_MODE": "official-50", "BENCHMARK_HARNESS": "carry",
+            "RUN_ID": "official-test",
             "BASE_IMAGE": "node@sha256:" + "a" * 64,
             "CARRY_BASE_IMAGE": "rust@sha256:" + "b" * 64,
             "CODEX_VERSION": "1.2.3", "PI_VERSION": "0.84.2",
@@ -315,7 +384,7 @@ class SmokeWorkerTests(unittest.TestCase):
             with mock.patch.dict(sys.modules, {"datasets": fake_datasets}), \
                     mock.patch.object(self.worker, "materialize", side_effect=fake_materialize), \
                     mock.patch.object(self.worker, "build_images", return_value={
-                        method: {"tag": f"image:{method}"} for method in ("carry", "codex", "pi")
+                        "carry": {"tag": "image:carry"}
                     }) as build, \
                     mock.patch.object(self.worker, "run_agent", side_effect=fake_agent), \
                     mock.patch.object(self.worker, "run_official_evaluation", side_effect=fake_evaluation):
@@ -330,15 +399,16 @@ class SmokeWorkerTests(unittest.TestCase):
 
             self.assertEqual(build.call_count, 1)
             self.assertEqual([len(shard) for shard in materialized_shards], [10] * 5)
-            self.assertEqual(len(evaluation_shards), 15)
+            self.assertEqual(len(evaluation_shards), 5)
             self.assertTrue(all(len(shard) == 10 for shard in evaluation_shards))
             self.assertFalse(secret.exists())
             self.assertFalse((work / "agent-shards").exists())
             report = json.loads((output / "report.json").read_text())
-            self.assertEqual((report["denominator"], report["completed"]), (150, 150))
-            self.assertEqual(report["methods"]["carry"]["response_retries"], 100)
+            self.assertEqual((report["denominator"], report["completed"]), (50, 50))
+            self.assertEqual(set(report["harnesses"]), {"carry"})
+            self.assertEqual(report["harnesses"]["carry"]["response_retries"], 100)
 
-    def test_official_build_failure_still_preserves_all_150_planned_slots(self):
+    def test_official_build_failure_still_preserves_all_selected_planned_slots(self):
         frozen = [f"task-{number:02d}" for number in range(50)]
         dataset = [
             {"instance_id": instance_id, "repo": "owner/repo", "base_commit": "a" * 40,
@@ -346,7 +416,8 @@ class SmokeWorkerTests(unittest.TestCase):
             for instance_id in frozen
         ]
         config = {
-            "BENCHMARK_MODE": "official-50", "RUN_ID": "official-test",
+            "BENCHMARK_MODE": "official-50", "BENCHMARK_HARNESS": "carry",
+            "RUN_ID": "official-test",
             "BASE_IMAGE": "node@sha256:" + "a" * 64,
             "CARRY_BASE_IMAGE": "rust@sha256:" + "b" * 64,
             "CODEX_VERSION": "1.2.3", "PI_VERSION": "0.84.2",
@@ -368,7 +439,7 @@ class SmokeWorkerTests(unittest.TestCase):
                     )
             records = json.loads((output / "records.json").read_text())
             report = json.loads((output / "report.json").read_text())
-            self.assertEqual(len(records), 150)
+            self.assertEqual(len(records), 50)
             self.assertEqual({record["status"] for record in records}, {"not-run"})
             self.assertEqual(report["provenance"]["phase"], "planned")
 
@@ -379,7 +450,7 @@ class SmokeWorkerTests(unittest.TestCase):
                 (root / name).mkdir()
             with mock.patch.object(self.worker.subprocess, "run", side_effect=RuntimeError("agent stopped")) as run:
                 record = self.worker.run_agent(
-                    instance_id="task-1", method="codex", image="codex:run",
+                    instance_id="task-1", harness="codex", image="codex:run",
                     repo=root / "repo", task_input=root / "input", output=root / "output",
                     model="gpt-5.6-luna", reasoning="medium",
                 )
@@ -411,7 +482,7 @@ class SmokeWorkerTests(unittest.TestCase):
                     mock.patch.object(self.worker.time, "monotonic", side_effect=[10.0, 12.5]), \
                     mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as stdout:
                 record = self.worker.run_agent(
-                    instance_id="task-1", method="carry", image="carry:run",
+                    instance_id="task-1", harness="carry", image="carry:run",
                     repo=root / "repo", task_input=root / "input", output=root / "output",
                     model="gpt-5.6-luna", reasoning="medium", pricing=pricing,
                 )
@@ -442,7 +513,7 @@ class SmokeWorkerTests(unittest.TestCase):
 
             with mock.patch.object(self.worker.subprocess, "run", side_effect=fake_run):
                 record = self.worker.run_agent(
-                    instance_id="task-1", method="codex", image="codex:run",
+                    instance_id="task-1", harness="codex", image="codex:run",
                     repo=root / "repo", task_input=root / "input", output=root / "output",
                     model="gpt-5.6-luna", reasoning="medium", timeout_seconds=360,
                 )
@@ -479,7 +550,7 @@ class SmokeWorkerTests(unittest.TestCase):
                         self.worker.ContainerCleanupError, "could not prove container stopped"
                     ):
                 self.worker.run_agent(
-                    instance_id="task-1", method="carry", image="carry:run",
+                    instance_id="task-1", harness="carry", image="carry:run",
                     repo=root / "repo", task_input=root / "input", output=root / "output",
                     model="gpt-5.6-luna", reasoning="medium", timeout_seconds=10,
                 )
@@ -607,7 +678,35 @@ class SmokeWorkerTests(unittest.TestCase):
                     process_timeout_seconds=345,
                 )
 
-    def test_materialization_keeps_gold_data_out_of_agent_inputs_and_clones_per_method(self):
+    def test_materialization_clones_only_the_selected_harness(self):
+        selected = [f"task-{number}" for number in range(5)]
+        records = [
+            {
+                "instance_id": instance_id,
+                "repo": "owner/repo",
+                "base_commit": f"commit-{number}",
+                "problem_statement": f"problem {number}",
+            }
+            for number, instance_id in enumerate(selected)
+        ]
+        clones = []
+
+        def clone(repo, commit, destination):
+            clones.append((repo, commit, destination))
+            destination.mkdir(parents=True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.worker.materialize(
+                records=records,
+                selected_ids=selected,
+                root=pathlib.Path(directory),
+                clone=clone,
+                harnesses=("carry",),
+            )
+        self.assertEqual(len(clones), 5)
+        self.assertTrue(all(destination.parts[-2:] == ("carry", "repo") for _, _, destination in clones))
+
+    def test_materialization_keeps_gold_data_out_of_agent_inputs_and_clones_per_harness(self):
         selected = [f"task-{number}" for number in range(5)]
         records = [
             {"instance_id": instance_id, "repo": "owner/repo", "base_commit": f"commit-{number}",
@@ -631,7 +730,35 @@ class SmokeWorkerTests(unittest.TestCase):
             canonical = json.loads((root / "canonical-dataset.json").read_text())
             self.assertEqual(canonical, records)
 
-    def test_builds_each_method_once_and_records_local_image_identity(self):
+    def test_builds_only_the_selected_harness_image(self):
+        calls = []
+
+        def execute(command, **kwargs):
+            calls.append(command)
+            if command[:2] == ["docker", "image"]:
+                return mock.Mock(stdout="sha256:" + "c" * 64 + "\n")
+            return mock.Mock(stdout="")
+
+        config = {
+            "BASE_IMAGE": "node@sha256:" + "a" * 64,
+            "CARRY_BASE_IMAGE": "rust@sha256:" + "b" * 64,
+            "CODEX_VERSION": "1.2.3",
+            "PI_VERSION": "0.84.2",
+            "MODEL": "gpt-5.6-luna",
+            "REASONING": "medium",
+        }
+        provenance = self.worker.build_images(
+            source=SCRIPT.parents[1],
+            run_id="run1",
+            config=config,
+            execute=execute,
+            harnesses=("carry",),
+        )
+        builds = [command for command in calls if command[:2] == ["docker", "build"]]
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(set(provenance), {"carry"})
+
+    def test_builds_each_harness_once_and_records_local_image_identity(self):
         calls = []
         def execute(command, **kwargs):
             calls.append(command)

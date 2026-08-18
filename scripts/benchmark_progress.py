@@ -22,13 +22,13 @@ def load_seen(path: pathlib.Path) -> set[str]:
 
 def render(event: dict[str, object]) -> str | None:
     instance_id = event.get("instance_id")
-    method = event.get("method")
+    harness = event.get("harness")
     state = event.get("state")
     if (not isinstance(instance_id, str) or not SAFE_VALUE.fullmatch(instance_id)
-            or method not in ("carry", "codex", "pi")
+            or harness not in ("carry", "codex", "pi")
             or state not in ("started", "completed", "grading", "graded")):
         return None
-    prefix = f"[{method}] {instance_id} {state}"
+    prefix = f"[{harness}] {instance_id} {state}"
     if state in ("completed", "graded"):
         status = event.get("status")
         elapsed = event.get("elapsed_seconds")

@@ -15,6 +15,12 @@ on:
         default: bootstrap
         type: choice
         options: [bootstrap, smoke-5, official-50, cleanup]
+      harness:
+        description: Agent harness to run for smoke-5 or official-50
+        required: true
+        default: carry
+        type: choice
+        options: [carry, codex, pi]
       cleanup_run_id:
         description: Exact gh-RUN_ID-ATTEMPT to sanitize when mode=cleanup
         required: false
@@ -31,7 +37,7 @@ permissions:
 
 jobs:
   bootstrap-worker:
-    name: ${{ inputs.mode }} ${{ inputs.carry_ref }}
+    name: ${{ inputs.mode }} ${{ inputs.harness }} ${{ inputs.carry_ref }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     concurrency:
@@ -49,6 +55,7 @@ jobs:
       LAUNCH_TEMPLATE_VERSION: ${{ vars.BENCHMARK_WORKER_LAUNCH_TEMPLATE_VERSION }}
       BOOTSTRAP_WAIT_SECONDS: ${{ inputs.bootstrap_wait_seconds }}
       BENCHMARK_MODE: ${{ inputs.mode }}
+      BENCHMARK_HARNESS: ${{ inputs.harness }}
       MODEL: ${{ vars.BENCHMARK_MODEL || 'gpt-5.6-luna' }}
       REASONING: ${{ vars.BENCHMARK_REASONING || 'medium' }}
     steps:
@@ -152,6 +159,10 @@ jobs:
             for required in OPENAI_API_KEY DOCKERHUB_USERNAME DOCKERHUB_TOKEN MODEL REASONING; do
               [[ -n "${!required}" ]] || { echo "missing benchmark configuration: $required" >&2; exit 1; }
             done
+            [[ "$BENCHMARK_HARNESS" =~ ^(carry|codex|pi)$ ]] || {
+              echo "benchmark harness must be carry, codex, or pi" >&2
+              exit 1
+            }
           fi
           RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           ASSUMED=$(aws sts assume-role --role-arn "$ARTIFACT_SESSION_ROLE_ARN" \
@@ -239,6 +250,7 @@ jobs:
             printf 'SOURCE_SHA256=%q\n' "$SOURCE_SHA256"
             printf 'SOURCE_COMMIT=%q\n' "$SOURCE_COMMIT"
             printf 'BENCHMARK_MODE=%q\n' "$BENCHMARK_MODE"
+            printf 'BENCHMARK_HARNESS=%q\n' "$BENCHMARK_HARNESS"
             printf 'BOOTSTRAP_WAIT_SECONDS=%q\n' "$BOOTSTRAP_WAIT_SECONDS"
             printf 'RUN_ID=%q\n' "$RUN_ID"
             printf 'MODEL=%q\n' "$MODEL"
@@ -362,10 +374,10 @@ jobs:
           python3 - <<'PY'
           import json, os
           records=json.load(open('benchmark-artifact/records.json', encoding='utf-8'))
-          pairs={(r.get('instance_id'),r.get('method')) for r in records}
+          pairs={(r.get('instance_id'),r.get('harness')) for r in records}
           frozen=json.load(open('benchmarks/swe-bench-verified-50.json', encoding='utf-8'))['instance_ids']
           selected=frozen if os.environ['BENCHMARK_MODE']=='official-50' else frozen[:5]
-          expected={(instance_id, method) for instance_id in selected for method in ('carry','codex','pi')}
+          expected={(instance_id, os.environ['BENCHMARK_HARNESS']) for instance_id in selected}
           assert len(records)==len(expected) and pairs==expected, 'artifact does not contain exact fixed denominator'
           report=json.load(open('benchmark-artifact/report.json', encoding='utf-8'))
           assert report['denominator']==len(expected), 'canonical report denominator does not match records'
@@ -388,7 +400,7 @@ jobs:
         if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'official-50')
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
-          name: swebench-${{ inputs.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swebench-${{ inputs.mode }}-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: benchmark-artifact
           if-no-files-found: warn
           retention-days: 14
