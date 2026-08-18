@@ -15,8 +15,8 @@ on:
         default: bootstrap
         type: choice
         options: [bootstrap, smoke-5, official-50, cleanup]
-      method:
-        description: Agent method to run for smoke-5 or official-50
+      harness:
+        description: Agent harness to run for smoke-5 or official-50
         required: true
         default: carry
         type: choice
@@ -37,7 +37,7 @@ permissions:
 
 jobs:
   bootstrap-worker:
-    name: ${{ inputs.mode }} ${{ inputs.method }} ${{ inputs.carry_ref }}
+    name: ${{ inputs.mode }} ${{ inputs.harness }} ${{ inputs.carry_ref }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     concurrency:
@@ -55,7 +55,7 @@ jobs:
       LAUNCH_TEMPLATE_VERSION: ${{ vars.BENCHMARK_WORKER_LAUNCH_TEMPLATE_VERSION }}
       BOOTSTRAP_WAIT_SECONDS: ${{ inputs.bootstrap_wait_seconds }}
       BENCHMARK_MODE: ${{ inputs.mode }}
-      BENCHMARK_METHOD: ${{ inputs.method }}
+      BENCHMARK_METHOD: ${{ inputs.harness }}
       MODEL: ${{ vars.BENCHMARK_MODEL || 'gpt-5.6-luna' }}
       REASONING: ${{ vars.BENCHMARK_REASONING || 'medium' }}
     steps:
@@ -160,7 +160,7 @@ jobs:
               [[ -n "${!required}" ]] || { echo "missing benchmark configuration: $required" >&2; exit 1; }
             done
             [[ "$BENCHMARK_METHOD" =~ ^(carry|codex|pi)$ ]] || {
-              echo "benchmark method must be carry, codex, or pi" >&2
+              echo "benchmark harness must be carry, codex, or pi" >&2
               exit 1
             }
           fi
@@ -400,7 +400,7 @@ jobs:
         if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'official-50')
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
-          name: swebench-${{ inputs.mode }}-${{ inputs.method }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swebench-${{ inputs.mode }}-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: benchmark-artifact
           if-no-files-found: warn
           retention-days: 14
