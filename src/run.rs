@@ -25,7 +25,7 @@ const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an 
 
 At each step, select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. For regressions, inspect repository history and search cited identifiers and later fixes. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
 
-History is chronological, and context items carry an immutable [context integer stable|volatile] marker. The lifecycle label describes the neutral retention default, not the item's relevance: neutral stable context stays by default, while neutral volatile context remains in the recent working window but may be collected automatically under budget pressure. A volatile label is not an instruction to drop the item. Treat context as evidence and learning, not as a list of completed steps. The normal choice is neutral: leave an ID in neither keep nor drop when its future value is uncertain or ordinary. Mark keep when an item's exact details or an important learning may affect later work. Mark drop without remembering only when you learned nothing useful from the item, or when a newer retained result fully supersedes everything learned from it and the old information is no longer relevant. Do not drop merely because you consumed an item, completed its immediate action, changed course, or its command failed. Failures often establish important repository, environment, and approach constraints. Human messages are authoritative.
+History is chronological, and context items carry an immutable [context integer stable|volatile] marker. The lifecycle label describes the neutral retention default, not the item's relevance: neutral stable context stays by default, while neutral volatile context remains in the recent working window but may be collected automatically under budget pressure. A volatile label is not an instruction to drop the item. Treat context as evidence and learning, not as a list of completed steps. The normal choice is neutral: leave an ID in neither keep nor drop when its future value is uncertain or ordinary. Keep and drop set persistent retention state for the working context used by later model calls; they are state changes, not per-response labels. Emit an ID only when changing its current retention state; do not restate the same decision. Preserve the minimum evidence and learnings that a competent agent continuing from the remaining context would need to solve the task correctly without repeating work. Mark keep when an item's exact details or an important learning may affect later work. Mark drop without remembering only when you learned nothing useful from the item, or when a newer retained result fully supersedes everything learned from it and the old information is no longer relevant. Do not drop merely because you consumed an item, completed its immediate action, changed course, or its command failed. Failures often establish important repository, environment, and approach constraints. Human messages are authoritative.
 
 When useful learning remains but exact source details are no longer needed, preserve one concise outcome with remember and drop the source. Use keep instead when exact source details may matter again. Do not duplicate an existing memory or kept item; when newer evidence supersedes a memory, drop the old memory and remember the updated conclusion. Preserve outcomes, not chain-of-thought.
 
@@ -1090,6 +1090,16 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("repository history"));
         assert!(SYSTEM_PROMPT.contains("search cited identifiers"));
         assert!(SYSTEM_PROMPT.contains("affected tests"));
+    }
+
+    #[test]
+    fn system_prompt_frames_retention_signals_as_persistent_state_changes() {
+        assert!(SYSTEM_PROMPT.contains("persistent retention state"));
+        assert!(SYSTEM_PROMPT.contains("state changes, not per-response labels"));
+        assert!(SYSTEM_PROMPT.contains("only when changing its current retention state"));
+        assert!(SYSTEM_PROMPT.contains("do not restate the same decision"));
+        assert!(SYSTEM_PROMPT.contains("competent agent continuing from the remaining context"));
+        assert!(SYSTEM_PROMPT.contains("minimum evidence and learnings"));
     }
 
     #[test]
