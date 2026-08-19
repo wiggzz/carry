@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
     time::Instant,
@@ -11,19 +11,23 @@ use serde_json::json;
 use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc, time::Duration};
 
 use crate::{
-    context::{CompactionKind, CompactionPolicy, ContextState},
+    context::{CompactionPolicy, ContextState, PricedBreakpoint, RenderedBreakpoint},
     log::RunLogger,
-    openai::{ModelReply, OpenAiClient, Usage},
+    openai::{ModelReply, OpenAiClient, PromptCacheCapabilities, Usage},
     protocol::{ActionKind, Step},
 };
+
+// Initial policy hypothesis: keep a meaningful recent working set while leaving ample room in
+// the model context. Hysteresis compacts this 32 Ki-token high-water mark toward 24 Ki tokens.
+const NEUTRAL_VOLATILE_BUDGET_TOKENS: usize = 32 * 1024;
 
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
 At each step, select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. For regressions, inspect repository history and search cited identifiers and later fixes. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
 
-History is chronological, and tool results end with an immutable [integer stable|volatile] marker. Stable items stay by default; mark drop only when a stable item is no longer useful. Volatile items may be removed unless marked keep, so keep a volatile item while its exact details still matter. Signals are sparse advice, not immediate commands. Human messages are authoritative.
+History is chronological, and context items carry an immutable [context integer stable|volatile] marker. The lifecycle label describes the neutral retention default, not the item's relevance: neutral stable context stays by default, while neutral volatile context remains in the recent working window but may be collected automatically under budget pressure. A volatile label is not an instruction to drop the item. Treat context as evidence and learning, not as a list of completed steps. The normal choice is neutral: leave an ID in neither keep nor drop when its future value is uncertain or ordinary. Keep and drop set persistent retention state for the working context used by later model calls; they are state changes, not per-response labels. Emit an ID only when changing its current retention state; do not restate the same decision. Preserve the minimum evidence and learnings that a competent agent continuing from the remaining context would need to solve the task correctly without repeating work. Mark keep when an item's exact details or an important learning may affect later work. Mark drop without remembering only when you learned nothing useful from the item, or when a newer retained result fully supersedes everything learned from it and the old information is no longer relevant. Do not drop merely because you consumed an item, completed its immediate action, changed course, or its command failed. Failures often establish important repository, environment, and approach constraints. Human messages are authoritative.
 
-Use remember instead of keep when only a small durable fact matters in a large volatile tool result and retaining the whole interaction would be wasteful. The memory gets its own stable ID, so do not also keep the source. Keep memories concise and preserve outcomes, not chain-of-thought.
+When useful learning remains but exact source details are no longer needed, preserve one concise outcome with remember and drop the source. Use keep instead when exact source details may matter again. Do not duplicate an existing memory or kept item; when newer evidence supersedes a memory, drop the old memory and remember the updated conclusion. Preserve outcomes, not chain-of-thought.
 
 Large text shell results arrive as structured `output_head` and `output_tail` previews with an absolute `full_output_path`. Non-text output is omitted from the model payload and available only through its artifact paths. Read or slice those session files when omitted details matter.
 
@@ -97,8 +101,7 @@ struct RunMetrics {
     usage: Usage,
     model_latency_ms: u64,
     response_retries: usize,
-    minor_compactions: usize,
-    major_compactions: usize,
+    compactions: usize,
 }
 
 impl RunMetrics {
@@ -122,55 +125,172 @@ impl RunMetrics {
         self.response_retries = self.response_retries.saturating_add(response_retries);
     }
 
-    fn record_compaction(&mut self, kind: CompactionKind) {
-        match kind {
-            CompactionKind::Minor => {
-                self.minor_compactions = self.minor_compactions.saturating_add(1)
-            }
-            CompactionKind::Major => {
-                self.major_compactions = self.major_compactions.saturating_add(1)
-            }
-        }
+    fn record_compaction(&mut self) {
+        self.compactions = self.compactions.saturating_add(1);
     }
+}
+
+#[derive(Debug, Default)]
+struct CacheTracker {
+    capabilities: Option<PromptCacheCapabilities>,
+    implicit_activity: Option<Instant>,
+    implicit_cached_tokens: usize,
+    implicit_prefix: Vec<serde_json::Value>,
+    breakpoints: HashMap<u64, TrackedBreakpoint>,
+    pending: Vec<RenderedBreakpoint>,
+    pending_request_tokens: usize,
+    pending_history: Vec<serde_json::Value>,
 }
 
 #[derive(Debug)]
-struct CacheTracker {
-    implicit_activity: Option<Instant>,
-    stable_checkpoint_activity: Option<Instant>,
-    checkpoint_pending: bool,
-}
-
-impl Default for CacheTracker {
-    fn default() -> Self {
-        Self {
-            implicit_activity: None,
-            stable_checkpoint_activity: None,
-            checkpoint_pending: true,
-        }
-    }
+struct TrackedBreakpoint {
+    prefix_tokens: usize,
+    cached_tokens: usize,
+    activity: Option<Instant>,
 }
 
 impl CacheTracker {
-    fn observe(&mut self, usage: &Usage) {
-        let now = Instant::now();
-        let cache_activity = usage.cached_input_tokens > 0 || usage.cache_write_input_tokens > 0;
-        if cache_activity {
-            self.implicit_activity = Some(now);
-        }
-        if self.checkpoint_pending {
-            self.stable_checkpoint_activity = cache_activity.then_some(now);
-            self.checkpoint_pending = false;
-        } else if usage.cached_input_tokens > 0 {
-            self.stable_checkpoint_activity = Some(now);
+    fn new(capabilities: Option<PromptCacheCapabilities>) -> Self {
+        Self {
+            capabilities,
+            ..Self::default()
         }
     }
 
-    fn policy(&self) -> CompactionPolicy {
+    #[cfg(test)]
+    fn begin_request(&mut self, breakpoints: Vec<RenderedBreakpoint>) {
+        self.begin_request_with_tokens(breakpoints, 0);
+    }
+
+    #[cfg(test)]
+    fn begin_request_with_tokens(
+        &mut self,
+        breakpoints: Vec<RenderedBreakpoint>,
+        request_tokens: usize,
+    ) {
+        self.begin_request_with_history(breakpoints, &[], request_tokens);
+    }
+
+    fn begin_request_with_history(
+        &mut self,
+        breakpoints: Vec<RenderedBreakpoint>,
+        history: &[serde_json::Value],
+        request_tokens: usize,
+    ) {
+        for breakpoint in &breakpoints {
+            self.breakpoints
+                .entry(breakpoint.generation)
+                .and_modify(|tracked| tracked.prefix_tokens = breakpoint.prefix_tokens)
+                .or_insert(TrackedBreakpoint {
+                    prefix_tokens: breakpoint.prefix_tokens,
+                    cached_tokens: 0,
+                    activity: None,
+                });
+        }
+        self.pending = breakpoints;
+        self.pending_request_tokens = request_tokens;
+        self.pending_history = history.to_vec();
+    }
+
+    fn observe(&mut self, usage: &Usage) {
+        let Some(capabilities) = self.capabilities else {
+            self.pending.clear();
+            self.pending_request_tokens = 0;
+            self.pending_history.clear();
+            return;
+        };
         let now = Instant::now();
+        let cache_activity = usage.cached_input_tokens > 0 || usage.cache_write_input_tokens > 0;
+        if cache_activity && self.pending_request_tokens >= capabilities.minimum_prefix_tokens {
+            self.implicit_activity = Some(now);
+            self.implicit_cached_tokens = self.pending_request_tokens;
+            self.implicit_prefix.clone_from(&self.pending_history);
+        }
+        let readable = self
+            .pending
+            .iter()
+            .rev()
+            .take(capabilities.max_read_breakpoints)
+            .filter(|breakpoint| breakpoint.prefix_tokens <= usage.cached_input_tokens as usize)
+            .filter(|breakpoint| {
+                self.breakpoints
+                    .get(&breakpoint.generation)
+                    .is_some_and(|tracked| cache_alive(tracked.activity, now))
+            })
+            .max_by_key(|breakpoint| breakpoint.prefix_tokens)
+            .map(|breakpoint| breakpoint.generation);
+        if let Some(generation) = readable
+            && let Some(tracked) = self.breakpoints.get_mut(&generation)
+        {
+            tracked.activity = Some(now);
+        }
+
+        if usage.cache_write_input_tokens > 0 {
+            let explicit_write_slots =
+                capabilities
+                    .max_write_breakpoints
+                    .saturating_sub(usize::from(
+                        capabilities.implicit_breakpoint_uses_write_slot,
+                    ));
+            for breakpoint in self
+                .pending
+                .iter()
+                .filter(|breakpoint| breakpoint.prefix_tokens >= capabilities.minimum_prefix_tokens)
+                .rev()
+                .take(explicit_write_slots)
+            {
+                let tracked = self
+                    .breakpoints
+                    .get_mut(&breakpoint.generation)
+                    .expect("pending breakpoints are tracked");
+                tracked.cached_tokens = breakpoint.prefix_tokens;
+                tracked.activity = Some(now);
+            }
+        }
+        self.pending.clear();
+        self.pending_request_tokens = 0;
+        self.pending_history.clear();
+    }
+
+    #[cfg(test)]
+    fn policy(&self) -> CompactionPolicy {
+        self.policy_with_implicit_compatibility(true)
+    }
+
+    fn policy_for_history(&self, history: &[serde_json::Value]) -> CompactionPolicy {
+        self.policy_with_implicit_compatibility(history.starts_with(&self.implicit_prefix))
+    }
+
+    fn policy_with_implicit_compatibility(
+        &self,
+        implicit_prefix_compatible: bool,
+    ) -> CompactionPolicy {
+        let now = Instant::now();
+        let mut breakpoints = self
+            .breakpoints
+            .iter()
+            .filter(|(_, tracked)| cache_alive(tracked.activity, now))
+            .map(|(generation, tracked)| PricedBreakpoint {
+                generation: *generation,
+                cached_tokens: tracked.cached_tokens,
+            })
+            .collect::<Vec<_>>();
+        breakpoints.sort_by_key(|breakpoint| breakpoint.generation);
+        let max_read_breakpoints = self
+            .capabilities
+            .map_or(0, |capabilities| capabilities.max_read_breakpoints);
+        if breakpoints.len() > max_read_breakpoints {
+            breakpoints.drain(..breakpoints.len() - max_read_breakpoints);
+        }
         CompactionPolicy {
-            implicit_cache_alive: cache_alive(self.implicit_activity, now),
-            stable_cache_alive: cache_alive(self.stable_checkpoint_activity, now),
+            implicit_cached_tokens: if implicit_prefix_compatible
+                && cache_alive(self.implicit_activity, now)
+            {
+                self.implicit_cached_tokens
+            } else {
+                0
+            },
+            breakpoints,
         }
     }
 
@@ -179,9 +299,13 @@ impl CacheTracker {
             .is_some_and(|activity| activity.elapsed() >= CACHE_TTL)
     }
 
-    fn mark_compaction(&mut self) {
+    fn mark_compaction(&mut self, invalidated_generations: &[u64]) {
         self.implicit_activity = None;
-        self.checkpoint_pending = true;
+        self.implicit_cached_tokens = 0;
+        self.implicit_prefix.clear();
+        for generation in invalidated_generations {
+            self.breakpoints.remove(generation);
+        }
     }
 }
 
@@ -213,6 +337,13 @@ impl Backend {
             bail!("scripted steps file is empty: {}", path.display());
         }
         Ok(Self::Scripted { steps, emitted: 0 })
+    }
+
+    fn prompt_cache_capabilities(&self) -> Option<PromptCacheCapabilities> {
+        match self {
+            Self::OpenAi(client) => client.prompt_cache_capabilities(),
+            Self::Scripted { .. } => None,
+        }
     }
 
     fn request_body(&self, history: &[serde_json::Value]) -> Option<serde_json::Value> {
@@ -265,6 +396,7 @@ async fn run_loop(
     mut input: Option<mpsc::UnboundedReceiver<UserInput>>,
 ) -> Result<RunOutcome> {
     let run_started = Instant::now();
+    let prompt_cache_capabilities = backend.prompt_cache_capabilities();
     tokio::fs::create_dir_all(config.session_dir.join("tools")).await?;
     let mut logger = RunLogger::create(&config.session_dir)?;
     logger.raw_event(
@@ -275,14 +407,18 @@ async fn run_loop(
             "model": config.model,
             "max_steps": config.max_steps,
             "cache_ttl_seconds": CACHE_TTL.as_secs(),
+            "prompt_cache_capabilities": prompt_cache_capabilities,
             "compaction_decision": "next_request"
         }),
         &format!("carry · {} · {}", config.model, config.cwd.display()),
     )?;
 
-    let mut context_state = ContextState::new(config.prompt.clone());
+    let mut context_state = ContextState::new_with_max_read_breakpoints(
+        config.prompt.clone(),
+        prompt_cache_capabilities.map_or(0, |capabilities| capabilities.max_read_breakpoints),
+    );
     let mut metrics = RunMetrics::default();
-    let mut cache = CacheTracker::default();
+    let mut cache = CacheTracker::new(prompt_cache_capabilities);
     let mut step_index = 0;
     let mut turn_step = 0;
     let mut protected_until_request = Vec::new();
@@ -325,6 +461,11 @@ async fn run_loop(
         step_index += 1;
         turn_step += 1;
         let history = context_state.input_items();
+        cache.begin_request_with_history(
+            context_state.rendered_breakpoints(),
+            &history,
+            context_state.estimated_tokens(),
+        );
         protected_until_request.clear();
         let request = backend.request_body(&history);
         logger.raw_event_silent(
@@ -508,22 +649,29 @@ fn maybe_compact(
     logger: &mut RunLogger,
     trigger: &str,
 ) -> Result<bool> {
-    let Some(plan) = state.plan_compaction(protected, cache.policy()) else {
+    let policy = cache.policy_for_history(&state.input_items());
+    let Some(plan) = state.plan_compaction_with_neutral_budget(
+        protected,
+        policy,
+        NEUTRAL_VOLATILE_BUDGET_TOKENS,
+    ) else {
         return Ok(false);
     };
     let change = state.compact(plan);
-    cache.mark_compaction();
-    metrics.record_compaction(change.kind);
+    cache.mark_compaction(&change.invalidated_generations);
+    metrics.record_compaction();
     logger.raw_event(
         "context_compacted",
         json!({"trigger": trigger, "compaction": &change}),
         &format!(
-            "  compact {} · -{} items / ~{} tok · {} retained · {} rewritten · next request saves ~{} input-equivalent tok",
-            change.kind.label(),
+            "  compact · -{} items / ~{} tok · {} retained · {} rewritten · reuse {} · invalidate {} generations / {} cached tok · next request saves ~{} input-equivalent tok",
             change.dropped.len(),
             compact_number(change.dropped_tokens as u64),
             compact_number(change.retained_tokens as u64),
             compact_number(change.rewrite_tokens as u64),
+            change.reused_generation.map_or_else(|| "cold".to_owned(), |generation| generation.to_string()),
+            change.invalidated_generations.len(),
+            compact_number(change.invalidated_cache_tokens as u64),
             compact_number(change.estimated_savings_input_units.round().max(0.0) as u64),
         ),
     )?;
@@ -854,10 +1002,7 @@ async fn write_final_artifacts(
         "usage": &metrics.usage,
         "model_latency_ms": metrics.model_latency_ms,
         "response_retries": metrics.response_retries,
-        "compactions": {
-            "minor": metrics.minor_compactions,
-            "major": metrics.major_compactions
-        },
+        "compactions": metrics.compactions,
         "elapsed_ms": elapsed_ms
     });
     tokio::fs::write(
@@ -871,6 +1016,73 @@ async fn write_final_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openai::PromptCacheCapabilities;
+
+    fn openai_cache_capabilities() -> PromptCacheCapabilities {
+        PromptCacheCapabilities {
+            minimum_prefix_tokens: 1_024,
+            max_read_breakpoints: 50,
+            max_write_breakpoints: 4,
+            implicit_breakpoint_uses_write_slot: true,
+        }
+    }
+
+    #[test]
+    fn tracker_respects_resolved_minimum_and_write_slots() {
+        let mut cache = CacheTracker::new(Some(PromptCacheCapabilities {
+            minimum_prefix_tokens: 2_000,
+            max_read_breakpoints: 7,
+            max_write_breakpoints: 2,
+            implicit_breakpoint_uses_write_slot: true,
+        }));
+        cache.begin_request(vec![
+            RenderedBreakpoint {
+                generation: 0,
+                prefix_tokens: 1_999,
+            },
+            RenderedBreakpoint {
+                generation: 1,
+                prefix_tokens: 2_100,
+            },
+            RenderedBreakpoint {
+                generation: 2,
+                prefix_tokens: 2_200,
+            },
+        ]);
+        cache.observe(&Usage {
+            cache_write_input_tokens: 9_000,
+            ..Usage::default()
+        });
+
+        assert_eq!(
+            cache.policy().breakpoints,
+            vec![PricedBreakpoint {
+                generation: 2,
+                cached_tokens: 2_200,
+            }]
+        );
+    }
+
+    #[test]
+    fn unknown_cache_capabilities_disable_cache_assumptions() {
+        let mut cache = CacheTracker::new(None);
+        cache.begin_request_with_tokens(
+            vec![RenderedBreakpoint {
+                generation: 1,
+                prefix_tokens: 4_000,
+            }],
+            4_000,
+        );
+        cache.observe(&Usage {
+            cached_input_tokens: 4_000,
+            cache_write_input_tokens: 4_000,
+            ..Usage::default()
+        });
+
+        let policy = cache.policy();
+        assert_eq!(policy.implicit_cached_tokens, 0);
+        assert!(policy.breakpoints.is_empty());
+    }
 
     #[test]
     fn system_prompt_requires_reproduction_and_history_checks() {
@@ -878,6 +1090,16 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("repository history"));
         assert!(SYSTEM_PROMPT.contains("search cited identifiers"));
         assert!(SYSTEM_PROMPT.contains("affected tests"));
+    }
+
+    #[test]
+    fn system_prompt_frames_retention_signals_as_persistent_state_changes() {
+        assert!(SYSTEM_PROMPT.contains("persistent retention state"));
+        assert!(SYSTEM_PROMPT.contains("state changes, not per-response labels"));
+        assert!(SYSTEM_PROMPT.contains("only when changing its current retention state"));
+        assert!(SYSTEM_PROMPT.contains("do not restate the same decision"));
+        assert!(SYSTEM_PROMPT.contains("competent agent continuing from the remaining context"));
+        assert!(SYSTEM_PROMPT.contains("minimum evidence and learnings"));
     }
 
     #[test]
@@ -1013,18 +1235,192 @@ mod tests {
     }
 
     #[test]
-    fn cached_reads_refresh_the_stable_checkpoint_ttl() {
-        let mut cache = CacheTracker {
-            implicit_activity: None,
-            stable_checkpoint_activity: Some(Instant::now() - CACHE_TTL),
-            checkpoint_pending: false,
-        };
+    fn policy_prices_the_exact_previous_implicit_prefix() {
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+        cache.begin_request_with_tokens(Vec::new(), 2_400);
         cache.observe(&Usage {
-            cached_input_tokens: 10,
+            cache_write_input_tokens: 2_400,
             ..Usage::default()
         });
 
-        assert!(cache.policy().stable_cache_alive);
+        assert_eq!(cache.policy().implicit_cached_tokens, 2_400);
+    }
+
+    #[test]
+    fn policy_rejects_a_mutated_previous_implicit_prefix() {
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+        let original = vec![json!({"role": "user", "content": "original"})];
+        cache.begin_request_with_history(Vec::new(), &original, 2_400);
+        cache.observe(&Usage {
+            cache_write_input_tokens: 2_400,
+            ..Usage::default()
+        });
+
+        let extended = vec![
+            json!({"role": "user", "content": "original"}),
+            json!({"type": "function_call_output", "output": "new"}),
+        ];
+        assert_eq!(
+            cache.policy_for_history(&extended).implicit_cached_tokens,
+            2_400
+        );
+        let mutated = vec![json!({"role": "user", "content": "changed"})];
+        assert_eq!(cache.policy_for_history(&mutated).implicit_cached_tokens, 0);
+    }
+
+    #[test]
+    fn eligible_explicit_breakpoint_writes_are_tracked_by_generation() {
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+        cache.begin_request(vec![
+            RenderedBreakpoint {
+                generation: 0,
+                prefix_tokens: 1_023,
+            },
+            RenderedBreakpoint {
+                generation: 1,
+                prefix_tokens: 1_200,
+            },
+            RenderedBreakpoint {
+                generation: 2,
+                prefix_tokens: 1_400,
+            },
+        ]);
+        cache.observe(&Usage {
+            cache_write_input_tokens: 7_200,
+            ..Usage::default()
+        });
+
+        let mut priced = cache.policy().breakpoints;
+        priced.sort_by_key(|breakpoint| breakpoint.generation);
+        assert_eq!(
+            priced,
+            vec![
+                PricedBreakpoint {
+                    generation: 1,
+                    cached_tokens: 1_200,
+                },
+                PricedBreakpoint {
+                    generation: 2,
+                    cached_tokens: 1_400,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn one_explicit_write_is_not_divided_with_the_implicit_slot() {
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+        cache.begin_request(vec![RenderedBreakpoint {
+            generation: 1,
+            prefix_tokens: 1_200,
+        }]);
+        cache.observe(&Usage {
+            cache_write_input_tokens: 1_200,
+            ..Usage::default()
+        });
+
+        assert_eq!(
+            cache.policy().breakpoints,
+            vec![PricedBreakpoint {
+                generation: 1,
+                cached_tokens: 1_200,
+            }]
+        );
+    }
+
+    #[test]
+    fn implicit_slot_limits_explicit_writes_to_latest_three_generations() {
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+        cache.begin_request(
+            (0..4)
+                .map(|generation| RenderedBreakpoint {
+                    generation,
+                    prefix_tokens: 1_100,
+                })
+                .collect(),
+        );
+        cache.observe(&Usage {
+            cache_write_input_tokens: 8_000,
+            ..Usage::default()
+        });
+
+        let mut generations = cache
+            .policy()
+            .breakpoints
+            .iter()
+            .map(|breakpoint| breakpoint.generation)
+            .collect::<Vec<_>>();
+        generations.sort_unstable();
+        assert_eq!(generations, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn planner_prices_only_the_resolved_number_of_readable_breakpoints() {
+        let now = Instant::now();
+        let cache = CacheTracker {
+            capabilities: Some(PromptCacheCapabilities {
+                max_read_breakpoints: 2,
+                ..openai_cache_capabilities()
+            }),
+            implicit_activity: Some(now),
+            implicit_cached_tokens: 1_500,
+            implicit_prefix: Vec::new(),
+            breakpoints: (0..3)
+                .map(|generation| {
+                    (
+                        generation,
+                        TrackedBreakpoint {
+                            prefix_tokens: 1_200,
+                            cached_tokens: 1_100,
+                            activity: Some(now),
+                        },
+                    )
+                })
+                .collect(),
+            pending: Vec::new(),
+            pending_request_tokens: 0,
+            pending_history: Vec::new(),
+        };
+
+        let mut generations = cache
+            .policy()
+            .breakpoints
+            .iter()
+            .map(|breakpoint| breakpoint.generation)
+            .collect::<Vec<_>>();
+        generations.sort_unstable();
+        assert_eq!(generations, vec![1, 2]);
+    }
+
+    #[test]
+    fn aggregate_reads_do_not_resurrect_an_expired_generation() {
+        let mut cache = CacheTracker {
+            capabilities: Some(openai_cache_capabilities()),
+            implicit_activity: None,
+            implicit_cached_tokens: 0,
+            implicit_prefix: Vec::new(),
+            breakpoints: HashMap::from([(
+                7,
+                TrackedBreakpoint {
+                    prefix_tokens: 1_200,
+                    cached_tokens: 1_100,
+                    activity: Some(Instant::now() - CACHE_TTL),
+                },
+            )]),
+            pending: Vec::new(),
+            pending_request_tokens: 0,
+            pending_history: Vec::new(),
+        };
+        cache.begin_request(vec![RenderedBreakpoint {
+            generation: 7,
+            prefix_tokens: 1_200,
+        }]);
+        cache.observe(&Usage {
+            cached_input_tokens: 2_048,
+            ..Usage::default()
+        });
+
+        assert!(cache.policy().breakpoints.is_empty());
     }
 
     #[tokio::test]
@@ -1136,8 +1532,7 @@ mod tests {
         assert_eq!(result["usage"]["output_tokens"], 0);
         assert_eq!(result["model_latency_ms"], 0);
         assert_eq!(result["response_retries"], 0);
-        assert_eq!(result["compactions"]["minor"], 0);
-        assert_eq!(result["compactions"]["major"], 0);
+        assert_eq!(result["compactions"], 0);
         assert!(result["elapsed_ms"].is_u64());
     }
 
@@ -1214,6 +1609,11 @@ mod tests {
         )
         .unwrap();
         assert!(result["steps_limit"].is_null());
+        assert_eq!(result["compactions"], 0);
+        let trace_jsonl = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap();
+        assert!(!trace_jsonl.contains("context_compacted"));
         let trace = tokio::fs::read_to_string(session_dir.join("trace.log"))
             .await
             .unwrap();
@@ -1326,7 +1726,7 @@ mod tests {
                 item["type"] == "function_call_output"
                     && item["output"]
                         .as_str()
-                        .is_some_and(|output| output.ends_with("[2 volatile]"))
+                        .is_some_and(|output| output.ends_with("[context 2 volatile]"))
             })
             .unwrap();
         let steering = history
@@ -1336,7 +1736,7 @@ mod tests {
         assert!(tool_result < steering);
         assert_eq!(
             history[steering + 1]["content"][0]["text"],
-            "[3 user stable]"
+            "[context 3 stable]"
         );
     }
 }
