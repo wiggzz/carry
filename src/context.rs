@@ -212,6 +212,14 @@ impl ContextState {
     }
 
     fn render_items(items: &[ContextItem], breakpoint_frontiers: &[u64]) -> Vec<Value> {
+        Self::render_items_through(items, breakpoint_frontiers, None)
+    }
+
+    fn render_items_through(
+        items: &[ContextItem],
+        breakpoint_frontiers: &[u64],
+        through: Option<u64>,
+    ) -> Vec<Value> {
         let present = items.iter().map(|item| item.id).collect::<HashSet<_>>();
         let mut input = Vec::new();
         for item in items {
@@ -257,6 +265,9 @@ impl ContextState {
                         input.push(cache_frontier_marker());
                     }
                 }
+            }
+            if through == Some(item.id) {
+                break;
             }
         }
         input
@@ -623,18 +634,38 @@ impl ContextState {
             }
         }
         self.generation = self.generation.saturating_add(1);
-        let item_ids = self.items.iter().map(|item| item.id).collect::<Vec<_>>();
-        let mut frontiers = self.compatible_breakpoint_frontiers(&self.items);
-        if let Some(frontier) = item_ids.last().copied() {
-            frontiers.push(frontier);
+        let stable_frontier = self.stable_frontier_id();
+        if let Some(frontier) = stable_frontier {
+            let prefix_len = self
+                .items
+                .iter()
+                .position(|item| item.id == frontier)
+                .expect("stable frontier belongs to retained context")
+                + 1;
+            let item_ids = self
+                .items
+                .iter()
+                .take(prefix_len)
+                .map(|item| item.id)
+                .collect::<Vec<_>>();
+            let prefix_ids = item_ids.iter().copied().collect::<HashSet<_>>();
+            let mut frontiers = self
+                .compatible_breakpoint_frontiers(&self.items)
+                .into_iter()
+                .filter(|candidate| prefix_ids.contains(candidate))
+                .collect::<Vec<_>>();
+            if !frontiers.contains(&frontier) {
+                frontiers.push(frontier);
+            }
+            let rendered_prefix =
+                Self::render_items_through(&self.items, &frontiers, Some(frontier));
+            self.breakpoints.push(StoredBreakpoint {
+                generation: self.generation,
+                item_ids,
+                marker_frontiers: frontiers,
+                rendered_prefix,
+            });
         }
-        let rendered_prefix = Self::render_items(&self.items, &frontiers);
-        self.breakpoints.push(StoredBreakpoint {
-            generation: self.generation,
-            item_ids,
-            marker_frontiers: frontiers,
-            rendered_prefix,
-        });
 
         ContextChange {
             dropped: plan.dropped,
@@ -1317,6 +1348,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.dropped, vec![old_tool, new_tool]);
+    }
+
+    #[test]
+    fn compaction_generation_reuses_the_stable_frontier_after_dropping_its_volatile_tail() {
+        let mut state = ContextState::new("initial ".repeat(800));
+        let disposable = add_tool_with_output(&mut state, &"old ".repeat(100));
+        let volatile_tail = add_tool_with_output(&mut state, &"tail ".repeat(2_000));
+        state.record_signals(
+            &update(&[], &[disposable], &["durable outcome"]),
+            volatile_tail,
+        );
+
+        let first_plan = state
+            .plan_compaction_with_neutral_budget(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                },
+                usize::MAX,
+            )
+            .unwrap();
+        assert_eq!(
+            first_plan
+                .neutral_retained
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![volatile_tail]
+        );
+        let first_change = state.compact(first_plan);
+        assert_eq!(first_change.stable_frontier, Some(1));
+
+        state.record_signals(&update(&[], &[volatile_tail], &[]), volatile_tail);
+        let second_plan = state
+            .plan_compaction_with_neutral_budget(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: vec![PricedBreakpoint {
+                        generation: first_change.generation,
+                        cached_tokens: 1_200,
+                    }],
+                },
+                usize::MAX,
+            )
+            .unwrap();
+
+        assert_eq!(second_plan.dropped, vec![volatile_tail]);
+        assert_eq!(second_plan.reused_generation, Some(first_change.generation));
+        assert!(second_plan.rewrite_tokens < second_plan.retained_tokens);
     }
 
     #[test]
