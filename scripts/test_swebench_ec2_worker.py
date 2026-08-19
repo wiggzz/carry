@@ -72,6 +72,83 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             self.assertIn("python3.11", packages)
             self.assertNotIn("curl", packages)
 
+    def test_official_worker_launches_runner_with_bounded_evaluator_concurrency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            payload = root / "payload"
+            (payload / "scripts").mkdir(parents=True)
+            archive = root / "source.tar.gz"
+            with tarfile.open(archive, "w:gz") as stream:
+                stream.add(payload / "scripts", arcname="scripts")
+
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            for command in ("dnf", "systemctl"):
+                path = fake_bin / command
+                path.write_text("#!/bin/sh\nexit 0\n")
+                path.chmod(0o755)
+
+            curl = fake_bin / "curl"
+            curl.write_text(
+                "#!/bin/sh\n"
+                "output=\n"
+                "while [ $# -gt 0 ]; do\n"
+                "  if [ \"$1\" = -o ]; then output=$2; shift 2; continue; fi\n"
+                "  shift\n"
+                "done\n"
+                "if [ \"$output\" = \"$CARRY_ROOT/source.tar.gz\" ]; then\n"
+                "  cp \"$FAKE_SOURCE_ARCHIVE\" \"$output\"\n"
+                "else\n"
+                "  printf fake > \"$output\"\n"
+                "fi\n"
+            )
+            curl.chmod(0o755)
+
+            python = fake_bin / "python3"
+            python.write_text(
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = -m ] && [ \"${2:-}\" = venv ]; then\n"
+                "  mkdir -p \"$3/bin\"\n"
+                "  printf '#!/bin/sh\\nexit 0\\n' > \"$3/bin/pip\"\n"
+                "  chmod +x \"$3/bin/pip\"\n"
+                "  exit 0\n"
+                "fi\n"
+                "case \"$*\" in\n"
+                "  *swebench_smoke.py*)\n"
+                "    printf 'evaluator=%s\\nmode=%s\\n' \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" > \"$FAKE_RUNNER_ENV\";;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            python.chmod(0o755)
+
+            carry_root = root / "worker"
+            runner_env = root / "runner.env"
+            capability = base64.b64encode(b"https://example.invalid/object").decode()
+            env = dict(
+                os.environ,
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                SOURCE_URL_B64=capability,
+                KEY_URL_B64=capability,
+                DOCKER_AUTH_URL_B64=capability,
+                RESULT_URL_B64="",
+                SOURCE_SHA256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+                SOURCE_COMMIT="a" * 40,
+                BENCHMARK_MODE="official-50",
+                BENCHMARK_HARNESS="carry",
+                BOOTSTRAP_WAIT_SECONDS="1",
+                RUN_ID="gh-test-2",
+                CARRY_ROOT=str(carry_root),
+                SECRET_FILE=str(root / "secret"),
+                PYTHON_BIN="python3",
+                SKIP_SHUTDOWN="1",
+                FAKE_SOURCE_ARCHIVE=str(archive),
+                FAKE_RUNNER_ENV=str(runner_env),
+            )
+            run = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
+
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(runner_env.read_text(), "evaluator=5\nmode=official-50\n")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

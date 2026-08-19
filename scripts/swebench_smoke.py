@@ -324,7 +324,10 @@ def cleanup_evaluator_containers(run_id: str) -> None:
 def run_official_evaluation(*, predictions: pathlib.Path, canonical_dataset: pathlib.Path,
                             instance_ids: list[str], run_id: str, output: pathlib.Path,
                             environment: Mapping[str, str] | None = None,
-                            process_timeout_seconds: int | None = None) -> None:
+                            process_timeout_seconds: int | None = None,
+                            max_workers: int = 5) -> None:
+    if max_workers < 1 or max_workers > 5:
+        raise ValueError("evaluator max_workers must be between 1 and 5")
     env = dict(environment if environment is not None else os.environ)
     for key in list(env):
         if key.startswith("OPENAI_"):
@@ -334,7 +337,7 @@ def run_official_evaluation(*, predictions: pathlib.Path, canonical_dataset: pat
         "--dataset_name", str(canonical_dataset),
         "--split", "test", "--predictions_path", str(predictions),
         "--run_id", run_id, "--report_dir", str(output),
-        "--max_workers", os.environ.get("EVALUATOR_CONCURRENCY", "5"),
+        "--max_workers", str(max_workers),
         "--timeout", os.environ.get("EVALUATOR_TIMEOUT_SECONDS", "300"),
         # Every harness grades the same frozen task set on one disposable worker.
         # Keep per-instance images so later harnesses reuse the first harness's build.
@@ -415,6 +418,25 @@ def status_for_official_outcome(instance_id: str, outcomes: Mapping[str, set[str
     if instance_id in outcomes["error_ids"]:
         return "evaluation-error"
     return "evaluation-incomplete"
+
+
+def official_evaluation_unknowns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unknown_statuses = {"evaluation-error", "evaluation-incomplete", "evaluator-failed"}
+    return sorted(
+        (record for record in records if record.get("status") in unknown_statuses),
+        key=lambda record: (record["instance_id"], record["harness"]),
+    )
+
+
+def require_complete_official_evaluations(records: list[dict[str, Any]]) -> None:
+    unknown = official_evaluation_unknowns(records)
+    if unknown:
+        slots = ", ".join(
+            f"{record['instance_id']}/{record['harness']}" for record in unknown
+        )
+        raise RuntimeError(
+            f"official evaluation incomplete for {len(unknown)} slots: {slots}"
+        )
 
 
 def _clone(repo: str, commit: str, destination: pathlib.Path, mirror: pathlib.Path | None = None) -> None:
@@ -646,8 +668,10 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         (source / "benchmarks" / "swe-bench-verified-50.json").read_text(encoding="utf-8")
     )["instance_ids"]
     selection = selection_for_mode(frozen_ids, mode)
-    shard_size = 5 if mode == "smoke-5" else 10
-    selection_shards = ordered_shards(selection, shard_size)
+    agent_shard_size = 5 if mode == "smoke-5" else 10
+    evaluator_shard_size = 5
+    agent_shards = ordered_shards(selection, agent_shard_size)
+    evaluator_shards = ordered_shards(selection, evaluator_shard_size)
 
     from datasets import load_dataset  # installed only on the disposable worker
     dataset = load_dataset(DATASET, split="test", revision=DATASET_REVISION)
@@ -666,10 +690,10 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         raise ValueError("AGENT_CONCURRENCY must be between 1 and 5")
     agent_timeout = int(config.get("AGENT_TIMEOUT_SECONDS", "360"))
     evaluator_timeout = int(config.get("EVALUATOR_TIMEOUT_SECONDS", "300"))
-    evaluator_concurrency = int(config.get("EVALUATOR_CONCURRENCY", "10" if mode == "official-50" else "5"))
+    evaluator_concurrency = int(config.get("EVALUATOR_CONCURRENCY", "5"))
     if mode == "official-50" and (
             concurrency != 3 or agent_timeout != 360
-            or evaluator_timeout != 300 or evaluator_concurrency != 10):
+            or evaluator_timeout != 300 or evaluator_concurrency != 5):
         raise ValueError("official mode requires fixed agent/evaluator timing and concurrency limits")
 
     provenance_payload = {
@@ -699,10 +723,10 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     execution_limits: dict[str, Any] = {
         "agent_timeout_seconds": agent_timeout,
         "agent_concurrency": concurrency,
-        "agent_shard_size": shard_size,
+        "agent_shard_size": agent_shard_size,
         "evaluator_timeout_seconds": evaluator_timeout,
         "evaluator_concurrency": evaluator_concurrency,
-        "evaluator_shard_size": shard_size,
+        "evaluator_shard_size": evaluator_shard_size,
     }
     if phase_limits is not None:
         execution_limits["phase_budgets"] = phase_limits
@@ -729,7 +753,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
             mirrors[repo] = mirror
         _clone(repo, commit, destination, mirrors[repo])
 
-    for shard_index, shard_ids in enumerate(selection_shards):
+    for shard_index, shard_ids in enumerate(agent_shards):
         shard_root = work / "agent-shards" / f"{shard_index:02d}"
         shard_tasks = materialize(
             records=all_records, selected_ids=shard_ids, root=shard_root, clone=clone_one,
@@ -800,9 +824,9 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     evaluation_budget_exhausted = False
     official_root = output / "official"
     for harness in harnesses:
-        for shard_index, shard_ids in enumerate(selection_shards):
+        for shard_index, shard_ids in enumerate(evaluator_shards):
             report_dir = official_root / harness
-            if len(selection_shards) > 1:
+            if len(evaluator_shards) > 1:
                 report_dir = report_dir / f"shard-{shard_index:02d}"
             prediction_file = report_dir / "predictions.jsonl"
             prediction_file.parent.mkdir(parents=True, exist_ok=True)
@@ -828,6 +852,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                     instance_ids=shard_ids,
                     run_id=f"{config['RUN_ID']}-{harness}-{shard_index:02d}", output=report_dir,
                     process_timeout_seconds=process_timeout,
+                    max_workers=evaluator_concurrency,
                 )
                 outcomes = load_official_report(report_dir)
                 validate_official_outcomes(outcomes, shard_ids)
@@ -847,7 +872,8 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                     "state": "graded", "status": record["status"],
                 }, sort_keys=True), flush=True)
             finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
-    provenance_payload["phase"] = "complete"
+    evaluation_unknown = official_evaluation_unknowns(records)
+    provenance_payload["phase"] = "incomplete" if evaluation_unknown else "complete"
     finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
     for record in records:
         slot = output / "slots" / record["instance_id"] / record["harness"]
@@ -861,6 +887,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         if evaluation_budget_exhausted:
             exhausted.append("evaluation")
         raise RuntimeError(f"official {' and '.join(exhausted)} phase budget exhausted")
+    require_complete_official_evaluations(records)
 
 
 def main() -> int:

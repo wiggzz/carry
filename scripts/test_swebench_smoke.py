@@ -289,7 +289,7 @@ class SmokeWorkerTests(unittest.TestCase):
             limits["agent_seconds"] + limits["evaluation_seconds"] + limits["setup_reserve_seconds"],
             limits["worker_seconds"],
         )
-        evaluator_worst_case = 15 * (300 + 45)  # Leave global orchestration margin.
+        evaluator_worst_case = 10 * (300 + 45)  # Ten five-task evaluator shards.
         self.assertLess(evaluator_worst_case, limits["evaluation_seconds"])
         self.assertEqual(150 * 360 // 3, limits["worker_seconds"])
         self.assertLess(limits["agent_seconds"], 150 * 360 // 3)
@@ -325,7 +325,21 @@ class SmokeWorkerTests(unittest.TestCase):
             "evaluation-error",
         )
 
-    def test_official_execution_builds_once_runs_five_agent_shards_and_grades_selected_harness(self):
+    def test_official_completion_fails_closed_on_unknown_evaluator_outcomes(self):
+        records = [
+            {"instance_id": "resolved", "harness": "carry", "status": "evaluated"},
+            {"instance_id": "empty", "harness": "carry", "status": "empty-patch"},
+            {"instance_id": "error", "harness": "carry", "status": "evaluation-error"},
+            {"instance_id": "missing", "harness": "carry", "status": "evaluation-incomplete"},
+            {"instance_id": "failed", "harness": "carry", "status": "evaluator-failed"},
+        ]
+        with self.assertRaisesRegex(
+                RuntimeError, "official evaluation incomplete for 3 slots.*error.*failed.*missing"):
+            self.worker.require_complete_official_evaluations(records)
+
+        self.worker.require_complete_official_evaluations(records[:2])
+
+    def test_official_execution_uses_five_task_evaluator_shards(self):
         frozen = [f"task-{number:02d}" for number in range(50)]
         dataset = [
             {"instance_id": instance_id, "repo": "owner/repo", "base_commit": "a" * 40,
@@ -387,7 +401,11 @@ class SmokeWorkerTests(unittest.TestCase):
                         "carry": {"tag": "image:carry"}
                     }) as build, \
                     mock.patch.object(self.worker, "run_agent", side_effect=fake_agent), \
-                    mock.patch.object(self.worker, "run_official_evaluation", side_effect=fake_evaluation):
+                    mock.patch.object(self.worker, "run_official_evaluation", side_effect=fake_evaluation), \
+                    mock.patch.object(
+                        self.worker, "require_complete_official_evaluations",
+                        wraps=self.worker.require_complete_official_evaluations,
+                    ) as require_complete:
                 with mock.patch.dict(os.environ, {
                     "OPENAI_API_KEY": "not-a-real-key", "OPENAI_SECRET_FILE": str(secret),
                 }, clear=False):
@@ -398,15 +416,21 @@ class SmokeWorkerTests(unittest.TestCase):
                     self.assertNotIn("OPENAI_SECRET_FILE", os.environ)
 
             self.assertEqual(build.call_count, 1)
+            require_complete.assert_called_once()
+            self.assertEqual(len(require_complete.call_args.args[0]), 50)
             self.assertEqual([len(shard) for shard in materialized_shards], [10] * 5)
-            self.assertEqual(len(evaluation_shards), 5)
-            self.assertTrue(all(len(shard) == 10 for shard in evaluation_shards))
+            self.assertEqual(len(evaluation_shards), 10)
+            self.assertTrue(all(len(shard) == 5 for shard in evaluation_shards))
             self.assertFalse(secret.exists())
             self.assertFalse((work / "agent-shards").exists())
             report = json.loads((output / "report.json").read_text())
             self.assertEqual((report["denominator"], report["completed"]), (50, 50))
             self.assertEqual(set(report["harnesses"]), {"carry"})
             self.assertEqual(report["harnesses"]["carry"]["response_retries"], 100)
+            limits = report["provenance"]["images"]["execution_limits"]
+            self.assertEqual(limits["agent_shard_size"], 10)
+            self.assertEqual(limits["evaluator_shard_size"], 5)
+            self.assertEqual(limits["evaluator_concurrency"], 5)
 
     def test_official_build_failure_still_preserves_all_selected_planned_slots(self):
         frozen = [f"task-{number:02d}" for number in range(50)]
@@ -576,12 +600,20 @@ class SmokeWorkerTests(unittest.TestCase):
             command = captured["command"]
             self.assertIn("swebench.harness.run_evaluation", command)
             self.assertIn(str(canonical), command)
+            self.assertEqual(command[command.index("--max_workers") + 1], "5")
             self.assertEqual(command[command.index("--cache_level") + 1], "instance")
             self.assertNotIn("--dataset_revision", command)
             self.assertNotIn("OPENAI_API_KEY", captured["kwargs"]["env"])
             self.assertNotIn("OPENAI_MODEL", captured["kwargs"]["env"])
             self.assertEqual(captured["kwargs"]["cwd"], root)
             self.assertFalse(captured["kwargs"]["check"])
+
+            with self.assertRaisesRegex(ValueError, "max_workers must be between 1 and 5"):
+                self.worker.run_official_evaluation(
+                    predictions=predictions, canonical_dataset=canonical,
+                    instance_ids=["task-1"], run_id="run-codex", output=root,
+                    max_workers=10,
+                )
 
     def test_official_evaluation_timeout_removes_only_exact_run_containers(self):
         with tempfile.TemporaryDirectory() as directory:
