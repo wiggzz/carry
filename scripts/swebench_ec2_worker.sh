@@ -129,7 +129,9 @@ export EVALUATOR_TIMEOUT_SECONDS=300
 export AGENT_CONCURRENCY=3
 
 if [[ "$BENCHMARK_MODE" == official-50 ]]; then
-  export EVALUATOR_CONCURRENCY=10
+  # Five concurrent Docker creates have been reliable; ten repeatedly saturated
+  # the daemon and left half of a shard without evaluator outcomes.
+  export EVALUATOR_CONCURRENCY=5
   export OFFICIAL_WORKER_SECONDS=18000
   export OFFICIAL_AGENT_PHASE_SECONDS=11400
   export OFFICIAL_EVALUATION_PHASE_SECONDS=5400

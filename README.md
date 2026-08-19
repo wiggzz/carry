@@ -118,17 +118,21 @@ official mode. Automation never applies Terraform.
 The official mode uses one disposable worker and builds the selected run-local harness
 image once. It executes five ordered ten-task agent shards at concurrency three, removes each
 shard's working checkouts after patch capture, deletes the model key before grading,
-and evaluates the selected harness in ten-task shards with `swebench==4.1.0`. It writes the full
+and evaluates the selected harness in ten ordered five-task shards at evaluator concurrency
+five with `swebench==4.1.0`. Limiting each evaluator shard to five avoids the Docker-daemon
+create saturation observed when ten instance containers launched together. It writes the full
 50-slot `not-run` checkpoint before image builds and checkpoints after every agent and
-evaluator shard, so infrastructure failure cannot silently shrink the denominator. Carry's
+evaluator shard, so infrastructure failure cannot silently shrink the denominator. Evaluator
+errors or missing outcomes mark provenance incomplete and fail the worker after artifacts are
+persisted rather than producing a green official run. Carry's
 aggregate Responses API retry count is copied into each slot record and harness summary.
 Each agent slot remains capped at six minutes. The limit is also passed into each named
 agent container; host-side cleanup retries and verifies exact-container absence, failing
 the worker closed if Docker cannot prove it stopped. Official execution reserves 190
-minutes for agents, 90 minutes for grading at evaluator concurrency ten, and 20 minutes
+minutes for agents, 90 minutes for grading at evaluator concurrency five, and 20 minutes
 for setup inside a five-hour wall clock that starts before package/source setup. Evaluator
-shards have a 345-second outer cap, leaving 225 seconds of phase-level orchestration
-margin. After every evaluator return path, exact-run containers receive verified cleanup
+shards have a 345-second outer cap, leaving at least 1,950 seconds of phase-level
+orchestration margin. After every evaluator return path, exact-run containers receive verified cleanup
 because SWE-bench may suppress its own stop/remove failures. Queued agent
 slots become explicit budget-exhausted diagnostics rather than silently disappearing.
 The controller permits twenty minutes for EC2 launch/boot around the worker clock and
