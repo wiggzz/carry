@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -219,15 +220,150 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
     return config
 
 
+def start_agent_network(*, identity: str, proxy_image: str, proxy_script: pathlib.Path,
+                        execute: Any = subprocess.run) -> dict[str, str]:
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+    network = {
+        "internal": f"carry-agent-internal-{digest}",
+        "egress": f"carry-agent-egress-{digest}",
+        "proxy": f"carry-openai-proxy-{digest}",
+        "api_base": "http://openai-proxy:8080/v1",
+    }
+    try:
+        execute(["docker", "network", "create", "--internal", network["internal"]], check=True)
+        execute(["docker", "network", "create", network["egress"]], check=True)
+        execute(
+            [
+                "docker", "run", "--detach", "--name", network["proxy"],
+                "--network", network["egress"], "--read-only", "--cap-drop=ALL",
+                "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,nosuid,nodev,size=16m",
+                "--mount", f"type=bind,src={proxy_script.resolve()},dst=/proxy/openai_proxy.js,readonly",
+                "--entrypoint", "node", proxy_image, "/proxy/openai_proxy.js",
+            ],
+            check=True,
+        )
+        execute(
+            ["docker", "network", "connect", "--alias", "openai-proxy",
+             network["internal"], network["proxy"]],
+            check=True,
+        )
+        proxy_ip_result = execute(
+            [
+                "docker", "inspect", "--format",
+                f"{{{{(index .NetworkSettings.Networks {json.dumps(network['internal'])}).IPAddress}}}}",
+                network["proxy"],
+            ],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        proxy_ip = proxy_ip_result.stdout.strip()
+        try:
+            if ipaddress.ip_address(proxy_ip).version != 4:
+                raise ValueError("not IPv4")
+        except ValueError as error:
+            raise RuntimeError("OpenAI proxy has no valid internal IPv4 address") from error
+        network["proxy_ip"] = proxy_ip
+        isolated_network_args = [
+            "--network", network["internal"], "--dns", "127.0.0.1",
+            "--add-host", f"openai-proxy:{proxy_ip}",
+        ]
+        direct_probe_script = """
+const net = require('node:net');
+const dns = require('node:dns').promises;
+function connects(host) {
+  return new Promise(resolve => {
+    const socket = net.connect({host, port: 443});
+    socket.setTimeout(5000);
+    socket.once('connect', () => { socket.destroy(); resolve(true); });
+    socket.once('timeout', () => { socket.destroy(); resolve(false); });
+    socket.once('error', () => resolve(false));
+  });
+}
+Promise.all([
+  fetch('https://github.com', {signal: AbortSignal.timeout(5000)}).then(() => true).catch(() => false),
+  connects('1.1.1.1'),
+  connects('2606:4700:4700::1111'),
+  dns.resolve4('github.com').then(() => true).catch(() => false),
+]).then(results => process.exit(results.some(Boolean) ? 42 : 0));
+"""
+        direct_probe = execute(
+            [
+                "docker", "run", "--rm", *isolated_network_args,
+                "--entrypoint", "node", proxy_image, "-e", direct_probe_script,
+            ],
+            check=False, timeout=15,
+        )
+        if direct_probe.returncode != 0:
+            raise RuntimeError("agent network permits direct internet access")
+        health_script = (
+            "fetch('http://openai-proxy:8080/healthz', {signal: AbortSignal.timeout(2000)})"
+            ".then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+        )
+        healthy = False
+        for _ in range(10):
+            health = execute(
+                [
+                    "docker", "run", "--rm", *isolated_network_args,
+                    "--entrypoint", "node", proxy_image, "-e", health_script,
+                ],
+                check=False, timeout=10,
+            )
+            if health.returncode == 0:
+                healthy = True
+                break
+            time.sleep(1)
+        if not healthy:
+            raise RuntimeError("OpenAI-only proxy did not become reachable")
+        return network
+    except Exception:
+        cleanup_agent_network(network, execute=execute)
+        raise
+
+
+def cleanup_agent_network(network: Mapping[str, str], execute: Any = subprocess.run) -> None:
+    leftovers: list[str] = []
+    for attempt in range(3):
+        execute(["docker", "rm", "--force", network["proxy"]], check=False, timeout=30)
+        execute(["docker", "network", "rm", network["internal"]], check=False, timeout=30)
+        execute(["docker", "network", "rm", network["egress"]], check=False, timeout=30)
+        proxy = execute(
+            ["docker", "inspect", "--type", "container", network["proxy"]],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+        internal = execute(
+            ["docker", "network", "inspect", network["internal"]],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+        egress = execute(
+            ["docker", "network", "inspect", network["egress"]],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+        leftovers = []
+        if proxy.returncode == 0:
+            leftovers.append("proxy container remains")
+        if internal.returncode == 0:
+            leftovers.append("internal network remains")
+        if egress.returncode == 0:
+            leftovers.append("egress network remains")
+        if not leftovers:
+            return
+        if attempt < 2:
+            time.sleep(1)
+    raise ContainerCleanupError("agent network cleanup failed: " + ", ".join(leftovers))
+
+
 def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path, task_input: pathlib.Path,
                          output: pathlib.Path, model: str, reasoning: str,
-                         container_name: str, agent_timeout_seconds: int) -> list[str]:
+                         container_name: str, agent_timeout_seconds: int,
+                         network: str, proxy_ip: str, api_base: str) -> list[str]:
     if harness not in HARNESSES:
         raise ValueError("unknown harness")
     return [
         "docker", "run", "--rm", "--name", container_name, "--stop-timeout", "10",
+        "--network", network, "--dns", "127.0.0.1",
+        "--add-host", f"openai-proxy:{proxy_ip}",
         "--read-only", "--cap-drop=ALL",
         "--security-opt", "no-new-privileges", "--env", "OPENAI_API_KEY",
+        "--env", f"OPENAI_BASE_URL={api_base}",
         "--env", f"AGENT_TIMEOUT_SECONDS={agent_timeout_seconds}",
         "--env", "HOME=/agent-home", "--env", "XDG_CONFIG_HOME=/agent-home/.config",
         "--tmpfs", "/agent-home:rw,nosuid,nodev,size=256m",
@@ -241,9 +377,30 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path, task_i
     ]
 
 
+def run_isolated_agent(*, instance_id: str, harness: str, image: str, proxy_image: str,
+                       proxy_script: pathlib.Path, repo: pathlib.Path,
+                       task_input: pathlib.Path, output: pathlib.Path, model: str, reasoning: str,
+                       timeout_seconds: int | None = None,
+                       pricing: Mapping[str, float] | None = None) -> dict[str, Any]:
+    identity = f"{instance_id}\0{harness}\0{output.resolve()}"
+    network = start_agent_network(
+        identity=identity, proxy_image=proxy_image, proxy_script=proxy_script,
+    )
+    try:
+        return run_agent(
+            instance_id=instance_id, harness=harness, image=image,
+            repo=repo, task_input=task_input, output=output,
+            model=model, reasoning=reasoning, timeout_seconds=timeout_seconds,
+            pricing=pricing, network=network["internal"], proxy_ip=network["proxy_ip"],
+            api_base=network["api_base"],
+        )
+    finally:
+        cleanup_agent_network(network)
+
+
 def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
               task_input: pathlib.Path, output: pathlib.Path, model: str, reasoning: str,
-              timeout_seconds: int | None = None,
+              network: str, proxy_ip: str, api_base: str, timeout_seconds: int | None = None,
               pricing: Mapping[str, float] | None = None) -> dict[str, Any]:
     slot_timeout = (
         timeout_seconds if timeout_seconds is not None
@@ -257,7 +414,8 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
     command = agent_docker_command(
         image=image, harness=harness, repo=repo, task_input=task_input, output=output,
         model=model, reasoning=reasoning, container_name=container_name,
-        agent_timeout_seconds=in_container_timeout,
+        agent_timeout_seconds=in_container_timeout, network=network,
+        proxy_ip=proxy_ip, api_base=api_base,
     )
     started = time.monotonic()
     print("BENCHMARK_PROGRESS " + json.dumps({
@@ -440,9 +598,92 @@ def require_complete_official_evaluations(records: list[dict[str, Any]]) -> None
 
 
 def _clone(repo: str, commit: str, destination: pathlib.Path, mirror: pathlib.Path | None = None) -> None:
-    source = str(mirror) if mirror else f"https://github.com/{repo}.git"
-    subprocess.run(["git", "clone", "--quiet", source, str(destination)], check=True)
+    if mirror is None:
+        mirror = destination.parent / (destination.name + "-source.git")
+        subprocess.run(
+            ["git", "clone", "--quiet", "--mirror", f"https://github.com/{repo}.git", str(mirror)],
+            check=True,
+        )
+    ref_suffix = hashlib.sha256(str(destination.resolve()).encode()).hexdigest()[:16]
+    branch = f"carry-benchmark-base-{commit[:16]}-{ref_suffix}"
+    ref = f"refs/heads/{branch}"
+    subprocess.run(["git", "--git-dir", str(mirror), "update-ref", ref, commit], check=True)
+    try:
+        # --no-local forces upload-pack to send only objects reachable from the
+        # temporary base ref instead of hard-linking the full local mirror.
+        subprocess.run(
+            [
+                "git", "clone", "--quiet", "--no-local", "--no-tags", "--single-branch",
+                "--branch", branch, str(mirror), str(destination),
+            ],
+            check=True,
+        )
+    finally:
+        subprocess.run(
+            ["git", "--git-dir", str(mirror), "update-ref", "-d", ref],
+            check=True,
+        )
     subprocess.run(["git", "-C", str(destination), "checkout", "--quiet", "--detach", commit], check=True)
+    subprocess.run(
+        ["git", "-C", str(destination), "branch", "--quiet", "--delete", "--force", branch],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(destination), "remote", "remove", "origin"], check=True)
+    subprocess.run(["git", "-C", str(destination), "reflog", "expire", "--expire=now", "--all"], check=True)
+    subprocess.run(["git", "-C", str(destination), "gc", "--prune=now", "--quiet"], check=True)
+    head = subprocess.run(
+        ["git", "-C", str(destination), "rev-parse", "HEAD"],
+        check=True, text=True, capture_output=True,
+    ).stdout.strip()
+    if head != commit:
+        raise RuntimeError(f"task checkout HEAD {head} does not match base commit {commit}")
+    git_dir = destination / ".git"
+    forbidden_paths = (
+        git_dir / "objects" / "info" / "alternates",
+        git_dir / "info" / "grafts",
+        git_dir / "shallow",
+    )
+    if any(path.exists() for path in forbidden_paths):
+        raise RuntimeError("task checkout contains alternates, grafts, or a shallow boundary")
+    refs = subprocess.run(
+        ["git", "-C", str(destination), "for-each-ref", "--format=%(refname)"],
+        check=True, text=True, capture_output=True,
+    ).stdout.strip()
+    if refs:
+        raise RuntimeError("task checkout contains branch, tag, remote, or replace refs")
+    remotes = subprocess.run(
+        ["git", "-C", str(destination), "remote"],
+        check=True, text=True, capture_output=True,
+    ).stdout.strip()
+    if remotes:
+        raise RuntimeError("task checkout contains a configured remote")
+    reflog = subprocess.run(
+        ["git", "-C", str(destination), "reflog"],
+        check=True, text=True, capture_output=True,
+    ).stdout.strip()
+    if reflog:
+        raise RuntimeError("task checkout contains reflog entries")
+    isolated_git_environment = {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}
+    ancestors = set(subprocess.run(
+        ["git", "-C", str(destination), "rev-list", commit],
+        check=True, text=True, capture_output=True, env=isolated_git_environment,
+    ).stdout.splitlines())
+    object_rows = subprocess.run(
+        [
+            "git", "-C", str(destination), "cat-file", "--batch-all-objects",
+            "--batch-check=%(objectname) %(objecttype)",
+        ],
+        check=True, text=True, capture_output=True, env=isolated_git_environment,
+    ).stdout.splitlines()
+    stored_commits = {row.split()[0] for row in object_rows if row.endswith(" commit")}
+    if stored_commits != ancestors:
+        raise RuntimeError("task checkout object database is not exactly the base commit ancestry")
+    unreachable = subprocess.run(
+        ["git", "-C", str(destination), "fsck", "--no-reflogs", "--unreachable", "--no-progress"],
+        check=True, text=True, capture_output=True,
+    ).stdout.strip()
+    if unreachable:
+        raise RuntimeError("task checkout contains Git objects unreachable from the base commit")
 
 
 def materialize(*, records: list[dict[str, Any]], selected_ids: list[str], root: pathlib.Path,
@@ -781,9 +1022,11 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                         "model": validated["MODEL"], "reasoning": validated["REASONING"],
                     }
                 slot_timeout = min(slot_timeout, remaining)
-            record = run_agent(
+            record = run_isolated_agent(
                 instance_id=task["instance_id"], harness=harness,
-                image=provenance[harness]["tag"], repo=task_root / harness / "repo",
+                image=provenance[harness]["tag"], proxy_image=validated["BASE_IMAGE"],
+                proxy_script=source / "scripts" / "openai_proxy.js",
+                repo=task_root / harness / "repo",
                 task_input=task_root / "input", output=slot_output,
                 model=validated["MODEL"], reasoning=validated["REASONING"],
                 timeout_seconds=slot_timeout, pricing=pricing,

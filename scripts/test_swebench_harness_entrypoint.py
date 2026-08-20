@@ -41,6 +41,7 @@ class HarnessEntrypointTests(unittest.TestCase):
             env = dict(
                 os.environ,
                 OPENAI_API_KEY="unit-test-secret",
+                OPENAI_BASE_URL="http://openai-proxy:8080/v1",
                 AGENT_HARNESS="codex",
                 CODEX_BINARY=str(login),
                 LOGIN_CAPTURE=str(capture),
@@ -82,6 +83,7 @@ class HarnessEntrypointTests(unittest.TestCase):
                 "pathlib.Path('new.txt').write_text('new\\n')\n"
             )
             env = dict(os.environ, OPENAI_API_KEY="unit-test-secret",
+                       OPENAI_BASE_URL="http://openai-proxy:8080/v1",
                        AGENT_COMMAND=f"python3 {helper} {{prompt_text}}", AGENT_TIMEOUT_SECONDS="30",
                        BENCHMARK_WORKSPACE=str(repo))
             run = subprocess.run(
@@ -124,6 +126,7 @@ class HarnessEntrypointTests(unittest.TestCase):
             env = dict(
                 os.environ,
                 OPENAI_API_KEY="unit-test-secret",
+                OPENAI_BASE_URL="http://openai-proxy:8080/v1",
                 AGENT_COMMAND=command_template,
                 AGENT_TIMEOUT_SECONDS="1",
                 BENCHMARK_WORKSPACE=str(repo),

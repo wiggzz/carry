@@ -17,6 +17,8 @@ parser.add_argument("--output", required=True)
 args = parser.parse_args()
 if not os.environ.get("OPENAI_API_KEY"):
     parser.error("OPENAI_API_KEY is required")
+if not os.environ.get("OPENAI_BASE_URL"):
+    parser.error("OPENAI_BASE_URL is required")
 
 output = pathlib.Path(args.output)
 output.mkdir(parents=True, exist_ok=True)
@@ -43,7 +45,7 @@ if os.environ.get("AGENT_HARNESS") == "pi":
     models = {
         "providers": {
             "openai-benchmark": {
-                "baseUrl": "https://api.openai.com/v1",
+                "baseUrl": os.environ["OPENAI_BASE_URL"],
                 "api": "openai-responses",
                 "apiKey": "$OPENAI_API_KEY",
                 "models": [{
