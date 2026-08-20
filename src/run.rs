@@ -66,8 +66,8 @@ pub enum UserInput {
     Exit,
 }
 
-const TOOL_OUTPUT_INLINE_BYTES: usize = 32 * 1024;
-const TOOL_OUTPUT_PREVIEW_BYTES: usize = 16 * 1024;
+const TOOL_OUTPUT_INLINE_BYTES: usize = 10 * 1024;
+const TOOL_OUTPUT_PREVIEW_BYTES: usize = TOOL_OUTPUT_INLINE_BYTES / 2;
 const BINARY_OUTPUT_OMISSION_REASON: &str =
     "Shell output is not UTF-8 text or appears binary; inspect full_output_path instead.";
 
@@ -824,6 +824,9 @@ fn preview_tool_output(output: &[u8]) -> ToolOutputPreview {
     let Ok(text) = std::str::from_utf8(output) else {
         return omitted_binary_output(output.len());
     };
+    if text.contains('\0') {
+        return omitted_binary_output(output.len());
+    }
 
     if output.len() <= TOOL_OUTPUT_INLINE_BYTES
         && json_string_size(text) <= TOOL_OUTPUT_INLINE_BYTES + 2
@@ -872,7 +875,7 @@ fn bounded_utf8_head_end(text: &str) -> Option<usize> {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    for _ in 0..=256 {
+    loop {
         if json_string_size(&text[..end]) <= TOOL_OUTPUT_PREVIEW_BYTES + 2 {
             return Some(end);
         }
@@ -892,7 +895,7 @@ fn bounded_utf8_tail_start(text: &str) -> Option<usize> {
     while !text.is_char_boundary(start) {
         start += 1;
     }
-    for _ in 0..=256 {
+    loop {
         if json_string_size(&text[start..]) <= TOOL_OUTPUT_PREVIEW_BYTES + 2 {
             return Some(start);
         }
@@ -1114,11 +1117,21 @@ mod tests {
 
     #[test]
     fn exact_inline_byte_boundary_is_not_offloaded() {
-        let exact = vec![b'x'; TOOL_OUTPUT_INLINE_BYTES];
+        let exact = vec![b'x'; 10 * 1024];
         assert!(preview_tool_output(&exact).tail.is_none());
 
-        let over = vec![b'x'; TOOL_OUTPUT_INLINE_BYTES + 1];
+        let over = vec![b'x'; 10 * 1024 + 1];
         assert!(preview_tool_output(&over).tail.is_some());
+    }
+
+    #[test]
+    fn newline_rich_text_uses_a_text_preview_instead_of_the_binary_guard() {
+        let full = "ordinary search result\n".repeat(2_000).into_bytes();
+        let preview = preview_tool_output(&full);
+
+        assert_eq!(preview.encoding, "utf-8");
+        assert!(preview.tail.is_some());
+        assert!(preview.omission_reason.is_none());
     }
 
     #[test]
@@ -1187,10 +1200,12 @@ mod tests {
         assert_eq!(rendered["output_encoding"], "utf-8");
         let head = rendered["output_head"].as_str().unwrap();
         let tail = rendered["output_tail"].as_str().unwrap();
-        assert!(head.len() <= 16 * 1024 && head.len() > 15 * 1024);
-        assert!(tail.len() <= 16 * 1024 && tail.len() > 15 * 1024);
-        assert!(serde_json::to_string(head).unwrap().len() <= 16 * 1024 + 2);
-        assert!(serde_json::to_string(tail).unwrap().len() <= 16 * 1024 + 2);
+        assert!(head.len() <= 5 * 1024 && head.len() > 4 * 1024);
+        assert!(tail.len() <= 5 * 1024 && tail.len() > 4 * 1024);
+        assert!(
+            serde_json::to_string(head).unwrap().len() + serde_json::to_string(tail).unwrap().len()
+                <= 10 * 1024 + 4
+        );
         assert!(rendered.get("output").is_none());
         assert!(rendered["output_omitted_bytes"].as_u64().unwrap() > 0);
         let full_path = rendered["full_output_path"].as_str().unwrap();

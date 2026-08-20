@@ -186,7 +186,7 @@ pub fn tool_definitions() -> Value {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The complete shell command to execute. Use output-limiting arguments to return only the minimum output needed for correctness. It may contain pipes, conditionals, or a heredoc when useful."
+                        "description": "The complete shell command to execute. It may contain pipes, conditionals, or a heredoc when useful."
                     },
                     "message": {
                         "type": ["string", "null"],
@@ -243,18 +243,6 @@ mod tests {
         assert!(drop.contains("learned nothing useful"));
         assert!(drop.contains("fully superseded"));
         assert!(remember.contains("exact source details are no longer needed"));
-    }
-
-    #[test]
-    fn shell_command_parameter_requests_minimum_required_output() {
-        let schema = tool_definitions();
-        let description = schema[0]["parameters"]["properties"]["command"]["description"]
-            .as_str()
-            .unwrap();
-
-        assert!(description.contains(
-            "Use output-limiting arguments to return only the minimum output needed for correctness."
-        ));
     }
 
     #[test]
