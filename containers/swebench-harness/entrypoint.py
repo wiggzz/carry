@@ -81,6 +81,18 @@ with trace_path.open("w", encoding="utf-8") as trace:
             )
             returncode = login.returncode
             if returncode == 0:
+                codex_home = pathlib.Path(os.environ["HOME"]) / ".codex"
+                codex_home.mkdir(parents=True, exist_ok=True)
+                (codex_home / "config.toml").write_text(
+                    'model_provider = "openai-benchmark"\n\n'
+                    '[model_providers.openai-benchmark]\n'
+                    'name = "OpenAI benchmark proxy"\n'
+                    f'base_url = {json.dumps(os.environ["OPENAI_BASE_URL"])}\n'
+                    'wire_api = "responses"\n'
+                    'requires_openai_auth = true\n'
+                    'supports_websockets = false\n',
+                    encoding="utf-8",
+                )
                 # Codex now reads its run-scoped auth file from the tmpfs HOME.
                 # Do not expose the key to model-controlled child shell commands.
                 agent_env.pop("OPENAI_API_KEY", None)

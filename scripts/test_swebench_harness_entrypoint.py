@@ -35,11 +35,20 @@ class HarnessEntrypointTests(unittest.TestCase):
             agent = root / "agent.py"
             agent.write_text(
                 "import os,pathlib\nassert 'OPENAI_API_KEY' not in os.environ\n"
+                "config=(pathlib.Path(os.environ['HOME'])/'.codex/config.toml').read_text()\n"
+                "assert 'model_provider = \"openai-benchmark\"' in config\n"
+                "assert 'base_url = \"http://openai-proxy:8080/v1\"' in config\n"
+                "assert 'wire_api = \"responses\"' in config\n"
+                "assert 'requires_openai_auth = true' in config\n"
+                "assert 'supports_websockets = false' in config\n"
                 "pathlib.Path('file.txt').write_text('after\\n')\n"
             )
             capture = root / "login-secret"
+            home = root / "home"
+            home.mkdir()
             env = dict(
                 os.environ,
+                HOME=str(home),
                 OPENAI_API_KEY="unit-test-secret",
                 OPENAI_BASE_URL="http://openai-proxy:8080/v1",
                 AGENT_HARNESS="codex",

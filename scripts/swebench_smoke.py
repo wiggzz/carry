@@ -578,10 +578,21 @@ def status_for_official_outcome(instance_id: str, outcomes: Mapping[str, set[str
     return "evaluation-incomplete"
 
 
+def apply_official_outcomes(
+    records: list[dict[str, Any]], outcomes: Mapping[str, set[str]]
+) -> None:
+    """Apply grading only to slots whose agent process completed successfully."""
+    for record in records:
+        if record.get("status") != "agent-completed":
+            continue
+        instance_id = record["instance_id"]
+        record["resolved"] = instance_id in outcomes["resolved_ids"]
+        record["status"] = status_for_official_outcome(instance_id, outcomes)
+
+
 def official_evaluation_unknowns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    unknown_statuses = {"evaluation-error", "evaluation-incomplete", "evaluator-failed"}
     return sorted(
-        (record for record in records if record.get("status") in unknown_statuses),
+        (record for record in records if record.get("status") not in {"evaluated", "empty-patch"}),
         key=lambda record: (record["instance_id"], record["harness"]),
     )
 
@@ -1099,10 +1110,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 )
                 outcomes = load_official_report(report_dir)
                 validate_official_outcomes(outcomes, shard_ids)
-                for record in shard_records:
-                    instance_id = record["instance_id"]
-                    record["resolved"] = instance_id in outcomes["resolved_ids"]
-                    record["status"] = status_for_official_outcome(instance_id, outcomes)
+                apply_official_outcomes(shard_records, outcomes)
             except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
                 if isinstance(error, (subprocess.TimeoutExpired, ContainerCleanupError)):
                     evaluation_budget_exhausted = True

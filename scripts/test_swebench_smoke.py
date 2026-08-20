@@ -502,12 +502,27 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             {"instance_id": "error", "harness": "carry", "status": "evaluation-error"},
             {"instance_id": "missing", "harness": "carry", "status": "evaluation-incomplete"},
             {"instance_id": "failed", "harness": "carry", "status": "evaluator-failed"},
+            {"instance_id": "agent", "harness": "carry", "status": "agent-failed"},
         ]
         with self.assertRaisesRegex(
-                RuntimeError, "official evaluation incomplete for 3 slots.*error.*failed.*missing"):
+                RuntimeError, "official evaluation incomplete for 4 slots.*agent.*error.*failed.*missing"):
             self.worker.require_complete_official_evaluations(records)
 
         self.worker.require_complete_official_evaluations(records[:2])
+
+    def test_official_outcomes_do_not_overwrite_agent_failures(self):
+        records = [
+            {"instance_id": "failed", "harness": "codex", "status": "agent-failed", "resolved": False},
+            {"instance_id": "finished", "harness": "codex", "status": "agent-completed", "resolved": False},
+        ]
+        outcomes = {
+            "resolved_ids": set(), "unresolved_ids": set(),
+            "empty_patch_ids": {"failed", "finished"},
+            "error_ids": set(), "incomplete_ids": set(), "completed_ids": set(),
+        }
+        self.worker.apply_official_outcomes(records, outcomes)
+        self.assertEqual(records[0]["status"], "agent-failed")
+        self.assertEqual(records[1]["status"], "empty-patch")
 
     def test_official_execution_uses_five_task_evaluator_shards(self):
         frozen = [f"task-{number:02d}" for number in range(50)]
