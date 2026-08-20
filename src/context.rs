@@ -12,6 +12,8 @@ const CACHE_WRITE_RATE: f64 = 1.25;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
 const NEUTRAL_TARGET_NUMERATOR: usize = 3;
 const NEUTRAL_TARGET_DENOMINATOR: usize = 4;
+const HISTORY_COMPACTED_STATUS: &str =
+    "[history status: earlier context has been removed by compaction]";
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +34,7 @@ pub(crate) enum RetentionSignal {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ContextItemKind {
     User,
+    Status,
     Memory,
     Tool,
 }
@@ -85,6 +88,18 @@ impl ContextItem {
             materialized: false,
         });
         item
+    }
+
+    fn history_status(id: u64) -> Self {
+        Self::new(
+            id,
+            ContextItemKind::Status,
+            Retention::Stable,
+            vec![json!({
+                "role": "developer",
+                "content": [{ "type": "input_text", "text": HISTORY_COMPACTED_STATUS }]
+            })],
+        )
     }
 
     pub fn tool(id: u64, output_items: Vec<Value>, function_call_output: Value) -> Result<Self> {
@@ -225,7 +240,7 @@ impl ContextState {
         for item in items {
             let checkpoint = breakpoint_frontiers.contains(&item.id);
             match item.kind {
-                ContextItemKind::User => {
+                ContextItemKind::User | ContextItemKind::Status => {
                     input.extend(item.input_items.iter().cloned());
                     input.push(item.marker(checkpoint));
                 }
@@ -543,6 +558,12 @@ impl ContextState {
                 item.retention = Retention::Stable;
             }
         }
+        if !retained
+            .iter()
+            .any(|item| item.kind == ContextItemKind::Status)
+        {
+            retained.push(ContextItem::history_status(self.next_id.saturating_add(1)));
+        }
         let retained_rendered = self.render_with_compatible_breakpoints(&retained);
         let retained_tokens = estimated_tokens(&retained_rendered);
         let dropped_tokens = current_tokens.saturating_sub(retained_tokens);
@@ -632,6 +653,14 @@ impl ContextState {
             if item.signal == RetentionSignal::Keep && item.retention == Retention::Stable {
                 item.signal = RetentionSignal::Neutral;
             }
+        }
+        if !self
+            .items
+            .iter()
+            .any(|item| item.kind == ContextItemKind::Status)
+        {
+            let id = self.allocate_id();
+            self.items.push(ContextItem::history_status(id));
         }
         self.generation = self.generation.saturating_add(1);
         let stable_frontier = self.stable_frontier_id();
@@ -818,7 +847,7 @@ mod tests {
     }
 
     fn add_tool(state: &mut ContextState) -> u64 {
-        add_tool_with_output(state, "exact output")
+        add_tool_with_output(state, &"exact output ".repeat(100))
     }
 
     fn add_tool_with_output(state: &mut ContextState, output: &str) -> u64 {
@@ -985,6 +1014,9 @@ mod tests {
                 .iter()
                 .filter(|item| !plan.dropped.contains(&item.id))
                 .cloned()
+                .chain(std::iter::once(ContextItem::history_status(
+                    state.next_id + 1,
+                )))
                 .collect::<Vec<_>>();
             let expected = estimated_tokens(&state.render_with_compatible_breakpoints(&retained));
             assert_eq!(
@@ -1013,6 +1045,73 @@ mod tests {
 
         assert_eq!(plan.dropped, vec![dropped]);
         assert!(plan.neutral_retained.is_empty());
+    }
+
+    #[test]
+    fn compaction_adds_one_stable_history_status_and_prices_it() {
+        let mut state = ContextState::new("initial".into());
+        let first = add_tool_with_output(&mut state, &"first ".repeat(1_000));
+        state.record_signals(&update(&[], &[first], &[]), first);
+
+        let plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                },
+            )
+            .unwrap();
+        let mut expected_retained = state
+            .items
+            .iter()
+            .filter(|item| !plan.dropped.contains(&item.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for item in &mut expected_retained {
+            item.retention = Retention::Stable;
+        }
+        expected_retained.push(ContextItem::history_status(state.next_id + 1));
+        assert_eq!(
+            plan.retained_tokens,
+            estimated_tokens(&state.render_with_compatible_breakpoints(&expected_retained))
+        );
+        state.compact(plan);
+
+        let status = "[history status: earlier context has been removed by compaction]";
+        let rendered = serde_json::to_string(&state.input_items()).unwrap();
+        assert_eq!(rendered.matches(status).count(), 1);
+        let status_item = state
+            .snapshot()
+            .into_iter()
+            .find(|item| {
+                serde_json::to_string(&item.input_items)
+                    .unwrap()
+                    .contains(status)
+            })
+            .unwrap();
+        assert_eq!(status_item.retention, Retention::Stable);
+
+        let second = add_tool_with_output(&mut state, &"second ".repeat(1_000));
+        state.record_signals(&update(&[], &[second], &[]), second);
+        let plan = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                },
+            )
+            .unwrap();
+        state.compact(plan);
+
+        assert_eq!(
+            serde_json::to_string(&state.input_items())
+                .unwrap()
+                .matches(status)
+                .count(),
+            1
+        );
     }
 
     #[test]

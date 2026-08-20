@@ -26,7 +26,9 @@ pub enum ActionKind {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ContextManagement {
+    #[serde(rename = "protected")]
     pub keep: Vec<u64>,
+    #[serde(rename = "removable")]
     pub drop: Vec<u64>,
     pub remember: Vec<String>,
 }
@@ -147,28 +149,28 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Sparse advice about learning from context. Markers identify stable context, which neutral retention keeps by default, and volatile context, which neutral retention keeps in the recent working window until budget pressure; volatile does not itself mean drop. The neutral default is to leave an ID in neither keep nor drop when its future value is uncertain or ordinary. Signals persist until reversed or acted on; they do not immediately mutate history.",
+        "description": "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Stable items remain by default; volatile items may be removed automatically under budget pressure. Retention decisions persist until reversed or applied by compaction.",
         "properties": {
-            "keep": {
+            "protected": {
                 "type": "array",
-                "description": "Protect up to four context IDs whose exact details or important learning may affect later work. Use remember instead when only a concise outcome remains useful. A later keep reverses an earlier drop.",
+                "description": "Protect up to four context IDs when you learned anything from them that is not preserved elsewhere. This is especially important for volatile items. When only a concise learning must remain, use remember and make its bulky source removable instead. Protecting an ID reverses a removable decision.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
-            "drop": {
+            "removable": {
                 "type": "array",
-                "description": "Mark up to four context IDs removable without remembering only when you learned nothing useful from them, or when newer retained context fully superseded everything learned and the old information is no longer relevant. Do not drop merely because an item was consumed, its immediate action completed, or its command failed. A later drop reverses an earlier keep.",
+                "description": "Mark up to four context IDs removable only when you learned nothing from them, or when everything learned from them is preserved elsewhere. Finishing an action does not preserve its learning. Making an ID removable reverses protection.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "remember": {
                 "type": "array",
-                "description": "At most one concise durable learning for when useful information remains but exact source details are no longer needed. Drop the source rather than also keeping it. Do not duplicate an existing memory or kept item; preserve outcomes, not chain-of-thought.",
+                "description": "At most one concise learning that preserves what a bulky source taught you without retaining its exact details. Make the source removable rather than also protecting it. Preserve outcomes, not chain-of-thought.",
                 "items": { "type": "string" },
                 "maxItems": 1
             }
         },
-        "required": ["keep", "drop", "remember"],
+        "required": ["protected", "removable", "remember"],
         "additionalProperties": false
     })
 }
@@ -224,25 +226,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn context_schema_frames_retention_as_learning_with_a_neutral_default() {
+    fn context_schema_uses_learning_framed_protected_and_removable_names() {
         let schema = tool_definitions();
         let context = &schema[0]["parameters"]["properties"]["context"];
         let description = context["description"].as_str().unwrap();
-        let keep = context["properties"]["keep"]["description"]
+        let protected = context["properties"]["protected"]["description"]
             .as_str()
             .unwrap();
-        let drop = context["properties"]["drop"]["description"]
+        let removable = context["properties"]["removable"]["description"]
             .as_str()
             .unwrap();
         let remember = context["properties"]["remember"]["description"]
             .as_str()
             .unwrap();
 
-        assert!(description.contains("leave an ID in neither keep nor drop"));
-        assert!(keep.contains("important learning"));
-        assert!(drop.contains("learned nothing useful"));
-        assert!(drop.contains("fully superseded"));
-        assert!(remember.contains("exact source details are no longer needed"));
+        assert!(
+            !context["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("keep")
+        );
+        assert!(
+            !context["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("drop")
+        );
+        assert_eq!(
+            context["required"],
+            json!(["protected", "removable", "remember"])
+        );
+        assert!(description.contains("recently added visible context"));
+        assert!(protected.contains("learned anything"));
+        assert!(removable.contains("learned nothing"));
+        assert!(removable.contains("preserved elsewhere"));
+        assert!(remember.contains("concise learning"));
     }
 
     #[test]
@@ -251,7 +269,7 @@ mod tests {
             "type": "function_call",
             "name": "shell",
             "call_id": "call_1",
-            "arguments": r#"{"command":"cargo test","message":"Checking the focused tests first.","context":{"keep":[1],"drop":[],"remember":[]}}"#
+            "arguments": r#"{"command":"cargo test","message":"Checking the focused tests first.","context":{"protected":[1],"removable":[],"remember":[]}}"#
         });
         let parsed = Step::from_function_call(&shell).unwrap();
         assert_eq!(parsed.action.kind, ActionKind::Shell);
@@ -263,7 +281,7 @@ mod tests {
         assert_eq!(parsed.context.keep, vec![1]);
         let schema = tool_definitions();
         assert_eq!(
-            schema[0]["parameters"]["properties"]["context"]["properties"]["keep"]["items"]["type"],
+            schema[0]["parameters"]["properties"]["context"]["properties"]["protected"]["items"]["type"],
             "integer"
         );
         assert!(
@@ -276,7 +294,7 @@ mod tests {
             "type": "function_call",
             "name": "finish",
             "call_id": "call_2",
-            "arguments": r#"{"answer":"done","context":{"keep":[],"drop":[],"remember":[]}}"#
+            "arguments": r#"{"answer":"done","context":{"protected":[],"removable":[],"remember":[]}}"#
         });
         assert_eq!(
             Step::from_function_call(&finish)

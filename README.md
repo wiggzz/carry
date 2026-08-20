@@ -44,27 +44,27 @@ The terminal shows compact per-step input, cache-read, cache-write, and output t
 
 ## Context policy
 
-Carry keeps one strictly chronological context ledger. Human messages and memories enter stable retention; tool interactions begin volatile. Stable items persist by default, while neutral volatile items are removable unless the model protects them with `keep`. The stable cache frontier is the longest chronological prefix made entirely of stable items; later stable human messages remain durable without reordering history or forcing earlier volatile items to promote.
+Carry keeps one strictly chronological context ledger. Human messages and memories enter stable retention; tool interactions begin volatile. Stable items persist by default, while neutral volatile items remain in a recent working window and may be removed automatically under budget pressure unless the model marks them `protected`. The stable cache frontier is the longest chronological prefix made entirely of stable items; later stable human messages remain durable without reordering history or forcing earlier volatile items to promote.
 
-Every item has a compact integer ID and an immutable retention marker; tool results end with markers such as `[2 volatile]`. Carry preserves all native Responses API output items—including reasoning items—alongside function results. Between compactions, retained history grows by exact appends for prompt-cache reuse. Immediately before each model request, the planner compares that request with and without compaction and rewrites only when the compacted request is already cheaper. A minor compaction acts only on volatile drop candidates; a major compaction may also remove stable drop candidates. Both preserve chronology, make the retained generation stable, and establish a new explicit cache frontier. Cache age participates in the decision, so an expired cache is rebuilt promptly instead of preserving a no-longer-useful prefix.
+Every item has a compact integer ID and a marker showing its current lifecycle; tool results end with markers such as `[context 2 volatile]`. Carry preserves all native Responses API output items—including reasoning items—alongside function results. Between compactions, retained history grows by exact appends for prompt-cache reuse. Immediately before each model request, the planner compares that request with and without compaction and rewrites only when the compacted request is already cheaper. Compaction may remove explicitly removable items and neutral volatile items selected under the automatic budget, preserves chronology, promotes protected items to stable, and establishes a new explicit cache frontier. After the first compaction removes history, Carry adds one stable status item stating that earlier context has been removed.
 
-Each action includes context management:
+Each action performs its highest-priority task step and can preserve learning from recently visible context:
 
 ```json
 {
   "command": "...",
   "message": "Checking the focused tests first.",
   "context": {
-    "keep": [2, 3],
-    "drop": [],
-    "remember": ["Concise durable reasoning outcome"]
+    "protected": [2, 3],
+    "removable": [],
+    "remember": ["Concise learning preserved from bulky evidence"]
   }
 }
 ```
 
-`keep` and `drop` are sparse, sticky advisory signals, limited to four IDs each per turn. `keep` protects volatile interactions whose exact details still matter. `drop` makes stable content removable; volatile content is already removable unless kept. Carry still defers deletion until the immediately upcoming request is cheaper with compaction. A later opposite signal reverses the prior opinion, and `keep` wins if both name the same ID in one response. Unknown or stale IDs are ignored.
+`protected` and `removable` are persistent model-facing retention decisions, limited to four IDs each per turn. Protect an item when it contains learning that is not represented elsewhere. Make an item removable only when it taught nothing or when everything learned from it is preserved elsewhere. A later opposite decision reverses the prior opinion, and protection wins if both name the same ID in one response. Unknown or stale IDs are ignored.
 
-`remember` is limited to one concise durable fact per turn. Use it instead of `keep` when only a small amount of valuable information matters in a large, otherwise disposable tool result. Its stable ID is stored inside that tool result without duplicating the memory text, which remains in the original function-call arguments. If compaction later removes the source tool but retains the memory, Carry materializes it as an assistant message with the same memory ID during that cache rewrite.
+`remember` is limited to one concise learning per turn. Use it when a small conclusion should remain but retaining its bulky source would be wasteful; make the source removable rather than also protecting it. Its stable ID is stored inside that tool result without duplicating the memory text, which remains in the original function-call arguments. If compaction later removes the source tool but retains the memory, Carry materializes it as an assistant message with the same memory ID during that cache rewrite.
 
 ## Development
 

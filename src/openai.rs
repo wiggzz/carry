@@ -448,7 +448,7 @@ mod tests {
                 "type": "function_call",
                 "call_id": "call-1",
                 "name": "finish",
-                "arguments": "{\"answer\":\"done\",\"context\":{\"keep\":[],\"drop\":[],\"remember\":[]}}"
+                "arguments": "{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
             }],
             "usage": {}
         });
@@ -483,7 +483,7 @@ mod tests {
                 "type": "function_call",
                 "call_id": "call-1",
                 "name": "finish",
-                "arguments": "{\"answer\":\"done\",\"context\":{\"keep\":[],\"drop\":[],\"remember\":[]}}"
+                "arguments": "{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
             }],
             "usage": {}
         });
@@ -607,7 +607,7 @@ mod tests {
                     "type":"function_call",
                     "call_id":"call_1",
                     "name":"finish",
-                    "arguments":"{\"answer\":\"done\",\"context\":{\"keep\":[],\"drop\":[],\"remember\":[]}}"
+                    "arguments":"{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
                 }
             ],
             "usage": {
