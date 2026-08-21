@@ -18,24 +18,27 @@ class PullRequestTitleTests(unittest.TestCase):
             check=False,
         )
 
-    def test_accepts_release_please_compatible_conventional_titles(self):
+    def test_accepts_release_note_eligible_conventional_titles(self):
         titles = (
             "feat: add shell completion",
             "fix(parser): preserve nested tool results",
             "perf!: replace the cache format",
+            "revert: restore the previous cache format",
+            "docs!: remove a deprecated public command",
             "chore(main): release 0.6.0",
-            "build(deps): bump serde from 1.0.1 to 1.0.2",
         )
         for title in titles:
             with self.subTest(title=title):
                 result = self.validate(title)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_rejects_titles_release_please_cannot_parse_as_conventional_commits(self):
+    def test_rejects_titles_omitted_from_release_notes(self):
         titles = (
             "Handle historical Git metadata in benchmark preflight",
             "Fix: uppercase types are not conventional",
             "feature: unknown types are not accepted",
+            "docs: hidden Release Please types need a breaking marker",
+            "build(deps): hidden dependency updates are not release notes",
             "fix missing separator",
             "fix: ",
             " fix: leading whitespace",
