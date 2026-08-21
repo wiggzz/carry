@@ -994,10 +994,44 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertFalse((destination / ".git" / "shallow").exists())
             self.assertEqual(
                 subprocess.run(
-                    ["git", "fsck", "--no-reflogs", "--unreachable", "--no-progress"],
+                    ["git", "fsck", "--connectivity-only", "--no-reflogs", "--unreachable", "--no-progress"],
                     cwd=destination, check=True, text=True, capture_output=True,
                 ).stdout,
                 "",
+            )
+
+    def test_clone_accepts_reachable_historical_commit_with_invalid_timezone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            mirror = root / "mirror.git"
+            destination = root / "destination"
+            subprocess.run(["git", "init", "--quiet", "--bare", str(mirror)], check=True)
+            empty_tree = subprocess.run(
+                ["git", "--git-dir", str(mirror), "mktree"], input="", check=True,
+                text=True, capture_output=True,
+            ).stdout.strip()
+            commit_text = (
+                f"tree {empty_tree}\n"
+                "author Historical Author <author@example.invalid> 1 +051800\n"
+                "committer Historical Author <author@example.invalid> 1 +051800\n\n"
+                "historical malformed timezone\n"
+            )
+            commit = subprocess.run(
+                ["git", "--git-dir", str(mirror), "hash-object", "-t", "commit", "-w", "--stdin"],
+                input=commit_text, check=True, text=True, capture_output=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "--git-dir", str(mirror), "update-ref", "refs/heads/main", commit], check=True,
+            )
+
+            self.worker._clone("owner/repo", commit, destination, mirror)
+
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=destination, check=True,
+                    text=True, capture_output=True,
+                ).stdout.strip(),
+                commit,
             )
 
     def test_materialization_keeps_gold_data_out_of_agent_inputs_and_clones_per_harness(self):

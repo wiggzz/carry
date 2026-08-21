@@ -690,7 +690,10 @@ def _clone(repo: str, commit: str, destination: pathlib.Path, mirror: pathlib.Pa
     if stored_commits != ancestors:
         raise RuntimeError("task checkout object database is not exactly the base commit ancestry")
     unreachable = subprocess.run(
-        ["git", "-C", str(destination), "fsck", "--no-reflogs", "--unreachable", "--no-progress"],
+        [
+            "git", "-C", str(destination), "fsck", "--connectivity-only",
+            "--no-reflogs", "--unreachable", "--no-progress",
+        ],
         check=True, text=True, capture_output=True,
     ).stdout.strip()
     if unreachable:
