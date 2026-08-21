@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Behavior tests for the executable protected-worker benchmark."""
+import hashlib
 import importlib.util
 import json
 import os
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import types
 import unittest
+import zlib
 from unittest import mock
 
 
@@ -1016,10 +1018,11 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                 "committer Historical Author <author@example.invalid> 1 +051800\n\n"
                 "historical malformed timezone\n"
             )
-            commit = subprocess.run(
-                ["git", "--git-dir", str(mirror), "hash-object", "-t", "commit", "-w", "--stdin"],
-                input=commit_text, check=True, text=True, capture_output=True,
-            ).stdout.strip()
+            object_data = f"commit {len(commit_text.encode())}\0{commit_text}".encode()
+            commit = hashlib.sha1(object_data).hexdigest()
+            object_path = mirror / "objects" / commit[:2] / commit[2:]
+            object_path.parent.mkdir()
+            object_path.write_bytes(zlib.compress(object_data))
             subprocess.run(
                 ["git", "--git-dir", str(mirror), "update-ref", "refs/heads/main", commit], check=True,
             )
