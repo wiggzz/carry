@@ -23,7 +23,7 @@ const NEUTRAL_VOLATILE_BUDGET_TOKENS: usize = 32 * 1024;
 
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
-At each step, select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. For regressions, inspect repository history and search cited identifiers and later fixes. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
+At each step, select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
 
 History is a working set, not a complete transcript. Context items carry a [context integer stable|volatile] marker showing their current lifecycle. Stable items remain by default. Volatile items remain in the recent working window but may be removed automatically under budget pressure. Compaction may change a retained volatile item to stable. After the first removal, a history-status item states that earlier context has been removed.
 
@@ -1092,11 +1092,11 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_requires_reproduction_and_history_checks() {
+    fn system_prompt_requires_reproduction_without_soliciting_future_fixes() {
         assert!(SYSTEM_PROMPT.contains("minimal failing reproduction"));
-        assert!(SYSTEM_PROMPT.contains("repository history"));
-        assert!(SYSTEM_PROMPT.contains("search cited identifiers"));
         assert!(SYSTEM_PROMPT.contains("affected tests"));
+        assert!(!SYSTEM_PROMPT.contains("later fixes"));
+        assert!(!SYSTEM_PROMPT.contains("upstream fix"));
     }
 
     #[test]

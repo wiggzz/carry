@@ -116,7 +116,23 @@ the protected dispatch role's maximum session to six hours before dispatching th
 official mode. Automation never applies Terraform.
 
 The official mode uses one disposable worker and builds the selected run-local harness
-image once. It executes five ordered ten-task agent shards at concurrency three, removes each
+image once. Before a slot starts, the trusted worker creates a fresh Git repository by
+fetching only a temporary ref at the declared base commit. It then removes that ref,
+the origin remote, local branch, and reflogs; prunes unreachable objects; and fails
+preflight if `git fsck` finds anything outside the base commit and its ancestors. Gold
+patches, hidden test patches, and canonical grading records remain in host-only paths
+that are not mounted into the agent container.
+
+Every agent slot runs on its own Docker `--internal` network with external DNS disabled.
+A read-only, capability-free proxy container bridges that network to the provider, but
+forwards only OpenAI Responses API paths to the fixed `api.openai.com` upstream. The
+worker fails closed unless preflight proves that DNS, direct IPv4, direct IPv6, and a
+GitHub request are blocked while the proxy health endpoint remains reachable. The
+agent receives only the proxy's fixed internal address; trusted grading runs separately
+after the generated patch is captured and the model credential is removed. Proxy
+containers and both per-slot networks receive verified cleanup on every return path.
+
+It executes five ordered ten-task agent shards at concurrency three, removes each
 shard's working checkouts after patch capture, deletes the model key before grading,
 and evaluates the selected harness in ten ordered five-task shards at evaluator concurrency
 five with `swebench==4.1.0`. Limiting each evaluator shard to five avoids the Docker-daemon

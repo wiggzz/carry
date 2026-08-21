@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -78,10 +79,15 @@ class SmokeWorkerTests(unittest.TestCase):
                 image="smoke-codex:run", harness="codex", repo=root / "repo",
                 task_input=root / "input", output=root / "output", model="gpt-5.6-luna",
                 reasoning="medium", container_name="carry-agent-codex-test",
-                agent_timeout_seconds=315,
+                agent_timeout_seconds=315, network="carry-agent-internal-test",
+                proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
             )
             rendered = "\n".join(command)
             self.assertIn("--env\nOPENAI_API_KEY", rendered)
+            self.assertIn("--network\ncarry-agent-internal-test", rendered)
+            self.assertIn("--dns\n127.0.0.1", rendered)
+            self.assertIn("--add-host\nopenai-proxy:172.28.0.2", rendered)
+            self.assertIn("OPENAI_BASE_URL=http://openai-proxy:8080/v1", rendered)
             self.assertNotIn("/var/run/docker.sock", rendered)
             self.assertNotIn(str(pathlib.Path.home()), rendered)
             self.assertEqual(rendered.count("type=bind"), 3)
@@ -93,6 +99,170 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertIn("carry-agent-codex-test", rendered)
             self.assertIn("/agent-home:rw", rendered)
             self.assertIn("/tmp:rw", rendered)
+
+    def test_agent_network_is_internal_and_reaches_only_the_openai_proxy(self):
+        calls = []
+
+        def execute(command, **kwargs):
+            calls.append((command, kwargs))
+            if command[:2] == ["docker", "inspect"] and "--format" in command:
+                return mock.Mock(returncode=0, stdout="172.28.0.2\n")
+            return mock.Mock(returncode=0, stdout="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            proxy_script = pathlib.Path(directory) / "openai_proxy.js"
+            proxy_script.write_text("// proxy fixture\n")
+            network = self.worker.start_agent_network(
+                identity="slot-one", proxy_image="node@sha256:" + "a" * 64,
+                proxy_script=proxy_script, execute=execute,
+            )
+
+        commands = [command for command, _ in calls]
+        self.assertIn(
+            ["docker", "network", "create", "--internal", network["internal"]],
+            commands,
+        )
+        self.assertIn(
+            ["docker", "network", "connect", "--alias", "openai-proxy", network["internal"], network["proxy"]],
+            commands,
+        )
+        proxy_run = next(command for command in commands if command[:3] == ["docker", "run", "--detach"])
+        self.assertEqual(proxy_run[proxy_run.index("--network") + 1], network["egress"])
+        self.assertIn("no-new-privileges", proxy_run)
+        self.assertIn("--cap-drop=ALL", proxy_run)
+        self.assertEqual(network["api_base"], "http://openai-proxy:8080/v1")
+        probes = [command for command in commands if command[:2] == ["docker", "run"] and "--detach" not in command]
+        self.assertEqual(len(probes), 2)
+        self.assertTrue(all(command[command.index("--network") + 1] == network["internal"] for command in probes))
+        self.assertTrue(all(command[command.index("--dns") + 1] == "127.0.0.1" for command in probes))
+        self.assertTrue(all(f"openai-proxy:{network['proxy_ip']}" in command for command in probes))
+        self.assertTrue(any("github.com" in " ".join(command) for command in probes))
+        self.assertTrue(any("openai-proxy:8080/healthz" in " ".join(command) for command in probes))
+
+    def test_agent_network_fails_closed_when_direct_internet_is_reachable(self):
+        def execute(command, **kwargs):
+            if command[:2] == ["docker", "inspect"] and "--format" in command:
+                return mock.Mock(returncode=0, stdout="172.28.0.2\n")
+            if "github.com" in " ".join(command):
+                return mock.Mock(returncode=42, stdout="")
+            if command[:2] == ["docker", "inspect"] or command[:3] == ["docker", "network", "inspect"]:
+                return mock.Mock(returncode=1, stdout="")
+            return mock.Mock(returncode=0, stdout="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            proxy_script = pathlib.Path(directory) / "openai_proxy.js"
+            proxy_script.write_text("// proxy fixture\n")
+            with self.assertRaisesRegex(RuntimeError, "direct internet"):
+                self.worker.start_agent_network(
+                    identity="slot-two", proxy_image="node@sha256:" + "a" * 64,
+                    proxy_script=proxy_script, execute=execute,
+                )
+
+    def test_agent_network_cleanup_fails_if_proxy_remains(self):
+        network = {"internal": "internal", "egress": "egress", "proxy": "proxy"}
+
+        def execute(command, **kwargs):
+            if command[:2] == ["docker", "inspect"]:
+                return mock.Mock(returncode=0, stdout="proxy still exists\n")
+            return mock.Mock(returncode=0, stdout="")
+
+        with self.assertRaisesRegex(self.worker.ContainerCleanupError, "proxy.*remains"):
+            self.worker.cleanup_agent_network(network, execute=execute)
+
+    @unittest.skipUnless(shutil.which("docker"), "Docker is required for the network namespace test")
+    def test_agent_network_namespace_blocks_external_fetch_and_proxy_escape(self):
+        image = "node@sha256:afff6d8c97964a438d2e6a9c96509367e45d8bf93f790ad561a1eaea926303d9"
+        network = self.worker.start_agent_network(
+            identity=f"integration-{os.getpid()}", proxy_image=image,
+            proxy_script=SCRIPT.with_name("openai_proxy.js"),
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "docker", "run", "--rm", "--network", network["internal"],
+                    "--dns", "127.0.0.1", "--add-host", f"openai-proxy:{network['proxy_ip']}",
+                    "--entrypoint", "node", image, "-e",
+                    "fetch('http://openai-proxy:8080/v1/models')"
+                    ".then(r => process.exit(r.status === 403 ? 0 : 1))"
+                    ".catch(() => process.exit(2))",
+                ],
+                check=False, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0)
+        finally:
+            self.worker.cleanup_agent_network(network)
+
+    def test_isolated_agent_always_removes_its_proxy_and_networks(self):
+        network = {
+            "internal": "internal", "egress": "egress", "proxy": "proxy",
+            "proxy_ip": "172.28.0.2", "api_base": "http://openai-proxy:8080/v1",
+        }
+        with mock.patch.object(self.worker, "start_agent_network", return_value=network), \
+                mock.patch.object(self.worker, "run_agent", side_effect=RuntimeError("agent crash")) as run, \
+                mock.patch.object(self.worker, "cleanup_agent_network") as cleanup, \
+                self.assertRaisesRegex(RuntimeError, "agent crash"):
+            self.worker.run_isolated_agent(
+                instance_id="task-1", harness="carry", image="carry:run",
+                proxy_image="node@sha256:" + "a" * 64,
+                proxy_script=pathlib.Path("openai_proxy.js"),
+                repo=pathlib.Path("repo"), task_input=pathlib.Path("input"),
+                output=pathlib.Path("output"), model="gpt-5.6-luna", reasoning="medium",
+            )
+        self.assertEqual(run.call_args.kwargs["network"], "internal")
+        self.assertEqual(run.call_args.kwargs["proxy_ip"], "172.28.0.2")
+        self.assertEqual(run.call_args.kwargs["api_base"], "http://openai-proxy:8080/v1")
+        cleanup.assert_called_once_with(network)
+
+    def test_openai_proxy_rejects_non_responses_targets(self):
+        proxy = SCRIPT.with_name("openai_proxy.js")
+        check = """
+const { isAllowedRequest } = require(process.argv[1]);
+if (!isAllowedRequest('POST', '/v1/responses')) process.exit(1);
+if (!isAllowedRequest('POST', '/v1/responses/compact')) process.exit(2);
+if (!isAllowedRequest('GET', '/healthz')) process.exit(3);
+if (isAllowedRequest('GET', '/v1/models')) process.exit(4);
+if (isAllowedRequest('GET', 'https://github.com/owner/repo')) process.exit(5);
+if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
+"""
+        subprocess.run(["node", "-e", check, str(proxy)], check=True)
+
+    def test_pi_adapter_uses_the_isolated_openai_base_url(self):
+        entrypoint = SCRIPT.parents[1] / "containers" / "swebench-harness" / "entrypoint.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo, home, output = root / "repo", root / "home", root / "output"
+            repo.mkdir()
+            home.mkdir()
+            subprocess.run(["git", "init", "--quiet", "--initial-branch=main"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Benchmark Test"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "benchmark@example.invalid"], cwd=repo, check=True)
+            (repo / "tracked.txt").write_text("base\n")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=repo, check=True)
+            prompt = root / "task.md"
+            prompt.write_text("task\n")
+            fake_agent = root / "verify_pi_config.py"
+            fake_agent.write_text(
+                "import json, os, pathlib, sys\n"
+                "p = pathlib.Path(os.environ['HOME']) / '.pi/agent/models.json'\n"
+                "d = json.loads(p.read_text())\n"
+                "actual = d['providers']['openai-benchmark']['baseUrl']\n"
+                "sys.exit(0 if actual == os.environ['OPENAI_BASE_URL'] else 7)\n"
+            )
+            env = {
+                **os.environ,
+                "AGENT_COMMAND": f"python3 {fake_agent}",
+                "AGENT_HARNESS": "pi",
+                "BENCHMARK_WORKSPACE": str(repo),
+                "HOME": str(home),
+                "OPENAI_API_KEY": "not-a-real-key",
+                "OPENAI_BASE_URL": "http://openai-proxy:8080/v1",
+            }
+            subprocess.run(
+                ["python3", str(entrypoint), "run", "--model", "gpt-test", "--reasoning", "medium",
+                 "--prompt", str(prompt), "--output", str(output)],
+                check=True, env=env,
+            )
 
     def test_finalize_accepts_one_selected_harness_as_the_exact_denominator(self):
         tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
@@ -332,12 +502,27 @@ class SmokeWorkerTests(unittest.TestCase):
             {"instance_id": "error", "harness": "carry", "status": "evaluation-error"},
             {"instance_id": "missing", "harness": "carry", "status": "evaluation-incomplete"},
             {"instance_id": "failed", "harness": "carry", "status": "evaluator-failed"},
+            {"instance_id": "agent", "harness": "carry", "status": "agent-failed"},
         ]
         with self.assertRaisesRegex(
-                RuntimeError, "official evaluation incomplete for 3 slots.*error.*failed.*missing"):
+                RuntimeError, "official evaluation incomplete for 4 slots.*agent.*error.*failed.*missing"):
             self.worker.require_complete_official_evaluations(records)
 
         self.worker.require_complete_official_evaluations(records[:2])
+
+    def test_official_outcomes_do_not_overwrite_agent_failures(self):
+        records = [
+            {"instance_id": "failed", "harness": "codex", "status": "agent-failed", "resolved": False},
+            {"instance_id": "finished", "harness": "codex", "status": "agent-completed", "resolved": False},
+        ]
+        outcomes = {
+            "resolved_ids": set(), "unresolved_ids": set(),
+            "empty_patch_ids": {"failed", "finished"},
+            "error_ids": set(), "incomplete_ids": set(), "completed_ids": set(),
+        }
+        self.worker.apply_official_outcomes(records, outcomes)
+        self.assertEqual(records[0]["status"], "agent-failed")
+        self.assertEqual(records[1]["status"], "empty-patch")
 
     def test_official_execution_uses_five_task_evaluator_shards(self):
         frozen = [f"task-{number:02d}" for number in range(50)]
@@ -400,7 +585,7 @@ class SmokeWorkerTests(unittest.TestCase):
                     mock.patch.object(self.worker, "build_images", return_value={
                         "carry": {"tag": "image:carry"}
                     }) as build, \
-                    mock.patch.object(self.worker, "run_agent", side_effect=fake_agent), \
+                    mock.patch.object(self.worker, "run_isolated_agent", side_effect=fake_agent), \
                     mock.patch.object(self.worker, "run_official_evaluation", side_effect=fake_evaluation), \
                     mock.patch.object(
                         self.worker, "require_complete_official_evaluations",
@@ -477,6 +662,7 @@ class SmokeWorkerTests(unittest.TestCase):
                     instance_id="task-1", harness="codex", image="codex:run",
                     repo=root / "repo", task_input=root / "input", output=root / "output",
                     model="gpt-5.6-luna", reasoning="medium",
+                    network="internal", proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
                 )
             self.assertEqual(run.call_count, 1)
             self.assertEqual(record["status"], "agent-failed")
@@ -509,6 +695,7 @@ class SmokeWorkerTests(unittest.TestCase):
                     instance_id="task-1", harness="carry", image="carry:run",
                     repo=root / "repo", task_input=root / "input", output=root / "output",
                     model="gpt-5.6-luna", reasoning="medium", pricing=pricing,
+                    network="internal", proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
                 )
 
             self.assertEqual(record["status"], "agent-completed")
@@ -540,6 +727,7 @@ class SmokeWorkerTests(unittest.TestCase):
                     instance_id="task-1", harness="codex", image="codex:run",
                     repo=root / "repo", task_input=root / "input", output=root / "output",
                     model="gpt-5.6-luna", reasoning="medium", timeout_seconds=360,
+                    network="internal", proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
                 )
 
             run_command = calls[0][0]
@@ -577,6 +765,7 @@ class SmokeWorkerTests(unittest.TestCase):
                     instance_id="task-1", harness="carry", image="carry:run",
                     repo=root / "repo", task_input=root / "input", output=root / "output",
                     model="gpt-5.6-luna", reasoning="medium", timeout_seconds=10,
+                    network="internal", proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
                 )
 
     def test_official_evaluation_removes_model_credentials_and_uses_pinned_dataset(self):
@@ -737,6 +926,79 @@ class SmokeWorkerTests(unittest.TestCase):
             )
         self.assertEqual(len(clones), 5)
         self.assertTrue(all(destination.parts[-2:] == ("carry", "repo") for _, _, destination in clones))
+
+    def test_clone_excludes_commits_after_the_task_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "source"
+            mirror = root / "mirror.git"
+            destination = root / "destination"
+            source.mkdir()
+            subprocess.run(["git", "init", "--quiet", "--initial-branch=main"], cwd=source, check=True)
+            subprocess.run(["git", "config", "user.name", "Benchmark Test"], cwd=source, check=True)
+            subprocess.run(["git", "config", "user.email", "benchmark@example.invalid"], cwd=source, check=True)
+            (source / "value.txt").write_text("base\n")
+            subprocess.run(["git", "add", "value.txt"], cwd=source, check=True)
+            subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=source, check=True)
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=source, check=True, text=True, capture_output=True,
+            ).stdout.strip()
+            (source / "value.txt").write_text("future solution\n")
+            subprocess.run(["git", "commit", "--quiet", "-am", "future solution"], cwd=source, check=True)
+            future = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=source, check=True, text=True, capture_output=True,
+            ).stdout.strip()
+            subprocess.run(["git", "tag", "future-release", future], cwd=source, check=True)
+            subprocess.run(["git", "clone", "--quiet", "--mirror", str(source), str(mirror)], check=True)
+
+            self.worker._clone("owner/repo", base, destination, mirror)
+
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=destination, check=True, text=True, capture_output=True,
+            ).stdout.strip()
+            self.assertEqual(head, base)
+            self.assertNotEqual(
+                subprocess.run(
+                    ["git", "cat-file", "-e", f"{future}^{{commit}}"], cwd=destination,
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                ).returncode,
+                0,
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "remote"], cwd=destination, check=True, text=True, capture_output=True,
+                ).stdout,
+                "",
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"],
+                    cwd=destination, check=True, text=True, capture_output=True,
+                ).stdout,
+                "",
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "tag"], cwd=destination, check=True, text=True, capture_output=True,
+                ).stdout,
+                "",
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "reflog"], cwd=destination, check=True, text=True, capture_output=True,
+                ).stdout,
+                "",
+            )
+            self.assertFalse((destination / ".git" / "objects" / "info" / "alternates").exists())
+            self.assertFalse((destination / ".git" / "info" / "grafts").exists())
+            self.assertFalse((destination / ".git" / "shallow").exists())
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "fsck", "--no-reflogs", "--unreachable", "--no-progress"],
+                    cwd=destination, check=True, text=True, capture_output=True,
+                ).stdout,
+                "",
+            )
 
     def test_materialization_keeps_gold_data_out_of_agent_inputs_and_clones_per_harness(self):
         selected = [f"task-{number}" for number in range(5)]
