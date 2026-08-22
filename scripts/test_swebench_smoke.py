@@ -245,6 +245,14 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(result["build_overlay_sha256"], "a" * 64)
         self.assertEqual(payload["packages"][0]["name"], "pytest")
 
+    def test_swebench_base_image_dependency_sources_are_https_only(self):
+        templates = {"py": "FROM ubuntu:22.04\nRUN apt update && apt install -y git\n"}
+        first = self.worker.enforce_https_swebench_base_images(templates)
+        second = self.worker.enforce_https_swebench_base_images(templates)
+        self.assertEqual(first, second)
+        self.assertIn("sed -i 's|http://|https://|g'", templates["py"])
+        self.assertNotIn("\nRUN apt update", templates["py"])
+
     def test_prepare_task_environments_builds_and_checks_every_task_before_returning(self):
         records = [
             {"instance_id": "owner__repo-1", "repo": "owner/repo", "version": "1.0", "base_commit": "a" * 40},
@@ -303,6 +311,7 @@ class SmokeWorkerTests(unittest.TestCase):
                 get_specs=lambda dataset: specs,
                 parsers={"owner/repo": lambda *_args: {"test": "PASSED"}},
                 repo_specs={"owner/repo": {"1.0": {"test_cmd": "pytest -rA"}}},
+                dockerfile_templates={"py": "FROM ubuntu:22.04\nRUN apt update\n"},
             )
         self.assertEqual(set(prepared), {record["instance_id"] for record in records})
         self.assertEqual(events[0][0], "build")
@@ -803,6 +812,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                     },
                     "task_image_id": "sha256:" + "e" * 64,
                     "source_task_image": f"source:{record['instance_id']}",
+                    "base_dockerfile_sha256": "0" * 64,
                     "dependency_manifest": {"package_count": 2, "sha256": "1" * 64},
                     "readiness": {"status": "ready", "parsed_test_count": 1,
                                   "test_command_sha256": "2" * 64},

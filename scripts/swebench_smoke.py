@@ -632,13 +632,27 @@ def capture_dependency_manifest(*, image: str, output: pathlib.Path,
     }
 
 
+def enforce_https_swebench_base_images(templates: dict[str, str]) -> str:
+    """Keep trusted dependency installation on the worker's HTTPS-only egress."""
+    template = templates.get("py", "")
+    marker = "RUN sed -i 's|http://|https://|g' /etc/apt/sources.list && apt update"
+    if marker not in template:
+        needle = "RUN apt update"
+        if template.count(needle) != 1:
+            raise RuntimeError("unexpected SWE-bench Python base Dockerfile")
+        template = template.replace(needle, marker, 1)
+        templates["py"] = template
+    return hashlib.sha256(template.encode()).hexdigest()
+
+
 def prepare_task_environments(*, records: list[dict[str, Any]], source: pathlib.Path,
                               run_id: str, harness_images: Mapping[str, Mapping[str, str]],
                               work: pathlib.Path, output: pathlib.Path, clone: Any,
                               timeout_seconds: int = 180, max_workers: int = 5,
                               client: Any = None, build_instances: Any = None,
                               get_specs: Any = None, parsers: Mapping[str, Any] | None = None,
-                              repo_specs: Mapping[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+                              repo_specs: Mapping[str, Any] | None = None,
+                              dockerfile_templates: dict[str, str] | None = None) -> dict[str, dict[str, Any]]:
     """Build dependencies, sanitize images, and prove public tests run before agents."""
     if not records or len({record["instance_id"] for record in records}) != len(records):
         raise ValueError("preparation requires unique task records")
@@ -660,6 +674,13 @@ def prepare_task_environments(*, records: list[dict[str, Any]], source: pathlib.
         repo_specs = importlib.import_module(
             "swebench.harness.constants"
         ).MAP_REPO_VERSION_TO_SPECS
+    if dockerfile_templates is None:
+        dockerfile_templates = importlib.import_module(
+            "swebench.harness.dockerfiles"
+        )._DOCKERFILE_BASE
+    if dockerfile_templates is None:
+        raise RuntimeError("SWE-bench Dockerfile templates were not initialized")
+    base_dockerfile_sha256 = enforce_https_swebench_base_images(dockerfile_templates)
     parser_map = parsers
     specs_map = repo_specs
     if parser_map is None or specs_map is None:
@@ -729,6 +750,7 @@ def prepare_task_environments(*, records: list[dict[str, Any]], source: pathlib.
                 "images": task_images,
                 "task_image_id": task_images[HARNESSES[0]]["task_image_id"],
                 "source_task_image": spec.instance_image_key,
+                "base_dockerfile_sha256": base_dockerfile_sha256,
                 "dependency_manifest": dependency,
                 "readiness": readiness,
             }
@@ -1416,6 +1438,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
             },
             "task_image_id": item["task_image_id"],
             "source_task_image": item["source_task_image"],
+            "base_dockerfile_sha256": item["base_dockerfile_sha256"],
             "dependency_manifest": item["dependency_manifest"],
             "readiness": {
                 key: value for key, value in item["readiness"].items()
