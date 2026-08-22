@@ -145,24 +145,33 @@ class PreparedSWEbenchImageTests(unittest.TestCase):
             for path in (repo, *repo.rglob("*"), output):
                 path.chmod(0o777)
             (prompt / "task.md").write_text("fix", encoding="utf-8")
-            subprocess.run(
-                [
-                    "docker", "run", "--rm", "--network", "none", "--read-only",
-                    "--cap-drop=ALL", "--security-opt", "no-new-privileges",
-                    "--env", "OPENAI_API_KEY=test-only",
-                    "--env", "OPENAI_BASE_URL=http://unused.invalid/v1",
-                    "--env", "BENCHMARK_WORKSPACE=/testbed",
-                    "--env", "HOME=/agent-home", "--tmpfs", "/agent-home:rw,nosuid,nodev",
-                    "--tmpfs", "/tmp:rw,nosuid,nodev",
-                    "--mount", f"type=bind,src={repo},dst=/testbed",
-                    "--mount", f"type=bind,src={prompt},dst=/benchmark/input,readonly",
-                    "--mount", f"type=bind,src={output},dst=/benchmark/output",
-                    "--workdir", "/testbed", prepared["carry"]["tag"], "run", "--harness", "carry",
-                    "--model", "fixture", "--reasoning", "medium",
-                    "--prompt", "/benchmark/input/task.md", "--output", "/benchmark/output",
-                ],
-                check=True,
-            )
+            agent_command = [
+                "docker", "run", "--rm", "--network", "none", "--read-only",
+                "--cap-drop=ALL", "--security-opt", "no-new-privileges",
+                "--env", "OPENAI_API_KEY=test-only",
+                "--env", "OPENAI_BASE_URL=http://unused.invalid/v1",
+                "--env", "BENCHMARK_WORKSPACE=/testbed",
+                "--env", "HOME=/agent-home", "--tmpfs", "/agent-home:rw,nosuid,nodev",
+                "--tmpfs", "/tmp:rw,nosuid,nodev",
+                "--mount", f"type=bind,src={repo},dst=/testbed",
+                "--mount", f"type=bind,src={prompt},dst=/benchmark/input,readonly",
+                "--mount", f"type=bind,src={output},dst=/benchmark/output",
+                "--workdir", "/testbed", prepared["carry"]["tag"], "run", "--harness", "carry",
+                "--model", "fixture", "--reasoning", "medium",
+                "--prompt", "/benchmark/input/task.md", "--output", "/benchmark/output",
+            ]
+            try:
+                subprocess.run(agent_command, check=True)
+            finally:
+                subprocess.run(
+                    [
+                        "docker", "run", "--rm",
+                        "--mount", f"type=bind,src={repo},dst=/testbed",
+                        "--entrypoint", "chmod", prepared["carry"]["tag"],
+                        "-R", "a+rwx", "/testbed",
+                    ],
+                    check=False,
+                )
             patch = (output / "final.patch").read_text(encoding="utf-8")
             self.assertIn("+after", patch)
             self.assertNotIn("compiled-proof", patch)
