@@ -90,7 +90,10 @@ class PreparedSWEbenchImageTests(unittest.TestCase):
                 for value in args:
                     command.extend(("--build-arg", value))
                 command.append(str(fixture))
-                subprocess.run(command, check=True, text=True, capture_output=True)
+                try:
+                    subprocess.run(command, check=True, text=True, capture_output=True)
+                except subprocess.CalledProcessError as error:
+                    self.fail(f"docker build failed: {error.stdout}\n{error.stderr}")
                 return subprocess.run(
                     ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
                     check=True, text=True, capture_output=True,

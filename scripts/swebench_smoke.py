@@ -428,15 +428,28 @@ def build_prepared_task_image(*, source: pathlib.Path, run_id: str, instance_id:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", instance_id):
         raise ValueError("invalid instance ID for prepared image tag")
     tag = f"swebench-{run_id}-prepared-{instance_id.lower()}-{harness}"
+    parent_tags = {
+        name: f"{tag}-parent-{name.lower().replace('_', '-')}"
+        for name in parent_ids
+    }
+    for name, image_id in parent_ids.items():
+        execute(["docker", "image", "tag", image_id, parent_tags[name]], check=True)
     dockerfile = source / "containers" / "swebench-harness" / "Dockerfile.prepared"
     context = source
     command = [
         "docker", "build", "--progress=plain", "--file", str(dockerfile), "--tag", tag,
     ]
-    for name, value in parent_ids.items():
+    for name, value in parent_tags.items():
         command.extend(("--build-arg", f"{name}={value}"))
     command.append(str(context))
     execute(command, check=True, text=True)
+    for name, parent_tag in parent_tags.items():
+        parent_inspected = execute(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", parent_tag],
+            check=True, text=True, capture_output=True,
+        ).stdout.strip()
+        if parent_inspected != parent_ids[name]:
+            raise RuntimeError("prepared task parent image changed during build")
     inspected = execute(
         ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
         check=True, text=True, capture_output=True,

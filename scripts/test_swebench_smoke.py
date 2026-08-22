@@ -152,7 +152,11 @@ class SmokeWorkerTests(unittest.TestCase):
         def execute(command, **kwargs):
             calls.append(command)
             if command[:3] == ["docker", "image", "inspect"]:
-                return mock.Mock(stdout="sha256:" + "e" * 64 + "\n")
+                reference = command[-1]
+                value = "a" if reference.endswith("parent-task-image") else (
+                    "b" if reference.endswith("parent-harness-image") else "e"
+                )
+                return mock.Mock(stdout="sha256:" + value * 64 + "\n")
             return mock.Mock(returncode=0, stdout="")
 
         result = self.worker.build_prepared_task_image(
@@ -166,8 +170,12 @@ class SmokeWorkerTests(unittest.TestCase):
         )
         build = next(command for command in calls if command[:2] == ["docker", "build"])
         rendered = "\n".join(build)
-        for letter in "ab":
-            self.assertIn("sha256:" + letter * 64, rendered)
+        tag_commands = [command for command in calls if command[:3] == ["docker", "image", "tag"]]
+        self.assertEqual({command[3] for command in tag_commands}, {
+            "sha256:" + "a" * 64, "sha256:" + "b" * 64,
+        })
+        self.assertIn("parent-task-image", rendered)
+        self.assertIn("parent-harness-image", rendered)
         self.assertEqual(result["image_id"], "sha256:" + "e" * 64)
         self.assertEqual(result["tag"], "swebench-run-1-prepared-owner__repo-1-carry")
 
