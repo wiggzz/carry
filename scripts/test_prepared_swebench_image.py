@@ -151,6 +151,7 @@ class PreparedSWEbenchImageTests(unittest.TestCase):
                     "--cap-drop=ALL", "--security-opt", "no-new-privileges",
                     "--env", "OPENAI_API_KEY=test-only",
                     "--env", "OPENAI_BASE_URL=http://unused.invalid/v1",
+                    "--env", "BENCHMARK_WORKSPACE=/testbed",
                     "--env", "HOME=/agent-home", "--tmpfs", "/agent-home:rw,nosuid,nodev",
                     "--tmpfs", "/tmp:rw,nosuid,nodev",
                     "--mount", f"type=bind,src={repo},dst=/testbed",
