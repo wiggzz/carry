@@ -197,4 +197,4 @@ always-cleanup boundaries. See `docs/benchmark-isolation.md` for the v1 contract
 
 ## Releases and contributions
 
-Use Conventional Commits. CI runs formatting, Clippy, unit tests, a release build, and the scripted fixture on pull requests and `main`. Release Please opens a release PR from conventional commits; merging that PR creates a GitHub Release with a Linux x86_64 binary and checksum.
+Use a release-note-eligible Conventional Commit for each pull request title: `feat`, `fix`, `perf`, or `revert`, with an optional scope and breaking-change marker—for example, `feat: add shell completion` or `fix(parser): preserve nested output`. Release Please hides non-breaking `build`, `chore`, `ci`, `docs`, `refactor`, `style`, and `test` commits by default, so CI accepts those types only with `!`; generated `chore(main): release X.Y.Z` release pull requests are also accepted. CI runs formatting, Clippy, unit tests, a release build, and the scripted fixture on pull requests and `main`. Release Please opens a release PR from conventional commits; merging that PR creates a GitHub Release with a Linux x86_64 binary and checksum.
