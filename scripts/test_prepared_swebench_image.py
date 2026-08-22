@@ -142,6 +142,8 @@ class PreparedSWEbenchImageTests(unittest.TestCase):
             (repo / ".gitignore").write_text("*.so\n", encoding="utf-8")
             subprocess.run(["git", "-C", str(repo), "add", "file.txt", ".gitignore"], check=True)
             subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            for path in (repo, *repo.rglob("*"), output):
+                path.chmod(0o777)
             (prompt / "task.md").write_text("fix", encoding="utf-8")
             subprocess.run(
                 [
