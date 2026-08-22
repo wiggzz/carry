@@ -8,9 +8,12 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/*.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git python3 python3-pip python3-venv ripgrep \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install --global "${PACKAGE}@${PACKAGE_VERSION}"
+    && mkdir -p /opt/swebench-harness/bin \
+    && cp /usr/local/bin/node /opt/swebench-harness/bin/node \
+    && npm install --global --prefix /opt/swebench-harness "${PACKAGE}@${PACKAGE_VERSION}"
+ENV PATH=/opt/swebench-harness/bin:${PATH}
 ENV AGENT_COMMAND=${AGENT_COMMAND}
 ENV AGENT_HARNESS=${AGENT_HARNESS}
-COPY entrypoint.py /usr/local/bin/swebench-harness
-RUN chmod 0555 /usr/local/bin/swebench-harness
-ENTRYPOINT ["/usr/local/bin/swebench-harness"]
+COPY entrypoint.py /opt/swebench-harness/bin/adapter
+RUN chmod 0555 /opt/swebench-harness/bin/adapter
+ENTRYPOINT ["/opt/swebench-harness/bin/adapter"]

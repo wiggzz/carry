@@ -10,6 +10,8 @@ import sys
 
 parser = argparse.ArgumentParser()
 parser.add_argument("command", choices=["run"])
+parser.add_argument("--harness", choices=["carry", "codex", "pi"],
+                    default=os.environ.get("AGENT_HARNESS"))
 parser.add_argument("--model", required=True)
 parser.add_argument("--reasoning", required=True)
 parser.add_argument("--prompt", required=True)
@@ -24,7 +26,18 @@ output = pathlib.Path(args.output)
 output.mkdir(parents=True, exist_ok=True)
 template = os.environ.get("AGENT_COMMAND", "")
 if not template:
-    parser.error("agent command was not configured")
+    if not args.harness:
+        parser.error("agent command or --harness is required")
+    root = pathlib.Path(os.environ.get("PREPARED_HARNESS_ROOT", "/opt/swebench-harness"))
+    template = {
+        "carry": f"{root}/bin/carry --cwd /testbed --session-dir {{output}} "
+                 "--model {model} -p {prompt_text}",
+        "codex": f"{root}/bin/codex exec --dangerously-bypass-approvals-and-sandbox "
+                 "--model {model} --config model_reasoning_effort={reasoning} "
+                 "--json {prompt_text}",
+        "pi": f"{root}/bin/pi --mode json --provider openai-benchmark --model {{model}} "
+              "--thinking {reasoning} --no-session {prompt_text}",
+    }[args.harness]
 prompt_text = pathlib.Path(args.prompt).read_text(encoding="utf-8")
 values = {
     "model": args.model,
@@ -35,11 +48,15 @@ values = {
 }
 command = [part.format(**values) for part in shlex.split(template)]
 workspace = os.environ.get("BENCHMARK_WORKSPACE", "/workspace")
+subprocess.run(
+    ["git", "config", "--global", "--add", "safe.directory", workspace],
+    check=True,
+)
 baseline = subprocess.check_output(
     ["git", "rev-parse", "HEAD"], cwd=workspace, text=True
 ).strip()
 
-if os.environ.get("AGENT_HARNESS") == "pi":
+if args.harness == "pi":
     config = pathlib.Path(os.environ["HOME"]) / ".pi" / "agent"
     config.mkdir(parents=True, exist_ok=True)
     models = {
@@ -66,10 +83,14 @@ trace_path = output / "trace.log"
 agent_env = os.environ.copy()
 with trace_path.open("w", encoding="utf-8") as trace:
     returncode = 0
-    if os.environ.get("AGENT_HARNESS") == "codex":
+    if args.harness == "codex":
         try:
+            default_codex = str(
+                pathlib.Path(os.environ.get("PREPARED_HARNESS_ROOT", "/opt/swebench-harness"))
+                / "bin" / "codex"
+            ) if not os.environ.get("AGENT_COMMAND") else "codex"
             login = subprocess.run(
-                [os.environ.get("CODEX_BINARY", "codex"), "login", "--with-api-key"],
+                [os.environ.get("CODEX_BINARY", default_codex), "login", "--with-api-key"],
                 input=os.environ["OPENAI_API_KEY"],
                 cwd=workspace,
                 env=agent_env,

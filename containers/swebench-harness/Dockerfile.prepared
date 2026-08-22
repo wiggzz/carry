@@ -1,0 +1,25 @@
+ARG TASK_IMAGE
+ARG HARNESS_IMAGE
+
+FROM ${HARNESS_IMAGE} AS harness
+FROM ${TASK_IMAGE}
+
+# Official instance images contain a full upstream clone. Never expose its Git
+# objects or setup scripts to the model; a verified base-only checkout replaces
+# /testbed at runtime.
+RUN mkdir -p /opt/swebench-prepared \
+    && cd /testbed \
+    && git ls-files --others --ignored --exclude-standard -z \
+       > /opt/swebench-prepared/testbed-overlay-files \
+    && tar --null --files-from=/opt/swebench-prepared/testbed-overlay-files \
+       --create --file=/opt/swebench-prepared/testbed-overlay.tar \
+    && rm /opt/swebench-prepared/testbed-overlay-files \
+    && rm -rf /testbed /root/setup_env.sh /root/setup_repo.sh \
+    && mkdir -p /testbed
+COPY --from=harness /opt/swebench-harness /opt/swebench-harness
+COPY containers/swebench-harness/prepared-entrypoint.sh /usr/local/bin/prepared-entrypoint
+COPY containers/swebench-harness/apply-testbed-overlay.sh /usr/local/bin/apply-testbed-overlay
+RUN chmod 0555 /usr/local/bin/prepared-entrypoint /usr/local/bin/apply-testbed-overlay
+ENV PREPARED_HARNESS_ROOT=/opt/swebench-harness
+ENV PATH=/opt/swebench-harness/bin:${PATH}
+ENTRYPOINT ["/usr/local/bin/prepared-entrypoint"]
