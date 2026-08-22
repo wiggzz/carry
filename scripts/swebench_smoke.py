@@ -667,6 +667,7 @@ def prepare_task_environments(*, records: list[dict[str, Any]], source: pathlib.
 
     _, failed = build_instances(
         client, records, force_rebuild=False, max_workers=max_workers,
+        tag="latest", env_image_tag="latest",
     )
     if failed:
         raise RuntimeError(f"dependency preparation failed for {len(failed)} task images")

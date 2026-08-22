@@ -265,8 +265,8 @@ class SmokeWorkerTests(unittest.TestCase):
         ))
         events = []
 
-        def build_instances(_client, dataset, **_kwargs):
-            events.append(("build", [row["instance_id"] for row in dataset]))
+        def build_instances(_client, dataset, **kwargs):
+            events.append(("build", [row["instance_id"] for row in dataset], kwargs))
             return [spec.instance_image_key for spec in specs], []
 
         def clone(_repo, _commit, destination):
@@ -306,6 +306,8 @@ class SmokeWorkerTests(unittest.TestCase):
             )
         self.assertEqual(set(prepared), {record["instance_id"] for record in records})
         self.assertEqual(events[0][0], "build")
+        self.assertEqual(events[0][2]["tag"], "latest")
+        self.assertEqual(events[0][2]["env_image_tag"], "latest")
         self.assertEqual({event for event in events[1:7]}, {
             ("image", record["instance_id"], harness)
             for record in records for harness in self.worker.HARNESSES
