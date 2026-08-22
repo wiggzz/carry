@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -204,6 +205,27 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertNotIn("tests/test_public.py", script)
         self.assertNotIn("HIDDEN GOLD TEST", script)
         self.assertNotIn("git apply", script)
+
+    def test_streamable_public_test_command_bounds_each_sympy_test(self):
+        command = (
+            "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' "
+            "bin/test -C --verbose"
+        )
+        bounded = self.worker.streamable_public_test_command(command)
+        self.assertEqual(
+            shlex.split(bounded),
+            [
+                "PYTHONWARNINGS=ignore::UserWarning,ignore::SyntaxWarning",
+                "bin/test", "-C", "--verbose", "--timeout", "15",
+                "--split", "1/500",
+            ],
+        )
+        self.assertEqual(
+            shlex.split(self.worker.streamable_public_test_command(
+                "bin/test -C --verbose --timeout 17"
+            )),
+            ["bin/test", "-C", "--verbose", "--timeout", "17", "--split", "1/500"],
+        )
 
     def test_run_task_readiness_persists_diagnostics_and_accepts_test_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -688,7 +710,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         with self.assertRaises(ValueError):
             self.worker.selection_for_mode(frozen[:-1], "official-50")
 
-    def test_official_phase_budgets_fit_the_five_hour_worker_envelope(self):
+    def test_official_phase_budgets_fit_the_observed_preparation_envelope(self):
         limits = self.worker.official_phase_limits()
         self.assertEqual(
             limits["preparation_seconds"] + limits["agent_seconds"]
@@ -697,9 +719,11 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         )
         readiness_worst_case = 10 * 180  # Fifty tasks, five concurrent checks.
         self.assertLess(readiness_worst_case, limits["preparation_seconds"])
+        self.assertEqual(limits["preparation_seconds"], 6000)
         evaluator_worst_case = 30 * (270 + 45)  # Thirty all-harness evaluator shards.
         self.assertLess(evaluator_worst_case, limits["evaluation_seconds"])
-        self.assertEqual(150 * 360 // 3, limits["worker_seconds"])
+        self.assertEqual(limits["evaluation_seconds"], 10200)
+        self.assertEqual(limits["worker_seconds"], 21000)
         self.assertLess(limits["agent_seconds"], 150 * 360 // 3)
 
     def test_official_outcomes_require_exact_nonoverlapping_coverage(self):

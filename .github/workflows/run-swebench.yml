@@ -39,7 +39,7 @@ jobs:
   bootstrap-worker:
     name: ${{ inputs.mode }} ${{ inputs.harness }} ${{ inputs.carry_ref }}
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 420
     concurrency:
       group: swe-bench-bootstrap
       cancel-in-progress: false
@@ -93,7 +93,7 @@ jobs:
           role-to-assume: ${{ vars.BENCHMARK_DISPATCH_ROLE_ARN }}
           aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
           role-session-name: carry-bootstrap-${{ github.run_id }}
-          role-duration-seconds: 21600
+          role-duration-seconds: 25200
           mask-aws-account-id: true
 
       - name: Sanitize exact prior run objects
@@ -257,7 +257,7 @@ jobs:
             printf 'REASONING=%q\n' "$REASONING"
             cat scripts/swebench_ec2_worker.sh
           } > worker-user-data.sh
-          EXPIRES_AT=$(date -u -d '+6 hours' +'%Y-%m-%dT%H:%M:%SZ')
+          EXPIRES_AT=$(date -u -d '+8 hours' +'%Y-%m-%dT%H:%M:%SZ')
           TAGS="Tags=[{Key=Application,Value=Carry},{Key=Component,Value=swebench-benchmark},{Key=ExpiresAt,Value=$EXPIRES_AT},{Key=ManagedBy,Value=carry-swebench},{Key=Project,Value=carry-swebench},{Key=Purpose,Value=benchmark-worker},{Key=Repository,Value=wiggzz/carry},{Key=RunId,Value=$RUN_ID}]"
           WORKER_INSTANCE_ID=$(aws ec2 run-instances --launch-template "LaunchTemplateId=$LAUNCH_TEMPLATE_ID,Version=$LAUNCH_TEMPLATE_VERSION" \
             --count 1 --client-token "$RUN_ID" --user-data file://worker-user-data.sh \
@@ -277,8 +277,8 @@ jobs:
           mkdir -p benchmark-artifact
           if [[ "$BENCHMARK_MODE" == official-50 ]]; then
             # Allow twenty minutes for EC2 launch/boot around the worker's
-            # five-hour wall clock; preserve forty minutes of the six-hour job.
-            deadline=$((SECONDS + 19200))
+            # 350-minute wall clock; preserve fifty minutes of the seven-hour job.
+            deadline=$((SECONDS + 22200))
             next_rotation=$((SECONDS + 1500))
           else
             deadline=$((SECONDS + 3300))

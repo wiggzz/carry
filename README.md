@@ -114,7 +114,7 @@ Choose `smoke-5` for the first five frozen IDs
 share the exact same task-image parents and dependency manifests in one worker. Select a
 single harness only for lane-specific smoke or diagnostic runs. Apply the Terraform change
 that raises
-the protected dispatch role's maximum session to six hours before dispatching the
+the protected dispatch role's maximum session to seven hours before dispatching the
 official mode. Automation never applies Terraform.
 
 The official mode uses one disposable worker and builds all three pinned run-local harness
@@ -165,16 +165,17 @@ persisted rather than producing a green official run. Carry's
 aggregate Responses API retry count is copied into each slot record and harness summary.
 Each agent slot remains capped at six minutes. The limit is also passed into each named
 agent container; host-side cleanup retries and verifies exact-container absence, failing
-the worker closed if Docker cannot prove it stopped. Official execution reserves 50
+the worker closed if Docker cannot prove it stopped. Official execution reserves 100
 minutes for dependency preparation/readiness, 60 minutes for agents, 170 minutes for
-grading at evaluator concurrency five, and 20 minutes for setup inside a five-hour wall
-clock that starts before package/source setup. Evaluator shards have a 315-second outer
-cap, leaving at least 750 seconds of phase-level orchestration margin. After every evaluator
-return path, exact-run containers receive verified cleanup because SWE-bench may suppress
+grading at evaluator concurrency five, and 20 minutes for setup inside a 350-minute wall
+clock that starts before package/source setup. The phase budgets are fail-closed; the
+preparation allowance reflects the measured 50-task image-build path, while grading retains
+its reviewed concurrency and per-shard timeout. After every evaluator return path,
+exact-run containers receive verified cleanup because SWE-bench may suppress
 its own stop/remove failures. Queued agent slots become explicit budget-exhausted
 diagnostics rather than silently disappearing.
 The controller permits twenty minutes for EC2 launch/boot around the worker clock and
-reserves the remaining forty minutes of its six-hour job for termination and exact cleanup.
+reserves the remaining fifty minutes of its seven-hour job for termination and exact cleanup.
 All limits, model-derived pricing, and image identities are recorded in provenance. Pricing is
 looked up by exact model ID in the reviewed benchmark code and accounts separately for ordinary
 input, cache reads, cache writes, and output; unknown models report cost as unavailable. The workflow

@@ -195,8 +195,8 @@ PI_COMMAND = (
 def official_phase_limits(values: Mapping[str, str] | None = None) -> dict[str, int]:
     source = values if values is not None else os.environ
     limits = {
-        "worker_seconds": int(source.get("OFFICIAL_WORKER_SECONDS", "18000")),
-        "preparation_seconds": int(source.get("OFFICIAL_PREPARATION_PHASE_SECONDS", "3000")),
+        "worker_seconds": int(source.get("OFFICIAL_WORKER_SECONDS", "21000")),
+        "preparation_seconds": int(source.get("OFFICIAL_PREPARATION_PHASE_SECONDS", "6000")),
         "agent_seconds": int(source.get("OFFICIAL_AGENT_PHASE_SECONDS", "3600")),
         "evaluation_seconds": int(source.get("OFFICIAL_EVALUATION_PHASE_SECONDS", "10200")),
         "setup_reserve_seconds": int(source.get("OFFICIAL_SETUP_RESERVE_SECONDS", "1200")),
@@ -467,7 +467,7 @@ def build_prepared_task_image(*, source: pathlib.Path, run_id: str, instance_id:
 
 
 def streamable_public_test_command(command: str) -> str:
-    """Make pytest report executed tests before a bounded readiness timeout."""
+    """Make public runners report bounded test outcomes during readiness."""
     tokens = shlex.split(command)
     pytest_command = (
         bool(tokens) and pathlib.PurePath(tokens[0]).name in {"pytest", "py.test"}
@@ -475,14 +475,25 @@ def streamable_public_test_command(command: str) -> str:
         len(tokens) >= 3 and pathlib.PurePath(tokens[0]).name.startswith("python")
         and tokens[1:3] == ["-m", "pytest"]
     )
-    if not pytest_command:
-        return command
-    if not any(token in {"-v", "-vv", "--verbose"} or token.startswith("--verbose=")
-               for token in tokens):
-        tokens.append("-vv")
-    if not any(token == "-x" or token.startswith("--maxfail") for token in tokens):
-        tokens.append("--maxfail=1")
-    return shlex.join(tokens)
+    if pytest_command:
+        if not any(token in {"-v", "-vv", "--verbose"} or token.startswith("--verbose=")
+                   for token in tokens):
+            tokens.append("-vv")
+        if not any(token == "-x" or token.startswith("--maxfail") for token in tokens):
+            tokens.append("--maxfail=1")
+        return shlex.join(tokens)
+
+    # SymPy's runner can begin a real test and then hang indefinitely on a buggy
+    # base commit without emitting a parser-recognizable outcome. Bound each test
+    # and run a deterministic public slice so readiness proves the ordinary path
+    # without spending minutes traversing the full suite for every task image.
+    if any(token.lstrip("./") == "bin/test" for token in tokens):
+        if not any(token == "--timeout" or token.startswith("--timeout=") for token in tokens):
+            tokens.extend(("--timeout", "15"))
+        if not any(token == "--split" or token.startswith("--split=") for token in tokens):
+            tokens.extend(("--split", "1/500"))
+        return shlex.join(tokens)
+    return command
 
 
 def trusted_readiness_script(test_spec: Any, *, public_test_command: str | None = None) -> tuple[str, str]:
