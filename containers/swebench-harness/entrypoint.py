@@ -48,6 +48,10 @@ values = {
 }
 command = [part.format(**values) for part in shlex.split(template)]
 workspace = os.environ.get("BENCHMARK_WORKSPACE", "/workspace")
+subprocess.run(
+    ["git", "config", "--global", "--add", "safe.directory", workspace],
+    check=True,
+)
 baseline = subprocess.check_output(
     ["git", "rev-parse", "HEAD"], cwd=workspace, text=True
 ).strip()
