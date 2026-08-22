@@ -246,11 +246,17 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(payload["packages"][0]["name"], "pytest")
 
     def test_swebench_base_image_dependency_sources_are_https_only(self):
-        templates = {"py": "FROM ubuntu:22.04\nRUN apt update && apt install -y git\n"}
-        first = self.worker.enforce_https_swebench_base_images(templates)
-        second = self.worker.enforce_https_swebench_base_images(templates)
+        templates = {"py": (
+            "FROM --platform={platform} ubuntu:{ubuntu_version}\n"
+            "ENV TZ=Etc/UTC\nRUN apt update && apt install -y git\n"
+        )}
+        ca_image = "node@sha256:" + "a" * 64
+        first = self.worker.enforce_https_swebench_base_images(templates, ca_image)
+        second = self.worker.enforce_https_swebench_base_images(templates, ca_image)
         self.assertEqual(first, second)
         self.assertIn("sed -i 's|http://|https://|g'", templates["py"])
+        self.assertIn(ca_image, templates["py"])
+        self.assertIn("COPY --from=trusted_certs /etc/ssl/certs", templates["py"])
         self.assertNotIn("\nRUN apt update", templates["py"])
 
     def test_prepare_task_environments_builds_and_checks_every_task_before_returning(self):
@@ -311,7 +317,11 @@ class SmokeWorkerTests(unittest.TestCase):
                 get_specs=lambda dataset: specs,
                 parsers={"owner/repo": lambda *_args: {"test": "PASSED"}},
                 repo_specs={"owner/repo": {"1.0": {"test_cmd": "pytest -rA"}}},
-                dockerfile_templates={"py": "FROM ubuntu:22.04\nRUN apt update\n"},
+                dockerfile_templates={"py": (
+                    "FROM --platform={platform} ubuntu:{ubuntu_version}\n"
+                    "ENV TZ=Etc/UTC\nRUN apt update\n"
+                )},
+                trusted_ca_image="node@sha256:" + "a" * 64,
             )
         self.assertEqual(set(prepared), {record["instance_id"] for record in records})
         self.assertEqual(events[0][0], "build")

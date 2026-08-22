@@ -632,16 +632,31 @@ def capture_dependency_manifest(*, image: str, output: pathlib.Path,
     }
 
 
-def enforce_https_swebench_base_images(templates: dict[str, str]) -> str:
+def enforce_https_swebench_base_images(templates: dict[str, str],
+                                       trusted_ca_image: str) -> str:
     """Keep trusted dependency installation on the worker's HTTPS-only egress."""
+    if not DIGEST_IMAGE.fullmatch(trusted_ca_image):
+        raise ValueError("trusted CA image must use an immutable sha256 digest")
     template = templates.get("py", "")
+    source_from = "FROM --platform={platform} ubuntu:{ubuntu_version}"
+    ca_stage = f"FROM --platform={{platform}} {trusted_ca_image} AS trusted_certs"
+    if ca_stage not in template:
+        if template.count(source_from) != 1:
+            raise RuntimeError("unexpected SWE-bench Python base image source")
+        template = template.replace(source_from, f"{ca_stage}\n{source_from}", 1)
+    ca_copy = "COPY --from=trusted_certs /etc/ssl/certs /etc/ssl/certs"
+    if ca_copy not in template:
+        env_marker = "ENV TZ=Etc/UTC"
+        if template.count(env_marker) != 1:
+            raise RuntimeError("unexpected SWE-bench Python base environment")
+        template = template.replace(env_marker, f"{env_marker}\n{ca_copy}", 1)
     marker = "RUN sed -i 's|http://|https://|g' /etc/apt/sources.list && apt update"
     if marker not in template:
         needle = "RUN apt update"
         if template.count(needle) != 1:
             raise RuntimeError("unexpected SWE-bench Python base Dockerfile")
         template = template.replace(needle, marker, 1)
-        templates["py"] = template
+    templates["py"] = template
     return hashlib.sha256(template.encode()).hexdigest()
 
 
@@ -652,16 +667,21 @@ def prepare_task_environments(*, records: list[dict[str, Any]], source: pathlib.
                               client: Any = None, build_instances: Any = None,
                               get_specs: Any = None, parsers: Mapping[str, Any] | None = None,
                               repo_specs: Mapping[str, Any] | None = None,
-                              dockerfile_templates: dict[str, str] | None = None) -> dict[str, dict[str, Any]]:
+                              dockerfile_templates: dict[str, str] | None = None,
+                              trusted_ca_image: str | None = None) -> dict[str, dict[str, Any]]:
     """Build dependencies, sanitize images, and prove public tests run before agents."""
     if not records or len({record["instance_id"] for record in records}) != len(records):
         raise ValueError("preparation requires unique task records")
+    output.mkdir(parents=True, exist_ok=True)
     if client is None:
         client = importlib.import_module("docker").from_env()
     if build_instances is None:
-        build_instances = importlib.import_module(
-            "swebench.harness.docker_build"
-        ).build_instance_images
+        docker_build = importlib.import_module("swebench.harness.docker_build")
+        build_log_root = (output / "build-logs").resolve()
+        setattr(docker_build, "BASE_IMAGE_BUILD_DIR", build_log_root / "base")
+        setattr(docker_build, "ENV_IMAGE_BUILD_DIR", build_log_root / "env")
+        setattr(docker_build, "INSTANCE_IMAGE_BUILD_DIR", build_log_root / "instances")
+        build_instances = docker_build.build_instance_images
     if get_specs is None:
         get_specs = importlib.import_module(
             "swebench.harness.test_spec.test_spec"
@@ -680,7 +700,11 @@ def prepare_task_environments(*, records: list[dict[str, Any]], source: pathlib.
         )._DOCKERFILE_BASE
     if dockerfile_templates is None:
         raise RuntimeError("SWE-bench Dockerfile templates were not initialized")
-    base_dockerfile_sha256 = enforce_https_swebench_base_images(dockerfile_templates)
+    if trusted_ca_image is None:
+        raise RuntimeError("trusted CA image was not provided")
+    base_dockerfile_sha256 = enforce_https_swebench_base_images(
+        dockerfile_templates, trusted_ca_image,
+    )
     parser_map = parsers
     specs_map = repo_specs
     if parser_map is None or specs_map is None:
@@ -1410,6 +1434,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
             harness_images=provenance, work=work,
             output=output / "preparation", clone=clone_one,
             timeout_seconds=readiness_timeout, max_workers=readiness_concurrency,
+            trusted_ca_image=validated["BASE_IMAGE"],
         )
         preparation_elapsed = time.monotonic() - preparation_started
         if phase_limits is not None and preparation_elapsed > phase_limits["preparation_seconds"]:
