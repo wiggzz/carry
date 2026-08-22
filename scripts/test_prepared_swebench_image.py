@@ -29,12 +29,12 @@ class PreparedSWEbenchImageTests(unittest.TestCase):
                 (ROOT / "containers" / "swebench-harness" / "entrypoint.py").read_bytes()
             )
             (fixture / "conda.sh").write_text(
-                "conda() {\n"
-                "  if [ \"${1:-}\" = activate ]; then\n"
-                "    export CONDA_PREFIX=/opt/miniconda3/envs/testbed\n"
-                "    export PATH=\"$CONDA_PREFIX/bin:$PATH\"\n"
-                "  fi\n"
-                "}\n",
+                "if [ \"$#\" -ne 1 ] || [ \"$1\" != testbed ]; then\n"
+                "  printf 'activate requires exactly one environment\\n' >&2\n"
+                "  return 2\n"
+                "fi\n"
+                "export CONDA_PREFIX=/opt/miniconda3/envs/testbed\n"
+                "export PATH=\"$CONDA_PREFIX/bin:$PATH\"\n",
                 encoding="utf-8",
             )
             (fixture / "dependency-proof").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
