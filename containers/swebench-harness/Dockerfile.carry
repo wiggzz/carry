@@ -1,6 +1,7 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE} AS build
-RUN apt-get update \
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/*.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends musl-tools \
     && rm -rf /var/lib/apt/lists/* \
     && rustup target add x86_64-unknown-linux-musl
