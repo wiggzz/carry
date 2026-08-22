@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import hashlib
+import importlib
 import ipaddress
 import json
 import math
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -22,8 +24,10 @@ HARNESSES = ("carry", "codex", "pi")
 
 def selected_harnesses(values: Mapping[str, str]) -> tuple[str, ...]:
     harness = values.get("BENCHMARK_HARNESS", "carry")
+    if harness == "all":
+        return HARNESSES
     if harness not in HARNESSES:
-        raise ValueError(f"BENCHMARK_HARNESS must be one of {', '.join(HARNESSES)}")
+        raise ValueError(f"BENCHMARK_HARNESS must be all or one of {', '.join(HARNESSES)}")
     return (harness,)
 
 
@@ -192,14 +196,16 @@ def official_phase_limits(values: Mapping[str, str] | None = None) -> dict[str, 
     source = values if values is not None else os.environ
     limits = {
         "worker_seconds": int(source.get("OFFICIAL_WORKER_SECONDS", "18000")),
-        "agent_seconds": int(source.get("OFFICIAL_AGENT_PHASE_SECONDS", "11400")),
-        "evaluation_seconds": int(source.get("OFFICIAL_EVALUATION_PHASE_SECONDS", "5400")),
+        "preparation_seconds": int(source.get("OFFICIAL_PREPARATION_PHASE_SECONDS", "3000")),
+        "agent_seconds": int(source.get("OFFICIAL_AGENT_PHASE_SECONDS", "3600")),
+        "evaluation_seconds": int(source.get("OFFICIAL_EVALUATION_PHASE_SECONDS", "10200")),
         "setup_reserve_seconds": int(source.get("OFFICIAL_SETUP_RESERVE_SECONDS", "1200")),
     }
     if any(value <= 0 for value in limits.values()):
         raise ValueError("official phase limits must be positive")
-    if (limits["agent_seconds"] + limits["evaluation_seconds"]
-            + limits["setup_reserve_seconds"] != limits["worker_seconds"]):
+    if (limits["preparation_seconds"] + limits["agent_seconds"]
+            + limits["evaluation_seconds"] + limits["setup_reserve_seconds"]
+            != limits["worker_seconds"]):
         raise ValueError("official phase limits must exactly partition the worker budget")
     return limits
 
@@ -365,16 +371,427 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path, task_i
         "--security-opt", "no-new-privileges", "--env", "OPENAI_API_KEY",
         "--env", f"OPENAI_BASE_URL={api_base}",
         "--env", f"AGENT_TIMEOUT_SECONDS={agent_timeout_seconds}",
+        "--env", "BENCHMARK_WORKSPACE=/testbed",
         "--env", "HOME=/agent-home", "--env", "XDG_CONFIG_HOME=/agent-home/.config",
         "--tmpfs", "/agent-home:rw,nosuid,nodev,size=256m",
         "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m",
-        "--mount", f"type=bind,src={repo.resolve()},dst=/workspace",
+        "--mount", f"type=bind,src={repo.resolve()},dst=/testbed",
         "--mount", f"type=bind,src={task_input.resolve()},dst=/benchmark/input,readonly",
         "--mount", f"type=bind,src={output.resolve()},dst=/benchmark/output",
-        "--workdir", "/workspace", image, "run", "--model", model,
+        "--workdir", "/testbed", image, "run", "--harness", harness,
+        "--model", model,
         "--reasoning", reasoning, "--prompt", "/benchmark/input/task.md",
         "--output", "/benchmark/output",
     ]
+
+
+def readiness_docker_command(*, image: str, container_name: str, repo: pathlib.Path,
+                             script: str) -> list[str]:
+    """Run a trusted public-test preflight without network or evaluator mounts."""
+    return [
+        "docker", "run", "--rm", "--name", container_name,
+        "--network", "none", "--read-only", "--cap-drop=ALL",
+        "--security-opt", "no-new-privileges",
+        "--env", "HOME=/tmp/home",
+        "--tmpfs", "/tmp:rw,nosuid,nodev,size=1g",
+        "--mount", f"type=bind,src={repo.resolve()},dst=/testbed",
+        "--workdir", "/testbed", "--entrypoint", "/bin/bash", image,
+        "-lc", script,
+    ]
+
+
+def validate_readiness_result(*, returncode: int, timed_out: bool,
+                              parsed_tests: Mapping[str, str]) -> dict[str, Any]:
+    """Accept buggy baseline failures only after the official parser saw tests run."""
+    if not parsed_tests:
+        raise RuntimeError("readiness command did not execute any parseable public tests")
+    return {
+        "status": "ready",
+        "baseline_exit_code": returncode,
+        "timed_out_after_tests_started": timed_out,
+        "parsed_test_count": len(parsed_tests),
+        "parsed_statuses": dict(sorted(Counter(parsed_tests.values()).items())),
+    }
+
+
+def build_prepared_task_image(*, source: pathlib.Path, run_id: str, instance_id: str,
+                              harness: str, task_image_id: str,
+                              harness_image_id: str,
+                              execute: Any = subprocess.run) -> dict[str, str]:
+    """Layer one pinned harness onto a dependency-ready, sanitized task image."""
+    if harness not in HARNESSES:
+        raise ValueError(f"unknown harness {harness}")
+    image_id_pattern = re.compile(r"^sha256:[0-9a-f]{64}$")
+    parent_ids = {"TASK_IMAGE": task_image_id, "HARNESS_IMAGE": harness_image_id}
+    if any(not image_id_pattern.fullmatch(value) for value in parent_ids.values()):
+        raise ValueError("prepared task images require immutable local sha256 parent IDs")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", instance_id):
+        raise ValueError("invalid instance ID for prepared image tag")
+    tag = f"swebench-{run_id}-prepared-{instance_id.lower()}-{harness}"
+    parent_tags = {
+        name: f"{tag}-parent-{name.lower().replace('_', '-')}"
+        for name in parent_ids
+    }
+    for name, image_id in parent_ids.items():
+        execute(["docker", "image", "tag", image_id, parent_tags[name]], check=True)
+    dockerfile = source / "containers" / "swebench-harness" / "Dockerfile.prepared"
+    context = source
+    command = [
+        "docker", "build", "--progress=plain", "--file", str(dockerfile), "--tag", tag,
+    ]
+    for name, value in parent_tags.items():
+        command.extend(("--build-arg", f"{name}={value}"))
+    command.append(str(context))
+    execute(command, check=True, text=True)
+    for name, parent_tag in parent_tags.items():
+        parent_inspected = execute(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", parent_tag],
+            check=True, text=True, capture_output=True,
+        ).stdout.strip()
+        if parent_inspected != parent_ids[name]:
+            raise RuntimeError("prepared task parent image changed during build")
+    inspected = execute(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
+        check=True, text=True, capture_output=True,
+    ).stdout.strip()
+    if not image_id_pattern.fullmatch(inspected):
+        raise RuntimeError("prepared task image did not resolve to a sha256 image ID")
+    return {
+        "tag": tag,
+        "image_id": inspected,
+        "task_image_id": task_image_id,
+        "harness": harness,
+        "harness_image_id": harness_image_id,
+        "dockerfile_sha256": hashlib.sha256(dockerfile.read_bytes()).hexdigest(),
+    }
+
+
+def streamable_public_test_command(command: str) -> str:
+    """Make pytest report executed tests before a bounded readiness timeout."""
+    tokens = shlex.split(command)
+    pytest_command = (
+        bool(tokens) and pathlib.PurePath(tokens[0]).name in {"pytest", "py.test"}
+    ) or (
+        len(tokens) >= 3 and pathlib.PurePath(tokens[0]).name.startswith("python")
+        and tokens[1:3] == ["-m", "pytest"]
+    )
+    if not pytest_command:
+        return command
+    if not any(token in {"-v", "-vv", "--verbose"} or token.startswith("--verbose=")
+               for token in tokens):
+        tokens.append("-vv")
+    if not any(token == "-x" or token.startswith("--maxfail") for token in tokens):
+        tokens.append("--maxfail=1")
+    return shlex.join(tokens)
+
+
+def trusted_readiness_script(test_spec: Any, *, public_test_command: str | None = None) -> tuple[str, str]:
+    """Create a gold-free baseline command from the official public test path."""
+    commands = list(test_spec.eval_script_list)
+    try:
+        start = commands.index(": '>>>>> Start Test Output'")
+    except ValueError as error:
+        raise RuntimeError("test spec has no official test-output marker") from error
+    if start + 1 >= len(commands):
+        raise RuntimeError("test spec has no public test command")
+    test_command = streamable_public_test_command(
+        public_test_command or commands[start + 1]
+    )
+    if not test_command.strip():
+        raise RuntimeError("public readiness test command is empty")
+    apply_indexes = [
+        index for index, command in enumerate(commands[:start])
+        if command.lstrip().startswith("git apply ")
+    ]
+    if len(apply_indexes) != 1:
+        raise RuntimeError("test spec must contain exactly one hidden test-patch command")
+    config_indexes = [
+        index for index, command in enumerate(commands[:apply_indexes[0]])
+        if command.strip().startswith("git config --global --add safe.directory ")
+    ]
+    if len(config_indexes) != 1:
+        raise RuntimeError("test spec must delimit repository eval commands")
+    # The official instance image already executed its repository installation
+    # script. Re-running the later evaluator install could hide a broken prepared
+    # layer and would require writes to the immutable environment.
+    preamble = commands[:config_indexes[0]]
+    lines = [
+        "set -euo pipefail", "/usr/local/bin/apply-testbed-overlay", *preamble, "set +e",
+    ]
+    lines.extend((
+        "printf '%s\\n' '>>>>> Start Test Output'",
+        test_command,
+        "readiness_status=$?",
+        "printf '%s\\n' '>>>>> End Test Output'",
+        "exit \"$readiness_status\"",
+    ))
+    script = "\n".join(lines) + "\n"
+    if "git apply" in script:
+        raise RuntimeError("hidden test patch leaked into readiness script")
+    return script, test_command
+
+
+def run_task_readiness(*, instance_id: str, image: str, repo: pathlib.Path,
+                       script: str, test_command: str, parser: Any, test_spec: Any,
+                       output: pathlib.Path, timeout_seconds: int) -> dict[str, Any]:
+    """Run and parse a disposable baseline public-test check before model spend."""
+    if timeout_seconds < 1:
+        raise ValueError("readiness timeout must be positive")
+    output.mkdir(parents=True, exist_ok=True)
+    identity = hashlib.sha256(f"{instance_id}\0{image}\0{repo.resolve()}".encode()).hexdigest()[:16]
+    container_name = f"carry-readiness-{identity}"
+    command = readiness_docker_command(
+        image=image, container_name=container_name, repo=repo, script=script,
+    )
+    timed_out = False
+    try:
+        process = subprocess.run(
+            command, check=False, capture_output=True, text=True,
+            timeout=timeout_seconds,
+        )
+        returncode = process.returncode
+        captured = (process.stdout or "") + (process.stderr or "")
+    except subprocess.TimeoutExpired as error:
+        timed_out = True
+        returncode = 124
+        stdout = error.stdout.decode(errors="replace") if isinstance(error.stdout, bytes) else (error.stdout or "")
+        stderr = error.stderr.decode(errors="replace") if isinstance(error.stderr, bytes) else (error.stderr or "")
+        captured = stdout + stderr
+        force_remove_container(container_name, exact_name=True)
+    (output / "test-output.txt").write_text(captured, encoding="utf-8")
+    base_metadata = {
+        "instance_id": instance_id,
+        "baseline_exit_code": returncode,
+        "timed_out_after_tests_started": timed_out,
+        "test_command": test_command,
+        "test_command_sha256": hashlib.sha256(test_command.encode()).hexdigest(),
+        "prepared_image": image,
+    }
+    try:
+        parsed_tests = parser(captured, test_spec)
+        result = validate_readiness_result(
+            returncode=returncode, timed_out=timed_out, parsed_tests=parsed_tests,
+        )
+    except Exception as error:
+        failure = {**base_metadata, "status": "not-ready", "error": str(error)}
+        (output / "metadata.json").write_text(
+            json.dumps(failure, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+        )
+        raise
+    result.update(base_metadata)
+    (output / "metadata.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    return result
+
+
+def capture_dependency_manifest(*, image: str, output: pathlib.Path,
+                                execute: Any = subprocess.run) -> dict[str, Any]:
+    """Capture the exact installed conda package set from a prepared task image."""
+    command = [
+        "docker", "run", "--rm", "--network", "none", "--read-only",
+        "--cap-drop=ALL", "--security-opt", "no-new-privileges",
+        "--entrypoint", "/bin/bash", image, "-lc",
+        "source /opt/miniconda3/bin/activate && conda activate testbed "
+        "&& conda list --json",
+    ]
+    process = execute(command, check=True, capture_output=True, text=True, timeout=60)
+    overlay = execute(
+        [
+            "docker", "run", "--rm", "--network", "none", "--read-only",
+            "--cap-drop=ALL", "--security-opt", "no-new-privileges",
+            "--entrypoint", "sha256sum", image,
+            "/opt/swebench-prepared/testbed-overlay.tar",
+        ],
+        check=True, capture_output=True, text=True, timeout=60,
+    )
+    overlay_match = re.fullmatch(
+        r"([0-9a-f]{64})\s+/opt/swebench-prepared/testbed-overlay\.tar\s*",
+        overlay.stdout,
+    )
+    if overlay_match is None:
+        raise RuntimeError("prepared build overlay did not produce a sha256 digest")
+    packages = json.loads(process.stdout)
+    if not isinstance(packages, list) or any(not isinstance(item, dict) for item in packages):
+        raise RuntimeError("prepared dependency manifest is not a JSON package list")
+    canonical = json.dumps(packages, sort_keys=True, separators=(",", ":"))
+    payload = {
+        "image": image,
+        "package_count": len(packages),
+        "sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+        "build_overlay_sha256": overlay_match.group(1),
+        "packages": packages,
+    }
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "dependencies.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    return {
+        key: payload[key]
+        for key in ("package_count", "sha256", "build_overlay_sha256")
+    }
+
+
+def enforce_https_swebench_base_images(templates: dict[str, str],
+                                       trusted_ca_image: str) -> str:
+    """Keep trusted dependency installation on the worker's HTTPS-only egress."""
+    if not DIGEST_IMAGE.fullmatch(trusted_ca_image):
+        raise ValueError("trusted CA image must use an immutable sha256 digest")
+    template = templates.get("py", "")
+    source_from = "FROM --platform={platform} ubuntu:{ubuntu_version}"
+    ca_stage = f"FROM --platform={{platform}} {trusted_ca_image} AS trusted_certs"
+    if ca_stage not in template:
+        if template.count(source_from) != 1:
+            raise RuntimeError("unexpected SWE-bench Python base image source")
+        template = template.replace(source_from, f"{ca_stage}\n{source_from}", 1)
+    ca_copy = "COPY --from=trusted_certs /etc/ssl/certs /etc/ssl/certs"
+    if ca_copy not in template:
+        env_marker = "ENV TZ=Etc/UTC"
+        if template.count(env_marker) != 1:
+            raise RuntimeError("unexpected SWE-bench Python base environment")
+        template = template.replace(env_marker, f"{env_marker}\n{ca_copy}", 1)
+    marker = "RUN sed -i 's|http://|https://|g' /etc/apt/sources.list && apt update"
+    if marker not in template:
+        needle = "RUN apt update"
+        if template.count(needle) != 1:
+            raise RuntimeError("unexpected SWE-bench Python base Dockerfile")
+        template = template.replace(needle, marker, 1)
+    templates["py"] = template
+    return hashlib.sha256(template.encode()).hexdigest()
+
+
+def prepare_task_environments(*, records: list[dict[str, Any]], source: pathlib.Path,
+                              run_id: str, harness_images: Mapping[str, Mapping[str, str]],
+                              work: pathlib.Path, output: pathlib.Path, clone: Any,
+                              timeout_seconds: int = 180, max_workers: int = 5,
+                              client: Any = None, build_instances: Any = None,
+                              get_specs: Any = None, parsers: Mapping[str, Any] | None = None,
+                              repo_specs: Mapping[str, Any] | None = None,
+                              dockerfile_templates: dict[str, str] | None = None,
+                              trusted_ca_image: str | None = None) -> dict[str, dict[str, Any]]:
+    """Build dependencies, sanitize images, and prove public tests run before agents."""
+    if not records or len({record["instance_id"] for record in records}) != len(records):
+        raise ValueError("preparation requires unique task records")
+    output.mkdir(parents=True, exist_ok=True)
+    if client is None:
+        client = importlib.import_module("docker").from_env()
+    if build_instances is None:
+        docker_build = importlib.import_module("swebench.harness.docker_build")
+        build_log_root = (output / "build-logs").resolve()
+        setattr(docker_build, "BASE_IMAGE_BUILD_DIR", build_log_root / "base")
+        setattr(docker_build, "ENV_IMAGE_BUILD_DIR", build_log_root / "env")
+        setattr(docker_build, "INSTANCE_IMAGE_BUILD_DIR", build_log_root / "instances")
+        build_instances = docker_build.build_instance_images
+    if get_specs is None:
+        get_specs = importlib.import_module(
+            "swebench.harness.test_spec.test_spec"
+        ).get_test_specs_from_dataset
+    if parsers is None:
+        parsers = importlib.import_module(
+            "swebench.harness.log_parsers"
+        ).MAP_REPO_TO_PARSER
+    if repo_specs is None:
+        repo_specs = importlib.import_module(
+            "swebench.harness.constants"
+        ).MAP_REPO_VERSION_TO_SPECS
+    if dockerfile_templates is None:
+        dockerfile_templates = importlib.import_module(
+            "swebench.harness.dockerfiles"
+        )._DOCKERFILE_BASE
+    if dockerfile_templates is None:
+        raise RuntimeError("SWE-bench Dockerfile templates were not initialized")
+    if trusted_ca_image is None:
+        raise RuntimeError("trusted CA image was not provided")
+    base_dockerfile_sha256 = enforce_https_swebench_base_images(
+        dockerfile_templates, trusted_ca_image,
+    )
+    parser_map = parsers
+    specs_map = repo_specs
+    if parser_map is None or specs_map is None:
+        raise RuntimeError("official parser/spec maps were not initialized")
+
+    _, failed = build_instances(
+        client, records, force_rebuild=False, max_workers=max_workers,
+        tag="latest", env_image_tag="latest",
+    )
+    if failed:
+        raise RuntimeError(f"dependency preparation failed for {len(failed)} task images")
+    specs = list(get_specs(records))
+    by_spec = {spec.instance_id: spec for spec in specs}
+    expected = {record["instance_id"] for record in records}
+    if set(by_spec) != expected:
+        raise RuntimeError("prepared test specs do not match the fixed task denominator")
+
+    prepared: dict[str, dict[str, Any]] = {}
+    staged: list[tuple[dict[str, Any], Any, dict[str, dict[str, str]],
+                       dict[str, Any], pathlib.Path]] = []
+    readiness_root = work / "readiness"
+    for record in records:
+        instance_id = record["instance_id"]
+        spec = by_spec[instance_id]
+        source_image = client.images.get(spec.instance_image_key)
+        task_images = {
+            harness: build_prepared_task_image(
+                source=source, run_id=run_id, instance_id=instance_id, harness=harness,
+                task_image_id=source_image.id,
+                harness_image_id=harness_images[harness]["image_id"],
+            )
+            for harness in HARNESSES
+        }
+        task_output = output / instance_id
+        dependency = capture_dependency_manifest(
+            image=task_images[HARNESSES[0]]["tag"], output=task_output,
+        )
+        task_root = readiness_root / instance_id
+        clone(record["repo"], record["base_commit"], task_root / "repo")
+        staged.append((record, spec, task_images, dependency, task_root))
+
+    def check_readiness(item: tuple[dict[str, Any], Any, dict[str, dict[str, str]],
+                                    dict[str, Any], pathlib.Path]) -> tuple[str, dict[str, Any]]:
+        record, spec, task_images, dependency, task_root = item
+        instance_id = record["instance_id"]
+        try:
+            try:
+                public_test_command = specs_map[record["repo"]][record["version"]]["test_cmd"]
+            except (KeyError, TypeError) as error:
+                raise RuntimeError(
+                    f"no ordinary public test command for {record['repo']} {record.get('version')}"
+                ) from error
+            script, test_command = trusted_readiness_script(
+                spec, public_test_command=public_test_command,
+            )
+            parser = parser_map.get(record["repo"])
+            if parser is None:
+                raise RuntimeError(f"no official log parser for {record['repo']}")
+            readiness = run_task_readiness(
+                instance_id=instance_id, image=task_images[HARNESSES[0]]["tag"],
+                repo=task_root / "repo",
+                script=script, test_command=test_command, parser=parser,
+                test_spec=record, output=output / instance_id,
+                timeout_seconds=timeout_seconds,
+            )
+            return instance_id, {
+                "images": task_images,
+                "task_image_id": task_images[HARNESSES[0]]["task_image_id"],
+                "source_task_image": spec.instance_image_key,
+                "base_dockerfile_sha256": base_dockerfile_sha256,
+                "dependency_manifest": dependency,
+                "readiness": readiness,
+            }
+        finally:
+            shutil.rmtree(task_root, ignore_errors=True)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for instance_id, item in executor.map(check_readiness, staged):
+                prepared[instance_id] = item
+    finally:
+        shutil.rmtree(readiness_root, ignore_errors=True)
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "preparation.json").write_text(
+        json.dumps(prepared, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    return prepared
 
 
 def run_isolated_agent(*, instance_id: str, harness: str, image: str, proxy_image: str,
@@ -944,12 +1361,15 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     if concurrency < 1 or concurrency > 5:
         raise ValueError("AGENT_CONCURRENCY must be between 1 and 5")
     agent_timeout = int(config.get("AGENT_TIMEOUT_SECONDS", "360"))
-    evaluator_timeout = int(config.get("EVALUATOR_TIMEOUT_SECONDS", "300"))
+    readiness_timeout = int(config.get("READINESS_TIMEOUT_SECONDS", "180"))
+    readiness_concurrency = int(config.get("READINESS_CONCURRENCY", "5"))
+    evaluator_timeout = int(config.get("EVALUATOR_TIMEOUT_SECONDS", "270"))
     evaluator_concurrency = int(config.get("EVALUATOR_CONCURRENCY", "5"))
     if mode == "official-50" and (
             concurrency != 3 or agent_timeout != 360
-            or evaluator_timeout != 300 or evaluator_concurrency != 5):
-        raise ValueError("official mode requires fixed agent/evaluator timing and concurrency limits")
+            or readiness_timeout != 180 or readiness_concurrency != 5
+            or evaluator_timeout != 270 or evaluator_concurrency != 5):
+        raise ValueError("official mode requires fixed preparation, agent, and evaluator limits")
 
     provenance_payload = {
         "dataset": DATASET, "dataset_revision": DATASET_REVISION,
@@ -972,29 +1392,6 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     # Persist the exact denominator before any model-bearing slot starts.
     finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
 
-    provenance = build_images(
-        source=source, run_id=config["RUN_ID"], config=config, harnesses=harnesses
-    )
-    execution_limits: dict[str, Any] = {
-        "agent_timeout_seconds": agent_timeout,
-        "agent_concurrency": concurrency,
-        "agent_shard_size": agent_shard_size,
-        "evaluator_timeout_seconds": evaluator_timeout,
-        "evaluator_concurrency": evaluator_concurrency,
-        "evaluator_shard_size": evaluator_shard_size,
-    }
-    if phase_limits is not None:
-        execution_limits["phase_budgets"] = phase_limits
-    provenance["execution_limits"] = execution_limits
-    provenance_payload["images"] = provenance
-    provenance_payload["phase"] = "agents"
-    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
-    agent_deadline = (
-        time.monotonic() + phase_limits["agent_seconds"]
-        if phase_limits is not None else None
-    )
-    agent_budget_exhausted = False
-
     mirrors: dict[str, pathlib.Path] = {}
 
     def clone_one(repo: str, commit: str, destination: pathlib.Path) -> None:
@@ -1007,6 +1404,81 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
             )
             mirrors[repo] = mirror
         _clone(repo, commit, destination, mirrors[repo])
+
+    # Every official arm receives the same prepared image containing all pinned
+    # harness binaries. Ordinary task dependencies come only from the official
+    # instance image and are verified before any model-bearing process starts.
+    provenance = build_images(
+        source=source, run_id=config["RUN_ID"], config=config, harnesses=HARNESSES
+    )
+    execution_limits: dict[str, Any] = {
+        "readiness_timeout_seconds": readiness_timeout,
+        "readiness_concurrency": readiness_concurrency,
+        "agent_timeout_seconds": agent_timeout,
+        "agent_concurrency": concurrency,
+        "agent_shard_size": agent_shard_size,
+        "evaluator_timeout_seconds": evaluator_timeout,
+        "evaluator_concurrency": evaluator_concurrency,
+        "evaluator_shard_size": evaluator_shard_size,
+    }
+    if phase_limits is not None:
+        execution_limits["phase_budgets"] = phase_limits
+    provenance["execution_limits"] = execution_limits
+    provenance_payload["images"] = provenance
+    provenance_payload["phase"] = "preparing"
+    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
+    preparation_started = time.monotonic()
+    try:
+        prepared = prepare_task_environments(
+            records=selected_records, source=source, run_id=config["RUN_ID"],
+            harness_images=provenance, work=work,
+            output=output / "preparation", clone=clone_one,
+            timeout_seconds=readiness_timeout, max_workers=readiness_concurrency,
+            trusted_ca_image=validated["BASE_IMAGE"],
+        )
+        preparation_elapsed = time.monotonic() - preparation_started
+        if phase_limits is not None and preparation_elapsed > phase_limits["preparation_seconds"]:
+            raise TimeoutError("official preparation phase budget exhausted before model launch")
+    except Exception:
+        provenance_payload["phase"] = "preparation-failed"
+        finalize(tasks=tasks, records=records, output=output,
+                 provenance=provenance_payload, harnesses=harnesses)
+        shutil.rmtree(work / "readiness", ignore_errors=True)
+        shutil.rmtree(work / "repositories", ignore_errors=True)
+        os.environ.pop("OPENAI_API_KEY", None)
+        secret_file = os.environ.pop("OPENAI_SECRET_FILE", "")
+        if secret_file:
+            pathlib.Path(secret_file).unlink(missing_ok=True)
+        raise
+    provenance_payload["preparation_elapsed_seconds"] = round(preparation_elapsed, 3)
+    provenance_payload["prepared_tasks"] = {
+        instance_id: {
+            "images": {
+                harness: {
+                    "image_id": image["image_id"],
+                    "harness_image_id": image["harness_image_id"],
+                    "dockerfile_sha256": image["dockerfile_sha256"],
+                }
+                for harness, image in item["images"].items()
+            },
+            "task_image_id": item["task_image_id"],
+            "source_task_image": item["source_task_image"],
+            "base_dockerfile_sha256": item["base_dockerfile_sha256"],
+            "dependency_manifest": item["dependency_manifest"],
+            "readiness": {
+                key: value for key, value in item["readiness"].items()
+                if key not in {"test_command", "prepared_image"}
+            },
+        }
+        for instance_id, item in prepared.items()
+    }
+    provenance_payload["phase"] = "agents"
+    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
+    agent_deadline = (
+        time.monotonic() + phase_limits["agent_seconds"]
+        if phase_limits is not None else None
+    )
+    agent_budget_exhausted = False
 
     for shard_index, shard_ids in enumerate(agent_shards):
         shard_root = work / "agent-shards" / f"{shard_index:02d}"
@@ -1038,7 +1510,8 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 slot_timeout = min(slot_timeout, remaining)
             record = run_isolated_agent(
                 instance_id=task["instance_id"], harness=harness,
-                image=provenance[harness]["tag"], proxy_image=validated["BASE_IMAGE"],
+                image=prepared[task["instance_id"]]["images"][harness]["tag"],
+                proxy_image=validated["BASE_IMAGE"],
                 proxy_script=source / "scripts" / "openai_proxy.js",
                 repo=task_root / harness / "repo",
                 task_input=task_root / "input", output=slot_output,
@@ -1151,7 +1624,7 @@ def main() -> int:
     parser.add_argument("--source", type=pathlib.Path)
     parser.add_argument("--work", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path)
-    parser.add_argument("--harness", choices=HARNESSES, default="carry")
+    parser.add_argument("--harness", choices=(*HARNESSES, "all"), default="carry")
     args = parser.parse_args()
     if args.validate_records:
         payload = json.loads(args.validate_records.read_text(encoding="utf-8"))

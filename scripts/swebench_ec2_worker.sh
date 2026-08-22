@@ -125,16 +125,19 @@ export CARRY_BASE_IMAGE='rust@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4f
 export CODEX_VERSION='0.147.0'
 export PI_VERSION='0.84.2'
 export AGENT_TIMEOUT_SECONDS=360
-export EVALUATOR_TIMEOUT_SECONDS=300
+export READINESS_TIMEOUT_SECONDS=180
+export EVALUATOR_TIMEOUT_SECONDS=270
 export AGENT_CONCURRENCY=3
+export READINESS_CONCURRENCY=5
 
 if [[ "$BENCHMARK_MODE" == official-50 ]]; then
   # Five concurrent Docker creates have been reliable; ten repeatedly saturated
   # the daemon and left half of a shard without evaluator outcomes.
   export EVALUATOR_CONCURRENCY=5
   export OFFICIAL_WORKER_SECONDS=18000
-  export OFFICIAL_AGENT_PHASE_SECONDS=11400
-  export OFFICIAL_EVALUATION_PHASE_SECONDS=5400
+  export OFFICIAL_PREPARATION_PHASE_SECONDS=3000
+  export OFFICIAL_AGENT_PHASE_SECONDS=3600
+  export OFFICIAL_EVALUATION_PHASE_SECONDS=10200
   export OFFICIAL_SETUP_RESERVE_SECONDS=1200
   worker_elapsed_seconds=$(( $(date +%s) - worker_started_at ))
   OVERALL_TIMEOUT_SECONDS=$(( OFFICIAL_WORKER_SECONDS - worker_elapsed_seconds ))

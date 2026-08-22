@@ -16,11 +16,11 @@ on:
         type: choice
         options: [bootstrap, smoke-5, official-50, cleanup]
       harness:
-        description: Agent harness to run for smoke-5 or official-50
+        description: Agent harness, or all three in one prepared environment
         required: true
         default: carry
         type: choice
-        options: [carry, codex, pi]
+        options: [carry, codex, pi, all]
       cleanup_run_id:
         description: Exact gh-RUN_ID-ATTEMPT to sanitize when mode=cleanup
         required: false
@@ -159,8 +159,8 @@ jobs:
             for required in OPENAI_API_KEY DOCKERHUB_USERNAME DOCKERHUB_TOKEN MODEL REASONING; do
               [[ -n "${!required}" ]] || { echo "missing benchmark configuration: $required" >&2; exit 1; }
             done
-            [[ "$BENCHMARK_HARNESS" =~ ^(carry|codex|pi)$ ]] || {
-              echo "benchmark harness must be carry, codex, or pi" >&2
+            [[ "$BENCHMARK_HARNESS" =~ ^(carry|codex|pi|all)$ ]] || {
+              echo "benchmark harness must be carry, codex, pi, or all" >&2
               exit 1
             }
           fi
@@ -377,7 +377,8 @@ jobs:
           pairs={(r.get('instance_id'),r.get('harness')) for r in records}
           frozen=json.load(open('benchmarks/swe-bench-verified-50.json', encoding='utf-8'))['instance_ids']
           selected=frozen if os.environ['BENCHMARK_MODE']=='official-50' else frozen[:5]
-          expected={(instance_id, os.environ['BENCHMARK_HARNESS']) for instance_id in selected}
+          harnesses=('carry','codex','pi') if os.environ['BENCHMARK_HARNESS']=='all' else (os.environ['BENCHMARK_HARNESS'],)
+          expected={(instance_id,harness) for instance_id in selected for harness in harnesses}
           assert len(records)==len(expected) and pairs==expected, 'artifact does not contain exact fixed denominator'
           report=json.load(open('benchmark-artifact/report.json', encoding='utf-8'))
           assert report['denominator']==len(expected), 'canonical report denominator does not match records'

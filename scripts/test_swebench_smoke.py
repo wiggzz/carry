@@ -48,8 +48,12 @@ class SmokeWorkerTests(unittest.TestCase):
                     self.worker.selected_harnesses({"BENCHMARK_HARNESS": harness}),
                     (harness,),
                 )
+        self.assertEqual(
+            self.worker.selected_harnesses({"BENCHMARK_HARNESS": "all"}),
+            ("carry", "codex", "pi"),
+        )
         with self.assertRaisesRegex(ValueError, "BENCHMARK_HARNESS"):
-            self.worker.selected_harnesses({"BENCHMARK_HARNESS": "all"})
+            self.worker.selected_harnesses({"BENCHMARK_HARNESS": "unknown"})
 
     def test_run_cli_forwards_the_selected_harness(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -93,14 +97,243 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertNotIn("/var/run/docker.sock", rendered)
             self.assertNotIn(str(pathlib.Path.home()), rendered)
             self.assertEqual(rendered.count("type=bind"), 3)
-            self.assertIn("dst=/workspace", rendered)
+            self.assertIn("dst=/testbed", rendered)
+            self.assertIn("BENCHMARK_WORKSPACE=/testbed", rendered)
             self.assertIn("dst=/benchmark/input,readonly", rendered)
             self.assertIn("dst=/benchmark/output", rendered)
+            self.assertIn("--harness\ncodex", rendered)
             self.assertIn("HOME=/agent-home", rendered)
             self.assertIn("AGENT_TIMEOUT_SECONDS=315", rendered)
             self.assertIn("carry-agent-codex-test", rendered)
             self.assertIn("/agent-home:rw", rendered)
             self.assertIn("/tmp:rw", rendered)
+
+    def test_readiness_command_has_no_network_secret_or_evaluator_mounts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = pathlib.Path(directory) / "repo"
+            repo.mkdir()
+            command = self.worker.readiness_docker_command(
+                image="sha256:" + "a" * 64,
+                container_name="carry-readiness-task",
+                repo=repo,
+                script="pytest -rA tests/test_public.py",
+            )
+        rendered = "\n".join(command)
+        self.assertIn("--network\nnone", rendered)
+        self.assertIn("--cap-drop=ALL", command)
+        self.assertIn("no-new-privileges", command)
+        self.assertIn("dst=/testbed", rendered)
+        self.assertNotIn("OPENAI", rendered)
+        self.assertNotIn("test_patch", rendered)
+        self.assertNotIn("canonical-dataset", rendered)
+        self.assertEqual(rendered.count("type=bind"), 1)
+
+    def test_readiness_accepts_failing_baseline_after_tests_execute(self):
+        result = self.worker.validate_readiness_result(
+            returncode=1,
+            timed_out=False,
+            parsed_tests={"tests/test_public.py::test_bug": "FAILED"},
+        )
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["parsed_test_count"], 1)
+        self.assertEqual(result["baseline_exit_code"], 1)
+
+    def test_readiness_rejects_runner_that_never_executes_a_test(self):
+        with self.assertRaisesRegex(RuntimeError, "did not execute any parseable public tests"):
+            self.worker.validate_readiness_result(
+                returncode=0,
+                timed_out=False,
+                parsed_tests={},
+            )
+
+    def test_prepared_image_uses_immutable_parent_ids(self):
+        calls = []
+
+        def execute(command, **kwargs):
+            calls.append(command)
+            if command[:3] == ["docker", "image", "inspect"]:
+                reference = command[-1]
+                value = "a" if reference.endswith("parent-task-image") else (
+                    "b" if reference.endswith("parent-harness-image") else "e"
+                )
+                return mock.Mock(stdout="sha256:" + value * 64 + "\n")
+            return mock.Mock(returncode=0, stdout="")
+
+        result = self.worker.build_prepared_task_image(
+            source=SCRIPT.parent.parent,
+            run_id="run-1",
+            instance_id="owner__repo-1",
+            harness="carry",
+            task_image_id="sha256:" + "a" * 64,
+            harness_image_id="sha256:" + "b" * 64,
+            execute=execute,
+        )
+        build = next(command for command in calls if command[:2] == ["docker", "build"])
+        rendered = "\n".join(build)
+        tag_commands = [command for command in calls if command[:3] == ["docker", "image", "tag"]]
+        self.assertEqual({command[3] for command in tag_commands}, {
+            "sha256:" + "a" * 64, "sha256:" + "b" * 64,
+        })
+        self.assertIn("parent-task-image", rendered)
+        self.assertIn("parent-harness-image", rendered)
+        self.assertEqual(result["image_id"], "sha256:" + "e" * 64)
+        self.assertEqual(result["tag"], "swebench-run-1-prepared-owner__repo-1-carry")
+
+    def test_readiness_script_excludes_hidden_test_patch_but_runs_public_test_command(self):
+        spec = types.SimpleNamespace(eval_script_list=[
+            "source /opt/miniconda3/bin/activate",
+            "conda activate testbed",
+            "cd /testbed",
+            "export PUBLIC_TEST_MODE=1",
+            "git config --global --add safe.directory /testbed",
+            "git status",
+            "python -m pip install -e .",
+            "git checkout base tests/test_public.py",
+            "git apply -v - <<'EOF'\nHIDDEN GOLD TEST\nEOF",
+            ": '>>>>> Start Test Output'",
+            "pytest -rA tests/test_public.py",
+            ": '>>>>> End Test Output'",
+        ])
+        script, test_command = self.worker.trusted_readiness_script(
+            spec, public_test_command="pytest -rA",
+        )
+        self.assertEqual(test_command, "pytest -rA -vv --maxfail=1")
+        self.assertIn("export PUBLIC_TEST_MODE=1", script)
+        self.assertNotIn("python -m pip install -e .", script)
+        self.assertIn("pytest -rA", script)
+        self.assertNotIn("tests/test_public.py", script)
+        self.assertNotIn("HIDDEN GOLD TEST", script)
+        self.assertNotIn("git apply", script)
+
+    def test_run_task_readiness_persists_diagnostics_and_accepts_test_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"; output = root / "output"
+            repo.mkdir(); output.mkdir()
+            process = mock.Mock(returncode=1, stdout="FAILED tests/test_public.py::test_bug\n", stderr="")
+            with mock.patch.object(self.worker.subprocess, "run", return_value=process):
+                result = self.worker.run_task_readiness(
+                    instance_id="owner__repo-1",
+                    image="prepared:task",
+                    repo=repo,
+                    script="pytest -rA tests/test_public.py",
+                    test_command="pytest -rA tests/test_public.py",
+                    parser=lambda output, _spec: {"tests/test_public.py::test_bug": "FAILED"},
+                    test_spec=object(),
+                    output=output,
+                    timeout_seconds=60,
+                )
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(result["baseline_exit_code"], 1)
+            self.assertEqual((output / "test-output.txt").read_text(), process.stdout)
+            metadata = json.loads((output / "metadata.json").read_text())
+            self.assertEqual(metadata["test_command"], "pytest -rA tests/test_public.py")
+
+    def test_dependency_manifest_records_packages_and_build_overlay_identity(self):
+        responses = iter((
+            mock.Mock(stdout='[{"name":"pytest","version":"8.0"}]\n'),
+            mock.Mock(stdout=("a" * 64) + "  /opt/swebench-prepared/testbed-overlay.tar\n"),
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            result = self.worker.capture_dependency_manifest(
+                image="prepared:task", output=output,
+                execute=lambda *_args, **_kwargs: next(responses),
+            )
+            payload = json.loads((output / "dependencies.json").read_text())
+        self.assertEqual(result["package_count"], 1)
+        self.assertEqual(result["build_overlay_sha256"], "a" * 64)
+        self.assertEqual(payload["packages"][0]["name"], "pytest")
+
+    def test_swebench_base_image_dependency_sources_are_https_only(self):
+        templates = {"py": (
+            "FROM --platform={platform} ubuntu:{ubuntu_version}\n"
+            "ENV TZ=Etc/UTC\nRUN apt update && apt install -y git\n"
+        )}
+        ca_image = "node@sha256:" + "a" * 64
+        first = self.worker.enforce_https_swebench_base_images(templates, ca_image)
+        second = self.worker.enforce_https_swebench_base_images(templates, ca_image)
+        self.assertEqual(first, second)
+        self.assertIn("sed -i 's|http://|https://|g'", templates["py"])
+        self.assertIn(ca_image, templates["py"])
+        self.assertIn("COPY --from=trusted_certs /etc/ssl/certs", templates["py"])
+        self.assertNotIn("\nRUN apt update", templates["py"])
+
+    def test_prepare_task_environments_builds_and_checks_every_task_before_returning(self):
+        records = [
+            {"instance_id": "owner__repo-1", "repo": "owner/repo", "version": "1.0", "base_commit": "a" * 40},
+            {"instance_id": "owner__repo-2", "repo": "owner/repo", "version": "1.0", "base_commit": "b" * 40},
+        ]
+        specs = [types.SimpleNamespace(
+            instance_id=record["instance_id"], repo=record["repo"],
+            instance_image_key=f"source:{record['instance_id']}",
+            eval_script_list=[
+                "source /opt/miniconda3/bin/activate", "conda activate testbed", "cd /testbed",
+                "git config --global --add safe.directory /testbed",
+                "git apply -v hidden", ": '>>>>> Start Test Output'",
+                "pytest -rA tests/test_public.py", ": '>>>>> End Test Output'",
+            ],
+        ) for record in records]
+        client = types.SimpleNamespace(images=types.SimpleNamespace(
+            get=lambda key: types.SimpleNamespace(id="sha256:" + ("a" if key.endswith("1") else "b") * 64)
+        ))
+        events = []
+
+        def build_instances(_client, dataset, **kwargs):
+            events.append(("build", [row["instance_id"] for row in dataset], kwargs))
+            return [spec.instance_image_key for spec in specs], []
+
+        def clone(_repo, _commit, destination):
+            destination.mkdir(parents=True)
+
+        def fake_prepared(**kwargs):
+            events.append(("image", kwargs["instance_id"], kwargs["harness"]))
+            return {
+                "tag": f"prepared:{kwargs['instance_id']}:{kwargs['harness']}",
+                "image_id": "sha256:" + "c" * 64,
+                "task_image_id": kwargs["task_image_id"],
+                "harness": kwargs["harness"],
+                "harness_image_id": kwargs["harness_image_id"],
+                "dockerfile_sha256": "d" * 64,
+            }
+
+        def fake_readiness(**kwargs):
+            events.append(("readiness", kwargs["instance_id"]))
+            return {"status": "ready", "parsed_test_count": 1,
+                    "test_command_sha256": "e" * 64}
+
+        harness_images = {harness: {"image_id": "sha256:" + "f" * 64} for harness in self.worker.HARNESSES}
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(self.worker, "build_prepared_task_image", side_effect=fake_prepared), \
+                mock.patch.object(self.worker, "run_task_readiness", side_effect=fake_readiness), \
+                mock.patch.object(self.worker, "capture_dependency_manifest", return_value={
+                    "package_count": 2, "sha256": "1" * 64,
+                }):
+            root = pathlib.Path(directory)
+            prepared = self.worker.prepare_task_environments(
+                records=records, source=SCRIPT.parent.parent, run_id="run-1",
+                harness_images=harness_images, work=root / "work", output=root / "output",
+                clone=clone, client=client, build_instances=build_instances,
+                get_specs=lambda dataset: specs,
+                parsers={"owner/repo": lambda *_args: {"test": "PASSED"}},
+                repo_specs={"owner/repo": {"1.0": {"test_cmd": "pytest -rA"}}},
+                dockerfile_templates={"py": (
+                    "FROM --platform={platform} ubuntu:{ubuntu_version}\n"
+                    "ENV TZ=Etc/UTC\nRUN apt update\n"
+                )},
+                trusted_ca_image="node@sha256:" + "a" * 64,
+            )
+        self.assertEqual(set(prepared), {record["instance_id"] for record in records})
+        self.assertEqual(events[0][0], "build")
+        self.assertEqual(events[0][2]["tag"], "latest")
+        self.assertEqual(events[0][2]["env_image_tag"], "latest")
+        self.assertEqual({event for event in events[1:7]}, {
+            ("image", record["instance_id"], harness)
+            for record in records for harness in self.worker.HARNESSES
+        })
+        self.assertEqual({event for event in events[7:]}, {
+            ("readiness", "owner__repo-1"), ("readiness", "owner__repo-2"),
+        })
 
     def test_agent_network_is_internal_and_reaches_only_the_openai_proxy(self):
         calls = []
@@ -458,10 +691,13 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
     def test_official_phase_budgets_fit_the_five_hour_worker_envelope(self):
         limits = self.worker.official_phase_limits()
         self.assertEqual(
-            limits["agent_seconds"] + limits["evaluation_seconds"] + limits["setup_reserve_seconds"],
+            limits["preparation_seconds"] + limits["agent_seconds"]
+            + limits["evaluation_seconds"] + limits["setup_reserve_seconds"],
             limits["worker_seconds"],
         )
-        evaluator_worst_case = 10 * (300 + 45)  # Ten five-task evaluator shards.
+        readiness_worst_case = 10 * 180  # Fifty tasks, five concurrent checks.
+        self.assertLess(readiness_worst_case, limits["preparation_seconds"])
+        evaluator_worst_case = 30 * (270 + 45)  # Thirty all-harness evaluator shards.
         self.assertLess(evaluator_worst_case, limits["evaluation_seconds"])
         self.assertEqual(150 * 360 // 3, limits["worker_seconds"])
         self.assertLess(limits["agent_seconds"], 150 * 360 // 3)
@@ -526,7 +762,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         self.assertEqual(records[0]["status"], "agent-failed")
         self.assertEqual(records[1]["status"], "empty-patch")
 
-    def test_official_execution_uses_five_task_evaluator_shards(self):
+    def test_official_all_harness_execution_shares_preparation_and_uses_five_task_evaluator_shards(self):
         frozen = [f"task-{number:02d}" for number in range(50)]
         dataset = [
             {"instance_id": instance_id, "repo": "owner/repo", "base_commit": "a" * 40,
@@ -536,6 +772,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         fake_datasets = types.SimpleNamespace(load_dataset=lambda *args, **kwargs: dataset)
         materialized_shards = []
         evaluation_shards = []
+        execution_events = []
 
         def fake_materialize(*, records, selected_ids, root, clone, harnesses):
             materialized_shards.append(list(selected_ids))
@@ -550,6 +787,10 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             return tasks
 
         def fake_agent(**kwargs):
+            execution_events.append(("agent", kwargs["instance_id"]))
+            self.assertEqual(
+                kwargs["image"], f"prepared:{kwargs['instance_id']}:{kwargs['harness']}"
+            )
             return {"instance_id": kwargs["instance_id"], "harness": kwargs["harness"],
                     "status": "agent-completed", "patch": "", "error": None,
                     "attempts": 1, "retries": 0,
@@ -564,8 +805,33 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                 "error_ids": [], "incomplete_ids": [],
             }))
 
+        def fake_prepare(*, records, **_kwargs):
+            execution_events.append(("prepare", len(records)))
+            return {
+                record["instance_id"]: {
+                    "images": {
+                        harness: {
+                            "tag": f"prepared:{record['instance_id']}:{harness}",
+                            "image_id": "sha256:" + "d" * 64,
+                            "task_image_id": "sha256:" + "e" * 64,
+                            "harness": harness,
+                            "harness_image_id": "sha256:" + "c" * 64,
+                            "dockerfile_sha256": "f" * 64,
+                        }
+                        for harness in self.worker.HARNESSES
+                    },
+                    "task_image_id": "sha256:" + "e" * 64,
+                    "source_task_image": f"source:{record['instance_id']}",
+                    "base_dockerfile_sha256": "0" * 64,
+                    "dependency_manifest": {"package_count": 2, "sha256": "1" * 64},
+                    "readiness": {"status": "ready", "parsed_test_count": 1,
+                                  "test_command_sha256": "2" * 64},
+                }
+                for record in records
+            }
+
         config = {
-            "BENCHMARK_MODE": "official-50", "BENCHMARK_HARNESS": "carry",
+            "BENCHMARK_MODE": "official-50", "BENCHMARK_HARNESS": "all",
             "RUN_ID": "official-test",
             "BASE_IMAGE": "node@sha256:" + "a" * 64,
             "CARRY_BASE_IMAGE": "rust@sha256:" + "b" * 64,
@@ -585,8 +851,10 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             with mock.patch.dict(sys.modules, {"datasets": fake_datasets}), \
                     mock.patch.object(self.worker, "materialize", side_effect=fake_materialize), \
                     mock.patch.object(self.worker, "build_images", return_value={
-                        "carry": {"tag": "image:carry"}
+                        harness: {"tag": f"image:{harness}", "image_id": "sha256:" + "c" * 64}
+                        for harness in self.worker.HARNESSES
                     }) as build, \
+                    mock.patch.object(self.worker, "prepare_task_environments", side_effect=fake_prepare), \
                     mock.patch.object(self.worker, "run_isolated_agent", side_effect=fake_agent), \
                     mock.patch.object(self.worker, "run_official_evaluation", side_effect=fake_evaluation), \
                     mock.patch.object(
@@ -603,21 +871,68 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                     self.assertNotIn("OPENAI_SECRET_FILE", os.environ)
 
             self.assertEqual(build.call_count, 1)
+            self.assertEqual(execution_events[0], ("prepare", 50))
+            self.assertEqual(len(execution_events), 151)
+            self.assertTrue(all(event[0] == "agent" for event in execution_events[1:]))
             require_complete.assert_called_once()
-            self.assertEqual(len(require_complete.call_args.args[0]), 50)
+            self.assertEqual(len(require_complete.call_args.args[0]), 150)
             self.assertEqual([len(shard) for shard in materialized_shards], [10] * 5)
-            self.assertEqual(len(evaluation_shards), 10)
+            self.assertEqual(len(evaluation_shards), 30)
             self.assertTrue(all(len(shard) == 5 for shard in evaluation_shards))
             self.assertFalse(secret.exists())
             self.assertFalse((work / "agent-shards").exists())
             report = json.loads((output / "report.json").read_text())
-            self.assertEqual((report["denominator"], report["completed"]), (50, 50))
-            self.assertEqual(set(report["harnesses"]), {"carry"})
+            self.assertEqual((report["denominator"], report["completed"]), (150, 150))
+            self.assertEqual(set(report["harnesses"]), set(self.worker.HARNESSES))
             self.assertEqual(report["harnesses"]["carry"]["response_retries"], 100)
+            self.assertEqual(report["harnesses"]["codex"]["response_retries"], 0)
+            self.assertEqual(report["harnesses"]["pi"]["response_retries"], 0)
             limits = report["provenance"]["images"]["execution_limits"]
             self.assertEqual(limits["agent_shard_size"], 10)
             self.assertEqual(limits["evaluator_shard_size"], 5)
             self.assertEqual(limits["evaluator_concurrency"], 5)
+
+    def test_preparation_failure_stops_before_model_spend(self):
+        frozen = [f"task-{number:02d}" for number in range(50)]
+        dataset = [
+            {"instance_id": instance_id, "repo": "owner/repo", "base_commit": "a" * 40,
+             "problem_statement": f"problem {instance_id}"}
+            for instance_id in frozen
+        ]
+        config = {
+            "BENCHMARK_MODE": "official-50", "BENCHMARK_HARNESS": "carry",
+            "RUN_ID": "official-test", "BASE_IMAGE": "node@sha256:" + "a" * 64,
+            "CARRY_BASE_IMAGE": "rust@sha256:" + "b" * 64,
+            "CODEX_VERSION": "1.2.3", "PI_VERSION": "0.84.2",
+            "MODEL": "gpt-5.6-luna", "REASONING": "medium",
+        }
+        fake_datasets = types.SimpleNamespace(load_dataset=lambda *args, **kwargs: dataset)
+        images = {
+            harness: {"tag": f"image:{harness}", "image_id": "sha256:" + "c" * 64}
+            for harness in self.worker.HARNESSES
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source, work, output = root / "source", root / "work", root / "output"
+            (source / "benchmarks").mkdir(parents=True)
+            (source / "benchmarks" / "swe-bench-verified-50.json").write_text(
+                json.dumps({"instance_ids": frozen})
+            )
+            with mock.patch.dict(sys.modules, {"datasets": fake_datasets}), \
+                    mock.patch.object(self.worker, "build_images", return_value=images), \
+                    mock.patch.object(
+                        self.worker, "prepare_task_environments",
+                        side_effect=RuntimeError("public tests unusable"),
+                    ), \
+                    mock.patch.object(self.worker, "run_isolated_agent") as run_agent:
+                with self.assertRaisesRegex(RuntimeError, "public tests unusable"):
+                    self.worker.execute_benchmark(
+                        source=source, work=work, output=output, config=config
+                    )
+            run_agent.assert_not_called()
+            report = json.loads((output / "report.json").read_text())
+            self.assertEqual(report["provenance"]["phase"], "preparation-failed")
+            self.assertIsNone(report["harnesses"]["carry"]["estimated_cost_usd"])
 
     def test_official_build_failure_still_preserves_all_selected_planned_slots(self):
         frozen = [f"task-{number:02d}" for number in range(50)]

@@ -59,7 +59,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
@@ -92,6 +92,7 @@ jobs:
           scripts/test_swebench_live_runner.py
           scripts/test_swebench_smoke.py
           scripts/test_swebench_harness_entrypoint.py
+          scripts/test_prepared_swebench_image.py
           scripts/test_swebench_ec2_worker.py
           scripts/test_docker_registry_login.py
           scripts/test_presign_s3.py
@@ -100,6 +101,20 @@ jobs:
 
       - name: Release build
         run: cargo build --release --locked
+
+      - name: Build and execute portable Carry harness binary
+        run: |
+          docker build --tag carry-harness:ci \
+            --file containers/swebench-harness/Dockerfile.carry \
+            --build-arg BASE_IMAGE='rust@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff' \
+            .
+          container=$(docker create carry-harness:ci)
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container:/opt/swebench-harness/bin/carry" "$RUNNER_TEMP/carry-portable"
+          chmod 0555 "$RUNNER_TEMP/carry-portable"
+          docker run --rm --network none \
+            --mount "type=bind,src=$RUNNER_TEMP/carry-portable,dst=/carry,readonly" \
+            --entrypoint /carry alpine:3.20 --help >/dev/null
 
       - name: Scripted fixture
         run: |
