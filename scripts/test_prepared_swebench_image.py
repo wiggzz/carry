@@ -100,12 +100,13 @@ class PreparedSWEbenchImageTests(unittest.TestCase):
                 ).stdout.strip()
 
             prefix = f"prepared-fixture-{os.getpid()}"
-            task_id = build(f"{prefix}-task", "Dockerfile.task")
-            carry_id = build(f"{prefix}-carry", "Dockerfile.carry", f"BASE={task_id}")
+            task_tag = f"{prefix}-task"
+            task_id = build(task_tag, "Dockerfile.task")
+            carry_id = build(f"{prefix}-carry", "Dockerfile.carry", f"BASE={task_tag}")
             codex_id = build(
-                f"{prefix}-codex", "Dockerfile.node", f"BASE={task_id}", "BIN=codex"
+                f"{prefix}-codex", "Dockerfile.node", f"BASE={task_tag}", "BIN=codex"
             )
-            pi_id = build(f"{prefix}-pi", "Dockerfile.node", f"BASE={task_id}", "BIN=pi")
+            pi_id = build(f"{prefix}-pi", "Dockerfile.node", f"BASE={task_tag}", "BIN=pi")
             prepared = {
                 harness: WORKER.build_prepared_task_image(
                     source=ROOT,
