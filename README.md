@@ -107,21 +107,42 @@ publishing pipeline or additional protected configuration is needed.
 
 Dispatch the workflow on the reviewed branch and use that same branch in `carry_ref`;
 the workflow checks out the dispatch event's immutable commit and rejects a different
-candidate ref. Leave `mode=bootstrap` for the canary, then select one `harness`
-(`carry`, `codex`, or `pi`). Choose `smoke-5` for the first five frozen IDs
+candidate ref. Leave `mode=bootstrap` for the canary, then select one harness or `all`.
+Choose `smoke-5` for the first five frozen IDs
 (5 mandatory records), or choose `official-50` for all 50 frozen IDs
-(50 mandatory records). Dispatch separate runs when comparing multiple harnesses. Apply
-the Terraform change that raises
+(50 mandatory records). Use `harness=all` for a direct comparison: all three arms then
+share the exact same task-image parents and dependency manifests in one worker. Select a
+single harness only for lane-specific smoke or diagnostic runs. Apply the Terraform change
+that raises
 the protected dispatch role's maximum session to six hours before dispatching the
 official mode. Automation never applies Terraform.
 
-The official mode uses one disposable worker and builds the selected run-local harness
-image once. Before a slot starts, the trusted worker creates a fresh Git repository by
-fetching only a temporary ref at the declared base commit. It then removes that ref,
-the origin remote, local branch, and reflogs; prunes unreachable objects; and fails
-preflight if `git fsck` finds anything outside the base commit and its ancestors. Gold
-patches, hidden test patches, and canonical grading records remain in host-only paths
-that are not mounted into the agent container.
+The official mode uses one disposable worker and builds all three pinned run-local harness
+images once. In trusted setup, before any model process starts, it builds the official
+SWE-bench instance image for each task, records its immutable image ID and complete
+`conda list --json` package manifest, and creates one derivative per harness. Every
+derivative has the same task-image parent and ordinary dependencies but copies only its
+selected harness bundle, preventing one agent from invoking a competing harness. Git-ignored
+in-tree build products such as compiled extensions are archived as a trusted overlay;
+tracked source, Git objects, and non-ignored files are not. Each derivative deletes the
+instance image's checkout
+and setup scripts. A fresh, separately verified base-only checkout is then mounted at
+`/testbed`, the same path used when the ordinary project dependencies were installed.
+
+A disposable, networkless readiness container runs the official public test path without
+applying the hidden test patch. Readiness requires the official repository parser to observe
+at least one executed test; a failing result is allowed because the benchmark bug may be
+present at the base commit. Missing runners, imports, plugins, unparseable startup, image
+build failures, or dependency-manifest failures stop the run before model spend. Commands,
+output, package resolution, timing, and image identities are retained under `preparation/`,
+but that directory and all grading material remain outside agent mounts.
+
+Before each slot starts, the trusted worker creates a fresh Git repository by fetching only
+a temporary ref at the declared base commit. It then removes that ref, the origin remote,
+local branch, and reflogs; prunes unreachable objects; and fails preflight if `git fsck`
+finds anything outside the base commit and its ancestors. Gold patches, hidden test patches,
+and canonical grading records remain in host-only paths that are not mounted into the agent
+container.
 
 Every agent slot runs on its own Docker `--internal` network with external DNS disabled.
 A read-only, capability-free proxy container bridges that network to the provider, but
@@ -144,13 +165,14 @@ persisted rather than producing a green official run. Carry's
 aggregate Responses API retry count is copied into each slot record and harness summary.
 Each agent slot remains capped at six minutes. The limit is also passed into each named
 agent container; host-side cleanup retries and verifies exact-container absence, failing
-the worker closed if Docker cannot prove it stopped. Official execution reserves 190
-minutes for agents, 90 minutes for grading at evaluator concurrency five, and 20 minutes
-for setup inside a five-hour wall clock that starts before package/source setup. Evaluator
-shards have a 345-second outer cap, leaving at least 1,950 seconds of phase-level
-orchestration margin. After every evaluator return path, exact-run containers receive verified cleanup
-because SWE-bench may suppress its own stop/remove failures. Queued agent
-slots become explicit budget-exhausted diagnostics rather than silently disappearing.
+the worker closed if Docker cannot prove it stopped. Official execution reserves 50
+minutes for dependency preparation/readiness, 60 minutes for agents, 170 minutes for
+grading at evaluator concurrency five, and 20 minutes for setup inside a five-hour wall
+clock that starts before package/source setup. Evaluator shards have a 315-second outer
+cap, leaving at least 750 seconds of phase-level orchestration margin. After every evaluator
+return path, exact-run containers receive verified cleanup because SWE-bench may suppress
+its own stop/remove failures. Queued agent slots become explicit budget-exhausted
+diagnostics rather than silently disappearing.
 The controller permits twenty minutes for EC2 launch/boot around the worker clock and
 reserves the remaining forty minutes of its six-hour job for termination and exact cleanup.
 All limits, model-derived pricing, and image identities are recorded in provenance. Pricing is

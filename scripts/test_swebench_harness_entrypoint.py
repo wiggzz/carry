@@ -12,6 +12,43 @@ ENTRYPOINT = pathlib.Path(__file__).parents[1] / "containers" / "swebench-harnes
 
 
 class HarnessEntrypointTests(unittest.TestCase):
+    def test_prepared_image_selects_harness_without_image_environment_template(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"; prompt_dir = root / "input"; output = root / "output"
+            binary = root / "bin" / "carry"
+            repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); binary.parent.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "file.txt").write_text("before\n")
+            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            (prompt_dir / "task.md").write_text("fix")
+            binary.write_text(
+                "#!/usr/bin/env python3\nimport pathlib\n"
+                "pathlib.Path('file.txt').write_text('after\\n')\n"
+            )
+            binary.chmod(0o755)
+            env = dict(
+                os.environ,
+                OPENAI_API_KEY="unit-test-secret",
+                OPENAI_BASE_URL="http://openai-proxy:8080/v1",
+                PREPARED_HARNESS_ROOT=str(root),
+                AGENT_TIMEOUT_SECONDS="30",
+                BENCHMARK_WORKSPACE=str(repo),
+            )
+            env.pop("AGENT_COMMAND", None)
+            env.pop("AGENT_HARNESS", None)
+            run = subprocess.run(
+                ["python3", str(ENTRYPOINT), "run", "--harness", "carry",
+                 "--model", "model", "--reasoning", "medium",
+                 "--prompt", str(prompt_dir / "task.md"), "--output", str(output)],
+                cwd=repo, env=env, text=True, capture_output=True,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertIn("+after", (output / "final.patch").read_text())
+
     def test_codex_logs_in_from_stdin_then_removes_key_from_agent_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

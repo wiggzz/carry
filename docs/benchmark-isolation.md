@@ -37,27 +37,47 @@ The existing default-branch workflow has only `workflow_dispatch`, uses the prot
 `smoke-5` resolves and archives the requested commit before AWS authentication, then
 runs exactly the first five frozen IDs with the selected harness. It fails artifact
 validation unless all five records exist, including explicit failed records with empty
-patches. Comparing multiple harnesses requires separate workflow dispatches.
+patches. `harness=all` runs all three arms against one prepared image set; single-harness
+runs remain available for diagnostics.
 
-The `invoke` command is worker-side code. A future reviewed extension to the
-existing EC2 dispatcher must copy it to the short-lived worker and invoke it
-there; the dispatcher must terminate the instance after the slot/lane finishes.
-No self-hosted or persistent GitHub runner is permitted.
+The dispatcher copies worker-side code to a short-lived EC2 instance and always
+terminates that exact instance after the run. No self-hosted or persistent GitHub
+runner is permitted.
 
-The worker builds only the selected run-local harness image. Carry is built from the archived
-commit; Codex is fixed at `@openai/codex@0.147.0`; Pi is fixed at
-`@earendil-works/pi-coding-agent@0.84.2`. Reviewed Node 22.19 and Rust base images are
-pinned by manifest digest. The noninteractive command adapters are versioned with this
-repository rather than supplied as mutable protected variables.
+The worker builds all three pinned run-local harness images. Carry is built as a
+portable static executable from the archived commit; Codex is fixed at
+`@openai/codex@0.147.0`; Pi is fixed at
+`@earendil-works/pi-coding-agent@0.84.2`. Reviewed Node 22.19 and Rust base images
+are pinned by manifest digest. The noninteractive command adapters are versioned
+with this repository rather than supplied as mutable protected variables.
+
+## Prepared environment contract
+
+Before model spend, trusted setup uses `swebench==4.1.0` to build each official
+instance image with its ordinary repository dependencies. It captures the source
+and derivative image IDs plus a complete conda package manifest. It creates one
+derivative per harness from the same task-image parent and copies only that harness's
+bundle, so an agent cannot invoke a competing harness. Git-ignored in-tree build
+products, including compiled extensions, are retained in a trusted overlay; tracked
+source, Git objects, and non-ignored files are excluded. Every derivative removes
+`/testbed` and the setup scripts from the parent image. At agent launch,
+`/testbed` is replaced by a fresh base-ancestry-only checkout, so editable installs
+still resolve to the expected path without exposing the parent image's Git objects
+or future history.
+
+Trusted readiness runs in a disposable container with `--network none`, no model
+credential, no grading mounts, and no hidden test patch. It activates the prepared
+environment and launches the official public test path against a throwaway
+base-only checkout. The official parser must observe at least one test result.
+Baseline failures and timeouts after tests begin are diagnostic and acceptable;
+missing runners, imports, plugins, parseable test execution, package manifests,
+or images fail the run before any agent starts. Readiness workspaces are discarded.
+Its command, output, timing, and dependency resolution remain in trusted artifacts
+that are never mounted into an agent slot.
 
 The canonical dataset is loaded at revision
 `c104f840cc67f8b6eec6f759ebc8b2693d585d4a` and materialized as local JSON for
-`swebench==4.1.0`. Official reports alone determine resolution. Evaluator processes have
-all `OPENAI_*` variables removed and may use only host Docker and canonical task data.
-
-## Remaining scaling blockers
-
-Do not expand to the full 50 until smoke data establishes instance sizing, wall time,
-token spend, evaluator image/cache pressure, and safe URL/job timeouts. A 50-task design
-also needs reviewed concurrency and artifact aggregation while retaining the exact
-50-record per-dispatch denominator and no selective retry/replacement policy.
+trusted preparation and grading only. Gold patches, hidden test patches, evaluator
+assets, and canonical records are absent from agent mounts. Official reports alone
+determine resolution. Evaluator processes have all `OPENAI_*` variables removed
+and may use only host Docker and canonical task data.
