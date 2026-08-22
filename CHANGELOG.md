@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.6.0](https://github.com/wiggzz/carry/compare/v0.5.0...v0.6.0) (2026-08-22)
+
+
+### Features
+
+* offload large shell output ([#41](https://github.com/wiggzz/carry/issues/41)) ([dcff860](https://github.com/wiggzz/carry/commit/dcff8606d431cd43141b1687c5d3380e5f53935f))
+* plan compaction across cache generations ([#37](https://github.com/wiggzz/carry/issues/37)) ([f2ac9c7](https://github.com/wiggzz/carry/commit/f2ac9c785bed8f8d240619515cb4835838d26505))
+
+
+### Bug Fixes
+
+* bound official evaluator concurrency ([#44](https://github.com/wiggzz/carry/issues/44)) ([d3e2bff](https://github.com/wiggzz/carry/commit/d3e2bff55726b66d6fb24f488ef5024c42f139b2))
+* handle historical Git metadata in benchmark preflight ([#48](https://github.com/wiggzz/carry/issues/48)) ([441760e](https://github.com/wiggzz/carry/commit/441760e081e841d29a9286150232dd2c5caea4c2))
+* remove protected benchmark step cap ([#40](https://github.com/wiggzz/carry/issues/40)) ([bde8fe3](https://github.com/wiggzz/carry/commit/bde8fe316e95b203184c57c0c8beb6e0512cff4a))
+* validate pull request titles ([#49](https://github.com/wiggzz/carry/issues/49)) ([8460022](https://github.com/wiggzz/carry/commit/8460022070d0bd2bbc13cde55263642376f0af58))
+
 ## [0.5.0](https://github.com/wiggzz/carry/compare/v0.4.0...v0.5.0) (2026-08-17)
 
 
