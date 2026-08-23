@@ -281,8 +281,8 @@ def validate_task_catalog(*, catalog: Mapping[str, Any], records: list[dict[str,
         raise RuntimeError("task catalog metadata does not match reviewed benchmark inputs")
     tasks = catalog.get("tasks")
     expected_ids = {record["instance_id"] for record in records}
-    if not isinstance(tasks, dict) or set(tasks) != expected_ids:
-        raise RuntimeError("task catalog does not match the fixed task denominator")
+    if not isinstance(tasks, dict) or not expected_ids.issubset(tasks):
+        raise RuntimeError("task catalog does not cover the fixed task selection")
     normalized: dict[str, Any] = dict(catalog)
     normalized_tasks: dict[str, dict[str, str]] = {}
     for record in records:

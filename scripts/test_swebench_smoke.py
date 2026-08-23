@@ -251,6 +251,14 @@ class SmokeWorkerTests(unittest.TestCase):
             prepared_recipe_sha256=prepared_recipe,
             base_recipe_sha256=base_recipe,
         )
+        superset = json.loads(json.dumps(catalog))
+        superset["tasks"]["unused__task-2"] = superset["tasks"][record["instance_id"]]
+        normalized = self.worker.validate_task_catalog(
+            catalog=superset, records=[record], repository=repository,
+            prepared_recipe_sha256=prepared_recipe,
+            base_recipe_sha256=base_recipe,
+        )
+        self.assertEqual(set(normalized["tasks"]), {record["instance_id"]})
         with self.assertRaisesRegex(RuntimeError, "metadata"):
             self.worker.validate_task_catalog(
                 catalog=dict(catalog, dataset_revision="0" * 40), records=[record],
