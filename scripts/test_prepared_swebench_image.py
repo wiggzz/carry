@@ -102,31 +102,26 @@ class PreparedSWEbenchImageTests(unittest.TestCase):
             prefix = f"prepared-fixture-{os.getpid()}"
             task_tag = f"{prefix}-task"
             task_id = build(task_tag, "Dockerfile.task")
-            carry_id = build(f"{prefix}-carry", "Dockerfile.carry", f"BASE={task_tag}")
-            codex_id = build(
-                f"{prefix}-codex", "Dockerfile.node", f"BASE={task_tag}", "BIN=codex"
+            carry_tag = f"{prefix}-carry"
+            carry_id = build(carry_tag, "Dockerfile.carry", f"BASE={task_tag}")
+            prepared = WORKER.build_prepared_task_image(
+                source=ROOT,
+                run_id=prefix,
+                instance_id="fixture__task-1",
+                task_image_id=task_id,
+                cache_key="a" * 64,
             )
-            pi_id = build(f"{prefix}-pi", "Dockerfile.node", f"BASE={task_tag}", "BIN=pi")
-            prepared = {
-                harness: WORKER.build_prepared_task_image(
-                    source=ROOT,
-                    run_id=prefix,
-                    instance_id="fixture__task-1",
-                    harness=harness,
-                    task_image_id=task_id,
-                    harness_image_id=image_id,
-                )
-                for harness, image_id in {
-                    "carry": carry_id, "codex": codex_id, "pi": pi_id,
-                }.items()
-            }
+            bundles = WORKER.export_harness_bundles(
+                harness_images={"carry": {"tag": carry_tag, "image_id": carry_id}},
+                output=root / "bundles",
+            )
             subprocess.run(
                 [
                     "docker", "run", "--rm", "--network", "none",
-                    "--entrypoint", "/bin/bash", prepared["carry"]["tag"], "-lc",
+                    "--entrypoint", "/bin/bash", prepared["tag"], "-lc",
                     "test ! -e /testbed/future-git-object "
                     "&& test ! -e /root/setup_env.sh && test ! -e /root/setup_repo.sh "
-                    "&& test -x /opt/swebench-harness/bin/carry "
+                    "&& test ! -e /opt/swebench-harness/bin/carry "
                     "&& test ! -e /opt/swebench-harness/bin/codex "
                     "&& test ! -e /opt/swebench-harness/bin/pi",
                 ],
@@ -154,9 +149,10 @@ class PreparedSWEbenchImageTests(unittest.TestCase):
                 "--env", "HOME=/agent-home", "--tmpfs", "/agent-home:rw,nosuid,nodev",
                 "--tmpfs", "/tmp:rw,nosuid,nodev",
                 "--mount", f"type=bind,src={repo},dst=/testbed",
+                "--mount", f"type=bind,src={bundles['carry']},dst=/opt/swebench-harness,readonly",
                 "--mount", f"type=bind,src={prompt},dst=/benchmark/input,readonly",
                 "--mount", f"type=bind,src={output},dst=/benchmark/output",
-                "--workdir", "/testbed", prepared["carry"]["tag"], "run", "--harness", "carry",
+                "--workdir", "/testbed", prepared["tag"], "run", "--harness", "carry",
                 "--model", "fixture", "--reasoning", "medium",
                 "--prompt", "/benchmark/input/task.md", "--output", "/benchmark/output",
             ]
@@ -167,7 +163,7 @@ class PreparedSWEbenchImageTests(unittest.TestCase):
                     [
                         "docker", "run", "--rm",
                         "--mount", f"type=bind,src={repo},dst=/testbed",
-                        "--entrypoint", "chmod", prepared["carry"]["tag"],
+                        "--entrypoint", "chmod", prepared["tag"],
                         "-R", "a+rwx", "/testbed",
                     ],
                     check=False,

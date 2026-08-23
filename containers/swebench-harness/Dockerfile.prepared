@@ -1,12 +1,12 @@
 ARG TASK_IMAGE
-ARG HARNESS_IMAGE
-
-FROM ${HARNESS_IMAGE} AS harness
 FROM ${TASK_IMAGE}
+ARG TASK_IMAGE_ID
+ARG TASK_CACHE_KEY
 
 # Official instance images contain a full upstream clone. Never expose its Git
 # objects or setup scripts to the model; a verified base-only checkout replaces
-# /testbed at runtime.
+# /testbed at runtime. Preserve only ignored build products needed by the
+# installed environment and the trusted overlay/runtime scripts.
 RUN mkdir -p /opt/swebench-prepared \
     && cd /testbed \
     && git ls-files --others --ignored --exclude-standard -z \
@@ -16,10 +16,11 @@ RUN mkdir -p /opt/swebench-prepared \
     && rm /opt/swebench-prepared/testbed-overlay-files \
     && rm -rf /testbed /root/setup_env.sh /root/setup_repo.sh \
     && mkdir -p /testbed
-COPY --from=harness /opt/swebench-harness /opt/swebench-harness
 COPY containers/swebench-harness/prepared-entrypoint.sh /usr/local/bin/prepared-entrypoint
 COPY containers/swebench-harness/apply-testbed-overlay.sh /usr/local/bin/apply-testbed-overlay
 RUN chmod 0555 /usr/local/bin/prepared-entrypoint /usr/local/bin/apply-testbed-overlay
+LABEL org.carry.swebench.task-cache-key=${TASK_CACHE_KEY} \
+      org.carry.swebench.evaluator-image-id=${TASK_IMAGE_ID}
 ENV PREPARED_HARNESS_ROOT=/opt/swebench-harness
 ENV PATH=/opt/swebench-harness/bin:${PATH}
 ENTRYPOINT ["/usr/local/bin/prepared-entrypoint"]

@@ -180,8 +180,11 @@ def force_remove_container(reference: str, *, exact_name: bool = False) -> None:
 
 DATASET = "princeton-nlp/SWE-bench_Verified"
 DATASET_REVISION = "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
+TASK_IMAGE_CATALOG_VERSION = "swebench-4.1.0-prepared-v1"
 VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 DIGEST_IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
+LOCAL_IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
+REPO_DIGEST = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 CODEX_COMMAND = (
     "codex exec --dangerously-bypass-approvals-and-sandbox --model {model} "
     "--config model_reasoning_effort={reasoning} --json {prompt_text}"
@@ -190,6 +193,136 @@ PI_COMMAND = (
     "pi --mode json --provider openai-benchmark --model {model} "
     "--thinking {reasoning} --no-session {prompt_text}"
 )
+
+
+def prepared_image_recipe_sha256(source: pathlib.Path) -> str:
+    """Hash every repository file copied into the reusable agent image."""
+    relative_paths = (
+        "containers/swebench-harness/Dockerfile.prepared",
+        "containers/swebench-harness/prepared-entrypoint.sh",
+        "containers/swebench-harness/apply-testbed-overlay.sh",
+    )
+    digest = hashlib.sha256()
+    for relative in relative_paths:
+        content = (source / relative).read_bytes()
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def task_image_cache_key(record: Mapping[str, Any], *,
+                         prepared_dockerfile_sha256: str,
+                         base_dockerfile_sha256: str) -> str:
+    """Hash environment-affecting public inputs, never prompt/gold/evaluator data."""
+    if not re.fullmatch(r"[0-9a-f]{64}", prepared_dockerfile_sha256):
+        raise ValueError("prepared Dockerfile sha256 must be lowercase hexadecimal")
+    if not re.fullmatch(r"[0-9a-f]{64}", base_dockerfile_sha256):
+        raise ValueError("base Dockerfile sha256 must be lowercase hexadecimal")
+    environment_record = {
+        key: record.get(key)
+        for key in ("instance_id", "repo", "version", "base_commit")
+    }
+    payload = {
+        "catalog_version": TASK_IMAGE_CATALOG_VERSION,
+        "dataset": DATASET,
+        "dataset_revision": DATASET_REVISION,
+        "swebench_version": "4.1.0",
+        "platform": "linux/amd64",
+        "prepared_dockerfile_sha256": prepared_dockerfile_sha256,
+        "base_dockerfile_sha256": base_dockerfile_sha256,
+        "record": environment_record,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def task_catalog_payload(*, published: Mapping[str, Mapping[str, Any]],
+                         repository: str, prepared_recipe_sha256: str,
+                         base_recipe_sha256: str) -> dict[str, Any]:
+    tasks = {
+        instance_id: {
+            "cache_key": item["cache_key"],
+            "agent_digest": item["agent_image"]["resolved_digest"],
+            "evaluator_digest": item["evaluator_image"]["resolved_digest"],
+        }
+        for instance_id, item in published.items()
+    }
+    return {
+        "schema": "carry.swebench-task-catalog.v1",
+        "catalog_version": TASK_IMAGE_CATALOG_VERSION,
+        "dataset": DATASET,
+        "dataset_revision": DATASET_REVISION,
+        "swebench_version": "4.1.0",
+        "platform": "linux/amd64",
+        "repository": repository,
+        "prepared_recipe_sha256": prepared_recipe_sha256,
+        "base_recipe_sha256": base_recipe_sha256,
+        "tasks": tasks,
+    }
+
+
+def validate_task_catalog(*, catalog: Mapping[str, Any], records: list[dict[str, Any]],
+                          repository: str, prepared_recipe_sha256: str,
+                          base_recipe_sha256: str) -> dict[str, Any]:
+    expected_metadata = {
+        "schema": "carry.swebench-task-catalog.v1",
+        "catalog_version": TASK_IMAGE_CATALOG_VERSION,
+        "dataset": DATASET,
+        "dataset_revision": DATASET_REVISION,
+        "swebench_version": "4.1.0",
+        "platform": "linux/amd64",
+        "repository": repository,
+        "prepared_recipe_sha256": prepared_recipe_sha256,
+        "base_recipe_sha256": base_recipe_sha256,
+    }
+    if any(catalog.get(key) != value for key, value in expected_metadata.items()):
+        raise RuntimeError("task catalog metadata does not match reviewed benchmark inputs")
+    tasks = catalog.get("tasks")
+    expected_ids = {record["instance_id"] for record in records}
+    if not isinstance(tasks, dict) or set(tasks) != expected_ids:
+        raise RuntimeError("task catalog does not match the fixed task denominator")
+    normalized: dict[str, Any] = dict(catalog)
+    normalized_tasks: dict[str, dict[str, str]] = {}
+    for record in records:
+        instance_id = record["instance_id"]
+        item = tasks[instance_id]
+        if not isinstance(item, dict):
+            raise RuntimeError(f"task catalog entry is invalid for {instance_id}")
+        expected_key = task_image_cache_key(
+            record, prepared_dockerfile_sha256=prepared_recipe_sha256,
+            base_dockerfile_sha256=base_recipe_sha256,
+        )
+        if item.get("cache_key") != expected_key:
+            raise RuntimeError(f"task catalog cache key mismatch for {instance_id}")
+        agent = item.get("agent_digest", "")
+        evaluator = item.get("evaluator_digest", "")
+        if not DIGEST_IMAGE.fullmatch(agent) or not DIGEST_IMAGE.fullmatch(evaluator):
+            raise RuntimeError(f"task catalog digest is invalid for {instance_id}")
+        if not agent.startswith(repository + "@") or not evaluator.startswith(repository + "@"):
+            raise RuntimeError(f"task catalog repository mismatch for {instance_id}")
+        normalized_tasks[instance_id] = {
+            "cache_key": expected_key,
+            "agent_digest": agent,
+            "evaluator_digest": evaluator,
+        }
+    normalized["tasks"] = normalized_tasks
+    return normalized
+
+
+def task_image_references(repository: str, cache_key: str) -> dict[str, str]:
+    """Return immutable lookup tags for one evaluator/agent image pair."""
+    final_component = repository.rsplit("/", 1)[-1]
+    if (not repository or any(character.isspace() for character in repository)
+            or "@" in repository or ":" in final_component):
+        raise ValueError("TASK_IMAGE_REPOSITORY must be an untagged image repository")
+    if not re.fullmatch(r"[0-9a-f]{64}", cache_key):
+        raise ValueError("task image cache key must be lowercase sha256")
+    return {
+        "evaluator": f"{repository}:swebench-evaluator-{cache_key}",
+        "agent": f"{repository}:swebench-ready-{cache_key}",
+    }
 
 
 def official_phase_limits(values: Mapping[str, str] | None = None) -> dict[str, int]:
@@ -357,7 +490,8 @@ def cleanup_agent_network(network: Mapping[str, str], execute: Any = subprocess.
     raise ContainerCleanupError("agent network cleanup failed: " + ", ".join(leftovers))
 
 
-def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path, task_input: pathlib.Path,
+def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
+                         harness_bundle: pathlib.Path, task_input: pathlib.Path,
                          output: pathlib.Path, model: str, reasoning: str,
                          container_name: str, agent_timeout_seconds: int,
                          network: str, proxy_ip: str, api_base: str) -> list[str]:
@@ -376,6 +510,7 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path, task_i
         "--tmpfs", "/agent-home:rw,nosuid,nodev,size=256m",
         "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m",
         "--mount", f"type=bind,src={repo.resolve()},dst=/testbed",
+        "--mount", f"type=bind,src={harness_bundle.resolve()},dst=/opt/swebench-harness,readonly",
         "--mount", f"type=bind,src={task_input.resolve()},dst=/benchmark/input,readonly",
         "--mount", f"type=bind,src={output.resolve()},dst=/benchmark/output",
         "--workdir", "/testbed", image, "run", "--harness", harness,
@@ -415,53 +550,44 @@ def validate_readiness_result(*, returncode: int, timed_out: bool,
 
 
 def build_prepared_task_image(*, source: pathlib.Path, run_id: str, instance_id: str,
-                              harness: str, task_image_id: str,
-                              harness_image_id: str,
+                              task_image_id: str, cache_key: str,
                               execute: Any = subprocess.run) -> dict[str, str]:
-    """Layer one pinned harness onto a dependency-ready, sanitized task image."""
-    if harness not in HARNESSES:
-        raise ValueError(f"unknown harness {harness}")
-    image_id_pattern = re.compile(r"^sha256:[0-9a-f]{64}$")
-    parent_ids = {"TASK_IMAGE": task_image_id, "HARNESS_IMAGE": harness_image_id}
-    if any(not image_id_pattern.fullmatch(value) for value in parent_ids.values()):
-        raise ValueError("prepared task images require immutable local sha256 parent IDs")
+    """Create one harness-neutral, sanitized image from an official task image."""
+    if not LOCAL_IMAGE_ID.fullmatch(task_image_id):
+        raise ValueError("prepared task images require an immutable local sha256 parent ID")
+    if not re.fullmatch(r"[0-9a-f]{64}", cache_key):
+        raise ValueError("prepared task images require a sha256 cache key")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", instance_id):
         raise ValueError("invalid instance ID for prepared image tag")
-    tag = f"swebench-{run_id}-prepared-{instance_id.lower()}-{harness}"
-    parent_tags = {
-        name: f"{tag}-parent-{name.lower().replace('_', '-')}"
-        for name in parent_ids
-    }
-    for name, image_id in parent_ids.items():
-        execute(["docker", "image", "tag", image_id, parent_tags[name]], check=True)
+    tag = f"swebench-{run_id}-prepared-{instance_id.lower()}"
+    parent_tag = f"{tag}-parent-task-image"
+    execute(["docker", "image", "tag", task_image_id, parent_tag], check=True)
     dockerfile = source / "containers" / "swebench-harness" / "Dockerfile.prepared"
-    context = source
     command = [
         "docker", "build", "--progress=plain", "--file", str(dockerfile), "--tag", tag,
+        "--build-arg", f"TASK_IMAGE={parent_tag}",
+        "--build-arg", f"TASK_IMAGE_ID={task_image_id}",
+        "--build-arg", f"TASK_CACHE_KEY={cache_key}",
+        str(source),
     ]
-    for name, value in parent_tags.items():
-        command.extend(("--build-arg", f"{name}={value}"))
-    command.append(str(context))
     execute(command, check=True, text=True)
-    for name, parent_tag in parent_tags.items():
-        parent_inspected = execute(
-            ["docker", "image", "inspect", "--format", "{{.Id}}", parent_tag],
-            check=True, text=True, capture_output=True,
-        ).stdout.strip()
-        if parent_inspected != parent_ids[name]:
-            raise RuntimeError("prepared task parent image changed during build")
+    parent_inspected = execute(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", parent_tag],
+        check=True, text=True, capture_output=True,
+    ).stdout.strip()
+    if parent_inspected != task_image_id:
+        raise RuntimeError("prepared task parent image changed during build")
     inspected = execute(
         ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
         check=True, text=True, capture_output=True,
     ).stdout.strip()
-    if not image_id_pattern.fullmatch(inspected):
+    if not LOCAL_IMAGE_ID.fullmatch(inspected):
         raise RuntimeError("prepared task image did not resolve to a sha256 image ID")
     return {
         "tag": tag,
         "image_id": inspected,
         "task_image_id": task_image_id,
-        "harness": harness,
-        "harness_image_id": harness_image_id,
+        "cache_key": cache_key,
         "dockerfile_sha256": hashlib.sha256(dockerfile.read_bytes()).hexdigest(),
     }
 
@@ -660,19 +786,301 @@ def enforce_https_swebench_base_images(templates: dict[str, str],
     return hashlib.sha256(template.encode()).hexdigest()
 
 
-def prepare_task_environments(*, records: list[dict[str, Any]], source: pathlib.Path,
-                              run_id: str, harness_images: Mapping[str, Mapping[str, str]],
-                              work: pathlib.Path, output: pathlib.Path, clone: Any,
+def publish_task_catalog_image(*, catalog: Mapping[str, Any], repository: str,
+                               output: pathlib.Path,
+                               execute: Any = subprocess.run) -> str:
+    """Publish the frozen catalog as a tiny OCI image and return its digest reference."""
+    canonical = json.dumps(catalog, indent=2, sort_keys=True) + "\n"
+    catalog_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    context = output / "catalog-image"
+    context.mkdir(parents=True, exist_ok=False)
+    (context / "catalog.json").write_text(canonical, encoding="utf-8")
+    (context / "Dockerfile").write_text(
+        "FROM scratch\nCOPY catalog.json /catalog.json\nCMD [\"/catalog.json\"]\n",
+        encoding="utf-8",
+    )
+    tag = f"{repository}:catalog-{catalog_hash}"
+    execute(
+        ["docker", "build", "--file", str(context / "Dockerfile"), "--tag", tag, str(context)],
+        check=True, text=True,
+    )
+    execute(["docker", "push", tag], check=True, text=True)
+    inspected = _inspect_catalog_image(tag, execute=execute)
+    return inspected["resolved_digest"]
+
+
+def load_task_catalog_image(*, reference: str, repository: str, output: pathlib.Path,
+                            execute: Any = subprocess.run) -> dict[str, Any]:
+    """Pull an immutable OCI catalog and extract its JSON without running it."""
+    if not DIGEST_IMAGE.fullmatch(reference) or not reference.startswith(repository + "@"):
+        raise ValueError("TASK_IMAGE_CATALOG must pin the configured repository by digest")
+    execute(["docker", "pull", reference], check=True, text=True)
+    name = "carry-task-catalog-" + reference.rsplit(":", 1)[-1][:16]
+    execute(["docker", "create", "--name", name, reference], check=True, capture_output=True, text=True)
+    output.mkdir(parents=True, exist_ok=True)
+    destination = output / "catalog.json"
+    try:
+        execute(["docker", "cp", f"{name}:/catalog.json", str(destination)], check=True)
+    finally:
+        execute(["docker", "rm", "--force", name], check=True)
+    try:
+        payload = json.loads(destination.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("task catalog image contains invalid JSON") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("task catalog image root must be an object")
+    return payload
+
+
+def _inspect_catalog_image(reference: str, *, execute: Any) -> dict[str, Any]:
+    inspected = execute(
+        ["docker", "image", "inspect", "--format", "{{json .}}", reference],
+        check=True, capture_output=True, text=True,
+    )
+    try:
+        payload = json.loads(inspected.stdout)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"catalog image {reference} produced invalid inspect data") from error
+    image_id = payload.get("Id")
+    if not isinstance(image_id, str) or not LOCAL_IMAGE_ID.fullmatch(image_id):
+        raise RuntimeError(f"catalog image {reference} has no immutable local image ID")
+    repository = reference.split("@", 1)[0] if "@" in reference else reference.rsplit(":", 1)[0]
+    repo_digests = payload.get("RepoDigests") or []
+    resolved = next(
+        (value for value in repo_digests
+         if isinstance(value, str) and value.startswith(repository + "@")
+         and REPO_DIGEST.fullmatch(value)),
+        None,
+    )
+    if resolved is None:
+        raise RuntimeError(f"catalog image {reference} has no resolved repository digest")
+    if "@" in reference and resolved != reference:
+        raise RuntimeError(f"catalog image digest does not match requested reference: {reference}")
+    labels = ((payload.get("Config") or {}).get("Labels") or {})
+    if not isinstance(labels, dict):
+        raise RuntimeError(f"catalog image {reference} has invalid labels")
+    return {"tag": reference, "image_id": image_id, "resolved_digest": resolved, "labels": labels}
+
+
+def resolve_task_environments(*, records: list[dict[str, Any]], source: pathlib.Path,
+                              repository: str, output: pathlib.Path,
+                              base_dockerfile_sha256: str | None = None,
+                              dockerfile_templates: dict[str, str] | None = None,
+                              trusted_ca_image: str | None = None,
+                              max_workers: int = 5,
+                              catalog_reference: str | None = None,
+                              catalog: Mapping[str, Any] | None = None,
+                              get_specs: Any = None,
+                              execute: Any = subprocess.run) -> dict[str, dict[str, Any]]:
+    """Pull and validate prepared catalog pairs without building any task image."""
+    if not records or len({record["instance_id"] for record in records}) != len(records):
+        raise ValueError("resolution requires unique task records")
+    if base_dockerfile_sha256 is None:
+        if dockerfile_templates is None:
+            dockerfile_templates = importlib.import_module(
+                "swebench.harness.dockerfiles"
+            )._DOCKERFILE_BASE
+        if trusted_ca_image is None:
+            raise RuntimeError("resolver build recipe inputs were not initialized")
+        base_dockerfile_sha256 = enforce_https_swebench_base_images(
+            dockerfile_templates, trusted_ca_image,
+        )
+    if get_specs is None:
+        get_specs = importlib.import_module(
+            "swebench.harness.test_spec.test_spec"
+        ).get_test_specs_from_dataset
+    specs = list(get_specs(records))
+    by_spec = {spec.instance_id: spec for spec in specs}
+    expected = {record["instance_id"] for record in records}
+    if set(by_spec) != expected:
+        raise RuntimeError("catalog test specs do not match the fixed task denominator")
+    dockerfile_hash = prepared_image_recipe_sha256(source)
+    if catalog is None:
+        if catalog_reference is None:
+            raise RuntimeError("benchmark requires an immutable task catalog digest")
+        catalog = load_task_catalog_image(
+            reference=catalog_reference, repository=repository,
+            output=output / "catalog", execute=execute,
+        )
+    catalog = validate_task_catalog(
+        catalog=catalog, records=records, repository=repository,
+        prepared_recipe_sha256=dockerfile_hash,
+        base_recipe_sha256=base_dockerfile_sha256,
+    )
+    if max_workers < 1:
+        raise ValueError("catalog pull concurrency must be positive")
+
+    def resolve_one(record: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        instance_id = record["instance_id"]
+        cache_key = task_image_cache_key(
+            record, prepared_dockerfile_sha256=dockerfile_hash,
+            base_dockerfile_sha256=base_dockerfile_sha256,
+        )
+        catalog_item = catalog["tasks"][instance_id]
+        references = {
+            "evaluator": catalog_item["evaluator_digest"],
+            "agent": catalog_item["agent_digest"],
+        }
+        try:
+            execute(["docker", "pull", references["evaluator"]], check=True, text=True)
+            execute(["docker", "pull", references["agent"]], check=True, text=True)
+            evaluator = _inspect_catalog_image(references["evaluator"], execute=execute)
+            agent = _inspect_catalog_image(references["agent"], execute=execute)
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise RuntimeError(f"required catalog images unavailable for {instance_id}") from error
+        labels = agent.pop("labels")
+        evaluator.pop("labels")
+        if labels.get("org.carry.swebench.task-cache-key") != cache_key:
+            raise RuntimeError(f"prepared image cache key mismatch for {instance_id}")
+        if labels.get("org.carry.swebench.evaluator-image-id") != evaluator["image_id"]:
+            raise RuntimeError(f"prepared image evaluator image identity mismatch for {instance_id}")
+        official_key = by_spec[instance_id].instance_image_key
+        execute(
+            ["docker", "image", "tag", references["evaluator"], official_key], check=True,
+        )
+        retagged = execute(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", official_key],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        if retagged != evaluator["image_id"]:
+            raise RuntimeError(f"official evaluator retag mismatch for {instance_id}")
+        return instance_id, {
+            "cache_key": cache_key,
+            "source_task_image": official_key,
+            "evaluator_image": evaluator,
+            "agent_image": agent,
+            "dockerfile_sha256": dockerfile_hash,
+            "base_dockerfile_sha256": base_dockerfile_sha256,
+        }
+
+    completed: dict[str, dict[str, Any]] = {}
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    futures = [executor.submit(resolve_one, record) for record in records]
+    try:
+        for instance_id, item in fail_fast_completion_order(futures):
+            completed[instance_id] = item
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    resolved = {record["instance_id"]: completed[record["instance_id"]] for record in records}
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "preparation.json").write_text(
+        json.dumps(resolved, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    return resolved
+
+
+def _catalog_pair(*, references: Mapping[str, str], cache_key: str,
+                  execute: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    for reference in (references["evaluator"], references["agent"]):
+        execute(["docker", "pull", reference], check=True, text=True)
+    evaluator = _inspect_catalog_image(references["evaluator"], execute=execute)
+    agent = _inspect_catalog_image(references["agent"], execute=execute)
+    labels = agent.pop("labels")
+    evaluator.pop("labels")
+    if labels.get("org.carry.swebench.task-cache-key") != cache_key:
+        raise RuntimeError("prepared catalog image cache key mismatch")
+    if labels.get("org.carry.swebench.evaluator-image-id") != evaluator["image_id"]:
+        raise RuntimeError("prepared catalog image evaluator image identity mismatch")
+    return evaluator, agent
+
+
+def _remote_tag_exists(reference: str, *, execute: Any) -> bool:
+    result = execute(
+        ["docker", "manifest", "inspect", reference], check=False,
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0
+
+
+def fail_fast_completion_order(futures: list[Any]) -> Any:
+    """Yield future results as completed and cancel outstanding work on failure."""
+    try:
+        for future in concurrent.futures.as_completed(futures):
+            yield future.result()
+    except Exception:
+        for future in futures:
+            future.cancel()
+        raise
+
+
+def publish_task_environments(*, records: list[dict[str, Any]], source: pathlib.Path,
+                              run_id: str, repository: str, work: pathlib.Path,
+                              output: pathlib.Path, clone: Any,
                               timeout_seconds: int = 180, max_workers: int = 5,
                               client: Any = None, build_instances: Any = None,
                               get_specs: Any = None, parsers: Mapping[str, Any] | None = None,
                               repo_specs: Mapping[str, Any] | None = None,
                               dockerfile_templates: dict[str, str] | None = None,
-                              trusted_ca_image: str | None = None) -> dict[str, dict[str, Any]]:
-    """Build dependencies, sanitize images, and prove public tests run before agents."""
+                              trusted_ca_image: str | None = None,
+                              base_dockerfile_sha256: str | None = None,
+                              remote_exists: Any = None,
+                              execute: Any = subprocess.run) -> dict[str, dict[str, Any]]:
+    """Publish readiness-approved evaluator/agent pairs, building only cache misses."""
     if not records or len({record["instance_id"] for record in records}) != len(records):
-        raise ValueError("preparation requires unique task records")
+        raise ValueError("publication requires unique task records")
     output.mkdir(parents=True, exist_ok=True)
+    if base_dockerfile_sha256 is None:
+        if dockerfile_templates is None:
+            dockerfile_templates = importlib.import_module(
+                "swebench.harness.dockerfiles"
+            )._DOCKERFILE_BASE
+        if trusted_ca_image is None:
+            raise RuntimeError("publisher build recipe inputs were not initialized")
+        base_dockerfile_sha256 = enforce_https_swebench_base_images(
+            dockerfile_templates, trusted_ca_image,
+        )
+    if get_specs is None:
+        get_specs = importlib.import_module(
+            "swebench.harness.test_spec.test_spec"
+        ).get_test_specs_from_dataset
+    specs = list(get_specs(records))
+    by_spec = {spec.instance_id: spec for spec in specs}
+    expected = {record["instance_id"] for record in records}
+    if set(by_spec) != expected:
+        raise RuntimeError("publisher test specs do not match the fixed task denominator")
+    dockerfile_hash = prepared_image_recipe_sha256(source)
+    exists = remote_exists or (lambda reference: _remote_tag_exists(reference, execute=execute))
+    catalog = {
+        record["instance_id"]: {
+            "cache_key": task_image_cache_key(
+                record, prepared_dockerfile_sha256=dockerfile_hash,
+                base_dockerfile_sha256=base_dockerfile_sha256,
+            )
+        }
+        for record in records
+    }
+    for item in catalog.values():
+        item["references"] = task_image_references(repository, item["cache_key"])
+
+    published: dict[str, dict[str, Any]] = {}
+    misses: list[dict[str, Any]] = []
+    for record in records:
+        instance_id = record["instance_id"]
+        item = catalog[instance_id]
+        references = item["references"]
+        if not exists(references["agent"]):
+            misses.append(record)
+            continue
+        if not exists(references["evaluator"]):
+            raise RuntimeError(f"ready catalog image has no evaluator pair for {instance_id}")
+        try:
+            evaluator, agent = _catalog_pair(
+                references=references, cache_key=item["cache_key"], execute=execute,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise RuntimeError(f"cached catalog pair unavailable for {instance_id}") from error
+        published[instance_id] = {
+            "status": "cached", "cache_key": item["cache_key"],
+            "source_task_image": by_spec[instance_id].instance_image_key,
+            "evaluator_image": evaluator, "agent_image": agent,
+            "dockerfile_sha256": dockerfile_hash,
+        }
+
+    if not misses:
+        (output / "preparation.json").write_text(
+            json.dumps(published, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+        )
+        return published
     if client is None:
         client = importlib.import_module("docker").from_env()
     if build_instances is None:
@@ -682,119 +1090,114 @@ def prepare_task_environments(*, records: list[dict[str, Any]], source: pathlib.
         setattr(docker_build, "ENV_IMAGE_BUILD_DIR", build_log_root / "env")
         setattr(docker_build, "INSTANCE_IMAGE_BUILD_DIR", build_log_root / "instances")
         build_instances = docker_build.build_instance_images
-    if get_specs is None:
-        get_specs = importlib.import_module(
-            "swebench.harness.test_spec.test_spec"
-        ).get_test_specs_from_dataset
     if parsers is None:
-        parsers = importlib.import_module(
-            "swebench.harness.log_parsers"
-        ).MAP_REPO_TO_PARSER
+        parsers = importlib.import_module("swebench.harness.log_parsers").MAP_REPO_TO_PARSER
     if repo_specs is None:
         repo_specs = importlib.import_module(
             "swebench.harness.constants"
         ).MAP_REPO_VERSION_TO_SPECS
-    if dockerfile_templates is None:
-        dockerfile_templates = importlib.import_module(
-            "swebench.harness.dockerfiles"
-        )._DOCKERFILE_BASE
-    if dockerfile_templates is None:
-        raise RuntimeError("SWE-bench Dockerfile templates were not initialized")
-    if trusted_ca_image is None:
-        raise RuntimeError("trusted CA image was not provided")
-    base_dockerfile_sha256 = enforce_https_swebench_base_images(
-        dockerfile_templates, trusted_ca_image,
-    )
-    parser_map = parsers
-    specs_map = repo_specs
-    if parser_map is None or specs_map is None:
-        raise RuntimeError("official parser/spec maps were not initialized")
-
     _, failed = build_instances(
-        client, records, force_rebuild=False, max_workers=max_workers,
+        client, misses, force_rebuild=False, max_workers=max_workers,
         tag="latest", env_image_tag="latest",
     )
     if failed:
         raise RuntimeError(f"dependency preparation failed for {len(failed)} task images")
-    specs = list(get_specs(records))
-    by_spec = {spec.instance_id: spec for spec in specs}
-    expected = {record["instance_id"] for record in records}
-    if set(by_spec) != expected:
-        raise RuntimeError("prepared test specs do not match the fixed task denominator")
 
-    prepared: dict[str, dict[str, Any]] = {}
-    staged: list[tuple[dict[str, Any], Any, dict[str, dict[str, str]],
-                       dict[str, Any], pathlib.Path]] = []
     readiness_root = work / "readiness"
-    for record in records:
+    staged: list[dict[str, Any]] = []
+    for record in misses:
         instance_id = record["instance_id"]
         spec = by_spec[instance_id]
         source_image = client.images.get(spec.instance_image_key)
-        task_images = {
-            harness: build_prepared_task_image(
-                source=source, run_id=run_id, instance_id=instance_id, harness=harness,
-                task_image_id=source_image.id,
-                harness_image_id=harness_images[harness]["image_id"],
-            )
-            for harness in HARNESSES
-        }
-        task_output = output / instance_id
+        item = catalog[instance_id]
+        prepared = build_prepared_task_image(
+            source=source, run_id=run_id, instance_id=instance_id,
+            task_image_id=source_image.id, cache_key=item["cache_key"],
+        )
         dependency = capture_dependency_manifest(
-            image=task_images[HARNESSES[0]]["tag"], output=task_output,
+            image=prepared["tag"], output=output / instance_id,
         )
         task_root = readiness_root / instance_id
         clone(record["repo"], record["base_commit"], task_root / "repo")
-        staged.append((record, spec, task_images, dependency, task_root))
+        staged.append({
+            "record": record, "spec": spec, "source_image": source_image,
+            "prepared": prepared, "dependency": dependency, "task_root": task_root,
+            "catalog": item,
+        })
 
-    def check_readiness(item: tuple[dict[str, Any], Any, dict[str, dict[str, str]],
-                                    dict[str, Any], pathlib.Path]) -> tuple[str, dict[str, Any]]:
-        record, spec, task_images, dependency, task_root = item
-        instance_id = record["instance_id"]
+    def check_readiness(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        record = item["record"]
         try:
             try:
-                public_test_command = specs_map[record["repo"]][record["version"]]["test_cmd"]
+                public_command = repo_specs[record["repo"]][record["version"]]["test_cmd"]
             except (KeyError, TypeError) as error:
                 raise RuntimeError(
                     f"no ordinary public test command for {record['repo']} {record.get('version')}"
                 ) from error
             script, test_command = trusted_readiness_script(
-                spec, public_test_command=public_test_command,
+                item["spec"], public_test_command=public_command,
             )
-            parser = parser_map.get(record["repo"])
+            parser = parsers.get(record["repo"])
             if parser is None:
                 raise RuntimeError(f"no official log parser for {record['repo']}")
             readiness = run_task_readiness(
-                instance_id=instance_id, image=task_images[HARNESSES[0]]["tag"],
-                repo=task_root / "repo",
-                script=script, test_command=test_command, parser=parser,
-                test_spec=record, output=output / instance_id,
-                timeout_seconds=timeout_seconds,
+                instance_id=record["instance_id"], image=item["prepared"]["tag"],
+                repo=item["task_root"] / "repo", script=script,
+                test_command=test_command, parser=parser, test_spec=record,
+                output=output / record["instance_id"], timeout_seconds=timeout_seconds,
             )
-            return instance_id, {
-                "images": task_images,
-                "task_image_id": task_images[HARNESSES[0]]["task_image_id"],
-                "source_task_image": spec.instance_image_key,
-                "base_dockerfile_sha256": base_dockerfile_sha256,
-                "dependency_manifest": dependency,
-                "readiness": readiness,
-            }
+            return item, readiness
         finally:
-            shutil.rmtree(task_root, ignore_errors=True)
+            shutil.rmtree(item["task_root"], ignore_errors=True)
 
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    futures = [executor.submit(check_readiness, item) for item in staged]
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for instance_id, item in executor.map(check_readiness, staged):
-                prepared[instance_id] = item
+        for item, readiness in fail_fast_completion_order(futures):
+            record = item["record"]
+            instance_id = record["instance_id"]
+            references = item["catalog"]["references"]
+            execute(
+                ["docker", "image", "tag", item["source_image"].id, references["evaluator"]],
+                check=True,
+            )
+            execute(["docker", "push", references["evaluator"]], check=True, text=True)
+            execute(
+                ["docker", "image", "tag", item["prepared"]["tag"], references["agent"]],
+                check=True,
+            )
+            # The readiness-approved tag is the immutable completion marker and is pushed last.
+            execute(["docker", "push", references["agent"]], check=True, text=True)
+            evaluator, agent = _catalog_pair(
+                references=references, cache_key=item["catalog"]["cache_key"],
+                execute=execute,
+            )
+            published[instance_id] = {
+                "status": "published", "cache_key": item["catalog"]["cache_key"],
+                "source_task_image": item["spec"].instance_image_key,
+                "evaluator_image": evaluator, "agent_image": agent,
+                "dockerfile_sha256": dockerfile_hash,
+                "base_dockerfile_sha256": base_dockerfile_sha256,
+                "dependency_manifest": item["dependency"], "readiness": readiness,
+            }
+    except Exception:
+        for future in futures:
+            future.cancel()
+        raise
     finally:
+        executor.shutdown(wait=True, cancel_futures=True)
         shutil.rmtree(readiness_root, ignore_errors=True)
-    output.mkdir(parents=True, exist_ok=True)
     (output / "preparation.json").write_text(
-        json.dumps(prepared, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+        json.dumps(published, indent=2, sort_keys=True) + "\n", encoding="utf-8",
     )
-    return prepared
+    return published
 
 
-def run_isolated_agent(*, instance_id: str, harness: str, image: str, proxy_image: str,
+
+
+
+def run_isolated_agent(*, instance_id: str, harness: str, image: str,
+                       harness_bundle: pathlib.Path, proxy_image: str,
                        proxy_script: pathlib.Path, repo: pathlib.Path,
                        task_input: pathlib.Path, output: pathlib.Path, model: str, reasoning: str,
                        timeout_seconds: int | None = None,
@@ -806,6 +1209,7 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str, proxy_imag
     try:
         return run_agent(
             instance_id=instance_id, harness=harness, image=image,
+            harness_bundle=harness_bundle,
             repo=repo, task_input=task_input, output=output,
             model=model, reasoning=reasoning, timeout_seconds=timeout_seconds,
             pricing=pricing, network=network["internal"], proxy_ip=network["proxy_ip"],
@@ -816,7 +1220,8 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str, proxy_imag
 
 
 def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
-              task_input: pathlib.Path, output: pathlib.Path, model: str, reasoning: str,
+              harness_bundle: pathlib.Path, task_input: pathlib.Path,
+              output: pathlib.Path, model: str, reasoning: str,
               network: str, proxy_ip: str, api_base: str, timeout_seconds: int | None = None,
               pricing: Mapping[str, float] | None = None) -> dict[str, Any]:
     slot_timeout = (
@@ -829,7 +1234,8 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
     container_name = f"carry-agent-{harness}-{hashlib.sha256(identity).hexdigest()[:16]}"
     in_container_timeout = max(1, slot_timeout - 45)
     command = agent_docker_command(
-        image=image, harness=harness, repo=repo, task_input=task_input, output=output,
+        image=image, harness=harness, repo=repo, harness_bundle=harness_bundle,
+        task_input=task_input, output=output,
         model=model, reasoning=reasoning, container_name=container_name,
         agent_timeout_seconds=in_container_timeout, network=network,
         proxy_ip=proxy_ip, api_base=api_base,
@@ -951,11 +1357,15 @@ def load_resolved_ids(report_dir: pathlib.Path) -> set[str]:
     return load_official_report(report_dir)["resolved_ids"]
 
 
-def selection_for_mode(frozen_ids: list[str], mode: str) -> list[str]:
+def selection_for_mode(frozen_ids: list[str], mode: str,
+                       smoke_ids: list[str] | None = None) -> list[str]:
     if len(frozen_ids) != 50 or len(set(frozen_ids)) != 50:
         raise ValueError("frozen official manifest must contain exactly 50 unique IDs")
     if mode == "smoke-5":
-        return frozen_ids[:5]
+        if (smoke_ids is None or len(smoke_ids) != 5 or len(set(smoke_ids)) != 5
+                or not set(smoke_ids).issubset(frozen_ids)):
+            raise ValueError("smoke manifest must contain five unique frozen task IDs")
+        return list(smoke_ids)
     if mode == "official-50":
         return list(frozen_ids)
     raise ValueError(f"unsupported benchmark mode: {mode}")
@@ -1210,6 +1620,40 @@ def build_images(*, source: pathlib.Path, run_id: str, config: Mapping[str, str]
     return result
 
 
+def export_harness_bundles(harness_images: Mapping[str, Mapping[str, str]],
+                           output: pathlib.Path,
+                           execute: Any = subprocess.run) -> dict[str, pathlib.Path]:
+    """Export each built harness once for read-only per-slot mounting."""
+    if not harness_images or any(harness not in HARNESSES for harness in harness_images):
+        raise ValueError("harness bundle export received unknown or empty image set")
+    output.mkdir(parents=True, exist_ok=True)
+    bundles: dict[str, pathlib.Path] = {}
+    for harness, image in harness_images.items():
+        image_id = image.get("image_id", "")
+        if not LOCAL_IMAGE_ID.fullmatch(image_id):
+            raise ValueError("harness bundle export requires immutable local image IDs")
+        bundle = output / harness
+        if bundle.exists():
+            raise RuntimeError(f"harness bundle destination already exists: {bundle}")
+        bundle.mkdir()
+        container_name = f"carry-harness-export-{harness}-{image_id[7:19]}"
+        execute(
+            ["docker", "create", "--name", container_name, image_id],
+            check=True, capture_output=True, text=True,
+        )
+        try:
+            execute(
+                ["docker", "cp", f"{container_name}:/opt/swebench-harness/.", str(bundle)],
+                check=True,
+            )
+        finally:
+            execute(["docker", "rm", "--force", container_name], check=True)
+        if not (bundle / "bin" / "adapter").is_file():
+            raise RuntimeError(f"exported {harness} harness bundle has no adapter")
+        bundles[harness] = bundle.resolve()
+    return bundles
+
+
 def _validate_records(
     tasks: list[dict[str, Any]],
     records: list[dict[str, Any]],
@@ -1329,17 +1773,123 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
     )
 
 
+def execute_preparation(*, source: pathlib.Path, work: pathlib.Path, output: pathlib.Path,
+                        config: Mapping[str, str]) -> None:
+    """Build/readiness-check only missing frozen task images and publish them."""
+    if os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_SECRET_FILE"):
+        raise RuntimeError("task-image preparation must not receive model credentials")
+    validated = validate_config(config)
+    repository = config.get("TASK_IMAGE_REPOSITORY", "")
+    task_image_references(repository, "0" * 64)
+    if config.get("BENCHMARK_MODE") != "prepare-50":
+        raise ValueError("image publisher requires BENCHMARK_MODE=prepare-50")
+    frozen_ids = json.loads(
+        (source / "benchmarks" / "swe-bench-verified-50.json").read_text(encoding="utf-8")
+    )["instance_ids"]
+    selection_for_mode(frozen_ids, "official-50")
+
+    from datasets import load_dataset  # installed only on the disposable worker
+    dataset = load_dataset(DATASET, split="test", revision=DATASET_REVISION)
+    by_id = {record.get("instance_id"): dict(record) for record in dataset}
+    if any(instance_id not in by_id for instance_id in frozen_ids):
+        raise ValueError("canonical dataset does not contain the frozen preparation set")
+    selected_records = [by_id[instance_id] for instance_id in frozen_ids]
+    work.mkdir(parents=True, exist_ok=True)
+    output.mkdir(parents=True, exist_ok=True)
+    mirrors: dict[str, pathlib.Path] = {}
+
+    def clone_one(repo: str, commit: str, destination: pathlib.Path) -> None:
+        if repo not in mirrors:
+            mirror = work / "repositories" / (repo.replace("/", "__") + ".git")
+            mirror.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["git", "clone", "--quiet", "--mirror", f"https://github.com/{repo}.git", str(mirror)],
+                check=True,
+            )
+            mirrors[repo] = mirror
+        _clone(repo, commit, destination, mirrors[repo])
+
+    started = time.monotonic()
+    dockerfile_templates = importlib.import_module(
+        "swebench.harness.dockerfiles"
+    )._DOCKERFILE_BASE
+    base_recipe_sha256 = enforce_https_swebench_base_images(
+        dockerfile_templates, validated["BASE_IMAGE"],
+    )
+    prepared_recipe_sha256 = prepared_image_recipe_sha256(source)
+    try:
+        published = publish_task_environments(
+            records=selected_records, source=source, run_id=config["RUN_ID"],
+            repository=repository, work=work, output=output / "preparation",
+            clone=clone_one, timeout_seconds=int(config.get("READINESS_TIMEOUT_SECONDS", "180")),
+            max_workers=int(config.get("READINESS_CONCURRENCY", "5")),
+            trusted_ca_image=validated["BASE_IMAGE"],
+            base_dockerfile_sha256=base_recipe_sha256,
+        )
+    finally:
+        shutil.rmtree(work / "repositories", ignore_errors=True)
+        shutil.rmtree(work / "readiness", ignore_errors=True)
+    if set(published) != set(frozen_ids):
+        raise RuntimeError("publisher did not return the exact frozen task denominator")
+    catalog = task_catalog_payload(
+        published=published, repository=repository,
+        prepared_recipe_sha256=prepared_recipe_sha256,
+        base_recipe_sha256=base_recipe_sha256,
+    )
+    catalog = validate_task_catalog(
+        catalog=catalog, records=selected_records, repository=repository,
+        prepared_recipe_sha256=prepared_recipe_sha256,
+        base_recipe_sha256=base_recipe_sha256,
+    )
+    catalog_reference = publish_task_catalog_image(
+        catalog=catalog, repository=repository, output=output,
+    )
+    report = {
+        "schema": "carry.swebench-task-catalog.v1",
+        "phase": "complete",
+        "dataset": DATASET,
+        "dataset_revision": DATASET_REVISION,
+        "repository": repository,
+        "catalog_reference": catalog_reference,
+        "denominator": len(frozen_ids),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "status_counts": dict(sorted(Counter(item["status"] for item in published.values()).items())),
+        "tasks": {
+            instance_id: {
+                "cache_key": item["cache_key"],
+                "status": item["status"],
+                "agent_digest": item["agent_image"]["resolved_digest"],
+                "evaluator_digest": item["evaluator_image"]["resolved_digest"],
+            }
+            for instance_id, item in published.items()
+        },
+    }
+    (output / "preparation-report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+
+
 def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathlib.Path,
                       config: Mapping[str, str]) -> None:
     validated = validate_config(config)
     harnesses = selected_harnesses(config)
+    repository = config.get("TASK_IMAGE_REPOSITORY", "")
+    task_image_references(repository, "0" * 64)
+    catalog_reference = config.get("TASK_IMAGE_CATALOG", "")
+    if not DIGEST_IMAGE.fullmatch(catalog_reference) or not catalog_reference.startswith(repository + "@"):
+        raise ValueError("TASK_IMAGE_CATALOG must pin the configured repository by digest")
     pricing = pricing_for_model(validated["MODEL"])
     mode = config.get("BENCHMARK_MODE", "smoke-5")
     phase_limits = official_phase_limits(config) if mode == "official-50" else None
     frozen_ids = json.loads(
         (source / "benchmarks" / "swe-bench-verified-50.json").read_text(encoding="utf-8")
     )["instance_ids"]
-    selection = selection_for_mode(frozen_ids, mode)
+    smoke_ids = None
+    if mode == "smoke-5":
+        smoke_ids = json.loads(
+            (source / "benchmarks" / "swe-bench-verified-smoke-5.json").read_text(encoding="utf-8")
+        )["instance_ids"]
+    selection = selection_for_mode(frozen_ids, mode, smoke_ids)
     agent_shard_size = 5 if mode == "smoke-5" else 10
     evaluator_shard_size = 5
     agent_shards = ordered_shards(selection, agent_shard_size)
@@ -1405,15 +1955,17 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
             mirrors[repo] = mirror
         _clone(repo, commit, destination, mirrors[repo])
 
-    # Every official arm receives the same prepared image containing all pinned
-    # harness binaries. Ordinary task dependencies come only from the official
-    # instance image and are verified before any model-bearing process starts.
+    # Build each reviewed harness once, export it as a read-only bundle, then
+    # pull every selected task/evaluator image before the first model call.
     provenance = build_images(
         source=source, run_id=config["RUN_ID"], config=config, harnesses=HARNESSES
     )
+    harness_bundles = export_harness_bundles(
+        provenance, work / "harness-bundles",
+    )
     execution_limits: dict[str, Any] = {
-        "readiness_timeout_seconds": readiness_timeout,
-        "readiness_concurrency": readiness_concurrency,
+        "catalog_pull_timeout_seconds": readiness_timeout,
+        "catalog_pull_concurrency": readiness_concurrency,
         "agent_timeout_seconds": agent_timeout,
         "agent_concurrency": concurrency,
         "agent_shard_size": agent_shard_size,
@@ -1425,25 +1977,25 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         execution_limits["phase_budgets"] = phase_limits
     provenance["execution_limits"] = execution_limits
     provenance_payload["images"] = provenance
-    provenance_payload["phase"] = "preparing"
+    provenance_payload["phase"] = "resolving-task-images"
     finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
     preparation_started = time.monotonic()
     try:
-        prepared = prepare_task_environments(
-            records=selected_records, source=source, run_id=config["RUN_ID"],
-            harness_images=provenance, work=work,
-            output=output / "preparation", clone=clone_one,
-            timeout_seconds=readiness_timeout, max_workers=readiness_concurrency,
+        prepared = resolve_task_environments(
+            records=selected_records, source=source,
+            repository=repository,
+            output=output / "preparation",
             trusted_ca_image=validated["BASE_IMAGE"],
+            max_workers=readiness_concurrency,
+            catalog_reference=catalog_reference,
         )
         preparation_elapsed = time.monotonic() - preparation_started
         if phase_limits is not None and preparation_elapsed > phase_limits["preparation_seconds"]:
-            raise TimeoutError("official preparation phase budget exhausted before model launch")
+            raise TimeoutError("official task-image resolution budget exhausted before model launch")
     except Exception:
         provenance_payload["phase"] = "preparation-failed"
         finalize(tasks=tasks, records=records, output=output,
                  provenance=provenance_payload, harnesses=harnesses)
-        shutil.rmtree(work / "readiness", ignore_errors=True)
         shutil.rmtree(work / "repositories", ignore_errors=True)
         os.environ.pop("OPENAI_API_KEY", None)
         secret_file = os.environ.pop("OPENAI_SECRET_FILE", "")
@@ -1451,24 +2003,14 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
             pathlib.Path(secret_file).unlink(missing_ok=True)
         raise
     provenance_payload["preparation_elapsed_seconds"] = round(preparation_elapsed, 3)
+    provenance_payload["task_catalog_reference"] = catalog_reference
     provenance_payload["prepared_tasks"] = {
         instance_id: {
-            "images": {
-                harness: {
-                    "image_id": image["image_id"],
-                    "harness_image_id": image["harness_image_id"],
-                    "dockerfile_sha256": image["dockerfile_sha256"],
-                }
-                for harness, image in item["images"].items()
-            },
-            "task_image_id": item["task_image_id"],
+            "cache_key": item["cache_key"],
             "source_task_image": item["source_task_image"],
-            "base_dockerfile_sha256": item["base_dockerfile_sha256"],
-            "dependency_manifest": item["dependency_manifest"],
-            "readiness": {
-                key: value for key, value in item["readiness"].items()
-                if key not in {"test_command", "prepared_image"}
-            },
+            "agent_image": item["agent_image"],
+            "evaluator_image": item["evaluator_image"],
+            "dockerfile_sha256": item["dockerfile_sha256"],
         }
         for instance_id, item in prepared.items()
     }
@@ -1510,7 +2052,8 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 slot_timeout = min(slot_timeout, remaining)
             record = run_isolated_agent(
                 instance_id=task["instance_id"], harness=harness,
-                image=prepared[task["instance_id"]]["images"][harness]["tag"],
+                image=prepared[task["instance_id"]]["agent_image"]["tag"],
+                harness_bundle=harness_bundles[harness],
                 proxy_image=validated["BASE_IMAGE"],
                 proxy_script=source / "scripts" / "openai_proxy.js",
                 repo=task_root / harness / "repo",
@@ -1621,6 +2164,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--validate-records", type=pathlib.Path)
     parser.add_argument("--run", action="store_true")
+    parser.add_argument("--prepare-images", action="store_true")
     parser.add_argument("--source", type=pathlib.Path)
     parser.add_argument("--work", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path)
@@ -1629,12 +2173,19 @@ def main() -> int:
     if args.validate_records:
         payload = json.loads(args.validate_records.read_text(encoding="utf-8"))
         _validate_records(payload["tasks"], payload["records"])
-    elif args.run:
+    elif args.run or args.prepare_images:
         if not args.source or not args.work or not args.output:
-            parser.error("--run requires --source, --work, and --output")
+            parser.error("execution requires --source, --work, and --output")
         config = dict(os.environ)
         config["BENCHMARK_HARNESS"] = args.harness
-        execute_benchmark(source=args.source, work=args.work, output=args.output, config=config)
+        if args.prepare_images:
+            execute_preparation(
+                source=args.source, work=args.work, output=args.output, config=config,
+            )
+        else:
+            execute_benchmark(
+                source=args.source, work=args.work, output=args.output, config=config,
+            )
     return 0
 
 

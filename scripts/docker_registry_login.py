@@ -9,7 +9,8 @@ import subprocess
 import sys
 
 
-def login(auth_file: pathlib.Path, docker_config: pathlib.Path) -> None:
+def login(auth_file: pathlib.Path, docker_config: pathlib.Path,
+          registry: str | None = None) -> None:
     try:
         payload = json.loads(auth_file.read_text(encoding="utf-8"))
         username = payload.get("username")
@@ -22,8 +23,11 @@ def login(auth_file: pathlib.Path, docker_config: pathlib.Path) -> None:
         docker_config.mkdir(parents=True, exist_ok=True, mode=0o700)
         docker_config.chmod(0o700)
         environment = dict(os.environ, DOCKER_CONFIG=str(docker_config))
+        command = ["docker", "login", "--username", username, "--password-stdin"]
+        if registry:
+            command.append(registry)
         result = subprocess.run(
-            ["docker", "login", "--username", username, "--password-stdin"],
+            command,
             input=token,
             text=True,
             capture_output=True,
@@ -31,21 +35,22 @@ def login(auth_file: pathlib.Path, docker_config: pathlib.Path) -> None:
             env=environment,
         )
         if result.returncode != 0:
-            raise RuntimeError(f"Docker Hub login failed with status {result.returncode}")
+            raise RuntimeError(f"Docker registry login failed with status {result.returncode}")
     finally:
         auth_file.unlink(missing_ok=True)
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        print("usage: docker_registry_login.py AUTH_FILE DOCKER_CONFIG", file=sys.stderr)
+    if len(sys.argv) not in {3, 4}:
+        print("usage: docker_registry_login.py AUTH_FILE DOCKER_CONFIG [REGISTRY]", file=sys.stderr)
         return 2
     try:
-        login(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]))
+        login(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]),
+              sys.argv[3] if len(sys.argv) == 4 else None)
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
         print(str(error), file=sys.stderr)
         return 1
-    print("Docker Hub login succeeded")
+    print("Docker registry login succeeded")
     return 0
 
 

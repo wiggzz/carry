@@ -11,15 +11,19 @@ worker_started_at=$(date +%s)
 : "${BENCHMARK_HARNESS:=carry}"
 : "${BOOTSTRAP_WAIT_SECONDS:?}"
 : "${RUN_ID:?}"
+: "${TASK_IMAGE_REPOSITORY:=}"
+: "${TASK_IMAGE_CATALOG:=}"
 : "${RESULT_URL_B64:=}"
 : "${KEY_URL_B64:=}"
 : "${DOCKER_AUTH_URL_B64:=}"
+: "${REGISTRY_AUTH_URL_B64:=}"
 : "${CONTROL_URL_B64:=}"
 : "${MODEL:=gpt-5.6-luna}"
 : "${REASONING:=medium}"
 : "${CARRY_ROOT:=/opt/carry}"
 : "${SECRET_FILE:=/dev/shm/carry-openai-key}"
 DOCKER_AUTH_FILE=/dev/shm/carry-dockerhub-auth
+REGISTRY_AUTH_FILE=/dev/shm/carry-task-registry-auth
 DOCKER_CONFIG=/dev/shm/carry-docker-config
 : "${PYTHON_BIN:=}"
 
@@ -37,7 +41,7 @@ finish() {
     result_url=$(<"$result_url_file")
   fi
   unset OPENAI_API_KEY
-  rm -f "$SECRET_FILE" "$DOCKER_AUTH_FILE" "$result_url_file"
+  rm -f "$SECRET_FILE" "$DOCKER_AUTH_FILE" "$REGISTRY_AUTH_FILE" "$result_url_file"
   rm -rf "$DOCKER_CONFIG"
   if [[ -n "$result_url" && -d "$CARRY_ROOT/results" ]]; then
     printf '%s\n' "$status" > "$CARRY_ROOT/results/worker-exit-status"
@@ -85,7 +89,7 @@ if [[ "$BENCHMARK_MODE" == bootstrap ]]; then
   exit 0
 fi
 case "$BENCHMARK_MODE" in
-  smoke-5|official-50) ;;
+  smoke-5|official-50|prepare-50) ;;
   *) echo "unknown benchmark mode" >&2; exit 2 ;;
 esac
 
@@ -98,6 +102,19 @@ export DOCKER_CONFIG
 "$PYTHON_BIN" "$CARRY_ROOT/source/scripts/docker_registry_login.py" \
   "$DOCKER_AUTH_FILE" "$DOCKER_CONFIG"
 
+if [[ "$BENCHMARK_MODE" == prepare-50 ]]; then
+  registry_auth_url=$(printf '%s' "$REGISTRY_AUTH_URL_B64" | base64 -d)
+  [[ -n "$registry_auth_url" && -n "${TASK_IMAGE_REPOSITORY:-}" ]] || {
+    echo "missing task-registry publication configuration" >&2
+    exit 2
+  }
+  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+    "$registry_auth_url" -o "$REGISTRY_AUTH_FILE"
+  chmod 0600 "$REGISTRY_AUTH_FILE"
+  "$PYTHON_BIN" "$CARRY_ROOT/source/scripts/docker_registry_login.py" \
+    "$REGISTRY_AUTH_FILE" "$DOCKER_CONFIG" public.ecr.aws
+fi
+
 control_url=$(printf '%s' "$CONTROL_URL_B64" | base64 -d)
 if [[ -n "$control_url" ]]; then
   printf '%s' "$result_url" > "$result_url_file"
@@ -107,19 +124,22 @@ if [[ -n "$control_url" ]]; then
   capability_refresh_pid=$!
 fi
 
-key_url=$(printf '%s' "$KEY_URL_B64" | base64 -d)
-curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-  "$key_url" -o "$SECRET_FILE"
-chmod 0600 "$SECRET_FILE"
-export OPENAI_API_KEY
-OPENAI_API_KEY=$(cat "$SECRET_FILE")
-export OPENAI_SECRET_FILE="$SECRET_FILE"
+if [[ "$BENCHMARK_MODE" != prepare-50 ]]; then
+  key_url=$(printf '%s' "$KEY_URL_B64" | base64 -d)
+  [[ -n "$key_url" ]] || { echo "missing model credential capability" >&2; exit 2; }
+  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+    "$key_url" -o "$SECRET_FILE"
+  chmod 0600 "$SECRET_FILE"
+  export OPENAI_API_KEY
+  OPENAI_API_KEY=$(cat "$SECRET_FILE")
+  export OPENAI_SECRET_FILE="$SECRET_FILE"
+fi
 
 "$PYTHON_BIN" -m venv "$CARRY_ROOT/venv"
 "$CARRY_ROOT/venv/bin/pip" install --disable-pip-version-check \
   'swebench==4.1.0' 'datasets>=2.19,<4'
 export PATH="$CARRY_ROOT/venv/bin:$PATH"
-export RUN_ID SOURCE_COMMIT MODEL REASONING BENCHMARK_MODE
+export RUN_ID SOURCE_COMMIT MODEL REASONING BENCHMARK_MODE TASK_IMAGE_REPOSITORY TASK_IMAGE_CATALOG
 export BASE_IMAGE='node@sha256:afff6d8c97964a438d2e6a9c96509367e45d8bf93f790ad561a1eaea926303d9'
 export CARRY_BASE_IMAGE='rust@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff'
 export CODEX_VERSION='0.147.0'
@@ -145,10 +165,15 @@ if [[ "$BENCHMARK_MODE" == official-50 ]]; then
     echo "official worker budget exhausted during setup" >&2
     exit 124
   }
+elif [[ "$BENCHMARK_MODE" == prepare-50 ]]; then
+  export EVALUATOR_CONCURRENCY=5
+  OVERALL_TIMEOUT_SECONDS=18000
 else
   export EVALUATOR_CONCURRENCY=5
   OVERALL_TIMEOUT_SECONDS=3000
 fi
+runner_mode=--run
+[[ "$BENCHMARK_MODE" == prepare-50 ]] && runner_mode=--prepare-images
 timeout --signal=TERM --kill-after=30s "$OVERALL_TIMEOUT_SECONDS" python3 "$CARRY_ROOT/source/scripts/swebench_smoke.py" \
-  --run --source "$CARRY_ROOT/source" --work "$CARRY_ROOT/work" --output "$CARRY_ROOT/results" \
-  --harness "$BENCHMARK_HARNESS"
+  "$runner_mode" --source "$CARRY_ROOT/source" --work "$CARRY_ROOT/work" \
+  --output "$CARRY_ROOT/results" --harness "$BENCHMARK_HARNESS"

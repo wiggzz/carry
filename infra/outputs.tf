@@ -32,3 +32,13 @@ output "worker_instance_profile_name" {
   description = "Zero-permission instance profile; artifacts use short-lived pre-signed URLs instead of worker AWS credentials."
   value       = aws_iam_instance_profile.worker.name
 }
+
+output "task_image_repository_uri" {
+  description = "Public ECR repository used for immutable prepared SWE-bench task images."
+  value       = aws_ecrpublic_repository.task_images.repository_uri
+}
+
+output "task_image_publisher_role_arn" {
+  description = "Role assumed only by protected preparation runs to push task images."
+  value       = aws_iam_role.task_image_publisher.arn
+}

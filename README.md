@@ -87,55 +87,58 @@ Live fixtures require `OPENAI_API_KEY`. Codex fixture comparisons require a sepa
 ## Running SWE-bench
 
 The manually dispatched **Run SWE-bench** workflow has a credential-free
-`bootstrap` default plus protected `smoke-5` and `official-50` modes. It requires the Terraform
-deployment first, then these protected `swe-bench` GitHub Environment values:
+`bootstrap` default plus protected `prepare-50`, `smoke-5`, and `official-50`
+modes. Apply the Terraform deployment first, then configure these protected
+`swe-bench` GitHub Environment values:
 
 - `BENCHMARK_AWS_REGION`
 - `BENCHMARK_DISPATCH_ROLE_ARN`
 - `BENCHMARK_ARTIFACT_BUCKET`
 - `BENCHMARK_ARTIFACT_SESSION_ROLE_ARN`
+- `BENCHMARK_TASK_IMAGE_PUBLISHER_ROLE_ARN`
+- `BENCHMARK_TASK_IMAGE_REPOSITORY` (the public ECR repository URI)
 - `BENCHMARK_WORKER_LAUNCH_TEMPLATE_ID`
-- `BENCHMARK_WORKER_LAUNCH_TEMPLATE_VERSION` (the numeric `worker_launch_template_version` Terraform output)
-- secret `OPENAI_API_KEY` (protected benchmark modes only)
+- `BENCHMARK_WORKER_LAUNCH_TEMPLATE_VERSION` (the numeric Terraform output)
+- secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`
+- secret `OPENAI_API_KEY` for model-bearing modes only
 - optional `BENCHMARK_MODEL` (defaults to `gpt-5.6-luna`) and
   `BENCHMARK_REASONING` (defaults to `medium`)
 
-The reviewed worker code pins Node 22.19 and Rust base-image manifest digests,
+The reviewed worker pins Node 22.19 and Rust base-image manifest digests,
 `@openai/codex@0.147.0`, and `@earendil-works/pi-coding-agent@0.84.2`.
-It builds all three run-local images once on the disposable worker; no registry
-publishing pipeline or additional protected configuration is needed.
+It builds each selected harness once per disposable benchmark worker and mounts
+that harness as a read-only bundle; task environments are never built in a
+model-bearing run.
 
-Dispatch the workflow on the reviewed branch and use that same branch in `carry_ref`;
-the workflow checks out the dispatch event's immutable commit and rejects a different
-candidate ref. Leave `mode=bootstrap` for the canary, then select one harness or `all`.
-Choose `smoke-5` for the first five frozen IDs
-(5 mandatory records), or choose `official-50` for all 50 frozen IDs
-(50 mandatory records). Use `harness=all` for a direct comparison: all three arms then
-share the exact same task-image parents and dependency manifests in one worker. Select a
-single harness only for lane-specific smoke or diagnostic runs. Apply the Terraform change
-that raises
-the protected dispatch role's maximum session to six hours before dispatching the
-official mode. Automation never applies Terraform.
+Dispatch `prepare-50` first. Its credential-free-with-respect-to-models worker
+computes a deterministic environment key from the pinned dataset revision,
+public task identity/base commit/version, transformed trusted-CA base recipe,
+sanitization recipe, SWE-bench version, and platform. It anonymously checks the
+public ECR repository, reuses and verifies complete cache pairs, and builds only
+missing official evaluator images plus their thin sanitized agent derivatives.
+It runs networkless public-test readiness before publishing the agent `ready-*`
+tag, then records both immutable repository digests in
+`preparation-report.json`. The temporary worker receives a short-lived Docker
+registry token, but no model key or general AWS credentials.
 
-The official mode uses one disposable worker and builds all three pinned run-local harness
-images once. In trusted setup, before any model process starts, it builds the official
-SWE-bench instance image for each task, records its immutable image ID and complete
-`conda list --json` package manifest, and creates one derivative per harness. Every
-derivative has the same task-image parent and ordinary dependencies but copies only its
-selected harness bundle, preventing one agent from invoking a competing harness. Git-ignored
-in-tree build products such as compiled extensions are archived as a trusted overlay;
-tracked source, Git objects, and non-ignored files are not. Each derivative deletes the
-instance image's checkout
-and setup scripts. A fresh, separately verified base-only checkout is then mounted at
-`/testbed`, the same path used when the ordinary project dependencies were installed.
+`smoke-5` and `official-50` are strictly pull-only. Before the first model call,
+they concurrently pull every required evaluator/agent pair, verify the cache
+key and parent image identity, retag the evaluator image for the official
+SWE-bench grader, and persist all resolved `@sha256:` references. A missing,
+invalid, or incomplete pair fails the run before model spend; there is no
+build-on-cache-miss fallback. Pass the `sha256:...` portion of the publisher's
+`catalog_reference` as the workflow's `catalog_digest`; the worker then extracts
+that OCI catalog and pulls every task image by the digest frozen inside it.
+`smoke-5` uses the repository-stratified manifest
+(one Django, SymPy, xarray, pytest, and requests task), while `official-50`
+requires all 50 frozen IDs. Use `harness=all` for the Carry/Codex/pi comparison.
 
-A disposable, networkless readiness container runs the official public test path without
-applying the hidden test patch. Readiness requires the official repository parser to observe
-at least one executed test; a failing result is allowed because the benchmark bug may be
-present at the base commit. Missing runners, imports, plugins, unparseable startup, image
-build failures, or dependency-manifest failures stop the run before model spend. Commands,
-output, package resolution, timing, and image identities are retained under `preparation/`,
-but that directory and all grading material remain outside agent mounts.
+The sanitized image contains ordinary task dependencies and a trusted overlay
+of Git-ignored build products, but no harness bundle, tracked source checkout,
+Git metadata, or setup scripts. Each slot mounts exactly one selected harness
+bundle read-only plus a separately verified base-only checkout at `/testbed`.
+Gold patches, hidden tests, evaluator records, competing harnesses, and registry
+credentials remain outside the agent container.
 
 Before each slot starts, the trusted worker creates a fresh Git repository by fetching only
 a temporary ref at the declared base commit. It then removes that ref, the origin remote,
@@ -158,7 +161,7 @@ shard's working checkouts after patch capture, deletes the model key before grad
 and evaluates the selected harness in ten ordered five-task shards at evaluator concurrency
 five with `swebench==4.1.0`. Limiting each evaluator shard to five avoids the Docker-daemon
 create saturation observed when ten instance containers launched together. It writes the full
-50-slot `not-run` checkpoint before image builds and checkpoints after every agent and
+50-slot `not-run` checkpoint before catalog pulls and checkpoints after every agent and
 evaluator shard, so infrastructure failure cannot silently shrink the denominator. Evaluator
 errors or missing outcomes mark provenance incomplete and fail the worker after artifacts are
 persisted rather than producing a green official run. Carry's
@@ -185,9 +188,10 @@ summary. The same data remains in `records.json`, `report.json`, and `report.md`
 The smoke uses one-hour S3 capabilities. During the longer official mode, the protected
 controller rotates exact-run presigned control/result capabilities every 25 minutes;
 the zero-permission worker receives only those opaque capabilities and never AWS
-credentials. The workflow uploads a `swebench-<mode>-<harness>-*` artifact containing predictions,
-all slot metadata/traces, official outputs, canonical records, and the report. Both live
-modes incur EC2, model-token, storage, and image-build costs.
+credentials. The workflow uploads a `swebench-<mode>-<harness>-*` artifact containing
+predictions or publication diagnostics and the associated provenance. Model-bearing
+modes incur EC2, model-token, and storage costs; image-build costs
+belong only to `prepare-50` and remain outside the model-economic comparison.
 
 The key is encrypted in a run-scoped S3 object, fetched through a short-lived presigned
 URL into root-only `/dev/shm`, and injected into agent containers only by environment
