@@ -593,7 +593,7 @@ def build_prepared_task_image(*, source: pathlib.Path, run_id: str, instance_id:
 
 
 def streamable_public_test_command(command: str) -> str:
-    """Make pytest report executed tests before a bounded readiness timeout."""
+    """Make public runners report bounded test outcomes during readiness."""
     tokens = shlex.split(command)
     pytest_command = (
         bool(tokens) and pathlib.PurePath(tokens[0]).name in {"pytest", "py.test"}
@@ -601,14 +601,20 @@ def streamable_public_test_command(command: str) -> str:
         len(tokens) >= 3 and pathlib.PurePath(tokens[0]).name.startswith("python")
         and tokens[1:3] == ["-m", "pytest"]
     )
-    if not pytest_command:
-        return command
-    if not any(token in {"-v", "-vv", "--verbose"} or token.startswith("--verbose=")
-               for token in tokens):
-        tokens.append("-vv")
-    if not any(token == "-x" or token.startswith("--maxfail") for token in tokens):
-        tokens.append("--maxfail=1")
-    return shlex.join(tokens)
+    if pytest_command:
+        if not any(token in {"-v", "-vv", "--verbose"} or token.startswith("--verbose=")
+                   for token in tokens):
+            tokens.append("-vv")
+        if not any(token == "-x" or token.startswith("--maxfail") for token in tokens):
+            tokens.append("--maxfail=1")
+        return shlex.join(tokens)
+    if any(token.lstrip("./") == "bin/test" for token in tokens):
+        if not any(token == "--timeout" or token.startswith("--timeout=") for token in tokens):
+            tokens.extend(("--timeout", "15"))
+        if not any(token == "--split" or token.startswith("--split=") for token in tokens):
+            tokens.extend(("--split", "1/500"))
+        return shlex.join(tokens)
+    return command
 
 
 def trusted_readiness_script(test_spec: Any, *, public_test_command: str | None = None) -> tuple[str, str]:

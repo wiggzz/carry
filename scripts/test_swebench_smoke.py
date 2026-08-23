@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -495,6 +496,26 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertNotIn("tests/test_public.py", script)
         self.assertNotIn("HIDDEN GOLD TEST", script)
         self.assertNotIn("git apply", script)
+
+    def test_streamable_public_test_command_bounds_each_sympy_test(self):
+        bounded = self.worker.streamable_public_test_command(
+            "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' bin/test -C --verbose"
+        )
+        self.assertEqual(
+            shlex.split(bounded),
+            [
+                "PYTHONWARNINGS=ignore::UserWarning,ignore::SyntaxWarning",
+                "bin/test", "-C", "--verbose", "--timeout", "15",
+                "--split", "1/500",
+            ],
+        )
+        existing = self.worker.streamable_public_test_command(
+            "bin/test -C --verbose --timeout 17"
+        )
+        self.assertEqual(
+            shlex.split(existing),
+            ["bin/test", "-C", "--verbose", "--timeout", "17", "--split", "1/500"],
+        )
 
     def test_run_task_readiness_persists_diagnostics_and_accepts_test_failure(self):
         with tempfile.TemporaryDirectory() as directory:
