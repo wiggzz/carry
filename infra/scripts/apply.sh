@@ -99,5 +99,9 @@ encrypt      = true
 use_lockfile = true
 EOF
 
-terraform -chdir="$INFRA_DIR" init -reconfigure -input=false -backend-config="$BACKEND_CONFIG"
+if [[ -f "$INFRA_DIR/terraform.tfstate" ]]; then
+  terraform -chdir="$INFRA_DIR" init -migrate-state -force-copy -input=false -backend-config="$BACKEND_CONFIG"
+else
+  terraform -chdir="$INFRA_DIR" init -reconfigure -input=false -backend-config="$BACKEND_CONFIG"
+fi
 terraform -chdir="$INFRA_DIR" apply -input=false -auto-approve

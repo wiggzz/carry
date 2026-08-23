@@ -68,9 +68,10 @@ With no configuration files or prompts, the script derives the account and OIDC
 provider, creates a separate private/versioned/encrypted Terraform-state bucket,
 calculates an artifact-bucket name, selects a public subnet from the default VPC,
 and resolves a concrete Amazon Linux x86_64 AMI/root device. It writes the ignored
-local `backend.hcl` and `terraform.tfvars`, then initializes Terraform and applies
-it non-interactively. The generated values stay pinned in `terraform.tfvars` for
-later applies.
+local `backend.hcl` and `terraform.tfvars`, initializes the S3 backend, and applies
+non-interactively. The generated values stay pinned in `terraform.tfvars` for later
+applies. If an earlier script version left local `terraform.tfstate`, the script
+migrates that state to the configured S3 backend before applying.
 
 Optional first-run overrides:
 
