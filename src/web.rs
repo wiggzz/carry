@@ -238,6 +238,13 @@ mod tests {
         assert!(INDEX.contains("shell-command"));
         assert!(INDEX.contains("shell-output"));
         assert!(INDEX.contains("context-pill"));
+        assert!(INDEX.contains("Session statistics"));
+        assert!(INDEX.contains("stat-tokens"));
+        assert!(INDEX.contains("stat-cached"));
+        assert!(INDEX.contains("model_response"));
+        assert!(INDEX.contains("context_compacted"));
+        assert!(INDEX.contains("session_ended"));
+        assert!(INDEX.contains("formatDuration"));
         assert!(INDEX.contains("model_progress"));
         assert!(INDEX.contains("Model streaming"));
         assert!(INDEX.contains("contextCompacted"));
