@@ -29,6 +29,19 @@ locals {
   }
 }
 
+resource "aws_ecrpublic_repository" "task_images" {
+  provider        = aws.us_east_1
+  repository_name = "carry-swebench-tasks"
+
+  catalog_data {
+    description = "Public, sanitized, readiness-checked SWE-bench task images"
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-tasks"
+  })
+}
+
 resource "aws_s3_bucket" "artifacts" {
   bucket        = var.artifact_bucket_name
   force_destroy = false
@@ -364,12 +377,82 @@ data "aws_iam_policy_document" "github_dispatch" {
     ]
     resources = [aws_iam_role.artifact_session.arn]
   }
+
+  statement {
+    sid       = "AssumeTaskImagePublisher"
+    effect    = "Allow"
+    actions   = ["sts:AssumeRole"]
+    resources = [aws_iam_role.task_image_publisher.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "github_dispatch" {
   name_prefix = "${local.name_prefix}-github-dispatch-"
   role        = aws_iam_role.github_dispatch.id
   policy      = data.aws_iam_policy_document.github_dispatch.json
+}
+
+data "aws_iam_policy_document" "task_image_publisher_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.github_dispatch.arn]
+    }
+  }
+}
+
+resource "aws_iam_role" "task_image_publisher" {
+  name_prefix          = "${local.name_prefix}-task-publisher-"
+  assume_role_policy   = data.aws_iam_policy_document.task_image_publisher_assume.json
+  max_session_duration = 21600
+
+  tags = local.common_tags
+}
+
+data "aws_iam_policy_document" "task_image_publisher" {
+  statement {
+    sid       = "AuthenticateToEcrPublic"
+    effect    = "Allow"
+    actions   = ["ecr-public:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "GetOnlyEcrPublicBearerToken"
+    effect    = "Allow"
+    actions   = ["sts:GetServiceBearerToken"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "sts:AWSServiceName"
+      values   = ["ecr-public.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid    = "PublishOnlyPreparedTaskImages"
+    effect = "Allow"
+    actions = [
+      "ecr-public:BatchCheckLayerAvailability",
+      "ecr-public:CompleteLayerUpload",
+      "ecr-public:DescribeImages",
+      "ecr-public:DescribeImageTags",
+      "ecr-public:InitiateLayerUpload",
+      "ecr-public:PutImage",
+      "ecr-public:UploadLayerPart",
+    ]
+    resources = [aws_ecrpublic_repository.task_images.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "task_image_publisher" {
+  name_prefix = "${local.name_prefix}-task-publisher-"
+  role        = aws_iam_role.task_image_publisher.id
+  policy      = data.aws_iam_policy_document.task_image_publisher.json
 }
 
 data "aws_iam_policy_document" "artifact_session_assume" {

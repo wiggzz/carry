@@ -1,0 +1,13 @@
+{
+  "schema": "carry.swe-bench-selection.v1",
+  "source_dataset": "princeton-nlp/SWE-bench_Verified",
+  "source_manifest": "swe-bench-verified-50.json",
+  "selection_strategy": "one frozen task from each repository family",
+  "instance_ids": [
+    "django__django-16612",
+    "sympy__sympy-24213",
+    "pydata__xarray-6938",
+    "pytest-dev__pytest-7521",
+    "psf__requests-6028"
+  ]
+}

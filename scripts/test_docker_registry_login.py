@@ -52,6 +52,44 @@ class DockerRegistryLoginTests(unittest.TestCase):
             self.assertFalse(auth_file.exists())
             self.assertEqual(docker_config.stat().st_mode & 0o777, 0o700)
 
+    def test_logs_in_to_an_explicit_registry_without_exposing_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            argv_log = root / "argv.log"
+            stdin_log = root / "stdin.log"
+            docker = fake_bin / "docker"
+            docker.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" > \"$ARGV_LOG\"\n"
+                "cat > \"$STDIN_LOG\"\n"
+            )
+            docker.chmod(0o755)
+            auth_file = root / "ecr-auth.json"
+            token = "temporary-ecr-token"
+            auth_file.write_text(json.dumps({"username": "AWS", "token": token}))
+            env = dict(
+                os.environ,
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                ARGV_LOG=str(argv_log), STDIN_LOG=str(stdin_log),
+            )
+
+            run = subprocess.run(
+                ["python3", str(SCRIPT), str(auth_file), str(root / "docker-config"),
+                 "public.ecr.aws"],
+                env=env, text=True, capture_output=True,
+            )
+
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(
+                argv_log.read_text().strip(),
+                "login --username AWS --password-stdin public.ecr.aws",
+            )
+            self.assertEqual(stdin_log.read_text(), token)
+            self.assertNotIn(token, run.stdout + run.stderr)
+            self.assertFalse(auth_file.exists())
+
     def test_failure_removes_staging_file_without_echoing_secret(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

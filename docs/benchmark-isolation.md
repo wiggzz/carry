@@ -32,48 +32,48 @@ status, and the two pinned image references.
 
 ## Manual protected workflow
 
-The existing default-branch workflow has only `workflow_dispatch`, uses the protected
+The default-branch workflow has only `workflow_dispatch`, uses the protected
 `swe-bench` Environment, and preserves credential-free `bootstrap` as its default.
-`smoke-5` resolves and archives the requested commit before AWS authentication, then
-runs exactly the first five frozen IDs with the selected harness. It fails artifact
-validation unless all five records exist, including explicit failed records with empty
-patches. `harness=all` runs all three arms against one prepared image set; single-harness
-runs remain available for diagnostics.
+`prepare-50` receives a short-lived public-ECR push token but no model credential;
+`smoke-5` and `official-50` receive model credentials but have no registry-write or
+AWS credentials. Every worker is disposable and the dispatcher terminates the exact
+instance after the run.
 
-The dispatcher copies worker-side code to a short-lived EC2 instance and always
-terminates that exact instance after the run. No self-hosted or persistent GitHub
-runner is permitted.
+The publisher computes a deterministic environment key, anonymously verifies cache
+pairs, builds only missing official evaluator images and their thin sanitized agent
+derivatives, runs networkless public-test readiness, and pushes the readiness-approved
+agent tag last. Benchmark workers are pull-only: all selected evaluator/agent pairs
+must resolve, pull, and pass identity checks before the first model process starts.
+There is no build-on-cache-miss path in a model-bearing run.
 
-The worker builds all three pinned run-local harness images. Carry is built as a
-portable static executable from the archived commit; Codex is fixed at
-`@openai/codex@0.147.0`; Pi is fixed at
-`@earendil-works/pi-coding-agent@0.84.2`. Reviewed Node 22.19 and Rust base images
-are pinned by manifest digest. The noninteractive command adapters are versioned
-with this repository rather than supplied as mutable protected variables.
+`smoke-5` uses one frozen task from each repository family represented by the
+official 50; fixed-denominator validation requires all selected task/harness records.
+`harness=all` runs all three arms against one digest-pinned environment set.
+
+The worker builds each selected pinned harness image once. Carry is a portable static
+executable from the archived commit; Codex is fixed at `@openai/codex@0.147.0`; Pi is
+fixed at `@earendil-works/pi-coding-agent@0.84.2`. The worker exports exactly the
+selected `/opt/swebench-harness` tree and mounts it read-only into each task container.
+A task image contains no harness, so it is reusable across arms without creating a
+task-by-harness derivative.
 
 ## Prepared environment contract
 
-Before model spend, trusted setup uses `swebench==4.1.0` to build each official
-instance image with its ordinary repository dependencies. It captures the source
-and derivative image IDs plus a complete conda package manifest. It creates one
-derivative per harness from the same task-image parent and copies only that harness's
-bundle, so an agent cannot invoke a competing harness. Git-ignored in-tree build
-products, including compiled extensions, are retained in a trusted overlay; tracked
-source, Git objects, and non-ignored files are excluded. Every derivative removes
-`/testbed` and the setup scripts from the parent image. At agent launch,
-`/testbed` is replaced by a fresh base-ancestry-only checkout, so editable installs
-still resolve to the expected path without exposing the parent image's Git objects
-or future history.
+The public ECR catalog stores two related immutable manifests per task key: the
+ordinary official instance image for trusted grading, and a sanitized agent derivative.
+OCI layers deduplicate their common operating system and dependency content. The agent
+derivative preserves only approved Git-ignored build products in a trusted overlay,
+then removes `/testbed`, Git objects, and setup scripts. At agent launch `/testbed` is
+a fresh base-ancestry-only checkout; the selected harness bundle is a separate read-only
+mount. Registry credentials, other harnesses, hidden tests, and grading assets are never
+mounted.
 
-Trusted readiness runs in a disposable container with `--network none`, no model
-credential, no grading mounts, and no hidden test patch. It activates the prepared
-environment and launches the official public test path against a throwaway
-base-only checkout. The official parser must observe at least one test result.
-Baseline failures and timeouts after tests begin are diagnostic and acceptable;
-missing runners, imports, plugins, parseable test execution, package manifests,
-or images fail the run before any agent starts. Readiness workspaces are discarded.
-Its command, output, timing, and dependency resolution remain in trusted artifacts
-that are never mounted into an agent slot.
+Readiness runs only in the credential-free publisher, in a disposable container with
+`--network none`, no grading mounts, and no hidden test patch. The official parser must
+observe at least one public test result. Baseline test failures are allowed; missing
+runners, imports, plugins, parseable execution, package manifests, or images fail
+publication. The `ready-*` tag is pushed only after readiness succeeds, and benchmark
+runs record its resolved repository digest rather than trusting a tag as identity.
 
 The canonical dataset is loaded at revision
 `c104f840cc67f8b6eec6f759ebc8b2693d585d4a` and materialized as local JSON for
