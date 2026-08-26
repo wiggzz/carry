@@ -369,6 +369,13 @@ data "aws_iam_policy_document" "github_dispatch" {
   }
 
   statement {
+    sid       = "ReadCurrentDeploymentManifest"
+    effect    = "Allow"
+    actions   = ["s3:GetObject"]
+    resources = ["arn:${data.aws_partition.current.partition}:s3:::carry-tfstate-${data.aws_caller_identity.current.account_id}-${var.aws_region}-${var.stage}/carry/swebench-benchmark-infra/${var.stage}.deployment.json"]
+  }
+
+  statement {
     sid    = "AssumeRunScopedArtifactSession"
     effect = "Allow"
     actions = [

@@ -95,6 +95,9 @@ class TerraformBackendTests(unittest.TestCase):
             root = pathlib.Path(directory)
             copied_infra = root / "infra"
             shutil.copytree(INFRA, copied_infra, ignore=shutil.ignore_patterns(".terraform", "*.tfstate*", "*.tfvars", "backend.hcl"))
+            copied_scripts = root / "scripts"
+            copied_scripts.mkdir()
+            shutil.copy2(ROOT / "scripts" / "benchmark_deployment_manifest.py", copied_scripts / "benchmark_deployment_manifest.py")
             (copied_infra / "terraform.tfvars").write_text(
                 "\n".join(
                     (
@@ -115,10 +118,11 @@ class TerraformBackendTests(unittest.TestCase):
             aws = fake_bin / "aws"
             aws.write_text(
                 "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$FAKE_AWS_LOG\"\n"
                 "case \"$1 $2\" in\n"
                 "  'configure get') printf '%s\\n' us-west-2 ;;\n"
                 "  'sts get-caller-identity') printf '%s\\n' 123456789012 ;;\n"
-                "  'iam get-open-id-connect-provider'|'s3api head-bucket'|'s3api put-bucket-versioning'|'s3api put-bucket-encryption'|'s3api put-public-access-block'|'s3api put-bucket-tagging') exit 0 ;;\n"
+                "  'iam get-open-id-connect-provider'|'s3api head-bucket'|'s3api put-bucket-versioning'|'s3api put-bucket-encryption'|'s3api put-public-access-block'|'s3api put-bucket-tagging'|'s3 cp') exit 0 ;;\n"
                 "  *) printf 'unexpected aws invocation: %s\\n' \"$*\" >&2; exit 64 ;;\n"
                 "esac\n"
             )
@@ -127,13 +131,22 @@ class TerraformBackendTests(unittest.TestCase):
             terraform.write_text(
                 "#!/bin/sh\n"
                 "printf '%s\\n' \"$*\" >> \"$FAKE_TERRAFORM_LOG\"\n"
+                "case \"$*\" in\n"
+                "  *' output -json') printf '%s\\n' '{\"artifact_bucket_name\":{\"value\":\"carry-artifacts-123456789012-us-west-2-swebench\"},\"artifact_session_role_arn\":{\"value\":\"arn:aws:iam::123456789012:role/artifact-session\"},\"github_dispatch_role_arn\":{\"value\":\"arn:aws:iam::123456789012:role/github-dispatch\"},\"task_image_publisher_role_arn\":{\"value\":\"arn:aws:iam::123456789012:role/task-publisher\"},\"task_image_repository_uri\":{\"value\":\"public.ecr.aws/example/carry-swebench-tasks\"},\"worker_launch_template_id\":{\"value\":\"lt-0123456789abcdef0\"},\"worker_launch_template_version\":{\"value\":\"7\"}}' ;;\n"
+                "esac\n"
                 "exit 0\n"
             )
             terraform.chmod(0o755)
             log = root / "terraform.log"
+            aws_log = root / "aws.log"
             run = subprocess.run(
                 ["bash", str(copied_infra / "scripts" / "apply.sh")],
-                env=dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}", FAKE_TERRAFORM_LOG=str(log)),
+                env=dict(
+                    os.environ,
+                    PATH=f"{fake_bin}:{os.environ['PATH']}",
+                    FAKE_TERRAFORM_LOG=str(log),
+                    FAKE_AWS_LOG=str(aws_log),
+                ),
                 text=True,
                 capture_output=True,
             )
@@ -143,6 +156,46 @@ class TerraformBackendTests(unittest.TestCase):
             self.assertIn("init", init)
             self.assertIn("-migrate-state", init)
             self.assertIn("-force-copy", init)
+            self.assertIn("-chdir=", "\n".join(log.read_text(encoding="utf-8").splitlines()))
+            self.assertIn(
+                "s3 cp",
+                aws_log.read_text(encoding="utf-8"),
+                "apply.sh must publish the non-secret deployment manifest after apply",
+            )
+            self.assertIn(
+                "carry/swebench-benchmark-infra/swebench.deployment.json",
+                aws_log.read_text(encoding="utf-8"),
+            )
+
+    def test_apply_rejects_a_non_deterministic_state_bucket_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            aws = fake_bin / "aws"
+            aws.write_text(
+                "#!/bin/sh\n"
+                "case \"$1 $2\" in\n"
+                "  'sts get-caller-identity') printf '%s\\n' 123456789012 ;;\n"
+                "  *) printf 'unexpected aws invocation: %s\\n' \"$*\" >&2; exit 64 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            aws.chmod(0o755)
+            run = subprocess.run(
+                ["bash", str(INFRA / "scripts" / "apply.sh")],
+                cwd=ROOT,
+                env=dict(
+                    os.environ,
+                    PATH=f"{fake_bin}:{os.environ['PATH']}",
+                    AWS_REGION="us-west-2",
+                    TF_STATE_BUCKET="other-state-bucket",
+                ),
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(run.returncode, 64)
+            self.assertIn("TF_STATE_BUCKET must match the deterministic benchmark state bucket", run.stderr)
 
 
 if __name__ == "__main__":

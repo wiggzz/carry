@@ -85,6 +85,24 @@ WORKER_SUBNET_ID=subnet-... WORKER_AMI_ID=ami-... infra/scripts/apply.sh
 sufficient for the credential-free bootstrap canary. Set `WORKER_AMI_ID` to a
 reviewed worker image before enabling the future external-container live runner.
 
+### Workflow deployment manifest
+
+A successful `apply.sh` publishes a versioned, non-secret manifest to the exact
+Terraform-state bucket path
+`carry/swebench-benchmark-infra/<STAGE>.deployment.json`. The state bucket is
+deterministic (`carry-tfstate-<account>-<region>-<stage>`); custom
+`TF_STATE_BUCKET` overrides are rejected so the workflow and IAM policy cannot
+drift apart. The manifest contains the current
+artifact bucket, run-scoped artifact role, task-image publisher/repository, and
+worker launch-template identifiers. It contains **no credentials**.
+
+The GitHub Environment retains only the stable OIDC bootstrap variables
+`BENCHMARK_AWS_REGION` and `BENCHMARK_DISPATCH_ROLE_ARN` (plus optional
+`BENCHMARK_STATE_STAGE` for a non-default stage) and the existing protected
+secrets. The dispatch role can read only this one manifest object, not Terraform
+state. The workflow derives all rebuilt resource identifiers from it and fails
+closed if its account/region/backend/dispatch-role binding is stale or mismatched.
+
 Every taggable resource receives `Application=Carry`,
 `Repository=wiggzz/carry`, and `Component=swebench-benchmark`. Workers and
 volumes additionally have the canonical lifecycle tags used by IAM cleanup
