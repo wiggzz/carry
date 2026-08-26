@@ -116,6 +116,7 @@ def resolve_manifest(arguments: argparse.Namespace) -> None:
         "TASK_IMAGE_REPOSITORY": manifest_value(document, "task_image_repository", REPOSITORY),
         "LAUNCH_TEMPLATE_ID": manifest_value(document, "worker_launch_template_id", TEMPLATE),
         "LAUNCH_TEMPLATE_VERSION": string(document.get("worker_launch_template_version"), "manifest worker_launch_template_version"),
+        "TASK_IMAGE_CATALOG": "",
         "CONFIGURATION_MANIFEST_SHA256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
     if not re.fullmatch(r"[1-9][0-9]*", environment["LAUNCH_TEMPLATE_VERSION"]):

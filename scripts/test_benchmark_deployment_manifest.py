@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -110,6 +111,22 @@ class BenchmarkDeploymentManifestTests(unittest.TestCase):
             self.assertEqual(environment["ARTIFACT_BUCKET"], manifest["artifact_bucket"])
             self.assertEqual(environment["TASK_IMAGE_CATALOG"], manifest["task_image_repository"] + "@sha256:" + "a" * 64)
             self.assertEqual(environment["CONFIGURATION_MANIFEST_SHA256"], hashlib.sha256(manifest_path.read_bytes()).hexdigest())
+
+            no_catalog_command = list(run.args[:-2])
+            no_catalog_run = subprocess.run(no_catalog_command, text=True, capture_output=True)
+            self.assertEqual(no_catalog_run.returncode, 0, no_catalog_run.stderr)
+            no_catalog_environment = dict(line.split("=", 1) for line in no_catalog_run.stdout.splitlines())
+            self.assertEqual(no_catalog_environment["TASK_IMAGE_CATALOG"], "")
+            worker_environment = dict(**no_catalog_environment)
+            worker_environment["PATH"] = os.environ["PATH"]
+            launch = subprocess.run(
+                ["bash", "-u", "-c", 'printf "%s" "$TASK_IMAGE_CATALOG"'],
+                text=True,
+                capture_output=True,
+                env=worker_environment,
+            )
+            self.assertEqual(launch.returncode, 0, launch.stderr)
+            self.assertEqual(launch.stdout, "")
 
             bare_digest_command = list(run.args)
             bare_digest_command[-1] = "b" * 64

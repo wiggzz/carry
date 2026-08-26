@@ -156,7 +156,9 @@ class TerraformBackendTests(unittest.TestCase):
             self.assertIn("init", init)
             self.assertIn("-migrate-state", init)
             self.assertIn("-force-copy", init)
-            self.assertIn("-chdir=", "\n".join(log.read_text(encoding="utf-8").splitlines()))
+            terraform_commands = "\n".join(log.read_text(encoding="utf-8").splitlines())
+            self.assertIn("-chdir=", terraform_commands)
+            self.assertIn("-var github_environment=swe-bench", terraform_commands)
             self.assertIn(
                 "s3 cp",
                 aws_log.read_text(encoding="utf-8"),

@@ -7,6 +7,7 @@ INFRA_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
 AWS_REGION=${AWS_REGION:-$(aws configure get region 2>/dev/null || true)}
 AWS_REGION=${AWS_REGION:-us-west-2}
 STAGE=${STAGE:-swebench}
+GITHUB_ENVIRONMENT="swe-bench"
 
 [[ "$STAGE" =~ ^([a-z0-9]|[a-z0-9][a-z0-9-]{0,10}[a-z0-9])$ ]] || {
   echo "STAGE must be 1-12 lowercase letters, digits, or hyphens" >&2
@@ -114,7 +115,8 @@ else
 fi
 terraform -chdir="$INFRA_DIR" apply -input=false -auto-approve \
   -var "aws_region=$AWS_REGION" \
-  -var "stage=$STAGE"
+  -var "stage=$STAGE" \
+  -var "github_environment=$GITHUB_ENVIRONMENT"
 
 terraform_outputs=$(mktemp)
 deployment_manifest=$(mktemp)
