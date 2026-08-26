@@ -431,8 +431,8 @@ where
         .context("Responses API stream read failed")?
     {
         pending.extend_from_slice(&chunk);
-        while let Some(end) = pending.windows(2).position(|pair| pair == b"\n\n") {
-            let frame: Vec<_> = pending.drain(..end + 2).collect();
+        while let Some((end, separator_len)) = sse_frame_end(&pending) {
+            let frame: Vec<_> = pending.drain(..end + separator_len).collect();
             process_sse_frame(&frame[..end], &mut completed, &mut current, progress)?;
         }
     }
@@ -444,6 +444,19 @@ where
         output_events: current.output_events,
     });
     Ok(response)
+}
+
+fn sse_frame_end(pending: &[u8]) -> Option<(usize, usize)> {
+    pending
+        .windows(2)
+        .position(|pair| pair == b"\n\n")
+        .map(|index| (index, 2))
+        .or_else(|| {
+            pending
+                .windows(4)
+                .position(|sequence| sequence == b"\r\n\r\n")
+                .map(|index| (index, 4))
+        })
 }
 
 fn process_sse_frame<F>(
@@ -578,6 +591,13 @@ mod tests {
         let body = body.to_string();
         format!(
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn sse_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
     }
@@ -738,6 +758,37 @@ mod tests {
         requests.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(requests.try_recv().is_err());
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reads_crlf_delimited_sse_response() {
+        let completed = json!({
+            "id": "response-crlf",
+            "output": [{
+                "type":"function_call",
+                "call_id":"call-crlf",
+                "name":"finish",
+                "arguments":"{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
+            }],
+            "usage": {"output_tokens": 2}
+        });
+        let body = format!(
+            "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}}\r\n\r\ndata: {{\"type\":\"response.completed\",\"response\":{completed}}}\r\n\r\n"
+        );
+        let (api_base, requests, server) = response_server(vec![sse_response(&body)]);
+        let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
+
+        let reply = client.step("system", &[]).await.unwrap();
+
+        assert_eq!(reply.response_id, "response-crlf");
+        requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sse_frame_boundaries_accept_lf_and_crlf() {
+        assert_eq!(sse_frame_end(b"data: one\n\nrest"), Some((9, 2)));
+        assert_eq!(sse_frame_end(b"data: one\r\n\r\nrest"), Some((9, 4)));
     }
 
     #[test]

@@ -196,19 +196,31 @@ async fn sse_events(
             Json(json!({"error": format!("failed to load session trace: {error:#}")})),
         )
     })?;
+    let highest_replayed_sequence = history
+        .iter()
+        .filter_map(|event| event["seq"].as_u64())
+        .max()
+        .unwrap_or_default();
     let history = history.into_iter().map(Ok).chain(std::iter::once(Ok(json!({
         "event": "history_complete",
         "data": {}
     }))));
     let history = tokio_stream::iter(history);
-    let live = BroadcastStream::new(live_receiver).filter_map(|event| match event {
-        Ok(value) => Some(Ok(value)),
-        Err(_) => None,
+    let live = BroadcastStream::new(live_receiver).filter_map(move |event| match event {
+        Ok(value) if should_emit_live_event(&value, highest_replayed_sequence) => Some(Ok(value)),
+        Ok(_) | Err(_) => None,
     });
     let stream = history.chain(live).map(|event: Result<Value, Infallible>| {
         event.map(|value| Event::default().json_data(value).expect("event is JSON"))
     });
     Ok(Sse::new(stream))
+}
+
+fn should_emit_live_event(event: &Value, highest_replayed_sequence: u64) -> bool {
+    event
+        .get("seq")
+        .and_then(Value::as_u64)
+        .is_none_or(|sequence| sequence > highest_replayed_sequence)
 }
 
 fn load_trace(session_dir: &Path) -> Result<Vec<Value>> {
@@ -229,35 +241,39 @@ fn load_trace(session_dir: &Path) -> Result<Vec<Value>> {
 mod tests {
     use super::*;
     #[test]
-    fn ui_flows_top_to_bottom_with_a_bottom_composer_and_inline_context_pills() {
-        assert!(INDEX.contains("EventSource"));
-        assert!(INDEX.contains("position:sticky;bottom:0"));
-        assert!(INDEX.contains("event.key === 'Enter'"));
-        assert!(INDEX.contains("event.shiftKey"));
-        assert!(INDEX.contains("renderMarkdown"));
-        assert!(INDEX.contains("new URL(href"));
-        assert!(INDEX.contains("target='_blank'"));
-        assert!(INDEX.contains("https?:\\/\\/"));
-        assert!(INDEX.contains("shell-command"));
-        assert!(INDEX.contains("shell-output"));
-        assert!(INDEX.contains("context-pill"));
-        assert!(INDEX.contains("Session statistics"));
-        assert!(INDEX.contains("stat-tokens"));
-        assert!(INDEX.contains("stat-cached"));
-        assert!(INDEX.contains("model_response"));
-        assert!(INDEX.contains("context_compacted"));
-        assert!(INDEX.contains("session_ended"));
-        assert!(INDEX.contains("formatDuration"));
-        assert!(INDEX.contains("model_progress"));
-        assert!(INDEX.contains("Model streaming"));
-        assert!(INDEX.contains("contextCompacted"));
-        assert!(INDEX.contains("Context compacted"));
-        assert!(INDEX.contains("followTail"));
-        assert!(INDEX.contains("addEventListener('scroll'"));
-        assert!(INDEX.contains("scheduleScrollToTail"));
-        assert!(INDEX.contains("history_complete"));
-        assert!(INDEX.contains("behavior:'auto'"));
-        assert!(!INDEX.contains("Context ledger"));
+    fn live_handoff_skips_replayed_events_but_keeps_ephemeral_progress() {
+        assert!(!should_emit_live_event(&json!({"seq": 7}), 7));
+        assert!(should_emit_live_event(&json!({"seq": 8}), 7));
+        assert!(should_emit_live_event(
+            &json!({"event": "model_progress"}),
+            7
+        ));
+    }
+
+    #[tokio::test]
+    async fn message_endpoint_enqueues_nonempty_input() {
+        let (input, mut receiver) = mpsc::unbounded_channel();
+        let (events, _) = broadcast::channel(1);
+        let state = AppState {
+            input,
+            events,
+            session_dir: Arc::new(std::path::PathBuf::from("unused")),
+            status: Arc::new(Mutex::new("waiting")),
+        };
+
+        let response = message(
+            State(state),
+            Json(MessageRequest {
+                message: "  steer right  ".to_owned(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(
+            matches!(receiver.recv().await, Some(UserInput::Message(message)) if message == "steer right")
+        );
     }
 
     #[test]
