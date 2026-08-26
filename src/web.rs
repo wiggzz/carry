@@ -235,6 +235,9 @@ mod tests {
         assert!(INDEX.contains("event.key === 'Enter'"));
         assert!(INDEX.contains("event.shiftKey"));
         assert!(INDEX.contains("renderMarkdown"));
+        assert!(INDEX.contains("new URL(href"));
+        assert!(INDEX.contains("target='_blank'"));
+        assert!(INDEX.contains("https?:\\/\\/"));
         assert!(INDEX.contains("shell-command"));
         assert!(INDEX.contains("shell-output"));
         assert!(INDEX.contains("context-pill"));
