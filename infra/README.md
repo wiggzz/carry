@@ -99,8 +99,11 @@ worker launch-template identifiers. It contains **no credentials**.
 The GitHub Environment retains only the stable OIDC bootstrap variables
 `BENCHMARK_AWS_REGION` and `BENCHMARK_DISPATCH_ROLE_ARN` (plus optional
 `BENCHMARK_STATE_STAGE` for a non-default stage) and the existing protected
-secrets. The dispatch role can read only this one manifest object, not Terraform
-state. The workflow derives all rebuilt resource identifiers from it and fails
+secrets. `apply.sh` explicitly pins Terraform's `github_environment` to the
+workflow's protected `swe-bench` Environment, so the OIDC subject claim cannot
+drift from the environment that supplies those values. The dispatch role can read
+only this one manifest object, not Terraform state. The workflow derives all
+rebuilt resource identifiers from it and fails
 closed if its account/region/backend/dispatch-role binding is stale or mismatched.
 
 Every taggable resource receives `Application=Carry`,
