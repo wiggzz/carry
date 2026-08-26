@@ -22,7 +22,7 @@ on:
         type: choice
         options: [carry, codex, pi, all]
       catalog_digest:
-        description: Immutable prepare-50 catalog digest (sha256:...); required for model-bearing modes
+        description: Immutable prepare-50 catalog digest (sha256:... or 64 lowercase hex); required for model-bearing modes
         required: false
         default: ""
         type: string
@@ -53,14 +53,12 @@ jobs:
       contents: read
       id-token: write # Needed only for the protected short-lived AWS OIDC session.
     env:
+      # These two protected values bootstrap the OIDC session. Every rebuilt
+      # resource identifier below is resolved from the constrained, non-secret
+      # deployment manifest published by infra/scripts/apply.sh.
       AWS_REGION: ${{ vars.BENCHMARK_AWS_REGION }}
-      ARTIFACT_BUCKET: ${{ vars.BENCHMARK_ARTIFACT_BUCKET }}
-      ARTIFACT_SESSION_ROLE_ARN: ${{ vars.BENCHMARK_ARTIFACT_SESSION_ROLE_ARN }}
-      TASK_IMAGE_PUBLISHER_ROLE_ARN: ${{ vars.BENCHMARK_TASK_IMAGE_PUBLISHER_ROLE_ARN }}
-      TASK_IMAGE_REPOSITORY: ${{ vars.BENCHMARK_TASK_IMAGE_REPOSITORY }}
-      TASK_IMAGE_CATALOG: ${{ inputs.catalog_digest && format('{0}@{1}', vars.BENCHMARK_TASK_IMAGE_REPOSITORY, inputs.catalog_digest) || '' }}
-      LAUNCH_TEMPLATE_ID: ${{ vars.BENCHMARK_WORKER_LAUNCH_TEMPLATE_ID }}
-      LAUNCH_TEMPLATE_VERSION: ${{ vars.BENCHMARK_WORKER_LAUNCH_TEMPLATE_VERSION }}
+      DISPATCH_ROLE_ARN: ${{ vars.BENCHMARK_DISPATCH_ROLE_ARN }}
+      BENCHMARK_STATE_STAGE: ${{ vars.BENCHMARK_STATE_STAGE || 'swebench' }}
       BOOTSTRAP_WAIT_SECONDS: ${{ inputs.bootstrap_wait_seconds }}
       BENCHMARK_MODE: ${{ inputs.mode }}
       BENCHMARK_HARNESS: ${{ inputs.harness }}
@@ -98,11 +96,40 @@ jobs:
       - name: Configure protected AWS dispatch identity
         uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8
         with:
-          role-to-assume: ${{ vars.BENCHMARK_DISPATCH_ROLE_ARN }}
-          aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
+          role-to-assume: ${{ env.DISPATCH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
           role-session-name: carry-bootstrap-${{ github.run_id }}
           role-duration-seconds: 21600
           mask-aws-account-id: true
+
+      - name: Resolve deployed benchmark configuration
+        shell: bash
+        env:
+          CATALOG_DIGEST: ${{ inputs.catalog_digest }}
+        run: |
+          set -euo pipefail
+          for required in AWS_REGION DISPATCH_ROLE_ARN BENCHMARK_STATE_STAGE; do
+            [[ -n "${!required}" ]] || { echo "missing protected bootstrap configuration: $required" >&2; exit 1; }
+          done
+          [[ "$BENCHMARK_STATE_STAGE" =~ ^([a-z0-9]|[a-z0-9][a-z0-9-]{0,10}[a-z0-9])$ ]] || {
+            echo "BENCHMARK_STATE_STAGE must be 1-12 lowercase letters, digits, or hyphens" >&2
+            exit 1
+          }
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          [[ "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]] || { echo "could not determine AWS account" >&2; exit 1; }
+          STATE_BUCKET="carry-tfstate-${ACCOUNT_ID}-${AWS_REGION}-${BENCHMARK_STATE_STAGE}"
+          STATE_KEY="carry/swebench-benchmark-infra/${BENCHMARK_STATE_STAGE}.tfstate"
+          MANIFEST_KEY="carry/swebench-benchmark-infra/${BENCHMARK_STATE_STAGE}.deployment.json"
+          MANIFEST="$RUNNER_TEMP/carry-swebench-deployment.json"
+          aws s3api get-object --bucket "$STATE_BUCKET" --key "$MANIFEST_KEY" "$MANIFEST" >/dev/null
+          python3 scripts/benchmark_deployment_manifest.py resolve \
+            --manifest "$MANIFEST" \
+            --expected-backend-bucket "$STATE_BUCKET" \
+            --expected-backend-key "$STATE_KEY" \
+            --expected-backend-region "$AWS_REGION" \
+            --expected-dispatch-role-arn "$DISPATCH_ROLE_ARN" \
+            --catalog-digest "$CATALOG_DIGEST" >> "$GITHUB_ENV"
+          echo "CONFIGURATION_MANIFEST_S3_URI=s3://${STATE_BUCKET}/${MANIFEST_KEY}" >> "$GITHUB_ENV"
 
       - name: Sanitize exact prior run objects
         if: inputs.mode == 'cleanup'
@@ -406,8 +433,8 @@ jobs:
         if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'official-50')
         uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8
         with:
-          role-to-assume: ${{ vars.BENCHMARK_DISPATCH_ROLE_ARN }}
-          aws-region: ${{ vars.BENCHMARK_AWS_REGION }}
+          role-to-assume: ${{ env.DISPATCH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
           role-session-name: carry-finish-${{ github.run_id }}
           mask-aws-account-id: true
 
