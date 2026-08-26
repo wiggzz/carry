@@ -88,8 +88,9 @@ Run `carry` without a prompt for an interactive session. You can also add
 instruction to queue it after the current shell action. `/help`, `/quit`, and
 `/exit` work at the prompt.
 
-Carry defaults to `gpt-5.6-luna`; override it with `--model` or `OPENAI_MODEL`.
-There is no default step limit. Use `--max-steps N` only when you need a cap.
+Run `carry --serve --cwd ../project` to launch the embedded local UI at `http://127.0.0.1:8765`; use `--port` to choose another port. The UI submits the initial task and later steering through a local HTTP API, and receives activity over SSE. It is deliberately localhost-only. Context status appears as protected, removable, and removed pills on the relevant output. To continue an existing session in the browser, run `carry --resume /path/to/session --serve`; the UI's first message becomes the resumed session's fresh human turn.
+
+The default model is `gpt-5.6-luna`; override it with `--model` or `OPENAI_MODEL`. Sessions have no default step limit. Use `--max-steps N` only when an explicit per-turn cap is required. Responses API `429` responses with `error.code=rate_limit_exceeded` and connection failures before a response is received are retried up to five times. Carry honors `Retry-After-Ms`, numeric `Retry-After`, and HTTP-date `Retry-After`; the total wait budget is 60 seconds, and Carry stops rather than sending earlier when the server requests a longer delay. Missing or invalid delay headers and transport failures use bounded exponential backoff. Retries resend the identical request body; successful model-response events include the retry count, and exhausted errors include the retry/wait summary. Quota failures and ambiguous `5xx` POST failures are not replayed.
 
 ## Inspect a run
 
