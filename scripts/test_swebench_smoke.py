@@ -1041,6 +1041,11 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         with self.assertRaisesRegex(ValueError, "smoke manifest"):
             self.worker.selection_for_mode(frozen, "smoke-5", smoke[:-1] + ["outside"])
 
+    def test_official_mode_defaults_to_five_agent_slots(self):
+        self.assertEqual(self.worker.agent_concurrency_for_mode({}, "official-50"), 5)
+        self.assertEqual(self.worker.agent_concurrency_for_mode({}, "smoke-5"), 3)
+        self.assertEqual(self.worker.agent_concurrency_for_mode({"AGENT_CONCURRENCY": "4"}, "official-50"), 4)
+
     def test_official_phase_budgets_fit_the_five_hour_worker_envelope(self):
         limits = self.worker.official_phase_limits()
         self.assertEqual(
@@ -1187,7 +1192,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             "MODEL": "gpt-5.6-luna", "REASONING": "medium",
             "TASK_IMAGE_REPOSITORY": "registry.example/tasks",
             "TASK_IMAGE_CATALOG": "registry.example/tasks@sha256:" + "f" * 64,
-            "AGENT_CONCURRENCY": "3",
+            "AGENT_CONCURRENCY": "5",
         }
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -1243,6 +1248,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertEqual(report["harnesses"]["pi"]["response_retries"], 0)
             limits = report["provenance"]["images"]["execution_limits"]
             self.assertEqual(limits["agent_shard_size"], 10)
+            self.assertEqual(limits["agent_concurrency"], 5)
             self.assertEqual(limits["evaluator_shard_size"], 5)
             self.assertEqual(limits["evaluator_concurrency"], 5)
 

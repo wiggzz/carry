@@ -153,6 +153,7 @@ export READINESS_CONCURRENCY=5
 if [[ "$BENCHMARK_MODE" == official-50 ]]; then
   # Five concurrent Docker creates have been reliable; ten repeatedly saturated
   # the daemon and left half of a shard without evaluator outcomes.
+  export AGENT_CONCURRENCY=5
   export EVALUATOR_CONCURRENCY=5
   export OFFICIAL_WORKER_SECONDS=18000
   export OFFICIAL_PREPARATION_PHASE_SECONDS=3000

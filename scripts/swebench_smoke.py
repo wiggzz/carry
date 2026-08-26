@@ -325,6 +325,15 @@ def task_image_references(repository: str, cache_key: str) -> dict[str, str]:
     }
 
 
+def agent_concurrency_for_mode(values: Mapping[str, str], mode: str) -> int:
+    """Return a bounded agent parallelism that fits the selected benchmark mode."""
+    default = "5" if mode == "official-50" else "3"
+    concurrency = int(values.get("AGENT_CONCURRENCY", default))
+    if concurrency < 1 or concurrency > 5:
+        raise ValueError("AGENT_CONCURRENCY must be between 1 and 5")
+    return concurrency
+
+
 def official_phase_limits(values: Mapping[str, str] | None = None) -> dict[str, int]:
     source = values if values is not None else os.environ
     limits = {
@@ -1913,16 +1922,14 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         json.dumps(selected_records, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
-    concurrency = int(config.get("AGENT_CONCURRENCY", "3"))
-    if concurrency < 1 or concurrency > 5:
-        raise ValueError("AGENT_CONCURRENCY must be between 1 and 5")
+    concurrency = agent_concurrency_for_mode(config, mode)
     agent_timeout = int(config.get("AGENT_TIMEOUT_SECONDS", "360"))
     readiness_timeout = int(config.get("READINESS_TIMEOUT_SECONDS", "180"))
     readiness_concurrency = int(config.get("READINESS_CONCURRENCY", "5"))
     evaluator_timeout = int(config.get("EVALUATOR_TIMEOUT_SECONDS", "270"))
     evaluator_concurrency = int(config.get("EVALUATOR_CONCURRENCY", "5"))
     if mode == "official-50" and (
-            concurrency != 3 or agent_timeout != 360
+            concurrency != 5 or agent_timeout != 360
             or readiness_timeout != 180 or readiness_concurrency != 5
             or evaluator_timeout != 270 or evaluator_concurrency != 5):
         raise ValueError("official mode requires fixed preparation, agent, and evaluator limits")

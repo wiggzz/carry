@@ -156,10 +156,10 @@ agent receives only the proxy's fixed internal address; trusted grading runs sep
 after the generated patch is captured and the model credential is removed. Proxy
 containers and both per-slot networks receive verified cleanup on every return path.
 
-It executes five ordered ten-task agent shards at concurrency three, removes each
-shard's working checkouts after patch capture, deletes the model key before grading,
-and evaluates the selected harness in ten ordered five-task shards at evaluator concurrency
-five with `swebench==4.1.0`. Limiting each evaluator shard to five avoids the Docker-daemon
+Official execution uses five ordered ten-task agent shards at concurrency five (the
+smaller modes default to three), removes each shard's working checkouts after patch
+capture, deletes the model key before grading, and evaluates the selected harness in ten
+ordered five-task shards at evaluator concurrency five with `swebench==4.1.0`. Limiting each evaluator shard to five avoids the Docker-daemon
 create saturation observed when ten instance containers launched together. It writes the full
 50-slot `not-run` checkpoint before catalog pulls and checkpoints after every agent and
 evaluator shard, so infrastructure failure cannot silently shrink the denominator. Evaluator

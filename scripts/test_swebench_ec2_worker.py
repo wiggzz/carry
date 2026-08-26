@@ -72,7 +72,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             self.assertIn("python3.11", packages)
             self.assertNotIn("curl", packages)
 
-    def test_official_worker_launches_runner_with_bounded_evaluator_concurrency(self):
+    def test_official_worker_launches_runner_with_bounded_agent_and_evaluator_concurrency(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             payload = root / "payload"
@@ -115,7 +115,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 "fi\n"
                 "case \"$*\" in\n"
                 "  *swebench_smoke.py*)\n"
-                "    printf 'evaluator=%s\\nmode=%s\\n' \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" > \"$FAKE_RUNNER_ENV\";;\n"
+                "    printf 'agent=%s\\nevaluator=%s\\nmode=%s\\n' \"$AGENT_CONCURRENCY\" \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" > \"$FAKE_RUNNER_ENV\";;\n"
                 "esac\n"
                 "exit 0\n"
             )
@@ -147,7 +147,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             run = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
 
             self.assertEqual(run.returncode, 0, run.stderr)
-            self.assertEqual(runner_env.read_text(), "evaluator=5\nmode=official-50\n")
+            self.assertEqual(runner_env.read_text(), "agent=5\nevaluator=5\nmode=official-50\n")
 
     def test_prepare_worker_uses_registry_auth_without_model_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
