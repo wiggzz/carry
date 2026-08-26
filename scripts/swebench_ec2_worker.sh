@@ -155,9 +155,9 @@ if [[ "$BENCHMARK_MODE" == official-50 ]]; then
   # the daemon and left half of a shard without evaluator outcomes.
   export AGENT_CONCURRENCY=5
   export EVALUATOR_CONCURRENCY=5
-  export OFFICIAL_WORKER_SECONDS=18000
+  export OFFICIAL_WORKER_SECONDS=18900
   export OFFICIAL_PREPARATION_PHASE_SECONDS=3000
-  export OFFICIAL_AGENT_PHASE_SECONDS=3600
+  export OFFICIAL_AGENT_PHASE_SECONDS=4500
   export OFFICIAL_EVALUATION_PHASE_SECONDS=10200
   export OFFICIAL_SETUP_RESERVE_SECONDS=1200
   worker_elapsed_seconds=$(( $(date +%s) - worker_started_at ))

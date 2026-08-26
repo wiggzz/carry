@@ -1046,8 +1046,10 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         self.assertEqual(self.worker.agent_concurrency_for_mode({}, "smoke-5"), 3)
         self.assertEqual(self.worker.agent_concurrency_for_mode({"AGENT_CONCURRENCY": "4"}, "official-50"), 4)
 
-    def test_official_phase_budgets_fit_the_five_hour_worker_envelope(self):
+    def test_official_phase_budgets_fit_the_five_and_a_quarter_hour_worker_envelope(self):
         limits = self.worker.official_phase_limits()
+        self.assertEqual(limits["worker_seconds"], 18_900)
+        self.assertEqual(limits["agent_seconds"], 4_500)
         self.assertEqual(
             limits["preparation_seconds"] + limits["agent_seconds"]
             + limits["evaluation_seconds"] + limits["setup_reserve_seconds"],
@@ -1057,8 +1059,10 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         self.assertLess(readiness_worst_case, limits["preparation_seconds"])
         evaluator_worst_case = 30 * (270 + 45)  # Thirty all-harness evaluator shards.
         self.assertLess(evaluator_worst_case, limits["evaluation_seconds"])
-        self.assertEqual(150 * 360 // 3, limits["worker_seconds"])
-        self.assertLess(limits["agent_seconds"], 150 * 360 // 3)
+        # Five bounded slots cannot reserve every per-slot maximum inside one
+        # phase, so the phase deadline remains the fail-closed control.
+        self.assertEqual(150 * 360 // 5, 10_800)
+        self.assertLess(limits["agent_seconds"], 150 * 360 // 5)
 
     def test_official_outcomes_require_exact_nonoverlapping_coverage(self):
         outcomes = {

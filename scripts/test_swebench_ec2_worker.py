@@ -115,7 +115,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 "fi\n"
                 "case \"$*\" in\n"
                 "  *swebench_smoke.py*)\n"
-                "    printf 'agent=%s\\nevaluator=%s\\nmode=%s\\n' \"$AGENT_CONCURRENCY\" \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" > \"$FAKE_RUNNER_ENV\";;\n"
+                "    printf 'agent=%s\\nevaluator=%s\\nmode=%s\\nworker=%s\\nagent_phase=%s\\n' \"$AGENT_CONCURRENCY\" \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" \"$OFFICIAL_WORKER_SECONDS\" \"$OFFICIAL_AGENT_PHASE_SECONDS\" > \"$FAKE_RUNNER_ENV\";;\n"
                 "esac\n"
                 "exit 0\n"
             )
@@ -147,7 +147,11 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             run = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
 
             self.assertEqual(run.returncode, 0, run.stderr)
-            self.assertEqual(runner_env.read_text(), "agent=5\nevaluator=5\nmode=official-50\n")
+            self.assertEqual(
+                runner_env.read_text(),
+                "agent=5\nevaluator=5\nmode=official-50\nworker=18900\n"
+                "agent_phase=4500\n",
+            )
 
     def test_prepare_worker_uses_registry_auth_without_model_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
