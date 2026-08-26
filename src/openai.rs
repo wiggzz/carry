@@ -4,7 +4,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use reqwest::{Client, StatusCode, header::HeaderMap};
+use reqwest::{
+    Client, StatusCode,
+    header::{CONTENT_TYPE, HeaderMap},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -12,6 +15,10 @@ use crate::protocol::{Step, tool_definitions};
 
 const MAX_RESPONSE_RETRIES: usize = 5;
 const MAX_TOTAL_RETRY_WAIT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(test)]
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -55,6 +62,8 @@ pub struct OpenAiClient {
     model: String,
     reasoning_effort: String,
     prompt_cache_key: String,
+    request_timeout: Duration,
+    connect_timeout: Duration,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -73,7 +82,15 @@ pub struct Usage {
     pub total_tokens: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ModelProgress {
+    /// Estimated while streaming; replaced with the API total on completion.
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub output_events: u64,
+}
+
+#[derive(Debug)]
 pub struct ModelReply {
     pub response_id: String,
     pub step: Step,
@@ -87,15 +104,50 @@ pub struct ModelReply {
 }
 
 impl OpenAiClient {
-    pub fn new(api_base: String, api_key: String, model: String, reasoning_effort: String) -> Self {
-        Self {
-            http: Client::new(),
+    #[cfg(test)]
+    fn new(api_base: String, api_key: String, model: String, reasoning_effort: String) -> Self {
+        Self::with_timeouts(
+            api_base,
+            api_key,
+            model,
+            reasoning_effort,
+            DEFAULT_REQUEST_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+        .expect("default OpenAI HTTP client configuration is valid")
+    }
+
+    pub fn with_timeouts(
+        api_base: String,
+        api_key: String,
+        model: String,
+        reasoning_effort: String,
+        request_timeout: Duration,
+        connect_timeout: Duration,
+    ) -> Result<Self> {
+        let http = Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(connect_timeout)
+            .build()
+            .context("failed to build OpenAI HTTP client")?;
+        Ok(Self {
+            http,
             api_base: api_base.trim_end_matches('/').to_owned(),
             api_key,
             model,
             reasoning_effort,
             prompt_cache_key: new_prompt_cache_key(),
-        }
+            request_timeout,
+            connect_timeout,
+        })
+    }
+
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    pub(crate) fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
     }
 
     pub(crate) fn prompt_cache_capabilities(&self) -> Option<PromptCacheCapabilities> {
@@ -122,8 +174,22 @@ impl OpenAiClient {
         })
     }
 
+    #[cfg(test)]
     pub async fn step(&self, system: &str, history: &[Value]) -> Result<ModelReply> {
-        let body = self.request_body(system, history);
+        self.step_with_progress(system, history, |_| {}).await
+    }
+
+    pub async fn step_with_progress<F>(
+        &self,
+        system: &str,
+        history: &[Value],
+        mut progress: F,
+    ) -> Result<ModelReply>
+    where
+        F: FnMut(ModelProgress),
+    {
+        let mut body = self.request_body(system, history);
+        body["stream"] = json!(true);
 
         let started = Instant::now();
         let mut retries = 0;
@@ -165,6 +231,16 @@ impl OpenAiClient {
             };
             let status = response.status();
             let headers = response.headers().clone();
+            let is_stream = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"));
+            if status.is_success() && is_stream {
+                // Read completed SSE frames as they arrive. `bytes()` would defer all progress
+                // until the model has finished its (possibly long) reasoning turn.
+                break read_sse_response(response, &mut progress).await?;
+            }
             let response_body = match response.bytes().await {
                 Ok(body) => body,
                 Err(error) if retries < MAX_RESPONSE_RETRIES => {
@@ -184,12 +260,10 @@ impl OpenAiClient {
                     tokio::time::sleep(delay).await;
                     continue;
                 }
-                Err(error) => {
-                    return Err(error).context(format!(
-                        "Responses API response body read failed after {retries} retries and {}ms waiting",
-                        retry_wait.as_millis()
-                    ));
-                }
+                Err(error) => return Err(error).context(format!(
+                    "Responses API response body read failed after {retries} retries and {}ms waiting",
+                    retry_wait.as_millis()
+                )),
             };
             if status.is_success() {
                 break serde_json::from_slice(&response_body)
@@ -342,6 +416,74 @@ fn new_prompt_cache_key() -> String {
         .as_nanos();
     let sequence = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     format!("carry-{}-{now}-{sequence}", std::process::id())
+}
+
+async fn read_sse_response<F>(mut response: reqwest::Response, progress: &mut F) -> Result<Value>
+where
+    F: FnMut(ModelProgress),
+{
+    let mut pending = Vec::new();
+    let mut completed = None;
+    let mut current = ModelProgress::default();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("Responses API stream read failed")?
+    {
+        pending.extend_from_slice(&chunk);
+        while let Some(end) = pending.windows(2).position(|pair| pair == b"\n\n") {
+            let frame: Vec<_> = pending.drain(..end + 2).collect();
+            process_sse_frame(&frame[..end], &mut completed, &mut current, progress)?;
+        }
+    }
+    let response = completed.context("Responses API stream ended without response.completed")?;
+    let usage = extract_usage(&response);
+    progress(ModelProgress {
+        output_tokens: usage.output_tokens,
+        reasoning_output_tokens: usage.reasoning_tokens,
+        output_events: current.output_events,
+    });
+    Ok(response)
+}
+
+fn process_sse_frame<F>(
+    frame: &[u8],
+    completed: &mut Option<Value>,
+    current: &mut ModelProgress,
+    progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(ModelProgress),
+{
+    let text = std::str::from_utf8(frame).context("Responses API stream was not UTF-8")?;
+    let data = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(());
+    }
+    let event: Value =
+        serde_json::from_str(&data).context("Responses API stream contained invalid JSON")?;
+    let event_type = event["type"].as_str().unwrap_or_default();
+    if let Some(delta) = event["delta"].as_str() {
+        // Private reasoning tokens are not exposed as token deltas. This is an explicit
+        // approximate activity counter and is corrected by final usage on completion.
+        current.output_tokens += (delta.len().max(1) as u64).div_ceil(4);
+        if event_type.contains("reasoning") {
+            current.reasoning_output_tokens += (delta.len().max(1) as u64).div_ceil(4);
+        }
+        current.output_events += 1;
+        progress(current.clone());
+    } else if event_type.contains(".delta") {
+        current.output_events += 1;
+        progress(current.clone());
+    }
+    if event_type == "response.completed" {
+        *completed = event.get("response").cloned();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -599,6 +741,40 @@ mod tests {
     }
 
     #[test]
+    fn sse_deltas_report_live_progress_and_completed_response() {
+        let mut completed = None;
+        let mut current = ModelProgress::default();
+        let mut updates = Vec::new();
+        process_sse_frame(
+            br#"event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
+            &mut completed,
+            &mut current,
+            &mut |progress| updates.push(progress),
+        )
+        .unwrap();
+        process_sse_frame(
+            br#"data: {"type":"response.output_text.delta","delta":"done"}"#,
+            &mut completed,
+            &mut current,
+            &mut |progress| updates.push(progress),
+        )
+        .unwrap();
+        process_sse_frame(
+            br#"data: {"type":"response.completed","response":{"id":"response-1","usage":{"output_tokens":9}}}"#,
+            &mut completed,
+            &mut current,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].reasoning_output_tokens, 2);
+        assert!(updates[1].output_tokens > updates[0].output_tokens);
+        assert_eq!(completed.unwrap()["id"], "response-1");
+    }
+
+    #[test]
     fn extracts_one_function_call_and_usage() {
         let raw = json!({
             "output": [
@@ -623,6 +799,22 @@ mod tests {
         assert_eq!(usage.cached_input_tokens, 4);
         assert_eq!(usage.cache_write_input_tokens, 6);
         assert_eq!(usage.reasoning_tokens, 1);
+    }
+
+    #[test]
+    fn client_uses_configured_request_and_connect_timeouts() {
+        let client = OpenAiClient::with_timeouts(
+            "https://example.invalid/v1".into(),
+            "secret".into(),
+            "model".into(),
+            "medium".into(),
+            Duration::from_secs(123),
+            Duration::from_secs(7),
+        )
+        .unwrap();
+
+        assert_eq!(client.request_timeout(), Duration::from_secs(123));
+        assert_eq!(client.connect_timeout(), Duration::from_secs(7));
     }
 
     #[test]
