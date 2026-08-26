@@ -8,12 +8,17 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::json;
-use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc, time::Duration};
+use tokio::{
+    io::AsyncWriteExt,
+    process::Command,
+    sync::{broadcast, mpsc},
+    time::Duration,
+};
 
 use crate::{
     context::{CompactionPolicy, ContextState, PricedBreakpoint, RenderedBreakpoint},
     log::RunLogger,
-    openai::{ModelReply, OpenAiClient, PromptCacheCapabilities, Usage},
+    openai::{ModelProgress, ModelReply, OpenAiClient, PromptCacheCapabilities, Usage},
     protocol::{ActionKind, Step},
 };
 
@@ -37,13 +42,6 @@ Large text shell results arrive as structured `output_head` and `output_tail` pr
 
 Work only within the assigned repository. Do not perform destructive or external actions."#;
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CompactionMode {
-    Economic,
-    Disabled,
-}
-
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub cwd: PathBuf,
@@ -52,7 +50,7 @@ pub struct RunConfig {
     pub model: String,
     pub max_steps: Option<usize>,
     pub shell_timeout_secs: u64,
-    pub compaction_mode: CompactionMode,
+    pub resume_history: Option<Vec<serde_json::Value>>,
 }
 
 const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
@@ -365,9 +363,30 @@ impl Backend {
         }
     }
 
-    async fn step(&mut self, history: &[serde_json::Value]) -> Result<ModelReply> {
+    fn request_metadata(&self) -> serde_json::Value {
         match self {
-            Self::OpenAi(client) => client.step(SYSTEM_PROMPT, history).await,
+            Self::OpenAi(client) => json!({
+                "request_timeout_ms": client.request_timeout().as_millis(),
+                "connect_timeout_ms": client.connect_timeout().as_millis(),
+            }),
+            Self::Scripted { .. } => json!({"scripted": true}),
+        }
+    }
+
+    async fn step_with_progress<F>(
+        &mut self,
+        history: &[serde_json::Value],
+        progress: F,
+    ) -> Result<ModelReply>
+    where
+        F: FnMut(ModelProgress),
+    {
+        match self {
+            Self::OpenAi(client) => {
+                client
+                    .step_with_progress(SYSTEM_PROMPT, history, progress)
+                    .await
+            }
             Self::Scripted { steps, emitted } => {
                 let step = steps
                     .pop_front()
@@ -391,7 +410,7 @@ impl Backend {
 }
 
 pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, None).await
+    run_loop(config, &mut backend, None, None).await
 }
 
 pub async fn run_interactive(
@@ -399,37 +418,81 @@ pub async fn run_interactive(
     mut backend: Backend,
     input: mpsc::UnboundedReceiver<UserInput>,
 ) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, Some(input)).await
+    run_loop(config, &mut backend, Some(input), None).await
+}
+
+pub async fn run_interactive_with_events(
+    config: RunConfig,
+    mut backend: Backend,
+    input: mpsc::UnboundedReceiver<UserInput>,
+    events: broadcast::Sender<serde_json::Value>,
+) -> Result<RunOutcome> {
+    run_loop(config, &mut backend, Some(input), Some(events)).await
 }
 
 async fn run_loop(
     config: RunConfig,
     backend: &mut Backend,
     mut input: Option<mpsc::UnboundedReceiver<UserInput>>,
+    events: Option<broadcast::Sender<serde_json::Value>>,
 ) -> Result<RunOutcome> {
     let run_started = Instant::now();
     let prompt_cache_capabilities = backend.prompt_cache_capabilities();
     tokio::fs::create_dir_all(config.session_dir.join("tools")).await?;
-    let mut logger = RunLogger::create(&config.session_dir)?;
-    logger.raw_event(
-        "run_started",
-        json!({
-            "cwd": config.cwd,
-            "prompt": config.prompt,
-            "model": config.model,
-            "max_steps": config.max_steps,
-            "cache_ttl_seconds": CACHE_TTL.as_secs(),
-            "prompt_cache_capabilities": prompt_cache_capabilities,
-            "compaction_policy": config.compaction_mode,
-            "compaction_decision": "next_request"
-        }),
-        &format!("carry · {} · {}", config.model, config.cwd.display()),
-    )?;
+    let resumed = config.resume_history.is_some();
+    let mut logger = if resumed {
+        RunLogger::resume_with_events(&config.session_dir, events.clone())?
+    } else {
+        RunLogger::create_with_events(&config.session_dir, events.clone())?
+    };
+    if let Some(history) = config.resume_history.clone() {
+        logger.raw_event(
+            "session_resumed",
+            json!({
+                "cwd": config.cwd,
+                "model": config.model,
+                "history_items": history.len(),
+                "cache_ttl_seconds": CACHE_TTL.as_secs(),
+                "prompt_cache_capabilities": prompt_cache_capabilities,
+            }),
+            &format!(
+                "resumed · {} · {} history items",
+                config.model,
+                history.len()
+            ),
+        )?;
+    } else {
+        logger.raw_event(
+            "run_started",
+            json!({
+                "cwd": config.cwd,
+                "prompt": config.prompt,
+                "model": config.model,
+                "max_steps": config.max_steps,
+                "cache_ttl_seconds": CACHE_TTL.as_secs(),
+                "prompt_cache_capabilities": prompt_cache_capabilities,
+                "compaction_decision": "next_request"
+            }),
+            &format!("carry · {} · {}", config.model, config.cwd.display()),
+        )?;
+    }
 
-    let mut context_state = ContextState::new_with_max_read_breakpoints(
-        config.prompt.clone(),
-        prompt_cache_capabilities.map_or(0, |capabilities| capabilities.max_read_breakpoints),
-    );
+    let max_read_breakpoints =
+        prompt_cache_capabilities.map_or(0, |capabilities| capabilities.max_read_breakpoints);
+    let resumed_history = config.resume_history.is_some();
+    let mut context_state = match config.resume_history.clone() {
+        Some(history) => ContextState::from_input_items(history, max_read_breakpoints),
+        None => {
+            ContextState::new_with_max_read_breakpoints(config.prompt.clone(), max_read_breakpoints)
+        }
+    };
+    if !resumed_history {
+        logger.raw_event(
+            "human_message",
+            json!({"context_id": 1, "message": config.prompt}),
+            "  prompt [1] submitted",
+        )?;
+    }
     let mut metrics = RunMetrics::default();
     let mut cache = CacheTracker::new(prompt_cache_capabilities);
     let mut step_index = 0;
@@ -463,16 +526,14 @@ async fn run_loop(
         } else {
             "economic"
         };
-        if config.compaction_mode == CompactionMode::Economic {
-            maybe_compact(
-                &mut context_state,
-                &protected_until_request,
-                &mut cache,
-                &mut metrics,
-                &mut logger,
-                trigger,
-            )?;
-        }
+        maybe_compact(
+            &mut context_state,
+            &protected_until_request,
+            &mut cache,
+            &mut metrics,
+            &mut logger,
+            trigger,
+        )?;
         step_index += 1;
         turn_step += 1;
         let history = context_state.input_items();
@@ -483,16 +544,69 @@ async fn run_loop(
         );
         protected_until_request.clear();
         let request = backend.request_body(&history);
+        let request_started = Instant::now();
         logger.raw_event_silent(
             "model_request",
             json!({
                 "step": step_index,
                 "history": history,
-                "request": request
+                "request": request,
+                "transport": backend.request_metadata()
             }),
         )?;
 
-        let reply = backend.step(&history).await?;
+        let progress_events = events.clone();
+        let mut last_progress = None;
+        let reply = match backend
+            .step_with_progress(&history, |progress| {
+                if last_progress
+                    .as_ref()
+                    .is_some_and(|previous: &ModelProgress| {
+                        previous.output_tokens == progress.output_tokens
+                            && previous.reasoning_output_tokens == progress.reasoning_output_tokens
+                            && previous.output_events == progress.output_events
+                    })
+                {
+                    return;
+                }
+                eprint!(
+                    "\r  model streaming · ~{} output tokens · {} events",
+                    progress.output_tokens, progress.output_events
+                );
+                if let Some(events) = &progress_events {
+                    let _ = events.send(json!({"event":"model_progress", "data": {
+                        "step": step_index,
+                        "output_tokens": progress.output_tokens,
+                        "reasoning_output_tokens": progress.reasoning_output_tokens,
+                        "output_events": progress.output_events,
+                        "estimated": true,
+                    }}));
+                }
+                last_progress = Some(progress);
+            })
+            .await
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                logger.raw_event(
+                    "model_error",
+                    json!({
+                        "step": step_index,
+                        "latency_ms": request_started.elapsed().as_millis(),
+                        "transport": backend.request_metadata(),
+                        "error": format!("{error:#}"),
+                    }),
+                    &format!(
+                        "  model request failed after {}ms: {error}",
+                        request_started.elapsed().as_millis()
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
+        if last_progress.is_some() {
+            eprintln!();
+        }
         metrics.record(&reply.usage, reply.latency_ms, reply.response_retries);
         cache.observe(&reply.usage);
         logger.raw_event(
@@ -540,11 +654,18 @@ async fn run_loop(
                 .await?;
                 let output = function_call_output(&reply.function_call, &result)?;
                 let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
-                logger.event("shell_finished", &result, &terminal_shell_result(&result))?;
+                logger.raw_event(
+                    "shell_finished",
+                    json!({"result": &result, "context_id": item_id}),
+                    &terminal_shell_result(&result),
+                )?;
                 let signals = context_state.record_signals(&reply.step.context, item_id);
                 protected_until_request.push(item_id);
                 protected_until_request.extend(signals.added.iter().copied());
-                logger.event_silent("context_signals", &signals)?;
+                logger.raw_event_silent(
+                    "context_signals",
+                    json!({"source_id": item_id, "signals": &signals}),
+                )?;
 
                 if let Some(receiver) = input.as_mut()
                     && drain_user_input(receiver, &mut context_state, &mut logger)?
@@ -574,7 +695,10 @@ async fn run_loop(
                 let signals = context_state.record_signals(&reply.step.context, item_id);
                 protected_until_request.push(item_id);
                 protected_until_request.extend(signals.added.iter().copied());
-                logger.event_silent("context_signals", &signals)?;
+                logger.raw_event_silent(
+                    "context_signals",
+                    json!({"source_id": item_id, "signals": &signals}),
+                )?;
                 logger.raw_event(
                     if input.is_some() {
                         "turn_finished"
@@ -584,6 +708,7 @@ async fn run_loop(
                     json!({
                         "step": step_index,
                         "answer": answer,
+                        "context_id": item_id,
                         "retained_context": context_state.snapshot()
                     }),
                     &terminal_finished(step_index, &metrics.usage),
@@ -597,7 +722,12 @@ async fn run_loop(
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                         match receiver.recv().await {
                             Some(UserInput::Message(message)) => {
-                                append_user_message(&mut context_state, &mut logger, message)?;
+                                append_user_message(
+                                    &mut context_state,
+                                    &mut logger,
+                                    message,
+                                    false,
+                                )?;
                             }
                             Some(UserInput::Exit) | None => should_exit = true,
                         }
@@ -635,7 +765,7 @@ fn drain_user_input(
     while let Ok(input) = receiver.try_recv() {
         match input {
             UserInput::Message(message) => {
-                append_user_message(state, logger, message)?;
+                append_user_message(state, logger, message, true)?;
             }
             UserInput::Exit => should_exit = true,
         }
@@ -647,12 +777,18 @@ fn append_user_message(
     state: &mut ContextState,
     logger: &mut RunLogger,
     message: String,
+    steering: bool,
 ) -> Result<()> {
     let id = state.add_user(message.clone());
+    let terminal = if steering {
+        format!("  steering [{id}] queued")
+    } else {
+        format!("  prompt [{id}] submitted")
+    };
     logger.raw_event(
         "human_message",
         json!({"context_id": id, "message": message}),
-        &format!("  steering [{id}] queued"),
+        &terminal,
     )
 }
 
@@ -677,7 +813,7 @@ fn maybe_compact(
     metrics.record_compaction();
     logger.raw_event(
         "context_compacted",
-        json!({"trigger": trigger, "compaction": &change}),
+        json!({"trigger": trigger, "compaction": &change, "retained_context": state.snapshot()}),
         &format!(
             "  compact · -{} items / ~{} tok · {} retained · {} rewritten · reuse {} · invalidate {} generations / {} cached tok · next request saves ~{} input-equivalent tok",
             change.dropped.len(),
@@ -1020,7 +1156,6 @@ async fn write_final_artifacts(
         "usage": &metrics.usage,
         "model_latency_ms": metrics.model_latency_ms,
         "response_retries": metrics.response_retries,
-        "compaction_policy": config.compaction_mode,
         "compactions": metrics.compactions,
         "elapsed_ms": elapsed_ms
     });
@@ -1549,7 +1684,7 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Disabled,
+                resume_history: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1568,7 +1703,6 @@ mod tests {
         assert_eq!(result["model_latency_ms"], 0);
         assert_eq!(result["response_retries"], 0);
         assert_eq!(result["compactions"], 0);
-        assert_eq!(result["compaction_policy"], "disabled");
         assert!(result["elapsed_ms"].is_u64());
     }
 
@@ -1594,7 +1728,7 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: None,
                 shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
+                resume_history: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1632,7 +1766,7 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: None,
                 shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
+                resume_history: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1685,7 +1819,7 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Disabled,
+                resume_history: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1739,7 +1873,7 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: None,
                 shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
+                resume_history: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
             receiver,
@@ -1754,7 +1888,13 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert!(events.iter().any(|event| event["event"] == "human_message"));
+        let initial_prompt = events
+            .iter()
+            .find(|event| {
+                event["event"] == "human_message" && event["data"]["message"] == "initial task"
+            })
+            .expect("initial prompt is logged as a human message");
+        assert_eq!(initial_prompt["data"]["context_id"], 1);
         let requests = events
             .iter()
             .filter(|event| event["event"] == "model_request")

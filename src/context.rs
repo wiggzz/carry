@@ -37,6 +37,7 @@ pub(crate) enum ContextItemKind {
     Status,
     Memory,
     Tool,
+    Restored,
 }
 
 impl Retention {
@@ -88,6 +89,15 @@ impl ContextItem {
             materialized: false,
         });
         item
+    }
+
+    fn restored(id: u64, input_items: Vec<Value>) -> Self {
+        Self::new(
+            id,
+            ContextItemKind::Restored,
+            Retention::Stable,
+            input_items,
+        )
     }
 
     fn history_status(id: u64) -> Self {
@@ -200,6 +210,16 @@ impl ContextState {
         }
     }
 
+    pub fn from_input_items(input_items: Vec<Value>, max_read_breakpoints: usize) -> Self {
+        Self {
+            items: vec![ContextItem::restored(1, input_items)],
+            next_id: 1,
+            generation: 0,
+            max_read_breakpoints,
+            breakpoints: Vec::new(),
+        }
+    }
+
     pub fn add_user(&mut self, content: String) -> u64 {
         let id = self.allocate_id();
         self.items.push(ContextItem::user(id, content));
@@ -244,6 +264,7 @@ impl ContextState {
                     input.extend(item.input_items.iter().cloned());
                     input.push(item.marker(checkpoint));
                 }
+                ContextItemKind::Restored => input.extend(item.input_items.iter().cloned()),
                 ContextItemKind::Tool => {
                     let mut native = item.input_items.clone();
                     let output = native
@@ -1498,6 +1519,19 @@ mod tests {
         assert_eq!(second_plan.dropped, vec![volatile_tail]);
         assert_eq!(second_plan.reused_generation, Some(first_change.generation));
         assert!(second_plan.rewrite_tokens < second_plan.retained_tokens);
+    }
+
+    #[test]
+    fn restored_history_is_rendered_verbatim_before_new_context() {
+        let history = vec![
+            json!({"role":"user","content":[{"type":"input_text","text":"original"}]}),
+            json!({"type":"function_call_output","call_id":"call_1","output":"done"}),
+        ];
+        let mut state = ContextState::from_input_items(history.clone(), 0);
+
+        assert_eq!(state.input_items(), history);
+        state.add_user("follow-up".into());
+        assert_eq!(&state.input_items()[..history.len()], history.as_slice());
     }
 
     #[test]
