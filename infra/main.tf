@@ -420,17 +420,16 @@ data "aws_iam_policy_document" "task_image_publisher" {
     resources = ["*"]
   }
 
+  # Amazon ECR Public's documented registry-login prerequisites are
+  # ecr-public:GetAuthorizationToken and sts:GetServiceBearerToken. The
+  # service-bearer request made by the ECR Public CLI did not satisfy the
+  # STS condition key in practice, so keep this narrowly scoped role's
+  # required bearer-token permission unconditional.
   statement {
-    sid       = "GetOnlyEcrPublicBearerToken"
+    sid       = "GetEcrPublicBearerToken"
     effect    = "Allow"
     actions   = ["sts:GetServiceBearerToken"]
     resources = ["*"]
-
-    condition {
-      test     = "StringEquals"
-      variable = "sts:AWSServiceName"
-      values   = ["ecr-public.amazonaws.com"]
-    }
   }
 
   statement {
@@ -494,6 +493,7 @@ data "aws_iam_policy_document" "artifact_session" {
     sid    = "ReadAndWriteOnlyTheTaggedRun"
     effect = "Allow"
     actions = [
+      "s3:DeleteObject",
       "s3:GetObject",
       "s3:PutObject",
     ]
