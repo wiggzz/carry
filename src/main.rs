@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
-use run::{Backend, RunConfig, UserInput};
+use run::{Backend, CompactionMode, RunConfig, UserInput};
 use tokio::sync::mpsc;
 
 const EXAMPLES: &str = r#"Examples:
@@ -75,6 +75,15 @@ struct Cli {
     #[arg(long)]
     max_steps: Option<usize>,
 
+    /// Context compaction policy. `economic` compacts only when the next request is cheaper; `disabled` preserves all context.
+    #[arg(
+        long,
+        value_enum,
+        env = "CARRY_COMPACTION_POLICY",
+        default_value_t = CompactionPolicyArg::Economic
+    )]
+    compaction_policy: CompactionPolicyArg,
+
     /// Timeout for each shell command.
     #[arg(long, default_value_t = 300)]
     shell_timeout_secs: u64,
@@ -82,6 +91,21 @@ struct Cli {
     /// JSONL Step objects to use instead of calling a model.
     #[arg(long, hide = true)]
     scripted_steps: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CompactionPolicyArg {
+    Economic,
+    Disabled,
+}
+
+impl From<CompactionPolicyArg> for CompactionMode {
+    fn from(value: CompactionPolicyArg) -> Self {
+        match value {
+            CompactionPolicyArg::Economic => Self::Economic,
+            CompactionPolicyArg::Disabled => Self::Disabled,
+        }
+    }
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -183,6 +207,7 @@ async fn run_command(args: Cli) -> Result<()> {
         model: args.model,
         max_steps: args.max_steps,
         shell_timeout_secs: args.shell_timeout_secs,
+        compaction_mode: args.compaction_policy.into(),
     };
 
     let outcome = if interactive {
@@ -289,6 +314,21 @@ mod tests {
     #[test]
     fn prompt_sources_are_mutually_exclusive() {
         assert!(Cli::try_parse_from(["carry", "-p", "one", "two"]).is_err());
+    }
+
+    #[test]
+    fn disabled_compaction_policy_is_accepted() {
+        let args = Cli::try_parse_from([
+            "carry",
+            "--compaction-policy",
+            "disabled",
+            "fix",
+            "the",
+            "tests",
+        ])
+        .unwrap();
+        assert_eq!(args.compaction_policy, CompactionPolicyArg::Disabled);
+        assert_eq!(args.prompt_words, ["fix", "the", "tests"]);
     }
 
     #[test]

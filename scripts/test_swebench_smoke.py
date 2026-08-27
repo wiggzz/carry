@@ -38,7 +38,9 @@ class SmokeWorkerTests(unittest.TestCase):
         }
         config = self.worker.validate_config(valid)
         self.assertEqual(config["PI_VERSION"], "0.84.2")
-        for key, value in (("BASE_IMAGE", "node:22"), ("CODEX_VERSION", "latest")):
+        self.assertEqual(config["CARRY_COMPACTION_POLICY"], "economic")
+        for key, value in (("BASE_IMAGE", "node:22"), ("CODEX_VERSION", "latest"),
+                           ("CARRY_COMPACTION_POLICY", "adaptive")):
             bad = dict(valid)
             bad[key] = value
             with self.subTest(key=key), self.assertRaises(ValueError):
@@ -127,6 +129,7 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertIn("--harness\ncodex", rendered)
             self.assertIn("HOME=/agent-home", rendered)
             self.assertIn("AGENT_TIMEOUT_SECONDS=315", rendered)
+            self.assertIn("--env\nCARRY_COMPACTION_POLICY", rendered)
             self.assertIn("carry-agent-codex-test", rendered)
             self.assertIn("/agent-home:rw", rendered)
             self.assertIn("/tmp:rw", rendered)
