@@ -21,6 +21,12 @@ on:
         default: carry
         type: choice
         options: [carry, codex, pi, all]
+      carry_compaction_policy:
+        description: Carry-only context policy; record it for paired ablations
+        required: true
+        default: economic
+        type: choice
+        options: [economic, disabled]
       catalog_digest:
         description: Immutable prepare-50 catalog digest (sha256:...); required for model-bearing modes
         required: false
@@ -64,6 +70,7 @@ jobs:
       BOOTSTRAP_WAIT_SECONDS: ${{ inputs.bootstrap_wait_seconds }}
       BENCHMARK_MODE: ${{ inputs.mode }}
       BENCHMARK_HARNESS: ${{ inputs.harness }}
+      CARRY_COMPACTION_POLICY: ${{ inputs.carry_compaction_policy }}
       MODEL: ${{ vars.BENCHMARK_MODEL || 'gpt-5.6-luna' }}
       REASONING: ${{ vars.BENCHMARK_REASONING || 'medium' }}
     steps:
@@ -169,6 +176,10 @@ jobs:
             done
             [[ "$BENCHMARK_HARNESS" =~ ^(carry|codex|pi|all)$ ]] || {
               echo "benchmark harness must be carry, codex, pi, or all" >&2
+              exit 1
+            }
+            [[ "$CARRY_COMPACTION_POLICY" =~ ^(economic|disabled)$ ]] || {
+              echo "carry compaction policy must be economic or disabled" >&2
               exit 1
             }
             [[ "$TASK_IMAGE_CATALOG" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] || {
@@ -307,6 +318,7 @@ jobs:
             printf 'SOURCE_COMMIT=%q\n' "$SOURCE_COMMIT"
             printf 'BENCHMARK_MODE=%q\n' "$BENCHMARK_MODE"
             printf 'BENCHMARK_HARNESS=%q\n' "$BENCHMARK_HARNESS"
+            printf 'CARRY_COMPACTION_POLICY=%q\n' "$CARRY_COMPACTION_POLICY"
             printf 'BOOTSTRAP_WAIT_SECONDS=%q\n' "$BOOTSTRAP_WAIT_SECONDS"
             printf 'RUN_ID=%q\n' "$RUN_ID"
             printf 'MODEL=%q\n' "$MODEL"

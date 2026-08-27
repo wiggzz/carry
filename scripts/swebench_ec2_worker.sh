@@ -20,6 +20,7 @@ worker_started_at=$(date +%s)
 : "${CONTROL_URL_B64:=}"
 : "${MODEL:=gpt-5.6-luna}"
 : "${REASONING:=medium}"
+: "${CARRY_COMPACTION_POLICY:=economic}"
 : "${CARRY_ROOT:=/opt/carry}"
 : "${SECRET_FILE:=/dev/shm/carry-openai-key}"
 DOCKER_AUTH_FILE=/dev/shm/carry-dockerhub-auth
@@ -92,6 +93,10 @@ case "$BENCHMARK_MODE" in
   smoke-5|official-50|prepare-50) ;;
   *) echo "unknown benchmark mode" >&2; exit 2 ;;
 esac
+[[ "$CARRY_COMPACTION_POLICY" =~ ^(economic|disabled)$ ]] || {
+  echo "CARRY_COMPACTION_POLICY must be economic or disabled" >&2
+  exit 2
+}
 
 docker_auth_url=$(printf '%s' "$DOCKER_AUTH_URL_B64" | base64 -d)
 [[ -n "$docker_auth_url" ]] || { echo "missing Docker Hub authentication capability" >&2; exit 2; }

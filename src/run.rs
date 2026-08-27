@@ -37,6 +37,13 @@ Large text shell results arrive as structured `output_head` and `output_tail` pr
 
 Work only within the assigned repository. Do not perform destructive or external actions."#;
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    Economic,
+    Disabled,
+}
+
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub cwd: PathBuf,
@@ -45,6 +52,7 @@ pub struct RunConfig {
     pub model: String,
     pub max_steps: Option<usize>,
     pub shell_timeout_secs: u64,
+    pub compaction_mode: CompactionMode,
 }
 
 const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
@@ -412,6 +420,7 @@ async fn run_loop(
             "max_steps": config.max_steps,
             "cache_ttl_seconds": CACHE_TTL.as_secs(),
             "prompt_cache_capabilities": prompt_cache_capabilities,
+            "compaction_policy": config.compaction_mode,
             "compaction_decision": "next_request"
         }),
         &format!("carry · {} · {}", config.model, config.cwd.display()),
@@ -454,14 +463,16 @@ async fn run_loop(
         } else {
             "economic"
         };
-        maybe_compact(
-            &mut context_state,
-            &protected_until_request,
-            &mut cache,
-            &mut metrics,
-            &mut logger,
-            trigger,
-        )?;
+        if config.compaction_mode == CompactionMode::Economic {
+            maybe_compact(
+                &mut context_state,
+                &protected_until_request,
+                &mut cache,
+                &mut metrics,
+                &mut logger,
+                trigger,
+            )?;
+        }
         step_index += 1;
         turn_step += 1;
         let history = context_state.input_items();
@@ -1009,6 +1020,7 @@ async fn write_final_artifacts(
         "usage": &metrics.usage,
         "model_latency_ms": metrics.model_latency_ms,
         "response_retries": metrics.response_retries,
+        "compaction_policy": config.compaction_mode,
         "compactions": metrics.compactions,
         "elapsed_ms": elapsed_ms
     });
@@ -1537,6 +1549,7 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Disabled,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1555,6 +1568,7 @@ mod tests {
         assert_eq!(result["model_latency_ms"], 0);
         assert_eq!(result["response_retries"], 0);
         assert_eq!(result["compactions"], 0);
+        assert_eq!(result["compaction_policy"], "disabled");
         assert!(result["elapsed_ms"].is_u64());
     }
 
@@ -1580,6 +1594,7 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: None,
                 shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Economic,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1617,6 +1632,7 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: None,
                 shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Economic,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1669,6 +1685,7 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Disabled,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1722,6 +1739,7 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: None,
                 shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Economic,
             },
             Backend::scripted(&steps_file).await.unwrap(),
             receiver,

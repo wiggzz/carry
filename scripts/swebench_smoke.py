@@ -355,6 +355,9 @@ def official_phase_limits(values: Mapping[str, str] | None = None) -> dict[str, 
 def validate_config(values: Mapping[str, str]) -> dict[str, str]:
     required = ("BASE_IMAGE", "CODEX_VERSION", "PI_VERSION", "MODEL", "REASONING")
     config = {key: values.get(key, "") for key in required}
+    config["CARRY_COMPACTION_POLICY"] = values.get("CARRY_COMPACTION_POLICY", "economic")
+    if config["CARRY_COMPACTION_POLICY"] not in {"economic", "disabled"}:
+        raise ValueError("CARRY_COMPACTION_POLICY must be economic or disabled")
     if not DIGEST_IMAGE.fullmatch(config["BASE_IMAGE"]):
         raise ValueError("BASE_IMAGE must use an immutable sha256 digest")
     for key in ("CODEX_VERSION", "PI_VERSION"):
@@ -514,6 +517,7 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
         "--security-opt", "no-new-privileges", "--env", "OPENAI_API_KEY",
         "--env", f"OPENAI_BASE_URL={api_base}",
         "--env", f"AGENT_TIMEOUT_SECONDS={agent_timeout_seconds}",
+        "--env", "CARRY_COMPACTION_POLICY",
         "--env", "BENCHMARK_WORKSPACE=/testbed",
         "--env", "HOME=/agent-home", "--env", "XDG_CONFIG_HOME=/agent-home/.config",
         "--tmpfs", "/agent-home:rw,nosuid,nodev,size=256m",
@@ -1937,7 +1941,9 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     provenance_payload = {
         "dataset": DATASET, "dataset_revision": DATASET_REVISION,
         "swebench_version": "4.1.0", "model": validated["MODEL"],
-        "reasoning": validated["REASONING"], "images": {},
+        "reasoning": validated["REASONING"],
+        "carry_compaction_policy": validated["CARRY_COMPACTION_POLICY"],
+        "images": {},
         "mode": mode, "harnesses": list(harnesses), "phase": "planned",
         "pricing_usd_per_million": pricing,
     }
