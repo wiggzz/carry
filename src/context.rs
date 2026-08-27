@@ -1605,4 +1605,32 @@ mod tests {
             vec![2]
         );
     }
+
+    #[test]
+    fn context_state_round_trips_between_task_boundaries() {
+        let mut state = ContextState::new("first task".to_owned());
+        let tool_id = add_tool_with_output(&mut state, "first result");
+        state.record_signals(&update(&[tool_id], &[], &[]), tool_id);
+
+        let encoded = state.encode().unwrap();
+        let mut resumed = ContextState::decode(&encoded).unwrap();
+        resumed.add_user("second task".to_owned());
+
+        let rendered = resumed.input_items();
+        assert!(
+            rendered
+                .iter()
+                .any(|item| item.to_string().contains("first task"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|item| item.to_string().contains("first result"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|item| item.to_string().contains("second task"))
+        );
+    }
 }

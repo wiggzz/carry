@@ -16,7 +16,10 @@ parser.add_argument("--model", required=True)
 parser.add_argument("--reasoning", required=True)
 parser.add_argument("--prompt", required=True)
 parser.add_argument("--output", required=True)
+parser.add_argument("--resume-session", type=pathlib.Path)
 args = parser.parse_args()
+if args.resume_session and args.harness != "carry":
+    parser.error("--resume-session is supported only by the Carry harness")
 if not os.environ.get("OPENAI_API_KEY"):
     parser.error("OPENAI_API_KEY is required")
 if not os.environ.get("OPENAI_BASE_URL"):
@@ -47,6 +50,8 @@ values = {
     "output": args.output,
 }
 command = [part.format(**values) for part in shlex.split(template)]
+if args.resume_session:
+    command.extend(["--resume", str(args.resume_session)])
 workspace = os.environ.get("BENCHMARK_WORKSPACE", "/workspace")
 subprocess.run(
     ["git", "config", "--global", "--add", "safe.directory", workspace],

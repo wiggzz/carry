@@ -90,9 +90,13 @@ if [[ "$BENCHMARK_MODE" == bootstrap ]]; then
   exit 0
 fi
 case "$BENCHMARK_MODE" in
-  smoke-5|official-50|prepare-50) ;;
+  smoke-5|session-smoke-5|official-50|prepare-50) ;;
   *) echo "unknown benchmark mode" >&2; exit 2 ;;
 esac
+if [[ "$BENCHMARK_MODE" == session-smoke-5 && "$BENCHMARK_HARNESS" != carry ]]; then
+  echo "session-smoke-5 requires BENCHMARK_HARNESS=carry" >&2
+  exit 2
+fi
 [[ "$CARRY_COMPACTION_POLICY" =~ ^(economic|disabled)$ ]] || {
   echo "CARRY_COMPACTION_POLICY must be economic or disabled" >&2
   exit 2
@@ -174,6 +178,10 @@ if [[ "$BENCHMARK_MODE" == official-50 ]]; then
 elif [[ "$BENCHMARK_MODE" == prepare-50 ]]; then
   export EVALUATOR_CONCURRENCY=5
   OVERALL_TIMEOUT_SECONDS=18000
+elif [[ "$BENCHMARK_MODE" == session-smoke-5 ]]; then
+  export AGENT_CONCURRENCY=1
+  export EVALUATOR_CONCURRENCY=5
+  OVERALL_TIMEOUT_SECONDS=3000
 else
   export EVALUATOR_CONCURRENCY=5
   OVERALL_TIMEOUT_SECONDS=3000

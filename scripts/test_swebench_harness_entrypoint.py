@@ -12,6 +12,40 @@ ENTRYPOINT = pathlib.Path(__file__).parents[1] / "containers" / "swebench-harnes
 
 
 class HarnessEntrypointTests(unittest.TestCase):
+    def test_carry_resume_session_is_forwarded_only_to_the_carry_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo, prompt_dir, output = root / "repo", root / "input", root / "output"
+            binary, session = root / "bin" / "carry", root / "session"
+            repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); binary.parent.mkdir(parents=True); session.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "file.txt").write_text("before\n")
+            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            (prompt_dir / "task.md").write_text("fix")
+            binary.write_text(
+                "#!/usr/bin/env python3\nimport pathlib,sys\n"
+                "index=sys.argv.index('--resume')\n"
+                "assert sys.argv[index + 1] == '/benchmark/session', sys.argv\n"
+                "pathlib.Path('file.txt').write_text('after\\n')\n"
+            )
+            binary.chmod(0o755)
+            env = dict(os.environ, OPENAI_API_KEY="unit-test-secret",
+                       OPENAI_BASE_URL="http://openai-proxy:8080/v1",
+                       PREPARED_HARNESS_ROOT=str(root), AGENT_TIMEOUT_SECONDS="30",
+                       BENCHMARK_WORKSPACE=str(repo))
+            run = subprocess.run(
+                ["python3", str(ENTRYPOINT), "run", "--harness", "carry",
+                 "--model", "model", "--reasoning", "medium",
+                 "--prompt", str(prompt_dir / "task.md"), "--output", str(output),
+                 "--resume-session", "/benchmark/session"],
+                cwd=repo, env=env, text=True, capture_output=True,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertIn("+after", (output / "final.patch").read_text())
+
     def test_prepared_image_selects_harness_without_image_environment_template(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
