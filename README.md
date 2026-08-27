@@ -1,21 +1,64 @@
 # Carry
 
-Carry is an experimental agentic coding harness that aims to minimize token use and cost while maintaining performance comparable to state-of-the-art harnesses. It lets the model signal which context matters while a cache-aware planner decides when compaction is worth its rewrite cost. Each model turn must produce one structured `shell` or `finish` function call and a sparse context-management update.
+Carry is an experimental coding agent that tries to spend less context without
+throwing away the evidence needed to finish the job. It runs a model with a
+shell, keeps a chronological record of the work, and writes a patch plus a
+trace you can inspect afterward.
 
-> **Security:** Carry's shell tool is not a security boundary. Run it only in a disposable checkout or another isolation mechanism you control. Never give an agent a workspace containing secrets or unrelated source trees.
+Use it on a disposable checkout. Carry's shell is **not** a security boundary:
+never give it a repository, home directory, or container that contains secrets
+or unrelated work.
 
-## Install
+## Why Carry exists
 
-### Linux x86_64 release
+Most coding agents either keep every tool result in context or periodically
+summarize history with a fixed rule. Carry takes a different approach:
 
-Download the `carry-<version>-x86_64-unknown-linux-gnu.tar.gz` asset from the [latest release](https://github.com/wiggzz/carry/releases/latest), verify it with the accompanying `SHA256SUMS`, then place `carry` on your `PATH`.
+- The model marks recent evidence as protected, removable, or worth remembering.
+- A cache-aware planner decides whether rewriting context will make the **next**
+  request cheaper. If it will not, Carry keeps the existing history.
+- The result is a chronological, inspectable record instead of an opaque
+  summary. `trace.jsonl`, shell outputs, `result.json`, and `final.patch` stay
+  with the session.
+
+This is still an experiment. The point is to make the tradeoff measurable, not
+claim that context compaction is always useful.
+
+## Latest benchmark result
+
+The latest complete comparison was a fixed 50-task SWE-bench Verified run with
+`gpt-5.6-luna` at medium reasoning. All 150 Carry, Codex, and Pi slots were
+evaluated.
+
+| Harness | Resolved | Recorded model cost |
+| --- | ---: | ---: |
+| Carry | 40 / 50 | $0.536538 |
+| Codex | 41 / 50 | $1.092152 |
+| Pi | 39 / 50 | $0.649433 |
+
+Carry was one task behind Codex and one ahead of Pi on this catalog while using
+less recorded model spend than either. These are artifact-recorded estimates,
+not provider invoices, and one 50-task run is evidence rather than a general
+performance claim. The [run artifact](https://github.com/wiggzz/carry/actions/runs/33029120967)
+contains the per-task outcomes, tokens, costs, and provenance.
+
+## Try it
+
+### Install a release
+
+Download the Linux x86_64 archive and its `SHA256SUMS` file from the
+[latest release](https://github.com/wiggzz/carry/releases/latest). Verify the
+archive before installing it:
 
 ```sh
-tar -xzf carry-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+sha256sum -c SHA256SUMS
+mkdir -p ~/.local/bin
+tar -xzf carry-<version>-x86_64-unknown-linux-gnu.tar.gz
 install -m 0755 carry ~/.local/bin/carry
+carry --help
 ```
 
-### Build from source
+### Or build from source
 
 ```sh
 git clone https://github.com/wiggzz/carry.git
@@ -24,47 +67,65 @@ cargo build --release --locked
 ./target/release/carry --help
 ```
 
-## Use
+### Run a task
 
-Set an OpenAI API key only in the process environment, then run Carry against a disposable repository checkout. Prompt words can be passed directly or with `-p` when the text contains option-like values.
+Set an OpenAI API key in the process environment, then point Carry at an
+isolated repository checkout:
 
 ```sh
 export OPENAI_API_KEY=...
 carry --cwd /path/to/disposable/repo fix the failing tests
+```
+
+Use `-p` when the prompt itself starts with an option-like value:
+
+```sh
 carry --cwd /path/to/disposable/repo -p "explain why --release is failing"
 ```
 
-Run `carry` without a prompt to start an interactive session, or add `--interactive` to continue after an initial prompt. Input remains active while the model and shell commands run; steering is queued and appended immediately after the current action completes. Use `/help`, `/quit`, or `/exit` at the prompt.
+Run `carry` without a prompt for an interactive session. You can also add
+`--interactive` after an initial prompt. While Carry works, type another
+instruction to queue it after the current shell action. `/help`, `/quit`, and
+`/exit` work at the prompt.
 
-The default model is `gpt-5.6-luna`; override it with `--model` or `OPENAI_MODEL`. Sessions have no default step limit. Use `--max-steps N` only when an explicit per-turn cap is required. Context compaction defaults to `--compaction-policy economic`; use `--compaction-policy disabled` (or `CARRY_COMPACTION_POLICY=disabled`) for a paired no-compaction control run. The selected policy is recorded in both `trace.jsonl` and `result.json`. Responses API `429` responses with `error.code=rate_limit_exceeded` and connection failures before a response is received are retried up to five times. Carry honors `Retry-After-Ms`, numeric `Retry-After`, and HTTP-date `Retry-After`; the total wait budget is 60 seconds, and Carry stops rather than sending earlier when the server requests a longer delay. Missing or invalid delay headers and transport failures use bounded exponential backoff. Retries resend the identical request body; successful model-response events include the retry count, and exhausted errors include the retry/wait summary. Quota failures and ambiguous `5xx` POST failures are not replayed.
+Carry defaults to `gpt-5.6-luna`; override it with `--model` or `OPENAI_MODEL`.
+There is no default step limit. Use `--max-steps N` only when you need a cap.
 
-Session data is written beneath `$CARRY_HOME/sessions` or `~/.carry/sessions` by default. Use `--session-home` to select another parent or `--session-dir` to choose the exact directory. A session contains `trace.jsonl`, `trace.log`, shell outputs, `result.json`, and `final.patch`. Model request traces exclude HTTP headers and the API key.
+## Inspect a run
 
-The terminal shows compact per-step input, cache-read, cache-write, and output token counts. Compactions are called out as `minor` or `major` with the dropped, retained, and rewritten token estimates; `result.json` records aggregate token usage and compaction counts.
+Sessions are written under `$CARRY_HOME/sessions` or `~/.carry/sessions`.
+Choose another parent with `--session-home`, or choose the exact directory with
+`--session-dir`.
+
+Each session includes:
+
+- `final.patch`: the patch produced by the agent
+- `result.json`: outcome, aggregate token use, cost estimate, and compaction count
+- `trace.jsonl`: chronological structured events with no API headers or key
+- `trace.log` and shell-output files: human-readable execution evidence
+
+The terminal prints compact per-step input, cache-read, cache-write, and output
+token counts. `result.json` records the selected compaction policy and retries.
 
 ## Context policy
 
-Carry keeps one strictly chronological context ledger. Human messages and memories enter stable retention; tool interactions begin volatile. Stable items persist by default, while neutral volatile items remain in a recent working window and may be removed automatically under budget pressure unless the model marks them `protected`. The stable cache frontier is the longest chronological prefix made entirely of stable items; later stable human messages remain durable without reordering history or forcing earlier volatile items to promote.
+Carry retains human messages and model-authored memories by default. Tool
+interactions start in a recent working window. The model may protect evidence
+that must survive, mark evidence removable, or save one concise learning from
+a bulky tool result.
 
-Every item has a compact integer ID and a marker showing its current lifecycle; tool results end with markers such as `[context 2 volatile]`. Carry preserves all native Responses API output items—including reasoning items—alongside function results. Between compactions, retained history grows by exact appends for prompt-cache reuse. Immediately before each model request, the planner compares that request with and without compaction and rewrites only when the compacted request is already cheaper. Compaction may remove explicitly removable items and neutral volatile items selected under the automatic budget, preserves chronology, promotes protected items to stable, and establishes a new explicit cache frontier. After the first compaction removes history, Carry adds one stable status item stating that earlier context has been removed.
+The default `economic` policy compares the next model request with and without
+compaction, then rewrites only when the compacted request is already cheaper.
+For an ablation or control run, disable compaction explicitly:
 
-Each action performs its highest-priority task step and can preserve learning from recently visible context:
-
-```json
-{
-  "command": "...",
-  "message": "Checking the focused tests first.",
-  "context": {
-    "protected": [2, 3],
-    "removable": [],
-    "remember": ["Concise learning preserved from bulky evidence"]
-  }
-}
+```sh
+carry --compaction-policy disabled --cwd /path/to/disposable/repo fix the tests
+# or: CARRY_COMPACTION_POLICY=disabled carry ...
 ```
 
-`protected` and `removable` are persistent model-facing retention decisions, limited to four IDs each per turn. Protect an item when it contains learning that is not represented elsewhere. Make an item removable only when it taught nothing or when everything learned from it is preserved elsewhere. A later opposite decision reverses the prior opinion, and protection wins if both name the same ID in one response. Unknown or stale IDs are ignored.
-
-`remember` is limited to one concise learning per turn. Use it when a small conclusion should remain but retaining its bulky source would be wasteful; make the source removable rather than also protecting it. Its stable ID is stored inside that tool result without duplicating the memory text, which remains in the original function-call arguments. If compaction later removes the source tool but retains the memory, Carry materializes it as an assistant message with the same memory ID during that cache rewrite.
+Carry records the selected policy in `trace.jsonl` and `result.json`. See the
+[context-policy design](docs/context-policy.md) for the ledger, retention
+markers, cache frontier, and rewrite rules.
 
 ## Development
 
@@ -75,152 +136,34 @@ cargo test
 cargo build --release --locked
 ```
 
-The deterministic fixture smoke test requires Docker but no model credentials:
+The deterministic fixture smoke needs Docker but no model credential:
 
 ```sh
 docker build --tag carry:dev .
 ./scripts/run-fixture.sh clamp scripted
 ```
 
-Live fixtures require `OPENAI_API_KEY`. Codex fixture comparisons require a separately configured Codex CLI session; neither runs in CI.
+Live fixtures require `OPENAI_API_KEY`. Codex fixture comparisons also require
+a separately configured Codex CLI session; neither runs in CI.
 
-## Running SWE-bench
+## SWE-bench operations
 
-The manually dispatched **Run SWE-bench** workflow has a credential-free
-`bootstrap` default plus protected `prepare-50`, `smoke-5`, and `official-50`
-modes. Apply the Terraform deployment first, then configure these protected
-`swe-bench` GitHub Environment values:
+The manual, protected `Run SWE-bench` workflow is for maintainers. It has
+credential-free `bootstrap`, catalog-building `prepare-50`, pull-only
+`smoke-5`, and fixed-denominator `official-50` modes. Read
+[benchmark isolation](docs/benchmark-isolation.md) and
+[the workflow](.github/workflows/run-swebench.yml) before dispatching one.
 
-- `BENCHMARK_AWS_REGION`
-- `BENCHMARK_DISPATCH_ROLE_ARN`
-- `BENCHMARK_ARTIFACT_BUCKET`
-- `BENCHMARK_ARTIFACT_SESSION_ROLE_ARN`
-- `BENCHMARK_TASK_IMAGE_PUBLISHER_ROLE_ARN`
-- `BENCHMARK_TASK_IMAGE_REPOSITORY` (the public ECR repository URI)
-- `BENCHMARK_WORKER_LAUNCH_TEMPLATE_ID`
-- `BENCHMARK_WORKER_LAUNCH_TEMPLATE_VERSION` (the numeric Terraform output)
-- secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`
-- secret `OPENAI_API_KEY` for model-bearing modes only
-- optional `BENCHMARK_MODEL` (defaults to `gpt-5.6-luna`) and
-  `BENCHMARK_REASONING` (defaults to `medium`)
-
-The reviewed worker pins Node 22.19 and Rust base-image manifest digests,
-`@openai/codex@0.147.0`, and `@earendil-works/pi-coding-agent@0.84.2`.
-It builds each selected harness once per disposable benchmark worker and mounts
-that harness as a read-only bundle; task environments are never built in a
-model-bearing run.
-
-Dispatch `prepare-50` first. Its credential-free-with-respect-to-models worker
-computes a deterministic environment key from the pinned dataset revision,
-public task identity/base commit/version, transformed trusted-CA base recipe,
-sanitization recipe, SWE-bench version, and platform. It anonymously checks the
-public ECR repository, reuses and verifies complete cache pairs, and builds only
-missing official evaluator images plus their thin sanitized agent derivatives.
-It runs networkless public-test readiness before publishing the agent `ready-*`
-tag, then records both immutable repository digests in
-`preparation-report.json`. The temporary worker receives a short-lived Docker
-registry token, but no model key or general AWS credentials.
-
-`smoke-5` and `official-50` are strictly pull-only. Before the first model call,
-they concurrently pull every required evaluator/agent pair, verify the cache
-key and parent image identity, retag the evaluator image for the official
-SWE-bench grader, and persist all resolved `@sha256:` references. A missing,
-invalid, or incomplete pair fails the run before model spend; there is no
-build-on-cache-miss fallback. Pass the `sha256:...` portion of the publisher's
-`catalog_reference` as the workflow's `catalog_digest`; the worker then extracts
-that OCI catalog and pulls every task image by the digest frozen inside it.
-`smoke-5` uses the repository-stratified manifest
-(one Django, SymPy, xarray, pytest, and requests task), while `official-50`
-requires all 50 frozen IDs. Use `harness=all` for the Carry/Codex/pi comparison.
-
-The sanitized image contains ordinary task dependencies and a trusted overlay
-of Git-ignored build products, but no harness bundle, tracked source checkout,
-Git metadata, or setup scripts. Each slot mounts exactly one selected harness
-bundle read-only plus a separately verified base-only checkout at `/testbed`.
-Gold patches, hidden tests, evaluator records, competing harnesses, and registry
-credentials remain outside the agent container.
-
-Before each slot starts, the trusted worker creates a fresh Git repository by fetching only
-a temporary ref at the declared base commit. It then removes that ref, the origin remote,
-local branch, and reflogs; prunes unreachable objects; and fails preflight if `git fsck`
-finds anything outside the base commit and its ancestors. Gold patches, hidden test patches,
-and canonical grading records remain in host-only paths that are not mounted into the agent
-container.
-
-Every agent slot runs on its own Docker `--internal` network with external DNS disabled.
-A read-only, capability-free proxy container bridges that network to the provider, but
-forwards only OpenAI Responses API paths to the fixed `api.openai.com` upstream. The
-worker fails closed unless preflight proves that DNS, direct IPv4, direct IPv6, and a
-GitHub request are blocked while the proxy health endpoint remains reachable. The
-agent receives only the proxy's fixed internal address; trusted grading runs separately
-after the generated patch is captured and the model credential is removed. Proxy
-containers and both per-slot networks receive verified cleanup on every return path.
-
-Official execution uses five ordered ten-task agent shards at concurrency five (the
-smaller modes default to three), removes each shard's working checkouts after patch
-capture, deletes the model key before grading, and evaluates the selected harness in ten
-ordered five-task shards at evaluator concurrency five with `swebench==4.1.0`. Limiting each evaluator shard to five avoids the Docker-daemon
-create saturation observed when ten instance containers launched together. It writes the full
-50-slot `not-run` checkpoint before catalog pulls and checkpoints after every agent and
-evaluator shard, so infrastructure failure cannot silently shrink the denominator. Evaluator
-errors or missing outcomes mark provenance incomplete and fail the worker after artifacts are
-persisted rather than producing a green official run. Carry's
-aggregate Responses API retry count is copied into each slot record and harness summary.
-Each agent slot remains capped at six minutes. The limit is also passed into each named
-agent container; host-side cleanup retries and verifies exact-container absence, failing
-the worker closed if Docker cannot prove it stopped. Official execution reserves 50
-minutes for dependency preparation/readiness, 60 minutes for agents, 170 minutes for
-grading at evaluator concurrency five, and 20 minutes for setup inside a five-hour wall
-clock that starts before package/source setup. Evaluator shards have a 315-second outer
-cap, leaving at least 750 seconds of phase-level orchestration margin. After every evaluator
-return path, exact-run containers receive verified cleanup because SWE-bench may suppress
-its own stop/remove failures. Queued agent slots become explicit budget-exhausted
-diagnostics rather than silently disappearing.
-The controller permits twenty minutes for EC2 launch/boot around the worker clock and
-reserves the remaining forty minutes of its six-hour job for termination and exact cleanup.
-All limits, model-derived pricing, and image identities are recorded in provenance. Pricing is
-looked up by exact model ID in the reviewed benchmark code and accounts separately for ordinary
-input, cache reads, cache writes, and output; unknown models report cost as unavailable. The workflow
-streams deduplicated slot start/completion/grading events from the worker's EC2 console and
-publishes the final harness and per-slot performance/time/token/cost table in the GitHub run
-summary. The same data remains in `records.json`, `report.json`, and `report.md` in the artifact.
-
-The smoke uses one-hour S3 capabilities. During the longer official mode, the protected
-controller rotates exact-run presigned control/result capabilities every 25 minutes;
-the zero-permission worker receives only those opaque capabilities and never AWS
-credentials. The workflow uploads a `swebench-<mode>-<harness>-*` artifact containing
-predictions or publication diagnostics and the associated provenance. Model-bearing
-modes incur EC2, model-token, and storage costs; image-build costs
-belong only to `prepare-50` and remain outside the model-economic comparison.
-
-The key is encrypted in a run-scoped S3 object, fetched through a short-lived presigned
-URL into root-only `/dev/shm`, and injected into agent containers only by environment
-name. The host transiently holds it in the Actions secret environment, the encrypted
-upload stream, worker process environment, and tmpfs. It is deleted before evaluation.
-The worker has no AWS credentials and uploads through a presigned PUT; it self-terminates,
-while the controller retains exact-instance and exact-object cleanup.
-
-A reviewable live-run manifest is available without executing a model:
-
-```sh
-python3 scripts/swebench_live_runner.py plan --run-id review-1 --output live-plan.json
-```
-
-It fixes the denominator at 50 tasks × Carry/Codex/Pi = 150 records and records
-distinct external agent/evaluator container contracts. A manual protected
-workflow can invoke one selected task/harness with digest-pinned external
-containers. It forwards `OPENAI_API_KEY` only to the agent by environment name;
-the evaluator gets neither that key nor model configuration or agent output.
-The selected-50 planning and 150-record denominator remain unchanged. Official execution
-is deliberately manual and protected; review the immutable source commit and expected
-cost before dispatch. See `docs/benchmark-isolation.md`.
-Every credential-bearing agent harness—Carry, Codex, Pi, or another
-alternative—must run inside a disposable container or equivalent sandbox that
-limits its filesystem, process, and network reach. Carry Bubblewrap support is
-useful defense in depth, but is not the sole security boundary. The later mode
-must preserve the protected-environment, explicit-ref, run-scoped-artifact, and
-always-cleanup boundaries. See `docs/benchmark-isolation.md` for the v1 contract.
+Every official model-bearing run uses disposable containers, a model-key-only
+agent environment, separate credential-free grading, immutable task-image
+digests, and exact cleanup checks. The benchmark has real model and cloud cost;
+review its source commit, catalog digest, and expected spend before dispatch.
 
 ## Releases and contributions
 
-Use a release-note-eligible Conventional Commit for each pull request title: `feat`, `fix`, `perf`, or `revert`, with an optional scope and breaking-change marker—for example, `feat: add shell completion` or `fix(parser): preserve nested output`. Release Please hides non-breaking `build`, `chore`, `ci`, `docs`, `refactor`, `style`, and `test` commits by default, so CI accepts those types only with `!`; generated `chore(main): release X.Y.Z` release pull requests are also accepted. CI runs formatting, Clippy, unit tests, a release build, and the scripted fixture on pull requests and `main`. Release Please opens a release PR from conventional commits; merging that PR creates a GitHub Release with a Linux x86_64 binary and checksum.
+Use a release-note-eligible Conventional Commit for each pull request title:
+`feat`, `fix`, `perf`, or `revert`, with an optional scope and breaking-change
+marker. CI accepts the other Conventional Commit types only with `!`, because
+Release Please hides their non-breaking entries. CI runs formatting, Clippy,
+unit tests, a release build, and the scripted fixture. Release Please opens a
+release PR; merging it publishes a Linux x86_64 binary and checksum.
