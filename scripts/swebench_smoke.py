@@ -337,9 +337,9 @@ def agent_concurrency_for_mode(values: Mapping[str, str], mode: str) -> int:
 def official_phase_limits(values: Mapping[str, str] | None = None) -> dict[str, int]:
     source = values if values is not None else os.environ
     limits = {
-        "worker_seconds": int(source.get("OFFICIAL_WORKER_SECONDS", "18000")),
+        "worker_seconds": int(source.get("OFFICIAL_WORKER_SECONDS", "18900")),
         "preparation_seconds": int(source.get("OFFICIAL_PREPARATION_PHASE_SECONDS", "3000")),
-        "agent_seconds": int(source.get("OFFICIAL_AGENT_PHASE_SECONDS", "3600")),
+        "agent_seconds": int(source.get("OFFICIAL_AGENT_PHASE_SECONDS", "4500")),
         "evaluation_seconds": int(source.get("OFFICIAL_EVALUATION_PHASE_SECONDS", "10200")),
         "setup_reserve_seconds": int(source.get("OFFICIAL_SETUP_RESERVE_SECONDS", "1200")),
     }

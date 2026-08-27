@@ -335,8 +335,9 @@ jobs:
           mkdir -p benchmark-artifact
           if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == official-50 ]]; then
             # Allow twenty minutes for EC2 launch/boot around the worker's
-            # five-hour wall clock; preserve forty minutes of the six-hour job.
-            deadline=$((SECONDS + 19200))
+            # five-and-a-quarter-hour wall clock; preserve twenty-five minutes
+            # of the six-hour job for result validation and exact cleanup.
+            deadline=$((SECONDS + 20100))
             next_rotation=$((SECONDS + 1500))
           else
             deadline=$((SECONDS + 3300))
