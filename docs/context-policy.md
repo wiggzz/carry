@@ -64,6 +64,28 @@ still records the session, but it never asks the planner to rewrite history.
 Both the selected policy and aggregate compaction count appear in `result.json`
 and `trace.jsonl`.
 
+## Session-persistence benchmark mode
+
+`session-smoke-5` is a separate **Carry-only** stress-test mode, not an ordinary
+SWE-bench score. It uses the frozen five-task smoke manifest in its recorded
+order. Every task gets a fresh prepared workspace/image and normal per-task
+SWE-bench grading. Each completed Carry slot writes its native versioned
+`context-state.json` checkpoint into that slot's output directory; the next slot
+mounts that whole completed session read-only as `--resume` input and writes a
+fresh destination session. The source trace is audit evidence and is never
+modified by a later task.
+
+Each new task prompt explicitly says that its `/testbed` is new and that old
+paths, patches, and conclusions must not be reused. The artifacts record the
+task order, session ID, retained-context flag, per-task position, source and
+destination checkpoint SHA-256 values, and fresh workspace/evaluator isolation.
+Raw checkpoints are not uploaded. If a continuation source or completed output
+lacks `context-state.json`, the runner fails closed rather than launching a
+fresh-context replacement.
+
+This mode rejects Codex and Pi until their own native, cross-container session
+contracts have equivalent behavioral verification.
+
 ## What the policy does not promise
 
 Compaction is not guaranteed to reduce total task cost or improve task success.

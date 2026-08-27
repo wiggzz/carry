@@ -72,6 +72,42 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             self.assertIn("python3.11", packages)
             self.assertNotIn("curl", packages)
 
+    def test_session_worker_rejects_non_carry_harness_before_fetching_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            payload = root / "payload"; payload.mkdir()
+            archive = root / "source.tar.gz"
+            with tarfile.open(archive, "w:gz") as stream:
+                stream.add(payload, arcname="payload")
+            fake_bin = root / "bin"; fake_bin.mkdir()
+            for command in ("dnf", "systemctl"):
+                path = fake_bin / command
+                path.write_text("#!/bin/sh\nexit 0\n")
+                path.chmod(0o755)
+            curl = fake_bin / "curl"
+            curl.write_text(
+                "#!/bin/sh\n"
+                "while [ $# -gt 0 ]; do\n"
+                "  if [ \"$1\" = -o ]; then cp \"$FAKE_SOURCE_ARCHIVE\" \"$2\"; exit 0; fi\n"
+                "  shift\n"
+                "done\nexit 2\n"
+            )
+            curl.chmod(0o755)
+            carry_root = root / "worker"
+            env = dict(
+                os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}",
+                SOURCE_URL_B64=base64.b64encode(b"https://example.invalid/source").decode(),
+                KEY_URL_B64="", DOCKER_AUTH_URL_B64="", RESULT_URL_B64="",
+                SOURCE_SHA256=hashlib.sha256(archive.read_bytes()).hexdigest(), SOURCE_COMMIT="a" * 40,
+                BENCHMARK_MODE="session-smoke-5", BENCHMARK_HARNESS="codex", BOOTSTRAP_WAIT_SECONDS="1",
+                RUN_ID="gh-test-session", CARRY_ROOT=str(carry_root), SECRET_FILE=str(root / "secret"),
+                PYTHON_BIN="python3", SKIP_SHUTDOWN="1", FAKE_SOURCE_ARCHIVE=str(archive),
+            )
+            run = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
+            self.assertEqual(run.returncode, 2)
+            self.assertIn("requires BENCHMARK_HARNESS=carry", (carry_root / "results" / "worker.log").read_text())
+            self.assertFalse((root / "secret").exists())
+
     def test_official_worker_launches_runner_with_bounded_agent_and_evaluator_concurrency(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

@@ -327,10 +327,12 @@ def task_image_references(repository: str, cache_key: str) -> dict[str, str]:
 
 def agent_concurrency_for_mode(values: Mapping[str, str], mode: str) -> int:
     """Return a bounded agent parallelism that fits the selected benchmark mode."""
-    default = "5" if mode == "official-50" else "3"
+    default = "5" if mode == "official-50" else "1" if mode == "session-smoke-5" else "3"
     concurrency = int(values.get("AGENT_CONCURRENCY", default))
     if concurrency < 1 or concurrency > 5:
         raise ValueError("AGENT_CONCURRENCY must be between 1 and 5")
+    if mode == "session-smoke-5" and concurrency != 1:
+        raise ValueError("session-smoke-5 requires exactly one sequential Carry slot")
     return concurrency
 
 
@@ -506,10 +508,13 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
                          harness_bundle: pathlib.Path, task_input: pathlib.Path,
                          output: pathlib.Path, model: str, reasoning: str,
                          container_name: str, agent_timeout_seconds: int,
-                         network: str, proxy_ip: str, api_base: str) -> list[str]:
+                         network: str, proxy_ip: str, api_base: str,
+                         resume_session: pathlib.Path | None = None) -> list[str]:
     if harness not in HARNESSES:
         raise ValueError("unknown harness")
-    return [
+    if resume_session is not None and harness != "carry":
+        raise ValueError("only Carry supports a resumed session context")
+    command = [
         "docker", "run", "--rm", "--name", container_name, "--stop-timeout", "10",
         "--network", network, "--dns", "127.0.0.1",
         "--add-host", f"openai-proxy:{proxy_ip}",
@@ -526,11 +531,21 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
         "--mount", f"type=bind,src={harness_bundle.resolve()},dst=/opt/swebench-harness,readonly",
         "--mount", f"type=bind,src={task_input.resolve()},dst=/benchmark/input,readonly",
         "--mount", f"type=bind,src={output.resolve()},dst=/benchmark/output",
+    ]
+    if resume_session is not None:
+        command.extend([
+            "--mount",
+            f"type=bind,src={resume_session.resolve()},dst=/benchmark/session,readonly",
+        ])
+    command.extend([
         "--workdir", "/testbed", image, "run", "--harness", harness,
         "--model", model,
         "--reasoning", reasoning, "--prompt", "/benchmark/input/task.md",
         "--output", "/benchmark/output",
-    ]
+    ])
+    if resume_session is not None:
+        command.extend(["--resume-session", "/benchmark/session"])
+    return command
 
 
 def readiness_docker_command(*, image: str, container_name: str, repo: pathlib.Path,
@@ -1220,7 +1235,8 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
                        proxy_script: pathlib.Path, repo: pathlib.Path,
                        task_input: pathlib.Path, output: pathlib.Path, model: str, reasoning: str,
                        timeout_seconds: int | None = None,
-                       pricing: Mapping[str, float] | None = None) -> dict[str, Any]:
+                       pricing: Mapping[str, float] | None = None,
+                       resume_session: pathlib.Path | None = None) -> dict[str, Any]:
     identity = f"{instance_id}\0{harness}\0{output.resolve()}"
     network = start_agent_network(
         identity=identity, proxy_image=proxy_image, proxy_script=proxy_script,
@@ -1232,7 +1248,7 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
             repo=repo, task_input=task_input, output=output,
             model=model, reasoning=reasoning, timeout_seconds=timeout_seconds,
             pricing=pricing, network=network["internal"], proxy_ip=network["proxy_ip"],
-            api_base=network["api_base"],
+            api_base=network["api_base"], resume_session=resume_session,
         )
     finally:
         cleanup_agent_network(network)
@@ -1242,7 +1258,8 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
               harness_bundle: pathlib.Path, task_input: pathlib.Path,
               output: pathlib.Path, model: str, reasoning: str,
               network: str, proxy_ip: str, api_base: str, timeout_seconds: int | None = None,
-              pricing: Mapping[str, float] | None = None) -> dict[str, Any]:
+              pricing: Mapping[str, float] | None = None,
+              resume_session: pathlib.Path | None = None) -> dict[str, Any]:
     slot_timeout = (
         timeout_seconds if timeout_seconds is not None
         else int(os.environ.get("AGENT_TIMEOUT_SECONDS", "1200"))
@@ -1257,7 +1274,7 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
         task_input=task_input, output=output,
         model=model, reasoning=reasoning, container_name=container_name,
         agent_timeout_seconds=in_container_timeout, network=network,
-        proxy_ip=proxy_ip, api_base=api_base,
+        proxy_ip=proxy_ip, api_base=api_base, resume_session=resume_session,
     )
     started = time.monotonic()
     print("BENCHMARK_PROGRESS " + json.dumps({
@@ -1380,7 +1397,7 @@ def selection_for_mode(frozen_ids: list[str], mode: str,
                        smoke_ids: list[str] | None = None) -> list[str]:
     if len(frozen_ids) != 50 or len(set(frozen_ids)) != 50:
         raise ValueError("frozen official manifest must contain exactly 50 unique IDs")
-    if mode == "smoke-5":
+    if mode in {"smoke-5", "session-smoke-5"}:
         if (smoke_ids is None or len(smoke_ids) != 5 or len(set(smoke_ids)) != 5
                 or not set(smoke_ids).issubset(frozen_ids)):
             raise ValueError("smoke manifest must contain five unique frozen task IDs")
@@ -1388,6 +1405,11 @@ def selection_for_mode(frozen_ids: list[str], mode: str,
     if mode == "official-50":
         return list(frozen_ids)
     raise ValueError(f"unsupported benchmark mode: {mode}")
+
+
+def validate_session_mode(mode: str, harnesses: tuple[str, ...]) -> None:
+    if mode == "session-smoke-5" and harnesses != ("carry",):
+        raise ValueError("session-smoke-5 requires the Carry harness only")
 
 
 def ordered_shards(instance_ids: list[str], shard_size: int) -> list[list[str]]:
@@ -1899,17 +1921,18 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         raise ValueError("TASK_IMAGE_CATALOG must pin the configured repository by digest")
     pricing = pricing_for_model(validated["MODEL"])
     mode = config.get("BENCHMARK_MODE", "smoke-5")
+    validate_session_mode(mode, harnesses)
     phase_limits = official_phase_limits(config) if mode == "official-50" else None
     frozen_ids = json.loads(
         (source / "benchmarks" / "swe-bench-verified-50.json").read_text(encoding="utf-8")
     )["instance_ids"]
     smoke_ids = None
-    if mode == "smoke-5":
+    if mode in {"smoke-5", "session-smoke-5"}:
         smoke_ids = json.loads(
             (source / "benchmarks" / "swe-bench-verified-smoke-5.json").read_text(encoding="utf-8")
         )["instance_ids"]
     selection = selection_for_mode(frozen_ids, mode, smoke_ids)
-    agent_shard_size = 5 if mode == "smoke-5" else 10
+    agent_shard_size = 5 if mode in {"smoke-5", "session-smoke-5"} else 10
     evaluator_shard_size = 5
     agent_shards = ordered_shards(selection, agent_shard_size)
     evaluator_shards = ordered_shards(selection, evaluator_shard_size)
@@ -1922,6 +1945,9 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         raise ValueError("canonical dataset does not contain the frozen selection")
     selected_records = [by_id[instance_id] for instance_id in selection]
     work.mkdir(parents=True, exist_ok=True)
+    session_source: pathlib.Path | None = None
+    if mode == "session-smoke-5":
+        (work / "session").mkdir(parents=True, exist_ok=True)
     (work / "canonical-dataset.json").write_text(
         json.dumps(selected_records, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -1947,6 +1973,14 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "mode": mode, "harnesses": list(harnesses), "phase": "planned",
         "pricing_usd_per_million": pricing,
     }
+    if mode == "session-smoke-5":
+        provenance_payload.update({
+            "retained_context": True,
+            "session_id": f"{config['RUN_ID']}:carry",
+            "task_order": selection,
+            "task_workspace_isolation": True,
+            "evaluator_isolation": True,
+        })
     tasks = [{
         "instance_id": record["instance_id"], "repo": record["repo"],
         "base_commit": record["base_commit"], "problem_statement": record["problem_statement"],
@@ -2056,7 +2090,9 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 slots.append((task, harness, task_root, slot_output))
 
         def execute_slot(slot: tuple[Any, ...]) -> dict[str, Any]:
+            nonlocal session_source
             task, harness, task_root, slot_output = slot
+            session_position = selection.index(task["instance_id"]) + 1 if mode == "session-smoke-5" else None
             slot_timeout = agent_timeout
             if agent_deadline is not None:
                 remaining = math.ceil(agent_deadline - time.monotonic())
@@ -2069,6 +2105,33 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                         "model": validated["MODEL"], "reasoning": validated["REASONING"],
                     }
                 slot_timeout = min(slot_timeout, remaining)
+            if session_position is not None:
+                if session_position > 1 and session_source is None:
+                    return {
+                        "instance_id": task["instance_id"], "harness": harness,
+                        "status": "agent-session-context-missing", "patch": "",
+                        "error": "retained Carry source session is unavailable before this task",
+                        "attempts": 0, "retries": 0, "response_retries": 0,
+                        "model": validated["MODEL"], "reasoning": validated["REASONING"],
+                        "session_position": session_position,
+                    }
+                prompt_path = task_root / "input" / "task.md"
+                if prompt_path.is_file():
+                    task_prompt = prompt_path.read_text(encoding="utf-8")
+                    prompt_path.write_text(
+                        "# New independent benchmark task\n\n"
+                        "This task has a fresh repository and workspace. Earlier conversation "
+                        "context is retained only as historical context: do not reuse prior task "
+                        "paths, patches, commands, or conclusions. Work only in the current "
+                        "`/testbed` workspace and solve the task below.\n\n"
+                        + task_prompt,
+                        encoding="utf-8",
+                    )
+            source_state = None
+            if session_position is not None and session_source is not None:
+                source_state = session_source / "context-state.json"
+                if not source_state.is_file():
+                    raise RuntimeError("retained Carry source session has no context-state.json")
             record = run_isolated_agent(
                 instance_id=task["instance_id"], harness=harness,
                 image=prepared[task["instance_id"]]["agent_image"]["tag"],
@@ -2079,9 +2142,20 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 task_input=task_root / "input", output=slot_output,
                 model=validated["MODEL"], reasoning=validated["REASONING"],
                 timeout_seconds=slot_timeout, pricing=pricing,
+                resume_session=session_source,
             )
             record["model"] = validated["MODEL"]
             record["reasoning"] = validated["REASONING"]
+            if session_position is not None:
+                record["session_position"] = session_position
+                if source_state is not None:
+                    record["source_session_state_sha256"] = hashlib.sha256(source_state.read_bytes()).hexdigest()
+                if record["status"] == "agent-completed":
+                    state = slot_output / "context-state.json"
+                    if not state.is_file():
+                        raise RuntimeError("completed Carry slot has no context-state.json")
+                    record["session_state_sha256"] = hashlib.sha256(state.read_bytes()).hexdigest()
+                    session_source = slot_output
             return record
 
         try:
