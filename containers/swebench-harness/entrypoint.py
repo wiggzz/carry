@@ -61,7 +61,7 @@ values = {
 command = [part.format(**values) for part in shlex.split(template)]
 if args.resume_session:
     command.extend(["--resume", str(args.resume_session)])
-if args.codex_session:
+if args.codex_session and args.codex_thread:
     codex_binary = str(
         pathlib.Path(os.environ.get("PREPARED_HARNESS_ROOT", "/opt/swebench-harness")) / "bin" / "codex"
     ) if not os.environ.get("AGENT_COMMAND") else "codex"
@@ -73,6 +73,7 @@ if args.codex_session:
     ]
 if args.harness == "pi":
     if args.pi_session_dir:
+        command.remove("--no-session")
         command.extend([
             "--session", str(args.pi_session_dir / "session.jsonl"),
             "--session-dir", str(args.pi_session_dir),
