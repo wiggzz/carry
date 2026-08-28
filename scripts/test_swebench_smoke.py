@@ -1088,6 +1088,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         smoke = [frozen[index] for index in (0, 25, 40, 45, 49)]
         self.assertEqual(self.worker.selection_for_mode(frozen, "smoke-5", smoke), smoke)
         self.assertEqual(self.worker.selection_for_mode(frozen, "official-50", smoke), frozen)
+        self.assertEqual(self.worker.selection_for_mode(frozen, "session-20", smoke), frozen[:20])
 
     def test_session_smoke_uses_the_frozen_smoke_order_and_permits_exactly_one_native_harness(self):
         frozen = [f"task-{number:02d}" for number in range(50)]

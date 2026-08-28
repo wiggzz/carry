@@ -105,7 +105,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             )
             run = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
             self.assertEqual(run.returncode, 2)
-            self.assertIn("requires exactly one BENCHMARK_HARNESS=carry, codex, or pi", (carry_root / "results" / "worker.log").read_text())
+            self.assertIn("retained-session modes require exactly one BENCHMARK_HARNESS=carry, codex, or pi", (carry_root / "results" / "worker.log").read_text())
             self.assertFalse((root / "secret").exists())
 
     def test_official_worker_launches_runner_with_bounded_agent_and_evaluator_concurrency(self):

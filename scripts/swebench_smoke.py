@@ -327,12 +327,12 @@ def task_image_references(repository: str, cache_key: str) -> dict[str, str]:
 
 def agent_concurrency_for_mode(values: Mapping[str, str], mode: str) -> int:
     """Return a bounded agent parallelism that fits the selected benchmark mode."""
-    default = "5" if mode == "official-50" else "1" if mode == "session-smoke-5" else "3"
+    default = "5" if mode == "official-50" else "1" if mode in {"session-smoke-5", "session-20"} else "3"
     concurrency = int(values.get("AGENT_CONCURRENCY", default))
     if concurrency < 1 or concurrency > 5:
         raise ValueError("AGENT_CONCURRENCY must be between 1 and 5")
-    if mode == "session-smoke-5" and concurrency != 1:
-        raise ValueError("session-smoke-5 requires exactly one sequential Carry slot")
+    if mode in {"session-smoke-5", "session-20"} and concurrency != 1:
+        raise ValueError("retained-session modes require exactly one sequential native harness")
     return concurrency
 
 
@@ -1458,14 +1458,16 @@ def selection_for_mode(frozen_ids: list[str], mode: str,
                 or not set(smoke_ids).issubset(frozen_ids)):
             raise ValueError("smoke manifest must contain five unique frozen task IDs")
         return list(smoke_ids)
+    if mode == "session-20":
+        return list(frozen_ids[:20])
     if mode == "official-50":
         return list(frozen_ids)
     raise ValueError(f"unsupported benchmark mode: {mode}")
 
 
 def validate_session_mode(mode: str, harnesses: tuple[str, ...]) -> None:
-    if mode == "session-smoke-5" and harnesses not in {("carry",), ("codex",), ("pi",)}:
-        raise ValueError("session-smoke-5 requires exactly one native harness")
+    if mode in {"session-smoke-5", "session-20"} and harnesses not in {("carry",), ("codex",), ("pi",)}:
+        raise ValueError("retained-session modes require exactly one native harness")
 
 
 def ordered_shards(instance_ids: list[str], shard_size: int) -> list[list[str]]:
@@ -2006,7 +2008,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     codex_thread: str | None = None
     pi_session_dir: pathlib.Path | None = None
     pi_session_file: pathlib.Path | None = None
-    if mode == "session-smoke-5":
+    if mode in {"session-smoke-5", "session-20"}:
         session_root = work / "session"
         session_root.mkdir(parents=True, exist_ok=True)
         if harnesses == ("codex",):
@@ -2043,7 +2045,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "mode": mode, "harnesses": list(harnesses), "phase": "planned",
         "pricing_usd_per_million": pricing,
     }
-    if mode == "session-smoke-5":
+    if mode in {"session-smoke-5", "session-20"}:
         provenance_payload.update({
             "retained_context": True,
             "session_id": f"{config['RUN_ID']}:{harnesses[0]}",
@@ -2167,7 +2169,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         def execute_slot(slot: tuple[Any, ...]) -> dict[str, Any]:
             nonlocal session_source, codex_thread
             task, harness, task_root, slot_output = slot
-            session_position = selection.index(task["instance_id"]) + 1 if mode == "session-smoke-5" else None
+            session_position = selection.index(task["instance_id"]) + 1 if mode in {"session-smoke-5", "session-20"} else None
             slot_timeout = agent_timeout
             if agent_deadline is not None:
                 remaining = math.ceil(agent_deadline - time.monotonic())

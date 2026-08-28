@@ -66,11 +66,12 @@ and `trace.jsonl`.
 
 ## Session-persistence benchmark mode
 
-`session-smoke-5` is a separate retained-session stress-test mode, not an ordinary
-SWE-bench score. It accepts exactly one sequential native harness: Carry, Codex,
-or Pi (never `all` or a mixed selection). It uses the frozen five-task smoke
-manifest in its recorded order. Every task gets a fresh prepared workspace/image
-and normal per-task SWE-bench grading.
+`session-smoke-5` and `session-20` are retained-session experiment modes, not ordinary
+SWE-bench scores. Each accepts exactly one sequential native harness: Carry, Codex,
+or Pi (never `all` or a mixed selection). `session-smoke-5` uses the frozen five-task
+smoke manifest; `session-20` uses the first twenty IDs in the recorded frozen-50
+order. Every task gets a fresh prepared workspace/image and normal per-task
+SWE-bench grading.
 
 Carry retains its existing behavior: each completed slot writes its native
 versioned `context-state.json` checkpoint into that slot's output directory; the
