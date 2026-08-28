@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::protocol::ContextManagement;
@@ -15,14 +15,14 @@ const NEUTRAL_TARGET_DENOMINATOR: usize = 4;
 const HISTORY_COMPACTED_STATUS: &str =
     "[history status: earlier context has been removed by compaction]";
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Retention {
     Stable,
     Volatile,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RetentionSignal {
     Neutral,
@@ -30,7 +30,7 @@ pub(crate) enum RetentionSignal {
     Drop,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ContextItemKind {
     User,
@@ -48,7 +48,7 @@ impl Retention {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) struct ContextItem {
     pub id: u64,
     pub kind: ContextItemKind,
@@ -59,7 +59,7 @@ pub(crate) struct ContextItem {
     memory: Option<MemoryData>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 struct MemoryData {
     content: String,
     source_id: u64,
@@ -157,7 +157,7 @@ fn serialized_bytes(items: &[Value]) -> usize {
     serde_json::to_vec(items).map_or(usize::MAX, |bytes| bytes.len())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct ContextState {
     items: Vec<ContextItem>,
     next_id: u64,
@@ -166,7 +166,7 @@ pub(crate) struct ContextState {
     breakpoints: Vec<StoredBreakpoint>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredBreakpoint {
     generation: u64,
     item_ids: Vec<u64>,
@@ -198,6 +198,19 @@ impl ContextState {
                 rendered_prefix,
             }],
         }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let state: Self = serde_json::from_slice(bytes)?;
+        let max_id = state.items.iter().map(|item| item.id).max().unwrap_or(0);
+        if state.next_id < max_id {
+            bail!("persisted context next_id is behind its item IDs");
+        }
+        Ok(state)
     }
 
     pub fn add_user(&mut self, content: String) -> u64 {
@@ -244,6 +257,7 @@ impl ContextState {
                     input.extend(item.input_items.iter().cloned());
                     input.push(item.marker(checkpoint));
                 }
+
                 ContextItemKind::Tool => {
                     let mut native = item.input_items.clone();
                     let output = native
@@ -1498,6 +1512,17 @@ mod tests {
         assert_eq!(second_plan.dropped, vec![volatile_tail]);
         assert_eq!(second_plan.reused_generation, Some(first_change.generation));
         assert!(second_plan.rewrite_tokens < second_plan.retained_tokens);
+    }
+
+    #[test]
+    fn context_checkpoint_round_trips_complete_state() {
+        let mut state = ContextState::new("first task".to_owned());
+        let item = add_tool(&mut state);
+        state.record_signals(&update(&[item], &[], &["keep this"]), item);
+        let expected = state.input_items();
+
+        let restored = ContextState::decode(&state.encode().unwrap()).unwrap();
+        assert_eq!(restored.input_items(), expected);
     }
 
     #[test]
