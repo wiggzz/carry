@@ -1067,15 +1067,16 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         self.assertEqual(self.worker.selection_for_mode(frozen, "smoke-5", smoke), smoke)
         self.assertEqual(self.worker.selection_for_mode(frozen, "official-50", smoke), frozen)
 
-    def test_session_smoke_uses_the_frozen_smoke_order_and_rejects_non_carry_harnesses(self):
+    def test_session_smoke_uses_the_frozen_smoke_order_and_rejects_unsupported_harness_sets(self):
         frozen = [f"task-{number:02d}" for number in range(50)]
         smoke = [frozen[index] for index in (0, 25, 40, 45, 49)]
         self.assertEqual(
             self.worker.selection_for_mode(frozen, "session-smoke-5", smoke), smoke,
         )
-        self.worker.validate_session_mode("session-smoke-5", ("carry",))
-        for harnesses in (("codex",), ("pi",), ("carry", "codex", "pi")):
-            with self.subTest(harnesses=harnesses), self.assertRaisesRegex(ValueError, "Carry"):
+        for harnesses in (("carry",), ("codex",)):
+            self.worker.validate_session_mode("session-smoke-5", harnesses)
+        for harnesses in (("pi",), ("carry", "codex"), ("carry", "codex", "pi")):
+            with self.subTest(harnesses=harnesses), self.assertRaisesRegex(ValueError, "one supported"):
                 self.worker.validate_session_mode("session-smoke-5", harnesses)
         shards = self.worker.ordered_shards(frozen, 10)
         self.assertEqual([len(shard) for shard in shards], [10] * 5)
