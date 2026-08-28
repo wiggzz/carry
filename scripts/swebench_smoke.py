@@ -53,6 +53,31 @@ def _nonnegative_int(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
+def load_proxy_round_input_tokens(proxy_container: str | None, *, execute: Any = subprocess.run) -> list[int]:
+    """Read only provider-issued per-response inputs from isolated proxy logs."""
+    if not proxy_container:
+        return []
+    try:
+        result = execute(["docker", "logs", proxy_container], check=False, capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    values: list[int] = []
+    for line in result.stdout.splitlines():
+        prefix = "BENCHMARK_PROXY_USAGE "
+        if not line.startswith(prefix):
+            continue
+        try:
+            event = json.loads(line[len(prefix):])
+        except json.JSONDecodeError:
+            continue
+        values.append(_nonnegative_int(event.get("input_tokens") if isinstance(event, dict) else None))
+    return values
+
+
+def max_observed_input_tokens(rounds: list[int]) -> int:
+    return max(rounds, default=0)
+
+
 def load_agent_usage(harness: str, output: pathlib.Path) -> dict[str, int]:
     """Normalize cumulative token usage emitted by each pinned harness."""
     usage = empty_usage()
@@ -1297,7 +1322,7 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
             repo=repo, task_input=task_input, output=output,
             model=model, reasoning=reasoning, timeout_seconds=timeout_seconds,
             pricing=pricing, network=network["internal"], proxy_ip=network["proxy_ip"],
-            api_base=network["api_base"], resume_session=resume_session,
+            proxy_container=network["proxy"], api_base=network["api_base"], resume_session=resume_session,
             codex_session=codex_session, codex_thread=codex_thread,
             pi_session_dir=pi_session_dir,
         )
@@ -1308,7 +1333,8 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
 def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
               harness_bundle: pathlib.Path, task_input: pathlib.Path,
               output: pathlib.Path, model: str, reasoning: str,
-              network: str, proxy_ip: str, api_base: str, timeout_seconds: int | None = None,
+              network: str, proxy_ip: str, proxy_container: str | None = None, api_base: str = "",
+              timeout_seconds: int | None = None,
               pricing: Mapping[str, float] | None = None,
               resume_session: pathlib.Path | None = None,
               codex_session: pathlib.Path | None = None,
@@ -1366,6 +1392,8 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
                   "response_retries": 0,
                   "timed_out": isinstance(error, subprocess.TimeoutExpired)}
     record["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    record["round_input_tokens"] = load_proxy_round_input_tokens(proxy_container)
+    record["max_round_input_tokens"] = max_observed_input_tokens(record["round_input_tokens"])
     record["usage"] = load_agent_usage(harness, output)
     record["estimated_cost_usd"] = estimate_cost_usd(record["usage"], pricing)
     print("BENCHMARK_PROGRESS " + json.dumps({
@@ -1759,8 +1787,8 @@ def _validate_records(
     harnesses: tuple[str, ...] = HARNESSES,
 ) -> None:
     task_count = len(tasks)
-    if task_count not in (5, 50):
-        raise ValueError("benchmark must contain exactly 5 or 50 tasks")
+    if task_count not in (5, 20, 50):
+        raise ValueError("benchmark must contain exactly 5, 20, or 50 tasks")
     expected = {(task["instance_id"], harness) for task in tasks for harness in harnesses}
     actual = [(record.get("instance_id"), record.get("harness")) for record in records]
     expected_count = task_count * len(harnesses)
@@ -1784,6 +1812,8 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
         item.setdefault("elapsed_seconds", 0.0)
         item.setdefault("estimated_cost_usd", None)
         item.setdefault("usage", empty_usage())
+        item.setdefault("round_input_tokens", [])
+        item.setdefault("max_round_input_tokens", 0)
         if (isinstance(item["response_retries"], bool)
                 or not isinstance(item["response_retries"], int)
                 or item["response_retries"] < 0):
@@ -1799,6 +1829,10 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
             raise ValueError("estimated_cost_usd must be null or nonnegative")
         if not isinstance(item["usage"], dict):
             raise ValueError("usage must be an object")
+        if not isinstance(item["round_input_tokens"], list):
+            raise ValueError("round_input_tokens must be a list")
+        item["round_input_tokens"] = [_nonnegative_int(value) for value in item["round_input_tokens"]]
+        item["max_round_input_tokens"] = max_observed_input_tokens(item["round_input_tokens"])
         item["usage"] = {key: _nonnegative_int(item["usage"].get(key)) for key in USAGE_KEYS}
         normalized.append(item)
         predictions.append({
@@ -1828,6 +1862,13 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
             "usage": {
                 key: sum(item["usage"][key] for item in harness_records) for key in USAGE_KEYS
             },
+            "max_round_input_tokens": max(
+                (item["max_round_input_tokens"] for item in harness_records), default=0,
+            ),
+            "observed_input_token_decreases": sum(
+                later < earlier for item in harness_records
+                for earlier, later in zip(item["round_input_tokens"], item["round_input_tokens"][1:])
+            ),
             "estimated_cost_usd": round(sum(costs), 6) if costs else None,
             "costed_slots": len(costs),
             "statuses": dict(sorted(Counter(item["status"] for item in harness_records).items())),

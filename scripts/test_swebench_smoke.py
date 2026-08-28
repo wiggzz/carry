@@ -43,8 +43,15 @@ class SmokeWorkerTests(unittest.TestCase):
                            ("CARRY_COMPACTION_POLICY", "adaptive")):
             bad = dict(valid)
             bad[key] = value
-            with self.subTest(key=key), self.assertRaises(ValueError):
+            with self.assertRaises(ValueError):
                 self.worker.validate_config(bad)
+
+    def test_proxy_round_usage_records_maximum_and_non_monotonic_inputs(self):
+        log = "noise\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 120}\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 90}\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 180}\n"
+        execute = mock.Mock(return_value=types.SimpleNamespace(stdout=log))
+        rounds = self.worker.load_proxy_round_input_tokens("isolated-proxy", execute=execute)
+        self.assertEqual(rounds, [120, 90, 180])
+        self.assertEqual(self.worker.max_observed_input_tokens(rounds), 180)
 
     def test_selected_harness_defaults_to_carry_and_rejects_unknown(self):
         self.assertEqual(self.worker.selected_harnesses({}), ("carry",))
@@ -929,8 +936,19 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertEqual(set(report["harnesses"]), {"carry"})
             self.assertEqual(len(json.loads((output / "records.json").read_text())), 5)
 
+    def test_finalize_accepts_twenty_task_retained_session_denominator(self):
+        tasks = [{"instance_id": f"task-{number}"} for number in range(20)]
+        records = [
+            {"instance_id": task["instance_id"], "harness": "carry", "status": "not-run", "patch": ""}
+            for task in tasks
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            self.worker.finalize(tasks=tasks, records=records, output=output, provenance={}, harnesses=("carry",))
+            self.assertEqual(json.loads((output / "report.json").read_text())["denominator"], 20)
+
         with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(
-            ValueError, "5 unique"
+            ValueError, "20 unique"
         ):
             self.worker.finalize(
                 tasks=tasks,
