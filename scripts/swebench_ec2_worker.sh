@@ -93,8 +93,8 @@ case "$BENCHMARK_MODE" in
   smoke-5|session-smoke-5|official-50|prepare-50) ;;
   *) echo "unknown benchmark mode" >&2; exit 2 ;;
 esac
-if [[ "$BENCHMARK_MODE" == session-smoke-5 && "$BENCHMARK_HARNESS" != carry ]]; then
-  echo "session-smoke-5 requires BENCHMARK_HARNESS=carry" >&2
+if [[ "$BENCHMARK_MODE" == session-smoke-5 && "$BENCHMARK_HARNESS" != carry && "$BENCHMARK_HARNESS" != codex && "$BENCHMARK_HARNESS" != pi ]]; then
+  echo "session-smoke-5 requires exactly one BENCHMARK_HARNESS=carry, codex, or pi" >&2
   exit 2
 fi
 [[ "$CARRY_COMPACTION_POLICY" =~ ^(economic|disabled)$ ]] || {
