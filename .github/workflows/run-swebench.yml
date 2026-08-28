@@ -170,8 +170,8 @@ jobs:
           [[ "$BOOTSTRAP_WAIT_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] && (( BOOTSTRAP_WAIT_SECONDS <= 300 )) || {
             echo "bootstrap_wait_seconds must be an integer from 1 through 300" >&2; exit 1;
           }
-          if [[ "$BENCHMARK_MODE" == session-smoke-5 && "$BENCHMARK_HARNESS" != carry ]]; then
-            echo "session-smoke-5 requires BENCHMARK_HARNESS=carry" >&2
+          if [[ "$BENCHMARK_MODE" == session-smoke-5 && "$BENCHMARK_HARNESS" != carry && "$BENCHMARK_HARNESS" != codex ]]; then
+            echo "session-smoke-5 requires BENCHMARK_HARNESS=carry or codex" >&2
             exit 1
           fi
           if [[ "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == session-smoke-5 || "$BENCHMARK_MODE" == official-50 ]]; then
