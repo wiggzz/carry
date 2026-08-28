@@ -17,9 +17,15 @@ parser.add_argument("--reasoning", required=True)
 parser.add_argument("--prompt", required=True)
 parser.add_argument("--output", required=True)
 parser.add_argument("--resume-session", type=pathlib.Path)
+parser.add_argument("--codex-session", type=pathlib.Path)
+parser.add_argument("--codex-thread")
 args = parser.parse_args()
 if args.resume_session and args.harness != "carry":
     parser.error("--resume-session is supported only by the Carry harness")
+if (args.codex_session or args.codex_thread) and args.harness != "codex":
+    parser.error("--codex-session and --codex-thread are supported only by Codex")
+if args.codex_thread and not args.codex_session:
+    parser.error("--codex-thread requires --codex-session")
 if not os.environ.get("OPENAI_API_KEY"):
     parser.error("OPENAI_API_KEY is required")
 if not os.environ.get("OPENAI_BASE_URL"):
@@ -52,6 +58,16 @@ values = {
 command = [part.format(**values) for part in shlex.split(template)]
 if args.resume_session:
     command.extend(["--resume", str(args.resume_session)])
+if args.codex_session:
+    codex_binary = str(
+        pathlib.Path(os.environ.get("PREPARED_HARNESS_ROOT", "/opt/swebench-harness")) / "bin" / "codex"
+    ) if not os.environ.get("AGENT_COMMAND") else "codex"
+    command = [
+        codex_binary, "exec", "resume", "--model", args.model,
+        "--config", f"model_reasoning_effort={args.reasoning}",
+        "--dangerously-bypass-approvals-and-sandbox", "--json",
+        args.codex_thread, prompt_text,
+    ]
 workspace = os.environ.get("BENCHMARK_WORKSPACE", "/workspace")
 subprocess.run(
     ["git", "config", "--global", "--add", "safe.directory", workspace],
@@ -86,6 +102,8 @@ if args.harness == "pi":
 
 trace_path = output / "trace.log"
 agent_env = os.environ.copy()
+if args.codex_session:
+    agent_env["CODEX_HOME"] = str(args.codex_session)
 with trace_path.open("w", encoding="utf-8") as trace:
     returncode = 0
     if args.harness == "codex":
@@ -107,7 +125,7 @@ with trace_path.open("w", encoding="utf-8") as trace:
             )
             returncode = login.returncode
             if returncode == 0:
-                codex_home = pathlib.Path(os.environ["HOME"]) / ".codex"
+                codex_home = pathlib.Path(agent_env.get("CODEX_HOME", str(pathlib.Path(os.environ["HOME"]) / ".codex")))
                 codex_home.mkdir(parents=True, exist_ok=True)
                 (codex_home / "config.toml").write_text(
                     'model_provider = "openai-benchmark"\n\n'
@@ -140,6 +158,11 @@ with trace_path.open("w", encoding="utf-8") as trace:
         except subprocess.TimeoutExpired:
             trace.write("\nagent timed out\n")
             returncode = 124
+
+if args.codex_session:
+    # Login writes credentials below CODEX_HOME; the retained artifact must contain
+    # native rollout state only, never reusable auth material.
+    (args.codex_session / "auth.json").unlink(missing_ok=True)
 
 patch_path = output / "final.patch"
 subprocess.run(["git", "add", "-N", "--", "."], cwd=workspace, check=True)

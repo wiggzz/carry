@@ -509,11 +509,17 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
                          output: pathlib.Path, model: str, reasoning: str,
                          container_name: str, agent_timeout_seconds: int,
                          network: str, proxy_ip: str, api_base: str,
-                         resume_session: pathlib.Path | None = None) -> list[str]:
+                         resume_session: pathlib.Path | None = None,
+                         codex_session: pathlib.Path | None = None,
+                         codex_thread: str | None = None) -> list[str]:
     if harness not in HARNESSES:
         raise ValueError("unknown harness")
     if resume_session is not None and harness != "carry":
         raise ValueError("only Carry supports a resumed session context")
+    if (codex_session is not None or codex_thread is not None) and harness != "codex":
+        raise ValueError("only Codex supports a durable native session")
+    if codex_thread is not None and codex_session is None:
+        raise ValueError("a Codex thread requires its durable session directory")
     command = [
         "docker", "run", "--rm", "--name", container_name, "--stop-timeout", "10",
         "--network", network, "--dns", "127.0.0.1",
@@ -537,6 +543,11 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
             "--mount",
             f"type=bind,src={resume_session.resolve()},dst=/benchmark/session,readonly",
         ])
+    if codex_session is not None:
+        command.extend([
+            "--mount",
+            f"type=bind,src={codex_session.resolve()},dst=/benchmark/codex-session",
+        ])
     command.extend([
         "--workdir", "/testbed", image, "run", "--harness", harness,
         "--model", model,
@@ -545,6 +556,10 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
     ])
     if resume_session is not None:
         command.extend(["--resume-session", "/benchmark/session"])
+    if codex_session is not None:
+        command.extend(["--codex-session", "/benchmark/codex-session"])
+    if codex_thread is not None:
+        command.extend(["--codex-thread", codex_thread])
     return command
 
 
@@ -1230,13 +1245,36 @@ def publish_task_environments(*, records: list[dict[str, Any]], source: pathlib.
 
 
 
+def codex_thread_id(trace_path: pathlib.Path) -> str:
+    """Extract one native Codex thread UUID from a JSONL execution trace."""
+    thread_ids = set()
+    for line in trace_path.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "thread.started":
+            continue
+        thread_id = event.get("thread_id", event.get("threadId"))
+        if isinstance(thread_id, str) and re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            thread_id.lower(),
+        ):
+            thread_ids.add(thread_id.lower())
+    if len(thread_ids) != 1:
+        raise RuntimeError("Codex trace must contain exactly one native thread.started UUID")
+    return thread_ids.pop()
+
+
 def run_isolated_agent(*, instance_id: str, harness: str, image: str,
                        harness_bundle: pathlib.Path, proxy_image: str,
                        proxy_script: pathlib.Path, repo: pathlib.Path,
                        task_input: pathlib.Path, output: pathlib.Path, model: str, reasoning: str,
                        timeout_seconds: int | None = None,
                        pricing: Mapping[str, float] | None = None,
-                       resume_session: pathlib.Path | None = None) -> dict[str, Any]:
+                       resume_session: pathlib.Path | None = None,
+                       codex_session: pathlib.Path | None = None,
+                       codex_thread: str | None = None) -> dict[str, Any]:
     identity = f"{instance_id}\0{harness}\0{output.resolve()}"
     network = start_agent_network(
         identity=identity, proxy_image=proxy_image, proxy_script=proxy_script,
@@ -1249,6 +1287,7 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
             model=model, reasoning=reasoning, timeout_seconds=timeout_seconds,
             pricing=pricing, network=network["internal"], proxy_ip=network["proxy_ip"],
             api_base=network["api_base"], resume_session=resume_session,
+            codex_session=codex_session, codex_thread=codex_thread,
         )
     finally:
         cleanup_agent_network(network)
@@ -1259,7 +1298,9 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
               output: pathlib.Path, model: str, reasoning: str,
               network: str, proxy_ip: str, api_base: str, timeout_seconds: int | None = None,
               pricing: Mapping[str, float] | None = None,
-              resume_session: pathlib.Path | None = None) -> dict[str, Any]:
+              resume_session: pathlib.Path | None = None,
+              codex_session: pathlib.Path | None = None,
+              codex_thread: str | None = None) -> dict[str, Any]:
     slot_timeout = (
         timeout_seconds if timeout_seconds is not None
         else int(os.environ.get("AGENT_TIMEOUT_SECONDS", "1200"))
@@ -1275,6 +1316,7 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
         model=model, reasoning=reasoning, container_name=container_name,
         agent_timeout_seconds=in_container_timeout, network=network,
         proxy_ip=proxy_ip, api_base=api_base, resume_session=resume_session,
+        codex_session=codex_session, codex_thread=codex_thread,
     )
     started = time.monotonic()
     print("BENCHMARK_PROGRESS " + json.dumps({
@@ -1408,8 +1450,8 @@ def selection_for_mode(frozen_ids: list[str], mode: str,
 
 
 def validate_session_mode(mode: str, harnesses: tuple[str, ...]) -> None:
-    if mode == "session-smoke-5" and harnesses != ("carry",):
-        raise ValueError("session-smoke-5 requires the Carry harness only")
+    if mode == "session-smoke-5" and harnesses not in {("carry",), ("codex",)}:
+        raise ValueError("session-smoke-5 requires one supported harness")
 
 
 def ordered_shards(instance_ids: list[str], shard_size: int) -> list[list[str]]:
@@ -1946,8 +1988,13 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     selected_records = [by_id[instance_id] for instance_id in selection]
     work.mkdir(parents=True, exist_ok=True)
     session_source: pathlib.Path | None = None
+    codex_session: pathlib.Path | None = None
+    codex_thread: str | None = None
     if mode == "session-smoke-5":
         (work / "session").mkdir(parents=True, exist_ok=True)
+        if harnesses == ("codex",):
+            codex_session = work / "session" / "codex"
+            codex_session.mkdir()
     (work / "canonical-dataset.json").write_text(
         json.dumps(selected_records, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -2090,7 +2137,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 slots.append((task, harness, task_root, slot_output))
 
         def execute_slot(slot: tuple[Any, ...]) -> dict[str, Any]:
-            nonlocal session_source
+            nonlocal session_source, codex_thread
             task, harness, task_root, slot_output = slot
             session_position = selection.index(task["instance_id"]) + 1 if mode == "session-smoke-5" else None
             slot_timeout = agent_timeout
@@ -2106,11 +2153,14 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                     }
                 slot_timeout = min(slot_timeout, remaining)
             if session_position is not None:
-                if session_position > 1 and session_source is None:
+                if session_position > 1 and (
+                    (harness == "carry" and session_source is None)
+                    or (harness == "codex" and codex_thread is None)
+                ):
                     return {
                         "instance_id": task["instance_id"], "harness": harness,
                         "status": "agent-session-context-missing", "patch": "",
-                        "error": "retained Carry source session is unavailable before this task",
+                        "error": "retained native source session is unavailable before this task",
                         "attempts": 0, "retries": 0, "response_retries": 0,
                         "model": validated["MODEL"], "reasoning": validated["REASONING"],
                         "session_position": session_position,
@@ -2142,7 +2192,9 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 task_input=task_root / "input", output=slot_output,
                 model=validated["MODEL"], reasoning=validated["REASONING"],
                 timeout_seconds=slot_timeout, pricing=pricing,
-                resume_session=session_source,
+                resume_session=session_source if harness == "carry" else None,
+                codex_session=codex_session if harness == "codex" else None,
+                codex_thread=codex_thread if harness == "codex" else None,
             )
             record["model"] = validated["MODEL"]
             record["reasoning"] = validated["REASONING"]
@@ -2156,6 +2208,22 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                         raise RuntimeError("completed Carry slot has no context-state.json")
                     record["session_state_sha256"] = hashlib.sha256(state.read_bytes()).hexdigest()
                     session_source = slot_output
+                elif harness == "codex" and record["status"] == "agent-completed":
+                    if codex_session is None:
+                        raise RuntimeError("Codex session directory was not initialized")
+                    next_thread = codex_thread_id(slot_output / "trace.log")
+                    if codex_thread is not None and next_thread != codex_thread:
+                        raise RuntimeError("resumed Codex task changed its native thread UUID")
+                    session_files = sorted(codex_session.rglob("*.jsonl"))
+                    if not session_files:
+                        raise RuntimeError("completed Codex slot persisted no native session JSONL")
+                    state_hash = hashlib.sha256()
+                    for path in session_files:
+                        state_hash.update(path.relative_to(codex_session).as_posix().encode() + b"\0")
+                        state_hash.update(path.read_bytes())
+                    record["session_state_sha256"] = state_hash.hexdigest()
+                    record["native_session_id_sha256"] = hashlib.sha256(next_thread.encode()).hexdigest()
+                    codex_thread = next_thread
             return record
 
         try:
