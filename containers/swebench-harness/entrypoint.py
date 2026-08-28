@@ -17,9 +17,12 @@ parser.add_argument("--reasoning", required=True)
 parser.add_argument("--prompt", required=True)
 parser.add_argument("--output", required=True)
 parser.add_argument("--resume-session", type=pathlib.Path)
+parser.add_argument("--pi-session-dir", type=pathlib.Path)
 args = parser.parse_args()
 if args.resume_session and args.harness != "carry":
     parser.error("--resume-session is supported only by the Carry harness")
+if args.pi_session_dir and args.harness != "pi":
+    parser.error("--pi-session-dir is supported only by the Pi harness")
 if not os.environ.get("OPENAI_API_KEY"):
     parser.error("OPENAI_API_KEY is required")
 if not os.environ.get("OPENAI_BASE_URL"):
@@ -39,7 +42,7 @@ if not template:
                  "--model {model} --config model_reasoning_effort={reasoning} "
                  "--json {prompt_text}",
         "pi": f"{root}/bin/pi --mode json --provider openai-benchmark --model {{model}} "
-              "--thinking {reasoning} --no-session {prompt_text}",
+              "--thinking {reasoning} {prompt_text}",
     }[args.harness]
 prompt_text = pathlib.Path(args.prompt).read_text(encoding="utf-8")
 values = {
@@ -52,6 +55,14 @@ values = {
 command = [part.format(**values) for part in shlex.split(template)]
 if args.resume_session:
     command.extend(["--resume", str(args.resume_session)])
+if args.harness == "pi":
+    if args.pi_session_dir:
+        command.extend([
+            "--session", str(args.pi_session_dir / "session.jsonl"),
+            "--session-dir", str(args.pi_session_dir),
+        ])
+    else:
+        command.append("--no-session")
 workspace = os.environ.get("BENCHMARK_WORKSPACE", "/workspace")
 subprocess.run(
     ["git", "config", "--global", "--add", "safe.directory", workspace],

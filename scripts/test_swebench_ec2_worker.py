@@ -72,7 +72,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             self.assertIn("python3.11", packages)
             self.assertNotIn("curl", packages)
 
-    def test_session_worker_rejects_non_carry_harness_before_fetching_credentials(self):
+    def test_session_worker_rejects_non_retained_harness_before_fetching_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             payload = root / "payload"; payload.mkdir()
@@ -105,7 +105,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             )
             run = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
             self.assertEqual(run.returncode, 2)
-            self.assertIn("requires BENCHMARK_HARNESS=carry", (carry_root / "results" / "worker.log").read_text())
+            self.assertIn("requires BENCHMARK_HARNESS=carry or pi", (carry_root / "results" / "worker.log").read_text())
             self.assertFalse((root / "secret").exists())
 
     def test_official_worker_launches_runner_with_bounded_agent_and_evaluator_concurrency(self):

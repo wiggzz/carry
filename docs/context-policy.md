@@ -66,25 +66,31 @@ and `trace.jsonl`.
 
 ## Session-persistence benchmark mode
 
-`session-smoke-5` is a separate **Carry-only** stress-test mode, not an ordinary
-SWE-bench score. It uses the frozen five-task smoke manifest in its recorded
-order. Every task gets a fresh prepared workspace/image and normal per-task
-SWE-bench grading. Each completed Carry slot writes its native versioned
-`context-state.json` checkpoint into that slot's output directory; the next slot
-mounts that whole completed session read-only as `--resume` input and writes a
-fresh destination session. The source trace is audit evidence and is never
-modified by a later task.
+`session-smoke-5` is a separate retained-session stress-test mode, not an ordinary
+SWE-bench score. It accepts exactly one sequential harness: Carry or Pi (never
+`all`). It uses the frozen five-task smoke manifest in its recorded order. Every
+task gets a fresh prepared workspace/image and normal per-task SWE-bench grading.
+
+Carry retains its existing behavior: each completed slot writes its native
+versioned `context-state.json` checkpoint into that slot's output directory; the
+next slot mounts that whole completed session read-only as `--resume` input and
+writes a fresh destination session. The source trace is audit evidence and is
+never modified by a later task.
+
+Pi retains its native JSONL session by mounting one worker-local session directory
+writable only into the sequential Pi agents. Each Pi invocation uses the explicit
+native `--session` file and `--session-dir`; no Pi home/configuration state is
+persisted. The raw JSONL session is not uploaded. Artifacts contain only its
+SHA-256 values plus the run-scoped session ID and fixed path-safe file name
+`session.jsonl`.
 
 Each new task prompt explicitly says that its `/testbed` is new and that old
 paths, patches, and conclusions must not be reused. The artifacts record the
 task order, session ID, retained-context flag, per-task position, source and
-destination checkpoint SHA-256 values, and fresh workspace/evaluator isolation.
-Raw checkpoints are not uploaded. If a continuation source or completed output
-lacks `context-state.json`, the runner fails closed rather than launching a
+destination checkpoint/session SHA-256 values, and fresh workspace/evaluator
+isolation. If a continuation source or completed output lacks the required native
+session persistence, the runner fails closed rather than launching a
 fresh-context replacement.
-
-This mode rejects Codex and Pi until their own native, cross-container session
-contracts have equivalent behavioral verification.
 
 ## What the policy does not promise
 
