@@ -98,20 +98,8 @@ pub async fn serve(address: SocketAddr, config: RunConfig, backend: Backend) -> 
         let _ = runner_state
             .events
             .send(json!({"event":"session_started", "data":{"prompt":prompt}}));
-        // The resumed history is restored as one server-side item, so the fresh
-        // browser message is not emitted by run_loop's initial-prompt path.
-        let _ = runner_state.events.send(json!({
-            "event": "human_message",
-            "data": {"message": prompt}
-        }));
         let mut config = config;
         config.prompt = prompt.clone();
-        if let Some(history) = config.resume_history.as_mut() {
-            history.push(json!({
-                "role": "user",
-                "content": [{"type": "input_text", "text": prompt}]
-            }));
-        }
         let outcome =
             run_interactive_with_events(config, backend, receiver, runner_state.events.clone())
                 .await;

@@ -2,11 +2,11 @@ use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     io::AsyncWriteExt,
@@ -42,6 +42,13 @@ Large text shell results arrive as structured `output_head` and `output_tail` pr
 
 Work only within the assigned repository. Do not perform destructive or external actions."#;
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    Economic,
+    Disabled,
+}
+
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub cwd: PathBuf,
@@ -50,10 +57,85 @@ pub struct RunConfig {
     pub model: String,
     pub max_steps: Option<usize>,
     pub shell_timeout_secs: u64,
-    pub resume_history: Option<Vec<serde_json::Value>>,
+    pub compaction_mode: CompactionMode,
+    pub resume_context: Option<ContextState>,
+    pub resume_source: Option<PathBuf>,
 }
 
 const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const CONTEXT_CHECKPOINT_FILE: &str = "context-state.json";
+const CONTEXT_CHECKPOINT_VERSION: u32 = 1;
+
+#[derive(Clone, Debug)]
+pub struct ResumeState {
+    pub context: ContextState,
+    pub model: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ContextCheckpoint {
+    version: u32,
+    model: String,
+    context: ContextState,
+}
+
+pub fn load_resume_state(session_dir: &Path) -> Result<ResumeState> {
+    let path = session_dir.join(CONTEXT_CHECKPOINT_FILE);
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("failed to read context checkpoint: {}", path.display()))?;
+    let checkpoint: ContextCheckpoint = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid context checkpoint: {}", path.display()))?;
+    if checkpoint.version != CONTEXT_CHECKPOINT_VERSION {
+        bail!(
+            "unsupported context checkpoint version {} in {}",
+            checkpoint.version,
+            path.display()
+        );
+    }
+    ContextState::decode(&checkpoint.context.encode()?)?;
+    Ok(ResumeState {
+        context: checkpoint.context,
+        model: checkpoint.model,
+    })
+}
+
+fn persist_context_checkpoint(config: &RunConfig, state: &ContextState) -> Result<()> {
+    std::fs::create_dir_all(&config.session_dir).with_context(|| {
+        format!(
+            "failed to create context checkpoint directory: {}",
+            config.session_dir.display()
+        )
+    })?;
+    let path = config.session_dir.join(CONTEXT_CHECKPOINT_FILE);
+    let checkpoint = ContextCheckpoint {
+        version: CONTEXT_CHECKPOINT_VERSION,
+        model: config.model.clone(),
+        context: state.clone(),
+    };
+    let bytes = serde_json::to_vec(&checkpoint)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = config.session_dir.join(format!(
+        ".{CONTEXT_CHECKPOINT_FILE}.{}.{}.tmp",
+        std::process::id(),
+        nonce
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .with_context(|| format!("failed to create context checkpoint: {}", temp.display()))?;
+    use std::io::Write as _;
+    file.write_all(&bytes)
+        .with_context(|| format!("failed to write context checkpoint: {}", temp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync context checkpoint: {}", temp.display()))?;
+    std::fs::rename(&temp, &path)
+        .with_context(|| format!("failed to publish context checkpoint: {}", path.display()))?;
+    Ok(())
+}
 
 pub enum Backend {
     OpenAi(OpenAiClient),
@@ -439,26 +521,38 @@ async fn run_loop(
     let run_started = Instant::now();
     let prompt_cache_capabilities = backend.prompt_cache_capabilities();
     tokio::fs::create_dir_all(config.session_dir.join("tools")).await?;
-    let resumed = config.resume_history.is_some();
-    let mut logger = if resumed {
-        RunLogger::resume_with_events(&config.session_dir, events.clone())?
+    let resumed = config.resume_context.is_some();
+    let mut trace_recovery = None;
+    let mut logger = if config.resume_source.as_ref() == Some(&config.session_dir) {
+        match RunLogger::resume_with_events(&config.session_dir, events.clone()) {
+            Ok(logger) => logger,
+            Err(error) => {
+                trace_recovery = Some(error.to_string());
+                RunLogger::recovery_segment_with_events(&config.session_dir, events.clone())?
+            }
+        }
     } else {
         RunLogger::create_with_events(&config.session_dir, events.clone())?
     };
-    if let Some(history) = config.resume_history.clone() {
+    if let Some(reason) = trace_recovery {
+        logger.raw_event_silent("trace_recovery", json!({"reason": reason}))?;
+    }
+    if let Some(context) = config.resume_context.as_ref() {
         logger.raw_event(
             "session_resumed",
             json!({
                 "cwd": config.cwd,
                 "model": config.model,
-                "history_items": history.len(),
+                "history_items": context.input_items().len(),
                 "cache_ttl_seconds": CACHE_TTL.as_secs(),
                 "prompt_cache_capabilities": prompt_cache_capabilities,
+                "compaction_policy": config.compaction_mode,
+                "source_session": config.resume_source,
             }),
             &format!(
                 "resumed · {} · {} history items",
                 config.model,
-                history.len()
+                context.input_items().len()
             ),
         )?;
     } else {
@@ -471,6 +565,7 @@ async fn run_loop(
                 "max_steps": config.max_steps,
                 "cache_ttl_seconds": CACHE_TTL.as_secs(),
                 "prompt_cache_capabilities": prompt_cache_capabilities,
+                "compaction_policy": config.compaction_mode,
                 "compaction_decision": "next_request"
             }),
             &format!("carry · {} · {}", config.model, config.cwd.display()),
@@ -479,20 +574,24 @@ async fn run_loop(
 
     let max_read_breakpoints =
         prompt_cache_capabilities.map_or(0, |capabilities| capabilities.max_read_breakpoints);
-    let resumed_history = config.resume_history.is_some();
-    let mut context_state = match config.resume_history.clone() {
-        Some(history) => ContextState::from_input_items(history, max_read_breakpoints),
-        None => {
-            ContextState::new_with_max_read_breakpoints(config.prompt.clone(), max_read_breakpoints)
-        }
-    };
-    if !resumed_history {
+    let mut context_state = config.resume_context.clone().unwrap_or_else(|| {
+        ContextState::new_with_max_read_breakpoints(config.prompt.clone(), max_read_breakpoints)
+    });
+    if resumed && !config.prompt.trim().is_empty() {
+        let id = context_state.add_user(config.prompt.clone());
+        logger.raw_event(
+            "human_message",
+            json!({"context_id": id, "message": config.prompt}),
+            &format!("  prompt [{id}] submitted"),
+        )?;
+    } else if !resumed {
         logger.raw_event(
             "human_message",
             json!({"context_id": 1, "message": config.prompt}),
             "  prompt [1] submitted",
         )?;
     }
+    persist_context_checkpoint(&config, &context_state)?;
     let mut metrics = RunMetrics::default();
     let mut cache = CacheTracker::new(prompt_cache_capabilities);
     let mut step_index = 0;
@@ -526,14 +625,17 @@ async fn run_loop(
         } else {
             "economic"
         };
-        maybe_compact(
-            &mut context_state,
-            &protected_until_request,
-            &mut cache,
-            &mut metrics,
-            &mut logger,
-            trigger,
-        )?;
+        if config.compaction_mode == CompactionMode::Economic {
+            maybe_compact(
+                &mut context_state,
+                &protected_until_request,
+                &mut cache,
+                &mut metrics,
+                &mut logger,
+                trigger,
+            )?;
+            persist_context_checkpoint(&config, &context_state)?;
+        }
         step_index += 1;
         turn_step += 1;
         let history = context_state.input_items();
@@ -666,9 +768,10 @@ async fn run_loop(
                     "context_signals",
                     json!({"source_id": item_id, "signals": &signals}),
                 )?;
+                persist_context_checkpoint(&config, &context_state)?;
 
                 if let Some(receiver) = input.as_mut()
-                    && drain_user_input(receiver, &mut context_state, &mut logger)?
+                    && drain_user_input(receiver, &mut context_state, &mut logger, &config)?
                 {
                     write_final_artifacts(
                         &config,
@@ -699,6 +802,7 @@ async fn run_loop(
                     "context_signals",
                     json!({"source_id": item_id, "signals": &signals}),
                 )?;
+                persist_context_checkpoint(&config, &context_state)?;
                 logger.raw_event(
                     if input.is_some() {
                         "turn_finished"
@@ -716,13 +820,14 @@ async fn run_loop(
                 if let Some(receiver) = input.as_mut() {
                     println!("{}", answer.as_deref().unwrap_or_default());
                     let mut should_exit =
-                        drain_user_input(receiver, &mut context_state, &mut logger)?;
+                        drain_user_input(receiver, &mut context_state, &mut logger, &config)?;
                     if !should_exit {
                         eprint!("carry> ");
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                         match receiver.recv().await {
                             Some(UserInput::Message(message)) => {
                                 append_user_message(
+                                    &config,
                                     &mut context_state,
                                     &mut logger,
                                     message,
@@ -760,12 +865,13 @@ fn drain_user_input(
     receiver: &mut mpsc::UnboundedReceiver<UserInput>,
     state: &mut ContextState,
     logger: &mut RunLogger,
+    config: &RunConfig,
 ) -> Result<bool> {
     let mut should_exit = false;
     while let Ok(input) = receiver.try_recv() {
         match input {
             UserInput::Message(message) => {
-                append_user_message(state, logger, message, true)?;
+                append_user_message(config, state, logger, message, true)?;
             }
             UserInput::Exit => should_exit = true,
         }
@@ -774,6 +880,7 @@ fn drain_user_input(
 }
 
 fn append_user_message(
+    config: &RunConfig,
     state: &mut ContextState,
     logger: &mut RunLogger,
     message: String,
@@ -789,7 +896,8 @@ fn append_user_message(
         "human_message",
         json!({"context_id": id, "message": message}),
         &terminal,
-    )
+    )?;
+    persist_context_checkpoint(config, state)
 }
 
 fn maybe_compact(
@@ -1157,6 +1265,7 @@ async fn write_final_artifacts(
         "model_latency_ms": metrics.model_latency_ms,
         "response_retries": metrics.response_retries,
         "compactions": metrics.compactions,
+        "compaction_policy": config.compaction_mode,
         "elapsed_ms": elapsed_ms
     });
     tokio::fs::write(
@@ -1684,7 +1793,9 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
-                resume_history: None,
+                compaction_mode: CompactionMode::Economic,
+                resume_context: None,
+                resume_source: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1702,8 +1813,85 @@ mod tests {
         assert_eq!(result["usage"]["output_tokens"], 0);
         assert_eq!(result["model_latency_ms"], 0);
         assert_eq!(result["response_retries"], 0);
-        assert_eq!(result["compactions"], 0);
         assert!(result["elapsed_ms"].is_u64());
+        let resumed = load_resume_state(&session_dir).unwrap();
+        assert_eq!(resumed.model, "scripted");
+        let restored = resumed.context.input_items();
+        assert!(restored.iter().any(|item| item["type"] == "function_call"));
+        assert!(restored.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("answer was delivered"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn resumed_run_sends_the_prior_terminal_response_to_the_next_model_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let first_session = temp.path().join("first");
+        let second_session = temp.path().join("second");
+        let first_steps = temp.path().join("first.jsonl");
+        let second_steps = temp.path().join("second.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        let finish = r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#;
+        tokio::fs::write(&first_steps, finish).await.unwrap();
+        tokio::fs::write(&second_steps, finish).await.unwrap();
+
+        run(
+            RunConfig {
+                cwd: workspace.clone(),
+                prompt: "first task".into(),
+                session_dir: first_session.clone(),
+                model: "scripted".into(),
+                max_steps: Some(1),
+                shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Economic,
+                resume_context: None,
+                resume_source: None,
+            },
+            Backend::scripted(&first_steps).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let resume = load_resume_state(&first_session).unwrap();
+
+        run(
+            RunConfig {
+                cwd: workspace,
+                prompt: "second task".into(),
+                session_dir: second_session.clone(),
+                model: resume.model,
+                max_steps: Some(1),
+                shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Economic,
+                resume_context: Some(resume.context),
+                resume_source: Some(first_session),
+            },
+            Backend::scripted(&second_steps).await.unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let event: serde_json::Value =
+            tokio::fs::read_to_string(second_session.join("trace.jsonl"))
+                .await
+                .unwrap()
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<std::result::Result<Vec<serde_json::Value>, _>>()
+                .unwrap()
+                .into_iter()
+                .find(|event| event["event"] == "model_request")
+                .unwrap();
+        assert!(
+            event["data"]["history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "function_call_output")
+        );
     }
 
     #[tokio::test]
@@ -1728,7 +1916,9 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: None,
                 shell_timeout_secs: 1,
-                resume_history: None,
+                compaction_mode: CompactionMode::Economic,
+                resume_context: None,
+                resume_source: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1766,7 +1956,9 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: None,
                 shell_timeout_secs: 1,
-                resume_history: None,
+                compaction_mode: CompactionMode::Economic,
+                resume_context: None,
+                resume_source: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1819,7 +2011,9 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
-                resume_history: None,
+                compaction_mode: CompactionMode::Economic,
+                resume_context: None,
+                resume_source: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1873,7 +2067,9 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: None,
                 shell_timeout_secs: 1,
-                resume_history: None,
+                compaction_mode: CompactionMode::Economic,
+                resume_context: None,
+                resume_source: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
             receiver,

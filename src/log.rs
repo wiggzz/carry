@@ -72,6 +72,29 @@ impl RunLogger {
         })
     }
 
+    pub fn recovery_segment_with_events(
+        run_dir: &Path,
+        events: Option<broadcast::Sender<Value>>,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(run_dir)
+            .with_context(|| format!("failed to create run directory: {}", run_dir.display()))?;
+        let run_id = format!(
+            "{}-recovered-{}",
+            run_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("run"),
+            now_ms()
+        );
+        Ok(Self {
+            run_id,
+            seq: 0,
+            jsonl: BufWriter::new(append(run_dir.join("trace.jsonl"))?),
+            text: BufWriter::new(append(run_dir.join("trace.log"))?),
+            events,
+        })
+    }
+
     pub fn event<T: Serialize>(&mut self, event: &str, data: &T, human: &str) -> Result<()> {
         self.write_event(event, data, Some(human))
     }

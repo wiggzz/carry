@@ -7,13 +7,13 @@ mod web;
 
 use std::{
     io::{BufRead, IsTerminal, Read, Write},
-    path::PathBuf,
+    path::{Component, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
-use run::{Backend, RunConfig, UserInput};
+use run::{Backend, CompactionMode, RunConfig, UserInput};
 use tokio::sync::mpsc;
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
@@ -104,9 +104,33 @@ struct Cli {
     #[arg(long, env = "OPENAI_CONNECT_TIMEOUT_SECS", default_value_t = DEFAULT_CONNECT_TIMEOUT_SECS)]
     connect_timeout_secs: u64,
 
+    /// Select automatic context compaction behavior.
+    #[arg(
+        long,
+        env = "CARRY_COMPACTION_POLICY",
+        value_enum,
+        default_value = "economic"
+    )]
+    compaction_policy: CompactionPolicyArg,
+
     /// JSONL Step objects to use instead of calling a model.
     #[arg(long, hide = true)]
     scripted_steps: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CompactionPolicyArg {
+    Economic,
+    Disabled,
+}
+
+impl From<CompactionPolicyArg> for CompactionMode {
+    fn from(value: CompactionPolicyArg) -> Self {
+        match value {
+            CompactionPolicyArg::Economic => Self::Economic,
+            CompactionPolicyArg::Disabled => Self::Disabled,
+        }
+    }
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -135,32 +159,20 @@ async fn main() -> Result<()> {
     run_command(Cli::parse()).await
 }
 
-struct ResumeState {
-    history: Vec<serde_json::Value>,
-    model: String,
-}
-
-fn validate_args(args: &Cli) -> Result<()> {
-    if args.resume.is_some()
-        && (args.prompt.is_some()
-            || !args.prompt_words.is_empty()
-            || args.session_dir.is_some()
-            || args.session_home.is_some()
-            || args.scripted_steps.is_some())
-    {
-        bail!(
-            "--resume cannot be combined with a prompt, session destination, or --scripted-steps"
-        );
-    }
+fn validate_args(_args: &Cli) -> Result<()> {
     Ok(())
 }
 
 async fn run_command(args: Cli) -> Result<()> {
     validate_args(&args)?;
-    let resume = args
+    let resume_source = args
         .resume
         .as_deref()
-        .map(load_resume_history)
+        .map(|reference| resolve_resume_session(reference, args.session_home.as_deref()))
+        .transpose()?;
+    let resume = resume_source
+        .as_deref()
+        .map(run::load_resume_state)
         .transpose()?;
     let model = resume
         .as_ref()
@@ -174,11 +186,10 @@ async fn run_command(args: Cli) -> Result<()> {
     }
 
     let stdin_is_terminal = std::io::stdin().is_terminal();
-    if (args.interactive || (args.resume.is_some() && !args.serve)) && !stdin_is_terminal {
-        bail!("--interactive and terminal --resume require a terminal on stdin");
+    if args.interactive && !stdin_is_terminal {
+        bail!("--interactive requires a terminal on stdin");
     }
-    let interactive = args.resume.is_some()
-        || args.interactive
+    let interactive = args.interactive
         || (!args.serve
             && args.prompt.is_none()
             && args.prompt_words.is_empty()
@@ -218,14 +229,30 @@ async fn run_command(args: Cli) -> Result<()> {
         input = Some(spawn_input_reader());
     }
 
-    let session_dir = match &args.resume {
-        Some(session_dir) => session_dir.clone(),
-        None => resolve_session_dir(args.session_dir, args.session_home)?,
+    let session_dir = match (args.session_dir.clone(), resume_source.as_ref()) {
+        (Some(session_dir), _) => session_dir,
+        (None, Some(source)) => source.clone(),
+        (None, None) => resolve_session_dir(None, args.session_home.clone())?,
     };
-    if args.resume.is_some() {
-        eprintln!("resuming session: {}", session_dir.display());
+    let session_dir = if session_dir.exists() {
+        session_dir.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize session directory: {}",
+                session_dir.display()
+            )
+        })?
     } else {
+        session_dir
+    };
+    if resume_source.as_ref() != Some(&session_dir) {
         create_private_session_dir(&session_dir)?;
+    }
+    if let Some(source) = &resume_source {
+        eprintln!("resuming session: {}", source.display());
+        if source != &session_dir {
+            eprintln!("new session: {}", session_dir.display());
+        }
+    } else {
         eprintln!("session: {}", session_dir.display());
     }
 
@@ -256,14 +283,9 @@ async fn run_command(args: Cli) -> Result<()> {
         model,
         max_steps: args.max_steps,
         shell_timeout_secs: args.shell_timeout_secs,
-        resume_history: resume.map(|mut resume| {
-            // Terminal resume receives its fresh human turn before the runner starts.
-            // In --serve mode, web::serve appends the browser's first message instead.
-            if !args.serve {
-                resume.history.push(user_input_item(prompt.trim()));
-            }
-            resume.history
-        }),
+        compaction_mode: args.compaction_policy.into(),
+        resume_context: resume.map(|resume| resume.context),
+        resume_source,
     };
 
     if args.serve {
@@ -317,44 +339,6 @@ fn print_resume_hint(session_dir: &std::path::Path) {
     );
 }
 
-fn load_resume_history(session_dir: &std::path::Path) -> Result<ResumeState> {
-    let trace_path = session_dir.join("trace.jsonl");
-    let trace = std::fs::read_to_string(&trace_path)
-        .with_context(|| format!("failed to read session trace: {}", trace_path.display()))?;
-    let mut latest_request = None;
-    for (line_number, line) in trace.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: serde_json::Value = serde_json::from_str(line).with_context(|| {
-            format!(
-                "invalid JSON on line {} of {}",
-                line_number + 1,
-                trace_path.display()
-            )
-        })?;
-        if event["event"].as_str() == Some("model_request") {
-            let history = event["data"]["history"]
-                .as_array()
-                .context("model_request event has no history array")?
-                .clone();
-            let model = event["data"]["request"]["model"]
-                .as_str()
-                .context("model_request event has no request model")?
-                .to_owned();
-            latest_request = Some(ResumeState { history, model });
-        }
-    }
-    latest_request.context("session has no model request to resume")
-}
-
-fn user_input_item(message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "role": "user",
-        "content": [{ "type": "input_text", "text": message }]
-    })
-}
-
 fn spawn_input_reader() -> mpsc::UnboundedReceiver<UserInput> {
     let (sender, receiver) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -388,6 +372,68 @@ fn spawn_input_reader() -> mpsc::UnboundedReceiver<UserInput> {
         }
     });
     receiver
+}
+
+fn resolve_resume_session(
+    reference: &std::path::Path,
+    session_home: Option<&std::path::Path>,
+) -> Result<PathBuf> {
+    if reference == std::path::Path::new("..") {
+        bail!(
+            "resume session ID must be a single directory name: {}",
+            reference.display()
+        );
+    }
+    if reference.is_dir() {
+        return reference.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize resume session: {}",
+                reference.display()
+            )
+        });
+    }
+    let mut components = reference.components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        bail!(
+            "resume session ID must be a single directory name: {}",
+            reference.display()
+        );
+    }
+    let home = if let Some(home) = session_home {
+        home.to_path_buf()
+    } else if let Some(home) = std::env::var_os("CARRY_HOME") {
+        PathBuf::from(home)
+    } else {
+        PathBuf::from(
+            std::env::var_os("HOME")
+                .context("HOME is not set; use --session-home or a session path")?,
+        )
+        .join(".carry")
+    };
+    let sessions = home.join("sessions");
+    let sessions_root = sessions.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize session home: {}",
+            sessions.display()
+        )
+    })?;
+    let session = sessions_root.join(reference);
+    if !session.is_dir() {
+        bail!("resume session does not exist: {}", session.display());
+    }
+    let session = session.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize resume session: {}",
+            session.display()
+        )
+    })?;
+    if !session.starts_with(&sessions_root) {
+        bail!(
+            "resume session escapes configured session home: {}",
+            session.display()
+        );
+    }
+    Ok(session)
 }
 
 fn resolve_session_dir(exact: Option<PathBuf>, home: Option<PathBuf>) -> Result<PathBuf> {
@@ -451,51 +497,76 @@ mod tests {
     }
 
     #[test]
+    fn compaction_policy_disabled_is_accepted() {
+        let args =
+            Cli::try_parse_from(["carry", "--compaction-policy", "disabled", "continue"]).unwrap();
+        assert_eq!(args.compaction_policy, CompactionPolicyArg::Disabled);
+    }
+
+    #[test]
     fn resume_can_be_served() {
         let args = Cli::try_parse_from(["carry", "--resume", "session", "--serve"]).unwrap();
         assert!(validate_args(&args).is_ok());
     }
 
     #[test]
-    fn resume_loads_the_latest_request_even_after_it_was_answered() {
-        let temp = tempfile::tempdir().unwrap();
-        let trace = [
-            serde_json::json!({"event":"model_request","data":{"history":["old"],"request":{"model":"old-model"}}}),
-            serde_json::json!({"event":"model_response","data":{}}),
-            serde_json::json!({"event":"model_request","data":{"history":["latest"],"request":{"model":"gpt-5.6-terra"}}}),
-            serde_json::json!({"event":"model_response","data":{}}),
-        ]
-        .into_iter()
-        .map(|event| event.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-        std::fs::write(temp.path().join("trace.jsonl"), trace).unwrap();
-
-        let resume = load_resume_history(temp.path()).unwrap();
-        assert_eq!(resume.history, vec![serde_json::json!("latest")]);
-        assert_eq!(resume.model, "gpt-5.6-terra");
-    }
-
-    #[test]
-    fn resume_rejects_a_session_without_a_model_request() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temp.path().join("trace.jsonl"),
-            serde_json::json!({"event":"model_response","data":{}}).to_string(),
-        )
+    fn resume_allows_a_fresh_session_destination() {
+        let args = Cli::try_parse_from([
+            "carry",
+            "--resume",
+            "session",
+            "--session-dir",
+            "new-session",
+            "continue with a new task",
+        ])
         .unwrap();
-
-        assert!(load_resume_history(temp.path()).is_err());
+        assert!(validate_args(&args).is_ok());
     }
 
     #[test]
-    fn resumed_message_is_a_responses_api_user_input_item() {
+    fn resume_session_path_is_canonicalized() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(temp.path().join("alias")).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        let alias = temp.path().join("alias").join("..").join("source");
+
         assert_eq!(
-            user_input_item("follow up"),
-            serde_json::json!({
-                "role": "user",
-                "content": [{ "type": "input_text", "text": "follow up" }]
-            })
+            resolve_resume_session(&alias, None).unwrap(),
+            source.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn resume_session_id_rejects_path_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(resolve_resume_session(std::path::Path::new(".."), Some(temp.path())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_session_id_rejects_symlink_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(&sessions).unwrap();
+        std::os::unix::fs::symlink(&outside, sessions.join("escaped")).unwrap();
+
+        assert!(
+            resolve_resume_session(std::path::Path::new("escaped"), Some(temp.path())).is_err()
+        );
+    }
+
+    #[test]
+    fn resume_session_id_resolves_in_configured_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let expected = temp.path().join("sessions").join("run-42");
+        std::fs::create_dir_all(&expected).unwrap();
+
+        assert_eq!(
+            resolve_resume_session(std::path::Path::new("run-42"), Some(temp.path())).unwrap(),
+            expected
         );
     }
 
