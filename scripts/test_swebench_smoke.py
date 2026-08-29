@@ -53,6 +53,18 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(rounds, [120, 90, 180])
         self.assertEqual(self.worker.max_observed_input_tokens(rounds), 180)
 
+    def test_codex_thread_id_accepts_the_native_uuidv7_emitted_by_codex(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trace = pathlib.Path(directory) / "trace.log"
+            trace.write_text(
+                '{"type":"thread.started","thread_id":"01a0488e-3e27-7ff0-9d61-b286f5ec1213"}\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                self.worker.codex_thread_id(trace),
+                "01a0488e-3e27-7ff0-9d61-b286f5ec1213",
+            )
+
     def test_selected_harness_defaults_to_carry_and_rejects_unknown(self):
         self.assertEqual(self.worker.selected_harnesses({}), ("carry",))
         for harness in ("carry", "codex", "pi"):

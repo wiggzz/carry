@@ -1292,7 +1292,7 @@ def codex_thread_id(trace_path: pathlib.Path) -> str:
             continue
         thread_id = event.get("thread_id", event.get("threadId"))
         if isinstance(thread_id, str) and re.fullmatch(
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
             thread_id.lower(),
         ):
             thread_ids.add(thread_id.lower())
