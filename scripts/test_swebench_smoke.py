@@ -134,6 +134,36 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertIn("/agent-home:rw", rendered)
             self.assertIn("/tmp:rw", rendered)
 
+    def test_session_carry_command_mounts_a_read_only_source_session_as_its_fifth_bind(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for name in ("repo", "input", "output", "harness", "session"):
+                (root / name).mkdir()
+            session = root / "session"
+            command = self.worker.agent_docker_command(
+                image="smoke-carry:run", harness="carry", repo=root / "repo",
+                harness_bundle=root / "harness", task_input=root / "input", output=root / "output",
+                model="gpt-5.6-luna", reasoning="medium", container_name="carry-agent-session-test",
+                agent_timeout_seconds=315, network="carry-agent-internal-test",
+                proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
+                resume_session=session,
+            )
+        rendered = "\n".join(command)
+        self.assertEqual(rendered.count("type=bind"), 5)
+        self.assertIn(f"src={session.resolve()},dst=/benchmark/session,readonly", rendered)
+        self.assertIn("--resume-session\n/benchmark/session", rendered)
+        self.assertNotIn("/var/run/docker.sock", rendered)
+        self.assertNotIn(str(pathlib.Path.home()), rendered)
+        with self.assertRaisesRegex(ValueError, "Carry"):
+            self.worker.agent_docker_command(
+                image="smoke-codex:run", harness="codex", repo=root / "repo",
+                harness_bundle=root / "harness", task_input=root / "input", output=root / "output",
+                model="gpt-5.6-luna", reasoning="medium", container_name="codex-session-test",
+                agent_timeout_seconds=315, network="carry-agent-internal-test",
+                proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
+                resume_session=session,
+            )
+
     def test_readiness_command_has_no_network_secret_or_evaluator_mounts(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = pathlib.Path(directory) / "repo"
@@ -1036,6 +1066,17 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         smoke = [frozen[index] for index in (0, 25, 40, 45, 49)]
         self.assertEqual(self.worker.selection_for_mode(frozen, "smoke-5", smoke), smoke)
         self.assertEqual(self.worker.selection_for_mode(frozen, "official-50", smoke), frozen)
+
+    def test_session_smoke_uses_the_frozen_smoke_order_and_rejects_non_carry_harnesses(self):
+        frozen = [f"task-{number:02d}" for number in range(50)]
+        smoke = [frozen[index] for index in (0, 25, 40, 45, 49)]
+        self.assertEqual(
+            self.worker.selection_for_mode(frozen, "session-smoke-5", smoke), smoke,
+        )
+        self.worker.validate_session_mode("session-smoke-5", ("carry",))
+        for harnesses in (("codex",), ("pi",), ("carry", "codex", "pi")):
+            with self.subTest(harnesses=harnesses), self.assertRaisesRegex(ValueError, "Carry"):
+                self.worker.validate_session_mode("session-smoke-5", harnesses)
         shards = self.worker.ordered_shards(frozen, 10)
         self.assertEqual([len(shard) for shard in shards], [10] * 5)
         self.assertEqual([item for shard in shards for item in shard], frozen)
@@ -1258,6 +1299,110 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertEqual(limits["agent_concurrency"], 5)
             self.assertEqual(limits["evaluator_shard_size"], 5)
             self.assertEqual(limits["evaluator_concurrency"], 5)
+
+    def test_session_smoke_runs_carry_slots_in_manifest_order_with_one_retained_context(self):
+        frozen = [f"task-{number:02d}" for number in range(50)]
+        smoke = [frozen[index] for index in (0, 25, 40, 45, 49)]
+        dataset = [
+            {"instance_id": instance_id, "repo": "owner/repo", "base_commit": "a" * 40,
+             "problem_statement": f"problem {instance_id}"}
+            for instance_id in frozen
+        ]
+        fake_datasets = types.SimpleNamespace(load_dataset=lambda *args, **kwargs: dataset)
+        materialized, executed, evaluated = [], [], []
+
+        def fake_materialize(*, selected_ids, root, harnesses, **_kwargs):
+            materialized.append(list(selected_ids))
+            tasks = []
+            for instance_id in selected_ids:
+                tasks.append({"instance_id": instance_id, "repo": "owner/repo", "base_commit": "a" * 40,
+                              "problem_statement": f"problem {instance_id}"})
+                (root / "tasks" / instance_id / "carry" / "repo").mkdir(parents=True)
+                (root / "tasks" / instance_id / "input").mkdir(parents=True)
+            self.assertEqual(harnesses, ("carry",))
+            return tasks
+
+        def fake_agent(**kwargs):
+            position = len(executed) + 1
+            self.assertEqual(kwargs["instance_id"], smoke[position - 1])
+            self.assertEqual(kwargs["harness"], "carry")
+            if position == 1:
+                self.assertIsNone(kwargs["resume_session"])
+            else:
+                self.assertEqual(kwargs["resume_session"], output / "slots" / smoke[position - 2] / "carry")
+            (kwargs["output"] / "context-state.json").write_text(
+                f"context-{position}", encoding="utf-8"
+            )
+            executed.append(kwargs["instance_id"])
+            return {"instance_id": kwargs["instance_id"], "harness": "carry",
+                    "status": "agent-completed", "patch": "", "error": None,
+                    "attempts": 1, "retries": 0, "response_retries": 0}
+
+        def fake_evaluation(*, instance_ids, output, **_kwargs):
+            evaluated.append(list(instance_ids))
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "report.json").write_text(json.dumps({
+                "completed_ids": list(instance_ids), "resolved_ids": [],
+                "unresolved_ids": list(instance_ids), "empty_patch_ids": [],
+                "error_ids": [], "incomplete_ids": [],
+            }))
+
+        def fake_resolve(*, records, **_kwargs):
+            return {record["instance_id"]: {
+                "cache_key": "a" * 64,
+                "agent_image": {"tag": f"prepared:{record['instance_id']}"},
+                "evaluator_image": {"tag": f"evaluator:{record['instance_id']}"},
+                "source_task_image": f"source:{record['instance_id']}", "dockerfile_sha256": "1" * 64,
+            } for record in records}
+
+        config = {
+            "BENCHMARK_MODE": "session-smoke-5", "BENCHMARK_HARNESS": "carry", "RUN_ID": "session-test",
+            "BASE_IMAGE": "node@sha256:" + "a" * 64,
+            "CARRY_BASE_IMAGE": "rust@sha256:" + "b" * 64,
+            "CODEX_VERSION": "1.2.3", "PI_VERSION": "0.84.2",
+            "MODEL": "gpt-5.6-luna", "REASONING": "medium",
+            "TASK_IMAGE_REPOSITORY": "registry.example/tasks",
+            "TASK_IMAGE_CATALOG": "registry.example/tasks@sha256:" + "f" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source, work, output = root / "source", root / "work", root / "output"
+            (source / "benchmarks").mkdir(parents=True)
+            (source / "benchmarks" / "swe-bench-verified-50.json").write_text(json.dumps({"instance_ids": frozen}))
+            (source / "benchmarks" / "swe-bench-verified-smoke-5.json").write_text(json.dumps({"instance_ids": smoke}))
+            secret = root / "openai-key"; secret.write_text("not-a-real-key")
+            with mock.patch.dict(sys.modules, {"datasets": fake_datasets}), \
+                    mock.patch.object(self.worker, "materialize", side_effect=fake_materialize), \
+                    mock.patch.object(self.worker, "build_images", return_value={
+                        harness: {"tag": f"image:{harness}", "image_id": "sha256:" + "c" * 64}
+                        for harness in self.worker.HARNESSES
+                    }), \
+                    mock.patch.object(self.worker, "export_harness_bundles", side_effect=lambda _images, bundle_root: {
+                        harness: bundle_root / harness for harness in self.worker.HARNESSES
+                    }), \
+                    mock.patch.object(self.worker, "resolve_task_environments", side_effect=fake_resolve), \
+                    mock.patch.object(self.worker, "run_isolated_agent", side_effect=fake_agent), \
+                    mock.patch.object(self.worker, "run_official_evaluation", side_effect=fake_evaluation), \
+                    mock.patch.dict(os.environ, {"OPENAI_API_KEY": "not-a-real-key", "OPENAI_SECRET_FILE": str(secret)}, clear=False):
+                self.worker.execute_benchmark(source=source, work=work, output=output, config=config)
+
+            records = json.loads((output / "records.json").read_text())
+            self.assertEqual(materialized, [smoke])
+            self.assertEqual(executed, smoke)
+            self.assertEqual(evaluated, [smoke])
+            self.assertEqual([record["session_position"] for record in records], [1, 2, 3, 4, 5])
+            self.assertEqual(
+                [record["session_state_sha256"] for record in records],
+                [hashlib.sha256(f"context-{position}".encode()).hexdigest() for position in range(1, 6)],
+            )
+            self.assertEqual(
+                [record["source_session_state_sha256"] for record in records[1:]],
+                [hashlib.sha256(f"context-{position}".encode()).hexdigest() for position in range(1, 5)],
+            )
+            report = json.loads((output / "report.json").read_text())
+            self.assertEqual(report["denominator"], 5)
+            limits = report["provenance"]["images"]["execution_limits"]
+            self.assertEqual((limits["agent_concurrency"], limits["agent_shard_size"]), (1, 5))
 
     def test_preparation_failure_stops_before_model_spend(self):
         frozen = [f"task-{number:02d}" for number in range(50)]

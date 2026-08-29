@@ -622,6 +622,7 @@ async fn run_loop(
                 run_started.elapsed().as_millis() as u64,
             )
             .await?;
+            persist_context_checkpoint(&config, &context_state)?;
             return Ok(RunOutcome {
                 completed: false,
                 answer: None,
@@ -789,6 +790,7 @@ async fn run_loop(
                         run_started.elapsed().as_millis() as u64,
                     )
                     .await?;
+                    persist_context_checkpoint(&config, &context_state)?;
                     return Ok(RunOutcome {
                         completed: true,
                         answer: None,

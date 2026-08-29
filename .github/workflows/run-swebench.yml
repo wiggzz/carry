@@ -14,7 +14,7 @@ on:
         required: true
         default: bootstrap
         type: choice
-        options: [bootstrap, prepare-50, smoke-5, official-50, cleanup]
+        options: [bootstrap, prepare-50, smoke-5, session-smoke-5, official-50, cleanup]
       harness:
         description: Agent harness, or all three in one prepared environment
         required: true
@@ -144,7 +144,7 @@ jobs:
           echo "sanitized exact run prefix $TARGET_RUN_ID"
 
       - name: Install pinned pre-signing client
-        if: inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'official-50'
+        if: inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'official-50'
         shell: bash
         run: |
           set -euo pipefail
@@ -158,9 +158,9 @@ jobs:
         shell: bash
         env:
           SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
-          OPENAI_API_KEY: ${{ (inputs.mode == 'smoke-5' || inputs.mode == 'official-50') && secrets.OPENAI_API_KEY || '' }}
-          DOCKERHUB_USERNAME: ${{ (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'official-50') && secrets.DOCKERHUB_USERNAME || '' }}
-          DOCKERHUB_TOKEN: ${{ (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'official-50') && secrets.DOCKERHUB_TOKEN || '' }}
+          OPENAI_API_KEY: ${{ (inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'official-50') && secrets.OPENAI_API_KEY || '' }}
+          DOCKERHUB_USERNAME: ${{ (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'official-50') && secrets.DOCKERHUB_USERNAME || '' }}
+          DOCKERHUB_TOKEN: ${{ (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'official-50') && secrets.DOCKERHUB_TOKEN || '' }}
         run: |
           set -euo pipefail
           for required in AWS_REGION ARTIFACT_BUCKET ARTIFACT_SESSION_ROLE_ARN LAUNCH_TEMPLATE_ID LAUNCH_TEMPLATE_VERSION SOURCE_COMMIT; do
@@ -170,7 +170,11 @@ jobs:
           [[ "$BOOTSTRAP_WAIT_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] && (( BOOTSTRAP_WAIT_SECONDS <= 300 )) || {
             echo "bootstrap_wait_seconds must be an integer from 1 through 300" >&2; exit 1;
           }
-          if [[ "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == official-50 ]]; then
+          if [[ "$BENCHMARK_MODE" == session-smoke-5 && "$BENCHMARK_HARNESS" != carry ]]; then
+            echo "session-smoke-5 requires BENCHMARK_HARNESS=carry" >&2
+            exit 1
+          fi
+          if [[ "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == session-smoke-5 || "$BENCHMARK_MODE" == official-50 ]]; then
             for required in OPENAI_API_KEY DOCKERHUB_USERNAME DOCKERHUB_TOKEN MODEL REASONING TASK_IMAGE_REPOSITORY TASK_IMAGE_CATALOG; do
               [[ -n "${!required}" ]] || { echo "missing benchmark configuration: $required" >&2; exit 1; }
             done
@@ -210,7 +214,7 @@ jobs:
           set -a; source "$RUNNER_TEMP/artifact-session.env"; set +a
           PREFIX="runs/$RUN_ID"
           aws s3 cp carry-source.tar.gz "s3://$ARTIFACT_BUCKET/$PREFIX/carry-source.tar.gz" --sse AES256 --only-show-errors
-          if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == official-50 ]]; then
+          if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == session-smoke-5 || "$BENCHMARK_MODE" == official-50 ]]; then
             DOCKER_AUTH_FILE="$RUNNER_TEMP/dockerhub-auth.json"
             python3 - "$DOCKER_AUTH_FILE" <<'PY'
           import json, os, sys
@@ -337,7 +341,7 @@ jobs:
           echo "WORKER_INSTANCE_ID=$WORKER_INSTANCE_ID" >> "$GITHUB_ENV"
 
       - name: Wait for protected benchmark result
-        if: inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'official-50'
+        if: inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'official-50'
         shell: bash
         env:
           RESULT_GET_URL: ${{ steps.stage.outputs.result_get_url }}
@@ -416,7 +420,7 @@ jobs:
           exit 1
 
       - name: Refresh protected AWS dispatch identity after benchmark
-        if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'official-50')
+        if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'official-50')
         uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8
         with:
           role-to-assume: ${{ vars.BENCHMARK_DISPATCH_ROLE_ARN }}
@@ -432,7 +436,7 @@ jobs:
         run: scripts/wait_for_ec2_termination.sh "$WORKER_INSTANCE_ID"
 
       - name: Validate fixed-denominator results
-        if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'official-50')
+        if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'official-50')
         shell: bash
         run: |
           set -euo pipefail
@@ -500,7 +504,7 @@ jobs:
           fi
 
       - name: Publish benchmark performance summary
-        if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'official-50')
+        if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'official-50')
         shell: bash
         run: |
           if [[ -f benchmark-artifact/report.md ]]; then
@@ -510,7 +514,7 @@ jobs:
           fi
 
       - name: Upload results and diagnostics
-        if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'official-50')
+        if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'official-50')
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
           name: swebench-${{ inputs.mode }}-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}
