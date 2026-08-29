@@ -117,6 +117,7 @@ impl OpenAiClient {
         .expect("default OpenAI HTTP client configuration is valid")
     }
 
+    #[cfg(test)]
     pub fn with_timeouts(
         api_base: String,
         api_key: String,
@@ -125,6 +126,29 @@ impl OpenAiClient {
         request_timeout: Duration,
         connect_timeout: Duration,
     ) -> Result<Self> {
+        Self::with_timeouts_and_prompt_cache_key(
+            api_base,
+            api_key,
+            model,
+            reasoning_effort,
+            new_prompt_cache_key(),
+            request_timeout,
+            connect_timeout,
+        )
+    }
+
+    pub fn with_timeouts_and_prompt_cache_key(
+        api_base: String,
+        api_key: String,
+        model: String,
+        reasoning_effort: String,
+        prompt_cache_key: String,
+        request_timeout: Duration,
+        connect_timeout: Duration,
+    ) -> Result<Self> {
+        if prompt_cache_key.is_empty() {
+            bail!("prompt cache key must not be empty");
+        }
         let http = Client::builder()
             .timeout(request_timeout)
             .connect_timeout(connect_timeout)
@@ -136,7 +160,7 @@ impl OpenAiClient {
             api_key,
             model,
             reasoning_effort,
-            prompt_cache_key: new_prompt_cache_key(),
+            prompt_cache_key,
             request_timeout,
             connect_timeout,
         })
@@ -409,7 +433,7 @@ fn extract_usage(raw: &Value) -> Usage {
     }
 }
 
-fn new_prompt_cache_key() -> String {
+pub(crate) fn new_prompt_cache_key() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -886,6 +910,23 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
         assert_eq!(input[1..3], history);
         assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn resumed_client_uses_the_persisted_prompt_cache_key() {
+        let client = OpenAiClient::with_timeouts_and_prompt_cache_key(
+            "https://example.invalid/v1".into(),
+            "secret".into(),
+            "gpt-5.6-luna".into(),
+            "medium".into(),
+            "resumable-cache-affinity".into(),
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        let body = client.request_body("system", &[]);
+        assert_eq!(body["prompt_cache_key"], "resumable-cache-affinity");
     }
 
     #[test]

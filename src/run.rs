@@ -60,6 +60,8 @@ pub struct RunConfig {
     pub compaction_mode: CompactionMode,
     pub resume_context: Option<ContextState>,
     pub resume_source: Option<PathBuf>,
+    /// Stable provider cache affinity, retained with the resumable state.
+    pub prompt_cache_key: Option<String>,
 }
 
 const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
@@ -70,6 +72,7 @@ const CONTEXT_CHECKPOINT_VERSION: u32 = 1;
 pub struct ResumeState {
     pub context: ContextState,
     pub model: String,
+    pub prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -77,6 +80,9 @@ struct ContextCheckpoint {
     version: u32,
     model: String,
     context: ContextState,
+    /// Missing from pre-cache-affinity checkpoints; such sessions resume normally.
+    #[serde(default)]
+    prompt_cache_key: Option<String>,
 }
 
 pub fn load_resume_state(session_dir: &Path) -> Result<ResumeState> {
@@ -96,6 +102,7 @@ pub fn load_resume_state(session_dir: &Path) -> Result<ResumeState> {
     Ok(ResumeState {
         context: checkpoint.context,
         model: checkpoint.model,
+        prompt_cache_key: checkpoint.prompt_cache_key,
     })
 }
 
@@ -111,6 +118,7 @@ fn persist_context_checkpoint(config: &RunConfig, state: &ContextState) -> Resul
         version: CONTEXT_CHECKPOINT_VERSION,
         model: config.model.clone(),
         context: state.clone(),
+        prompt_cache_key: config.prompt_cache_key.clone(),
     };
     let bytes = serde_json::to_vec(&checkpoint)?;
     let nonce = SystemTime::now()
@@ -1796,6 +1804,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 resume_context: None,
                 resume_source: None,
+                prompt_cache_key: Some("carry-test-cache-key".into()),
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1816,6 +1825,10 @@ mod tests {
         assert!(result["elapsed_ms"].is_u64());
         let resumed = load_resume_state(&session_dir).unwrap();
         assert_eq!(resumed.model, "scripted");
+        assert_eq!(
+            resumed.prompt_cache_key.as_deref(),
+            Some("carry-test-cache-key")
+        );
         let restored = resumed.context.input_items();
         assert!(restored.iter().any(|item| item["type"] == "function_call"));
         assert!(restored.iter().any(|item| {
@@ -1824,6 +1837,28 @@ mod tests {
                     .as_str()
                     .is_some_and(|output| output.contains("answer was delivered"))
         }));
+    }
+
+    #[test]
+    fn legacy_checkpoint_without_cache_key_remains_resumable() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkpoint = ContextCheckpoint {
+            version: CONTEXT_CHECKPOINT_VERSION,
+            model: "gpt-5.6-luna".into(),
+            context: ContextState::new("first task".into()),
+            prompt_cache_key: Some("newer-checkpoint-key".into()),
+        };
+        let mut legacy = serde_json::to_value(checkpoint).unwrap();
+        legacy.as_object_mut().unwrap().remove("prompt_cache_key");
+        std::fs::write(
+            temp.path().join(CONTEXT_CHECKPOINT_FILE),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let resumed = load_resume_state(temp.path()).unwrap();
+        assert_eq!(resumed.model, "gpt-5.6-luna");
+        assert_eq!(resumed.prompt_cache_key, None);
     }
 
     #[tokio::test]
@@ -1850,12 +1885,14 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 resume_context: None,
                 resume_source: None,
+                prompt_cache_key: Some("resumable-cache-affinity".into()),
             },
             Backend::scripted(&first_steps).await.unwrap(),
         )
         .await
         .unwrap();
         let resume = load_resume_state(&first_session).unwrap();
+        let prompt_cache_key = resume.prompt_cache_key.clone();
 
         run(
             RunConfig {
@@ -1868,11 +1905,19 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 resume_context: Some(resume.context),
                 resume_source: Some(first_session),
+                prompt_cache_key,
             },
             Backend::scripted(&second_steps).await.unwrap(),
         )
         .await
         .unwrap();
+        assert_eq!(
+            load_resume_state(&second_session)
+                .unwrap()
+                .prompt_cache_key
+                .as_deref(),
+            Some("resumable-cache-affinity"),
+        );
 
         let event: serde_json::Value =
             tokio::fs::read_to_string(second_session.join("trace.jsonl"))
@@ -1919,6 +1964,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 resume_context: None,
                 resume_source: None,
+                prompt_cache_key: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -1959,6 +2005,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 resume_context: None,
                 resume_source: None,
+                prompt_cache_key: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -2014,6 +2061,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 resume_context: None,
                 resume_source: None,
+                prompt_cache_key: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -2070,6 +2118,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 resume_context: None,
                 resume_source: None,
+                prompt_cache_key: None,
             },
             Backend::scripted(&steps_file).await.unwrap(),
             receiver,
