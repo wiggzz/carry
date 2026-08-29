@@ -66,25 +66,38 @@ and `trace.jsonl`.
 
 ## Session-persistence benchmark mode
 
-`session-smoke-5` is a separate **Carry-only** stress-test mode, not an ordinary
-SWE-bench score. It uses the frozen five-task smoke manifest in its recorded
+`session-smoke-5` and `session-20` are retained-session experiment modes, not ordinary
+SWE-bench scores. Each accepts exactly one sequential native harness: Carry, Codex,
+or Pi (never `all` or a mixed selection). `session-smoke-5` uses the frozen five-task
+smoke manifest; `session-20` uses the first twenty IDs in the recorded frozen-50
 order. Every task gets a fresh prepared workspace/image and normal per-task
-SWE-bench grading. Each completed Carry slot writes its native versioned
-`context-state.json` checkpoint into that slot's output directory; the next slot
-mounts that whole completed session read-only as `--resume` input and writes a
-fresh destination session. The source trace is audit evidence and is never
-modified by a later task.
+SWE-bench grading.
+
+Carry retains its existing behavior: each completed slot writes its native
+versioned `context-state.json` checkpoint into that slot's output directory; the
+next slot mounts that whole completed session read-only as `--resume` input and
+writes a fresh destination session. The source trace is audit evidence and is
+never modified by a later task.
+
+Codex retains its native thread by keeping a worker-local `CODEX_HOME` directory
+and resuming the one audited thread UUID for each later slot. The runner records
+only SHA-256 values for the native JSONL state and thread ID; login credentials
+are removed before the retained state is recorded.
+
+Pi retains its native JSONL session by mounting one worker-local session directory
+writable only into the sequential Pi agents. Each Pi invocation uses the explicit
+native `--session` file and `--session-dir`; no Pi home/configuration state is
+persisted. The raw JSONL session is not uploaded. Artifacts contain only its
+SHA-256 values plus the run-scoped session ID and fixed path-safe file name
+`session.jsonl`.
 
 Each new task prompt explicitly says that its `/testbed` is new and that old
 paths, patches, and conclusions must not be reused. The artifacts record the
 task order, session ID, retained-context flag, per-task position, source and
-destination checkpoint SHA-256 values, and fresh workspace/evaluator isolation.
-Raw checkpoints are not uploaded. If a continuation source or completed output
-lacks `context-state.json`, the runner fails closed rather than launching a
+destination checkpoint/session SHA-256 values, and fresh workspace/evaluator
+isolation. If a continuation source or completed output lacks the required native
+session persistence, the runner fails closed rather than launching a
 fresh-context replacement.
-
-This mode rejects Codex and Pi until their own native, cross-container session
-contracts have equivalent behavioral verification.
 
 ## What the policy does not promise
 

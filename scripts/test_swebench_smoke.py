@@ -43,8 +43,27 @@ class SmokeWorkerTests(unittest.TestCase):
                            ("CARRY_COMPACTION_POLICY", "adaptive")):
             bad = dict(valid)
             bad[key] = value
-            with self.subTest(key=key), self.assertRaises(ValueError):
+            with self.assertRaises(ValueError):
                 self.worker.validate_config(bad)
+
+    def test_proxy_round_usage_records_maximum_and_non_monotonic_inputs(self):
+        log = "noise\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 120}\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 90}\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 180}\n"
+        execute = mock.Mock(return_value=types.SimpleNamespace(stdout=log))
+        rounds = self.worker.load_proxy_round_input_tokens("isolated-proxy", execute=execute)
+        self.assertEqual(rounds, [120, 90, 180])
+        self.assertEqual(self.worker.max_observed_input_tokens(rounds), 180)
+
+    def test_codex_thread_id_accepts_the_native_uuidv7_emitted_by_codex(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trace = pathlib.Path(directory) / "trace.log"
+            trace.write_text(
+                '{"type":"thread.started","thread_id":"01a0488e-3e27-7ff0-9d61-b286f5ec1213"}\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                self.worker.codex_thread_id(trace),
+                "01a0488e-3e27-7ff0-9d61-b286f5ec1213",
+            )
 
     def test_selected_harness_defaults_to_carry_and_rejects_unknown(self):
         self.assertEqual(self.worker.selected_harnesses({}), ("carry",))
@@ -163,6 +182,28 @@ class SmokeWorkerTests(unittest.TestCase):
                 proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
                 resume_session=session,
             )
+
+    def test_pi_session_command_mounts_a_writable_worker_local_session_and_uses_native_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for name in ("repo", "input", "output", "harness", "pi-session"):
+                (root / name).mkdir()
+            session_dir = root / "pi-session"
+            command = self.worker.agent_docker_command(
+                image="smoke-pi:run", harness="pi", repo=root / "repo",
+                harness_bundle=root / "harness", task_input=root / "input", output=root / "output",
+                model="gpt-5.6-luna", reasoning="medium", container_name="carry-agent-pi-session-test",
+                agent_timeout_seconds=315, network="carry-agent-internal-test",
+                proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
+                pi_session_dir=session_dir,
+            )
+        rendered = "\n".join(command)
+        self.assertEqual(rendered.count("type=bind"), 5)
+        self.assertIn(f"src={session_dir.resolve()},dst=/benchmark/pi-session", rendered)
+        self.assertNotIn(f"src={session_dir.resolve()},dst=/benchmark/pi-session,readonly", rendered)
+        self.assertIn("--pi-session-dir\n/benchmark/pi-session", rendered)
+        self.assertNotIn("/var/run/docker.sock", rendered)
+        self.assertNotIn(str(pathlib.Path.home()), rendered)
 
     def test_readiness_command_has_no_network_secret_or_evaluator_mounts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -907,8 +948,19 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertEqual(set(report["harnesses"]), {"carry"})
             self.assertEqual(len(json.loads((output / "records.json").read_text())), 5)
 
+    def test_finalize_accepts_twenty_task_retained_session_denominator(self):
+        tasks = [{"instance_id": f"task-{number}"} for number in range(20)]
+        records = [
+            {"instance_id": task["instance_id"], "harness": "carry", "status": "not-run", "patch": ""}
+            for task in tasks
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            self.worker.finalize(tasks=tasks, records=records, output=output, provenance={}, harnesses=("carry",))
+            self.assertEqual(json.loads((output / "report.json").read_text())["denominator"], 20)
+
         with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(
-            ValueError, "5 unique"
+            ValueError, "20 unique"
         ):
             self.worker.finalize(
                 tasks=tasks,
@@ -1066,16 +1118,21 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         smoke = [frozen[index] for index in (0, 25, 40, 45, 49)]
         self.assertEqual(self.worker.selection_for_mode(frozen, "smoke-5", smoke), smoke)
         self.assertEqual(self.worker.selection_for_mode(frozen, "official-50", smoke), frozen)
+        self.assertEqual(self.worker.selection_for_mode(frozen, "session-20", smoke), frozen[:20])
 
-    def test_session_smoke_uses_the_frozen_smoke_order_and_rejects_non_carry_harnesses(self):
+    def test_session_smoke_uses_the_frozen_smoke_order_and_permits_exactly_one_native_harness(self):
         frozen = [f"task-{number:02d}" for number in range(50)]
         smoke = [frozen[index] for index in (0, 25, 40, 45, 49)]
         self.assertEqual(
             self.worker.selection_for_mode(frozen, "session-smoke-5", smoke), smoke,
         )
-        self.worker.validate_session_mode("session-smoke-5", ("carry",))
-        for harnesses in (("codex",), ("pi",), ("carry", "codex", "pi")):
-            with self.subTest(harnesses=harnesses), self.assertRaisesRegex(ValueError, "Carry"):
+        for harness in ("carry", "codex", "pi"):
+            with self.subTest(harness=harness):
+                self.worker.validate_session_mode("session-smoke-5", (harness,))
+        self.assertEqual(self.worker.agent_concurrency_for_mode({}, "session-smoke-5"), 1)
+        for harnesses in (("carry", "codex"), ("carry", "pi"), ("codex", "pi"),
+                          ("carry", "codex", "pi")):
+            with self.subTest(harnesses=harnesses), self.assertRaisesRegex(ValueError, "exactly one"):
                 self.worker.validate_session_mode("session-smoke-5", harnesses)
         shards = self.worker.ordered_shards(frozen, 10)
         self.assertEqual([len(shard) for shard in shards], [10] * 5)
@@ -1403,6 +1460,106 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertEqual(report["denominator"], 5)
             limits = report["provenance"]["images"]["execution_limits"]
             self.assertEqual((limits["agent_concurrency"], limits["agent_shard_size"]), (1, 5))
+
+    def test_session_smoke_runs_pi_slots_with_one_native_worker_local_session(self):
+        frozen = [f"task-{number:02d}" for number in range(50)]
+        smoke = [frozen[index] for index in (0, 25, 40, 45, 49)]
+        dataset = [
+            {"instance_id": instance_id, "repo": "owner/repo", "base_commit": "a" * 40,
+             "problem_statement": f"problem {instance_id}"}
+            for instance_id in frozen
+        ]
+        fake_datasets = types.SimpleNamespace(load_dataset=lambda *args, **kwargs: dataset)
+        executed = []
+
+        def fake_materialize(*, selected_ids, root, harnesses, **_kwargs):
+            self.assertEqual(harnesses, ("pi",))
+            tasks = []
+            for instance_id in selected_ids:
+                tasks.append({"instance_id": instance_id, "repo": "owner/repo", "base_commit": "a" * 40,
+                              "problem_statement": f"problem {instance_id}"})
+                (root / "tasks" / instance_id / "pi" / "repo").mkdir(parents=True)
+                (root / "tasks" / instance_id / "input").mkdir(parents=True)
+            return tasks
+
+        def fake_agent(**kwargs):
+            position = len(executed) + 1
+            session_file = kwargs["pi_session_dir"] / "session.jsonl"
+            self.assertEqual(kwargs["harness"], "pi")
+            self.assertIsNone(kwargs["resume_session"])
+            self.assertEqual(kwargs["pi_session_dir"], work / "session" / "pi")
+            if position > 1:
+                self.assertEqual(session_file.read_text(), f"session-{position - 1}")
+            session_file.write_text(f"session-{position}", encoding="utf-8")
+            executed.append(kwargs["instance_id"])
+            return {"instance_id": kwargs["instance_id"], "harness": "pi",
+                    "status": "agent-completed", "patch": "", "error": None,
+                    "attempts": 1, "retries": 0, "response_retries": 0}
+
+        def fake_evaluation(*, instance_ids, output, **_kwargs):
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "report.json").write_text(json.dumps({
+                "completed_ids": list(instance_ids), "resolved_ids": [],
+                "unresolved_ids": list(instance_ids), "empty_patch_ids": [],
+                "error_ids": [], "incomplete_ids": [],
+            }))
+
+        def fake_resolve(*, records, **_kwargs):
+            return {record["instance_id"]: {
+                "cache_key": "a" * 64,
+                "agent_image": {"tag": f"prepared:{record['instance_id']}"},
+                "evaluator_image": {"tag": f"evaluator:{record['instance_id']}"},
+                "source_task_image": f"source:{record['instance_id']}", "dockerfile_sha256": "1" * 64,
+            } for record in records}
+
+        config = {
+            "BENCHMARK_MODE": "session-smoke-5", "BENCHMARK_HARNESS": "pi", "RUN_ID": "session-test",
+            "BASE_IMAGE": "node@sha256:" + "a" * 64,
+            "CARRY_BASE_IMAGE": "rust@sha256:" + "b" * 64,
+            "CODEX_VERSION": "1.2.3", "PI_VERSION": "0.84.2",
+            "MODEL": "gpt-5.6-luna", "REASONING": "medium",
+            "TASK_IMAGE_REPOSITORY": "registry.example/tasks",
+            "TASK_IMAGE_CATALOG": "registry.example/tasks@sha256:" + "f" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source, work, output = root / "source", root / "work", root / "output"
+            (source / "benchmarks").mkdir(parents=True)
+            (source / "benchmarks" / "swe-bench-verified-50.json").write_text(json.dumps({"instance_ids": frozen}))
+            (source / "benchmarks" / "swe-bench-verified-smoke-5.json").write_text(json.dumps({"instance_ids": smoke}))
+            secret = root / "openai-key"; secret.write_text("not-a-real-key")
+            with mock.patch.dict(sys.modules, {"datasets": fake_datasets}), \
+                    mock.patch.object(self.worker, "materialize", side_effect=fake_materialize), \
+                    mock.patch.object(self.worker, "build_images", return_value={
+                        harness: {"tag": f"image:{harness}", "image_id": "sha256:" + "c" * 64}
+                        for harness in self.worker.HARNESSES
+                    }), \
+                    mock.patch.object(self.worker, "export_harness_bundles", side_effect=lambda _images, bundle_root: {
+                        harness: bundle_root / harness for harness in self.worker.HARNESSES
+                    }), \
+                    mock.patch.object(self.worker, "resolve_task_environments", side_effect=fake_resolve), \
+                    mock.patch.object(self.worker, "run_isolated_agent", side_effect=fake_agent), \
+                    mock.patch.object(self.worker, "run_official_evaluation", side_effect=fake_evaluation), \
+                    mock.patch.dict(os.environ, {"OPENAI_API_KEY": "not-a-real-key", "OPENAI_SECRET_FILE": str(secret)}, clear=False):
+                self.worker.execute_benchmark(source=source, work=work, output=output, config=config)
+
+            records = json.loads((output / "records.json").read_text())
+            self.assertEqual(executed, smoke)
+            self.assertEqual([record["session_position"] for record in records], [1, 2, 3, 4, 5])
+            self.assertEqual({record["session_id"] for record in records}, {"session-test:pi"})
+            self.assertEqual({record["session_file"] for record in records}, {"session.jsonl"})
+            self.assertEqual(
+                [record["session_file_sha256"] for record in records],
+                [hashlib.sha256(f"session-{position}".encode()).hexdigest() for position in range(1, 6)],
+            )
+            self.assertEqual(
+                [record["source_session_file_sha256"] for record in records[1:]],
+                [hashlib.sha256(f"session-{position}".encode()).hexdigest() for position in range(1, 5)],
+            )
+            provenance = json.loads((output / "report.json").read_text())["provenance"]
+            self.assertEqual(provenance["session_id"], "session-test:pi")
+            self.assertEqual(provenance["session_file"], "session.jsonl")
+            self.assertEqual(provenance["session_storage"], "worker-local")
 
     def test_preparation_failure_stops_before_model_spend(self):
         frozen = [f"task-{number:02d}" for number in range(50)]

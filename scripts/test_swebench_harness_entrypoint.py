@@ -46,6 +46,107 @@ class HarnessEntrypointTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn("+after", (output / "final.patch").read_text())
 
+    def test_codex_resume_uses_a_durable_codex_home_and_native_thread_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo, prompt_dir, output, session = (
+                root / "repo", root / "input", root / "output", root / "codex-session"
+            )
+            binary = root / "bin" / "codex"
+            repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); session.mkdir(); binary.parent.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "file.txt").write_text("before\n")
+            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            (prompt_dir / "task.md").write_text("fix")
+            thread = "11111111-1111-4111-8111-111111111111"
+            binary.write_text(
+                "#!/usr/bin/env python3\nimport os,pathlib,sys\n"
+                "if sys.argv[1] == 'login': sys.exit(0)\n"
+                "assert os.environ['CODEX_HOME'] == " + repr(str(session)) + ", (os.environ, sys.argv)\n"
+                "assert sys.argv[1:3] == ['exec', 'resume'], sys.argv\n"
+                "assert '" + thread + "' in sys.argv, sys.argv\n"
+                "pathlib.Path('file.txt').write_text('after\\n')\n"
+            )
+            binary.chmod(0o755)
+            env = dict(os.environ, OPENAI_API_KEY="unit-test-secret",
+                       OPENAI_BASE_URL="http://openai-proxy:8080/v1",
+                       PREPARED_HARNESS_ROOT=str(root), AGENT_TIMEOUT_SECONDS="30",
+                       BENCHMARK_WORKSPACE=str(repo))
+            run = subprocess.run(
+                ["python3", str(ENTRYPOINT), "run", "--harness", "codex",
+                 "--model", "model", "--reasoning", "medium",
+                 "--prompt", str(prompt_dir / "task.md"), "--output", str(output),
+                 "--codex-session", str(session), "--codex-thread", thread],
+                cwd=repo, env=env, text=True, capture_output=True,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertIn("+after", (output / "final.patch").read_text())
+
+    def test_codex_initial_task_uses_native_session_home_without_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo, prompt_dir, output, session = (root / "repo", root / "input", root / "output", root / "codex-session")
+            binary = root / "bin" / "codex"
+            repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); session.mkdir(); binary.parent.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "file.txt").write_text("before\n")
+            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            (prompt_dir / "task.md").write_text("fix")
+            binary.write_text(
+                "#!/usr/bin/env python3\nimport os,pathlib,sys\n"
+                "if sys.argv[1] == 'login': sys.exit(0)\n"
+                "assert os.environ['CODEX_HOME'] == " + repr(str(session)) + "\n"
+                "assert sys.argv[1] == 'exec' and 'resume' not in sys.argv, sys.argv\n"
+                "pathlib.Path('file.txt').write_text('after\\n')\n"
+            )
+            binary.chmod(0o755)
+            env = dict(os.environ, OPENAI_API_KEY="unit-test-secret", OPENAI_BASE_URL="http://openai-proxy:8080/v1",
+                       PREPARED_HARNESS_ROOT=str(root), AGENT_TIMEOUT_SECONDS="30", BENCHMARK_WORKSPACE=str(repo))
+            run = subprocess.run(
+                ["python3", str(ENTRYPOINT), "run", "--harness", "codex", "--model", "model", "--reasoning", "medium",
+                 "--prompt", str(prompt_dir / "task.md"), "--output", str(output), "--codex-session", str(session)],
+                cwd=repo, env=env, text=True, capture_output=True,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertIn("+after", (output / "final.patch").read_text())
+
+    def test_pi_native_session_does_not_include_no_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo, prompt_dir, output, session = (root / "repo", root / "input", root / "output", root / "pi-session")
+            binary = root / "bin" / "pi"
+            repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); session.mkdir(); binary.parent.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "file.txt").write_text("before\n")
+            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            (prompt_dir / "task.md").write_text("fix")
+            binary.write_text(
+                "#!/usr/bin/env python3\nimport pathlib,sys\n"
+                "assert '--no-session' not in sys.argv, sys.argv\n"
+                "assert '--session' in sys.argv and '--session-dir' in sys.argv, sys.argv\n"
+                "pathlib.Path(sys.argv[sys.argv.index('--session')+1]).write_text('{}\\n')\n"
+                "pathlib.Path('file.txt').write_text('after\\n')\n"
+            )
+            binary.chmod(0o755)
+            env = dict(os.environ, OPENAI_API_KEY="unit-test-secret", OPENAI_BASE_URL="http://openai-proxy:8080/v1",
+                       PREPARED_HARNESS_ROOT=str(root), AGENT_TIMEOUT_SECONDS="30", BENCHMARK_WORKSPACE=str(repo))
+            run = subprocess.run(
+                ["python3", str(ENTRYPOINT), "run", "--harness", "pi", "--model", "model", "--reasoning", "medium",
+                 "--prompt", str(prompt_dir / "task.md"), "--output", str(output), "--pi-session-dir", str(session)],
+                cwd=repo, env=env, text=True, capture_output=True,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertTrue((session / "session.jsonl").is_file())
+
     def test_prepared_image_selects_harness_without_image_environment_template(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
