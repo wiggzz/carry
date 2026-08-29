@@ -177,6 +177,10 @@ async fn run_command(args: Cli) -> Result<()> {
     let model = resume
         .as_ref()
         .map_or_else(|| args.model.clone(), |resume| resume.model.clone());
+    let prompt_cache_key = resume
+        .as_ref()
+        .and_then(|resume| resume.prompt_cache_key.clone())
+        .unwrap_or_else(openai::new_prompt_cache_key);
     let cwd = args
         .cwd
         .canonicalize()
@@ -265,11 +269,12 @@ async fn run_command(args: Cli) -> Result<()> {
         None => {
             let api_key = std::env::var("OPENAI_API_KEY")
                 .context("OPENAI_API_KEY is required unless --scripted-steps is used")?;
-            Backend::openai(openai::OpenAiClient::with_timeouts(
+            Backend::openai(openai::OpenAiClient::with_timeouts_and_prompt_cache_key(
                 args.api_base,
                 api_key,
                 model.clone(),
                 args.reasoning_effort.as_str().to_owned(),
+                prompt_cache_key.clone(),
                 Duration::from_secs(args.request_timeout_secs),
                 Duration::from_secs(args.connect_timeout_secs),
             )?)
@@ -286,6 +291,7 @@ async fn run_command(args: Cli) -> Result<()> {
         compaction_mode: args.compaction_policy.into(),
         resume_context: resume.map(|resume| resume.context),
         resume_source,
+        prompt_cache_key: Some(prompt_cache_key),
     };
 
     if args.serve {
