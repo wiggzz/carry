@@ -53,6 +53,31 @@ def _nonnegative_int(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
+def load_proxy_round_input_tokens(proxy_container: str | None, *, execute: Any = subprocess.run) -> list[int]:
+    """Read only provider-issued per-response inputs from isolated proxy logs."""
+    if not proxy_container:
+        return []
+    try:
+        result = execute(["docker", "logs", proxy_container], check=False, capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    values: list[int] = []
+    for line in result.stdout.splitlines():
+        prefix = "BENCHMARK_PROXY_USAGE "
+        if not line.startswith(prefix):
+            continue
+        try:
+            event = json.loads(line[len(prefix):])
+        except json.JSONDecodeError:
+            continue
+        values.append(_nonnegative_int(event.get("input_tokens") if isinstance(event, dict) else None))
+    return values
+
+
+def max_observed_input_tokens(rounds: list[int]) -> int:
+    return max(rounds, default=0)
+
+
 def load_agent_usage(harness: str, output: pathlib.Path) -> dict[str, int]:
     """Normalize cumulative token usage emitted by each pinned harness."""
     usage = empty_usage()
@@ -327,12 +352,12 @@ def task_image_references(repository: str, cache_key: str) -> dict[str, str]:
 
 def agent_concurrency_for_mode(values: Mapping[str, str], mode: str) -> int:
     """Return a bounded agent parallelism that fits the selected benchmark mode."""
-    default = "5" if mode == "official-50" else "1" if mode == "session-smoke-5" else "3"
+    default = "5" if mode == "official-50" else "1" if mode in {"session-smoke-5", "session-20"} else "3"
     concurrency = int(values.get("AGENT_CONCURRENCY", default))
     if concurrency < 1 or concurrency > 5:
         raise ValueError("AGENT_CONCURRENCY must be between 1 and 5")
-    if mode == "session-smoke-5" and concurrency != 1:
-        raise ValueError("session-smoke-5 requires exactly one sequential Carry slot")
+    if mode in {"session-smoke-5", "session-20"} and concurrency != 1:
+        raise ValueError("retained-session modes require exactly one sequential native harness")
     return concurrency
 
 
@@ -509,11 +534,20 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
                          output: pathlib.Path, model: str, reasoning: str,
                          container_name: str, agent_timeout_seconds: int,
                          network: str, proxy_ip: str, api_base: str,
-                         resume_session: pathlib.Path | None = None) -> list[str]:
+                         resume_session: pathlib.Path | None = None,
+                         codex_session: pathlib.Path | None = None,
+                         codex_thread: str | None = None,
+                         pi_session_dir: pathlib.Path | None = None) -> list[str]:
     if harness not in HARNESSES:
         raise ValueError("unknown harness")
     if resume_session is not None and harness != "carry":
         raise ValueError("only Carry supports a resumed session context")
+    if (codex_session is not None or codex_thread is not None) and harness != "codex":
+        raise ValueError("only Codex supports a durable native session")
+    if codex_thread is not None and codex_session is None:
+        raise ValueError("a Codex thread requires its durable session directory")
+    if pi_session_dir is not None and harness != "pi":
+        raise ValueError("only Pi supports a native session directory")
     command = [
         "docker", "run", "--rm", "--name", container_name, "--stop-timeout", "10",
         "--network", network, "--dns", "127.0.0.1",
@@ -537,6 +571,16 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
             "--mount",
             f"type=bind,src={resume_session.resolve()},dst=/benchmark/session,readonly",
         ])
+    if codex_session is not None:
+        command.extend([
+            "--mount",
+            f"type=bind,src={codex_session.resolve()},dst=/benchmark/codex-session",
+        ])
+    if pi_session_dir is not None:
+        command.extend([
+            "--mount",
+            f"type=bind,src={pi_session_dir.resolve()},dst=/benchmark/pi-session",
+        ])
     command.extend([
         "--workdir", "/testbed", image, "run", "--harness", harness,
         "--model", model,
@@ -545,6 +589,12 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
     ])
     if resume_session is not None:
         command.extend(["--resume-session", "/benchmark/session"])
+    if codex_session is not None:
+        command.extend(["--codex-session", "/benchmark/codex-session"])
+    if codex_thread is not None:
+        command.extend(["--codex-thread", codex_thread])
+    if pi_session_dir is not None:
+        command.extend(["--pi-session-dir", "/benchmark/pi-session"])
     return command
 
 
@@ -1230,13 +1280,37 @@ def publish_task_environments(*, records: list[dict[str, Any]], source: pathlib.
 
 
 
+def codex_thread_id(trace_path: pathlib.Path) -> str:
+    """Extract one native Codex thread UUID from a JSONL execution trace."""
+    thread_ids = set()
+    for line in trace_path.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "thread.started":
+            continue
+        thread_id = event.get("thread_id", event.get("threadId"))
+        if isinstance(thread_id, str) and re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            thread_id.lower(),
+        ):
+            thread_ids.add(thread_id.lower())
+    if len(thread_ids) != 1:
+        raise RuntimeError("Codex trace must contain exactly one native thread.started UUID")
+    return thread_ids.pop()
+
+
 def run_isolated_agent(*, instance_id: str, harness: str, image: str,
                        harness_bundle: pathlib.Path, proxy_image: str,
                        proxy_script: pathlib.Path, repo: pathlib.Path,
                        task_input: pathlib.Path, output: pathlib.Path, model: str, reasoning: str,
                        timeout_seconds: int | None = None,
                        pricing: Mapping[str, float] | None = None,
-                       resume_session: pathlib.Path | None = None) -> dict[str, Any]:
+                       resume_session: pathlib.Path | None = None,
+                       codex_session: pathlib.Path | None = None,
+                       codex_thread: str | None = None,
+                       pi_session_dir: pathlib.Path | None = None) -> dict[str, Any]:
     identity = f"{instance_id}\0{harness}\0{output.resolve()}"
     network = start_agent_network(
         identity=identity, proxy_image=proxy_image, proxy_script=proxy_script,
@@ -1248,7 +1322,9 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
             repo=repo, task_input=task_input, output=output,
             model=model, reasoning=reasoning, timeout_seconds=timeout_seconds,
             pricing=pricing, network=network["internal"], proxy_ip=network["proxy_ip"],
-            api_base=network["api_base"], resume_session=resume_session,
+            proxy_container=network["proxy"], api_base=network["api_base"], resume_session=resume_session,
+            codex_session=codex_session, codex_thread=codex_thread,
+            pi_session_dir=pi_session_dir,
         )
     finally:
         cleanup_agent_network(network)
@@ -1257,9 +1333,13 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
 def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
               harness_bundle: pathlib.Path, task_input: pathlib.Path,
               output: pathlib.Path, model: str, reasoning: str,
-              network: str, proxy_ip: str, api_base: str, timeout_seconds: int | None = None,
+              network: str, proxy_ip: str, proxy_container: str | None = None, api_base: str = "",
+              timeout_seconds: int | None = None,
               pricing: Mapping[str, float] | None = None,
-              resume_session: pathlib.Path | None = None) -> dict[str, Any]:
+              resume_session: pathlib.Path | None = None,
+              codex_session: pathlib.Path | None = None,
+              codex_thread: str | None = None,
+              pi_session_dir: pathlib.Path | None = None) -> dict[str, Any]:
     slot_timeout = (
         timeout_seconds if timeout_seconds is not None
         else int(os.environ.get("AGENT_TIMEOUT_SECONDS", "1200"))
@@ -1275,6 +1355,8 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
         model=model, reasoning=reasoning, container_name=container_name,
         agent_timeout_seconds=in_container_timeout, network=network,
         proxy_ip=proxy_ip, api_base=api_base, resume_session=resume_session,
+        codex_session=codex_session, codex_thread=codex_thread,
+        pi_session_dir=pi_session_dir,
     )
     started = time.monotonic()
     print("BENCHMARK_PROGRESS " + json.dumps({
@@ -1310,6 +1392,8 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
                   "response_retries": 0,
                   "timed_out": isinstance(error, subprocess.TimeoutExpired)}
     record["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    record["round_input_tokens"] = load_proxy_round_input_tokens(proxy_container)
+    record["max_round_input_tokens"] = max_observed_input_tokens(record["round_input_tokens"])
     record["usage"] = load_agent_usage(harness, output)
     record["estimated_cost_usd"] = estimate_cost_usd(record["usage"], pricing)
     print("BENCHMARK_PROGRESS " + json.dumps({
@@ -1402,14 +1486,16 @@ def selection_for_mode(frozen_ids: list[str], mode: str,
                 or not set(smoke_ids).issubset(frozen_ids)):
             raise ValueError("smoke manifest must contain five unique frozen task IDs")
         return list(smoke_ids)
+    if mode == "session-20":
+        return list(frozen_ids[:20])
     if mode == "official-50":
         return list(frozen_ids)
     raise ValueError(f"unsupported benchmark mode: {mode}")
 
 
 def validate_session_mode(mode: str, harnesses: tuple[str, ...]) -> None:
-    if mode == "session-smoke-5" and harnesses != ("carry",):
-        raise ValueError("session-smoke-5 requires the Carry harness only")
+    if mode in {"session-smoke-5", "session-20"} and harnesses not in {("carry",), ("codex",), ("pi",)}:
+        raise ValueError("retained-session modes require exactly one native harness")
 
 
 def ordered_shards(instance_ids: list[str], shard_size: int) -> list[list[str]]:
@@ -1701,8 +1787,8 @@ def _validate_records(
     harnesses: tuple[str, ...] = HARNESSES,
 ) -> None:
     task_count = len(tasks)
-    if task_count not in (5, 50):
-        raise ValueError("benchmark must contain exactly 5 or 50 tasks")
+    if task_count not in (5, 20, 50):
+        raise ValueError("benchmark must contain exactly 5, 20, or 50 tasks")
     expected = {(task["instance_id"], harness) for task in tasks for harness in harnesses}
     actual = [(record.get("instance_id"), record.get("harness")) for record in records]
     expected_count = task_count * len(harnesses)
@@ -1726,6 +1812,8 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
         item.setdefault("elapsed_seconds", 0.0)
         item.setdefault("estimated_cost_usd", None)
         item.setdefault("usage", empty_usage())
+        item.setdefault("round_input_tokens", [])
+        item.setdefault("max_round_input_tokens", 0)
         if (isinstance(item["response_retries"], bool)
                 or not isinstance(item["response_retries"], int)
                 or item["response_retries"] < 0):
@@ -1741,6 +1829,10 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
             raise ValueError("estimated_cost_usd must be null or nonnegative")
         if not isinstance(item["usage"], dict):
             raise ValueError("usage must be an object")
+        if not isinstance(item["round_input_tokens"], list):
+            raise ValueError("round_input_tokens must be a list")
+        item["round_input_tokens"] = [_nonnegative_int(value) for value in item["round_input_tokens"]]
+        item["max_round_input_tokens"] = max_observed_input_tokens(item["round_input_tokens"])
         item["usage"] = {key: _nonnegative_int(item["usage"].get(key)) for key in USAGE_KEYS}
         normalized.append(item)
         predictions.append({
@@ -1770,6 +1862,13 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
             "usage": {
                 key: sum(item["usage"][key] for item in harness_records) for key in USAGE_KEYS
             },
+            "max_round_input_tokens": max(
+                (item["max_round_input_tokens"] for item in harness_records), default=0,
+            ),
+            "observed_input_token_decreases": sum(
+                later < earlier for item in harness_records
+                for earlier, later in zip(item["round_input_tokens"], item["round_input_tokens"][1:])
+            ),
             "estimated_cost_usd": round(sum(costs), 6) if costs else None,
             "costed_slots": len(costs),
             "statuses": dict(sorted(Counter(item["status"] for item in harness_records).items())),
@@ -1946,8 +2045,22 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     selected_records = [by_id[instance_id] for instance_id in selection]
     work.mkdir(parents=True, exist_ok=True)
     session_source: pathlib.Path | None = None
-    if mode == "session-smoke-5":
-        (work / "session").mkdir(parents=True, exist_ok=True)
+    codex_session: pathlib.Path | None = None
+    codex_thread: str | None = None
+    pi_session_dir: pathlib.Path | None = None
+    pi_session_file: pathlib.Path | None = None
+    if mode in {"session-smoke-5", "session-20"}:
+        session_root = work / "session"
+        session_root.mkdir(parents=True, exist_ok=True)
+        if harnesses == ("codex",):
+            codex_session = session_root / "codex"
+            codex_session.mkdir()
+        elif harnesses == ("pi",):
+            pi_session_dir = session_root / "pi"
+            pi_session_dir.mkdir()
+            pi_session_file = pi_session_dir / "session.jsonl"
+            if pi_session_file.exists():
+                raise RuntimeError("Pi session storage must be empty before the benchmark starts")
     (work / "canonical-dataset.json").write_text(
         json.dumps(selected_records, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -1973,14 +2086,19 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "mode": mode, "harnesses": list(harnesses), "phase": "planned",
         "pricing_usd_per_million": pricing,
     }
-    if mode == "session-smoke-5":
+    if mode in {"session-smoke-5", "session-20"}:
         provenance_payload.update({
             "retained_context": True,
-            "session_id": f"{config['RUN_ID']}:carry",
+            "session_id": f"{config['RUN_ID']}:{harnesses[0]}",
             "task_order": selection,
             "task_workspace_isolation": True,
             "evaluator_isolation": True,
         })
+        if harnesses == ("pi",):
+            provenance_payload.update({
+                "session_file": "session.jsonl",
+                "session_storage": "worker-local",
+            })
     tasks = [{
         "instance_id": record["instance_id"], "repo": record["repo"],
         "base_commit": record["base_commit"], "problem_statement": record["problem_statement"],
@@ -2090,9 +2208,9 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 slots.append((task, harness, task_root, slot_output))
 
         def execute_slot(slot: tuple[Any, ...]) -> dict[str, Any]:
-            nonlocal session_source
+            nonlocal session_source, codex_thread
             task, harness, task_root, slot_output = slot
-            session_position = selection.index(task["instance_id"]) + 1 if mode == "session-smoke-5" else None
+            session_position = selection.index(task["instance_id"]) + 1 if mode in {"session-smoke-5", "session-20"} else None
             slot_timeout = agent_timeout
             if agent_deadline is not None:
                 remaining = math.ceil(agent_deadline - time.monotonic())
@@ -2106,11 +2224,15 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                     }
                 slot_timeout = min(slot_timeout, remaining)
             if session_position is not None:
-                if session_position > 1 and session_source is None:
+                if session_position > 1 and (
+                    (harness == "carry" and session_source is None)
+                    or (harness == "codex" and codex_thread is None)
+                    or (harness == "pi" and (pi_session_file is None or not pi_session_file.is_file()))
+                ):
                     return {
                         "instance_id": task["instance_id"], "harness": harness,
                         "status": "agent-session-context-missing", "patch": "",
-                        "error": "retained Carry source session is unavailable before this task",
+                        "error": "retained native source session is unavailable before this task",
                         "attempts": 0, "retries": 0, "response_retries": 0,
                         "model": validated["MODEL"], "reasoning": validated["REASONING"],
                         "session_position": session_position,
@@ -2132,6 +2254,10 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 source_state = session_source / "context-state.json"
                 if not source_state.is_file():
                     raise RuntimeError("retained Carry source session has no context-state.json")
+            source_pi_session_sha256 = None
+            if (session_position is not None and harness == "pi"
+                    and pi_session_file is not None and pi_session_file.is_file()):
+                source_pi_session_sha256 = hashlib.sha256(pi_session_file.read_bytes()).hexdigest()
             record = run_isolated_agent(
                 instance_id=task["instance_id"], harness=harness,
                 image=prepared[task["instance_id"]]["agent_image"]["tag"],
@@ -2142,20 +2268,49 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 task_input=task_root / "input", output=slot_output,
                 model=validated["MODEL"], reasoning=validated["REASONING"],
                 timeout_seconds=slot_timeout, pricing=pricing,
-                resume_session=session_source,
+                resume_session=session_source if harness == "carry" else None,
+                codex_session=codex_session if harness == "codex" else None,
+                codex_thread=codex_thread if harness == "codex" else None,
+                pi_session_dir=pi_session_dir if session_position is not None and harness == "pi" else None,
             )
             record["model"] = validated["MODEL"]
             record["reasoning"] = validated["REASONING"]
             if session_position is not None:
                 record["session_position"] = session_position
-                if source_state is not None:
-                    record["source_session_state_sha256"] = hashlib.sha256(source_state.read_bytes()).hexdigest()
-                if record["status"] == "agent-completed":
-                    state = slot_output / "context-state.json"
-                    if not state.is_file():
-                        raise RuntimeError("completed Carry slot has no context-state.json")
-                    record["session_state_sha256"] = hashlib.sha256(state.read_bytes()).hexdigest()
-                    session_source = slot_output
+                if harness == "carry":
+                    if source_state is not None:
+                        record["source_session_state_sha256"] = hashlib.sha256(source_state.read_bytes()).hexdigest()
+                    if record["status"] == "agent-completed":
+                        state = slot_output / "context-state.json"
+                        if not state.is_file():
+                            raise RuntimeError("completed Carry slot has no context-state.json")
+                        record["session_state_sha256"] = hashlib.sha256(state.read_bytes()).hexdigest()
+                        session_source = slot_output
+                elif harness == "codex" and record["status"] == "agent-completed":
+                    if codex_session is None:
+                        raise RuntimeError("Codex session directory was not initialized")
+                    next_thread = codex_thread_id(slot_output / "trace.log")
+                    if codex_thread is not None and next_thread != codex_thread:
+                        raise RuntimeError("resumed Codex task changed its native thread UUID")
+                    session_files = sorted(codex_session.rglob("*.jsonl"))
+                    if not session_files:
+                        raise RuntimeError("completed Codex slot persisted no native session JSONL")
+                    state_hash = hashlib.sha256()
+                    for path in session_files:
+                        state_hash.update(path.relative_to(codex_session).as_posix().encode() + b"\0")
+                        state_hash.update(path.read_bytes())
+                    record["session_state_sha256"] = state_hash.hexdigest()
+                    record["native_session_id_sha256"] = hashlib.sha256(next_thread.encode()).hexdigest()
+                    codex_thread = next_thread
+                elif harness == "pi":
+                    record["session_id"] = f"{config['RUN_ID']}:pi"
+                    record["session_file"] = "session.jsonl"
+                    if source_pi_session_sha256 is not None:
+                        record["source_session_file_sha256"] = source_pi_session_sha256
+                    if record["status"] == "agent-completed":
+                        if pi_session_file is None or not pi_session_file.is_file():
+                            raise RuntimeError("completed Pi slot has no session.jsonl")
+                        record["session_file_sha256"] = hashlib.sha256(pi_session_file.read_bytes()).hexdigest()
             return record
 
         try:
