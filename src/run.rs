@@ -27,7 +27,7 @@ use crate::{
 const NEUTRAL_VOLATILE_BUDGET_TOKENS: usize = 32 * 1024;
 const CONTEXT_PRESSURE_CANDIDATE_LIMIT: usize = 10;
 
-const CONTEXT_PRESSURE_REMINDER: &str = "[system reminder: Context pressure is high. On this turn, continue the task and use the context update to review the suggested older tool-context items below. They are suggestions, not instructions to discard information. Preserve any still-needed conclusion with `remember` or `protected`; mark only stale or redundant IDs `removable` so the harness can compact them on the next request.]";
+const CONTEXT_PRESSURE_REMINDER: &str = "Context pressure is high. Continue the task and use the context update to review the suggested older tool-context items below. They are suggestions, not instructions to discard information. Preserve any still-needed conclusion with `remember` or `protected`; mark only stale or redundant IDs `removable` so the harness can compact them on the next request.";
 
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
@@ -675,7 +675,9 @@ async fn run_loop(
                     ),
                 }),
             )?;
-            history.push(reminder);
+            context_state.append_pressure_reminder_to_latest_tool(&reminder)?;
+            persist_context_checkpoint(&config, &context_state)?;
+            history = context_state.input_items();
         }
         cache.begin_request_with_history(
             context_state.rendered_breakpoints(),
@@ -944,7 +946,7 @@ fn context_pressure_reminder(
     protected: &[u64],
     threshold_tokens: usize,
     candidate_limit: usize,
-) -> Option<serde_json::Value> {
+) -> Option<String> {
     let estimated_tokens = state.estimated_tokens();
     if estimated_tokens < threshold_tokens {
         return None;
@@ -969,13 +971,9 @@ fn context_pressure_reminder(
         })
         .collect::<Vec<_>>()
         .join("; ");
-    Some(json!({
-        "role": "developer",
-        "content": [{
-            "type": "input_text",
-            "text": format!("{CONTEXT_PRESSURE_REMINDER}\nSuggested candidates: {suggested}")
-        }]
-    }))
+    Some(format!(
+        "{CONTEXT_PRESSURE_REMINDER}\nSuggested candidates: {suggested}"
+    ))
 }
 
 fn maybe_compact(
@@ -1868,12 +1866,10 @@ mod tests {
 
         let reminder = context_pressure_reminder(&state, &[], 1, 10).unwrap();
 
-        assert_eq!(reminder["role"], "developer");
-        let text = reminder["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("Context pressure"));
-        assert!(text.contains("removable"));
-        assert!(text.contains("id=2"));
-        assert!(!text.contains("id=3"));
+        assert!(reminder.contains("Context pressure"));
+        assert!(reminder.contains("removable"));
+        assert!(reminder.contains("id=2"));
+        assert!(!reminder.contains("id=3"));
     }
 
     #[tokio::test]
@@ -1942,17 +1938,69 @@ mod tests {
             .iter()
             .find(|event| event["event"] == "model_request")
             .unwrap();
-        assert!(
-            request["data"]["history"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| {
-                    item["content"][0]["text"]
-                        .as_str()
-                        .is_some_and(|text| text.contains("Context pressure"))
-                })
-        );
+        let history = request["data"]["history"].as_array().unwrap();
+        assert!(history.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["output"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("[context pressure reminder]"))
+        }));
+        assert!(!history.iter().any(|item| {
+            item["role"] == "developer"
+                && item["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Context pressure"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn pressure_reminders_preserve_exact_request_prefixes_across_rounds() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("run");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(&steps_file, concat!(
+            r#"{"action":{"kind":"shell","command":"true","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+            r#"{"action":{"kind":"shell","command":"true","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+            r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+        )).await.unwrap();
+        let mut context = ContextState::new("prior task".into());
+        context.add_tool(vec![json!({"type":"function_call","call_id":"old","name":"shell","arguments":"{}"})], json!({"type":"function_call_output","call_id":"old","output":"old output ".repeat(400)})).unwrap();
+        context.add_tool(vec![json!({"type":"function_call","call_id":"latest","name":"shell","arguments":"{}"})], json!({"type":"function_call_output","call_id":"latest","output":"latest output"})).unwrap();
+        run(
+            RunConfig {
+                cwd: workspace,
+                prompt: String::new(),
+                session_dir: session_dir.clone(),
+                model: "scripted".into(),
+                max_steps: None,
+                shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Disabled,
+                context_pressure_reminder_at_tokens: Some(1),
+                resume_context: Some(context),
+                resume_source: None,
+                prompt_cache_key: None,
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let requests = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["event"] == "model_request")
+            .map(|event| event["data"]["history"].as_array().unwrap().clone())
+            .collect::<Vec<_>>();
+        assert!(requests.len() >= 3);
+        for pair in requests.windows(2) {
+            assert!(
+                pair[1].starts_with(&pair[0]),
+                "next request must extend the exact prior request prefix"
+            );
+        }
     }
 
     #[tokio::test]

@@ -139,13 +139,15 @@ markers, cache frontier, and rewrite rules.
 
 ### Context-pressure reminders
 
-Opt-in `--context-pressure-reminder-at-tokens N` adds an ephemeral developer
-reminder before each model request at or above `N` rendered-context tokens. It
-lists up to ten largest older tool-context IDs (never the newest tool result) so
-the model can preserve an essential conclusion with `remember`/`protected` or
-mark stale IDs `removable` in its normal context update. The reminder never
-deletes or summarizes state itself; normal economic compaction decides whether
-to apply model-authorized removal on the following request.
+Opt-in `--context-pressure-reminder-at-tokens N` appends a compact advisory
+reminder to the newest persisted tool result before each model request at or
+above `N` rendered-context tokens. It lists up to ten older large tool-context
+IDs so the model can preserve an essential conclusion with
+`remember`/`protected` or mark stale IDs `removable` in its normal context
+update. The decorated tool result is checkpointed, preserving exact request
+prefixes across later rounds. The reminder never deletes or summarizes state
+itself; normal economic compaction decides whether to apply model-authorized
+removal on the following request.
 
 For example, `139264` is half of a 272-Ki-token short-context budget:
 

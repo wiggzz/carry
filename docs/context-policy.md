@@ -68,18 +68,21 @@ and `trace.jsonl`.
 
 `--context-pressure-reminder-at-tokens N` is an opt-in harness behavior, not a
 second compactor. When Carry's rendered-context estimate reaches `N`, it appends
-an ephemeral developer reminder to the next model request. The reminder ranks at
-most ten large, older tool-context IDs, including items the model had previously
-protected; it excludes the latest tool result and request-protected IDs. The
-model remains responsible for choosing `remember`, `protected`, or `removable`
-in its ordinary context update.
+a compact advisory reminder to the newest tool result before sending the next
+model request. The decorated tool result is persisted in the canonical
+checkpoint, so later requests preserve an exact prefix rather than losing an
+implicit provider-cache frontier. The reminder ranks at most ten older large
+tool-context IDs, including items the model had previously protected; it
+excludes the newest tool result and request-protected IDs. The model remains
+responsible for choosing `remember`, `protected`, or `removable` in its ordinary
+context update.
 
-Carry never silently deletes, summarizes, or persists the reminder. A
-`context_pressure_reminder` trace event records the threshold, estimate, and
-exact candidates sent to the model. Only a later regular economic-compaction
-decision can remove an item the model marked removable. This preserves the
-checkpoint as the canonical full state and makes the policy separately
-measurable against an identical no-reminder run.
+Carry never silently deletes or summarizes state. A `context_pressure_reminder`
+trace event records the threshold, estimate, and exact candidates sent to the
+model. Only a later regular economic-compaction decision can remove an item the
+model marked removable. This preserves the checkpoint as the canonical full
+state and makes the policy separately measurable against an identical
+no-reminder run.
 
 ## Session-persistence benchmark mode
 

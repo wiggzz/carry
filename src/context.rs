@@ -219,6 +219,27 @@ impl ContextState {
         id
     }
 
+    pub fn append_pressure_reminder_to_latest_tool(&mut self, reminder: &str) -> Result<u64> {
+        let item = self
+            .items
+            .iter_mut()
+            .rev()
+            .find(|item| item.kind == ContextItemKind::Tool)
+            .context("context pressure reminder requires a prior tool result")?;
+        let output = item
+            .input_items
+            .last_mut()
+            .context("tool context always has a function output")?;
+        let existing = output["output"]
+            .as_str()
+            .context("tool result output is not text")?;
+        output["output"] = Value::String(format!(
+            "{existing}\n\n[context pressure reminder]\n{reminder}"
+        ));
+        item.bytes = serialized_bytes(&item.input_items);
+        Ok(item.id)
+    }
+
     pub fn add_tool(
         &mut self,
         output_items: Vec<Value>,
