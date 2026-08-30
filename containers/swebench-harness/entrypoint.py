@@ -33,6 +33,9 @@ if not os.environ.get("OPENAI_API_KEY"):
     parser.error("OPENAI_API_KEY is required")
 if not os.environ.get("OPENAI_BASE_URL"):
     parser.error("OPENAI_BASE_URL is required")
+compaction_policy = os.environ.get("CARRY_COMPACTION_POLICY", "economic")
+if compaction_policy not in {"economic", "disabled"}:
+    parser.error("CARRY_COMPACTION_POLICY must be economic or disabled")
 
 output = pathlib.Path(args.output)
 output.mkdir(parents=True, exist_ok=True)
@@ -43,7 +46,7 @@ if not template:
     root = pathlib.Path(os.environ.get("PREPARED_HARNESS_ROOT", "/opt/swebench-harness"))
     template = {
         "carry": f"{root}/bin/carry --cwd /testbed --session-dir {{output}} "
-                 "--model {model} -p {prompt_text}",
+                 "--model {model} --compaction-policy {compaction_policy} -p {prompt_text}",
         "codex": f"{root}/bin/codex exec --dangerously-bypass-approvals-and-sandbox "
                  "--model {model} --config model_reasoning_effort={reasoning} "
                  "--json {prompt_text}",
@@ -54,6 +57,7 @@ prompt_text = pathlib.Path(args.prompt).read_text(encoding="utf-8")
 values = {
     "model": args.model,
     "reasoning": args.reasoning,
+    "compaction_policy": compaction_policy,
     "prompt": args.prompt,
     "prompt_text": prompt_text,
     "output": args.output,

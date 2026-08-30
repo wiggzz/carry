@@ -46,6 +46,39 @@ class HarnessEntrypointTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn("+after", (output / "final.patch").read_text())
 
+    def test_carry_forwards_disabled_compaction_policy_to_native_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo, prompt_dir, output = root / "repo", root / "input", root / "output"
+            binary = root / "bin" / "carry"
+            repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); binary.parent.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "file.txt").write_text("before\n")
+            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            (prompt_dir / "task.md").write_text("fix")
+            binary.write_text(
+                "#!/usr/bin/env python3\nimport pathlib,sys\n"
+                "index=sys.argv.index('--compaction-policy')\n"
+                "assert sys.argv[index + 1] == 'disabled', sys.argv\n"
+                "pathlib.Path('file.txt').write_text('after\\n')\n"
+            )
+            binary.chmod(0o755)
+            env = dict(os.environ, OPENAI_API_KEY="unit-test-secret",
+                       OPENAI_BASE_URL="http://openai-proxy:8080/v1",
+                       PREPARED_HARNESS_ROOT=str(root), AGENT_TIMEOUT_SECONDS="30",
+                       BENCHMARK_WORKSPACE=str(repo), CARRY_COMPACTION_POLICY="disabled")
+            run = subprocess.run(
+                ["python3", str(ENTRYPOINT), "run", "--harness", "carry",
+                 "--model", "model", "--reasoning", "medium",
+                 "--prompt", str(prompt_dir / "task.md"), "--output", str(output)],
+                cwd=repo, env=env, text=True, capture_output=True,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertIn("+after", (output / "final.patch").read_text())
+
     def test_codex_resume_uses_a_durable_codex_home_and_native_thread_id(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
