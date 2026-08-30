@@ -334,6 +334,8 @@ class HarnessEntrypointTests(unittest.TestCase):
             fake_carry.write_text(
                 "#!/usr/bin/env python3\nimport pathlib,sys\n"
                 "assert '--max-steps' not in sys.argv[1:], sys.argv\n"
+                "index=sys.argv.index('--compaction-policy')\n"
+                "assert sys.argv[index + 1] == 'disabled', sys.argv\n"
                 "pathlib.Path('file.txt').write_text('after\\n')\n"
             )
             fake_carry.chmod(0o755)
@@ -342,6 +344,7 @@ class HarnessEntrypointTests(unittest.TestCase):
                 OPENAI_API_KEY="unit-test-secret",
                 OPENAI_BASE_URL="http://openai-proxy:8080/v1",
                 AGENT_COMMAND=command_template,
+                CARRY_COMPACTION_POLICY="disabled",
                 AGENT_TIMEOUT_SECONDS="1",
                 BENCHMARK_WORKSPACE=str(repo),
                 PATH=f"{bin_dir}:{os.environ['PATH']}",
