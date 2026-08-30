@@ -385,6 +385,14 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
     config["CARRY_COMPACTION_POLICY"] = values.get("CARRY_COMPACTION_POLICY", "economic")
     if config["CARRY_COMPACTION_POLICY"] not in {"economic", "disabled"}:
         raise ValueError("CARRY_COMPACTION_POLICY must be economic or disabled")
+    context_pressure_threshold = values.get("CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS", "").strip()
+    if context_pressure_threshold and (
+        not context_pressure_threshold.isascii()
+        or not context_pressure_threshold.isdecimal()
+        or int(context_pressure_threshold) <= 0
+    ):
+        raise ValueError("CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS must be a positive integer or empty")
+    config["CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS"] = context_pressure_threshold
     if not DIGEST_IMAGE.fullmatch(config["BASE_IMAGE"]):
         raise ValueError("BASE_IMAGE must use an immutable sha256 digest")
     for key in ("CODEX_VERSION", "PI_VERSION"):
@@ -557,6 +565,7 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
         "--env", f"OPENAI_BASE_URL={api_base}",
         "--env", f"AGENT_TIMEOUT_SECONDS={agent_timeout_seconds}",
         "--env", "CARRY_COMPACTION_POLICY",
+        "--env", "CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS",
         "--env", "BENCHMARK_WORKSPACE=/testbed",
         "--env", "HOME=/agent-home", "--env", "XDG_CONFIG_HOME=/agent-home/.config",
         "--tmpfs", "/agent-home:rw,nosuid,nodev,size=256m",
@@ -2082,6 +2091,9 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "swebench_version": "4.1.0", "model": validated["MODEL"],
         "reasoning": validated["REASONING"],
         "carry_compaction_policy": validated["CARRY_COMPACTION_POLICY"],
+        "carry_context_pressure_reminder_at_tokens": validated[
+            "CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS"
+        ] or None,
         "images": {},
         "mode": mode, "harnesses": list(harnesses), "phase": "planned",
         "pricing_usd_per_million": pricing,

@@ -348,6 +348,47 @@ impl ContextState {
         estimated_tokens(&self.input_items())
     }
 
+    pub fn estimated_tokens_for_input_items(items: &[Value]) -> usize {
+        estimated_tokens(items)
+    }
+
+    pub fn pressure_candidates(
+        &self,
+        protected: &[u64],
+        limit: usize,
+    ) -> Vec<ContextPressureCandidate> {
+        let protected = protected.iter().copied().collect::<HashSet<_>>();
+        let newest_tool = self
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.kind == ContextItemKind::Tool)
+            .map(|item| item.id);
+        let mut candidates = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.kind == ContextItemKind::Tool
+                    && Some(item.id) != newest_tool
+                    && !protected.contains(&item.id)
+            })
+            .map(|item| ContextPressureCandidate {
+                id: item.id,
+                tokens: item.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN),
+                retention: item.retention,
+                signal: item.signal,
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .tokens
+                .cmp(&left.tokens)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        candidates.truncate(limit);
+        candidates
+    }
+
     #[cfg(test)]
     fn item_estimated_tokens(&self, id: u64) -> usize {
         self.items
@@ -800,6 +841,14 @@ pub(crate) struct CompactionPlan {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct ContextPressureCandidate {
+    pub id: u64,
+    pub tokens: usize,
+    pub retention: Retention,
+    pub signal: RetentionSignal,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct NeutralRetentionDecision {
     pub id: u64,
     pub tokens: usize,
@@ -881,6 +930,30 @@ mod tests {
                 }),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn pressure_candidates_rank_largest_old_tool_items_including_previously_protected_items() {
+        let mut state = ContextState::new("current task".into());
+        let small = add_tool_with_output(&mut state, &"small ".repeat(20));
+        let large = add_tool_with_output(&mut state, &"large ".repeat(400));
+        let protected_large = add_tool_with_output(&mut state, &"protected ".repeat(100));
+        state.record_signals(&update(&[protected_large], &[], &[]), protected_large);
+        let newest = add_tool_with_output(&mut state, &"newest ".repeat(800));
+
+        let candidates = state.pressure_candidates(&[small], 10);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>(),
+            vec![large, protected_large]
+        );
+        assert_eq!(candidates[0].retention, Retention::Volatile);
+        assert_eq!(candidates[1].signal, RetentionSignal::Keep);
+        assert!(candidates[0].tokens >= candidates[1].tokens);
+        assert!(!candidates.iter().any(|candidate| candidate.id == newest));
     }
 
     #[test]
