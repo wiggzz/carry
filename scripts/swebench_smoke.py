@@ -1482,6 +1482,41 @@ def load_official_report(report_dir: pathlib.Path) -> dict[str, set[str]]:
     raise RuntimeError("official evaluator report did not contain outcome ID sets")
 
 
+def retry_official_evaluation_errors(
+    *, outcomes: Mapping[str, set[str]], predictions: pathlib.Path,
+    canonical_dataset: pathlib.Path, run_id: str, output: pathlib.Path,
+    process_timeout_seconds: int | None,
+) -> dict[str, set[str]]:
+    """Retry only official evaluator infrastructure errors once, without an agent rerun."""
+    retry_ids = sorted(outcomes["error_ids"])
+    if not retry_ids:
+        return {key: set(value) for key, value in outcomes.items()}
+    retry_output = output / "retry-01"
+    retry_output.mkdir(parents=True, exist_ok=True)
+    try:
+        run_official_evaluation(
+            predictions=predictions, canonical_dataset=canonical_dataset,
+            instance_ids=retry_ids, run_id=f"{run_id}-retry-01", output=retry_output,
+            process_timeout_seconds=process_timeout_seconds, max_workers=1,
+        )
+        retried = load_official_report(retry_output)
+        validate_official_outcomes(retried, retry_ids)
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+        print("BENCHMARK_EVALUATION_RETRY " + json.dumps({
+            "instance_ids": retry_ids, "result": "failed", "error": str(error),
+        }, sort_keys=True), flush=True)
+        return {key: set(value) for key, value in outcomes.items()}
+
+    merged = {
+        key: (set(value) - set(retry_ids)) | retried[key]
+        for key, value in outcomes.items()
+    }
+    print("BENCHMARK_EVALUATION_RETRY " + json.dumps({
+        "instance_ids": retry_ids, "result": "completed",
+    }, sort_keys=True), flush=True)
+    return merged
+
+
 def load_resolved_ids(report_dir: pathlib.Path) -> set[str]:
     return load_official_report(report_dir)["resolved_ids"]
 
@@ -2389,6 +2424,20 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 )
                 outcomes = load_official_report(report_dir)
                 validate_official_outcomes(outcomes, shard_ids)
+                retry_timeout = process_timeout
+                if outcomes["error_ids"] and evaluation_deadline is not None:
+                    remaining = math.ceil(evaluation_deadline - time.monotonic())
+                    if remaining <= 0:
+                        evaluation_budget_exhausted = True
+                    else:
+                        retry_timeout = min(remaining, evaluator_timeout + 45)
+                if outcomes["error_ids"] and not evaluation_budget_exhausted:
+                    outcomes = retry_official_evaluation_errors(
+                        outcomes=outcomes, predictions=prediction_file,
+                        canonical_dataset=work / "canonical-dataset.json",
+                        run_id=f"{config['RUN_ID']}-{harness}-{shard_index:02d}",
+                        output=report_dir, process_timeout_seconds=retry_timeout,
+                    )
                 apply_official_outcomes(shard_records, outcomes)
             except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
                 if isinstance(error, (subprocess.TimeoutExpired, ContainerCleanupError)):

@@ -1809,6 +1809,64 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                     max_workers=10,
                 )
 
+    def test_official_evaluation_retries_docker_error_slots_serially_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            initial = {
+                "completed_ids": set(),
+                "resolved_ids": set(),
+                "unresolved_ids": set(),
+                "empty_patch_ids": set(),
+                "error_ids": {"task-1"},
+                "incomplete_ids": set(),
+            }
+            calls = []
+
+            def fake_evaluation(**kwargs):
+                calls.append(kwargs)
+                self.assertEqual(kwargs["instance_ids"], ["task-1"])
+                self.assertEqual(kwargs["max_workers"], 1)
+                report = {
+                    "completed_ids": ["task-1"],
+                    "resolved_ids": [],
+                    "unresolved_ids": ["task-1"],
+                    "empty_patch_ids": [],
+                    "error_ids": [],
+                    "incomplete_ids": [],
+                }
+                (kwargs["output"] / "retry.json").write_text(json.dumps(report))
+
+            with mock.patch.object(self.worker, "run_official_evaluation", side_effect=fake_evaluation):
+                outcomes = self.worker.retry_official_evaluation_errors(
+                    outcomes=initial, predictions=root / "predictions.jsonl",
+                    canonical_dataset=root / "canonical.json", run_id="run-carry-00",
+                    output=root, process_timeout_seconds=315,
+                )
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["run_id"], "run-carry-00-retry-01")
+            self.assertEqual(outcomes["error_ids"], set())
+            self.assertEqual(outcomes["unresolved_ids"], {"task-1"})
+
+    def test_official_evaluation_preserves_initial_error_when_serial_retry_fails(self):
+        initial = {
+            "completed_ids": set(),
+            "resolved_ids": set(),
+            "unresolved_ids": set(),
+            "empty_patch_ids": set(),
+            "error_ids": {"task-1"},
+            "incomplete_ids": set(),
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(self.worker, "run_official_evaluation", side_effect=OSError("Docker unavailable")):
+            outcomes = self.worker.retry_official_evaluation_errors(
+                outcomes=initial, predictions=pathlib.Path(directory) / "predictions.jsonl",
+                canonical_dataset=pathlib.Path(directory) / "canonical.json",
+                run_id="run-carry-00", output=pathlib.Path(directory),
+                process_timeout_seconds=315,
+            )
+        self.assertEqual(outcomes, initial)
+
     def test_official_evaluation_timeout_removes_only_exact_run_containers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
