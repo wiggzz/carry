@@ -27,11 +27,6 @@ on:
         default: economic
         type: choice
         options: [economic, disabled]
-      carry_context_pressure_reminder_at_tokens:
-        description: Carry-only model-directed cleanup threshold in rendered tokens; empty disables it
-        required: false
-        default: ""
-        type: string
       catalog_digest:
         description: Immutable prepare-50 catalog digest (sha256:...); required for model-bearing modes
         required: false
@@ -77,7 +72,6 @@ jobs:
       BENCHMARK_MODE: ${{ inputs.mode }}
       BENCHMARK_HARNESS: ${{ inputs.harness }}
       CARRY_COMPACTION_POLICY: ${{ inputs.carry_compaction_policy }}
-      CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS: ${{ inputs.carry_context_pressure_reminder_at_tokens }}
       MODEL: ${{ vars.BENCHMARK_MODEL || 'gpt-5.6-luna' }}
       REASONING: ${{ vars.BENCHMARK_REASONING || 'medium' }}
     steps:
@@ -330,7 +324,6 @@ jobs:
             printf 'BENCHMARK_MODE=%q\n' "$BENCHMARK_MODE"
             printf 'BENCHMARK_HARNESS=%q\n' "$BENCHMARK_HARNESS"
             printf 'CARRY_COMPACTION_POLICY=%q\n' "$CARRY_COMPACTION_POLICY"
-            printf 'CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS=%q\n' "$CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS"
             printf 'BOOTSTRAP_WAIT_SECONDS=%q\n' "$BOOTSTRAP_WAIT_SECONDS"
             printf 'RUN_ID=%q\n' "$RUN_ID"
             printf 'MODEL=%q\n' "$MODEL"
