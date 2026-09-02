@@ -64,6 +64,23 @@ still records the session, but it never asks the planner to rewrite history.
 Both the selected policy and aggregate compaction count appear in `result.json`
 and `trace.jsonl`.
 
+## Experimental keep leases
+
+`--keep-lease-turns N` (or `CARRY_KEEP_LEASE_TURNS=N`) is disabled by default.
+When enabled, a model `protected` signal is a lease for `N` later model turns,
+not a permanent lock. When it is due, Carry appends a durable, small retention
+review to the next request. The model renews an ID only by naming it again in
+`protected`; any unrenewed ID becomes neutral and volatile. Expiry is not an
+implicit `removable` decision and never deletes an item by itself—the normal
+economic planner must later choose a rewrite.
+
+Each `context_compacted` trace event includes `retention_audit`, with every
+pre-rewrite item’s ID, estimated tokens, kept/removed outcome, and reason
+(active lease, expired lease, explicit removable, neutral policy, or stable
+baseline). Lease review and expiry events are also persisted in `trace.jsonl`.
+The review is appended to persisted native context, so it extends the previous
+request history and preserves prompt-cache continuity until a normal rewrite.
+
 ## Session-persistence benchmark mode
 
 `session-smoke-5` and `session-20` are retained-session experiment modes, not ordinary

@@ -27,6 +27,11 @@ on:
         default: economic
         type: choice
         options: [economic, disabled]
+      carry_keep_lease_turns:
+        description: Optional Carry keep-lease revalidation horizon; blank disables it
+        required: false
+        default: ""
+        type: string
       catalog_digest:
         description: Immutable prepare-50 catalog digest (sha256:...); required for model-bearing modes
         required: false
@@ -72,6 +77,7 @@ jobs:
       BENCHMARK_MODE: ${{ inputs.mode }}
       BENCHMARK_HARNESS: ${{ inputs.harness }}
       CARRY_COMPACTION_POLICY: ${{ inputs.carry_compaction_policy }}
+      CARRY_KEEP_LEASE_TURNS: ${{ inputs.carry_keep_lease_turns }}
       MODEL: ${{ vars.BENCHMARK_MODEL || 'gpt-5.6-luna' }}
       REASONING: ${{ vars.BENCHMARK_REASONING || 'medium' }}
     steps:
@@ -185,6 +191,10 @@ jobs:
             }
             [[ "$CARRY_COMPACTION_POLICY" =~ ^(economic|disabled)$ ]] || {
               echo "carry compaction policy must be economic or disabled" >&2
+              exit 1
+            }
+            [[ -z "$CARRY_KEEP_LEASE_TURNS" || "$CARRY_KEEP_LEASE_TURNS" =~ ^[1-9][0-9]*$ ]] || {
+              echo "carry keep lease turns must be blank or a positive integer" >&2
               exit 1
             }
             [[ "$TASK_IMAGE_CATALOG" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] || {
@@ -324,6 +334,7 @@ jobs:
             printf 'BENCHMARK_MODE=%q\n' "$BENCHMARK_MODE"
             printf 'BENCHMARK_HARNESS=%q\n' "$BENCHMARK_HARNESS"
             printf 'CARRY_COMPACTION_POLICY=%q\n' "$CARRY_COMPACTION_POLICY"
+            printf 'CARRY_KEEP_LEASE_TURNS=%q\n' "$CARRY_KEEP_LEASE_TURNS"
             printf 'BOOTSTRAP_WAIT_SECONDS=%q\n' "$BOOTSTRAP_WAIT_SECONDS"
             printf 'RUN_ID=%q\n' "$RUN_ID"
             printf 'MODEL=%q\n' "$MODEL"

@@ -56,6 +56,10 @@ pub(crate) struct ContextItem {
     pub signal: RetentionSignal,
     pub bytes: usize,
     pub input_items: Vec<Value>,
+    #[serde(default)]
+    keep_lease_expires_at_turn: Option<u64>,
+    #[serde(default)]
+    keep_lease_expired: bool,
     memory: Option<MemoryData>,
 }
 
@@ -102,6 +106,25 @@ impl ContextItem {
         )
     }
 
+    fn keep_lease_review(id: u64, item_ids: &[u64]) -> Self {
+        let ids = item_ids
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Self::new(
+            id,
+            ContextItemKind::Status,
+            Retention::Volatile,
+            vec![json!({
+                "role": "developer",
+                "content": [{ "type": "input_text", "text": format!(
+                    "[Retention review: IDs {ids} were protected earlier. Re-list an ID in protected only if it remains necessary for the current task; unrenewed IDs return to ordinary removal eligibility.]"
+                ) }]
+            })],
+        )
+    }
+
     pub fn tool(id: u64, output_items: Vec<Value>, function_call_output: Value) -> Result<Self> {
         if function_call_output["type"].as_str() != Some("function_call_output") {
             bail!("tool result item is not a function_call_output");
@@ -133,6 +156,8 @@ impl ContextItem {
             signal: RetentionSignal::Neutral,
             bytes: serialized_bytes(&input_items),
             input_items,
+            keep_lease_expires_at_turn: None,
+            keep_lease_expired: false,
             memory: None,
         }
     }
@@ -164,6 +189,10 @@ pub(crate) struct ContextState {
     generation: u64,
     max_read_breakpoints: usize,
     breakpoints: Vec<StoredBreakpoint>,
+    #[serde(default)]
+    retention_turn: u64,
+    #[serde(default)]
+    pending_keep_lease_review: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -197,6 +226,8 @@ impl ContextState {
                 marker_frontiers: vec![1],
                 rendered_prefix,
             }],
+            retention_turn: 0,
+            pending_keep_lease_review: Vec::new(),
         }
     }
 
@@ -228,6 +259,68 @@ impl ContextState {
         self.items
             .push(ContextItem::tool(id, output_items, function_call_output)?);
         Ok(id)
+    }
+
+    pub fn advance_retention_turn(&mut self) {
+        self.retention_turn = self.retention_turn.saturating_add(1);
+    }
+
+    pub fn arm_keep_leases(&mut self, ids: &[u64], turns: u64) {
+        if turns == 0 {
+            return;
+        }
+        let expires_at_turn = self.retention_turn.saturating_add(turns);
+        for id in unique_ids(ids) {
+            if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
+                item.keep_lease_expires_at_turn = Some(expires_at_turn);
+                item.keep_lease_expired = false;
+            }
+        }
+    }
+
+    pub fn queue_due_keep_lease_review(&mut self) -> KeepLeaseReview {
+        if !self.pending_keep_lease_review.is_empty() {
+            return KeepLeaseReview {
+                item_ids: self.pending_keep_lease_review.clone(),
+            };
+        }
+        let item_ids = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.signal != RetentionSignal::Drop
+                    && item
+                        .keep_lease_expires_at_turn
+                        .is_some_and(|expires_at| expires_at <= self.retention_turn)
+            })
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        if !item_ids.is_empty() {
+            let notice_id = self.allocate_id();
+            self.items
+                .push(ContextItem::keep_lease_review(notice_id, &item_ids));
+            self.pending_keep_lease_review = item_ids.clone();
+        }
+        KeepLeaseReview { item_ids }
+    }
+
+    pub fn resolve_keep_lease_review(&mut self, renewed: &[u64]) -> Vec<u64> {
+        let renewed = unique_ids(renewed).into_iter().collect::<HashSet<_>>();
+        let mut expired = Vec::new();
+        for id in std::mem::take(&mut self.pending_keep_lease_review) {
+            let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+                continue;
+            };
+            if renewed.contains(&id) || item.signal == RetentionSignal::Drop {
+                continue;
+            }
+            item.signal = RetentionSignal::Neutral;
+            item.retention = Retention::Volatile;
+            item.keep_lease_expires_at_turn = None;
+            item.keep_lease_expired = true;
+            expired.push(id);
+        }
+        expired
     }
 
     fn allocate_id(&mut self) -> u64 {
@@ -652,6 +745,41 @@ impl ContextState {
             .iter()
             .map(|decision| decision.id)
             .collect::<HashSet<_>>();
+        let retention_audit = self
+            .items
+            .iter()
+            .map(|item| {
+                let action = if dropped.contains(&item.id) {
+                    RetentionAuditAction::Removed
+                } else {
+                    RetentionAuditAction::Kept
+                };
+                let reason = if item.signal == RetentionSignal::Drop {
+                    RetentionAuditReason::ExplicitRemovable
+                } else if item.keep_lease_expired {
+                    RetentionAuditReason::ExpiredKeepLease
+                } else if item
+                    .keep_lease_expires_at_turn
+                    .is_some_and(|expires_at| expires_at > self.retention_turn)
+                {
+                    RetentionAuditReason::ActiveKeepLease
+                } else if item.signal == RetentionSignal::Keep {
+                    RetentionAuditReason::ExplicitKeep
+                } else if neutral_retained.contains(&item.id)
+                    || item.retention == Retention::Volatile
+                {
+                    RetentionAuditReason::AutomaticNeutral
+                } else {
+                    RetentionAuditReason::StableBaseline
+                };
+                RetentionAuditEntry {
+                    id: item.id,
+                    estimated_tokens: item.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN),
+                    action,
+                    reason,
+                }
+            })
+            .collect::<Vec<_>>();
         self.items.retain(|item| !dropped.contains(&item.id));
         for item in &mut self.items {
             if let Some(memory) = item.memory.as_mut()
@@ -712,6 +840,7 @@ impl ContextState {
 
         ContextChange {
             dropped: plan.dropped,
+            retention_audit,
             neutral_retained: plan.neutral_retained,
             neutral_budget_tokens: plan.neutral_budget_tokens,
             neutral_target_tokens: plan.neutral_target_tokens,
@@ -806,6 +935,37 @@ pub(crate) struct NeutralRetentionDecision {
     pub score: u64,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetentionAuditAction {
+    Kept,
+    Removed,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetentionAuditReason {
+    ActiveKeepLease,
+    ExplicitKeep,
+    ExpiredKeepLease,
+    ExplicitRemovable,
+    AutomaticNeutral,
+    StableBaseline,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct RetentionAuditEntry {
+    pub id: u64,
+    pub estimated_tokens: usize,
+    pub action: RetentionAuditAction,
+    pub reason: RetentionAuditReason,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct KeepLeaseReview {
+    pub item_ids: Vec<u64>,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct SignalChange {
     pub keep: Vec<u64>,
@@ -817,6 +977,7 @@ pub(crate) struct SignalChange {
 #[derive(Debug, Serialize)]
 pub(crate) struct ContextChange {
     pub dropped: Vec<u64>,
+    pub retention_audit: Vec<RetentionAuditEntry>,
     pub neutral_retained: Vec<NeutralRetentionDecision>,
     pub neutral_budget_tokens: usize,
     pub neutral_target_tokens: usize,
@@ -1126,6 +1287,75 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn expired_keep_lease_requires_explicit_renewal_before_becoming_neutral() {
+        let mut state = ContextState::new("initial".into());
+        let protected = add_tool(&mut state);
+        let source = add_tool(&mut state);
+        let change = state.record_signals(&update(&[protected], &[], &[]), source);
+        state.arm_keep_leases(&change.keep, 1);
+
+        state.advance_retention_turn();
+        let review = state.queue_due_keep_lease_review();
+        assert_eq!(review.item_ids, vec![protected]);
+        assert!(
+            serde_json::to_string(&state.input_items())
+                .unwrap()
+                .contains("Retention review")
+        );
+
+        let expired = state.resolve_keep_lease_review(&[]);
+        assert_eq!(expired, vec![protected]);
+        assert_eq!(state.signal_for(protected), Some(RetentionSignal::Neutral));
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .find(|item| item.id == protected)
+                .unwrap()
+                .retention,
+            Retention::Volatile
+        );
+    }
+
+    #[test]
+    fn compaction_audit_distinguishes_expired_leases_from_active_keeps() {
+        let mut state = ContextState::new("initial".into());
+        let expired = add_tool_with_output(&mut state, &"expired ".repeat(100));
+        let active = add_tool_with_output(&mut state, &"active ".repeat(100));
+        let source = add_tool(&mut state);
+        let change = state.record_signals(&update(&[expired, active], &[], &[]), source);
+        state.arm_keep_leases(&change.keep, 2);
+        state.advance_retention_turn();
+        state.advance_retention_turn();
+        state.queue_due_keep_lease_review();
+        state.resolve_keep_lease_review(&[active]);
+        state.arm_keep_leases(&[active], 2);
+
+        let plan = state
+            .plan_compaction_with_neutral_budget(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                },
+                0,
+            )
+            .unwrap();
+        let change = state.compact(plan);
+
+        assert!(change.retention_audit.iter().any(|entry| {
+            entry.id == expired
+                && entry.action == RetentionAuditAction::Removed
+                && entry.reason == RetentionAuditReason::ExpiredKeepLease
+        }));
+        assert!(change.retention_audit.iter().any(|entry| {
+            entry.id == active
+                && entry.action == RetentionAuditAction::Kept
+                && entry.reason == RetentionAuditReason::ActiveKeepLease
+        }));
     }
 
     #[test]
