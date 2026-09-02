@@ -66,8 +66,7 @@ jobs:
       TASK_IMAGE_PUBLISHER_ROLE_ARN: ${{ vars.BENCHMARK_TASK_IMAGE_PUBLISHER_ROLE_ARN }}
       TASK_IMAGE_REPOSITORY: ${{ vars.BENCHMARK_TASK_IMAGE_REPOSITORY }}
       TASK_IMAGE_CATALOG: ${{ inputs.catalog_digest && format('{0}@{1}', vars.BENCHMARK_TASK_IMAGE_REPOSITORY, inputs.catalog_digest) || '' }}
-      LAUNCH_TEMPLATE_ID: ${{ vars.BENCHMARK_WORKER_LAUNCH_TEMPLATE_ID }}
-      LAUNCH_TEMPLATE_VERSION: ${{ vars.BENCHMARK_WORKER_LAUNCH_TEMPLATE_VERSION }}
+      WORKER_LAUNCH_TEMPLATES: ${{ vars.BENCHMARK_WORKER_LAUNCH_TEMPLATES }}
       BOOTSTRAP_WAIT_SECONDS: ${{ inputs.bootstrap_wait_seconds }}
       BENCHMARK_MODE: ${{ inputs.mode }}
       BENCHMARK_HARNESS: ${{ inputs.harness }}
@@ -164,10 +163,10 @@ jobs:
           DOCKERHUB_TOKEN: ${{ (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50') && secrets.DOCKERHUB_TOKEN || '' }}
         run: |
           set -euo pipefail
-          for required in AWS_REGION ARTIFACT_BUCKET ARTIFACT_SESSION_ROLE_ARN LAUNCH_TEMPLATE_ID LAUNCH_TEMPLATE_VERSION SOURCE_COMMIT; do
+          for required in AWS_REGION ARTIFACT_BUCKET ARTIFACT_SESSION_ROLE_ARN WORKER_LAUNCH_TEMPLATES SOURCE_COMMIT; do
             [[ -n "${!required}" ]] || { echo "missing protected Environment variable: $required" >&2; exit 1; }
           done
-          [[ "$LAUNCH_TEMPLATE_VERSION" =~ ^[1-9][0-9]*$ ]] || { echo "launch template version must be numeric" >&2; exit 1; }
+          python3 -c 'import json, os; json.loads(os.environ["WORKER_LAUNCH_TEMPLATES"])'
           [[ "$BOOTSTRAP_WAIT_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] && (( BOOTSTRAP_WAIT_SECONDS <= 300 )) || {
             echo "bootstrap_wait_seconds must be an integer from 1 through 300" >&2; exit 1;
           }
@@ -334,10 +333,10 @@ jobs:
           } > worker-user-data.sh
           EXPIRES_AT=$(date -u -d '+6 hours' +'%Y-%m-%dT%H:%M:%SZ')
           TAGS="Tags=[{Key=Application,Value=Carry},{Key=Component,Value=swebench-benchmark},{Key=ExpiresAt,Value=$EXPIRES_AT},{Key=ManagedBy,Value=carry-swebench},{Key=Project,Value=carry-swebench},{Key=Purpose,Value=benchmark-worker},{Key=Repository,Value=wiggzz/carry},{Key=RunId,Value=$RUN_ID}]"
-          WORKER_INSTANCE_ID=$(aws ec2 run-instances --launch-template "LaunchTemplateId=$LAUNCH_TEMPLATE_ID,Version=$LAUNCH_TEMPLATE_VERSION" \
-            --count 1 --client-token "$RUN_ID" --user-data file://worker-user-data.sh \
-            --tag-specifications "ResourceType=instance,$TAGS" "ResourceType=volume,$TAGS" \
-            --query 'Instances[0].InstanceId' --output text)
+          launch_output=$(RUN_ID="$RUN_ID" WORKER_LAUNCH_TEMPLATES="$WORKER_LAUNCH_TEMPLATES" \
+            WORKER_USER_DATA_FILE=worker-user-data.sh WORKER_TAGS="$TAGS" scripts/launch_benchmark_worker.sh)
+          printf '%s\n' "$launch_output" >> "$GITHUB_ENV"
+          WORKER_INSTANCE_ID=$(printf '%s\n' "$launch_output" | awk -F= '/^WORKER_INSTANCE_ID=/{print $2}')
           [[ "$WORKER_INSTANCE_ID" =~ ^i-[0-9a-f]+$ ]] || { echo "invalid worker instance ID" >&2; exit 1; }
           echo "WORKER_INSTANCE_ID=$WORKER_INSTANCE_ID" >> "$GITHUB_ENV"
 

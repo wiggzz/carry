@@ -8,14 +8,13 @@ output "github_dispatch_role_arn" {
   value       = aws_iam_role.github_dispatch.arn
 }
 
-output "worker_launch_template_id" {
-  description = "Immutable launch-template ID used by the later manual benchmark workflow."
-  value       = aws_launch_template.worker.id
-}
-
-output "worker_launch_template_version" {
-  description = "Numeric launch-template version to pin in the protected dispatch workflow."
-  value       = aws_launch_template.worker.latest_version
+output "worker_launch_templates" {
+  description = "Ordered approved AZ/template candidates; copy the JSON value to the protected BENCHMARK_WORKER_LAUNCH_TEMPLATES variable."
+  value = [for subnet_id in sort(var.worker_subnet_ids) : {
+    availability_zone  = data.aws_subnet.workers[subnet_id].availability_zone
+    launch_template_id = aws_launch_template.worker[subnet_id].id
+    version            = tostring(aws_launch_template.worker[subnet_id].latest_version)
+  }]
 }
 
 output "artifact_session_role_arn" {

@@ -41,9 +41,14 @@ variable "worker_ami_id" {
   type        = string
 }
 
-variable "worker_subnet_id" {
-  description = "Public subnet ID for ephemeral workers. It must have an Internet route; the worker security group has no inbound rules."
-  type        = string
+variable "worker_subnet_ids" {
+  description = "One to three public subnet IDs in distinct AZs for ephemeral workers. Each must have an Internet route; the worker security group has no inbound rules."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.worker_subnet_ids) >= 2 && length(var.worker_subnet_ids) <= 3 && length(distinct(var.worker_subnet_ids)) == length(var.worker_subnet_ids)
+    error_message = "worker_subnet_ids must contain two or three distinct subnets."
+  }
 }
 
 variable "worker_instance_type" {

@@ -2,12 +2,13 @@ data "aws_partition" "current" {}
 
 data "aws_caller_identity" "current" {}
 
-data "aws_subnet" "worker" {
-  id = var.worker_subnet_id
+data "aws_subnet" "workers" {
+  for_each = toset(var.worker_subnet_ids)
+  id       = each.value
 }
 
 data "aws_vpc" "worker" {
-  id = data.aws_subnet.worker.vpc_id
+  id = data.aws_subnet.workers[var.worker_subnet_ids[0]].vpc_id
 }
 
 locals {
@@ -242,7 +243,7 @@ data "aws_iam_policy_document" "github_dispatch" {
     condition {
       test     = "ArnLike"
       variable = "ec2:LaunchTemplate"
-      values   = [aws_launch_template.worker.arn]
+      values   = [for template in aws_launch_template.worker : template.arn]
     }
   }
 
@@ -258,7 +259,7 @@ data "aws_iam_policy_document" "github_dispatch" {
     condition {
       test     = "ArnLike"
       variable = "ec2:LaunchTemplate"
-      values   = [aws_launch_template.worker.arn]
+      values   = [for template in aws_launch_template.worker : template.arn]
     }
 
     condition {
@@ -521,6 +522,7 @@ resource "aws_iam_role_policy" "artifact_session" {
 }
 
 resource "aws_launch_template" "worker" {
+  for_each               = toset(var.worker_subnet_ids)
   name_prefix            = "${local.name_prefix}-worker-"
   description            = "Pinned AMI template for disposable SWE-bench benchmark workers"
   image_id               = var.worker_ami_id
@@ -545,7 +547,7 @@ resource "aws_launch_template" "worker" {
     delete_on_termination       = true
     device_index                = 0
     security_groups             = [aws_security_group.worker.id]
-    subnet_id                   = var.worker_subnet_id
+    subnet_id                   = each.value
   }
 
   block_device_mappings {
