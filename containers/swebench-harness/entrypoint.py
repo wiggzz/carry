@@ -75,14 +75,8 @@ values = {
     "output": args.output,
 }
 command = [part.format(**values) for part in shlex.split(template)]
-pressure_flag = "--context-pressure-reminder-at-tokens"
-while pressure_flag in command:
-    pressure_flag_index = command.index(pressure_flag)
-    if pressure_flag_index + 1 < len(command) and not command[pressure_flag_index + 1].startswith("-"):
-        parser.error("AGENT_COMMAND must not provide a context-pressure reminder value")
-    command.pop(pressure_flag_index)
 if context_pressure_reminder_at_tokens:
-    command.extend([pressure_flag, context_pressure_reminder_at_tokens])
+    command.extend(["--context-pressure-reminder-at-tokens", context_pressure_reminder_at_tokens])
 if args.resume_session:
     command.extend(["--resume", str(args.resume_session)])
 if args.codex_session and args.codex_thread:

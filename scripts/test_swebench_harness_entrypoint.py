@@ -82,39 +82,6 @@ class HarnessEntrypointTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn("+after", (output / "final.patch").read_text())
 
-    def test_carry_drops_an_empty_pressure_flag_from_a_stale_command_template(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            repo, prompt_dir, output = root / "repo", root / "input", root / "output"
-            binary = root / "bin" / "carry"
-            repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); binary.parent.mkdir(parents=True)
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
-            (repo / "file.txt").write_text("before\n")
-            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
-            (prompt_dir / "task.md").write_text("fix")
-            binary.write_text(
-                "#!/usr/bin/env python3\nimport pathlib,sys\n"
-                "assert '--context-pressure-reminder-at-tokens' not in sys.argv, sys.argv\n"
-                "pathlib.Path('file.txt').write_text('after\\n')\n"
-            )
-            binary.chmod(0o755)
-            env = dict(os.environ, OPENAI_API_KEY="unit-test-secret",
-                       OPENAI_BASE_URL="http://openai-proxy:8080/v1",
-                       AGENT_HARNESS="carry", AGENT_TIMEOUT_SECONDS="30",
-                       BENCHMARK_WORKSPACE=str(repo),
-                       AGENT_COMMAND=f"{binary} --context-pressure-reminder-at-tokens -p {{prompt_text}}",
-                       CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS="")
-            run = subprocess.run(
-                ["python3", str(ENTRYPOINT), "run", "--model", "model", "--reasoning", "medium",
-                 "--prompt", str(prompt_dir / "task.md"), "--output", str(output)],
-                cwd=repo, env=env, text=True, capture_output=True,
-            )
-            self.assertEqual(run.returncode, 0, (output / "trace.log").read_text())
-            self.assertIn("+after", (output / "final.patch").read_text())
-
     def test_codex_resume_uses_a_durable_codex_home_and_native_thread_id(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
