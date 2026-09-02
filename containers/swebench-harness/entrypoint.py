@@ -36,18 +36,6 @@ if not os.environ.get("OPENAI_BASE_URL"):
 compaction_policy = os.environ.get("CARRY_COMPACTION_POLICY", "economic")
 if compaction_policy not in {"economic", "disabled"}:
     parser.error("CARRY_COMPACTION_POLICY must be economic or disabled")
-context_pressure_reminder_at_tokens = os.environ.get(
-    "CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS", ""
-).strip()
-if context_pressure_reminder_at_tokens:
-    if args.harness != "carry":
-        parser.error("CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS is supported only by Carry")
-    if (
-        not context_pressure_reminder_at_tokens.isascii()
-        or not context_pressure_reminder_at_tokens.isdecimal()
-        or int(context_pressure_reminder_at_tokens) <= 0
-    ):
-        parser.error("CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS must be a positive decimal integer")
 
 output = pathlib.Path(args.output)
 output.mkdir(parents=True, exist_ok=True)
@@ -75,14 +63,6 @@ values = {
     "output": args.output,
 }
 command = [part.format(**values) for part in shlex.split(template)]
-pressure_flag = "--context-pressure-reminder-at-tokens"
-while pressure_flag in command:
-    pressure_flag_index = command.index(pressure_flag)
-    if pressure_flag_index + 1 < len(command) and not command[pressure_flag_index + 1].startswith("-"):
-        parser.error("AGENT_COMMAND must not provide a context-pressure reminder value")
-    command.pop(pressure_flag_index)
-if context_pressure_reminder_at_tokens:
-    command.extend([pressure_flag, context_pressure_reminder_at_tokens])
 if args.resume_session:
     command.extend(["--resume", str(args.resume_session)])
 if args.codex_session and args.codex_thread:

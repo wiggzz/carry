@@ -113,10 +113,6 @@ struct Cli {
     )]
     compaction_policy: CompactionPolicyArg,
 
-    /// Start model-directed cleanup reminders once rendered context reaches this many tokens.
-    #[arg(long, env = "CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS")]
-    context_pressure_reminder_at_tokens: Option<usize>,
-
     /// JSONL Step objects to use instead of calling a model.
     #[arg(long, hide = true)]
     scripted_steps: Option<PathBuf>,
@@ -163,10 +159,7 @@ async fn main() -> Result<()> {
     run_command(Cli::parse()).await
 }
 
-fn validate_args(args: &Cli) -> Result<()> {
-    if args.context_pressure_reminder_at_tokens == Some(0) {
-        bail!("context pressure reminder threshold must be greater than zero");
-    }
+fn validate_args(_args: &Cli) -> Result<()> {
     Ok(())
 }
 
@@ -296,7 +289,6 @@ async fn run_command(args: Cli) -> Result<()> {
         max_steps: args.max_steps,
         shell_timeout_secs: args.shell_timeout_secs,
         compaction_mode: args.compaction_policy.into(),
-        context_pressure_reminder_at_tokens: args.context_pressure_reminder_at_tokens,
         resume_context: resume.map(|resume| resume.context),
         resume_source,
         prompt_cache_key: Some(prompt_cache_key),
@@ -508,28 +500,6 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("carry fix the failing tests"));
         assert!(help.contains("carry --interactive"));
-    }
-
-    #[test]
-    fn context_pressure_reminder_threshold_is_accepted_and_must_be_positive() {
-        let args = Cli::try_parse_from([
-            "carry",
-            "--context-pressure-reminder-at-tokens",
-            "139264",
-            "continue",
-        ])
-        .unwrap();
-        assert_eq!(args.context_pressure_reminder_at_tokens, Some(139_264));
-        assert!(validate_args(&args).is_ok());
-
-        let zero = Cli::try_parse_from([
-            "carry",
-            "--context-pressure-reminder-at-tokens",
-            "0",
-            "continue",
-        ])
-        .unwrap();
-        assert!(validate_args(&zero).is_err());
     }
 
     #[test]

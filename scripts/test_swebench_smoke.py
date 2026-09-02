@@ -39,15 +39,8 @@ class SmokeWorkerTests(unittest.TestCase):
         config = self.worker.validate_config(valid)
         self.assertEqual(config["PI_VERSION"], "0.84.2")
         self.assertEqual(config["CARRY_COMPACTION_POLICY"], "economic")
-        self.assertEqual(config["CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS"], "")
-        enabled = self.worker.validate_config({
-            **valid, "CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS": "139264"
-        })
-        self.assertEqual(enabled["CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS"], "139264")
         for key, value in (("BASE_IMAGE", "node:22"), ("CODEX_VERSION", "latest"),
-                           ("CARRY_COMPACTION_POLICY", "adaptive"),
-                           ("CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS", "0"),
-                           ("CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS", "not-a-number")):
+                           ("CARRY_COMPACTION_POLICY", "adaptive")):
             bad = dict(valid)
             bad[key] = value
             with self.assertRaises(ValueError):
@@ -156,7 +149,6 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertIn("HOME=/agent-home", rendered)
             self.assertIn("AGENT_TIMEOUT_SECONDS=315", rendered)
             self.assertIn("--env\nCARRY_COMPACTION_POLICY", rendered)
-            self.assertIn("--env\nCARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS", rendered)
             self.assertIn("carry-agent-codex-test", rendered)
             self.assertIn("/agent-home:rw", rendered)
             self.assertIn("/tmp:rw", rendered)

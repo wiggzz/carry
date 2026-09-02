@@ -137,28 +137,6 @@ Carry records the selected policy in `trace.jsonl` and `result.json`. See the
 [context-policy design](docs/context-policy.md) for the ledger, retention
 markers, cache frontier, and rewrite rules.
 
-### Context-pressure reminders
-
-Opt-in `--context-pressure-reminder-at-tokens N` adds an ephemeral developer
-reminder before each model request at or above `N` rendered-context tokens. It
-lists up to ten largest older tool-context IDs (never the newest tool result) so
-the model can preserve an essential conclusion with `remember`/`protected` or
-mark stale IDs `removable` in its normal context update. The reminder never
-deletes or summarizes state itself; normal economic compaction decides whether
-to apply model-authorized removal on the following request.
-
-For example, `139264` is half of a 272-Ki-token short-context budget:
-
-```sh
-carry --context-pressure-reminder-at-tokens 139264 --cwd /path/to/repo fix the tests
-```
-
-`trace.jsonl` records every reminder, threshold, estimated context size, and
-suggested IDs; session/result metadata records the configured threshold. In the
-protected SWE-bench workflow, set the identically named
-`carry_context_pressure_reminder_at_tokens` input; leave it empty for the
-control behavior.
-
 ## Development
 
 ```sh

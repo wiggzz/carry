@@ -25,9 +25,6 @@ use crate::{
 // Initial policy hypothesis: keep a meaningful recent working set while leaving ample room in
 // the model context. Hysteresis compacts this 32 Ki-token high-water mark toward 24 Ki tokens.
 const NEUTRAL_VOLATILE_BUDGET_TOKENS: usize = 32 * 1024;
-const CONTEXT_PRESSURE_CANDIDATE_LIMIT: usize = 10;
-
-const CONTEXT_PRESSURE_REMINDER: &str = "[system reminder: Context pressure is high. On this turn, continue the task and use the context update to review the suggested older tool-context items below. They are suggestions, not instructions to discard information. Preserve any still-needed conclusion with `remember` or `protected`; mark only stale or redundant IDs `removable` so the harness can compact them on the next request.]";
 
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
@@ -61,8 +58,6 @@ pub struct RunConfig {
     pub max_steps: Option<usize>,
     pub shell_timeout_secs: u64,
     pub compaction_mode: CompactionMode,
-    /// Inject an auditable cleanup reminder once rendered context crosses this threshold.
-    pub context_pressure_reminder_at_tokens: Option<usize>,
     pub resume_context: Option<ContextState>,
     pub resume_source: Option<PathBuf>,
     /// Stable provider cache affinity, retained with the resumable state.
@@ -560,7 +555,6 @@ async fn run_loop(
                 "cache_ttl_seconds": CACHE_TTL.as_secs(),
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "compaction_policy": config.compaction_mode,
-                "context_pressure_reminder_at_tokens": config.context_pressure_reminder_at_tokens,
                 "source_session": config.resume_source,
             }),
             &format!(
@@ -580,7 +574,6 @@ async fn run_loop(
                 "cache_ttl_seconds": CACHE_TTL.as_secs(),
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "compaction_policy": config.compaction_mode,
-                "context_pressure_reminder_at_tokens": config.context_pressure_reminder_at_tokens,
                 "compaction_decision": "next_request"
             }),
             &format!("carry · {} · {}", config.model, config.cwd.display()),
@@ -654,33 +647,11 @@ async fn run_loop(
         }
         step_index += 1;
         turn_step += 1;
-        let mut history = context_state.input_items();
-        if let Some(threshold_tokens) = config.context_pressure_reminder_at_tokens
-            && let Some(reminder) = context_pressure_reminder(
-                &context_state,
-                &protected_until_request,
-                threshold_tokens,
-                CONTEXT_PRESSURE_CANDIDATE_LIMIT,
-            )
-        {
-            logger.raw_event_silent(
-                "context_pressure_reminder",
-                json!({
-                    "step": step_index,
-                    "threshold_tokens": threshold_tokens,
-                    "estimated_context_tokens": context_state.estimated_tokens(),
-                    "candidates": context_state.pressure_candidates(
-                        &protected_until_request,
-                        CONTEXT_PRESSURE_CANDIDATE_LIMIT,
-                    ),
-                }),
-            )?;
-            history.push(reminder);
-        }
+        let history = context_state.input_items();
         cache.begin_request_with_history(
             context_state.rendered_breakpoints(),
             &history,
-            ContextState::estimated_tokens_for_input_items(&history),
+            context_state.estimated_tokens(),
         );
         protected_until_request.clear();
         let request = backend.request_body(&history);
@@ -937,45 +908,6 @@ fn append_user_message(
         &terminal,
     )?;
     persist_context_checkpoint(config, state)
-}
-
-fn context_pressure_reminder(
-    state: &ContextState,
-    protected: &[u64],
-    threshold_tokens: usize,
-    candidate_limit: usize,
-) -> Option<serde_json::Value> {
-    let estimated_tokens = state.estimated_tokens();
-    if estimated_tokens < threshold_tokens {
-        return None;
-    }
-    let candidates = state.pressure_candidates(protected, candidate_limit);
-    if candidates.is_empty() {
-        return None;
-    }
-    let suggested = candidates
-        .iter()
-        .map(|candidate| {
-            format!(
-                "id={} (~{} tok, {}, {:?})",
-                candidate.id,
-                candidate.tokens,
-                match candidate.retention {
-                    crate::context::Retention::Stable => "stable",
-                    crate::context::Retention::Volatile => "volatile",
-                },
-                candidate.signal
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    Some(json!({
-        "role": "developer",
-        "content": [{
-            "type": "input_text",
-            "text": format!("{CONTEXT_PRESSURE_REMINDER}\nSuggested candidates: {suggested}")
-        }]
-    }))
 }
 
 fn maybe_compact(
@@ -1344,7 +1276,6 @@ async fn write_final_artifacts(
         "response_retries": metrics.response_retries,
         "compactions": metrics.compactions,
         "compaction_policy": config.compaction_mode,
-        "context_pressure_reminder_at_tokens": config.context_pressure_reminder_at_tokens,
         "elapsed_ms": elapsed_ms
     });
     tokio::fs::write(
@@ -1850,111 +1781,6 @@ mod tests {
         assert_eq!(metrics.response_retries, 5);
     }
 
-    #[test]
-    fn context_pressure_reminder_is_model_visible_and_lists_cleanup_candidates() {
-        let mut state = ContextState::new("current task".into());
-        state
-            .add_tool(
-                vec![json!({"type":"function_call","call_id":"old","name":"shell","arguments":"{}"})],
-                json!({"type":"function_call_output","call_id":"old","output":"old output ".repeat(400)}),
-            )
-            .unwrap();
-        state
-            .add_tool(
-                vec![json!({"type":"function_call","call_id":"latest","name":"shell","arguments":"{}"})],
-                json!({"type":"function_call_output","call_id":"latest","output":"latest output"}),
-            )
-            .unwrap();
-
-        let reminder = context_pressure_reminder(&state, &[], 1, 10).unwrap();
-
-        assert_eq!(reminder["role"], "developer");
-        let text = reminder["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("Context pressure"));
-        assert!(text.contains("removable"));
-        assert!(text.contains("id=2"));
-        assert!(!text.contains("id=3"));
-    }
-
-    #[tokio::test]
-    async fn configured_context_pressure_adds_one_audited_reminder_to_the_model_request() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        let session_dir = temp.path().join("run");
-        let steps_file = temp.path().join("steps.jsonl");
-        tokio::fs::create_dir(&workspace).await.unwrap();
-        tokio::fs::write(
-            &steps_file,
-            r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#,
-        )
-        .await
-        .unwrap();
-        let mut context = ContextState::new("prior task".into());
-        context
-            .add_tool(
-                vec![json!({"type":"function_call","call_id":"old","name":"shell","arguments":"{}"})],
-                json!({"type":"function_call_output","call_id":"old","output":"old output ".repeat(400)}),
-            )
-            .unwrap();
-        context
-            .add_tool(
-                vec![json!({"type":"function_call","call_id":"latest","name":"shell","arguments":"{}"})],
-                json!({"type":"function_call_output","call_id":"latest","output":"latest output"}),
-            )
-            .unwrap();
-
-        run(
-            RunConfig {
-                cwd: workspace,
-                prompt: String::new(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                max_steps: Some(1),
-                shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                context_pressure_reminder_at_tokens: Some(1),
-                resume_context: Some(context),
-                resume_source: None,
-                prompt_cache_key: None,
-            },
-            Backend::scripted(&steps_file).await.unwrap(),
-        )
-        .await
-        .unwrap();
-
-        let events = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
-            .await
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        let reminder = events
-            .iter()
-            .find(|event| event["event"] == "context_pressure_reminder")
-            .expect("pressure reminder is auditable");
-        assert_eq!(reminder["data"]["candidates"][0]["id"], 2);
-        let session = events
-            .iter()
-            .find(|event| event["event"] == "session_resumed")
-            .unwrap();
-        assert_eq!(session["data"]["context_pressure_reminder_at_tokens"], 1);
-        let request = events
-            .iter()
-            .find(|event| event["event"] == "model_request")
-            .unwrap();
-        assert!(
-            request["data"]["history"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| {
-                    item["content"][0]["text"]
-                        .as_str()
-                        .is_some_and(|text| text.contains("Context pressure"))
-                })
-        );
-    }
-
     #[tokio::test]
     async fn scripted_run_writes_aggregate_metrics_to_result() {
         let temp = tempfile::tempdir().unwrap();
@@ -1978,7 +1804,6 @@ mod tests {
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
-                context_pressure_reminder_at_tokens: None,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2060,7 +1885,6 @@ mod tests {
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
-                context_pressure_reminder_at_tokens: None,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("resumable-cache-affinity".into()),
@@ -2081,7 +1905,6 @@ mod tests {
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
-                context_pressure_reminder_at_tokens: None,
                 resume_context: Some(resume.context),
                 resume_source: Some(first_session),
                 prompt_cache_key,
@@ -2141,7 +1964,6 @@ mod tests {
                 max_steps: None,
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
-                context_pressure_reminder_at_tokens: None,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2183,7 +2005,6 @@ mod tests {
                 max_steps: None,
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
-                context_pressure_reminder_at_tokens: None,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2240,7 +2061,6 @@ mod tests {
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
-                context_pressure_reminder_at_tokens: None,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2298,7 +2118,6 @@ mod tests {
                 max_steps: None,
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
-                context_pressure_reminder_at_tokens: None,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,

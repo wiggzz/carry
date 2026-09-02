@@ -151,7 +151,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 "fi\n"
                 "case \"$*\" in\n"
                 "  *swebench_smoke.py*)\n"
-                "    printf 'agent=%s\\nevaluator=%s\\nmode=%s\\npolicy=%s\\ncleanup=%s\\nworker=%s\\nagent_phase=%s\\n' \"$AGENT_CONCURRENCY\" \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" \"${CARRY_COMPACTION_POLICY-unset}\" \"${CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS-unset}\" \"$OFFICIAL_WORKER_SECONDS\" \"$OFFICIAL_AGENT_PHASE_SECONDS\" > \"$FAKE_RUNNER_ENV\";;\n"
+                "    printf 'agent=%s\\nevaluator=%s\\nmode=%s\\npolicy=%s\\nworker=%s\\nagent_phase=%s\\n' \"$AGENT_CONCURRENCY\" \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" \"${CARRY_COMPACTION_POLICY-unset}\" \"$OFFICIAL_WORKER_SECONDS\" \"$OFFICIAL_AGENT_PHASE_SECONDS\" > \"$FAKE_RUNNER_ENV\";;\n"
                 "esac\n"
                 "exit 0\n"
             )
@@ -181,14 +181,14 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 FAKE_RUNNER_ENV=str(runner_env),
             )
             run = subprocess.run(
-                ["bash", "-c", 'CARRY_COMPACTION_POLICY=disabled; CARRY_CONTEXT_PRESSURE_REMINDER_AT_TOKENS=139264; source "$WORKER_SCRIPT"'],
+                ["bash", "-c", 'CARRY_COMPACTION_POLICY=disabled; source "$WORKER_SCRIPT"'],
                 env={**env, "WORKER_SCRIPT": str(SCRIPT)}, text=True, capture_output=True,
             )
 
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual(
                 runner_env.read_text(),
-                "agent=5\nevaluator=5\nmode=official-50\npolicy=disabled\ncleanup=139264\nworker=18900\n"
+                "agent=5\nevaluator=5\nmode=official-50\npolicy=disabled\nworker=18900\n"
                 "agent_phase=4500\n",
             )
 
