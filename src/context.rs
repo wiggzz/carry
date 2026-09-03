@@ -60,6 +60,12 @@ pub(crate) struct ContextItem {
     keep_lease_expires_at_turn: Option<u64>,
     #[serde(default)]
     keep_lease_expired: bool,
+    /// Immutable lifecycle label rendered when this context block was created.
+    #[serde(default)]
+    display_retention: Option<Retention>,
+    /// Immutable sweep advisory rendered inside this completed tool result.
+    #[serde(default)]
+    keep_lease_review: Option<String>,
     memory: Option<MemoryData>,
 }
 
@@ -106,25 +112,6 @@ impl ContextItem {
         )
     }
 
-    fn keep_lease_review(id: u64, item_ids: &[u64]) -> Self {
-        let ids = item_ids
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        Self::new(
-            id,
-            ContextItemKind::Status,
-            Retention::Volatile,
-            vec![json!({
-                "role": "developer",
-                "content": [{ "type": "input_text", "text": format!(
-                    "[Retention review: IDs {ids} were protected earlier. Re-list an ID in protected only if it remains necessary for the current task; unrenewed IDs return to ordinary removal eligibility.]"
-                ) }]
-            })],
-        )
-    }
-
     pub fn tool(id: u64, output_items: Vec<Value>, function_call_output: Value) -> Result<Self> {
         if function_call_output["type"].as_str() != Some("function_call_output") {
             bail!("tool result item is not a function_call_output");
@@ -158,6 +145,8 @@ impl ContextItem {
             input_items,
             keep_lease_expires_at_turn: None,
             keep_lease_expired: false,
+            display_retention: Some(retention),
+            keep_lease_review: None,
             memory: None,
         }
     }
@@ -165,7 +154,7 @@ impl ContextItem {
     fn marker(&self, checkpoint: bool) -> Value {
         let mut block = json!({
             "type": "input_text",
-            "text": format!("[context {} {}]", self.id, self.retention.label())
+            "text": format!("[context {} {}]", self.id, self.display_retention.unwrap_or(self.retention).label())
         });
         if checkpoint {
             block["prompt_cache_breakpoint"] = json!({ "mode": "explicit" });
@@ -174,7 +163,11 @@ impl ContextItem {
     }
 
     fn compact_marker(&self) -> String {
-        format!("[context {} {}]", self.id, self.retention.label())
+        format!(
+            "[context {} {}]",
+            self.id,
+            self.display_retention.unwrap_or(self.retention).label()
+        )
     }
 }
 
@@ -265,6 +258,10 @@ impl ContextState {
         self.retention_turn = self.retention_turn.saturating_add(1);
     }
 
+    pub fn retention_turn(&self) -> u64 {
+        self.retention_turn
+    }
+
     pub fn arm_keep_leases(&mut self, ids: &[u64], turns: u64) {
         if turns == 0 {
             return;
@@ -278,10 +275,12 @@ impl ContextState {
         }
     }
 
-    pub fn queue_due_keep_lease_review(&mut self) -> KeepLeaseReview {
+    /// At a sweep, attach one immutable review to the newest completed tool block.
+    /// The review is resolved only after the next model response has seen it.
+    pub fn attach_due_keep_lease_review(&mut self) -> KeepLeaseReview {
         if !self.pending_keep_lease_review.is_empty() {
             return KeepLeaseReview {
-                item_ids: self.pending_keep_lease_review.clone(),
+                item_ids: Vec::new(),
             };
         }
         let item_ids = self
@@ -296,10 +295,23 @@ impl ContextState {
             .map(|item| item.id)
             .collect::<Vec<_>>();
         if !item_ids.is_empty() {
-            let notice_id = self.allocate_id();
-            self.items
-                .push(ContextItem::keep_lease_review(notice_id, &item_ids));
-            self.pending_keep_lease_review = item_ids.clone();
+            let ids = item_ids
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let text = format!(
+                "Previously protected items {ids} may be removed soon. If their learnings need to be preserved exactly, protect them. If there are learnings that can be summarized, remember those."
+            );
+            if let Some(item) = self
+                .items
+                .iter_mut()
+                .rev()
+                .find(|item| item.kind == ContextItemKind::Tool)
+            {
+                item.keep_lease_review = Some(text);
+                self.pending_keep_lease_review = item_ids.clone();
+            }
         }
         KeepLeaseReview { item_ids }
     }
@@ -357,6 +369,10 @@ impl ContextState {
                         .last_mut()
                         .expect("tool context always has a function output");
                     let mut annotated = output["output"].as_str().unwrap_or_default().to_owned();
+                    if let Some(review) = &item.keep_lease_review {
+                        annotated.push_str("\n\n");
+                        annotated.push_str(review);
+                    }
                     annotated.push_str(&format!("\n{}", item.compact_marker()));
                     for memory in items.iter().filter(|candidate| {
                         candidate.memory.as_ref().is_some_and(|memory| {
@@ -1298,12 +1314,12 @@ mod tests {
         state.arm_keep_leases(&change.keep, 1);
 
         state.advance_retention_turn();
-        let review = state.queue_due_keep_lease_review();
+        let review = state.attach_due_keep_lease_review();
         assert_eq!(review.item_ids, vec![protected]);
         assert!(
             serde_json::to_string(&state.input_items())
                 .unwrap()
-                .contains("Retention review")
+                .contains("Previously protected items")
         );
 
         let expired = state.resolve_keep_lease_review(&[]);
@@ -1330,7 +1346,7 @@ mod tests {
         state.arm_keep_leases(&change.keep, 2);
         state.advance_retention_turn();
         state.advance_retention_turn();
-        state.queue_due_keep_lease_review();
+        state.attach_due_keep_lease_review();
         state.resolve_keep_lease_review(&[active]);
         state.arm_keep_leases(&[active], 2);
 

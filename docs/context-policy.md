@@ -16,9 +16,11 @@ Carry preserves the original order. A later stable message does not force an
 earlier volatile tool result to become stable. The stable cache frontier is the
 longest chronological prefix made entirely of stable items.
 
-Tool results end with a marker such as `[context 2 volatile]`. Carry preserves
-native Responses API output items, including reasoning items, next to the
-function result that produced them.
+Tool rounds end with one immutable marker such as `[context 2 volatile]`. A
+round atomically contains the provider-native assistant tool call and its matching
+function result, so compaction never leaves an orphaned tool result or tool call.
+The marker records the block's creation class; later retention changes never
+rewrite a historical marker.
 
 ## Model signals
 
@@ -68,11 +70,19 @@ and `trace.jsonl`.
 
 `--keep-lease-turns N` (or `CARRY_KEEP_LEASE_TURNS=N`) is disabled by default.
 When enabled, a model `protected` signal is a lease for `N` later model turns,
-not a permanent lock. When it is due, Carry appends a durable, small retention
-review to the next request. The model renews an ID only by naming it again in
-`protected`; any unrenewed ID becomes neutral and volatile. Expiry is not an
-implicit `removable` decision and never deletes an item by itself—the normal
-economic planner must later choose a rewrite.
+not a permanent lock. Carry sweeps on the persisted `N`-turn cadence (rather
+than on every individual expiry) and batches every due lease into prose appended
+after the *newly completed* tool result. The next model action can renew an ID
+only by naming it again in `protected`; after that action completes, an
+unrenewed reviewed ID becomes neutral and volatile. Expiry is not an implicit
+`removable` decision and never deletes an item by itself—the normal economic
+planner may choose a later whole-round rewrite.
+
+A resume and final answer do not independently create a review/status block:
+reviews are emitted only with completed real tool results. The tool result plus
+its optional review is checkpointed as one immutable context block before the
+next provider request, preserving prompt-cache prefix continuity until an
+intentional compaction rewrite.
 
 Each `context_compacted` trace event includes `retention_audit`, with every
 pre-rewrite item’s ID, estimated tokens, kept/removed outcome, and reason

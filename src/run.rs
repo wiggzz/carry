@@ -604,6 +604,8 @@ async fn run_loop(
     persist_context_checkpoint(&config, &context_state)?;
     let mut metrics = RunMetrics::default();
     let mut cache = CacheTracker::new(prompt_cache_capabilities);
+    // A resumed provider session gets one unmodified request to reuse its persisted cache key.
+    let mut sent_model_request = false;
     let mut step_index = 0;
     let mut turn_step = 0;
     let mut protected_until_request = Vec::new();
@@ -636,7 +638,7 @@ async fn run_loop(
         } else {
             "economic"
         };
-        if config.compaction_mode == CompactionMode::Economic {
+        if config.compaction_mode == CompactionMode::Economic && (!resumed || sent_model_request) {
             maybe_compact(
                 &mut context_state,
                 &protected_until_request,
@@ -646,16 +648,6 @@ async fn run_loop(
                 trigger,
             )?;
             persist_context_checkpoint(&config, &context_state)?;
-        }
-        if config.keep_lease_turns.is_some() {
-            let review = context_state.queue_due_keep_lease_review();
-            if !review.item_ids.is_empty() {
-                logger.raw_event_silent(
-                    "retention_revalidation_requested",
-                    json!({"item_ids": &review.item_ids}),
-                )?;
-                persist_context_checkpoint(&config, &context_state)?;
-            }
         }
         step_index += 1;
         turn_step += 1;
@@ -731,6 +723,7 @@ async fn run_loop(
             eprintln!();
         }
         metrics.record(&reply.usage, reply.latency_ms, reply.response_retries);
+        sent_model_request = true;
         cache.observe(&reply.usage);
         logger.raw_event(
             "model_response",
@@ -791,6 +784,18 @@ async fn run_loop(
                 } else {
                     Vec::new()
                 };
+                if let Some(lease_turns) = config.keep_lease_turns
+                    && context_state.retention_turn().is_multiple_of(lease_turns)
+                {
+                    let review = context_state.attach_due_keep_lease_review();
+                    if !review.item_ids.is_empty() {
+                        protected_until_request.extend(review.item_ids.iter().copied());
+                        logger.raw_event_silent(
+                            "retention_revalidation_requested",
+                            json!({"item_ids": review.item_ids}),
+                        )?;
+                    }
+                }
                 protected_until_request.push(item_id);
                 protected_until_request.extend(signals.added.iter().copied());
                 logger.raw_event_silent(
@@ -1859,11 +1864,17 @@ mod tests {
         for pair in histories.windows(2) {
             assert_eq!(pair[1][..pair[0].len()], pair[0]);
         }
-        assert!(
-            serde_json::to_string(&histories[2])
-                .unwrap()
-                .contains("Retention review: IDs 2")
-        );
+        let third = &histories[2];
+        let review_in_tool_result = third.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["output"].as_str().is_some_and(|output| {
+                    output.contains("Previously protected items 2 may be removed soon")
+                })
+        });
+        assert!(review_in_tool_result);
+        assert!(!third.iter().any(|item| {
+            item["role"] == "developer" && item["content"].to_string().contains("Retention review")
+        }));
     }
 
     #[tokio::test]
@@ -1958,7 +1969,7 @@ mod tests {
         let first_steps = temp.path().join("first.jsonl");
         let second_steps = temp.path().join("second.jsonl");
         tokio::fs::create_dir(&workspace).await.unwrap();
-        let finish = r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#;
+        let finish = r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[1],"remember":[]}}"#;
         tokio::fs::write(&first_steps, finish).await.unwrap();
         tokio::fs::write(&second_steps, finish).await.unwrap();
 
@@ -2009,17 +2020,21 @@ mod tests {
             Some("resumable-cache-affinity"),
         );
 
-        let event: serde_json::Value =
-            tokio::fs::read_to_string(second_session.join("trace.jsonl"))
-                .await
-                .unwrap()
-                .lines()
-                .map(serde_json::from_str)
-                .collect::<std::result::Result<Vec<serde_json::Value>, _>>()
-                .unwrap()
-                .into_iter()
-                .find(|event| event["event"] == "model_request")
-                .unwrap();
+        let trace = tokio::fs::read_to_string(second_session.join("trace.jsonl"))
+            .await
+            .unwrap();
+        assert!(
+            !trace.contains("\"event\":\"context_compacted\""),
+            "a resumed run must not rewrite restored history before its first provider request"
+        );
+        let event: serde_json::Value = trace
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<Vec<serde_json::Value>, _>>()
+            .unwrap()
+            .into_iter()
+            .find(|event| event["event"] == "model_request")
+            .unwrap();
         assert!(
             event["data"]["history"]
                 .as_array()
