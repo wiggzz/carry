@@ -53,8 +53,13 @@ materializes the memory as an assistant message with the same ID.
 
 Between rewrites, retained history grows by exact appends so the model provider
 can reuse a stable prompt-cache prefix. Before a model request, the planner
-prices that request with and without a rewrite. Under the default `economic`
-policy, Carry compacts only when the rewritten next request is already cheaper.
+prices retaining the cached history against paying for a rewrite. The economic
+policy uses a three-request payoff period: it charges the rewrite once, then
+compares two later cache-read requests over the compacted and retained histories.
+It also requires projected savings to exceed 10% of the retained-path payoff
+cost. This deliberately avoids rewrites that only barely repay their cache
+invalidation. A compaction still begins a new cache generation; the model-visible
+history is otherwise prefix-continuous.
 
 A compaction can remove explicitly removable items and selected neutral volatile
 items, retain protected evidence, preserve chronology, and establish a new

@@ -9,6 +9,8 @@ use crate::protocol::ContextManagement;
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 const CACHE_READ_RATE: f64 = 0.10;
 const CACHE_WRITE_RATE: f64 = 1.25;
+const COMPACTION_PAYOFF_REQUESTS: usize = 3;
+const COMPACTION_MIN_PAYBACK_RATIO: f64 = 0.10;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
 const NEUTRAL_TARGET_NUMERATOR: usize = 3;
 const NEUTRAL_TARGET_DENOMINATOR: usize = 4;
@@ -648,7 +650,12 @@ impl ContextState {
 
         candidates
             .into_iter()
-            .filter(|plan| plan.estimated_savings_input_units > 0.0)
+            .filter(|plan| {
+                meets_payback_threshold(
+                    plan.estimated_savings_input_units,
+                    plan.minimum_payback_input_units,
+                )
+            })
             .max_by(|left, right| {
                 left.estimated_savings_input_units
                     .total_cmp(&right.estimated_savings_input_units)
@@ -712,10 +719,6 @@ impl ContextState {
             .unwrap_or_default();
         let rewrite_tokens = retained_tokens.saturating_sub(reused_tokens);
         let implicit_cached_tokens = policy.implicit_cached_tokens.min(current_tokens);
-        let baseline = implicit_cached_tokens as f64 * CACHE_READ_RATE
-            + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE;
-        let candidate_first =
-            reused_tokens as f64 * CACHE_READ_RATE + rewrite_tokens as f64 * CACHE_WRITE_RATE;
         let invalidated_generations = policy
             .breakpoints
             .iter()
@@ -734,6 +737,21 @@ impl ContextState {
             .map(|priced| priced.cached_tokens)
             .sum();
 
+        let compact_first_cost =
+            reused_tokens as f64 * CACHE_READ_RATE + rewrite_tokens as f64 * CACHE_WRITE_RATE;
+        let payoff_savings = payoff_savings_input_units(
+            implicit_cached_tokens,
+            current_tokens,
+            retained_tokens,
+            compact_first_cost,
+            COMPACTION_PAYOFF_REQUESTS,
+        );
+        let keep_payoff_cost = implicit_cached_tokens as f64 * CACHE_READ_RATE
+            + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE
+            + COMPACTION_PAYOFF_REQUESTS.saturating_sub(1) as f64
+                * current_tokens as f64
+                * CACHE_READ_RATE;
+
         CompactionPlan {
             dropped,
             neutral_retained,
@@ -750,7 +768,8 @@ impl ContextState {
                 .collect(),
             invalidated_generations,
             invalidated_cache_tokens,
-            estimated_savings_input_units: baseline - candidate_first,
+            estimated_savings_input_units: payoff_savings,
+            minimum_payback_input_units: keep_payoff_cost * COMPACTION_MIN_PAYBACK_RATIO,
         }
     }
 
@@ -890,6 +909,26 @@ impl ContextState {
     }
 }
 
+fn meets_payback_threshold(savings: f64, minimum_payback: f64) -> bool {
+    savings > minimum_payback
+}
+
+fn payoff_savings_input_units(
+    implicit_cached_tokens: usize,
+    current_tokens: usize,
+    retained_tokens: usize,
+    compact_first_cost: f64,
+    payoff_requests: usize,
+) -> f64 {
+    let keep_first = implicit_cached_tokens as f64 * CACHE_READ_RATE
+        + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE;
+    let compact_first = compact_first_cost;
+    let later_requests = payoff_requests.saturating_sub(1) as f64;
+    keep_first + later_requests * current_tokens as f64 * CACHE_READ_RATE
+        - compact_first
+        - later_requests * retained_tokens as f64 * CACHE_READ_RATE
+}
+
 fn unique_ids(ids: &[u64]) -> Vec<u64> {
     let mut seen = HashSet::new();
     ids.iter().copied().filter(|id| seen.insert(*id)).collect()
@@ -942,6 +981,7 @@ pub(crate) struct CompactionPlan {
     pub invalidated_generations: Vec<u64>,
     pub invalidated_cache_tokens: usize,
     pub estimated_savings_input_units: f64,
+    pub minimum_payback_input_units: f64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1058,6 +1098,18 @@ mod tests {
                 }),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn three_request_payoff_accepts_a_rewrite_that_one_request_rejects() {
+        assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 1) < 0.0);
+        assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 3) > 0.0);
+    }
+
+    #[test]
+    fn payback_threshold_rejects_small_positive_savings() {
+        assert!(!meets_payback_threshold(9.9, 10.0));
+        assert!(meets_payback_threshold(10.1, 10.0));
     }
 
     #[test]
@@ -1712,7 +1764,7 @@ mod tests {
     #[test]
     fn compaction_generation_reuses_the_stable_frontier_after_dropping_its_volatile_tail() {
         let mut state = ContextState::new("initial ".repeat(800));
-        let disposable = add_tool_with_output(&mut state, &"old ".repeat(100));
+        let disposable = add_tool_with_output(&mut state, &"old ".repeat(600));
         let volatile_tail = add_tool_with_output(&mut state, &"tail ".repeat(2_000));
         state.record_signals(
             &update(&[], &[disposable], &["durable outcome"]),
