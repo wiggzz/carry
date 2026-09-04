@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.7.0](https://github.com/wiggzz/carry/compare/v0.6.0...v0.7.0) (2026-09-04)
+
+### Features
+
+* add model-directed context pressure reminders ([#71](https://github.com/wiggzz/carry/issues/71)) ([33d9882](https://github.com/wiggzz/carry/commit/33d9882bdcba20b877f8e3d7628bde283bdd7f20))
+* add resumable web sessions and live run events ([#57](https://github.com/wiggzz/carry/issues/57)) ([e784bf1](https://github.com/wiggzz/carry/commit/e784bf17d8f78d65ede4899712b02eb90b80b123))
+* add retained-context SWE-bench smoke ([#63](https://github.com/wiggzz/carry/issues/63)) ([d203546](https://github.com/wiggzz/carry/commit/d203546195bf4f063164277f2d18f4b9f59e3fa5))
+* add selectable compaction policy ([#61](https://github.com/wiggzz/carry/issues/61)) ([57ec112](https://github.com/wiggzz/carry/commit/57ec112a13478b0b512250d1889c94941573516d))
+* complete native retained-session support ([#67](https://github.com/wiggzz/carry/issues/67)) ([8729e9a](https://github.com/wiggzz/carry/commit/8729e9aa78152a4cbb132b87cace4aa4f10d26c1))
+* prepare SWE-bench environments before agents ([#50](https://github.com/wiggzz/carry/issues/50)) ([3def41e](https://github.com/wiggzz/carry/commit/3def41e82146c10e1dad7ebf45650721d94b8c6b))
+* publish reusable SWE-bench task images ([#53](https://github.com/wiggzz/carry/issues/53)) ([35d00fa](https://github.com/wiggzz/carry/commit/35d00fa23d4cbb4361f45659ea7ee38981b8fa85))
+* revalidate protected context leases ([#75](https://github.com/wiggzz/carry/issues/75)) ([a544935](https://github.com/wiggzz/carry/commit/a544935828b61009f12fb7e312c9e9a8ab3f94b7))
+
+
+### Bug Fixes
+
+* authorize prepared image publishing and cleanup ([#55](https://github.com/wiggzz/carry/issues/55)) ([c3d3f2d](https://github.com/wiggzz/carry/commit/c3d3f2d05180fe7c20422549e17e8cfa10fb8b35))
+* export Carry compaction policy to benchmark runner ([#70](https://github.com/wiggzz/carry/issues/70)) ([b941095](https://github.com/wiggzz/carry/commit/b9410959d0b8b6a25bf47cdfa08bccc832870579))
+* extend official agent phase budget ([#60](https://github.com/wiggzz/carry/issues/60)) ([4c98efc](https://github.com/wiggzz/carry/commit/4c98efc4d3ca9e06676be4b2ae152855246cf6e7))
+* forward Carry compaction policy to native CLI ([#68](https://github.com/wiggzz/carry/issues/68)) ([57567ad](https://github.com/wiggzz/carry/commit/57567ad9fd4b10fc52239325829f3ff6b2b64672))
+* preserve prompt-cache affinity across native resumes ([#66](https://github.com/wiggzz/carry/issues/66)) ([12c0d61](https://github.com/wiggzz/carry/commit/12c0d61590397a3755db5d168090c99788798e9c))
+* propagate Carry compaction policy through image command ([#69](https://github.com/wiggzz/carry/issues/69)) ([045ecdc](https://github.com/wiggzz/carry/commit/045ecdc336b27b7a5f03be66144bf311d3896771))
+* scale official agent concurrency ([#59](https://github.com/wiggzz/carry/issues/59)) ([9659ae3](https://github.com/wiggzz/carry/commit/9659ae348621de758cd1d76095b70e071bf7302b))
+* tolerate empty context reminder templates ([#72](https://github.com/wiggzz/carry/issues/72)) ([f6bf52b](https://github.com/wiggzz/carry/commit/f6bf52b99d3a42834677d93d3e7bf100692f1518))
+
+
+### Reverts
+
+* remove experimental context-pressure reminders ([#74](https://github.com/wiggzz/carry/issues/74)) ([314f05d](https://github.com/wiggzz/carry/commit/314f05dad6b2c8884faa0791af22e87181bb312d))
+
+
+### Documentation
+
+* streamline README onboarding ([#62](https://github.com/wiggzz/carry/issues/62)) ([0f05e22](https://github.com/wiggzz/carry/commit/0f05e224eb20ecc237d2f7df0970f489d728d36b))
+
 ## [0.6.0](https://github.com/wiggzz/carry/compare/v0.5.0...v0.6.0) (2026-08-22)
 
 
