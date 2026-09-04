@@ -1,11 +1,6 @@
 # Changelog
 
-## [1.0.0](https://github.com/wiggzz/carry/compare/v0.6.0...v1.0.0) (2026-09-04)
-
-
-### ⚠ BREAKING CHANGES
-
-* streamline README onboarding ([#62](https://github.com/wiggzz/carry/issues/62))
+## [0.7.0](https://github.com/wiggzz/carry/compare/v0.6.0...v0.7.0) (2026-09-04)
 
 ### Features
 
