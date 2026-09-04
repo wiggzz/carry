@@ -9,7 +9,7 @@ use crate::protocol::ContextManagement;
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 const CACHE_READ_RATE: f64 = 0.10;
 const CACHE_WRITE_RATE: f64 = 1.25;
-const COMPACTION_PAYOFF_REQUESTS: usize = 3;
+const COMPACTION_PAYOFF_REQUESTS: usize = 5;
 const COMPACTION_MIN_PAYBACK_RATIO: f64 = 0.10;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
 const NEUTRAL_TARGET_NUMERATOR: usize = 3;
@@ -1101,9 +1101,10 @@ mod tests {
     }
 
     #[test]
-    fn three_request_payoff_accepts_a_rewrite_that_one_request_rejects() {
+    fn five_request_payoff_accepts_a_rewrite_that_one_request_rejects() {
+        assert_eq!(COMPACTION_PAYOFF_REQUESTS, 5);
         assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 1) < 0.0);
-        assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 3) > 0.0);
+        assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 5) > 0.0);
     }
 
     #[test]
