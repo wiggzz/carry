@@ -7,6 +7,7 @@ INFRA_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
 AWS_REGION=${AWS_REGION:-$(aws configure get region 2>/dev/null || true)}
 AWS_REGION=${AWS_REGION:-us-west-2}
 STAGE=${STAGE:-swebench}
+GITHUB_ENVIRONMENT="swe-bench"
 
 [[ "$STAGE" =~ ^([a-z0-9]|[a-z0-9][a-z0-9-]{0,10}[a-z0-9])$ ]] || {
   echo "STAGE must be 1-12 lowercase letters, digits, or hyphens" >&2
@@ -17,8 +18,16 @@ export AWS_DEFAULT_REGION="$AWS_REGION"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 [[ "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]] || { echo "could not determine AWS account" >&2; exit 69; }
 
-STATE_BUCKET=${TF_STATE_BUCKET:-"carry-tfstate-${ACCOUNT_ID}-${AWS_REGION}-${STAGE}"}
+EXPECTED_STATE_BUCKET="carry-tfstate-${ACCOUNT_ID}-${AWS_REGION}-${STAGE}"
+if [[ -n "${TF_STATE_BUCKET:-}" && "$TF_STATE_BUCKET" != "$EXPECTED_STATE_BUCKET" ]]; then
+  echo "TF_STATE_BUCKET must match the deterministic benchmark state bucket: $EXPECTED_STATE_BUCKET" >&2
+  exit 64
+fi
+export TF_VAR_stage="$STAGE"
+STATE_BUCKET="$EXPECTED_STATE_BUCKET"
 ARTIFACT_BUCKET=${ARTIFACT_BUCKET:-"carry-artifacts-${ACCOUNT_ID}-${AWS_REGION}-${STAGE}"}
+STATE_KEY="carry/swebench-benchmark-infra/${STAGE}.tfstate"
+MANIFEST_KEY="carry/swebench-benchmark-infra/${STAGE}.deployment.json"
 OIDC_PROVIDER_ARN="arn:aws:iam::${ACCOUNT_ID}:oidc-provider/token.actions.githubusercontent.com"
 BACKEND_CONFIG="$INFRA_DIR/backend.hcl"
 TFVARS="$INFRA_DIR/terraform.tfvars"
@@ -93,7 +102,7 @@ create_state_bucket
 
 cat > "$BACKEND_CONFIG" <<EOF
 bucket       = "$STATE_BUCKET"
-key          = "carry/swebench-benchmark-infra/$STAGE.tfstate"
+key          = "$STATE_KEY"
 region       = "$AWS_REGION"
 encrypt      = true
 use_lockfile = true
@@ -104,4 +113,21 @@ if [[ -f "$INFRA_DIR/terraform.tfstate" ]]; then
 else
   terraform -chdir="$INFRA_DIR" init -reconfigure -input=false -backend-config="$BACKEND_CONFIG"
 fi
-terraform -chdir="$INFRA_DIR" apply -input=false -auto-approve
+terraform -chdir="$INFRA_DIR" apply -input=false -auto-approve \
+  -var "aws_region=$AWS_REGION" \
+  -var "stage=$STAGE" \
+  -var "github_environment=$GITHUB_ENVIRONMENT"
+
+terraform_outputs=$(mktemp)
+deployment_manifest=$(mktemp)
+cleanup_manifest_files() { rm -f "$terraform_outputs" "$deployment_manifest"; }
+trap cleanup_manifest_files EXIT
+terraform -chdir="$INFRA_DIR" output -json > "$terraform_outputs"
+python3 "$INFRA_DIR/../scripts/benchmark_deployment_manifest.py" write \
+  --terraform-output "$terraform_outputs" \
+  --backend-bucket "$STATE_BUCKET" \
+  --backend-key "$STATE_KEY" \
+  --backend-region "$AWS_REGION" \
+  --output "$deployment_manifest"
+aws s3 cp "$deployment_manifest" "s3://$STATE_BUCKET/$MANIFEST_KEY" --sse AES256 --only-show-errors
+printf 'Published non-secret benchmark deployment manifest: s3://%s/%s\n' "$STATE_BUCKET" "$MANIFEST_KEY"
