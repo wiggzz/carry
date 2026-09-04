@@ -58,6 +58,10 @@ pub struct RunConfig {
     pub max_steps: Option<usize>,
     pub shell_timeout_secs: u64,
     pub compaction_mode: CompactionMode,
+    /// Experimental: revalidate model-requested protected context after this many model turns.
+    pub keep_lease_turns: Option<u64>,
+    /// Number of future requests used to amortize a compaction rewrite; one is next-request economics.
+    pub compaction_payoff_requests: u64,
     pub resume_context: Option<ContextState>,
     pub resume_source: Option<PathBuf>,
     /// Stable provider cache affinity, retained with the resumable state.
@@ -354,16 +358,24 @@ impl CacheTracker {
 
     #[cfg(test)]
     fn policy(&self) -> CompactionPolicy {
-        self.policy_with_implicit_compatibility(true)
+        self.policy_with_implicit_compatibility(true, 1)
     }
 
-    fn policy_for_history(&self, history: &[serde_json::Value]) -> CompactionPolicy {
-        self.policy_with_implicit_compatibility(history.starts_with(&self.implicit_prefix))
+    fn policy_for_history(
+        &self,
+        history: &[serde_json::Value],
+        payoff_requests: u64,
+    ) -> CompactionPolicy {
+        self.policy_with_implicit_compatibility(
+            history.starts_with(&self.implicit_prefix),
+            payoff_requests,
+        )
     }
 
     fn policy_with_implicit_compatibility(
         &self,
         implicit_prefix_compatible: bool,
+        payoff_requests: u64,
     ) -> CompactionPolicy {
         let now = Instant::now();
         let mut breakpoints = self
@@ -391,6 +403,7 @@ impl CacheTracker {
                 0
             },
             breakpoints,
+            payoff_requests,
         }
     }
 
@@ -602,6 +615,8 @@ async fn run_loop(
     persist_context_checkpoint(&config, &context_state)?;
     let mut metrics = RunMetrics::default();
     let mut cache = CacheTracker::new(prompt_cache_capabilities);
+    // A resumed provider session gets one unmodified request to reuse its persisted cache key.
+    let mut sent_model_request = false;
     let mut step_index = 0;
     let mut turn_step = 0;
     let mut protected_until_request = Vec::new();
@@ -634,13 +649,14 @@ async fn run_loop(
         } else {
             "economic"
         };
-        if config.compaction_mode == CompactionMode::Economic {
+        if config.compaction_mode == CompactionMode::Economic && (!resumed || sent_model_request) {
             maybe_compact(
                 &mut context_state,
                 &protected_until_request,
                 &mut cache,
                 &mut metrics,
                 &mut logger,
+                &config,
                 trigger,
             )?;
             persist_context_checkpoint(&config, &context_state)?;
@@ -719,6 +735,7 @@ async fn run_loop(
             eprintln!();
         }
         metrics.record(&reply.usage, reply.latency_ms, reply.response_retries);
+        sent_model_request = true;
         cache.observe(&reply.usage);
         logger.raw_event(
             "model_response",
@@ -771,11 +788,31 @@ async fn run_loop(
                     &terminal_shell_result(&result),
                 )?;
                 let signals = context_state.record_signals(&reply.step.context, item_id);
+                let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
+                    context_state.advance_retention_turn();
+                    let expired = context_state.resolve_keep_lease_review(&signals.keep);
+                    context_state.arm_keep_leases(&signals.keep, lease_turns);
+                    expired
+                } else {
+                    Vec::new()
+                };
+                if let Some(lease_turns) = config.keep_lease_turns
+                    && context_state.retention_turn().is_multiple_of(lease_turns)
+                {
+                    let review = context_state.attach_due_keep_lease_review();
+                    if !review.item_ids.is_empty() {
+                        protected_until_request.extend(review.item_ids.iter().copied());
+                        logger.raw_event_silent(
+                            "retention_revalidation_requested",
+                            json!({"item_ids": review.item_ids}),
+                        )?;
+                    }
+                }
                 protected_until_request.push(item_id);
                 protected_until_request.extend(signals.added.iter().copied());
                 logger.raw_event_silent(
                     "context_signals",
-                    json!({"source_id": item_id, "signals": &signals}),
+                    json!({"source_id": item_id, "signals": &signals, "expired_keep_leases": expired_keep_leases}),
                 )?;
                 persist_context_checkpoint(&config, &context_state)?;
 
@@ -806,11 +843,19 @@ async fn run_loop(
                 )?;
                 let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
                 let signals = context_state.record_signals(&reply.step.context, item_id);
+                let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
+                    context_state.advance_retention_turn();
+                    let expired = context_state.resolve_keep_lease_review(&signals.keep);
+                    context_state.arm_keep_leases(&signals.keep, lease_turns);
+                    expired
+                } else {
+                    Vec::new()
+                };
                 protected_until_request.push(item_id);
                 protected_until_request.extend(signals.added.iter().copied());
                 logger.raw_event_silent(
                     "context_signals",
-                    json!({"source_id": item_id, "signals": &signals}),
+                    json!({"source_id": item_id, "signals": &signals, "expired_keep_leases": expired_keep_leases}),
                 )?;
                 persist_context_checkpoint(&config, &context_state)?;
                 logger.raw_event(
@@ -916,9 +961,10 @@ fn maybe_compact(
     cache: &mut CacheTracker,
     metrics: &mut RunMetrics,
     logger: &mut RunLogger,
+    config: &RunConfig,
     trigger: &str,
 ) -> Result<bool> {
-    let policy = cache.policy_for_history(&state.input_items());
+    let policy = cache.policy_for_history(&state.input_items(), config.compaction_payoff_requests);
     let Some(plan) = state.plan_compaction_with_neutral_budget(
         protected,
         policy,
@@ -1549,11 +1595,16 @@ mod tests {
             json!({"type": "function_call_output", "output": "new"}),
         ];
         assert_eq!(
-            cache.policy_for_history(&extended).implicit_cached_tokens,
+            cache
+                .policy_for_history(&extended, 1)
+                .implicit_cached_tokens,
             2_400
         );
         let mutated = vec![json!({"role": "user", "content": "changed"})];
-        assert_eq!(cache.policy_for_history(&mutated).implicit_cached_tokens, 0);
+        assert_eq!(
+            cache.policy_for_history(&mutated, 1).implicit_cached_tokens,
+            0
+        );
     }
 
     #[test]
@@ -1782,6 +1833,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keep_lease_review_extends_cached_request_history_without_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("run");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"shell","command":"printf first","answer":null},"context":{"protected":[2],"removable":[],"remember":[]}}"#, "\n",
+                r#"{"action":{"kind":"shell","command":"printf second","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+            ),
+        )
+        .await
+        .unwrap();
+        run(
+            RunConfig {
+                cwd: workspace,
+                prompt: "Finish the task.".into(),
+                session_dir: session_dir.clone(),
+                model: "scripted".into(),
+                max_steps: Some(3),
+                shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Disabled,
+                keep_lease_turns: Some(1),
+                compaction_payoff_requests: 1,
+                resume_context: None,
+                resume_source: None,
+                prompt_cache_key: Some("carry-test-cache-key".into()),
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let histories = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap()
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|event| event["event"] == "model_request")
+            .map(|event| event["data"]["history"].as_array().unwrap().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(histories.len(), 3);
+        for pair in histories.windows(2) {
+            assert_eq!(pair[1][..pair[0].len()], pair[0]);
+        }
+        let third = &histories[2];
+        let review_in_tool_result = third.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["output"].as_str().is_some_and(|output| {
+                    output.contains("Previously protected items 2 may be removed soon")
+                })
+        });
+        assert!(review_in_tool_result);
+        assert!(!third.iter().any(|item| {
+            item["role"] == "developer" && item["content"].to_string().contains("Retention review")
+        }));
+    }
+
+    #[tokio::test]
     async fn scripted_run_writes_aggregate_metrics_to_result() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
@@ -1804,6 +1919,8 @@ mod tests {
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -1872,7 +1989,7 @@ mod tests {
         let first_steps = temp.path().join("first.jsonl");
         let second_steps = temp.path().join("second.jsonl");
         tokio::fs::create_dir(&workspace).await.unwrap();
-        let finish = r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#;
+        let finish = r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[1],"remember":[]}}"#;
         tokio::fs::write(&first_steps, finish).await.unwrap();
         tokio::fs::write(&second_steps, finish).await.unwrap();
 
@@ -1885,6 +2002,8 @@ mod tests {
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("resumable-cache-affinity".into()),
@@ -1905,6 +2024,8 @@ mod tests {
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: Some(resume.context),
                 resume_source: Some(first_session),
                 prompt_cache_key,
@@ -1921,17 +2042,21 @@ mod tests {
             Some("resumable-cache-affinity"),
         );
 
-        let event: serde_json::Value =
-            tokio::fs::read_to_string(second_session.join("trace.jsonl"))
-                .await
-                .unwrap()
-                .lines()
-                .map(serde_json::from_str)
-                .collect::<std::result::Result<Vec<serde_json::Value>, _>>()
-                .unwrap()
-                .into_iter()
-                .find(|event| event["event"] == "model_request")
-                .unwrap();
+        let trace = tokio::fs::read_to_string(second_session.join("trace.jsonl"))
+            .await
+            .unwrap();
+        assert!(
+            !trace.contains("\"event\":\"context_compacted\""),
+            "a resumed run must not rewrite restored history before its first provider request"
+        );
+        let event: serde_json::Value = trace
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<Vec<serde_json::Value>, _>>()
+            .unwrap()
+            .into_iter()
+            .find(|event| event["event"] == "model_request")
+            .unwrap();
         assert!(
             event["data"]["history"]
                 .as_array()
@@ -1964,6 +2089,8 @@ mod tests {
                 max_steps: None,
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2005,6 +2132,8 @@ mod tests {
                 max_steps: None,
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2061,6 +2190,8 @@ mod tests {
                 max_steps: Some(1),
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2118,6 +2249,8 @@ mod tests {
                 max_steps: None,
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,

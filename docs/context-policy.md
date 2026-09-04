@@ -16,9 +16,11 @@ Carry preserves the original order. A later stable message does not force an
 earlier volatile tool result to become stable. The stable cache frontier is the
 longest chronological prefix made entirely of stable items.
 
-Tool results end with a marker such as `[context 2 volatile]`. Carry preserves
-native Responses API output items, including reasoning items, next to the
-function result that produced them.
+Tool rounds end with one immutable marker such as `[context 2 volatile]`. A
+round atomically contains the provider-native assistant tool call and its matching
+function result, so compaction never leaves an orphaned tool result or tool call.
+The marker records the block's creation class; later retention changes never
+rewrite a historical marker.
 
 ## Model signals
 
@@ -51,8 +53,15 @@ materializes the memory as an assistant message with the same ID.
 
 Between rewrites, retained history grows by exact appends so the model provider
 can reuse a stable prompt-cache prefix. Before a model request, the planner
-prices that request with and without a rewrite. Under the default `economic`
-policy, Carry compacts only when the rewritten next request is already cheaper.
+prices retaining the cached history against paying for a rewrite. The economic
+The payoff period is configured with `--compaction-payoff-requests N` (or
+`CARRY_COMPACTION_PAYOFF_REQUESTS=N`). `N` must be a positive integer and defaults
+to `1`, preserving the original next-request economic policy. Benchmarks record
+this value in provenance; non-default experiments must pass it explicitly.
+It also requires projected savings to exceed 10% of the retained-path payoff
+cost. This deliberately avoids rewrites that only barely repay their cache
+invalidation. A compaction still begins a new cache generation; the model-visible
+history is otherwise prefix-continuous.
 
 A compaction can remove explicitly removable items and selected neutral volatile
 items, retain protected evidence, preserve chronology, and establish a new
@@ -63,6 +72,31 @@ Use `--compaction-policy disabled` when you need a no-compaction control. Carry
 still records the session, but it never asks the planner to rewrite history.
 Both the selected policy and aggregate compaction count appear in `result.json`
 and `trace.jsonl`.
+
+## Experimental keep leases
+
+`--keep-lease-turns N` (or `CARRY_KEEP_LEASE_TURNS=N`) is disabled by default.
+When enabled, a model `protected` signal is a lease for `N` later model turns,
+not a permanent lock. Carry sweeps on the persisted `N`-turn cadence (rather
+than on every individual expiry) and batches every due lease into prose appended
+after the *newly completed* tool result. The next model action can renew an ID
+only by naming it again in `protected`; after that action completes, an
+unrenewed reviewed ID becomes neutral and volatile. Expiry is not an implicit
+`removable` decision and never deletes an item by itself—the normal economic
+planner may choose a later whole-round rewrite.
+
+A resume and final answer do not independently create a review/status block:
+reviews are emitted only with completed real tool results. The tool result plus
+its optional review is checkpointed as one immutable context block before the
+next provider request, preserving prompt-cache prefix continuity until an
+intentional compaction rewrite.
+
+Each `context_compacted` trace event includes `retention_audit`, with every
+pre-rewrite item’s ID, estimated tokens, kept/removed outcome, and reason
+(active lease, expired lease, explicit removable, neutral policy, or stable
+baseline). Lease review and expiry events are also persisted in `trace.jsonl`.
+The review is appended to persisted native context, so it extends the previous
+request history and preserves prompt-cache continuity until a normal rewrite.
 
 ## Session-persistence benchmark mode
 

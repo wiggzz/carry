@@ -36,6 +36,14 @@ if not os.environ.get("OPENAI_BASE_URL"):
 compaction_policy = os.environ.get("CARRY_COMPACTION_POLICY", "economic")
 if compaction_policy not in {"economic", "disabled"}:
     parser.error("CARRY_COMPACTION_POLICY must be economic or disabled")
+keep_lease_turns = os.environ.get("CARRY_KEEP_LEASE_TURNS", "")
+if keep_lease_turns and (not keep_lease_turns.isascii() or not keep_lease_turns.isdecimal()
+                         or int(keep_lease_turns) < 1):
+    parser.error("CARRY_KEEP_LEASE_TURNS must be a positive ASCII decimal integer")
+payoff_requests = os.environ.get("CARRY_COMPACTION_PAYOFF_REQUESTS", "1")
+if (not payoff_requests.isascii() or not payoff_requests.isdecimal()
+        or int(payoff_requests) < 1):
+    parser.error("CARRY_COMPACTION_PAYOFF_REQUESTS must be a positive ASCII decimal integer")
 
 output = pathlib.Path(args.output)
 output.mkdir(parents=True, exist_ok=True)
@@ -63,6 +71,10 @@ values = {
     "output": args.output,
 }
 command = [part.format(**values) for part in shlex.split(template)]
+if args.harness == "carry" and keep_lease_turns:
+    command.extend(["--keep-lease-turns", keep_lease_turns])
+if args.harness == "carry":
+    command.extend(["--compaction-payoff-requests", payoff_requests])
 if args.resume_session:
     command.extend(["--resume", str(args.resume_session)])
 if args.codex_session and args.codex_thread:

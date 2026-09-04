@@ -9,6 +9,7 @@ use crate::protocol::ContextManagement;
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 const CACHE_READ_RATE: f64 = 0.10;
 const CACHE_WRITE_RATE: f64 = 1.25;
+const COMPACTION_MIN_PAYBACK_RATIO: f64 = 0.10;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
 const NEUTRAL_TARGET_NUMERATOR: usize = 3;
 const NEUTRAL_TARGET_DENOMINATOR: usize = 4;
@@ -56,6 +57,16 @@ pub(crate) struct ContextItem {
     pub signal: RetentionSignal,
     pub bytes: usize,
     pub input_items: Vec<Value>,
+    #[serde(default)]
+    keep_lease_expires_at_turn: Option<u64>,
+    #[serde(default)]
+    keep_lease_expired: bool,
+    /// Immutable lifecycle label rendered when this context block was created.
+    #[serde(default)]
+    display_retention: Option<Retention>,
+    /// Immutable sweep advisory rendered inside this completed tool result.
+    #[serde(default)]
+    keep_lease_review: Option<String>,
     memory: Option<MemoryData>,
 }
 
@@ -133,6 +144,10 @@ impl ContextItem {
             signal: RetentionSignal::Neutral,
             bytes: serialized_bytes(&input_items),
             input_items,
+            keep_lease_expires_at_turn: None,
+            keep_lease_expired: false,
+            display_retention: Some(retention),
+            keep_lease_review: None,
             memory: None,
         }
     }
@@ -140,7 +155,7 @@ impl ContextItem {
     fn marker(&self, checkpoint: bool) -> Value {
         let mut block = json!({
             "type": "input_text",
-            "text": format!("[context {} {}]", self.id, self.retention.label())
+            "text": format!("[context {} {}]", self.id, self.display_retention.unwrap_or(self.retention).label())
         });
         if checkpoint {
             block["prompt_cache_breakpoint"] = json!({ "mode": "explicit" });
@@ -149,7 +164,11 @@ impl ContextItem {
     }
 
     fn compact_marker(&self) -> String {
-        format!("[context {} {}]", self.id, self.retention.label())
+        format!(
+            "[context {} {}]",
+            self.id,
+            self.display_retention.unwrap_or(self.retention).label()
+        )
     }
 }
 
@@ -164,6 +183,10 @@ pub(crate) struct ContextState {
     generation: u64,
     max_read_breakpoints: usize,
     breakpoints: Vec<StoredBreakpoint>,
+    #[serde(default)]
+    retention_turn: u64,
+    #[serde(default)]
+    pending_keep_lease_review: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -197,6 +220,8 @@ impl ContextState {
                 marker_frontiers: vec![1],
                 rendered_prefix,
             }],
+            retention_turn: 0,
+            pending_keep_lease_review: Vec::new(),
         }
     }
 
@@ -228,6 +253,87 @@ impl ContextState {
         self.items
             .push(ContextItem::tool(id, output_items, function_call_output)?);
         Ok(id)
+    }
+
+    pub fn advance_retention_turn(&mut self) {
+        self.retention_turn = self.retention_turn.saturating_add(1);
+    }
+
+    pub fn retention_turn(&self) -> u64 {
+        self.retention_turn
+    }
+
+    pub fn arm_keep_leases(&mut self, ids: &[u64], turns: u64) {
+        if turns == 0 {
+            return;
+        }
+        let expires_at_turn = self.retention_turn.saturating_add(turns);
+        for id in unique_ids(ids) {
+            if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
+                item.keep_lease_expires_at_turn = Some(expires_at_turn);
+                item.keep_lease_expired = false;
+            }
+        }
+    }
+
+    /// At a sweep, attach one immutable review to the newest completed tool block.
+    /// The review is resolved only after the next model response has seen it.
+    pub fn attach_due_keep_lease_review(&mut self) -> KeepLeaseReview {
+        if !self.pending_keep_lease_review.is_empty() {
+            return KeepLeaseReview {
+                item_ids: Vec::new(),
+            };
+        }
+        let item_ids = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.signal != RetentionSignal::Drop
+                    && item
+                        .keep_lease_expires_at_turn
+                        .is_some_and(|expires_at| expires_at <= self.retention_turn)
+            })
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        if !item_ids.is_empty() {
+            let ids = item_ids
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let text = format!(
+                "Previously protected items {ids} may be removed soon. If their learnings need to be preserved exactly, protect them. If there are learnings that can be summarized, remember those."
+            );
+            if let Some(item) = self
+                .items
+                .iter_mut()
+                .rev()
+                .find(|item| item.kind == ContextItemKind::Tool)
+            {
+                item.keep_lease_review = Some(text);
+                self.pending_keep_lease_review = item_ids.clone();
+            }
+        }
+        KeepLeaseReview { item_ids }
+    }
+
+    pub fn resolve_keep_lease_review(&mut self, renewed: &[u64]) -> Vec<u64> {
+        let renewed = unique_ids(renewed).into_iter().collect::<HashSet<_>>();
+        let mut expired = Vec::new();
+        for id in std::mem::take(&mut self.pending_keep_lease_review) {
+            let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+                continue;
+            };
+            if renewed.contains(&id) || item.signal == RetentionSignal::Drop {
+                continue;
+            }
+            item.signal = RetentionSignal::Neutral;
+            item.retention = Retention::Volatile;
+            item.keep_lease_expires_at_turn = None;
+            item.keep_lease_expired = true;
+            expired.push(id);
+        }
+        expired
     }
 
     fn allocate_id(&mut self) -> u64 {
@@ -264,6 +370,10 @@ impl ContextState {
                         .last_mut()
                         .expect("tool context always has a function output");
                     let mut annotated = output["output"].as_str().unwrap_or_default().to_owned();
+                    if let Some(review) = &item.keep_lease_review {
+                        annotated.push_str("\n\n");
+                        annotated.push_str(review);
+                    }
                     annotated.push_str(&format!("\n{}", item.compact_marker()));
                     for memory in items.iter().filter(|candidate| {
                         candidate.memory.as_ref().is_some_and(|memory| {
@@ -539,7 +649,12 @@ impl ContextState {
 
         candidates
             .into_iter()
-            .filter(|plan| plan.estimated_savings_input_units > 0.0)
+            .filter(|plan| {
+                meets_payback_threshold(
+                    plan.estimated_savings_input_units,
+                    plan.minimum_payback_input_units,
+                )
+            })
             .max_by(|left, right| {
                 left.estimated_savings_input_units
                     .total_cmp(&right.estimated_savings_input_units)
@@ -603,10 +718,6 @@ impl ContextState {
             .unwrap_or_default();
         let rewrite_tokens = retained_tokens.saturating_sub(reused_tokens);
         let implicit_cached_tokens = policy.implicit_cached_tokens.min(current_tokens);
-        let baseline = implicit_cached_tokens as f64 * CACHE_READ_RATE
-            + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE;
-        let candidate_first =
-            reused_tokens as f64 * CACHE_READ_RATE + rewrite_tokens as f64 * CACHE_WRITE_RATE;
         let invalidated_generations = policy
             .breakpoints
             .iter()
@@ -625,6 +736,21 @@ impl ContextState {
             .map(|priced| priced.cached_tokens)
             .sum();
 
+        let compact_first_cost =
+            reused_tokens as f64 * CACHE_READ_RATE + rewrite_tokens as f64 * CACHE_WRITE_RATE;
+        let payoff_savings = payoff_savings_input_units(
+            implicit_cached_tokens,
+            current_tokens,
+            retained_tokens,
+            compact_first_cost,
+            policy.payoff_requests,
+        );
+        let keep_payoff_cost = implicit_cached_tokens as f64 * CACHE_READ_RATE
+            + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE
+            + policy.payoff_requests.saturating_sub(1) as f64
+                * current_tokens as f64
+                * CACHE_READ_RATE;
+
         CompactionPlan {
             dropped,
             neutral_retained,
@@ -641,7 +767,8 @@ impl ContextState {
                 .collect(),
             invalidated_generations,
             invalidated_cache_tokens,
-            estimated_savings_input_units: baseline - candidate_first,
+            estimated_savings_input_units: payoff_savings,
+            minimum_payback_input_units: keep_payoff_cost * COMPACTION_MIN_PAYBACK_RATIO,
         }
     }
 
@@ -652,6 +779,41 @@ impl ContextState {
             .iter()
             .map(|decision| decision.id)
             .collect::<HashSet<_>>();
+        let retention_audit = self
+            .items
+            .iter()
+            .map(|item| {
+                let action = if dropped.contains(&item.id) {
+                    RetentionAuditAction::Removed
+                } else {
+                    RetentionAuditAction::Kept
+                };
+                let reason = if item.signal == RetentionSignal::Drop {
+                    RetentionAuditReason::ExplicitRemovable
+                } else if item.keep_lease_expired {
+                    RetentionAuditReason::ExpiredKeepLease
+                } else if item
+                    .keep_lease_expires_at_turn
+                    .is_some_and(|expires_at| expires_at > self.retention_turn)
+                {
+                    RetentionAuditReason::ActiveKeepLease
+                } else if item.signal == RetentionSignal::Keep {
+                    RetentionAuditReason::ExplicitKeep
+                } else if neutral_retained.contains(&item.id)
+                    || item.retention == Retention::Volatile
+                {
+                    RetentionAuditReason::AutomaticNeutral
+                } else {
+                    RetentionAuditReason::StableBaseline
+                };
+                RetentionAuditEntry {
+                    id: item.id,
+                    estimated_tokens: item.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN),
+                    action,
+                    reason,
+                }
+            })
+            .collect::<Vec<_>>();
         self.items.retain(|item| !dropped.contains(&item.id));
         for item in &mut self.items {
             if let Some(memory) = item.memory.as_mut()
@@ -712,6 +874,7 @@ impl ContextState {
 
         ContextChange {
             dropped: plan.dropped,
+            retention_audit,
             neutral_retained: plan.neutral_retained,
             neutral_budget_tokens: plan.neutral_budget_tokens,
             neutral_target_tokens: plan.neutral_target_tokens,
@@ -745,6 +908,26 @@ impl ContextState {
     }
 }
 
+fn meets_payback_threshold(savings: f64, minimum_payback: f64) -> bool {
+    savings > minimum_payback
+}
+
+fn payoff_savings_input_units(
+    implicit_cached_tokens: usize,
+    current_tokens: usize,
+    retained_tokens: usize,
+    compact_first_cost: f64,
+    payoff_requests: u64,
+) -> f64 {
+    let keep_first = implicit_cached_tokens as f64 * CACHE_READ_RATE
+        + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE;
+    let compact_first = compact_first_cost;
+    let later_requests = payoff_requests.saturating_sub(1) as f64;
+    keep_first + later_requests * current_tokens as f64 * CACHE_READ_RATE
+        - compact_first
+        - later_requests * retained_tokens as f64 * CACHE_READ_RATE
+}
+
 fn unique_ids(ids: &[u64]) -> Vec<u64> {
     let mut seen = HashSet::new();
     ids.iter().copied().filter(|id| seen.insert(*id)).collect()
@@ -766,9 +949,11 @@ fn estimated_tokens(items: &[Value]) -> usize {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct CompactionPolicy {
+pub struct CompactionPolicy {
     pub implicit_cached_tokens: usize,
     pub breakpoints: Vec<PricedBreakpoint>,
+    /// Fixed number of requests over which a rewrite is amortized; must be positive.
+    pub payoff_requests: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -797,6 +982,7 @@ pub(crate) struct CompactionPlan {
     pub invalidated_generations: Vec<u64>,
     pub invalidated_cache_tokens: usize,
     pub estimated_savings_input_units: f64,
+    pub minimum_payback_input_units: f64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -804,6 +990,37 @@ pub(crate) struct NeutralRetentionDecision {
     pub id: u64,
     pub tokens: usize,
     pub score: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetentionAuditAction {
+    Kept,
+    Removed,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetentionAuditReason {
+    ActiveKeepLease,
+    ExplicitKeep,
+    ExpiredKeepLease,
+    ExplicitRemovable,
+    AutomaticNeutral,
+    StableBaseline,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct RetentionAuditEntry {
+    pub id: u64,
+    pub estimated_tokens: usize,
+    pub action: RetentionAuditAction,
+    pub reason: RetentionAuditReason,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct KeepLeaseReview {
+    pub item_ids: Vec<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -817,6 +1034,7 @@ pub(crate) struct SignalChange {
 #[derive(Debug, Serialize)]
 pub(crate) struct ContextChange {
     pub dropped: Vec<u64>,
+    pub retention_audit: Vec<RetentionAuditEntry>,
     pub neutral_retained: Vec<NeutralRetentionDecision>,
     pub neutral_budget_tokens: usize,
     pub neutral_target_tokens: usize,
@@ -884,6 +1102,24 @@ mod tests {
     }
 
     #[test]
+    fn five_request_payoff_accepts_a_rewrite_that_one_request_rejects() {
+        let policy = CompactionPolicy {
+            implicit_cached_tokens: 0,
+            breakpoints: Vec::new(),
+            payoff_requests: 5,
+        };
+        assert_eq!(policy.payoff_requests, 5);
+        assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 1) < 0.0);
+        assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 5) > 0.0);
+    }
+
+    #[test]
+    fn payback_threshold_rejects_small_positive_savings() {
+        assert!(!meets_payback_threshold(9.9, 10.0));
+        assert!(meets_payback_threshold(10.1, 10.0));
+    }
+
+    #[test]
     fn neutral_budget_retains_the_highest_recency_scores() {
         let mut state = ContextState::new("initial".into());
         let oldest = add_tool_with_output(&mut state, &"old ".repeat(100));
@@ -899,6 +1135,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
                 budget,
             )
@@ -931,6 +1168,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
                 budget,
             )
@@ -957,6 +1195,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
                 budget,
             )
@@ -986,6 +1225,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
                 budget,
             )
@@ -1017,6 +1257,7 @@ mod tests {
                     CompactionPolicy {
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
+                        payoff_requests: 1,
                     },
                     budget,
                 )
@@ -1052,6 +1293,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
                 usize::MAX,
             )
@@ -1073,6 +1315,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1114,6 +1357,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1126,6 +1370,76 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn expired_keep_lease_requires_explicit_renewal_before_becoming_neutral() {
+        let mut state = ContextState::new("initial".into());
+        let protected = add_tool(&mut state);
+        let source = add_tool(&mut state);
+        let change = state.record_signals(&update(&[protected], &[], &[]), source);
+        state.arm_keep_leases(&change.keep, 1);
+
+        state.advance_retention_turn();
+        let review = state.attach_due_keep_lease_review();
+        assert_eq!(review.item_ids, vec![protected]);
+        assert!(
+            serde_json::to_string(&state.input_items())
+                .unwrap()
+                .contains("Previously protected items")
+        );
+
+        let expired = state.resolve_keep_lease_review(&[]);
+        assert_eq!(expired, vec![protected]);
+        assert_eq!(state.signal_for(protected), Some(RetentionSignal::Neutral));
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .find(|item| item.id == protected)
+                .unwrap()
+                .retention,
+            Retention::Volatile
+        );
+    }
+
+    #[test]
+    fn compaction_audit_distinguishes_expired_leases_from_active_keeps() {
+        let mut state = ContextState::new("initial".into());
+        let expired = add_tool_with_output(&mut state, &"expired ".repeat(100));
+        let active = add_tool_with_output(&mut state, &"active ".repeat(100));
+        let source = add_tool(&mut state);
+        let change = state.record_signals(&update(&[expired, active], &[], &[]), source);
+        state.arm_keep_leases(&change.keep, 2);
+        state.advance_retention_turn();
+        state.advance_retention_turn();
+        state.attach_due_keep_lease_review();
+        state.resolve_keep_lease_review(&[active]);
+        state.arm_keep_leases(&[active], 2);
+
+        let plan = state
+            .plan_compaction_with_neutral_budget(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                    payoff_requests: 1,
+                },
+                0,
+            )
+            .unwrap();
+        let change = state.compact(plan);
+
+        assert!(change.retention_audit.iter().any(|entry| {
+            entry.id == expired
+                && entry.action == RetentionAuditAction::Removed
+                && entry.reason == RetentionAuditReason::ExpiredKeepLease
+        }));
+        assert!(change.retention_audit.iter().any(|entry| {
+            entry.id == active
+                && entry.action == RetentionAuditAction::Kept
+                && entry.reason == RetentionAuditReason::ActiveKeepLease
+        }));
     }
 
     #[test]
@@ -1217,6 +1531,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1253,6 +1568,7 @@ mod tests {
                     CompactionPolicy {
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
+                        payoff_requests: 1,
                     },
                 )
                 .is_none()
@@ -1274,6 +1590,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1341,6 +1658,7 @@ mod tests {
             CompactionPolicy {
                 implicit_cached_tokens: usize::MAX,
                 breakpoints: Vec::new(),
+                payoff_requests: 1,
             },
         );
         assert!(short.is_none());
@@ -1352,6 +1670,7 @@ mod tests {
                     CompactionPolicy {
                         implicit_cached_tokens: usize::MAX,
                         breakpoints: Vec::new(),
+                        payoff_requests: 1,
                     },
                 )
                 .is_none()
@@ -1375,6 +1694,7 @@ mod tests {
                         generation: 0,
                         cached_tokens: 1_200,
                     }],
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1395,6 +1715,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1408,6 +1729,7 @@ mod tests {
                     CompactionPolicy {
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
+                        payoff_requests: 1,
                     },
                 )
                 .is_none()
@@ -1427,6 +1749,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1456,6 +1779,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1466,7 +1790,7 @@ mod tests {
     #[test]
     fn compaction_generation_reuses_the_stable_frontier_after_dropping_its_volatile_tail() {
         let mut state = ContextState::new("initial ".repeat(800));
-        let disposable = add_tool_with_output(&mut state, &"old ".repeat(100));
+        let disposable = add_tool_with_output(&mut state, &"old ".repeat(600));
         let volatile_tail = add_tool_with_output(&mut state, &"tail ".repeat(2_000));
         state.record_signals(
             &update(&[], &[disposable], &["durable outcome"]),
@@ -1479,6 +1803,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
                 usize::MAX,
             )
@@ -1504,6 +1829,7 @@ mod tests {
                         generation: first_change.generation,
                         cached_tokens: 1_200,
                     }],
+                    payoff_requests: 1,
                 },
                 usize::MAX,
             )
@@ -1539,6 +1865,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1570,6 +1897,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1583,6 +1911,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
