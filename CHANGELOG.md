@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.2](https://github.com/wiggzz/carry/compare/v0.7.1...v0.7.2) (2026-09-04)
+
+
+### Bug Fixes
+
+* bound benchmark worker user data ([#82](https://github.com/wiggzz/carry/issues/82)) ([a631f11](https://github.com/wiggzz/carry/commit/a631f11242238033481f5a898160affa32157e97))
+* centralize benchmark agent commands ([#80](https://github.com/wiggzz/carry/issues/80)) ([3ea9555](https://github.com/wiggzz/carry/commit/3ea955596a835d10dc15e5f231efdee14018a645))
+
 ## [0.7.1](https://github.com/wiggzz/carry/compare/v0.7.0...v0.7.1) (2026-09-04)
 
 
