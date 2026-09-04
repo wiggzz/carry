@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.1](https://github.com/wiggzz/carry/compare/v0.7.0...v0.7.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* allow nonbreaking Conventional Commit titles ([#78](https://github.com/wiggzz/carry/issues/78)) ([3973e3e](https://github.com/wiggzz/carry/commit/3973e3ec4581601e245a1039139a7d121a55ce32))
+* document recent context benchmark evidence ([#79](https://github.com/wiggzz/carry/issues/79)) ([c0451cf](https://github.com/wiggzz/carry/commit/c0451cf284d4fd9f55cb7bbbd7b3a2ad467b08d2))
+
 ## [0.7.0](https://github.com/wiggzz/carry/compare/v0.6.0...v0.7.0) (2026-09-04)
 
 ### Features
