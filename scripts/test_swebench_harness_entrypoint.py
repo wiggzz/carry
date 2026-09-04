@@ -2,7 +2,6 @@
 """Behavior tests for the run-scoped harness image adapter."""
 import os
 import pathlib
-import re
 import subprocess
 import tempfile
 import unittest
@@ -315,52 +314,6 @@ class HarnessEntrypointTests(unittest.TestCase):
             self.assertNotIn("unit-test-secret", (output / "trace.log").read_text())
             self.assertIn("+after", (output / "final.patch").read_text())
             self.assertIn("new.txt", (output / "final.patch").read_text())
-
-    def test_carry_benchmark_command_relies_on_overall_timeout_without_step_cap(self):
-        dockerfile = ENTRYPOINT.with_name("Dockerfile.carry").read_text(encoding="utf-8")
-        match = re.search(r'^ENV AGENT_COMMAND="(.*)"$', dockerfile, re.MULTILINE)
-        if match is None:
-            self.fail("Carry benchmark command is missing")
-        command_template = match.group(1)
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            repo = root / "repo"; prompt_dir = root / "input"; output = root / "output"
-            bin_dir = root / "bin"
-            repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); bin_dir.mkdir()
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
-            (repo / "file.txt").write_text("before\n")
-            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
-            (prompt_dir / "task.md").write_text("fix")
-            fake_carry = bin_dir / "carry"
-            fake_carry.write_text(
-                "#!/usr/bin/env python3\nimport pathlib,sys\n"
-                "assert '--max-steps' not in sys.argv[1:], sys.argv\n"
-                "index=sys.argv.index('--compaction-policy')\n"
-                "assert sys.argv[index + 1] == 'disabled', sys.argv\n"
-                "pathlib.Path('file.txt').write_text('after\\n')\n"
-            )
-            fake_carry.chmod(0o755)
-            env = dict(
-                os.environ,
-                OPENAI_API_KEY="unit-test-secret",
-                OPENAI_BASE_URL="http://openai-proxy:8080/v1",
-                AGENT_COMMAND=command_template,
-                CARRY_COMPACTION_POLICY="disabled",
-                AGENT_TIMEOUT_SECONDS="1",
-                BENCHMARK_WORKSPACE=str(repo),
-                PATH=f"{bin_dir}:{os.environ['PATH']}",
-            )
-            run = subprocess.run(
-                ["python3", str(ENTRYPOINT), "run", "--model", "model", "--reasoning", "medium",
-                 "--prompt", str(prompt_dir / "task.md"), "--output", str(output)],
-                cwd=repo, env=env, text=True, capture_output=True,
-            )
-            self.assertEqual(run.returncode, 0, (output / "trace.log").read_text())
-            self.assertIn("+after", (output / "final.patch").read_text())
 
 
 if __name__ == "__main__":

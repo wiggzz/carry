@@ -154,6 +154,22 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertIn("/agent-home:rw", rendered)
             self.assertIn("/tmp:rw", rendered)
 
+    def test_runner_supplies_canonical_agent_template_for_each_harness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for name in ("repo", "input", "output", "harness"):
+                (root / name).mkdir()
+            for harness, template in self.worker.AGENT_COMMANDS.items():
+                command = self.worker.agent_docker_command(
+                    image=f"prepared-{harness}:immutable", harness=harness, repo=root / "repo",
+                    harness_bundle=root / "harness", task_input=root / "input", output=root / "output",
+                    model="gpt-5.6-luna", reasoning="medium", container_name=f"carry-agent-{harness}-template-test",
+                    agent_timeout_seconds=315, network="carry-agent-internal-test",
+                    proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
+                )
+                env_values = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "--env"]
+                self.assertIn(f"AGENT_COMMAND={template}", env_values)
+
     def test_session_carry_command_mounts_a_read_only_source_session_as_its_fifth_bind(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
