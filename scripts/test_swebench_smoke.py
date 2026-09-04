@@ -39,6 +39,7 @@ class SmokeWorkerTests(unittest.TestCase):
         config = self.worker.validate_config(valid)
         self.assertEqual(config["PI_VERSION"], "0.84.2")
         self.assertEqual(config["CARRY_COMPACTION_POLICY"], "economic")
+        self.assertEqual(config["CARRY_COMPACTION_PAYOFF_REQUESTS"], "1")
         for key, value in (("BASE_IMAGE", "node:22"), ("CODEX_VERSION", "latest"),
                            ("CARRY_COMPACTION_POLICY", "adaptive")):
             bad = dict(valid)

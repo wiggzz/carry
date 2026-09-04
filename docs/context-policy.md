@@ -54,8 +54,10 @@ materializes the memory as an assistant message with the same ID.
 Between rewrites, retained history grows by exact appends so the model provider
 can reuse a stable prompt-cache prefix. Before a model request, the planner
 prices retaining the cached history against paying for a rewrite. The economic
-policy uses a five-request payoff period: it charges the rewrite once, then
-compares four later cache-read requests over the compacted and retained histories.
+The payoff period is configured with `--compaction-payoff-requests N` (or
+`CARRY_COMPACTION_PAYOFF_REQUESTS=N`). `N` must be a positive integer and defaults
+to `1`, preserving the original next-request economic policy. Benchmarks record
+this value in provenance; non-default experiments must pass it explicitly.
 It also requires projected savings to exceed 10% of the retained-path payoff
 cost. This deliberately avoids rewrites that only barely repay their cache
 invalidation. A compaction still begins a new cache generation; the model-visible

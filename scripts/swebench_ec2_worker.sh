@@ -21,6 +21,7 @@ worker_started_at=$(date +%s)
 : "${MODEL:=gpt-5.6-luna}"
 : "${REASONING:=medium}"
 : "${CARRY_COMPACTION_POLICY:=economic}"
+: "${CARRY_COMPACTION_PAYOFF_REQUESTS:=1}"
 : "${CARRY_ROOT:=/opt/carry}"
 : "${SECRET_FILE:=/dev/shm/carry-openai-key}"
 DOCKER_AUTH_FILE=/dev/shm/carry-dockerhub-auth
@@ -101,6 +102,10 @@ fi
   echo "CARRY_COMPACTION_POLICY must be economic or disabled" >&2
   exit 2
 }
+[[ "$CARRY_COMPACTION_PAYOFF_REQUESTS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "CARRY_COMPACTION_PAYOFF_REQUESTS must be a positive integer" >&2
+  exit 2
+}
 
 docker_auth_url=$(printf '%s' "$DOCKER_AUTH_URL_B64" | base64 -d)
 [[ -n "$docker_auth_url" ]] || { echo "missing Docker Hub authentication capability" >&2; exit 2; }
@@ -148,7 +153,7 @@ fi
 "$CARRY_ROOT/venv/bin/pip" install --disable-pip-version-check \
   'swebench==4.1.0' 'datasets>=2.19,<4'
 export PATH="$CARRY_ROOT/venv/bin:$PATH"
-export RUN_ID SOURCE_COMMIT MODEL REASONING BENCHMARK_MODE BENCHMARK_HARNESS CARRY_COMPACTION_POLICY CARRY_KEEP_LEASE_TURNS TASK_IMAGE_REPOSITORY TASK_IMAGE_CATALOG
+export RUN_ID SOURCE_COMMIT MODEL REASONING BENCHMARK_MODE BENCHMARK_HARNESS CARRY_COMPACTION_POLICY CARRY_KEEP_LEASE_TURNS CARRY_COMPACTION_PAYOFF_REQUESTS TASK_IMAGE_REPOSITORY TASK_IMAGE_CATALOG
 export BASE_IMAGE='node@sha256:afff6d8c97964a438d2e6a9c96509367e45d8bf93f790ad561a1eaea926303d9'
 export CARRY_BASE_IMAGE='rust@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff'
 export CODEX_VERSION='0.147.0'

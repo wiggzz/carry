@@ -9,7 +9,6 @@ use crate::protocol::ContextManagement;
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 const CACHE_READ_RATE: f64 = 0.10;
 const CACHE_WRITE_RATE: f64 = 1.25;
-const COMPACTION_PAYOFF_REQUESTS: usize = 5;
 const COMPACTION_MIN_PAYBACK_RATIO: f64 = 0.10;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
 const NEUTRAL_TARGET_NUMERATOR: usize = 3;
@@ -744,11 +743,11 @@ impl ContextState {
             current_tokens,
             retained_tokens,
             compact_first_cost,
-            COMPACTION_PAYOFF_REQUESTS,
+            policy.payoff_requests,
         );
         let keep_payoff_cost = implicit_cached_tokens as f64 * CACHE_READ_RATE
             + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE
-            + COMPACTION_PAYOFF_REQUESTS.saturating_sub(1) as f64
+            + policy.payoff_requests.saturating_sub(1) as f64
                 * current_tokens as f64
                 * CACHE_READ_RATE;
 
@@ -918,7 +917,7 @@ fn payoff_savings_input_units(
     current_tokens: usize,
     retained_tokens: usize,
     compact_first_cost: f64,
-    payoff_requests: usize,
+    payoff_requests: u64,
 ) -> f64 {
     let keep_first = implicit_cached_tokens as f64 * CACHE_READ_RATE
         + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE;
@@ -950,9 +949,11 @@ fn estimated_tokens(items: &[Value]) -> usize {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct CompactionPolicy {
+pub struct CompactionPolicy {
     pub implicit_cached_tokens: usize,
     pub breakpoints: Vec<PricedBreakpoint>,
+    /// Fixed number of requests over which a rewrite is amortized; must be positive.
+    pub payoff_requests: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1102,7 +1103,12 @@ mod tests {
 
     #[test]
     fn five_request_payoff_accepts_a_rewrite_that_one_request_rejects() {
-        assert_eq!(COMPACTION_PAYOFF_REQUESTS, 5);
+        let policy = CompactionPolicy {
+            implicit_cached_tokens: 0,
+            breakpoints: Vec::new(),
+            payoff_requests: 5,
+        };
+        assert_eq!(policy.payoff_requests, 5);
         assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 1) < 0.0);
         assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 5) > 0.0);
     }
@@ -1129,6 +1135,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
                 budget,
             )
@@ -1161,6 +1168,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
                 budget,
             )
@@ -1187,6 +1195,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
                 budget,
             )
@@ -1216,6 +1225,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
                 budget,
             )
@@ -1247,6 +1257,7 @@ mod tests {
                     CompactionPolicy {
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
+                        payoff_requests: 1,
                     },
                     budget,
                 )
@@ -1282,6 +1293,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
                 usize::MAX,
             )
@@ -1303,6 +1315,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1344,6 +1357,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1409,6 +1423,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
                 0,
             )
@@ -1516,6 +1531,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1552,6 +1568,7 @@ mod tests {
                     CompactionPolicy {
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
+                        payoff_requests: 1,
                     },
                 )
                 .is_none()
@@ -1573,6 +1590,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1640,6 +1658,7 @@ mod tests {
             CompactionPolicy {
                 implicit_cached_tokens: usize::MAX,
                 breakpoints: Vec::new(),
+                payoff_requests: 1,
             },
         );
         assert!(short.is_none());
@@ -1651,6 +1670,7 @@ mod tests {
                     CompactionPolicy {
                         implicit_cached_tokens: usize::MAX,
                         breakpoints: Vec::new(),
+                        payoff_requests: 1,
                     },
                 )
                 .is_none()
@@ -1674,6 +1694,7 @@ mod tests {
                         generation: 0,
                         cached_tokens: 1_200,
                     }],
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1694,6 +1715,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1707,6 +1729,7 @@ mod tests {
                     CompactionPolicy {
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
+                        payoff_requests: 1,
                     },
                 )
                 .is_none()
@@ -1726,6 +1749,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1755,6 +1779,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1778,6 +1803,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
                 usize::MAX,
             )
@@ -1803,6 +1829,7 @@ mod tests {
                         generation: first_change.generation,
                         cached_tokens: 1_200,
                     }],
+                    payoff_requests: 1,
                 },
                 usize::MAX,
             )
@@ -1838,6 +1865,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1869,6 +1897,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();
@@ -1882,6 +1911,7 @@ mod tests {
                 CompactionPolicy {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
+                    payoff_requests: 1,
                 },
             )
             .unwrap();

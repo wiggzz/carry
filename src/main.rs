@@ -121,6 +121,15 @@ struct Cli {
     )]
     keep_lease_turns: Option<u64>,
 
+    /// Number of future requests used to amortize a compaction rewrite; one preserves next-request economics.
+    #[arg(
+        long,
+        env = "CARRY_COMPACTION_PAYOFF_REQUESTS",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    compaction_payoff_requests: u64,
+
     /// JSONL Step objects to use instead of calling a model.
     #[arg(long, hide = true)]
     scripted_steps: Option<PathBuf>,
@@ -298,6 +307,7 @@ async fn run_command(args: Cli) -> Result<()> {
         shell_timeout_secs: args.shell_timeout_secs,
         compaction_mode: args.compaction_policy.into(),
         keep_lease_turns: args.keep_lease_turns,
+        compaction_payoff_requests: args.compaction_payoff_requests,
         resume_context: resume.map(|resume| resume.context),
         resume_source,
         prompt_cache_key: Some(prompt_cache_key),
@@ -519,6 +529,20 @@ mod tests {
             Cli::try_parse_from(["carry", "--keep-lease-turns", "8", "continue"]).unwrap();
         assert_eq!(enabled.keep_lease_turns, Some(8));
         assert!(Cli::try_parse_from(["carry", "--keep-lease-turns", "0", "continue"]).is_err());
+    }
+
+    #[test]
+    fn compaction_payoff_requests_defaults_to_one_and_requires_positive_value() {
+        let defaulted = Cli::try_parse_from(["carry", "continue"]).unwrap();
+        assert_eq!(defaulted.compaction_payoff_requests, 1);
+        let configured =
+            Cli::try_parse_from(["carry", "--compaction-payoff-requests", "5", "continue"])
+                .unwrap();
+        assert_eq!(configured.compaction_payoff_requests, 5);
+        assert!(
+            Cli::try_parse_from(["carry", "--compaction-payoff-requests", "0", "continue",])
+                .is_err()
+        );
     }
 
     #[test]

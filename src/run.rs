@@ -60,6 +60,8 @@ pub struct RunConfig {
     pub compaction_mode: CompactionMode,
     /// Experimental: revalidate model-requested protected context after this many model turns.
     pub keep_lease_turns: Option<u64>,
+    /// Number of future requests used to amortize a compaction rewrite; one is next-request economics.
+    pub compaction_payoff_requests: u64,
     pub resume_context: Option<ContextState>,
     pub resume_source: Option<PathBuf>,
     /// Stable provider cache affinity, retained with the resumable state.
@@ -356,16 +358,24 @@ impl CacheTracker {
 
     #[cfg(test)]
     fn policy(&self) -> CompactionPolicy {
-        self.policy_with_implicit_compatibility(true)
+        self.policy_with_implicit_compatibility(true, 1)
     }
 
-    fn policy_for_history(&self, history: &[serde_json::Value]) -> CompactionPolicy {
-        self.policy_with_implicit_compatibility(history.starts_with(&self.implicit_prefix))
+    fn policy_for_history(
+        &self,
+        history: &[serde_json::Value],
+        payoff_requests: u64,
+    ) -> CompactionPolicy {
+        self.policy_with_implicit_compatibility(
+            history.starts_with(&self.implicit_prefix),
+            payoff_requests,
+        )
     }
 
     fn policy_with_implicit_compatibility(
         &self,
         implicit_prefix_compatible: bool,
+        payoff_requests: u64,
     ) -> CompactionPolicy {
         let now = Instant::now();
         let mut breakpoints = self
@@ -393,6 +403,7 @@ impl CacheTracker {
                 0
             },
             breakpoints,
+            payoff_requests,
         }
     }
 
@@ -645,6 +656,7 @@ async fn run_loop(
                 &mut cache,
                 &mut metrics,
                 &mut logger,
+                &config,
                 trigger,
             )?;
             persist_context_checkpoint(&config, &context_state)?;
@@ -949,9 +961,10 @@ fn maybe_compact(
     cache: &mut CacheTracker,
     metrics: &mut RunMetrics,
     logger: &mut RunLogger,
+    config: &RunConfig,
     trigger: &str,
 ) -> Result<bool> {
-    let policy = cache.policy_for_history(&state.input_items());
+    let policy = cache.policy_for_history(&state.input_items(), config.compaction_payoff_requests);
     let Some(plan) = state.plan_compaction_with_neutral_budget(
         protected,
         policy,
@@ -1582,11 +1595,16 @@ mod tests {
             json!({"type": "function_call_output", "output": "new"}),
         ];
         assert_eq!(
-            cache.policy_for_history(&extended).implicit_cached_tokens,
+            cache
+                .policy_for_history(&extended, 1)
+                .implicit_cached_tokens,
             2_400
         );
         let mutated = vec![json!({"role": "user", "content": "changed"})];
-        assert_eq!(cache.policy_for_history(&mutated).implicit_cached_tokens, 0);
+        assert_eq!(
+            cache.policy_for_history(&mutated, 1).implicit_cached_tokens,
+            0
+        );
     }
 
     #[test]
@@ -1841,6 +1859,7 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: Some(1),
+                compaction_payoff_requests: 1,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -1901,6 +1920,7 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -1983,6 +2003,7 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("resumable-cache-affinity".into()),
@@ -2004,6 +2025,7 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: Some(resume.context),
                 resume_source: Some(first_session),
                 prompt_cache_key,
@@ -2068,6 +2090,7 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2110,6 +2133,7 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2167,6 +2191,7 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2225,6 +2250,7 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                compaction_payoff_requests: 1,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
