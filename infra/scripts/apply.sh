@@ -41,21 +41,21 @@ create_state_bucket() {
     '{"TagSet":[{"Key":"Application","Value":"Carry"},{"Key":"Component","Value":"swebench-benchmark"},{"Key":"Repository","Value":"wiggzz/carry"},{"Key":"ManagedBy","Value":"apply.sh"}]}'
 }
 
-resolve_subnet() {
-  if [[ -n "${WORKER_SUBNET_ID:-}" ]]; then
-    printf '%s\n' "$WORKER_SUBNET_ID"
+resolve_subnets() {
+  if [[ -n "${WORKER_SUBNET_IDS:-}" ]]; then
+    printf '%s\n' "$WORKER_SUBNET_IDS" | tr ',' '\n'
     return
   fi
 
   local default_vpc
   default_vpc=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
   [[ "$default_vpc" != "None" && -n "$default_vpc" ]] || {
-    echo "no default VPC found; set WORKER_SUBNET_ID" >&2
+    echo "no default VPC found; set WORKER_SUBNET_IDS" >&2
     exit 69
   }
   aws ec2 describe-subnets \
     --filters "Name=vpc-id,Values=$default_vpc" "Name=map-public-ip-on-launch,Values=true" \
-    --query 'sort_by(Subnets,&AvailabilityZone)[0].SubnetId' --output text
+    --query 'sort_by(Subnets,&AvailabilityZone)[].SubnetId' --output text | tr '\t' '\n' | head -n 3
 }
 
 resolve_ami() {
@@ -71,11 +71,11 @@ resolve_ami() {
 aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$OIDC_PROVIDER_ARN" >/dev/null
 
 if [[ ! -f "$TFVARS" ]]; then
-  WORKER_SUBNET_ID=$(resolve_subnet)
+  mapfile -t WORKER_SUBNET_IDS < <(resolve_subnets)
   WORKER_AMI_ID=$(resolve_ami)
   ROOT_DEVICE_NAME=$(aws ec2 describe-images --image-ids "$WORKER_AMI_ID" \
     --query 'Images[0].BlockDeviceMappings[?Ebs!=`null`].DeviceName | [0]' --output text)
-  [[ "$WORKER_SUBNET_ID" != "None" && -n "$WORKER_SUBNET_ID" ]] || { echo "could not resolve a public subnet" >&2; exit 69; }
+  (( ${#WORKER_SUBNET_IDS[@]} >= 2 && ${#WORKER_SUBNET_IDS[@]} <= 3 )) || { echo "could not resolve two or three public subnets" >&2; exit 69; }
   [[ "$WORKER_AMI_ID" =~ ^ami-[0-9a-f]+$ ]] || { echo "could not resolve an x86_64 Amazon Linux AMI" >&2; exit 69; }
   [[ "$ROOT_DEVICE_NAME" == /dev/* ]] || { echo "could not resolve the AMI root device" >&2; exit 69; }
 
@@ -84,7 +84,7 @@ aws_region                = "$AWS_REGION"
 artifact_bucket_name      = "$ARTIFACT_BUCKET"
 github_oidc_provider_arn  = "$OIDC_PROVIDER_ARN"
 worker_ami_id             = "$WORKER_AMI_ID"
-worker_subnet_id          = "$WORKER_SUBNET_ID"
+worker_subnet_ids         = [$(printf '"%s",' "${WORKER_SUBNET_IDS[@]}" | sed 's/,$//')]
 root_device_name          = "$ROOT_DEVICE_NAME"
 EOF
 fi
