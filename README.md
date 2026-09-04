@@ -171,9 +171,10 @@ review its source commit, catalog digest, and expected spend before dispatch.
 
 ## Releases and contributions
 
-Use a release-note-eligible Conventional Commit for each pull request title:
-`feat`, `fix`, `perf`, or `revert`, with an optional scope and breaking-change
-marker. CI accepts the other Conventional Commit types only with `!`, because
-Release Please hides their non-breaking entries. CI runs formatting, Clippy,
-unit tests, a release build, and the scripted fixture. Release Please opens a
-release PR; merging it publishes a Linux x86_64 binary and checksum.
+Use a Conventional Commit title for each pull request. Release Please includes
+`feat`, `fix`, `perf`, and `revert` entries in release notes; ordinary
+non-release types such as `docs`, `refactor`, `test`, `ci`, `build`, `chore`, and
+`style` are valid but normally omitted. Use the optional `!` marker only for a
+real compatibility break. CI runs formatting, Clippy, unit tests, a release
+build, and the scripted fixture. Release Please opens a release PR; merging it
+publishes a Linux x86_64 binary and checksum.

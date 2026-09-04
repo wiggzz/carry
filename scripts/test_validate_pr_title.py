@@ -32,13 +32,26 @@ class PullRequestTitleTests(unittest.TestCase):
                 result = self.validate(title)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_rejects_titles_omitted_from_release_notes(self):
+    def test_accepts_non_release_note_conventional_titles(self):
+        titles = (
+            "build(deps): update a development dependency",
+            "chore: tidy generated metadata",
+            "ci: cache Rust dependencies",
+            "docs: clarify first-run setup",
+            "refactor(parser): simplify title parsing",
+            "style: normalize Markdown wrapping",
+            "test: cover malformed titles",
+        )
+        for title in titles:
+            with self.subTest(title=title):
+                result = self.validate(title)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_malformed_or_unknown_titles(self):
         titles = (
             "Handle historical Git metadata in benchmark preflight",
             "Fix: uppercase types are not conventional",
             "feature: unknown types are not accepted",
-            "docs: hidden Release Please types need a breaking marker",
-            "build(deps): hidden dependency updates are not release notes",
             "fix missing separator",
             "fix: ",
             " fix: leading whitespace",
