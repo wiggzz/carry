@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
-# Runs as EC2 user data after the workflow prepends immutable run configuration.
+# Runs as EC2 user data after fetching one run-scoped configuration capability.
 set -euo pipefail
 umask 077
+: "${CARRY_ROOT:=/opt/carry}"
+if [[ -n "${BOOTSTRAP_CONFIG_URL_B64:-}" ]]; then
+  bootstrap_config_url=$(printf '%s' "$BOOTSTRAP_CONFIG_URL_B64" | base64 -d)
+  bootstrap_config_file="$CARRY_ROOT/carry-bootstrap-config"
+  mkdir -p "$CARRY_ROOT"
+  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+    "$bootstrap_config_url" -o "$bootstrap_config_file"
+  chmod 0600 "$bootstrap_config_file"
+  set -a
+  # The workflow writes this file with shell-escaped values; it is a scoped,
+  # single-use capability fetched only by this exact worker.
+  source "$bootstrap_config_file"
+  set +a
+  rm -f "$bootstrap_config_file"
+fi
 worker_started_at=$(date +%s)
 
 : "${SOURCE_URL_B64:?}"
@@ -22,7 +37,6 @@ worker_started_at=$(date +%s)
 : "${REASONING:=medium}"
 : "${CARRY_COMPACTION_POLICY:=economic}"
 : "${CARRY_COMPACTION_PAYOFF_REQUESTS:=1}"
-: "${CARRY_ROOT:=/opt/carry}"
 : "${SECRET_FILE:=/dev/shm/carry-openai-key}"
 DOCKER_AUTH_FILE=/dev/shm/carry-dockerhub-auth
 REGISTRY_AUTH_FILE=/dev/shm/carry-task-registry-auth
