@@ -22,5 +22,8 @@ RUN chmod 0555 /usr/local/bin/prepared-entrypoint /usr/local/bin/apply-testbed-o
 LABEL org.carry.swebench.task-cache-key=${TASK_CACHE_KEY} \
       org.carry.swebench.evaluator-image-id=${TASK_IMAGE_ID}
 ENV PREPARED_HARNESS_ROOT=/opt/swebench-harness
+# Prepared task images are harness-neutral: inherited parent commands must not
+# select or configure an agent for a mounted benchmark harness.
+ENV AGENT_COMMAND="" AGENT_HARNESS=""
 ENV PATH=/opt/swebench-harness/bin:${PATH}
 ENTRYPOINT ["/usr/local/bin/prepared-entrypoint"]

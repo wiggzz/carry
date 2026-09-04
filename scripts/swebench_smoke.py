@@ -210,6 +210,10 @@ VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 DIGEST_IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 LOCAL_IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 REPO_DIGEST = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
+CARRY_COMMAND = (
+    "carry --cwd /testbed --session-dir {output} --model {model} "
+    "--compaction-policy {compaction_policy} -p {prompt_text}"
+)
 CODEX_COMMAND = (
     "codex exec --dangerously-bypass-approvals-and-sandbox --model {model} "
     "--config model_reasoning_effort={reasoning} --json {prompt_text}"
@@ -218,6 +222,11 @@ PI_COMMAND = (
     "pi --mode json --provider openai-benchmark --model {model} "
     "--thinking {reasoning} --no-session {prompt_text}"
 )
+AGENT_COMMANDS = {
+    "carry": CARRY_COMMAND,
+    "codex": CODEX_COMMAND,
+    "pi": PI_COMMAND,
+}
 
 
 def prepared_image_recipe_sha256(source: pathlib.Path) -> str:
@@ -572,6 +581,7 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
         "--env", "CARRY_COMPACTION_POLICY",
         "--env", "CARRY_KEEP_LEASE_TURNS",
         "--env", "CARRY_COMPACTION_PAYOFF_REQUESTS",
+        "--env", f"AGENT_COMMAND={AGENT_COMMANDS[harness]}",
         "--env", "BENCHMARK_WORKSPACE=/testbed",
         "--env", "HOME=/agent-home", "--env", "XDG_CONFIG_HOME=/agent-home/.config",
         "--tmpfs", "/agent-home:rw,nosuid,nodev,size=256m",
@@ -1733,14 +1743,12 @@ def build_images(*, source: pathlib.Path, run_id: str, config: Mapping[str, str]
         "codex": {
             "dockerfile": harness_dir / "Dockerfile.node", "context": harness_dir,
             "base": validated["BASE_IMAGE"], "package_version": validated["CODEX_VERSION"],
-            "args": ["PACKAGE=@openai/codex", f"PACKAGE_VERSION={validated['CODEX_VERSION']}",
-                     "AGENT_HARNESS=codex", f"AGENT_COMMAND={CODEX_COMMAND}"],
+            "args": ["PACKAGE=@openai/codex", f"PACKAGE_VERSION={validated['CODEX_VERSION']}"],
         },
         "pi": {
             "dockerfile": harness_dir / "Dockerfile.node", "context": harness_dir,
             "base": validated["BASE_IMAGE"], "package_version": validated["PI_VERSION"],
-            "args": ["PACKAGE=@earendil-works/pi-coding-agent", f"PACKAGE_VERSION={validated['PI_VERSION']}",
-                     "AGENT_HARNESS=pi", f"AGENT_COMMAND={PI_COMMAND}"],
+            "args": ["PACKAGE=@earendil-works/pi-coding-agent", f"PACKAGE_VERSION={validated['PI_VERSION']}"],
         },
     }
     result = {}

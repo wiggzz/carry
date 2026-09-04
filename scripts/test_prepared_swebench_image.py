@@ -56,6 +56,7 @@ class PreparedSWEbenchImageTests(unittest.TestCase):
                 " && printf future > /testbed/future-git-object \\\n"
                 " && printf setup > /root/setup_env.sh \\\n"
                 " && printf setup > /root/setup_repo.sh\n"
+                "ENV AGENT_COMMAND=\"/opt/swebench-harness/bin/carry --cwd /testbed --keep-lease-turns '' -p {prompt_text}\"\n"
                 "RUN cd /testbed && git init -q \\\n"
                 " && git config user.email test@example.com && git config user.name Test \\\n"
                 " && printf '*.so\\n' > .gitignore && printf tracked > tracked.txt \\\n"
@@ -122,8 +123,8 @@ class PreparedSWEbenchImageTests(unittest.TestCase):
                     "test ! -e /testbed/future-git-object "
                     "&& test ! -e /root/setup_env.sh && test ! -e /root/setup_repo.sh "
                     "&& test ! -e /opt/swebench-harness/bin/carry "
-                    "&& test ! -e /opt/swebench-harness/bin/codex "
-                    "&& test ! -e /opt/swebench-harness/bin/pi",
+                    "&& test ! -e /opt/swebench-harness/bin/pi "
+                    "&& test -z \"${AGENT_COMMAND:-}\" && test -z \"${AGENT_HARNESS:-}\"",
                 ],
                 check=True,
             )
@@ -140,24 +141,17 @@ class PreparedSWEbenchImageTests(unittest.TestCase):
             for path in (repo, *repo.rglob("*"), output):
                 path.chmod(0o777)
             (prompt / "task.md").write_text("fix", encoding="utf-8")
-            agent_command = [
-                "docker", "run", "--rm", "--network", "none", "--read-only",
-                "--cap-drop=ALL", "--security-opt", "no-new-privileges",
-                "--env", "OPENAI_API_KEY=test-only",
-                "--env", "OPENAI_BASE_URL=http://unused.invalid/v1",
-                "--env", "BENCHMARK_WORKSPACE=/testbed",
-                "--env", "HOME=/agent-home", "--tmpfs", "/agent-home:rw,nosuid,nodev",
-                "--tmpfs", "/tmp:rw,nosuid,nodev",
-                "--mount", f"type=bind,src={repo},dst=/testbed",
-                "--mount", f"type=bind,src={bundles['carry']},dst=/opt/swebench-harness,readonly",
-                "--mount", f"type=bind,src={prompt},dst=/benchmark/input,readonly",
-                "--mount", f"type=bind,src={output},dst=/benchmark/output",
-                "--workdir", "/testbed", prepared["tag"], "run", "--harness", "carry",
-                "--model", "fixture", "--reasoning", "medium",
-                "--prompt", "/benchmark/input/task.md", "--output", "/benchmark/output",
-            ]
+            agent_command = WORKER.agent_docker_command(
+                image=prepared["tag"], harness="carry", repo=repo, harness_bundle=bundles["carry"],
+                task_input=prompt, output=output, model="fixture", reasoning="medium",
+                container_name=f"{prefix}-agent", agent_timeout_seconds=30, network="none",
+                proxy_ip="127.0.0.1", api_base="http://unused.invalid/v1",
+            )
             try:
-                subprocess.run(agent_command, check=True)
+                subprocess.run(
+                    agent_command, check=True,
+                    env=dict(os.environ, OPENAI_API_KEY="test-only"),
+                )
             finally:
                 subprocess.run(
                     [
