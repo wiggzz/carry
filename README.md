@@ -24,11 +24,30 @@ summarize history with a fixed rule. Carry takes a different approach:
 This is still an experiment. The point is to make the tradeoff measurable, not
 claim that context compaction is always useful.
 
-## Latest benchmark result
+## Recent changes
 
-The latest complete comparison was a fixed 50-task SWE-bench Verified run with
-`gpt-5.6-luna` at medium reasoning. All 150 Carry, Codex, and Pi slots were
-evaluated.
+Carry now persists canonical `context-state.json` checkpoints, so a native
+continuation can begin a new task from the prior task's completed context without
+modifying the source session. The provider-native tool call and its matching
+function result are one compaction block, so a rewrite never leaves an orphaned
+call or result. Context history remains exact-prefix append-only between
+intentional rewrites, preserving prompt-cache reuse.
+
+The default `economic` policy remains conservative: it evaluates the next
+request (`--compaction-payoff-requests 1`) and rewrites only when projected
+savings clear a 10% margin. Longer positive payoff horizons are explicit
+experiments, and `--keep-lease-turns N` provides opt-in, expiring protection
+for evidence that needs another review. Both settings are recorded in run
+provenance; keep leases are disabled by default. See the
+[context-policy design](docs/context-policy.md) for the exact lifecycle and
+safety rules.
+
+## Benchmark evidence
+
+### Full-catalog snapshot
+
+A fixed 50-task SWE-bench Verified comparison ran `gpt-5.6-luna` at medium
+reasoning. All 150 Carry, Codex, and Pi slots were evaluated.
 
 | Harness | Resolved | Recorded model cost |
 | --- | ---: | ---: |
@@ -36,11 +55,29 @@ evaluated.
 | Codex | 41 / 50 | $1.092152 |
 | Pi | 39 / 50 | $0.649433 |
 
-Carry was one task behind Codex and one ahead of Pi on this catalog while using
+Carry was one task behind Codex and one ahead of Pi on that catalog while using
 less recorded model spend than either. These are artifact-recorded estimates,
 not provider invoices, and one 50-task run is evidence rather than a general
 performance claim. The [run artifact](https://github.com/wiggzz/carry/actions/runs/33029120967)
 contains the per-task outcomes, tokens, costs, and provenance.
+
+### Retained-context experiment
+
+The latest retained `session-20` experiment ran Carry sequentially through the
+first 20 positions of the frozen catalog. Each task still had a fresh prepared
+workspace and isolated SWE-bench evaluation; only Carry's completed native
+session was resumed. At source revision
+[`c47aa71`](https://github.com/wiggzz/carry/commit/c47aa71d275c3ed85b612818230e67a956a76425),
+with `gpt-5.6-luna`, `economic` compaction, payoff horizon 5, and an 8-turn
+keep lease, it resolved **16 / 20** tasks for **$0.369222** estimated model
+cost, with zero response retries. The
+[artifact](https://github.com/wiggzz/carry/actions/runs/33830628262) records
+all 20 outcomes, token accounting, configuration, and evaluator provenance.
+
+This is one retained-session trajectory, not a controlled comparison or a
+general solve-rate claim. It documents the current mechanism and its observed
+cost/outcome envelope; compare policies only on predeclared, matched task
+sets.
 
 ## Try it
 
