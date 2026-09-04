@@ -72,6 +72,49 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             self.assertIn("python3.11", packages)
             self.assertNotIn("curl", packages)
 
+    def test_bootstrap_loads_run_configuration_from_one_capability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            payload = root / "payload"; payload.mkdir()
+            (payload / "marker.txt").write_text("immutable source\n")
+            archive = root / "source.tar.gz"
+            with tarfile.open(archive, "w:gz") as stream:
+                stream.add(payload / "marker.txt", arcname="marker.txt")
+
+            config = root / "worker-config.env"
+            source_url = base64.b64encode(b"https://example.invalid/source").decode()
+            config.write_text(
+                f"SOURCE_URL_B64={source_url}\n"
+                "KEY_URL_B64=\nRESULT_URL_B64=\nDOCKER_AUTH_URL_B64=\nREGISTRY_AUTH_URL_B64=\nCONTROL_URL_B64=\n"
+                f"SOURCE_SHA256={hashlib.sha256(archive.read_bytes()).hexdigest()}\n"
+                "SOURCE_COMMIT=" + "a" * 40 + "\n"
+                "BENCHMARK_MODE=bootstrap\nBOOTSTRAP_WAIT_SECONDS=1\nRUN_ID=gh-test-config\n",
+                encoding="utf-8",
+            )
+            fake_bin = root / "bin"; fake_bin.mkdir()
+            for command in ("dnf", "systemctl"):
+                path = fake_bin / command
+                path.write_text("#!/bin/sh\nexit 0\n")
+                path.chmod(0o755)
+            curl = fake_bin / "curl"
+            curl.write_text(
+                "#!/bin/sh\noutput=\nwhile [ $# -gt 0 ]; do\n"
+                "  if [ \"$1\" = -o ]; then output=$2; shift 2; continue; fi\n  shift\ndone\n"
+                "case \"$output\" in *carry-bootstrap-config) cp \"$FAKE_CONFIG\" \"$output\" ;; *) cp \"$FAKE_SOURCE_ARCHIVE\" \"$output\" ;; esac\n"
+            )
+            curl.chmod(0o755)
+            carry_root = root / "worker"
+            env = dict(
+                os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}",
+                BOOTSTRAP_CONFIG_URL_B64=base64.b64encode(b"https://example.invalid/config").decode(),
+                CARRY_ROOT=str(carry_root), SECRET_FILE=str(root / "secret"), PYTHON_BIN="python3",
+                SKIP_SHUTDOWN="1", FAKE_CONFIG=str(config), FAKE_SOURCE_ARCHIVE=str(archive),
+            )
+            run = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual((carry_root / "source" / "marker.txt").read_text(), "immutable source\n")
+            self.assertFalse((carry_root / "carry-bootstrap-config").exists())
+
     def test_session_worker_rejects_non_retained_harness_before_fetching_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
