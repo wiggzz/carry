@@ -77,7 +77,52 @@ resolve_ami() {
     --query 'Parameter.Value' --output text
 }
 
+migrate_legacy_worker_subnet_config() {
+  [[ -f "$TFVARS" ]] || return
+  if ! python3 - "$TFVARS" <<'PY'
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+sys.exit(0 if re.search(r"(?m)^[ \t]*worker_subnet_id[ \t]*=", text) else 1)
+PY
+  then
+    return
+  fi
+
+  mapfile -t WORKER_SUBNET_IDS < <(resolve_subnets)
+  (( ${#WORKER_SUBNET_IDS[@]} >= 2 && ${#WORKER_SUBNET_IDS[@]} <= 3 )) || {
+    echo "could not resolve two or three public subnets to migrate legacy worker_subnet_id" >&2
+    exit 69
+  }
+
+  python3 - "$TFVARS" "${WORKER_SUBNET_IDS[@]}" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+subnets = sys.argv[2:]
+if len(subnets) not in (2, 3) or len(set(subnets)) != len(subnets):
+    raise SystemExit("resolved worker subnets must be two or three distinct values")
+if any(re.fullmatch(r"subnet-[0-9a-f]+", subnet) is None for subnet in subnets):
+    raise SystemExit("resolved worker subnet ID is malformed")
+
+text = path.read_text(encoding="utf-8")
+pattern = re.compile(r"(?m)^[ \t]*worker_subnet_id[ \t]*=[^\r\n]*(?:\r?\n|$)")
+text, replacements = pattern.subn("", text)
+if replacements != 1:
+    raise SystemExit("expected exactly one legacy worker_subnet_id assignment")
+assignment = "worker_subnet_ids         = [" + ",".join(json.dumps(subnet) for subnet in subnets) + "]"
+path.write_text(text.rstrip() + "\n" + assignment + "\n", encoding="utf-8")
+PY
+  printf 'Migrated legacy worker_subnet_id to worker_subnet_ids across approved public subnets.\n' >&2
+}
+
 aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$OIDC_PROVIDER_ARN" >/dev/null
+migrate_legacy_worker_subnet_config
 
 if [[ ! -f "$TFVARS" ]]; then
   mapfile -t WORKER_SUBNET_IDS < <(resolve_subnets)
