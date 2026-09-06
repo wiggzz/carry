@@ -17,7 +17,28 @@ BUCKET = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 REGION = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
 ROLE_ARN = re.compile(r"^arn:aws:iam::\d{12}:role/[A-Za-z0-9+=,.@_/-]+$")
 TEMPLATE = re.compile(r"^lt-[0-9a-f]+$")
+AVAILABILITY_ZONE = re.compile(r"^[a-z]{2}-[a-z]+-\d[a-z]$")
 REPOSITORY = re.compile(r"^public\.ecr\.aws/[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9._/-]*$")
+
+
+def launch_templates(value: Any, field: str) -> list[dict[str, str]]:
+    if not isinstance(value, list) or not 2 <= len(value) <= 3:
+        fail(f"{field} must contain two or three candidates")
+    result: list[dict[str, str]] = []
+    zones: set[str] = set()
+    for index, candidate in enumerate(value):
+        if not isinstance(candidate, dict):
+            fail(f"{field}[{index}] must be an object")
+        zone = require(AVAILABILITY_ZONE, string(candidate.get("availability_zone"), f"{field}[{index}].availability_zone"), f"{field}[{index}].availability_zone")
+        template_id = require(TEMPLATE, string(candidate.get("launch_template_id"), f"{field}[{index}].launch_template_id"), f"{field}[{index}].launch_template_id")
+        version = string(candidate.get("version"), f"{field}[{index}].version")
+        if not re.fullmatch(r"[1-9][0-9]*", version):
+            fail(f"{field}[{index}].version is malformed")
+        if zone in zones:
+            fail(f"{field} has duplicate availability zones")
+        zones.add(zone)
+        result.append({"availability_zone": zone, "launch_template_id": template_id, "version": version})
+    return result
 
 
 def fail(message: str) -> None:
@@ -57,10 +78,10 @@ def manifest_from_outputs(outputs: dict[str, Any], backend_bucket: str, backend_
     dispatch_role = require(ROLE_ARN, output_value(outputs, "github_dispatch_role_arn"), "dispatch role")
     artifact_role = require(ROLE_ARN, output_value(outputs, "artifact_session_role_arn"), "artifact session role")
     publisher_role = require(ROLE_ARN, output_value(outputs, "task_image_publisher_role_arn"), "task image publisher role")
-    template_id = require(TEMPLATE, output_value(outputs, "worker_launch_template_id"), "worker launch template ID")
-    template_version = output_value(outputs, "worker_launch_template_version")
-    if not re.fullmatch(r"[1-9][0-9]*", template_version):
-        fail("worker launch template version is malformed")
+    templates_entry = outputs.get("worker_launch_templates")
+    if not isinstance(templates_entry, dict) or "value" not in templates_entry:
+        fail("terraform output worker_launch_templates is missing")
+    templates = launch_templates(templates_entry["value"], "terraform output worker_launch_templates")
     repository = require(REPOSITORY, output_value(outputs, "task_image_repository_uri"), "task image repository")
     return {
         "schema": SCHEMA,
@@ -69,8 +90,7 @@ def manifest_from_outputs(outputs: dict[str, Any], backend_bucket: str, backend_
         "artifact_bucket": artifact_bucket,
         "artifact_session_role_arn": artifact_role,
         "github_dispatch_role_arn": dispatch_role,
-        "worker_launch_template_id": template_id,
-        "worker_launch_template_version": template_version,
+        "worker_launch_templates": templates,
         "task_image_publisher_role_arn": publisher_role,
         "task_image_repository": repository,
     }
@@ -114,13 +134,10 @@ def resolve_manifest(arguments: argparse.Namespace) -> None:
         "ARTIFACT_SESSION_ROLE_ARN": manifest_value(document, "artifact_session_role_arn", ROLE_ARN),
         "TASK_IMAGE_PUBLISHER_ROLE_ARN": manifest_value(document, "task_image_publisher_role_arn", ROLE_ARN),
         "TASK_IMAGE_REPOSITORY": manifest_value(document, "task_image_repository", REPOSITORY),
-        "LAUNCH_TEMPLATE_ID": manifest_value(document, "worker_launch_template_id", TEMPLATE),
-        "LAUNCH_TEMPLATE_VERSION": string(document.get("worker_launch_template_version"), "manifest worker_launch_template_version"),
+        "WORKER_LAUNCH_TEMPLATES": json.dumps(launch_templates(document.get("worker_launch_templates"), "manifest worker_launch_templates"), separators=(",", ":")),
         "TASK_IMAGE_CATALOG": "",
         "CONFIGURATION_MANIFEST_SHA256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
-    if not re.fullmatch(r"[1-9][0-9]*", environment["LAUNCH_TEMPLATE_VERSION"]):
-        fail("manifest worker launch template version is malformed")
     if arguments.catalog_digest:
         catalog_digest = arguments.catalog_digest
         if re.fullmatch(r"[0-9a-f]{64}", catalog_digest):

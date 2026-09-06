@@ -23,8 +23,10 @@ class BenchmarkDeploymentManifestTests(unittest.TestCase):
             "github_dispatch_role_arn": {"value": "arn:aws:iam::123456789012:role/github-dispatch"},
             "task_image_publisher_role_arn": {"value": "arn:aws:iam::123456789012:role/task-publisher"},
             "task_image_repository_uri": {"value": "public.ecr.aws/example/carry-swebench-tasks"},
-            "worker_launch_template_id": {"value": "lt-0123456789abcdef0"},
-            "worker_launch_template_version": {"value": "7"},
+            "worker_launch_templates": {"value": [
+                {"availability_zone": "us-west-2a", "launch_template_id": "lt-0123456789abcdef0", "version": "7"},
+                {"availability_zone": "us-west-2b", "launch_template_id": "lt-0123456789abcdef1", "version": "8"},
+            ]},
         }
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -61,6 +63,7 @@ class BenchmarkDeploymentManifestTests(unittest.TestCase):
             })
             self.assertEqual(document["aws_region"], "us-west-2")
             self.assertEqual(document["artifact_bucket"], outputs["artifact_bucket_name"]["value"])
+            self.assertEqual(document["worker_launch_templates"], outputs["worker_launch_templates"]["value"])
             self.assertNotIn("secret", json.dumps(document).lower())
 
     def test_resolves_a_verified_manifest_to_github_environment_values(self):
@@ -77,8 +80,10 @@ class BenchmarkDeploymentManifestTests(unittest.TestCase):
             "github_dispatch_role_arn": "arn:aws:iam::123456789012:role/github-dispatch",
             "task_image_publisher_role_arn": "arn:aws:iam::123456789012:role/task-publisher",
             "task_image_repository": "public.ecr.aws/example/carry-swebench-tasks",
-            "worker_launch_template_id": "lt-0123456789abcdef0",
-            "worker_launch_template_version": "7",
+            "worker_launch_templates": [
+                {"availability_zone": "us-west-2a", "launch_template_id": "lt-0123456789abcdef0", "version": "7"},
+                {"availability_zone": "us-west-2b", "launch_template_id": "lt-0123456789abcdef1", "version": "8"},
+            ],
         }
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -109,6 +114,7 @@ class BenchmarkDeploymentManifestTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             environment = dict(line.split("=", 1) for line in run.stdout.splitlines())
             self.assertEqual(environment["ARTIFACT_BUCKET"], manifest["artifact_bucket"])
+            self.assertEqual(json.loads(environment["WORKER_LAUNCH_TEMPLATES"]), manifest["worker_launch_templates"])
             self.assertEqual(environment["TASK_IMAGE_CATALOG"], manifest["task_image_repository"] + "@sha256:" + "a" * 64)
             self.assertEqual(environment["CONFIGURATION_MANIFEST_SHA256"], hashlib.sha256(manifest_path.read_bytes()).hexdigest())
 

@@ -132,7 +132,7 @@ class TerraformBackendTests(unittest.TestCase):
                 "#!/bin/sh\n"
                 "printf '%s\\n' \"$*\" >> \"$FAKE_TERRAFORM_LOG\"\n"
                 "case \"$*\" in\n"
-                "  *' output -json') printf '%s\\n' '{\"artifact_bucket_name\":{\"value\":\"carry-artifacts-123456789012-us-west-2-swebench\"},\"artifact_session_role_arn\":{\"value\":\"arn:aws:iam::123456789012:role/artifact-session\"},\"github_dispatch_role_arn\":{\"value\":\"arn:aws:iam::123456789012:role/github-dispatch\"},\"task_image_publisher_role_arn\":{\"value\":\"arn:aws:iam::123456789012:role/task-publisher\"},\"task_image_repository_uri\":{\"value\":\"public.ecr.aws/example/carry-swebench-tasks\"},\"worker_launch_template_id\":{\"value\":\"lt-0123456789abcdef0\"},\"worker_launch_template_version\":{\"value\":\"7\"}}' ;;\n"
+                "  *' output -json') printf '%s\\n' '{\"artifact_bucket_name\":{\"value\":\"carry-artifacts-123456789012-us-west-2-swebench\"},\"artifact_session_role_arn\":{\"value\":\"arn:aws:iam::123456789012:role/artifact-session\"},\"github_dispatch_role_arn\":{\"value\":\"arn:aws:iam::123456789012:role/github-dispatch\"},\"task_image_publisher_role_arn\":{\"value\":\"arn:aws:iam::123456789012:role/task-publisher\"},\"task_image_repository_uri\":{\"value\":\"public.ecr.aws/example/carry-swebench-tasks\"},\"worker_launch_templates\":{\"value\":[{\"availability_zone\":\"us-west-2a\",\"launch_template_id\":\"lt-0123456789abcdef0\",\"version\":\"7\"},{\"availability_zone\":\"us-west-2b\",\"launch_template_id\":\"lt-0123456789abcdef1\",\"version\":\"8\"}]}}' ;;\n"
                 "esac\n"
                 "exit 0\n"
             )
