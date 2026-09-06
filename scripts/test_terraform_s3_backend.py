@@ -123,7 +123,9 @@ class TerraformBackendTests(unittest.TestCase):
                 "  'configure get') printf '%s\\n' us-west-2 ;;\n"
                 "  'sts get-caller-identity') printf '%s\\n' 123456789012 ;;\n"
                 "  'iam get-open-id-connect-provider'|'s3api head-bucket'|'s3api put-bucket-versioning'|'s3api put-bucket-encryption'|'s3api put-public-access-block'|'s3api put-bucket-tagging'|'s3 cp') exit 0 ;;\n"
-                "  *) printf 'unexpected aws invocation: %s\\n' \"$*\" >&2; exit 64 ;;\n"
+                "  'ec2 describe-vpcs') printf '%s\n' vpc-12345678 ;;\n"
+                "  'ec2 describe-subnets') printf '%s\n' subnet-abcdef01 subnet-abcdef02 ;;\n"
+                "  *) printf 'unexpected aws invocation: %s\n' \"$*\" >&2; exit 64 ;;\n"
                 "esac\n"
             )
             aws.chmod(0o755)
@@ -152,6 +154,12 @@ class TerraformBackendTests(unittest.TestCase):
             )
 
             self.assertEqual(run.returncode, 0, run.stderr)
+            migrated_tfvars = (copied_infra / "terraform.tfvars").read_text(encoding="utf-8")
+            self.assertNotIn("worker_subnet_id =", migrated_tfvars)
+            self.assertIn(
+                'worker_subnet_ids         = ["subnet-abcdef01","subnet-abcdef02"]',
+                migrated_tfvars,
+            )
             init = log.read_text(encoding="utf-8").splitlines()[0]
             self.assertIn("init", init)
             self.assertIn("-migrate-state", init)
