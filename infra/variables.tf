@@ -4,6 +4,17 @@ variable "aws_region" {
   default     = "us-west-2"
 }
 
+variable "stage" {
+  description = "Deployment/state namespace used for the constrained non-secret manifest."
+  type        = string
+  default     = "swebench"
+
+  validation {
+    condition     = can(regex("^([a-z0-9]|[a-z0-9][a-z0-9-]{0,10}[a-z0-9])$", var.stage))
+    error_message = "stage must be 1-12 lowercase letters, digits, or hyphens."
+  }
+}
+
 variable "artifact_bucket_name" {
   description = "Globally unique private S3 bucket name for benchmark manifests and result artifacts."
   type        = string
@@ -41,9 +52,14 @@ variable "worker_ami_id" {
   type        = string
 }
 
-variable "worker_subnet_id" {
-  description = "Public subnet ID for ephemeral workers. It must have an Internet route; the worker security group has no inbound rules."
-  type        = string
+variable "worker_subnet_ids" {
+  description = "One to three public subnet IDs in distinct AZs for ephemeral workers. Each must have an Internet route; the worker security group has no inbound rules."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.worker_subnet_ids) >= 2 && length(var.worker_subnet_ids) <= 3 && length(distinct(var.worker_subnet_ids)) == length(var.worker_subnet_ids)
+    error_message = "worker_subnet_ids must contain two or three distinct subnets."
+  }
 }
 
 variable "worker_instance_type" {
