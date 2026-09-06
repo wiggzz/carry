@@ -77,6 +77,15 @@ resolve_ami() {
     --query 'Parameter.Value' --output text
 }
 
+resolve_worker_subnets() {
+  WORKER_SUBNET_IDS=()
+  local worker_subnet
+  while IFS= read -r worker_subnet; do
+    [[ -n "$worker_subnet" ]] || continue
+    WORKER_SUBNET_IDS+=("$worker_subnet")
+  done < <(resolve_subnets)
+}
+
 migrate_legacy_worker_subnet_config() {
   [[ -f "$TFVARS" ]] || return
   if ! python3 - "$TFVARS" <<'PY'
@@ -91,7 +100,7 @@ PY
     return
   fi
 
-  mapfile -t WORKER_SUBNET_IDS < <(resolve_subnets)
+  resolve_worker_subnets
   (( ${#WORKER_SUBNET_IDS[@]} >= 2 && ${#WORKER_SUBNET_IDS[@]} <= 3 )) || {
     echo "could not resolve two or three public subnets to migrate legacy worker_subnet_id" >&2
     exit 69
@@ -125,7 +134,7 @@ aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$OIDC_PROVI
 migrate_legacy_worker_subnet_config
 
 if [[ ! -f "$TFVARS" ]]; then
-  mapfile -t WORKER_SUBNET_IDS < <(resolve_subnets)
+  resolve_worker_subnets
   WORKER_AMI_ID=$(resolve_ami)
   ROOT_DEVICE_NAME=$(aws ec2 describe-images --image-ids "$WORKER_AMI_ID" \
     --query 'Images[0].BlockDeviceMappings[?Ebs!=`null`].DeviceName | [0]' --output text)

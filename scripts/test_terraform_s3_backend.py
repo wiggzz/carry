@@ -141,14 +141,16 @@ class TerraformBackendTests(unittest.TestCase):
             terraform.chmod(0o755)
             log = root / "terraform.log"
             aws_log = root / "aws.log"
+            environment = dict(
+                os.environ,
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                FAKE_TERRAFORM_LOG=str(log),
+                FAKE_AWS_LOG=str(aws_log),
+            )
+            environment["BASH_FUNC_mapfile%%"] = "() { return 127; }"
             run = subprocess.run(
                 ["bash", str(copied_infra / "scripts" / "apply.sh")],
-                env=dict(
-                    os.environ,
-                    PATH=f"{fake_bin}:{os.environ['PATH']}",
-                    FAKE_TERRAFORM_LOG=str(log),
-                    FAKE_AWS_LOG=str(aws_log),
-                ),
+                env=environment,
                 text=True,
                 capture_output=True,
             )
