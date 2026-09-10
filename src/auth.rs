@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     time::{Instant, sleep},
 };
 use url::Url;
@@ -195,6 +195,31 @@ fn authorization_url(verifier: &str, state: &str) -> Result<String> {
     Ok(url.into())
 }
 
+async fn read_browser_callback_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut request = Vec::with_capacity(1024);
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let size = stream
+                .read(&mut chunk)
+                .await
+                .context("read browser login callback")?;
+            if size == 0 {
+                bail!("browser login callback closed before completing HTTP headers");
+            }
+            if request.len().saturating_add(size) > 16 * 1024 {
+                bail!("browser login callback exceeded 16 KiB header limit");
+            }
+            request.extend_from_slice(&chunk[..size]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(request);
+            }
+        }
+    })
+    .await
+    .context("timed out reading browser login callback")?
+}
+
 async fn wait_for_browser_callback(listener: &TcpListener, state: &str) -> Result<String> {
     tokio::time::timeout(
         Duration::from_secs(10 * 60),
@@ -213,12 +238,20 @@ async fn wait_for_browser_callback_until_timeout(
             .accept()
             .await
             .context("accept browser login callback")?;
-        let mut request = vec![0_u8; 16 * 1024];
-        let size = tokio::time::timeout(Duration::from_secs(30), stream.read(&mut request))
-            .await
-            .context("timed out reading browser login callback")?
-            .context("read browser login callback")?;
-        let target = std::str::from_utf8(&request[..size])
+        let request = match read_browser_callback_request(&mut stream).await {
+            Ok(request) => request,
+            Err(error) => {
+                let body = "Invalid or incomplete sign-in callback.";
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                eprintln!("ignoring invalid browser login callback: {error:#}");
+                continue;
+            }
+        };
+        let target = std::str::from_utf8(&request)
             .ok()
             .and_then(|request| request.lines().next())
             .and_then(|line| line.split_whitespace().nth(1));
@@ -465,6 +498,30 @@ mod tests {
                 .get("code_challenge")
                 .is_some_and(|value| !value.is_empty())
         );
+    }
+
+    #[tokio::test]
+    async fn browser_callback_accepts_a_fragmented_http_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let callback =
+            tokio::spawn(
+                async move { wait_for_browser_callback(&listener, "expected-state").await },
+            );
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"GET /auth/callback?code=authorization-")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        stream
+            .write_all(
+                b"code&state=expected-state HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let code = callback.await.unwrap().unwrap();
+        assert_eq!(code, "authorization-code");
     }
 
     #[tokio::test]
