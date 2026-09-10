@@ -340,7 +340,10 @@ impl OpenAiClient {
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.starts_with("text/event-stream"));
-            if status.is_success() && is_stream {
+            // The Codex subscription endpoint is SSE-only. Some deployments mislabel
+            // that stream as application/json, so trust the selected transport here.
+            let subscription_stream = matches!(&self.auth, RequestAuth::CodexSubscription { .. });
+            if status.is_success() && (is_stream || subscription_stream) {
                 // Read completed SSE frames as they arrive. `bytes()` would defer all progress
                 // until the model has finished its (possibly long) reasoning turn.
                 break read_sse_response(response, &mut progress).await?;
@@ -845,6 +848,40 @@ mod tests {
         assert!(headers.contains("accept: text/event-stream"));
         assert!(headers.contains("session-id:"));
         assert!(headers.contains("x-client-request-id:"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_request_accepts_sse_when_the_content_type_is_mislabelled() {
+        let response = json!({
+            "id": "response-1",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "finish",
+                "arguments": "{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
+            }],
+            "usage": {}
+        });
+        let body = format!("data: {{\"type\":\"response.completed\",\"response\":{response}}}\n\n");
+        let mislabelled_sse = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (api_base, _headers, server) = header_server(mislabelled_sse);
+        let client = OpenAiClient::new_with_auth(
+            api_base,
+            RequestAuth::CodexSubscription {
+                access_token: "subscription-token".into(),
+                account_id: "account-1".into(),
+                credential_home: None,
+            },
+            "model".into(),
+            "medium".into(),
+        );
+
+        let reply = client.step("system", &[]).await.unwrap();
+        assert_eq!(reply.response_id, "response-1");
         server.join().unwrap();
     }
 
