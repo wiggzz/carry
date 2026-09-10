@@ -79,15 +79,21 @@ resolve_ami() {
 
 resolve_worker_subnets() {
   WORKER_SUBNET_IDS=()
-  local worker_subnet
+  local worker_subnet subnet_file
+  subnet_file=$(mktemp)
+  if ! resolve_subnets > "$subnet_file"; then
+    rm -f "$subnet_file"
+    return 1
+  fi
   while IFS= read -r worker_subnet; do
     [[ -n "$worker_subnet" ]] || continue
     WORKER_SUBNET_IDS+=("$worker_subnet")
-  done < <(resolve_subnets)
+  done < "$subnet_file"
+  rm -f "$subnet_file"
 }
 
 migrate_legacy_worker_subnet_config() {
-  [[ -f "$TFVARS" ]] || return
+  [[ -f "$TFVARS" ]] || return 0
   if ! python3 - "$TFVARS" <<'PY'
 import pathlib
 import re
