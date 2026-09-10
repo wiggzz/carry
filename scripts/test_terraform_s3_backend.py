@@ -179,6 +179,66 @@ class TerraformBackendTests(unittest.TestCase):
                 aws_log.read_text(encoding="utf-8"),
             )
 
+    def test_apply_generates_tfvars_on_first_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            copied_infra = root / "infra"
+            shutil.copytree(INFRA, copied_infra, ignore=shutil.ignore_patterns(".terraform", "*.tfstate*", "*.tfvars", "backend.hcl"))
+            copied_scripts = root / "scripts"
+            copied_scripts.mkdir()
+            shutil.copy2(ROOT / "scripts" / "benchmark_deployment_manifest.py", copied_scripts / "benchmark_deployment_manifest.py")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            aws = fake_bin / "aws"
+            aws.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$FAKE_AWS_LOG\"\n"
+                "case \"$1 $2\" in\n"
+                "  'configure get') printf '%s\\n' us-west-2 ;;\n"
+                "  'sts get-caller-identity') printf '%s\\n' 123456789012 ;;\n"
+                "  'iam get-open-id-connect-provider'|'s3api head-bucket'|'s3api put-bucket-versioning'|'s3api put-bucket-encryption'|'s3api put-public-access-block'|'s3api put-bucket-tagging'|'s3 cp') exit 0 ;;\n"
+                "  'ec2 describe-vpcs') printf '%s\n' vpc-12345678 ;;\n"
+                "  'ec2 describe-subnets') printf '%s\n' subnet-abcdef01 subnet-abcdef02 ;;\n"
+                "  'ssm get-parameter') printf '%s\n' ami-12345678 ;;\n"
+                "  'ec2 describe-images') printf '%s\n' /dev/xvda ;;\n"
+                "  *) printf 'unexpected aws invocation: %s\n' \"$*\" >&2; exit 64 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            aws.chmod(0o755)
+            terraform = fake_bin / "terraform"
+            terraform.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$FAKE_TERRAFORM_LOG\"\n"
+                "case \"$*\" in\n"
+                "  *' output -json') printf '%s\\n' '{\"artifact_bucket_name\":{\"value\":\"carry-artifacts-123456789012-us-west-2-swebench\"},\"artifact_session_role_arn\":{\"value\":\"arn:aws:iam::123456789012:role/artifact-session\"},\"github_dispatch_role_arn\":{\"value\":\"arn:aws:iam::123456789012:role/github-dispatch\"},\"task_image_publisher_role_arn\":{\"value\":\"arn:aws:iam::123456789012:role/task-publisher\"},\"task_image_repository_uri\":{\"value\":\"public.ecr.aws/example/carry-swebench-tasks\"},\"worker_launch_templates\":{\"value\":[{\"availability_zone\":\"us-west-2a\",\"launch_template_id\":\"lt-0123456789abcdef0\",\"version\":\"7\"},{\"availability_zone\":\"us-west-2b\",\"launch_template_id\":\"lt-0123456789abcdef1\",\"version\":\"8\"}]}}' ;;\n"
+                "esac\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            terraform.chmod(0o755)
+            log = root / "terraform.log"
+            aws_log = root / "aws.log"
+            run = subprocess.run(
+                ["bash", str(copied_infra / "scripts" / "apply.sh")],
+                env=dict(
+                    os.environ,
+                    PATH=f"{fake_bin}:{os.environ['PATH']}",
+                    FAKE_TERRAFORM_LOG=str(log),
+                    FAKE_AWS_LOG=str(aws_log),
+                ),
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(run.returncode, 0, run.stderr)
+            generated_tfvars = (copied_infra / "terraform.tfvars").read_text(encoding="utf-8")
+            self.assertIn('worker_subnet_ids         = ["subnet-abcdef01","subnet-abcdef02"]', generated_tfvars)
+            self.assertIn('worker_ami_id             = "ami-12345678"', generated_tfvars)
+            init = log.read_text(encoding="utf-8").splitlines()[0]
+            self.assertIn("init", init)
+            self.assertIn("-reconfigure", init)
+
     def test_apply_rejects_a_non_deterministic_state_bucket_override(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
