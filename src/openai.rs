@@ -204,7 +204,10 @@ impl OpenAiClient {
     }
 
     pub(crate) fn prompt_cache_capabilities(&self) -> Option<PromptCacheCapabilities> {
-        prompt_cache_capabilities(&self.model)
+        match self.auth {
+            RequestAuth::ApiKey(_) => prompt_cache_capabilities(&self.model),
+            RequestAuth::CodexSubscription { .. } => None,
+        }
     }
 
     pub fn request_body(&self, system: &str, history: &[Value]) -> Value {
@@ -228,6 +231,8 @@ impl OpenAiClient {
         // the public Responses API's implicit-cache configuration object.
         if let RequestAuth::ApiKey(_) = &self.auth {
             body["prompt_cache_options"] = json!({ "mode": "implicit" });
+        } else {
+            remove_prompt_cache_breakpoints(&mut body);
         }
         body
     }
@@ -515,6 +520,23 @@ pub(crate) fn new_prompt_cache_key() -> String {
         .as_nanos();
     let sequence = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     format!("carry-{}-{now}-{sequence}", std::process::id())
+}
+
+fn remove_prompt_cache_breakpoints(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("prompt_cache_breakpoint");
+            for value in object.values_mut() {
+                remove_prompt_cache_breakpoints(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                remove_prompt_cache_breakpoints(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn read_sse_response<F>(mut response: reqwest::Response, progress: &mut F) -> Result<Value>
@@ -1127,6 +1149,51 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
 
         let body = client.request_body("system", &[]);
         assert_eq!(body["prompt_cache_key"], "resumable-cache-affinity");
+    }
+
+    #[test]
+    fn subscription_client_disables_unsupported_explicit_cache_breakpoints() {
+        let client = OpenAiClient::new_with_auth(
+            "https://chatgpt.com/backend-api/codex".into(),
+            RequestAuth::CodexSubscription {
+                access_token: "subscription-token".into(),
+                account_id: "account-1".into(),
+                credential_home: None,
+            },
+            "gpt-5.6-luna".into(),
+            "medium".into(),
+        );
+
+        assert_eq!(client.prompt_cache_capabilities(), None);
+    }
+
+    #[test]
+    fn subscription_request_removes_stale_explicit_cache_breakpoints() {
+        let client = OpenAiClient::new_with_auth(
+            "https://chatgpt.com/backend-api/codex".into(),
+            RequestAuth::CodexSubscription {
+                access_token: "subscription-token".into(),
+                account_id: "account-1".into(),
+                credential_home: None,
+            },
+            "gpt-5.6-luna".into(),
+            "medium".into(),
+        );
+        let history = vec![json!({
+            "role": "developer",
+            "content": [{
+                "type": "input_text",
+                "text": "checkpoint",
+                "prompt_cache_breakpoint": { "mode": "explicit" }
+            }]
+        })];
+
+        let body = client.request_body("system", &history);
+        assert!(
+            body["input"][1]["content"][0]
+                .get("prompt_cache_breakpoint")
+                .is_none()
+        );
     }
 
     #[test]
