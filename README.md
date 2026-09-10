@@ -114,6 +114,28 @@ export OPENAI_API_KEY=...
 carry --cwd /path/to/disposable/repo fix the failing tests
 ```
 
+### ChatGPT subscription
+
+Instead of an API key, Carry can use an eligible ChatGPT subscription through the
+Codex endpoint. Sign in once; Carry stores the refreshable credential under
+`$CARRY_HOME/auth.json` (or `~/.carry/auth.json`) with owner-only permissions:
+
+```sh
+carry login
+```
+
+That opens a browser and waits for the localhost callback. On a headless host,
+use a device code instead:
+
+```sh
+carry login --device-auth
+```
+
+`carry` automatically refreshes a stored subscription credential before it
+expires. An explicit `OPENAI_API_KEY` continues to take precedence, and it is
+required for a custom `OPENAI_BASE_URL`. Remove the local subscription
+credential with `carry logout`.
+
 Use `-p` when the prompt itself starts with an option-like value:
 
 ```sh

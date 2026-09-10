@@ -55,10 +55,19 @@ fn model_family_prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapa
 }
 
 #[derive(Clone, Debug)]
+pub enum RequestAuth {
+    ApiKey(String),
+    CodexSubscription {
+        access_token: String,
+        account_id: String,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub struct OpenAiClient {
     http: Client,
     api_base: String,
-    api_key: String,
+    auth: RequestAuth,
     model: String,
     reasoning_effort: String,
     prompt_cache_key: String,
@@ -105,6 +114,25 @@ pub struct ModelReply {
 
 impl OpenAiClient {
     #[cfg(test)]
+    fn new_with_auth(
+        api_base: String,
+        auth: RequestAuth,
+        model: String,
+        reasoning_effort: String,
+    ) -> Self {
+        Self::with_timeouts_and_prompt_cache_key(
+            api_base,
+            auth,
+            model,
+            reasoning_effort,
+            new_prompt_cache_key(),
+            DEFAULT_REQUEST_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+        .expect("default OpenAI HTTP client configuration is valid")
+    }
+
+    #[cfg(test)]
     fn new(api_base: String, api_key: String, model: String, reasoning_effort: String) -> Self {
         Self::with_timeouts(
             api_base,
@@ -128,7 +156,7 @@ impl OpenAiClient {
     ) -> Result<Self> {
         Self::with_timeouts_and_prompt_cache_key(
             api_base,
-            api_key,
+            RequestAuth::ApiKey(api_key),
             model,
             reasoning_effort,
             new_prompt_cache_key(),
@@ -139,7 +167,7 @@ impl OpenAiClient {
 
     pub fn with_timeouts_and_prompt_cache_key(
         api_base: String,
-        api_key: String,
+        auth: RequestAuth,
         model: String,
         reasoning_effort: String,
         prompt_cache_key: String,
@@ -157,7 +185,7 @@ impl OpenAiClient {
         Ok(Self {
             http,
             api_base: api_base.trim_end_matches('/').to_owned(),
-            api_key,
+            auth,
             model,
             reasoning_effort,
             prompt_cache_key,
@@ -220,14 +248,26 @@ impl OpenAiClient {
         let mut retry_wait = Duration::ZERO;
         let mut retry_stopped_reason = None;
         let raw = loop {
-            let response = match self
+            let request = self
                 .http
                 .post(format!("{}/responses", self.api_base))
-                .bearer_auth(&self.api_key)
-                .json(&body)
-                .send()
-                .await
-            {
+                .json(&body);
+            let request = match &self.auth {
+                RequestAuth::ApiKey(api_key) => request.bearer_auth(api_key),
+                RequestAuth::CodexSubscription {
+                    access_token,
+                    account_id,
+                } => request
+                    .bearer_auth(access_token)
+                    .header("chatgpt-account-id", account_id)
+                    .header("OpenAI-Beta", "responses=experimental")
+                    .header("Accept", "text/event-stream")
+                    .header("session-id", &self.prompt_cache_key)
+                    .header("x-client-request-id", &self.prompt_cache_key)
+                    .header("originator", "carry")
+                    .header("User-Agent", concat!("carry/", env!("CARGO_PKG_VERSION"))),
+            };
+            let response = match request.send().await {
                 Ok(response) => response,
                 Err(error) if retries < MAX_RESPONSE_RETRIES => {
                     let delay = transport_retry_delay(retries);
@@ -611,6 +651,44 @@ mod tests {
         (format!("http://{address}"), receiver, server)
     }
 
+    fn header_server(response: String) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                assert_ne!(read, 0, "client closed before sending a complete request");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + 4 + content_length {
+                    sender.send(headers).unwrap();
+                    break;
+                }
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}"), receiver, server)
+    }
+
     fn http_response(status: &str, headers: &str, body: &Value) -> String {
         let body = body.to_string();
         format!(
@@ -624,6 +702,47 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    #[tokio::test]
+    async fn subscription_requests_send_codex_auth_headers() {
+        let response = json!({
+            "id": "response-1",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "finish",
+                "arguments": "{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
+            }],
+            "usage": {}
+        });
+        let (api_base, headers, server) = header_server(sse_response(&format!(
+            "data: {{\"type\":\"response.completed\",\"response\":{response}}}\n\n"
+        )));
+        let client = OpenAiClient::new_with_auth(
+            api_base,
+            RequestAuth::CodexSubscription {
+                access_token: "subscription-token".into(),
+                account_id: "account-1".into(),
+            },
+            "model".into(),
+            "medium".into(),
+        );
+
+        let reply = client.step("system", &[]).await.unwrap();
+        assert_eq!(reply.response_id, "response-1");
+        let headers = headers
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .to_lowercase();
+        assert!(headers.contains("authorization: bearer subscription-token"));
+        assert!(headers.contains("chatgpt-account-id: account-1"));
+        assert!(headers.contains("originator: carry"));
+        assert!(headers.contains("openai-beta: responses=experimental"));
+        assert!(headers.contains("accept: text/event-stream"));
+        assert!(headers.contains("session-id:"));
+        assert!(headers.contains("x-client-request-id:"));
+        server.join().unwrap();
     }
 
     #[tokio::test]
@@ -916,7 +1035,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
     fn resumed_client_uses_the_persisted_prompt_cache_key() {
         let client = OpenAiClient::with_timeouts_and_prompt_cache_key(
             "https://example.invalid/v1".into(),
-            "secret".into(),
+            RequestAuth::ApiKey("secret".into()),
             "gpt-5.6-luna".into(),
             "medium".into(),
             "resumable-cache-affinity".into(),
