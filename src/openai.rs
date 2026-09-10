@@ -211,11 +211,10 @@ impl OpenAiClient {
         let mut input = vec![json!({ "role": "system", "content": system })];
         input.extend_from_slice(history);
 
-        json!({
+        let mut body = json!({
             "model": self.model,
             "store": false,
             "prompt_cache_key": self.prompt_cache_key,
-            "prompt_cache_options": { "mode": "implicit" },
             "input": input,
             "reasoning": {
                 "effort": self.reasoning_effort,
@@ -224,7 +223,13 @@ impl OpenAiClient {
             "tools": tool_definitions(),
             "tool_choice": "required",
             "parallel_tool_calls": false
-        })
+        });
+        // chatgpt.com/backend-api/codex supports the stable session key but rejects
+        // the public Responses API's implicit-cache configuration object.
+        if let RequestAuth::ApiKey(_) = &self.auth {
+            body["prompt_cache_options"] = json!({ "mode": "implicit" });
+        }
+        body
     }
 
     async fn auth_for_step(&self) -> Result<RequestAuth> {
@@ -1122,6 +1127,24 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
 
         let body = client.request_body("system", &[]);
         assert_eq!(body["prompt_cache_key"], "resumable-cache-affinity");
+    }
+
+    #[test]
+    fn subscription_request_omits_unsupported_prompt_cache_options() {
+        let client = OpenAiClient::new_with_auth(
+            "https://chatgpt.com/backend-api/codex".into(),
+            RequestAuth::CodexSubscription {
+                access_token: "subscription-token".into(),
+                account_id: "account-1".into(),
+                credential_home: None,
+            },
+            "gpt-5.6-luna".into(),
+            "medium".into(),
+        );
+
+        let body = client.request_body("system", &[]);
+        assert!(body.get("prompt_cache_options").is_none());
+        assert!(body.get("prompt_cache_key").is_some());
     }
 
     #[test]
