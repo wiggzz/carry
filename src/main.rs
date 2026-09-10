@@ -344,6 +344,7 @@ async fn run_command(args: Cli) -> Result<()> {
                         openai::RequestAuth::CodexSubscription {
                             access_token: credential.access_token,
                             account_id: credential.account_id,
+                            credential_home: Some(auth::carry_home()?),
                         },
                     )
                 }

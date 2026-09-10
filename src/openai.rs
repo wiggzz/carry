@@ -60,6 +60,7 @@ pub enum RequestAuth {
     CodexSubscription {
         access_token: String,
         account_id: String,
+        credential_home: Option<std::path::PathBuf>,
     },
 }
 
@@ -226,6 +227,34 @@ impl OpenAiClient {
         })
     }
 
+    async fn auth_for_step(&self) -> Result<RequestAuth> {
+        match &self.auth {
+            RequestAuth::ApiKey(api_key) => Ok(RequestAuth::ApiKey(api_key.clone())),
+            RequestAuth::CodexSubscription {
+                access_token,
+                account_id,
+                credential_home: None,
+            } => Ok(RequestAuth::CodexSubscription {
+                access_token: access_token.clone(),
+                account_id: account_id.clone(),
+                credential_home: None,
+            }),
+            RequestAuth::CodexSubscription {
+                credential_home: Some(home),
+                ..
+            } => {
+                let credential = crate::auth::load_auth(home)
+                    .await?
+                    .context("ChatGPT subscription credential was removed; run `carry login`")?;
+                Ok(RequestAuth::CodexSubscription {
+                    access_token: credential.access_token,
+                    account_id: credential.account_id,
+                    credential_home: Some(home.clone()),
+                })
+            }
+        }
+    }
+
     #[cfg(test)]
     pub async fn step(&self, system: &str, history: &[Value]) -> Result<ModelReply> {
         self.step_with_progress(system, history, |_| {}).await
@@ -242,7 +271,7 @@ impl OpenAiClient {
     {
         let mut body = self.request_body(system, history);
         body["stream"] = json!(true);
-
+        let auth = self.auth_for_step().await?;
         let started = Instant::now();
         let mut retries = 0;
         let mut retry_wait = Duration::ZERO;
@@ -252,11 +281,12 @@ impl OpenAiClient {
                 .http
                 .post(format!("{}/responses", self.api_base))
                 .json(&body);
-            let request = match &self.auth {
+            let request = match &auth {
                 RequestAuth::ApiKey(api_key) => request.bearer_auth(api_key),
                 RequestAuth::CodexSubscription {
                     access_token,
                     account_id,
+                    ..
                 } => request
                     .bearer_auth(access_token)
                     .header("chatgpt-account-id", account_id)
@@ -705,6 +735,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscription_auth_reloads_the_stored_credential_before_each_step() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let home = tempfile::tempdir().unwrap();
+        let payload = URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fresh-account"}}"#);
+        let access_token = format!("header.{payload}.signature");
+        tokio::fs::write(
+            home.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "access_token": access_token,
+                "refresh_token": "refresh-token",
+                "expires_at_ms": u64::MAX,
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let client = OpenAiClient::new_with_auth(
+            "https://example.invalid".into(),
+            RequestAuth::CodexSubscription {
+                access_token: "stale-token".into(),
+                account_id: "stale-account".into(),
+                credential_home: Some(home.path().to_path_buf()),
+            },
+            "model".into(),
+            "medium".into(),
+        );
+
+        let auth = client.auth_for_step().await.unwrap();
+        match auth {
+            RequestAuth::CodexSubscription {
+                access_token: reloaded_token,
+                account_id,
+                ..
+            } => {
+                assert_eq!(reloaded_token, access_token);
+                assert_eq!(account_id, "fresh-account");
+            }
+            RequestAuth::ApiKey(_) => panic!("expected subscription credentials"),
+        }
+    }
+
+    #[tokio::test]
     async fn subscription_requests_send_codex_auth_headers() {
         let response = json!({
             "id": "response-1",
@@ -724,6 +799,7 @@ mod tests {
             RequestAuth::CodexSubscription {
                 access_token: "subscription-token".into(),
                 account_id: "account-1".into(),
+                credential_home: None,
             },
             "model".into(),
             "medium".into(),
