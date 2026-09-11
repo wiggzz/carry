@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
     sync::{broadcast, mpsc},
     time::Duration,
@@ -1071,8 +1071,8 @@ async fn execute_shell(
     timeout_secs: u64,
 ) -> Result<ShellResult> {
     let started = Instant::now();
-    let mut child = Command::new("/bin/sh");
-    child
+    let mut command_builder = Command::new("/bin/sh");
+    command_builder
         .arg("-lc")
         .arg(command)
         .current_dir(cwd)
@@ -1080,15 +1080,50 @@ async fn execute_shell(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    configure_shell_process_group(&mut command_builder);
 
-    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), child.output()).await;
-    let (exit_code, stdout, stderr, timed_out) = match output {
-        Ok(result) => {
-            let output = result.context("failed to execute shell command")?;
-            (output.status.code(), output.stdout, output.stderr, false)
+    let mut child = command_builder
+        .spawn()
+        .context("failed to start shell command")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("shell stdout was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("shell stderr was not captured")?;
+    let stdout_reader = tokio::spawn(read_shell_stream(stdout));
+    let stderr_reader = tokio::spawn(read_shell_stream(stderr));
+
+    let status = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+    let (exit_code, timed_out) = match status {
+        Ok(status) => (
+            status
+                .context("failed while waiting for shell command")?
+                .code(),
+            false,
+        ),
+        Err(_) => {
+            terminate_shell_process_group(&mut child)?;
+            (
+                child
+                    .wait()
+                    .await
+                    .context("failed to reap timed-out shell command")?
+                    .code(),
+                true,
+            )
         }
-        Err(_) => (None, Vec::new(), b"command timed out".to_vec(), true),
     };
+    let stdout = stdout_reader.await.context("stdout reader task failed")??;
+    let mut stderr = stderr_reader.await.context("stderr reader task failed")??;
+    if timed_out {
+        if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+            stderr.push(b'\n');
+        }
+        stderr.extend_from_slice(b"command timed out\n");
+    }
 
     let stdout_path = run_dir.join("tools").join(format!("{call_id}.stdout"));
     let stderr_path = run_dir.join("tools").join(format!("{call_id}.stderr"));
@@ -1119,6 +1154,48 @@ async fn execute_shell(
         full_output_path,
         prompt_output,
     })
+}
+
+async fn read_shell_stream<R>(mut stream: R) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn configure_shell_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    command.as_std_mut().process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_shell_process_group(_: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_shell_process_group(child: &mut tokio::process::Child) -> Result<()> {
+    let pid = child
+        .id()
+        .context("timed-out shell command has no process ID")? as i32;
+    // The shell is the process-group leader, so a negative PID targets only its descendants.
+    let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("failed to terminate timed-out shell process group");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn terminate_shell_process_group(child: &mut tokio::process::Child) -> Result<()> {
+    child
+        .start_kill()
+        .context("failed to terminate timed-out shell command")
 }
 
 async fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -2214,6 +2291,39 @@ mod tests {
             .await
             .unwrap();
         assert!(trace.contains(r#""reason":"max_steps""#));
+    }
+
+    #[tokio::test]
+    async fn timed_out_shell_preserves_partial_output_and_terminates_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("run");
+        tokio::fs::create_dir_all(run_dir.join("tools"))
+            .await
+            .unwrap();
+        let survivor = temp.path().join("survivor");
+        let command =
+            "printf stdout-before; printf stderr-before >&2; (sleep 2; touch survivor) & wait";
+
+        let result = execute_shell(temp.path(), &run_dir, "timeout".into(), command, 1)
+            .await
+            .unwrap();
+
+        assert!(result.timed_out);
+        assert_eq!(
+            tokio::fs::read(&result.stdout_path).await.unwrap(),
+            b"stdout-before"
+        );
+        assert!(
+            tokio::fs::read_to_string(&result.stderr_path)
+                .await
+                .unwrap()
+                .contains("stderr-before")
+        );
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            !survivor.exists(),
+            "a descendant continued modifying the workspace after timeout"
+        );
     }
 
     #[tokio::test]
