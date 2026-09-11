@@ -238,6 +238,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn browser_reconnect_deduplicates_durable_events() {
+        let output = std::process::Command::new("node")
+            .arg("tests/web_replay.cjs")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("Node.js is required to execute the browser replay regression");
+        assert!(
+            output.status.success(),
+            "browser replay regression failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[tokio::test]
     async fn message_endpoint_enqueues_nonempty_input() {
         let (input, mut receiver) = mpsc::unbounded_channel();
