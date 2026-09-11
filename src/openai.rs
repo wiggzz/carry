@@ -55,10 +55,20 @@ fn model_family_prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapa
 }
 
 #[derive(Clone, Debug)]
+pub enum RequestAuth {
+    ApiKey(String),
+    CodexSubscription {
+        access_token: String,
+        account_id: String,
+        credential_home: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub struct OpenAiClient {
     http: Client,
     api_base: String,
-    api_key: String,
+    auth: RequestAuth,
     model: String,
     reasoning_effort: String,
     prompt_cache_key: String,
@@ -105,6 +115,25 @@ pub struct ModelReply {
 
 impl OpenAiClient {
     #[cfg(test)]
+    fn new_with_auth(
+        api_base: String,
+        auth: RequestAuth,
+        model: String,
+        reasoning_effort: String,
+    ) -> Self {
+        Self::with_timeouts_and_prompt_cache_key(
+            api_base,
+            auth,
+            model,
+            reasoning_effort,
+            new_prompt_cache_key(),
+            DEFAULT_REQUEST_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+        .expect("default OpenAI HTTP client configuration is valid")
+    }
+
+    #[cfg(test)]
     fn new(api_base: String, api_key: String, model: String, reasoning_effort: String) -> Self {
         Self::with_timeouts(
             api_base,
@@ -128,7 +157,7 @@ impl OpenAiClient {
     ) -> Result<Self> {
         Self::with_timeouts_and_prompt_cache_key(
             api_base,
-            api_key,
+            RequestAuth::ApiKey(api_key),
             model,
             reasoning_effort,
             new_prompt_cache_key(),
@@ -139,7 +168,7 @@ impl OpenAiClient {
 
     pub fn with_timeouts_and_prompt_cache_key(
         api_base: String,
-        api_key: String,
+        auth: RequestAuth,
         model: String,
         reasoning_effort: String,
         prompt_cache_key: String,
@@ -157,7 +186,7 @@ impl OpenAiClient {
         Ok(Self {
             http,
             api_base: api_base.trim_end_matches('/').to_owned(),
-            api_key,
+            auth,
             model,
             reasoning_effort,
             prompt_cache_key,
@@ -175,18 +204,20 @@ impl OpenAiClient {
     }
 
     pub(crate) fn prompt_cache_capabilities(&self) -> Option<PromptCacheCapabilities> {
-        prompt_cache_capabilities(&self.model)
+        match self.auth {
+            RequestAuth::ApiKey(_) => prompt_cache_capabilities(&self.model),
+            RequestAuth::CodexSubscription { .. } => None,
+        }
     }
 
     pub fn request_body(&self, system: &str, history: &[Value]) -> Value {
         let mut input = vec![json!({ "role": "system", "content": system })];
         input.extend_from_slice(history);
 
-        json!({
+        let mut body = json!({
             "model": self.model,
             "store": false,
             "prompt_cache_key": self.prompt_cache_key,
-            "prompt_cache_options": { "mode": "implicit" },
             "input": input,
             "reasoning": {
                 "effort": self.reasoning_effort,
@@ -195,7 +226,43 @@ impl OpenAiClient {
             "tools": tool_definitions(),
             "tool_choice": "required",
             "parallel_tool_calls": false
-        })
+        });
+        // chatgpt.com/backend-api/codex supports the stable session key but rejects
+        // the public Responses API's implicit-cache configuration object.
+        if let RequestAuth::ApiKey(_) = &self.auth {
+            body["prompt_cache_options"] = json!({ "mode": "implicit" });
+        } else {
+            remove_prompt_cache_breakpoints(&mut body);
+        }
+        body
+    }
+
+    async fn auth_for_step(&self) -> Result<RequestAuth> {
+        match &self.auth {
+            RequestAuth::ApiKey(api_key) => Ok(RequestAuth::ApiKey(api_key.clone())),
+            RequestAuth::CodexSubscription {
+                access_token,
+                account_id,
+                credential_home: None,
+            } => Ok(RequestAuth::CodexSubscription {
+                access_token: access_token.clone(),
+                account_id: account_id.clone(),
+                credential_home: None,
+            }),
+            RequestAuth::CodexSubscription {
+                credential_home: Some(home),
+                ..
+            } => {
+                let credential = crate::auth::load_auth(home)
+                    .await?
+                    .context("ChatGPT subscription credential was removed; run `carry login`")?;
+                Ok(RequestAuth::CodexSubscription {
+                    access_token: credential.access_token,
+                    account_id: credential.account_id,
+                    credential_home: Some(home.clone()),
+                })
+            }
+        }
     }
 
     #[cfg(test)]
@@ -214,20 +281,33 @@ impl OpenAiClient {
     {
         let mut body = self.request_body(system, history);
         body["stream"] = json!(true);
-
+        let auth = self.auth_for_step().await?;
         let started = Instant::now();
         let mut retries = 0;
         let mut retry_wait = Duration::ZERO;
         let mut retry_stopped_reason = None;
         let raw = loop {
-            let response = match self
+            let request = self
                 .http
                 .post(format!("{}/responses", self.api_base))
-                .bearer_auth(&self.api_key)
-                .json(&body)
-                .send()
-                .await
-            {
+                .json(&body);
+            let request = match &auth {
+                RequestAuth::ApiKey(api_key) => request.bearer_auth(api_key),
+                RequestAuth::CodexSubscription {
+                    access_token,
+                    account_id,
+                    ..
+                } => request
+                    .bearer_auth(access_token)
+                    .header("chatgpt-account-id", account_id)
+                    .header("OpenAI-Beta", "responses=experimental")
+                    .header("Accept", "text/event-stream")
+                    .header("session-id", &self.prompt_cache_key)
+                    .header("x-client-request-id", &self.prompt_cache_key)
+                    .header("originator", "carry")
+                    .header("User-Agent", concat!("carry/", env!("CARGO_PKG_VERSION"))),
+            };
+            let response = match request.send().await {
                 Ok(response) => response,
                 Err(error) if retries < MAX_RESPONSE_RETRIES => {
                     let delay = transport_retry_delay(retries);
@@ -260,7 +340,10 @@ impl OpenAiClient {
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.starts_with("text/event-stream"));
-            if status.is_success() && is_stream {
+            // The Codex subscription endpoint is SSE-only. Some deployments mislabel
+            // that stream as application/json, so trust the selected transport here.
+            let subscription_stream = matches!(&self.auth, RequestAuth::CodexSubscription { .. });
+            if status.is_success() && (is_stream || subscription_stream) {
                 // Read completed SSE frames as they arrive. `bytes()` would defer all progress
                 // until the model has finished its (possibly long) reasoning turn.
                 break read_sse_response(response, &mut progress).await?;
@@ -333,11 +416,21 @@ impl OpenAiClient {
 
         let calls = function_calls(&raw);
         if calls.len() != 1 {
+            let output_types = raw["output"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item["type"].as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             bail!(
-                "Responses API returned {} function calls; expected exactly one",
+                "Responses API returned {} function calls; expected exactly one; output types: {output_types:?}",
                 calls.len()
             );
         }
+
         let function_call = calls[0].clone();
         let step = Step::from_function_call(&function_call)?;
         let output_items = raw["output"]
@@ -442,12 +535,30 @@ pub(crate) fn new_prompt_cache_key() -> String {
     format!("carry-{}-{now}-{sequence}", std::process::id())
 }
 
+fn remove_prompt_cache_breakpoints(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("prompt_cache_breakpoint");
+            for value in object.values_mut() {
+                remove_prompt_cache_breakpoints(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                remove_prompt_cache_breakpoints(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn read_sse_response<F>(mut response: reqwest::Response, progress: &mut F) -> Result<Value>
 where
     F: FnMut(ModelProgress),
 {
     let mut pending = Vec::new();
     let mut completed = None;
+    let mut completed_items = Vec::new();
     let mut current = ModelProgress::default();
     while let Some(chunk) = response
         .chunk()
@@ -457,10 +568,24 @@ where
         pending.extend_from_slice(&chunk);
         while let Some((end, separator_len)) = sse_frame_end(&pending) {
             let frame: Vec<_> = pending.drain(..end + separator_len).collect();
-            process_sse_frame(&frame[..end], &mut completed, &mut current, progress)?;
+            process_sse_frame(
+                &frame[..end],
+                &mut completed,
+                &mut completed_items,
+                &mut current,
+                progress,
+            )?;
         }
     }
-    let response = completed.context("Responses API stream ended without response.completed")?;
+    let mut response =
+        completed.context("Responses API stream ended without response.completed")?;
+    if response["output"]
+        .as_array()
+        .is_none_or(|output| output.is_empty())
+        && !completed_items.is_empty()
+    {
+        response["output"] = Value::Array(completed_items);
+    }
     let usage = extract_usage(&response);
     progress(ModelProgress {
         output_tokens: usage.output_tokens,
@@ -486,6 +611,7 @@ fn sse_frame_end(pending: &[u8]) -> Option<(usize, usize)> {
 fn process_sse_frame<F>(
     frame: &[u8],
     completed: &mut Option<Value>,
+    completed_items: &mut Vec<Value>,
     current: &mut ModelProgress,
     progress: &mut F,
 ) -> Result<()>
@@ -516,6 +642,9 @@ where
     } else if event_type.contains(".delta") {
         current.output_events += 1;
         progress(current.clone());
+    }
+    if let ("response.output_item.done", Some(item)) = (event_type, event.get("item")) {
+        completed_items.push(item.clone());
     }
     if event_type == "response.completed" {
         *completed = event.get("response").cloned();
@@ -611,6 +740,44 @@ mod tests {
         (format!("http://{address}"), receiver, server)
     }
 
+    fn header_server(response: String) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                assert_ne!(read, 0, "client closed before sending a complete request");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + 4 + content_length {
+                    sender.send(headers).unwrap();
+                    break;
+                }
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}"), receiver, server)
+    }
+
     fn http_response(status: &str, headers: &str, body: &Value) -> String {
         let body = body.to_string();
         format!(
@@ -624,6 +791,127 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    #[tokio::test]
+    async fn subscription_auth_reloads_the_stored_credential_before_each_step() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let home = tempfile::tempdir().unwrap();
+        let payload = URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fresh-account"}}"#);
+        let access_token = format!("header.{payload}.signature");
+        tokio::fs::write(
+            home.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "access_token": access_token,
+                "refresh_token": "refresh-token",
+                "expires_at_ms": u64::MAX,
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let client = OpenAiClient::new_with_auth(
+            "https://example.invalid".into(),
+            RequestAuth::CodexSubscription {
+                access_token: "stale-token".into(),
+                account_id: "stale-account".into(),
+                credential_home: Some(home.path().to_path_buf()),
+            },
+            "model".into(),
+            "medium".into(),
+        );
+
+        let auth = client.auth_for_step().await.unwrap();
+        match auth {
+            RequestAuth::CodexSubscription {
+                access_token: reloaded_token,
+                account_id,
+                ..
+            } => {
+                assert_eq!(reloaded_token, access_token);
+                assert_eq!(account_id, "fresh-account");
+            }
+            RequestAuth::ApiKey(_) => panic!("expected subscription credentials"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_requests_send_codex_auth_headers() {
+        let response = json!({
+            "id": "response-1",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "finish",
+                "arguments": "{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
+            }],
+            "usage": {}
+        });
+        let (api_base, headers, server) = header_server(sse_response(&format!(
+            "data: {{\"type\":\"response.completed\",\"response\":{response}}}\n\n"
+        )));
+        let client = OpenAiClient::new_with_auth(
+            api_base,
+            RequestAuth::CodexSubscription {
+                access_token: "subscription-token".into(),
+                account_id: "account-1".into(),
+                credential_home: None,
+            },
+            "model".into(),
+            "medium".into(),
+        );
+
+        let reply = client.step("system", &[]).await.unwrap();
+        assert_eq!(reply.response_id, "response-1");
+        let headers = headers
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .to_lowercase();
+        assert!(headers.contains("authorization: bearer subscription-token"));
+        assert!(headers.contains("chatgpt-account-id: account-1"));
+        assert!(headers.contains("originator: carry"));
+        assert!(headers.contains("openai-beta: responses=experimental"));
+        assert!(headers.contains("accept: text/event-stream"));
+        assert!(headers.contains("session-id:"));
+        assert!(headers.contains("x-client-request-id:"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_request_accepts_sse_when_the_content_type_is_mislabelled() {
+        let response = json!({
+            "id": "response-1",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "finish",
+                "arguments": "{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
+            }],
+            "usage": {}
+        });
+        let body = format!("data: {{\"type\":\"response.completed\",\"response\":{response}}}\n\n");
+        let mislabelled_sse = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (api_base, _headers, server) = header_server(mislabelled_sse);
+        let client = OpenAiClient::new_with_auth(
+            api_base,
+            RequestAuth::CodexSubscription {
+                access_token: "subscription-token".into(),
+                account_id: "account-1".into(),
+                credential_home: None,
+            },
+            "model".into(),
+            "medium".into(),
+        );
+
+        let reply = client.step("system", &[]).await.unwrap();
+        assert_eq!(reply.response_id, "response-1");
+        server.join().unwrap();
     }
 
     #[tokio::test]
@@ -809,6 +1097,33 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[tokio::test]
+    async fn sse_uses_completed_output_item_when_completed_response_omits_output() {
+        let function_call = json!({
+            "type": "function_call",
+            "call_id": "call-done",
+            "name": "finish",
+            "arguments": "{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
+        });
+        let completed = json!({
+            "id": "response-done",
+            "output": [],
+            "usage": {"output_tokens": 2}
+        });
+        let body = format!(
+            "data: {{\"type\":\"response.output_item.done\",\"item\":{function_call}}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\n"
+        );
+        let (api_base, requests, server) = response_server(vec![sse_response(&body)]);
+        let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
+
+        let reply = client.step("system", &[]).await.unwrap();
+
+        assert_eq!(reply.response_id, "response-done");
+        assert_eq!(reply.function_call["call_id"], "call-done");
+        requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.join().unwrap();
+    }
+
     #[test]
     fn sse_frame_boundaries_accept_lf_and_crlf() {
         assert_eq!(sse_frame_end(b"data: one\n\nrest"), Some((9, 2)));
@@ -818,12 +1133,14 @@ mod tests {
     #[test]
     fn sse_deltas_report_live_progress_and_completed_response() {
         let mut completed = None;
+        let mut completed_items = Vec::new();
         let mut current = ModelProgress::default();
         let mut updates = Vec::new();
         process_sse_frame(
             br#"event: response.reasoning_summary_text.delta
 data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
             &mut completed,
+            &mut completed_items,
             &mut current,
             &mut |progress| updates.push(progress),
         )
@@ -831,6 +1148,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
         process_sse_frame(
             br#"data: {"type":"response.output_text.delta","delta":"done"}"#,
             &mut completed,
+            &mut completed_items,
             &mut current,
             &mut |progress| updates.push(progress),
         )
@@ -838,6 +1156,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
         process_sse_frame(
             br#"data: {"type":"response.completed","response":{"id":"response-1","usage":{"output_tokens":9}}}"#,
             &mut completed,
+            &mut completed_items,
             &mut current,
             &mut |_| {},
         )
@@ -916,7 +1235,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
     fn resumed_client_uses_the_persisted_prompt_cache_key() {
         let client = OpenAiClient::with_timeouts_and_prompt_cache_key(
             "https://example.invalid/v1".into(),
-            "secret".into(),
+            RequestAuth::ApiKey("secret".into()),
             "gpt-5.6-luna".into(),
             "medium".into(),
             "resumable-cache-affinity".into(),
@@ -927,6 +1246,69 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
 
         let body = client.request_body("system", &[]);
         assert_eq!(body["prompt_cache_key"], "resumable-cache-affinity");
+    }
+
+    #[test]
+    fn subscription_client_disables_unsupported_explicit_cache_breakpoints() {
+        let client = OpenAiClient::new_with_auth(
+            "https://chatgpt.com/backend-api/codex".into(),
+            RequestAuth::CodexSubscription {
+                access_token: "subscription-token".into(),
+                account_id: "account-1".into(),
+                credential_home: None,
+            },
+            "gpt-5.6-luna".into(),
+            "medium".into(),
+        );
+
+        assert_eq!(client.prompt_cache_capabilities(), None);
+    }
+
+    #[test]
+    fn subscription_request_removes_stale_explicit_cache_breakpoints() {
+        let client = OpenAiClient::new_with_auth(
+            "https://chatgpt.com/backend-api/codex".into(),
+            RequestAuth::CodexSubscription {
+                access_token: "subscription-token".into(),
+                account_id: "account-1".into(),
+                credential_home: None,
+            },
+            "gpt-5.6-luna".into(),
+            "medium".into(),
+        );
+        let history = vec![json!({
+            "role": "developer",
+            "content": [{
+                "type": "input_text",
+                "text": "checkpoint",
+                "prompt_cache_breakpoint": { "mode": "explicit" }
+            }]
+        })];
+
+        let body = client.request_body("system", &history);
+        assert!(
+            body["input"][1]["content"][0]
+                .get("prompt_cache_breakpoint")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn subscription_request_omits_unsupported_prompt_cache_options() {
+        let client = OpenAiClient::new_with_auth(
+            "https://chatgpt.com/backend-api/codex".into(),
+            RequestAuth::CodexSubscription {
+                access_token: "subscription-token".into(),
+                account_id: "account-1".into(),
+                credential_home: None,
+            },
+            "gpt-5.6-luna".into(),
+            "medium".into(),
+        );
+
+        let body = client.request_body("system", &[]);
+        assert!(body.get("prompt_cache_options").is_none());
+        assert!(body.get("prompt_cache_key").is_some());
     }
 
     #[test]

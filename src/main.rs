@@ -1,3 +1,4 @@
+mod auth;
 mod context;
 mod log;
 mod openai;
@@ -135,6 +136,21 @@ struct Cli {
     scripted_steps: Option<PathBuf>,
 }
 
+#[derive(Debug, Parser)]
+#[command(name = "carry login", about = "Sign in with a ChatGPT subscription")]
+struct LoginCli {
+    /// Use a device code instead of a localhost browser callback.
+    #[arg(long)]
+    device_auth: bool,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "carry logout",
+    about = "Remove the stored ChatGPT subscription credential"
+)]
+struct LogoutCli {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum CompactionPolicyArg {
     Economic,
@@ -173,7 +189,30 @@ impl ReasoningEffort {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    run_command(Cli::parse()).await
+    let mut argv = std::env::args_os().collect::<Vec<_>>();
+    match argv.get(1).and_then(|argument| argument.to_str()) {
+        Some("login") => {
+            argv.remove(1);
+            let login = LoginCli::parse_from(argv);
+            let method = if login.device_auth {
+                auth::LoginMethod::DeviceCode
+            } else {
+                auth::LoginMethod::Browser
+            };
+            return auth::login(&auth::carry_home()?, method).await;
+        }
+        Some("logout") => {
+            argv.remove(1);
+            LogoutCli::parse_from(argv);
+            if auth::logout(&auth::carry_home()?).await? {
+                eprintln!("signed out of ChatGPT subscription");
+            } else {
+                eprintln!("no ChatGPT subscription credential was stored");
+            }
+            return Ok(());
+        }
+        _ => run_command(Cli::parse()).await,
+    }
 }
 
 fn validate_args(_args: &Cli) -> Result<()> {
@@ -284,11 +323,35 @@ async fn run_command(args: Cli) -> Result<()> {
     let backend = match args.scripted_steps {
         Some(path) => Backend::scripted(&path).await?,
         None => {
-            let api_key = std::env::var("OPENAI_API_KEY")
-                .context("OPENAI_API_KEY is required unless --scripted-steps is used")?;
+            let api_key = match std::env::var("OPENAI_API_KEY") {
+                Ok(api_key) if !api_key.trim().is_empty() => Some(api_key),
+                Ok(_) | Err(std::env::VarError::NotPresent) => None,
+                Err(error) => return Err(error).context("read OPENAI_API_KEY"),
+            };
+            let (api_base, request_auth) = match api_key {
+                Some(api_key) => (args.api_base.clone(), openai::RequestAuth::ApiKey(api_key)),
+                None => {
+                    if args.api_base != "https://api.openai.com/v1" {
+                        bail!(
+                            "OPENAI_BASE_URL requires OPENAI_API_KEY; ChatGPT subscription credentials are sent only to the Codex endpoint"
+                        );
+                    }
+                    let credential = auth::load_auth(&auth::carry_home()?)
+                        .await?
+                        .context("OPENAI_API_KEY is required, or run `carry login` to use a ChatGPT subscription")?;
+                    (
+                        auth::codex_responses_url().to_owned(),
+                        openai::RequestAuth::CodexSubscription {
+                            access_token: credential.access_token,
+                            account_id: credential.account_id,
+                            credential_home: Some(auth::carry_home()?),
+                        },
+                    )
+                }
+            };
             Backend::openai(openai::OpenAiClient::with_timeouts_and_prompt_cache_key(
-                args.api_base,
-                api_key,
+                api_base,
+                request_auth,
                 model.clone(),
                 args.reasoning_effort.as_str().to_owned(),
                 prompt_cache_key.clone(),
