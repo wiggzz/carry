@@ -416,11 +416,21 @@ impl OpenAiClient {
 
         let calls = function_calls(&raw);
         if calls.len() != 1 {
+            let output_types = raw["output"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item["type"].as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             bail!(
-                "Responses API returned {} function calls; expected exactly one",
+                "Responses API returned {} function calls; expected exactly one; output types: {output_types:?}",
                 calls.len()
             );
         }
+
         let function_call = calls[0].clone();
         let step = Step::from_function_call(&function_call)?;
         let output_items = raw["output"]
@@ -548,6 +558,7 @@ where
 {
     let mut pending = Vec::new();
     let mut completed = None;
+    let mut completed_items = Vec::new();
     let mut current = ModelProgress::default();
     while let Some(chunk) = response
         .chunk()
@@ -557,10 +568,24 @@ where
         pending.extend_from_slice(&chunk);
         while let Some((end, separator_len)) = sse_frame_end(&pending) {
             let frame: Vec<_> = pending.drain(..end + separator_len).collect();
-            process_sse_frame(&frame[..end], &mut completed, &mut current, progress)?;
+            process_sse_frame(
+                &frame[..end],
+                &mut completed,
+                &mut completed_items,
+                &mut current,
+                progress,
+            )?;
         }
     }
-    let response = completed.context("Responses API stream ended without response.completed")?;
+    let mut response =
+        completed.context("Responses API stream ended without response.completed")?;
+    if response["output"]
+        .as_array()
+        .is_none_or(|output| output.is_empty())
+        && !completed_items.is_empty()
+    {
+        response["output"] = Value::Array(completed_items);
+    }
     let usage = extract_usage(&response);
     progress(ModelProgress {
         output_tokens: usage.output_tokens,
@@ -586,6 +611,7 @@ fn sse_frame_end(pending: &[u8]) -> Option<(usize, usize)> {
 fn process_sse_frame<F>(
     frame: &[u8],
     completed: &mut Option<Value>,
+    completed_items: &mut Vec<Value>,
     current: &mut ModelProgress,
     progress: &mut F,
 ) -> Result<()>
@@ -616,6 +642,9 @@ where
     } else if event_type.contains(".delta") {
         current.output_events += 1;
         progress(current.clone());
+    }
+    if let ("response.output_item.done", Some(item)) = (event_type, event.get("item")) {
+        completed_items.push(item.clone());
     }
     if event_type == "response.completed" {
         *completed = event.get("response").cloned();
@@ -1068,6 +1097,33 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[tokio::test]
+    async fn sse_uses_completed_output_item_when_completed_response_omits_output() {
+        let function_call = json!({
+            "type": "function_call",
+            "call_id": "call-done",
+            "name": "finish",
+            "arguments": "{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
+        });
+        let completed = json!({
+            "id": "response-done",
+            "output": [],
+            "usage": {"output_tokens": 2}
+        });
+        let body = format!(
+            "data: {{\"type\":\"response.output_item.done\",\"item\":{function_call}}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\n"
+        );
+        let (api_base, requests, server) = response_server(vec![sse_response(&body)]);
+        let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
+
+        let reply = client.step("system", &[]).await.unwrap();
+
+        assert_eq!(reply.response_id, "response-done");
+        assert_eq!(reply.function_call["call_id"], "call-done");
+        requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.join().unwrap();
+    }
+
     #[test]
     fn sse_frame_boundaries_accept_lf_and_crlf() {
         assert_eq!(sse_frame_end(b"data: one\n\nrest"), Some((9, 2)));
@@ -1077,12 +1133,14 @@ mod tests {
     #[test]
     fn sse_deltas_report_live_progress_and_completed_response() {
         let mut completed = None;
+        let mut completed_items = Vec::new();
         let mut current = ModelProgress::default();
         let mut updates = Vec::new();
         process_sse_frame(
             br#"event: response.reasoning_summary_text.delta
 data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
             &mut completed,
+            &mut completed_items,
             &mut current,
             &mut |progress| updates.push(progress),
         )
@@ -1090,6 +1148,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
         process_sse_frame(
             br#"data: {"type":"response.output_text.delta","delta":"done"}"#,
             &mut completed,
+            &mut completed_items,
             &mut current,
             &mut |progress| updates.push(progress),
         )
@@ -1097,6 +1156,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
         process_sse_frame(
             br#"data: {"type":"response.completed","response":{"id":"response-1","usage":{"output_tokens":9}}}"#,
             &mut completed,
+            &mut completed_items,
             &mut current,
             &mut |_| {},
         )
