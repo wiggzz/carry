@@ -159,6 +159,7 @@ dependencies = [
  "clap",
  "getrandom 0.3.4",
  "httpdate",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
