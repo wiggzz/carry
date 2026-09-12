@@ -1,0 +1,7 @@
+FROM python:3.13-slim-bookworm
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY target/x86_64-unknown-linux-musl/release/carry /usr/local/bin/carry
+RUN chmod 0555 /usr/local/bin/carry
+ENTRYPOINT ["carry"]
