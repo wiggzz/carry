@@ -296,19 +296,22 @@ impl CacheTracker {
     }
 
     fn observe(&mut self, usage: &Usage) {
+        let now = Instant::now();
+        let cache_activity = usage.cached_input_tokens > 0 || usage.cache_write_input_tokens > 0;
+        let minimum_prefix_tokens = self
+            .capabilities
+            .map_or(0, |capabilities| capabilities.minimum_prefix_tokens);
+        if cache_activity && self.pending_request_tokens >= minimum_prefix_tokens {
+            self.implicit_activity = Some(now);
+            self.implicit_cached_tokens = self.pending_request_tokens;
+            self.implicit_prefix.clone_from(&self.pending_history);
+        }
         let Some(capabilities) = self.capabilities else {
             self.pending.clear();
             self.pending_request_tokens = 0;
             self.pending_history.clear();
             return;
         };
-        let now = Instant::now();
-        let cache_activity = usage.cached_input_tokens > 0 || usage.cache_write_input_tokens > 0;
-        if cache_activity && self.pending_request_tokens >= capabilities.minimum_prefix_tokens {
-            self.implicit_activity = Some(now);
-            self.implicit_cached_tokens = self.pending_request_tokens;
-            self.implicit_prefix.clone_from(&self.pending_history);
-        }
         let readable = self
             .pending
             .iter()
@@ -1459,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_cache_capabilities_disable_cache_assumptions() {
+    fn provider_reported_implicit_cache_is_tracked_without_explicit_capabilities() {
         let mut cache = CacheTracker::new(None);
         cache.begin_request_with_tokens(
             vec![RenderedBreakpoint {
@@ -1470,12 +1473,11 @@ mod tests {
         );
         cache.observe(&Usage {
             cached_input_tokens: 4_000,
-            cache_write_input_tokens: 4_000,
             ..Usage::default()
         });
 
         let policy = cache.policy();
-        assert_eq!(policy.implicit_cached_tokens, 0);
+        assert_eq!(policy.implicit_cached_tokens, 4_000);
         assert!(policy.breakpoints.is_empty());
     }
 
