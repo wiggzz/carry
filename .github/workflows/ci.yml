@@ -69,20 +69,23 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: python3 scripts/validate_pr_title.py "$PR_TITLE"
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain and portable target
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup component add rustfmt clippy
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Format
         run: cargo fmt -- --check
 
-      - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
-
       - name: Unit tests
         run: cargo test
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Benchmark planner, runner, worker, and lifecycle tests
         run: >-
@@ -99,13 +102,15 @@ jobs:
           scripts/test_validate_pr_title.py
           scripts/test_wait_for_ec2_termination.py
 
-      - name: Release build
-        run: cargo build --release --locked
+      - name: Build one portable release binary
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          target/x86_64-unknown-linux-musl/release/carry --help >/dev/null
 
       - name: Build and execute portable Carry harness binary
         run: |
           docker build --tag carry-harness:ci \
-            --file containers/swebench-harness/Dockerfile.carry \
+            --file containers/swebench-harness/Dockerfile.ci \
             --build-arg BASE_IMAGE='rust@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff' \
             .
           container=$(docker create carry-harness:ci)
@@ -118,5 +123,5 @@ jobs:
 
       - name: Scripted fixture
         run: |
-          docker build --tag carry:dev .
+          docker build --tag carry:dev --file containers/ci/Dockerfile.fixture .
           ./scripts/run-fixture.sh clamp scripted

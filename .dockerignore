@@ -1,0 +1,7 @@
+# Keep Docker build contexts small while allowing CI's single portable Carry binary.
+.git/
+runs/
+target/*
+!target/x86_64-unknown-linux-musl/
+!target/x86_64-unknown-linux-musl/release/
+!target/x86_64-unknown-linux-musl/release/carry
