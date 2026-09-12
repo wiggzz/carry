@@ -41,6 +41,8 @@ At each step:
 
 Retention decisions persist until reversed or applied by compaction. Preserve outcomes, not chain-of-thought.
 
+MCP tools are available through the exact Carry executable in `$CARRY_SELF`. Discover them with `"$CARRY_SELF" mcp list`, inspect a tool with `"$CARRY_SELF" mcp describe SERVER/TOOL`, and invoke it with `"$CARRY_SELF" mcp call SERVER/TOOL '{"argument":"value"}'`. MCP command output is JSON.
+
 Large stdout and stderr results arrive in separate structured sections. Each text payload is unmodified; truncation, encoding, and artifact-path metadata are outside that payload. Read or slice the relevant stdout/stderr artifact when omitted details matter.
 
 Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
@@ -1107,6 +1109,13 @@ fn compact_bytes(value: usize) -> String {
     }
 }
 
+fn current_executable() -> Result<PathBuf> {
+    std::env::current_exe()
+        .context("failed to locate the running carry executable")?
+        .canonicalize()
+        .context("failed to canonicalize the running carry executable")
+}
+
 async fn execute_shell(
     cwd: &Path,
     run_dir: &Path,
@@ -1120,6 +1129,7 @@ async fn execute_shell(
         .arg("-lc")
         .arg(command)
         .current_dir(cwd)
+        .env("CARRY_SELF", current_executable()?)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1579,6 +1589,8 @@ mod tests {
     fn system_prompt_requires_reproduction_without_soliciting_future_fixes() {
         assert!(SYSTEM_PROMPT.contains("minimal failing reproduction"));
         assert!(SYSTEM_PROMPT.contains("affected tests"));
+        assert!(SYSTEM_PROMPT.contains("$CARRY_SELF"));
+        assert!(SYSTEM_PROMPT.contains("mcp describe SERVER/TOOL"));
         assert!(!SYSTEM_PROMPT.contains("later fixes"));
         assert!(!SYSTEM_PROMPT.contains("upstream fix"));
     }
