@@ -39,8 +39,7 @@ At each step:
 Retention decisions persist until reversed or applied by compaction. When compaction applies protection, the retained item becomes stable. Preserve outcomes, not chain-of-thought.
 
 Large text shell results arrive as structured `output_head` and `output_tail` previews with an absolute `full_output_path`. Non-text output is omitted from the model payload and available only through its artifact paths. Read or slice those session files when omitted details matter.
-
-Work only within the assigned repository. Do not perform destructive or external actions."#;
+"#;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
