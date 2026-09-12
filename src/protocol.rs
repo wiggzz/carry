@@ -149,23 +149,23 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Human-authored intent, requirements, constraints, and decisions start protected and remain so after completing a request. Mark a human message removable only with an explicit decision that it is no longer needed or that its still-relevant semantics have been preserved with remember. Stable items remain by default; volatile items may be removed automatically under budget pressure. Retention decisions persist until reversed or applied by compaction.",
+        "description": "After choosing the next action, manage recent context. User messages start protected; mark one removable only when deliberately safe. Stable context stays by default; volatile context may compact under budget pressure.",
         "properties": {
             "protected": {
                 "type": "array",
-                "description": "Protect up to four context IDs when you learned anything from them that is not preserved elsewhere. This is especially important for volatile items. When only a concise learning must remain, use remember and make its bulky source removable instead. Protecting an ID reverses a removable decision.",
+                "description": "IDs that must remain. Use for volatile context whose information is not preserved elsewhere. Reverses removable.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "removable": {
                 "type": "array",
-                "description": "Mark up to four context IDs removable only when you learned nothing from them, or when everything learned from them is preserved elsewhere. Finishing an action does not preserve its learning. Making an ID removable reverses protection.",
+                "description": "IDs safe to remove because they add no needed information or remember preserves it. Reverses protected.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "remember": {
                 "type": "array",
-                "description": "At most one concise learning that preserves what a bulky source taught you without retaining its exact details. Make the source removable rather than also protecting it. Preserve outcomes, not chain-of-thought.",
+                "description": "One concise fact to preserve before removing a bulky source. Do not include chain-of-thought.",
                 "items": { "type": "string" },
                 "maxItems": 1
             }
@@ -256,12 +256,22 @@ mod tests {
             context["required"],
             json!(["protected", "removable", "remember"])
         );
-        assert!(description.contains("start protected"));
-        assert!(description.contains("explicit decision"));
-        assert!(protected.contains("learned anything"));
-        assert!(removable.contains("learned nothing"));
-        assert!(removable.contains("preserved elsewhere"));
-        assert!(remember.contains("concise learning"));
+        assert_eq!(
+            description,
+            "After choosing the next action, manage recent context. User messages start protected; mark one removable only when deliberately safe. Stable context stays by default; volatile context may compact under budget pressure."
+        );
+        assert_eq!(
+            protected,
+            "IDs that must remain. Use for volatile context whose information is not preserved elsewhere. Reverses removable."
+        );
+        assert_eq!(
+            removable,
+            "IDs safe to remove because they add no needed information or remember preserves it. Reverses protected."
+        );
+        assert_eq!(
+            remember,
+            "One concise fact to preserve before removing a bulky source. Do not include chain-of-thought."
+        );
     }
 
     #[test]
