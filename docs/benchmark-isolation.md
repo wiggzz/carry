@@ -94,10 +94,13 @@ The workflow has deliberately separate modes:
 - `plan` is offline and exercises adapter-contract tests only.
 - `provision` builds Carry once in a clean Runta runtime, freezes a named checkpoint,
   retrieves its manifest, and deletes that build runtime.
-- `smoke-2` restores that checkpoint for one Terminal-Bench and one DeepSWE task.
-- `full-30` restores the same checkpoint for the complete published task set. It is
-  assigned to a protected `self-hosted, frontierharness` runner because sequential
-  full trials can exceed GitHub-hosted's six-hour limit.
+- `smoke-2` runs one Terminal-Bench and one DeepSWE task through the same hosted
+  one-task shard and evidence-merge path used by the full run.
+- `full-30` restores the same checkpoint for the complete published task set using
+  deterministic two-task shards on GitHub-hosted runners. Shards run serially under
+  the workflow-level checkpoint lock, so no EC2/self-hosted orchestrator remains
+  running while Runta executes trials. The merger checks the frozen task-manifest
+  SHA-256 and requires exactly one evidence record per task before normalization.
 
 The checkpoint name is an explicit input: smoke/full must not silently rebuild or
 retarget it. The protected `frontierharness` Environment supplies `RUNTA_TOKEN` and

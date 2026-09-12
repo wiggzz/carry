@@ -7,7 +7,7 @@ FRONTIERHARNESS_COMMIT=e837a70bd6beb4e72eeeda62dd06e3bd34f6cb63
 usage() {
   cat <<'EOF'
 usage: run-frontierharness-ci.sh --mode MODE --source PATH --commit SHA --repo URL \
-       --checkpoint NAME --run-id ID --out DIR
+       --checkpoint NAME --run-id ID --out DIR [--tasks FILE]
 
 MODE is one of: plan, provision, smoke-2, full-30.
 `provision` creates a frozen checkpoint for the supplied immutable Carry commit.
@@ -22,6 +22,7 @@ REPO=""
 CHECKPOINT=""
 RUN_ID=""
 OUT=""
+TASKS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode) MODE=$2; shift 2 ;;
@@ -31,12 +32,21 @@ while [[ $# -gt 0 ]]; do
     --checkpoint) CHECKPOINT=$2; shift 2 ;;
     --run-id) RUN_ID=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
+    --tasks) TASKS=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
 case "$MODE" in plan|provision|smoke-2|full-30) ;; *) echo "invalid --mode" >&2; exit 2 ;; esac
+if [[ -n "$TASKS" && "$MODE" != smoke-2 && "$MODE" != full-30 ]]; then
+  echo "--tasks is valid only for smoke-2 and full-30" >&2
+  exit 2
+fi
+if [[ -n "$TASKS" && ! -r "$TASKS" ]]; then
+  echo "--tasks must name a readable task list" >&2
+  exit 2
+fi
 [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "--commit must be a full lowercase SHA" >&2; exit 2; }
 git -C "$SOURCE" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   || { echo "--source must be a Carry checkout" >&2; exit 2; }
@@ -97,10 +107,12 @@ runta checkpoint ls --json | jq -e --arg name "$CHECKPOINT" \
   || { echo "ready checkpoint not found: $CHECKPOINT" >&2; exit 2; }
 [[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{2,120}$ ]] || { echo "unsafe --run-id" >&2; exit 2; }
 
-if [[ "$MODE" == smoke-2 ]]; then
-  TASKS="$SOURCE/benchmarks/frontierharness/smoke-2.txt"
-else
-  TASKS="$FH/tasks"
+if [[ -z "$TASKS" ]]; then
+  if [[ "$MODE" == smoke-2 ]]; then
+    TASKS="$SOURCE/benchmarks/frontierharness/smoke-2.txt"
+  else
+    TASKS="$FH/tasks"
+  fi
 fi
 
 bash "$FH/skills/frontierharness-eval/scripts/run-trials.sh" \
