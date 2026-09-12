@@ -149,11 +149,11 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Human-authored content is kept by default. Mark it removable only if it is a large item whose information can be safely summarized, is available elsewhere, or provides no directional change or learning. Stable items remain by default; volatile items may be removed automatically under budget pressure. Retention decisions persist until reversed or applied by compaction.",
+        "description": "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Human-authored content is kept by default. Other context is eligible for removal under budget pressure. Mark a human item removable only if it is a large item whose information can be safely summarized, is available elsewhere, or provides no directional change or learning. Retention decisions persist until reversed or applied by compaction.",
         "properties": {
             "protected": {
                 "type": "array",
-                "description": "Protect up to four context IDs when you learned anything from them that is not preserved elsewhere. This is especially important for volatile items. When only a concise learning must remain, use remember and make its bulky source removable instead. Protecting an ID reverses a removable decision.",
+                "description": "Protect up to four context IDs when you learned anything from them that is not preserved elsewhere. When only a concise learning must remain, use remember and make its bulky source removable instead. Protecting an ID reverses a removable decision.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
@@ -258,12 +258,16 @@ mod tests {
         );
         assert_eq!(
             description,
-            "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Human-authored content is kept by default. Mark it removable only if it is a large item whose information can be safely summarized, is available elsewhere, or provides no directional change or learning. Stable items remain by default; volatile items may be removed automatically under budget pressure. Retention decisions persist until reversed or applied by compaction."
+            "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Human-authored content is kept by default. Other context is eligible for removal under budget pressure. Mark a human item removable only if it is a large item whose information can be safely summarized, is available elsewhere, or provides no directional change or learning. Retention decisions persist until reversed or applied by compaction."
         );
         assert!(protected.contains("learned anything"));
         assert!(removable.contains("learned nothing"));
         assert!(removable.contains("preserved elsewhere"));
         assert!(remember.contains("concise learning"));
+        assert!(!description.contains("stable"));
+        assert!(!description.contains("volatile"));
+        assert!(!protected.contains("stable"));
+        assert!(!protected.contains("volatile"));
     }
 
     #[test]

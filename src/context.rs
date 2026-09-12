@@ -17,10 +17,11 @@ const HISTORY_COMPACTED_STATUS: &str =
     "[history status: earlier context has been removed by compaction]";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub(crate) enum Retention {
-    Stable,
-    Volatile,
+    #[serde(rename = "protected", alias = "stable")]
+    Protected,
+    #[serde(rename = "eligible", alias = "volatile")]
+    Eligible,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -40,15 +41,6 @@ pub(crate) enum ContextItemKind {
     Tool,
 }
 
-impl Retention {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Stable => "stable",
-            Self::Volatile => "volatile",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) struct ContextItem {
     pub id: u64,
@@ -61,9 +53,6 @@ pub(crate) struct ContextItem {
     keep_lease_expires_at_turn: Option<u64>,
     #[serde(default)]
     keep_lease_expired: bool,
-    /// Immutable lifecycle label rendered when this context block was created.
-    #[serde(default)]
-    display_retention: Option<Retention>,
     /// Immutable sweep advisory rendered inside this completed tool result.
     #[serde(default)]
     keep_lease_review: Option<String>,
@@ -82,7 +71,7 @@ impl ContextItem {
         Self::new(
             id,
             ContextItemKind::User,
-            Retention::Stable,
+            Retention::Protected,
             vec![json!({
                 "role": "user",
                 "content": [{ "type": "input_text", "text": content }]
@@ -91,7 +80,7 @@ impl ContextItem {
     }
 
     fn memory(id: u64, source_id: u64, content: String) -> Self {
-        let mut item = Self::new(id, ContextItemKind::Memory, Retention::Stable, Vec::new());
+        let mut item = Self::new(id, ContextItemKind::Memory, Retention::Eligible, Vec::new());
         item.bytes = content.len();
         item.memory = Some(MemoryData {
             content,
@@ -105,7 +94,7 @@ impl ContextItem {
         Self::new(
             id,
             ContextItemKind::Status,
-            Retention::Stable,
+            Retention::Eligible,
             vec![json!({
                 "role": "developer",
                 "content": [{ "type": "input_text", "text": HISTORY_COMPACTED_STATUS }]
@@ -131,7 +120,7 @@ impl ContextItem {
         Ok(Self::new(
             id,
             ContextItemKind::Tool,
-            Retention::Volatile,
+            Retention::Eligible,
             input_items,
         ))
     }
@@ -146,7 +135,6 @@ impl ContextItem {
             input_items,
             keep_lease_expires_at_turn: None,
             keep_lease_expired: false,
-            display_retention: Some(retention),
             keep_lease_review: None,
             memory: None,
         }
@@ -155,7 +143,7 @@ impl ContextItem {
     fn marker(&self, checkpoint: bool) -> Value {
         let mut block = json!({
             "type": "input_text",
-            "text": format!("[context {} {}]", self.id, self.display_retention.unwrap_or(self.retention).label())
+            "text": format!("[context {}]", self.id)
         });
         if checkpoint {
             block["prompt_cache_breakpoint"] = json!({ "mode": "explicit" });
@@ -164,11 +152,7 @@ impl ContextItem {
     }
 
     fn compact_marker(&self) -> String {
-        format!(
-            "[context {} {}]",
-            self.id,
-            self.display_retention.unwrap_or(self.retention).label()
-        )
+        format!("[context {}]", self.id)
     }
 }
 
@@ -328,7 +312,7 @@ impl ContextState {
                 continue;
             }
             item.signal = RetentionSignal::Neutral;
-            item.retention = Retention::Volatile;
+            item.retention = Retention::Eligible;
             item.keep_lease_expires_at_turn = None;
             item.keep_lease_expired = true;
             expired.push(id);
@@ -436,15 +420,15 @@ impl ContextState {
         self.items.iter().collect()
     }
 
-    pub fn stable_frontier_len(&self) -> usize {
+    pub fn protected_frontier_len(&self) -> usize {
         self.items
             .iter()
-            .take_while(|item| item.retention == Retention::Stable)
+            .take_while(|item| item.retention == Retention::Protected)
             .count()
     }
 
-    pub fn stable_frontier_id(&self) -> Option<u64> {
-        self.stable_frontier_len()
+    pub fn protected_frontier_id(&self) -> Option<u64> {
+        self.protected_frontier_len()
             .checked_sub(1)
             .and_then(|index| self.items.get(index))
             .map(|item| item.id)
@@ -483,8 +467,8 @@ impl ContextState {
         let mut drop = Vec::new();
         let mut ignored = Vec::new();
 
-        // Context items begin at their own retention default. Making any item
-        // removable is an explicit, model-authorized signal.
+        // Human-authored items begin protected; every other kind begins eligible.
+        // Explicit removable/protected signals override those defaults.
         for id in unique_ids(&update.drop) {
             match self.items.iter_mut().find(|item| item.id == id) {
                 Some(item) => {
@@ -542,14 +526,14 @@ impl ContextState {
     ) -> Option<CompactionPlan> {
         let protected = protected.iter().copied().collect::<HashSet<_>>();
         let newest_id = self.items.last().map_or(0, |item| item.id);
-        // Explicit keep/drop signals remain authoritative. Neutral volatile items compete for
+        // Explicit keep/drop signals remain authoritative. Neutral eligible items compete for
         // a separate automatic budget using a monotone recency score; the shape can later gain
         // other evidence without changing the packing or telemetry contract.
         let mut neutral = self
             .items
             .iter()
             .filter(|item| {
-                item.retention == Retention::Volatile && item.signal == RetentionSignal::Neutral
+                item.retention == Retention::Eligible && item.signal == RetentionSignal::Neutral
             })
             .map(|item| NeutralRetentionDecision {
                 id: item.id,
@@ -685,7 +669,7 @@ impl ContextState {
             .collect::<Vec<_>>();
         for item in &mut retained {
             if !neutral_retained_set.contains(&item.id) {
-                item.retention = Retention::Stable;
+                item.retention = Retention::Protected;
             }
         }
         if !retained
@@ -801,11 +785,11 @@ impl ContextState {
                 } else if item.signal == RetentionSignal::Keep {
                     RetentionAuditReason::ExplicitKeep
                 } else if neutral_retained.contains(&item.id)
-                    || item.retention == Retention::Volatile
+                    || item.retention == Retention::Eligible
                 {
-                    RetentionAuditReason::AutomaticNeutral
+                    RetentionAuditReason::AutomaticEligible
                 } else {
-                    RetentionAuditReason::StableBaseline
+                    RetentionAuditReason::ProtectedBaseline
                 };
                 RetentionAuditEntry {
                     id: item.id,
@@ -823,11 +807,11 @@ impl ContextState {
                 memory.materialized = true;
             }
             if neutral_retained.contains(&item.id) {
-                item.retention = Retention::Volatile;
+                item.retention = Retention::Eligible;
             } else {
-                item.retention = Retention::Stable;
+                item.retention = Retention::Protected;
             }
-            if item.signal == RetentionSignal::Keep && item.retention == Retention::Stable {
+            if item.signal == RetentionSignal::Keep && item.retention == Retention::Protected {
                 item.signal = RetentionSignal::Neutral;
             }
         }
@@ -840,13 +824,13 @@ impl ContextState {
             self.items.push(ContextItem::history_status(id));
         }
         self.generation = self.generation.saturating_add(1);
-        let stable_frontier = self.stable_frontier_id();
-        if let Some(frontier) = stable_frontier {
+        let protected_frontier = self.protected_frontier_id();
+        if let Some(frontier) = protected_frontier {
             let prefix_len = self
                 .items
                 .iter()
                 .position(|item| item.id == frontier)
-                .expect("stable frontier belongs to retained context")
+                .expect("protected frontier belongs to retained context")
                 + 1;
             let item_ids = self
                 .items
@@ -888,7 +872,7 @@ impl ContextState {
             invalidated_cache_tokens: plan.invalidated_cache_tokens,
             estimated_savings_input_units: plan.estimated_savings_input_units,
             generation: self.generation,
-            stable_frontier: self.stable_frontier_id(),
+            protected_frontier: self.protected_frontier_id(),
             retained_bytes: self.retained_bytes(),
         }
     }
@@ -902,9 +886,9 @@ impl ContextState {
     }
 
     #[cfg(test)]
-    fn force_stable_for_test(&mut self) {
+    fn force_protected_for_test(&mut self) {
         for item in &mut self.items {
-            item.retention = Retention::Stable;
+            item.retention = Retention::Protected;
         }
     }
 }
@@ -1007,8 +991,8 @@ pub(crate) enum RetentionAuditReason {
     ExplicitKeep,
     ExpiredKeepLease,
     ExplicitRemovable,
-    AutomaticNeutral,
-    StableBaseline,
+    AutomaticEligible,
+    ProtectedBaseline,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1048,7 +1032,7 @@ pub(crate) struct ContextChange {
     pub invalidated_cache_tokens: usize,
     pub estimated_savings_input_units: f64,
     pub generation: u64,
-    pub stable_frontier: Option<u64>,
+    pub protected_frontier: Option<u64>,
     pub retained_bytes: usize,
 }
 
@@ -1103,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn human_direction_defaults_stable_and_explicitly_removable() {
+    fn human_direction_defaults_protected_and_explicitly_removable() {
         let mut state = ContextState::new("keep deployment private".into());
         let human = 1;
         let source = add_tool_with_output(&mut state, &"temporary output ".repeat(1_000));
@@ -1142,6 +1126,52 @@ mod tests {
                 .unwrap()
                 .contains("keep deployment private")
         );
+    }
+
+    #[test]
+    fn non_human_context_is_eligible_for_budget_compaction() {
+        let mut state = ContextState::new("initial direction".into());
+        let source = add_tool_with_output(&mut state, &"temporary output ".repeat(1_000));
+        let summary = "durable summary ".repeat(500);
+        let memory = state
+            .record_signals(&update(&[], &[], &[&summary]), source)
+            .added[0];
+
+        let first_plan = state
+            .plan_compaction_with_neutral_budget(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                    payoff_requests: 1,
+                },
+                0,
+            )
+            .unwrap();
+        assert!(first_plan.dropped.contains(&source));
+        assert!(first_plan.dropped.contains(&memory));
+        state.compact(first_plan);
+
+        let status = state
+            .snapshot()
+            .into_iter()
+            .find(|item| item.kind == ContextItemKind::Status)
+            .unwrap()
+            .id;
+        let next = add_tool_with_output(&mut state, &"next output ".repeat(1_000));
+        let second_plan = state
+            .plan_compaction_with_neutral_budget(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                    payoff_requests: 1,
+                },
+                0,
+            )
+            .unwrap();
+        assert!(second_plan.dropped.contains(&status));
+        assert!(second_plan.dropped.contains(&next));
     }
 
     #[test]
@@ -1196,7 +1226,7 @@ mod tests {
     }
 
     #[test]
-    fn budget_retained_neutral_items_remain_volatile_for_future_scoring() {
+    fn budget_retained_eligible_items_and_status_are_reconsidered() {
         let mut state = ContextState::new("initial".into());
         let oldest = add_tool_with_output(&mut state, &"old ".repeat(100));
         let middle = add_tool_with_output(&mut state, &"middle ".repeat(100));
@@ -1227,9 +1257,15 @@ mod tests {
                     .find(|item| item.id == id)
                     .unwrap()
                     .retention,
-                Retention::Volatile
+                Retention::Eligible
             );
         }
+        let status = state
+            .snapshot()
+            .into_iter()
+            .find(|item| item.kind == ContextItemKind::Status)
+            .unwrap()
+            .id;
 
         let latest = add_tool_with_output(&mut state, &"latest ".repeat(100));
         let next = state
@@ -1243,13 +1279,13 @@ mod tests {
                 budget,
             )
             .unwrap();
-        assert_eq!(next.dropped, vec![middle]);
+        assert_eq!(next.dropped, vec![middle, newest]);
         assert_eq!(
             next.neutral_retained
                 .iter()
                 .map(|item| item.id)
                 .collect::<Vec<_>>(),
-            vec![latest, newest]
+            vec![latest, status]
         );
     }
 
@@ -1286,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn budget_candidate_prices_the_same_volatile_markers_it_will_commit() {
+    fn budget_candidate_prices_the_same_eligible_markers_it_will_commit() {
         for padding in 0..16 {
             let mut state = ContextState::new("initial".into());
             let oldest = add_tool_with_output(&mut state, &"old ".repeat(100));
@@ -1319,7 +1355,7 @@ mod tests {
             let expected = estimated_tokens(&state.render_with_compatible_breakpoints(&retained));
             assert_eq!(
                 plan.retained_tokens, expected,
-                "padding {padding} must price the volatile marker committed by compact"
+                "padding {padding} must price the eligible marker committed by compact"
             );
         }
     }
@@ -1347,7 +1383,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_adds_one_stable_history_status_and_prices_it() {
+    fn compaction_adds_one_eligible_history_status_and_prices_it() {
         let mut state = ContextState::new("initial".into());
         let first = add_tool_with_output(&mut state, &"first ".repeat(1_000));
         state.record_signals(&update(&[], &[first], &[]), first);
@@ -1368,9 +1404,6 @@ mod tests {
             .filter(|item| !plan.dropped.contains(&item.id))
             .cloned()
             .collect::<Vec<_>>();
-        for item in &mut expected_retained {
-            item.retention = Retention::Stable;
-        }
         expected_retained.push(ContextItem::history_status(state.next_id + 1));
         assert_eq!(
             plan.retained_tokens,
@@ -1390,7 +1423,7 @@ mod tests {
                     .contains(status)
             })
             .unwrap();
-        assert_eq!(status_item.retention, Retention::Stable);
+        assert_eq!(status_item.retention, Retention::Eligible);
 
         let second = add_tool_with_output(&mut state, &"second ".repeat(1_000));
         state.record_signals(&update(&[], &[second], &[]), second);
@@ -1442,7 +1475,7 @@ mod tests {
                 .find(|item| item.id == protected)
                 .unwrap()
                 .retention,
-            Retention::Volatile
+            Retention::Eligible
         );
     }
 
@@ -1486,25 +1519,25 @@ mod tests {
     }
 
     #[test]
-    fn stable_human_message_below_volatile_item_does_not_move_the_frontier() {
+    fn human_protection_after_an_eligible_item_does_not_move_the_cache_frontier() {
         let mut state = ContextState::new("initial".into());
         let tool = add_tool(&mut state);
         let steering = state.add_user("steer here".into());
 
-        assert_eq!(state.stable_frontier_len(), 1);
+        assert_eq!(state.protected_frontier_len(), 1);
         let rendered = state.input_items();
         let texts = rendered
             .iter()
             .filter_map(|item| item["content"][0]["text"].as_str())
             .collect::<Vec<_>>();
-        assert!(texts.contains(&"[context 1 stable]"));
+        assert!(texts.contains(&"[context 1]"));
         assert!(rendered.iter().any(|item| {
             item["type"] == "function_call_output"
                 && item["output"]
                     .as_str()
-                    .is_some_and(|output| output.ends_with(&format!("[context {tool} volatile]")))
+                    .is_some_and(|output| output.ends_with(&format!("[context {tool}]")))
         }));
-        assert!(texts.contains(&format!("[context {steering} stable]").as_str()));
+        assert!(texts.contains(&format!("[context {steering}]").as_str()));
         assert_eq!(
             rendered
                 .iter()
@@ -1515,20 +1548,22 @@ mod tests {
     }
 
     #[test]
-    fn rendered_context_markers_expose_neutral_retention_defaults() {
+    fn rendered_context_markers_hide_lifecycle_details() {
         let mut state = ContextState::new("initial".into());
         let tool = add_tool(&mut state);
         let steering = state.add_user("steer here".into());
 
         let rendered = serde_json::to_string(&state.input_items()).unwrap();
 
-        assert!(rendered.contains("[context 1 stable]"));
-        assert!(rendered.contains(&format!("[context {tool} volatile]")));
-        assert!(rendered.contains(&format!("[context {steering} stable]")));
+        assert!(rendered.contains("[context 1]"));
+        assert!(rendered.contains(&format!("[context {tool}]")));
+        assert!(rendered.contains(&format!("[context {steering}]")));
+        assert!(!rendered.contains("stable"));
+        assert!(!rendered.contains("volatile"));
     }
 
     #[test]
-    fn memory_is_an_inline_stable_handle_without_duplicating_its_content() {
+    fn memory_is_an_inline_eligible_handle_without_duplicating_its_content() {
         let mut state = ContextState::new("initial".into());
         let tool = add_tool(&mut state);
         let change = state.record_signals(&update(&[], &[], &["durable outcome"]), tool);
@@ -1538,8 +1573,8 @@ mod tests {
             state.items.iter().map(|item| item.id).collect::<Vec<_>>(),
             vec![1, tool, memory]
         );
-        assert_eq!(state.items[2].retention, Retention::Stable);
-        assert_eq!(state.stable_frontier_len(), 1);
+        assert_eq!(state.items[2].retention, Retention::Eligible);
+        assert_eq!(state.protected_frontier_len(), 1);
 
         let rendered = state.input_items();
         let tool_output = rendered
@@ -1548,9 +1583,9 @@ mod tests {
             .unwrap()["output"]
             .as_str()
             .unwrap();
-        assert!(tool_output.contains(&format!("[context {tool} volatile]")));
+        assert!(tool_output.contains(&format!("[context {tool}]")));
         assert!(tool_output.contains("[memory stored]"));
-        assert!(tool_output.contains(&format!("[context {memory} stable]")));
+        assert!(tool_output.contains(&format!("[context {memory}]")));
         assert!(!tool_output.contains("durable outcome"));
         assert!(!rendered.iter().any(|item| {
             item["role"] == "user"
@@ -1567,6 +1602,7 @@ mod tests {
         let memory = state
             .record_signals(&update(&[], &[tool], &["durable outcome"]), tool)
             .added[0];
+        state.record_signals(&update(&[memory], &[], &[]), tool);
 
         let plan = state
             .plan_compaction(
@@ -1594,7 +1630,7 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .any(|item| { item["content"][0]["text"] == format!("[context {memory} stable]") })
+                .any(|item| { item["content"][0]["text"] == format!("[context {memory}]") })
         );
     }
 
@@ -1602,7 +1638,10 @@ mod tests {
     fn planner_prices_memory_materialization_before_dropping_its_source() {
         let mut state = ContextState::new("initial".into());
         let tool = add_tool(&mut state);
-        state.record_signals(&update(&[], &[tool], &[&"important ".repeat(2_000)]), tool);
+        let memory = state
+            .record_signals(&update(&[], &[tool], &[&"important ".repeat(2_000)]), tool)
+            .added[0];
+        state.record_signals(&update(&[memory], &[], &[]), tool);
 
         assert!(
             state
@@ -1748,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn neutral_volatile_items_are_removable_unless_kept() {
+    fn eligible_items_are_removable_unless_protected() {
         let mut state = ContextState::new("initial".into());
         let disposable = add_tool(&mut state);
 
@@ -1803,16 +1842,24 @@ mod tests {
             state
                 .snapshot()
                 .iter()
-                .all(|item| item.retention == Retention::Stable)
+                .filter(|item| item.kind != ContextItemKind::Status)
+                .all(|item| item.retention == Retention::Protected)
+        );
+        assert!(
+            state
+                .snapshot()
+                .iter()
+                .any(|item| item.kind == ContextItemKind::Status
+                    && item.retention == Retention::Eligible)
         );
         assert_eq!(state.signal_for(retained), Some(RetentionSignal::Neutral));
     }
 
     #[test]
-    fn compaction_can_remove_stable_drop_candidates() {
+    fn compaction_can_remove_protected_drop_candidates() {
         let mut state = ContextState::new("initial".into());
         let old_tool = add_tool(&mut state);
-        state.force_stable_for_test();
+        state.force_protected_for_test();
         let new_tool = add_tool(&mut state);
         state.record_signals(&update(&[], &[old_tool, new_tool], &[]), new_tool);
 
@@ -1831,14 +1878,16 @@ mod tests {
     }
 
     #[test]
-    fn compaction_generation_reuses_the_stable_frontier_after_dropping_its_volatile_tail() {
+    fn compaction_generation_reuses_the_protected_frontier_after_dropping_its_eligible_tail() {
         let mut state = ContextState::new("initial ".repeat(800));
         let disposable = add_tool_with_output(&mut state, &"old ".repeat(600));
-        let volatile_tail = add_tool_with_output(&mut state, &"tail ".repeat(2_000));
-        state.record_signals(
-            &update(&[], &[disposable], &["durable outcome"]),
-            volatile_tail,
-        );
+        let eligible_tail = add_tool_with_output(&mut state, &"tail ".repeat(2_000));
+        let memory = state
+            .record_signals(
+                &update(&[], &[disposable], &["durable outcome"]),
+                eligible_tail,
+            )
+            .added[0];
 
         let first_plan = state
             .plan_compaction_with_neutral_budget(
@@ -1857,12 +1906,12 @@ mod tests {
                 .iter()
                 .map(|item| item.id)
                 .collect::<Vec<_>>(),
-            vec![volatile_tail]
+            vec![memory, eligible_tail]
         );
         let first_change = state.compact(first_plan);
-        assert_eq!(first_change.stable_frontier, Some(1));
+        assert_eq!(first_change.protected_frontier, Some(1));
 
-        state.record_signals(&update(&[], &[volatile_tail], &[]), volatile_tail);
+        state.record_signals(&update(&[], &[eligible_tail], &[]), eligible_tail);
         let second_plan = state
             .plan_compaction_with_neutral_budget(
                 &[],
@@ -1878,9 +1927,22 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(second_plan.dropped, vec![volatile_tail]);
+        assert_eq!(second_plan.dropped, vec![eligible_tail]);
         assert_eq!(second_plan.reused_generation, Some(first_change.generation));
         assert!(second_plan.rewrite_tokens < second_plan.retained_tokens);
+    }
+
+    #[test]
+    fn legacy_stable_and_volatile_checkpoint_values_remain_resumable() {
+        let mut state = ContextState::new("first task".to_owned());
+        add_tool(&mut state);
+        let legacy = String::from_utf8(state.encode().unwrap())
+            .unwrap()
+            .replace("\"protected\"", "\"stable\"")
+            .replace("\"eligible\"", "\"volatile\"");
+
+        let restored = ContextState::decode(legacy.as_bytes()).unwrap();
+        assert_eq!(restored.input_items(), state.input_items());
     }
 
     #[test]
