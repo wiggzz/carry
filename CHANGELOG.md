@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.8.0](https://github.com/wiggzz/carry/compare/v0.7.1...v0.8.0) (2026-09-11)
+
+
+### Features
+
+* support ChatGPT Codex subscriptions ([#86](https://github.com/wiggzz/carry/issues/86)) ([8fa6a5a](https://github.com/wiggzz/carry/commit/8fa6a5a52efe68fcfe3c90c34d5f1bb4a8b68026))
+
+
+### Bug Fixes
+
+* avoid mapfile in subnet migration ([#84](https://github.com/wiggzz/carry/issues/84)) ([35b39ca](https://github.com/wiggzz/carry/commit/35b39caa3e3fddb3b28c0ce655dc298564e65769))
+* bound benchmark worker user data ([#82](https://github.com/wiggzz/carry/issues/82)) ([a631f11](https://github.com/wiggzz/carry/commit/a631f11242238033481f5a898160affa32157e97))
+* centralize benchmark agent commands ([#80](https://github.com/wiggzz/carry/issues/80)) ([3ea9555](https://github.com/wiggzz/carry/commit/3ea955596a835d10dc15e5f231efdee14018a645))
+* deduplicate replayed SSE events ([#91](https://github.com/wiggzz/carry/issues/91)) ([acb9e88](https://github.com/wiggzz/carry/commit/acb9e88625e03c0d0534d5b226072277c5bc94a3))
+* derive multi-AZ benchmark dispatch configuration ([#58](https://github.com/wiggzz/carry/issues/58)) ([c6a55ee](https://github.com/wiggzz/carry/commit/c6a55eee50e19443b1cfc166ff3ae557a4fee454))
+* make terraform apply script first-run portable ([#85](https://github.com/wiggzz/carry/issues/85)) ([70fe60b](https://github.com/wiggzz/carry/commit/70fe60b50a7dd03967f0a5b2159316e097ab2dfc))
+* migrate legacy worker subnet config ([#83](https://github.com/wiggzz/carry/issues/83)) ([00bc04c](https://github.com/wiggzz/carry/commit/00bc04c9d73ee013ed1466b27e1087d530370fee))
+* preserve timed-out shell diagnostics ([#90](https://github.com/wiggzz/carry/issues/90)) ([0f8ec28](https://github.com/wiggzz/carry/commit/0f8ec28767140b15995dfb9f0a8ed1c9dd0027bb))
+
 ## [0.7.1](https://github.com/wiggzz/carry/compare/v0.7.0...v0.7.1) (2026-09-04)
 
 
