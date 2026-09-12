@@ -170,6 +170,22 @@ class SmokeWorkerTests(unittest.TestCase):
                 env_values = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "--env"]
                 self.assertIn(f"AGENT_COMMAND={template}", env_values)
 
+    def test_empty_keep_lease_is_not_forwarded_to_the_native_carry_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for name in ("repo", "input", "output", "harness"):
+                (root / name).mkdir()
+            with mock.patch.dict(os.environ, {"CARRY_KEEP_LEASE_TURNS": ""}):
+                command = self.worker.agent_docker_command(
+                    image="prepared-carry:immutable", harness="carry", repo=root / "repo",
+                    harness_bundle=root / "harness", task_input=root / "input", output=root / "output",
+                    model="gpt-5.6-luna", reasoning="medium", container_name="carry-agent-empty-lease-test",
+                    agent_timeout_seconds=315, network="carry-agent-internal-test",
+                    proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
+                )
+        env_values = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "--env"]
+        self.assertNotIn("CARRY_KEEP_LEASE_TURNS", env_values)
+
     def test_session_carry_command_mounts_a_read_only_source_session_as_its_fifth_bind(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
