@@ -149,7 +149,7 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Keep human-authored content by default. Mark it removable only if it is a large item whose information can be safely summarized, is available elsewhere, or provides no directional change or learning. Stable items remain by default; volatile items may be removed automatically under budget pressure. Retention decisions persist until reversed or applied by compaction.",
+        "description": "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Human-authored content is kept by default. Mark it removable only if it is a large item whose information can be safely summarized, is available elsewhere, or provides no directional change or learning. Stable items remain by default; volatile items may be removed automatically under budget pressure. Retention decisions persist until reversed or applied by compaction.",
         "properties": {
             "protected": {
                 "type": "array",
@@ -258,7 +258,7 @@ mod tests {
         );
         assert_eq!(
             description,
-            "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Keep human-authored content by default. Mark it removable only if it is a large item whose information can be safely summarized, is available elsewhere, or provides no directional change or learning. Stable items remain by default; volatile items may be removed automatically under budget pressure. Retention decisions persist until reversed or applied by compaction."
+            "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Human-authored content is kept by default. Mark it removable only if it is a large item whose information can be safely summarized, is available elsewhere, or provides no directional change or learning. Stable items remain by default; volatile items may be removed automatically under budget pressure. Retention decisions persist until reversed or applied by compaction."
         );
         assert!(protected.contains("learned anything"));
         assert!(removable.contains("learned nothing"));
