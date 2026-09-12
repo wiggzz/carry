@@ -18,7 +18,10 @@ use tokio::{
 use crate::{
     context::{CompactionPolicy, ContextState, PricedBreakpoint, RenderedBreakpoint},
     log::RunLogger,
-    openai::{ModelProgress, ModelReply, OpenAiClient, PromptCacheCapabilities, Usage},
+    openai::{
+        ModelProgress, ModelReply, OpenAiClient, PromptCacheCapabilities, Usage,
+        prompt_cache_capabilities,
+    },
     protocol::{ActionKind, Step},
 };
 
@@ -236,6 +239,7 @@ impl RunMetrics {
 #[derive(Debug, Default)]
 struct CacheTracker {
     capabilities: Option<PromptCacheCapabilities>,
+    implicit_minimum_prefix_tokens: Option<usize>,
     implicit_activity: Option<Instant>,
     implicit_cached_tokens: usize,
     implicit_prefix: Vec<serde_json::Value>,
@@ -253,9 +257,20 @@ struct TrackedBreakpoint {
 }
 
 impl CacheTracker {
+    #[cfg(test)]
     fn new(capabilities: Option<PromptCacheCapabilities>) -> Self {
+        let implicit_minimum_prefix_tokens =
+            capabilities.map(|capabilities| capabilities.minimum_prefix_tokens);
+        Self::new_with_implicit_minimum(capabilities, implicit_minimum_prefix_tokens)
+    }
+
+    fn new_with_implicit_minimum(
+        capabilities: Option<PromptCacheCapabilities>,
+        implicit_minimum_prefix_tokens: Option<usize>,
+    ) -> Self {
         Self {
             capabilities,
+            implicit_minimum_prefix_tokens,
             ..Self::default()
         }
     }
@@ -296,19 +311,22 @@ impl CacheTracker {
     }
 
     fn observe(&mut self, usage: &Usage) {
+        let now = Instant::now();
+        let cache_activity = usage.cached_input_tokens > 0 || usage.cache_write_input_tokens > 0;
+        let estimated_cache_write = self
+            .implicit_minimum_prefix_tokens
+            .is_some_and(|minimum| self.pending_request_tokens >= minimum);
+        if cache_activity || estimated_cache_write {
+            self.implicit_activity = Some(now);
+            self.implicit_cached_tokens = self.pending_request_tokens;
+            self.implicit_prefix.clone_from(&self.pending_history);
+        }
         let Some(capabilities) = self.capabilities else {
             self.pending.clear();
             self.pending_request_tokens = 0;
             self.pending_history.clear();
             return;
         };
-        let now = Instant::now();
-        let cache_activity = usage.cached_input_tokens > 0 || usage.cache_write_input_tokens > 0;
-        if cache_activity && self.pending_request_tokens >= capabilities.minimum_prefix_tokens {
-            self.implicit_activity = Some(now);
-            self.implicit_cached_tokens = self.pending_request_tokens;
-            self.implicit_prefix.clone_from(&self.pending_history);
-        }
         let readable = self
             .pending
             .iter()
@@ -458,6 +476,14 @@ impl Backend {
         }
     }
 
+    fn implicit_cache_minimum_prefix_tokens(&self, model: &str) -> Option<usize> {
+        match self {
+            Self::OpenAi(_) => prompt_cache_capabilities(model)
+                .map(|capabilities| capabilities.minimum_prefix_tokens),
+            Self::Scripted { .. } => None,
+        }
+    }
+
     fn request_body(&self, history: &[serde_json::Value]) -> Option<serde_json::Value> {
         match self {
             Self::OpenAi(client) => Some(client.request_body(SYSTEM_PROMPT, history)),
@@ -540,6 +566,8 @@ async fn run_loop(
 ) -> Result<RunOutcome> {
     let run_started = Instant::now();
     let prompt_cache_capabilities = backend.prompt_cache_capabilities();
+    let implicit_cache_minimum_prefix_tokens =
+        backend.implicit_cache_minimum_prefix_tokens(&config.model);
     tokio::fs::create_dir_all(config.session_dir.join("tools")).await?;
     let resumed = config.resume_context.is_some();
     let mut trace_recovery = None;
@@ -566,6 +594,7 @@ async fn run_loop(
                 "history_items": context.input_items().len(),
                 "cache_ttl_seconds": CACHE_TTL.as_secs(),
                 "prompt_cache_capabilities": prompt_cache_capabilities,
+                "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
                 "compaction_policy": config.compaction_mode,
                 "source_session": config.resume_source,
             }),
@@ -585,6 +614,7 @@ async fn run_loop(
                 "max_steps": config.max_steps,
                 "cache_ttl_seconds": CACHE_TTL.as_secs(),
                 "prompt_cache_capabilities": prompt_cache_capabilities,
+                "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
                 "compaction_policy": config.compaction_mode,
                 "compaction_decision": "next_request"
             }),
@@ -613,7 +643,10 @@ async fn run_loop(
     }
     persist_context_checkpoint(&config, &context_state)?;
     let mut metrics = RunMetrics::default();
-    let mut cache = CacheTracker::new(prompt_cache_capabilities);
+    let mut cache = CacheTracker::new_with_implicit_minimum(
+        prompt_cache_capabilities,
+        implicit_cache_minimum_prefix_tokens,
+    );
     // A resumed provider session gets one unmodified request to reuse its persisted cache key.
     let mut sent_model_request = false;
     let mut step_index = 0;
@@ -1459,7 +1492,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_cache_capabilities_disable_cache_assumptions() {
+    fn provider_reported_implicit_cache_is_tracked_without_explicit_capabilities() {
         let mut cache = CacheTracker::new(None);
         cache.begin_request_with_tokens(
             vec![RenderedBreakpoint {
@@ -1470,12 +1503,11 @@ mod tests {
         );
         cache.observe(&Usage {
             cached_input_tokens: 4_000,
-            cache_write_input_tokens: 4_000,
             ..Usage::default()
         });
 
         let policy = cache.policy();
-        assert_eq!(policy.implicit_cached_tokens, 0);
+        assert_eq!(policy.implicit_cached_tokens, 4_000);
         assert!(policy.breakpoints.is_empty());
     }
 
@@ -1657,6 +1689,16 @@ mod tests {
     }
 
     #[test]
+    fn known_implicit_cache_estimates_an_unreported_write() {
+        let mut cache = CacheTracker::new_with_implicit_minimum(None, Some(1_024));
+        cache.begin_request_with_tokens(Vec::new(), 2_400);
+        cache.observe(&Usage::default());
+
+        assert_eq!(cache.policy().implicit_cached_tokens, 2_400);
+        assert!(cache.policy().breakpoints.is_empty());
+    }
+
+    #[test]
     fn policy_rejects_a_mutated_previous_implicit_prefix() {
         let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
         let original = vec![json!({"role": "user", "content": "original"})];
@@ -1777,6 +1819,7 @@ mod tests {
                 max_read_breakpoints: 2,
                 ..openai_cache_capabilities()
             }),
+            implicit_minimum_prefix_tokens: Some(openai_cache_capabilities().minimum_prefix_tokens),
             implicit_activity: Some(now),
             implicit_cached_tokens: 1_500,
             implicit_prefix: Vec::new(),
@@ -1811,6 +1854,7 @@ mod tests {
     fn aggregate_reads_do_not_resurrect_an_expired_generation() {
         let mut cache = CacheTracker {
             capabilities: Some(openai_cache_capabilities()),
+            implicit_minimum_prefix_tokens: Some(openai_cache_capabilities().minimum_prefix_tokens),
             implicit_activity: None,
             implicit_cached_tokens: 0,
             implicit_prefix: Vec::new(),
