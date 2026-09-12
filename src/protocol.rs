@@ -30,10 +30,6 @@ pub struct ContextManagement {
     pub keep: Vec<u64>,
     #[serde(rename = "removable")]
     pub drop: Vec<u64>,
-    /// Earlier human message replaced by later human direction. A concise `remember`
-    /// summary is required before this source may become compactable.
-    #[serde(default)]
-    pub superseded: Vec<u64>,
     pub remember: Vec<String>,
 }
 
@@ -153,7 +149,7 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Human-authored intent, requirements, constraints, and decisions are protected by default: completing a request does not make its originating user message removable. Stable items remain by default; volatile items may be removed automatically under budget pressure. If later human direction explicitly supersedes earlier direction, preserve a concise semantic summary with remember rather than dropping the older requirement. Retention decisions persist until reversed or applied by compaction.",
+        "description": "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Human-authored intent, requirements, constraints, and decisions start protected and remain so after completing a request. Mark a human message removable only with an explicit decision that it is no longer needed or that its still-relevant semantics have been preserved with remember. Stable items remain by default; volatile items may be removed automatically under budget pressure. Retention decisions persist until reversed or applied by compaction.",
         "properties": {
             "protected": {
                 "type": "array",
@@ -167,12 +163,6 @@ fn context_schema() -> Value {
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
-            "superseded": {
-                "type": "array",
-                "description": "At most one earlier human-message context ID that later human direction explicitly replaces. Use only with one concise remember entry that preserves its still-relevant constraints; completed instructions are not superseded merely because the immediate task finished.",
-                "items": { "type": "integer", "minimum": 1 },
-                "maxItems": 1
-            },
             "remember": {
                 "type": "array",
                 "description": "At most one concise learning that preserves what a bulky source taught you without retaining its exact details. Make the source removable rather than also protecting it. Preserve outcomes, not chain-of-thought.",
@@ -180,7 +170,7 @@ fn context_schema() -> Value {
                 "maxItems": 1
             }
         },
-        "required": ["protected", "removable", "superseded", "remember"],
+        "required": ["protected", "removable", "remember"],
         "additionalProperties": false
     })
 }
@@ -264,15 +254,10 @@ mod tests {
         );
         assert_eq!(
             context["required"],
-            json!(["protected", "removable", "superseded", "remember"])
+            json!(["protected", "removable", "remember"])
         );
-        assert!(description.contains("Human-authored intent"));
-        assert!(
-            context["properties"]["superseded"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("explicitly replaces")
-        );
+        assert!(description.contains("start protected"));
+        assert!(description.contains("explicit decision"));
         assert!(protected.contains("learned anything"));
         assert!(removable.contains("learned nothing"));
         assert!(removable.contains("preserved elsewhere"));

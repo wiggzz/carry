@@ -889,11 +889,6 @@ async fn run_loop(
                     "context_signals",
                     json!({"source_id": item_id, "signals": &signals, "expired_keep_leases": expired_keep_leases}),
                 )?;
-                let completed_human_intent = context_state.complete_active_human_intent();
-                logger.raw_event_silent(
-                    "human_intent_completed",
-                    json!({"context_ids": completed_human_intent}),
-                )?;
                 persist_context_checkpoint(&config, &context_state)?;
                 logger.raw_event(
                     if input.is_some() {

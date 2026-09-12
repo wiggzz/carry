@@ -40,14 +40,6 @@ pub(crate) enum ContextItemKind {
     Tool,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum HumanIntentState {
-    Active,
-    Completed,
-    Superseded,
-}
-
 impl Retention {
     fn label(self) -> &'static str {
         match self {
@@ -75,8 +67,6 @@ pub(crate) struct ContextItem {
     /// Immutable sweep advisory rendered inside this completed tool result.
     #[serde(default)]
     keep_lease_review: Option<String>,
-    #[serde(default)]
-    human_intent: Option<HumanIntentState>,
     memory: Option<MemoryData>,
 }
 
@@ -89,7 +79,7 @@ struct MemoryData {
 
 impl ContextItem {
     fn user(id: u64, content: String) -> Self {
-        let mut item = Self::new(
+        Self::new(
             id,
             ContextItemKind::User,
             Retention::Stable,
@@ -97,9 +87,7 @@ impl ContextItem {
                 "role": "user",
                 "content": [{ "type": "input_text", "text": content }]
             })],
-        );
-        item.human_intent = Some(HumanIntentState::Active);
-        item
+        )
     }
 
     fn memory(id: u64, source_id: u64, content: String) -> Self {
@@ -160,7 +148,6 @@ impl ContextItem {
             keep_lease_expired: false,
             display_retention: Some(retention),
             keep_lease_review: None,
-            human_intent: None,
             memory: None,
         }
     }
@@ -491,28 +478,15 @@ impl ContextState {
             .collect()
     }
 
-    pub fn complete_active_human_intent(&mut self) -> Vec<u64> {
-        let mut completed = Vec::new();
-        for item in &mut self.items {
-            if item.human_intent == Some(HumanIntentState::Active) {
-                item.human_intent = Some(HumanIntentState::Completed);
-                completed.push(item.id);
-            }
-        }
-        completed
-    }
-
     pub fn record_signals(&mut self, update: &ContextManagement, source_id: u64) -> SignalChange {
         let mut keep = Vec::new();
         let mut drop = Vec::new();
         let mut ignored = Vec::new();
 
-        // Human-authored direction is a durable source of requirements. A model may
-        // compact its own tool evidence, but it must not make a user instruction
-        // removable merely because the immediate task appears complete.
+        // Context items begin at their own retention default. Making any item
+        // removable is an explicit, model-authorized signal.
         for id in unique_ids(&update.drop) {
             match self.items.iter_mut().find(|item| item.id == id) {
-                Some(item) if item.kind == ContextItemKind::User => ignored.push(id),
                 Some(item) => {
                     item.signal = RetentionSignal::Drop;
                     drop.push(id);
@@ -530,60 +504,22 @@ impl ContextState {
             }
         }
 
-        let mut superseded = Vec::new();
-        let summary = update
-            .remember
-            .iter()
-            .map(|content| content.trim())
-            .find(|content| !content.is_empty());
-        let summary_source = if let (Some(summary), Some(id)) =
-            (summary, unique_ids(&update.superseded).first().copied())
-        {
-            match self.items.iter_mut().find(|item| item.id == id) {
-                Some(item)
-                    if item.kind == ContextItemKind::User
-                        && item.human_intent != Some(HumanIntentState::Superseded) =>
-                {
-                    item.human_intent = Some(HumanIntentState::Superseded);
-                    item.retention = Retention::Volatile;
-                    item.signal = RetentionSignal::Neutral;
-                    superseded.push(id);
-                    let _ = summary;
-                    Some(id)
-                }
-                _ => {
-                    ignored.push(id);
-                    None
-                }
-            }
-        } else {
-            ignored.extend(unique_ids(&update.superseded));
-            None
-        };
-
         let mut added = Vec::new();
-        for (index, content) in update
+        for content in update
             .remember
             .iter()
             .map(|content| content.trim())
             .filter(|content| !content.is_empty())
-            .enumerate()
         {
             let id = self.allocate_id();
-            let memory_source = if index == 0 {
-                summary_source.unwrap_or(source_id)
-            } else {
-                source_id
-            };
             self.items
-                .push(ContextItem::memory(id, memory_source, content.to_owned()));
+                .push(ContextItem::memory(id, source_id, content.to_owned()));
             added.push(id);
         }
 
         SignalChange {
             keep,
             drop,
-            superseded,
             ignored: unique_ids(&ignored),
             added,
         }
@@ -853,11 +789,7 @@ impl ContextState {
                 } else {
                     RetentionAuditAction::Kept
                 };
-                let reason = if item.human_intent == Some(HumanIntentState::Superseded)
-                    && dropped.contains(&item.id)
-                {
-                    RetentionAuditReason::SupersededHumanIntent
-                } else if item.signal == RetentionSignal::Drop {
+                let reason = if item.signal == RetentionSignal::Drop {
                     RetentionAuditReason::ExplicitRemovable
                 } else if item.keep_lease_expired {
                     RetentionAuditReason::ExpiredKeepLease
@@ -1075,7 +1007,6 @@ pub(crate) enum RetentionAuditReason {
     ExplicitKeep,
     ExpiredKeepLease,
     ExplicitRemovable,
-    SupersededHumanIntent,
     AutomaticNeutral,
     StableBaseline,
 }
@@ -1097,7 +1028,6 @@ pub(crate) struct KeepLeaseReview {
 pub(crate) struct SignalChange {
     pub keep: Vec<u64>,
     pub drop: Vec<u64>,
-    pub superseded: Vec<u64>,
     pub ignored: Vec<u64>,
     pub added: Vec<u64>,
 }
@@ -1145,7 +1075,6 @@ mod tests {
         ContextManagement {
             keep: keep.to_vec(),
             drop: drop.to_vec(),
-            superseded: Vec::new(),
             remember: remember.iter().map(|value| (*value).into()).collect(),
         }
     }
@@ -1174,15 +1103,12 @@ mod tests {
     }
 
     #[test]
-    fn human_direction_survives_an_explicit_removable_signal() {
+    fn human_direction_defaults_stable_and_explicitly_removable() {
         let mut state = ContextState::new("keep deployment private".into());
         let human = 1;
         let source = add_tool_with_output(&mut state, &"temporary output ".repeat(1_000));
-        let change = state.record_signals(&update(&[], &[human], &[]), source);
 
-        assert_eq!(change.drop, Vec::<u64>::new());
-        assert_eq!(change.ignored, vec![human]);
-        let plan = state
+        let default_plan = state
             .plan_compaction_with_neutral_budget(
                 &[],
                 CompactionPolicy {
@@ -1193,71 +1119,29 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert!(!plan.dropped.contains(&human));
-        state.compact(plan);
+        assert!(!default_plan.dropped.contains(&human));
+
+        let change = state.record_signals(&update(&[], &[human], &[]), source);
+        assert_eq!(change.drop, vec![human]);
+        assert!(change.ignored.is_empty());
+        let explicit_plan = state
+            .plan_compaction_with_neutral_budget(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                    payoff_requests: 1,
+                },
+                0,
+            )
+            .unwrap();
+        assert!(explicit_plan.dropped.contains(&human));
+        state.compact(explicit_plan);
         assert!(
-            serde_json::to_string(&state.input_items())
+            !serde_json::to_string(&state.input_items())
                 .unwrap()
                 .contains("keep deployment private")
         );
-    }
-
-    #[test]
-    fn completing_human_direction_keeps_it_protected() {
-        let mut state = ContextState::new("use an immutable release".into());
-        assert_eq!(state.complete_active_human_intent(), vec![1]);
-        assert_eq!(
-            state.items[0].human_intent,
-            Some(HumanIntentState::Completed)
-        );
-        let source = add_tool(&mut state);
-        let change = state.record_signals(&update(&[], &[1], &[]), source);
-        assert_eq!(change.ignored, vec![1]);
-        assert!(
-            serde_json::to_string(&state.input_items())
-                .unwrap()
-                .contains("use an immutable release")
-        );
-    }
-
-    #[test]
-    fn superseded_human_direction_compacts_only_after_a_summary_is_stored() {
-        let mut state = ContextState::new("deploy to staging only".into());
-        let human = 1;
-        let source = add_tool_with_output(&mut state, &"temporary output ".repeat(1_000));
-        let mut intent_update = update(
-            &[],
-            &[],
-            &["Deployment target changed from staging to production."],
-        );
-        intent_update.superseded = vec![human];
-        let change = state.record_signals(&intent_update, source);
-
-        assert_eq!(change.superseded, vec![human]);
-        assert_eq!(change.added.len(), 1);
-        assert_eq!(
-            state.items[0].human_intent,
-            Some(HumanIntentState::Superseded)
-        );
-
-        let plan = state
-            .plan_compaction_with_neutral_budget(
-                &[],
-                CompactionPolicy {
-                    implicit_cached_tokens: 0,
-                    breakpoints: Vec::new(),
-                    payoff_requests: 1,
-                },
-                0,
-            )
-            .unwrap();
-        let compacted = state.compact(plan);
-        let rendered = serde_json::to_string(&state.input_items()).unwrap();
-        assert!(!rendered.contains("deploy to staging only"));
-        assert!(rendered.contains("Deployment target changed from staging to production."));
-        assert!(compacted.retention_audit.iter().any(|entry| {
-            entry.id == human && entry.reason == RetentionAuditReason::SupersededHumanIntent
-        }));
     }
 
     #[test]
@@ -2044,10 +1928,6 @@ mod tests {
     #[test]
     fn new_generation_does_not_embed_an_incompatible_older_breakpoint() {
         let mut state = ContextState::new("initial ".repeat(800));
-        // This regression needs an ordinary stable prefix that is eligible for
-        // replacement; human direction itself is deliberately never eligible.
-        state.items[0].kind = ContextItemKind::Status;
-        state.items[0].human_intent = None;
         let disposable = add_tool(&mut state);
         let first_retained = add_tool(&mut state);
         state.record_signals(
