@@ -41,7 +41,7 @@ At each step:
 
 Retention decisions persist until reversed or applied by compaction. Preserve outcomes, not chain-of-thought.
 
-MCP tools are available through the exact Carry executable in `$CARRY_SELF`. Discover them with `"$CARRY_SELF" mcp list`, inspect a tool with `"$CARRY_SELF" mcp describe SERVER/TOOL`, and invoke it with `"$CARRY_SELF" mcp call SERVER/TOOL '{"argument":"value"}'`. MCP command output is JSON.
+MCP tools are available through the exact Carry executable in `$CARRY_SELF`. Discover them with `"$CARRY_SELF" mcp list`, inspect a tool with `"$CARRY_SELF" mcp describe SERVER/TOOL`, and invoke it with `"$CARRY_SELF" mcp call SERVER/TOOL '{"argument":"value"}'`. MCP command output is JSON. If a server requires authorization, ask the user to run `"$CARRY_SELF" mcp auth SERVER`.
 
 Large stdout and stderr results arrive in separate structured sections. Each text payload is unmodified; truncation, encoding, and artifact-path metadata are outside that payload. Read or slice the relevant stdout/stderr artifact when omitted details matter.
 
