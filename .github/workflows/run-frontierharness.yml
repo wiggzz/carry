@@ -1,0 +1,162 @@
+name: Run FrontierHarness
+
+on:
+  workflow_dispatch:
+    inputs:
+      carry_ref:
+        description: Carry branch, tag, or immutable commit to evaluate (main or a PR head ref)
+        required: true
+        default: main
+        type: string
+      mode:
+        description: plan is offline; provision freezes a source checkpoint; smoke/full require that checkpoint
+        required: true
+        default: plan
+        type: choice
+        options: [plan, provision, smoke-2, full-30]
+      checkpoint_name:
+        description: Immutable Runta checkpoint name (provision creates it; smoke/full restore it)
+        required: true
+        default: carry-fh-manual
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-source:
+    name: Resolve ${{ inputs.carry_ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.carry_ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve immutable Carry revision and validate local adapters
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          python3 benchmarks/frontierharness/test_adapter.py
+          python3 benchmarks/frontierharness/test_agents.py
+          python3 benchmarks/frontierharness/test_run_suite.py
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          {
+            echo "## FrontierHarness source"
+            echo "- requested ref: \`${{ inputs.carry_ref }}\`"
+            echo "- immutable Carry commit: \`$commit\`"
+            echo "- evaluator commit: \`e837a70bd6beb4e72eeeda62dd06e3bd34f6cb63\`"
+            echo "- mode: \`${{ inputs.mode }}\`"
+            echo "- checkpoint: \`${{ inputs.checkpoint_name }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  run-hosted:
+    name: ${{ inputs.mode }} (hosted)
+    needs: resolve-source
+    if: ${{ inputs.mode == 'provision' || inputs.mode == 'smoke-2' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment: frontierharness
+    concurrency:
+      group: frontierharness-${{ inputs.checkpoint_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.resolve-source.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned Runta CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @runta/runta-cli@0.2.4
+          runta --version
+          jq --version
+
+      - name: ${{ inputs.mode }} against frozen Carry source
+        env:
+          RUNTA_TOKEN: ${{ secrets.RUNTA_TOKEN }}
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p frontierharness-output
+          bash scripts/run-frontierharness-ci.sh \
+            --mode '${{ inputs.mode }}' \
+            --source "$GITHUB_WORKSPACE" \
+            --commit '${{ needs.resolve-source.outputs.commit }}' \
+            --repo '${{ github.server_url }}/${{ github.repository }}.git' \
+            --checkpoint '${{ inputs.checkpoint_name }}' \
+            --run-id "gh-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --out "$GITHUB_WORKSPACE/frontierharness-output"
+
+      - name: Upload protected benchmark evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: frontierharness-${{ inputs.mode }}-${{ needs.resolve-source.outputs.commit }}
+          path: frontierharness-output
+          if-no-files-found: warn
+          retention-days: 14
+
+  run-full:
+    name: full-30 (benchmark runner)
+    needs: resolve-source
+    if: ${{ inputs.mode == 'full-30' }}
+    # A full sequential 30-task run can exceed GitHub-hosted's six-hour ceiling.
+    # Configure this label on a protected self-hosted runner with Node, jq, and Python 3.
+    runs-on: [self-hosted, frontierharness]
+    timeout-minutes: 4320
+    environment: frontierharness
+    concurrency:
+      group: frontierharness-${{ inputs.checkpoint_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.resolve-source.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned Runta CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @runta/runta-cli@0.2.4
+          runta --version
+          jq --version
+
+      - name: Run all FrontierHarness tasks from the frozen checkpoint
+        env:
+          RUNTA_TOKEN: ${{ secrets.RUNTA_TOKEN }}
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p frontierharness-output
+          bash scripts/run-frontierharness-ci.sh \
+            --mode full-30 \
+            --source "$GITHUB_WORKSPACE" \
+            --commit '${{ needs.resolve-source.outputs.commit }}' \
+            --repo '${{ github.server_url }}/${{ github.repository }}.git' \
+            --checkpoint '${{ inputs.checkpoint_name }}' \
+            --run-id "gh-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --out "$GITHUB_WORKSPACE/frontierharness-output"
+
+      - name: Upload protected benchmark evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: frontierharness-full-30-${{ needs.resolve-source.outputs.commit }}
+          path: frontierharness-output
+          if-no-files-found: warn
+          retention-days: 14

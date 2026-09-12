@@ -1,0 +1,2 @@
+terminal-bench/regex-log
+datacurve/expr-try-catch-errors
