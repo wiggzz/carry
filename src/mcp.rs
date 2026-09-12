@@ -361,11 +361,16 @@ async fn authorization_manager(
     Ok(manager)
 }
 
+fn install_mcp_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 async fn http_transport(
     carry_home: &Path,
     name: &str,
     url: &str,
 ) -> Result<StreamableHttpClientTransport<AuthClient<reqwest_mcp::Client>>> {
+    install_mcp_crypto_provider();
     let manager = authorization_manager(carry_home, name, url).await?;
     let client = AuthClient::new(reqwest_mcp::Client::new(), manager);
     Ok(StreamableHttpClientTransport::with_client(
@@ -423,6 +428,7 @@ async fn authorize(carry_home: &Path, name: &str) -> Result<()> {
 }
 
 async fn authorization_challenge(url: &str, name: &str) -> Result<String> {
+    install_mcp_crypto_provider();
     let transport = StreamableHttpClientTransport::from_uri(url);
     match ClientInfo::default().serve(transport).await {
         Ok(client) => {
