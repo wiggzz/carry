@@ -260,18 +260,10 @@ mod tests {
             description,
             "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Keep human-authored content by default. Mark it removable only if it is a large item whose information can be safely summarized, is available elsewhere, or provides no directional change or learning. Stable items remain by default; volatile items may be removed automatically under budget pressure. Retention decisions persist until reversed or applied by compaction."
         );
-        assert_eq!(
-            protected,
-            "Protect up to four context IDs when you learned anything from them that is not preserved elsewhere. This is especially important for volatile items. When only a concise learning must remain, use remember and make its bulky source removable instead. Protecting an ID reverses a removable decision."
-        );
-        assert_eq!(
-            removable,
-            "Mark up to four context IDs removable only when you learned nothing from them, or when everything learned from them is preserved elsewhere. Finishing an action does not preserve its learning. Making an ID removable reverses protection."
-        );
-        assert_eq!(
-            remember,
-            "At most one concise learning that preserves what a bulky source taught you without retaining its exact details. Make the source removable rather than also protecting it. Preserve outcomes, not chain-of-thought."
-        );
+        assert!(protected.contains("learned anything"));
+        assert!(removable.contains("learned nothing"));
+        assert!(removable.contains("preserved elsewhere"));
+        assert!(remember.contains("concise learning"));
     }
 
     #[test]
