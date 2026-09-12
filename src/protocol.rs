@@ -149,23 +149,23 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "After choosing the next action, manage recent context. User messages start protected; mark one removable only when deliberately safe. Stable context stays by default; volatile context may compact under budget pressure.",
+        "description": "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Keep human-authored content by default. Mark it removable only if it is a large item whose information can be safely summarized, is available elsewhere, or provides no directional change or learning. Stable items remain by default; volatile items may be removed automatically under budget pressure. Retention decisions persist until reversed or applied by compaction.",
         "properties": {
             "protected": {
                 "type": "array",
-                "description": "IDs that must remain. Use for volatile context whose information is not preserved elsewhere. Reverses removable.",
+                "description": "Protect up to four context IDs when you learned anything from them that is not preserved elsewhere. This is especially important for volatile items. When only a concise learning must remain, use remember and make its bulky source removable instead. Protecting an ID reverses a removable decision.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "removable": {
                 "type": "array",
-                "description": "IDs safe to remove because they add no needed information or remember preserves it. Reverses protected.",
+                "description": "Mark up to four context IDs removable only when you learned nothing from them, or when everything learned from them is preserved elsewhere. Finishing an action does not preserve its learning. Making an ID removable reverses protection.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "remember": {
                 "type": "array",
-                "description": "One concise fact to preserve before removing a bulky source. Do not include chain-of-thought.",
+                "description": "At most one concise learning that preserves what a bulky source taught you without retaining its exact details. Make the source removable rather than also protecting it. Preserve outcomes, not chain-of-thought.",
                 "items": { "type": "string" },
                 "maxItems": 1
             }
@@ -226,7 +226,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn context_schema_uses_learning_framed_protected_and_removable_names() {
+    fn context_schema_keeps_human_content_by_default() {
         let schema = tool_definitions();
         let context = &schema[0]["parameters"]["properties"]["context"];
         let description = context["description"].as_str().unwrap();
@@ -258,19 +258,19 @@ mod tests {
         );
         assert_eq!(
             description,
-            "After choosing the next action, manage recent context. User messages start protected; mark one removable only when deliberately safe. Stable context stays by default; volatile context may compact under budget pressure."
+            "After selecting the highest-priority action, assess recently added visible context as secondary housekeeping. Keep human-authored content by default. Mark it removable only if it is a large item whose information can be safely summarized, is available elsewhere, or provides no directional change or learning. Stable items remain by default; volatile items may be removed automatically under budget pressure. Retention decisions persist until reversed or applied by compaction."
         );
         assert_eq!(
             protected,
-            "IDs that must remain. Use for volatile context whose information is not preserved elsewhere. Reverses removable."
+            "Protect up to four context IDs when you learned anything from them that is not preserved elsewhere. This is especially important for volatile items. When only a concise learning must remain, use remember and make its bulky source removable instead. Protecting an ID reverses a removable decision."
         );
         assert_eq!(
             removable,
-            "IDs safe to remove because they add no needed information or remember preserves it. Reverses protected."
+            "Mark up to four context IDs removable only when you learned nothing from them, or when everything learned from them is preserved elsewhere. Finishing an action does not preserve its learning. Making an ID removable reverses protection."
         );
         assert_eq!(
             remember,
-            "One concise fact to preserve before removing a bulky source. Do not include chain-of-thought."
+            "At most one concise learning that preserves what a bulky source taught you without retaining its exact details. Make the source removable rather than also protecting it. Preserve outcomes, not chain-of-thought."
         );
     }
 
