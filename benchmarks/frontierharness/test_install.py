@@ -33,6 +33,11 @@ class FrontierHarnessInstallTests(unittest.TestCase):
                 "printf 'cargo %s\\n' \"$*\" >> \"$TEST_LOG\"\n"
                 "CARGO\n"
                 "chmod 0755 \"$HOME/.cargo/bin/cargo\"\n"
+                "cat > \"$HOME/.cargo/bin/rustup\" <<'RUSTUP'\n"
+                "#!/usr/bin/env bash\n"
+                "printf 'rustup %s\\n' \"$*\" >> \"$TEST_LOG\"\n"
+                "RUSTUP\n"
+                "chmod 0755 \"$HOME/.cargo/bin/rustup\"\n"
                 "INSTALLER\n"
             )
             installer.chmod(0o755)
@@ -53,11 +58,20 @@ class FrontierHarnessInstallTests(unittest.TestCase):
                 "    : > \"$TEST_FAKE_BIN/apt-install-failed\"\n"
                 "    exit 100\n"
                 "  fi\n"
-                "  cat > \"$TEST_FAKE_BIN/cc\" <<'CC'\n"
+                "  if [[ \" $* \" == *\" build-essential \"* ]]; then\n"
+                "    cat > \"$TEST_FAKE_BIN/cc\" <<'CC'\n"
                 "#!/usr/bin/env bash\n"
                 "exit 0\n"
                 "CC\n"
-                "  chmod 0755 \"$TEST_FAKE_BIN/cc\"\n"
+                "    chmod 0755 \"$TEST_FAKE_BIN/cc\"\n"
+                "  fi\n"
+                "  if [[ \" $* \" == *\" musl-tools \"* ]]; then\n"
+                "    cat > \"$TEST_FAKE_BIN/musl-gcc\" <<'MUSL'\n"
+                "#!/usr/bin/env bash\n"
+                "exit 0\n"
+                "MUSL\n"
+                "    chmod 0755 \"$TEST_FAKE_BIN/musl-gcc\"\n"
+                "  fi\n"
                 "fi\n"
             )
             apt_get.chmod(0o755)
@@ -96,7 +110,8 @@ class FrontierHarnessInstallTests(unittest.TestCase):
                 ],
             )
             self.assertTrue(any(line.startswith("curl ") for line in commands))
-            self.assertIn("cargo build --locked --release", commands)
+            self.assertIn("rustup target add x86_64-unknown-linux-musl", commands)
+            self.assertIn("cargo build --locked --release --target x86_64-unknown-linux-musl", commands)
             self.assertEqual(
                 commands[-3:],
                 [

@@ -23,6 +23,25 @@ if ! command -v cc >/dev/null 2>&1; then
 fi
 command -v cc >/dev/null 2>&1 || { echo "cargo requires a C compiler" >&2; exit 1; }
 
+# A fully static musl binary runs in older task images as well as the modern
+# checkpoint runtime. Install its linker separately because a host C compiler
+# does not imply that musl-gcc is available.
+if ! command -v musl-gcc >/dev/null 2>&1; then
+  command -v apt-get >/dev/null 2>&1 || { echo "static Carry builds require musl-tools and apt-get is unavailable" >&2; exit 1; }
+  export DEBIAN_FRONTEND=noninteractive
+  for attempt in 1 2 3; do
+    if apt-get update -qq && apt-get install -y -qq musl-tools >/dev/null; then
+      break
+    fi
+    if [[ "$attempt" == 3 ]]; then
+      echo "static Carry builds require musl-tools; apt-get failed after 3 attempts" >&2
+      exit 1
+    fi
+    sleep "$attempt"
+  done
+fi
+command -v musl-gcc >/dev/null 2>&1 || { echo "static Carry builds require musl-gcc" >&2; exit 1; }
+
 # The FrontierHarness provisioning base image supplies Python tooling but not Rust.
 # Bootstrap a minimal toolchain only when the runtime does not already provide one.
 if ! command -v cargo >/dev/null 2>&1; then
@@ -30,8 +49,12 @@ if ! command -v cargo >/dev/null 2>&1; then
   export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
-cargo build --locked --release
-./target/release/carry --help >/dev/null 2>&1 || true
+rustup target add x86_64-unknown-linux-musl
+# The cc crate otherwise guesses x86_64-linux-musl-gcc; Debian's musl-tools
+# guarantees the portable musl-gcc wrapper instead.
+export CC_x86_64_unknown_linux_musl=musl-gcc
+cargo build --locked --release --target x86_64-unknown-linux-musl
+./target/x86_64-unknown-linux-musl/release/carry --help >/dev/null 2>&1 || true
 python3 benchmarks/frontierharness/test_adapter.py
 python3 benchmarks/frontierharness/test_agents.py
 python3 benchmarks/frontierharness/test_run_suite.py
