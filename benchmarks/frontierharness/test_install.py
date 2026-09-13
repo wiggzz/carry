@@ -57,16 +57,24 @@ class FrontierHarnessInstallTests(unittest.TestCase):
                 "fi\n"
             )
             apt_get.chmod(0o755)
+            # Isolate PATH without relying on whether a runner happens to expose
+            # /bin/cc as a symlink.  Supply only the shell utilities the mocked
+            # installer needs; notably, do not supply cc until fake apt-get does.
+            for command in ("bash", "sh", "mkdir", "cat", "chmod"):
+                resolved = shutil.which(command)
+                if resolved is None:
+                    self.fail(f"required shell utility is unavailable: {command}")
+                (fake_bin / command).symlink_to(resolved)
             environment = {
                 "HOME": str(root / "home"),
-                "PATH": f"{fake_bin}:/bin",
+                "PATH": str(fake_bin),
                 "TEST_LOG": str(log),
                 "TEST_FAKE_BIN": str(fake_bin),
             }
             self.assertIsNone(shutil.which("cargo", path=environment["PATH"]))
             self.assertIsNone(shutil.which("cc", path=environment["PATH"]))
             completed = subprocess.run(
-                ["bash", str(INSTALL)],
+                ["/bin/bash", str(INSTALL)],
                 cwd=INSTALL.parents[2],
                 text=True,
                 capture_output=True,
