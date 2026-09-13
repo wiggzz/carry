@@ -1,0 +1,278 @@
+name: Run FrontierHarness
+
+on:
+  workflow_dispatch:
+    inputs:
+      carry_ref:
+        description: Carry branch, tag, or immutable commit to evaluate (main or a PR head ref)
+        required: true
+        default: main
+        type: string
+      mode:
+        description: plan is offline; provision freezes a source checkpoint; smoke/full restore it
+        required: true
+        default: plan
+        type: choice
+        options: [plan, provision, smoke-2, full-30]
+      checkpoint_name:
+        description: Immutable Runta checkpoint name (provision creates it; smoke/full restore it)
+        required: true
+        default: carry-fh-manual
+        type: string
+
+permissions:
+  contents: read
+
+# Serialize workflow runs for one checkpoint without cancelling queued matrix shards.
+concurrency:
+  group: frontierharness-${{ inputs.checkpoint_name }}
+  cancel-in-progress: false
+
+jobs:
+  resolve-source:
+    name: Resolve ${{ inputs.carry_ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      task_matrix: ${{ steps.shards.outputs.matrix }}
+      task_count: ${{ steps.shards.outputs.task_count }}
+      manifest_sha256: ${{ steps.shards.outputs.manifest_sha256 }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.carry_ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve immutable Carry revision and validate local adapters
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          python3 benchmarks/frontierharness/test_adapter.py
+          python3 benchmarks/frontierharness/test_agents.py
+          python3 benchmarks/frontierharness/test_run_suite.py
+          python3 benchmarks/frontierharness/test_shards.py
+          python3 benchmarks/frontierharness/test_ci_entrypoint.py
+          python3 benchmarks/frontierharness/test_merge_shards.py
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Freeze hosted task shards
+        id: shards
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ inputs.mode }}' in
+            smoke-2)
+              manifest=benchmarks/frontierharness/smoke-2.txt
+              batch_size=1
+              ;;
+            full-30)
+              manifest=benchmarks/frontierharness/tasks-30.txt
+              # Two tasks are bounded below GitHub-hosted's six-hour limit even if
+              # each spends its 90-minute agent timeout plus image/startup overhead.
+              batch_size=2
+              ;;
+            *)
+              echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+              echo 'task_count=0' >> "$GITHUB_OUTPUT"
+              echo 'manifest_sha256=' >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          matrix=$(python3 scripts/frontierharness_shards.py --tasks "$manifest" --batch-size "$batch_size")
+          task_count=$(python3 - "$matrix" <<'PY'
+          import json, sys
+          print(sum(len(shard["tasks"]) for shard in json.loads(sys.argv[1])["include"]))
+          PY
+          )
+          manifest_sha256=$(sha256sum "$manifest" | awk '{print $1}')
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+          printf 'task_count=%s\n' "$task_count" >> "$GITHUB_OUTPUT"
+          printf 'manifest_sha256=%s\n' "$manifest_sha256" >> "$GITHUB_OUTPUT"
+          {
+            echo "## FrontierHarness source"
+            echo "- requested ref: \`${{ inputs.carry_ref }}\`"
+            echo "- immutable Carry commit: \`${{ steps.source.outputs.commit }}\`"
+            echo "- evaluator commit: \`e837a70bd6beb4e72eeeda62dd06e3bd34f6cb63\`"
+            echo "- mode: \`${{ inputs.mode }}\`"
+            echo "- checkpoint: \`${{ inputs.checkpoint_name }}\`"
+            echo "- task count: \`$task_count\`"
+            echo "- frozen task-manifest SHA-256: \`$manifest_sha256\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  provision:
+    name: provision (hosted)
+    needs: resolve-source
+    if: ${{ inputs.mode == 'provision' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment: frontierharness
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.resolve-source.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned Runta CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @runta/runta-cli@0.2.4
+          runta --version
+          jq --version
+
+      - name: Provision frozen checkpoint
+        env:
+          RUNTA_TOKEN: ${{ secrets.RUNTA_TOKEN }}
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p frontierharness-output
+          bash scripts/run-frontierharness-ci.sh \
+            --mode provision \
+            --source "$GITHUB_WORKSPACE" \
+            --commit '${{ needs.resolve-source.outputs.commit }}' \
+            --repo '${{ github.server_url }}/${{ github.repository }}.git' \
+            --checkpoint '${{ inputs.checkpoint_name }}' \
+            --run-id "gh-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --out "$GITHUB_WORKSPACE/frontierharness-output"
+
+      - name: Upload protected provision evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: frontierharness-provision-${{ needs.resolve-source.outputs.commit }}
+          path: frontierharness-output
+          if-no-files-found: warn
+          retention-days: 14
+
+  run-hosted-shards:
+    name: ${{ inputs.mode }} shard ${{ matrix.index }} (hosted)
+    needs: resolve-source
+    if: ${{ inputs.mode == 'smoke-2' || inputs.mode == 'full-30' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment: frontierharness
+    strategy:
+      fail-fast: false
+      # Keep the first live full run serial: it bounds concurrent Runta/model spend.
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.resolve-source.outputs.task_matrix) }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.resolve-source.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned Runta CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @runta/runta-cli@0.2.4
+          runta --version
+          jq --version
+
+      - name: Write frozen task shard
+        env:
+          TASKS_JSON: ${{ toJSON(matrix.tasks) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$TASKS_JSON" > shard-tasks.txt <<'PY'
+          import json, sys
+          for task in json.loads(sys.argv[1]):
+              print(task)
+          PY
+          test "$(wc -l < shard-tasks.txt | tr -d ' ')" -ge 1
+
+      - name: Run frozen checkpoint task shard
+        env:
+          RUNTA_TOKEN: ${{ secrets.RUNTA_TOKEN }}
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p frontierharness-output
+          bash scripts/run-frontierharness-ci.sh \
+            --mode '${{ inputs.mode }}' \
+            --source "$GITHUB_WORKSPACE" \
+            --commit '${{ needs.resolve-source.outputs.commit }}' \
+            --repo '${{ github.server_url }}/${{ github.repository }}.git' \
+            --checkpoint '${{ inputs.checkpoint_name }}' \
+            --run-id "gh-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.index }}" \
+            --tasks "$GITHUB_WORKSPACE/shard-tasks.txt" \
+            --out "$GITHUB_WORKSPACE/frontierharness-output"
+
+      - name: Upload protected shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: frontierharness-${{ inputs.mode }}-${{ needs.resolve-source.outputs.commit }}-shard-${{ matrix.index }}
+          path: frontierharness-output/runs
+          if-no-files-found: warn
+          retention-days: 14
+
+  merge-hosted-shards:
+    name: Merge ${{ inputs.mode }} hosted evidence
+    needs: [resolve-source, run-hosted-shards]
+    if: ${{ always() && (inputs.mode == 'smoke-2' || inputs.mode == 'full-30') && needs.run-hosted-shards.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.resolve-source.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download all shard evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: frontierharness-${{ inputs.mode }}-${{ needs.resolve-source.outputs.commit }}-shard-*
+          path: frontierharness-shards
+          merge-multiple: false
+
+      - name: Validate and merge frozen shard evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ inputs.mode }}' in
+            smoke-2) manifest=benchmarks/frontierharness/smoke-2.txt ;;
+            full-30) manifest=benchmarks/frontierharness/tasks-30.txt ;;
+            *) exit 2 ;;
+          esac
+          actual_sha256=$(sha256sum "$manifest" | awk '{print $1}')
+          test "$actual_sha256" = '${{ needs.resolve-source.outputs.manifest_sha256 }}'
+          test '${{ needs.resolve-source.outputs.task_count }}' -gt 0
+          python3 scripts/merge_frontierharness_shards.py \
+            --expected "$manifest" --shards frontierharness-shards --out merged-run > merge.json
+          git clone --quiet https://github.com/frontier-harness-eval/eval.git evaluator
+          git -C evaluator checkout --quiet e837a70bd6beb4e72eeeda62dd06e3bd34f6cb63
+          python3 - "$manifest" > benchmark.json <<'PY'
+          import json, sys
+          task_ids = [line.split('#', 1)[0].strip() for line in open(sys.argv[1], encoding='utf-8')]
+          task_ids = [task for task in task_ids if task]
+          print(json.dumps({'task_count': len(task_ids), 'task_ids': task_ids}))
+          PY
+          node evaluator/skills/frontierharness-eval/scripts/normalize-results.mjs \
+            --run merged-run --benchmark benchmark.json \
+            --label "Carry ${{ needs.resolve-source.outputs.commit }} (${{ inputs.mode }})"
+          cp merge.json merged-run/merge.json
+          jq '{completed, expected, full_coverage, successful, infra_invalid, total_cost_usd, effective_cost_per_pass}' \
+            merged-run/candidate.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload consolidated benchmark evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: frontierharness-${{ inputs.mode }}-${{ needs.resolve-source.outputs.commit }}-combined
+          path: merged-run
+          if-no-files-found: warn
+          retention-days: 14

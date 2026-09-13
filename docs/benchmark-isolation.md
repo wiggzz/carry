@@ -81,3 +81,37 @@ trusted preparation and grading only. Gold patches, hidden test patches, evaluat
 assets, and canonical records are absent from agent mounts. Official reports alone
 determine resolution. Evaluator processes have all `OPENAI_*` variables removed
 and may use only host Docker and canonical task data.
+
+## FrontierHarness Eval
+
+`.github/workflows/run-frontierharness.yml` is a separate manual benchmark lane;
+it never changes SWE-bench selection or execution. `carry_ref` is checked out and
+resolved to a full SHA before any protected credential is available. That SHA—not a
+branch name—is passed to the Runta provisioning script and recorded in artifacts.
+
+The workflow has deliberately separate modes:
+
+- `plan` is offline and exercises adapter-contract tests only.
+- `provision` builds Carry once in a clean Runta runtime, freezes a named checkpoint,
+  retrieves its manifest, and deletes that build runtime.
+- `smoke-2` runs one Terminal-Bench and one DeepSWE task through the same hosted
+  one-task shard and evidence-merge path used by the full run.
+- `full-30` restores the same checkpoint for the complete published task set using
+  deterministic two-task shards on GitHub-hosted runners. Shards run serially under
+  the workflow-level checkpoint lock, so no EC2/self-hosted orchestrator remains
+  running while Runta executes trials. The merger checks the frozen task-manifest
+  SHA-256 and requires exactly one evidence record per task before normalization.
+
+The checkpoint name is an explicit input: smoke/full must not silently rebuild or
+retarget it. The protected `frontierharness` Environment supplies `RUNTA_TOKEN` and
+`FIREWORKS_API_KEY`; Runta injects only a secret stub into the runtime and the actual
+key is never a command-line value or artifact. Each task receives a fresh checkpoint
+restore. Carry writes `trace.jsonl`, `result.json`, and `final.patch` under the task
+agent log mount. The adapters preserve those files, mark an absent/crashed Carry run
+as runtime evidence rather than rewriting a verifier result, and extract only actual
+`model_response` usage from the trace for cost accounting.
+
+The lane pins FrontierHarness Eval at
+`e837a70bd6beb4e72eeeda62dd06e3bd34f6cb63`, Harbor `0.22.0`, Pier `0.3.1`, and
+Runta CLI `0.2.4`. Scores are provisional until a matched Pi control uses the same
+checkpoint resources, provider, task order, and model configuration.
