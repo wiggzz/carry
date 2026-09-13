@@ -14,6 +14,7 @@ import unittest
 ENTRYPOINT = Path(__file__).parents[2] / "scripts" / "run-frontierharness-ci.sh"
 PREPARE_PATCH = Path(__file__).with_name("patch_prepare_image.py")
 CALCULATE_PATCH = Path(__file__).with_name("patch_calculate_cost.py")
+PROVISION_PATCH = Path(__file__).with_name("patch_provision_base_tools.py")
 spec = importlib.util.spec_from_file_location("patch_prepare_image", PREPARE_PATCH)
 assert spec and spec.loader
 prepare_patch = importlib.util.module_from_spec(spec)
@@ -22,6 +23,10 @@ calc_spec = importlib.util.spec_from_file_location("patch_calculate_cost", CALCU
 assert calc_spec and calc_spec.loader
 calculate_patch = importlib.util.module_from_spec(calc_spec)
 calc_spec.loader.exec_module(calculate_patch)
+provision_spec = importlib.util.spec_from_file_location("patch_provision_base_tools", PROVISION_PATCH)
+assert provision_spec and provision_spec.loader
+provision_patch = importlib.util.module_from_spec(provision_spec)
+provision_spec.loader.exec_module(provision_patch)
 
 
 class NormalizerWorkingDirectoryTests(unittest.TestCase):
@@ -34,6 +39,7 @@ class NormalizerWorkingDirectoryTests(unittest.TestCase):
             helper.write_text("raise SystemExit(0)\n")
             (helper.parent / "patch_prepare_image.py").write_text(PREPARE_PATCH.read_text())
             (helper.parent / "patch_calculate_cost.py").write_text(CALCULATE_PATCH.read_text())
+            (helper.parent / "patch_provision_base_tools.py").write_text(PROVISION_PATCH.read_text())
             subprocess.run(["git", "init", "-q", str(source)], check=True)
             subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.com"], check=True)
             subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
@@ -59,6 +65,7 @@ class NormalizerWorkingDirectoryTests(unittest.TestCase):
             )
             run_trials.chmod(0o755)
             (scripts / "calculate-cost.py").write_text("before\n" + calculate_patch.OLD + "after\n")
+            (scripts / "provision-golden-checkpoint.sh").write_text("before\n" + provision_patch.OLD + "after\n")
             (scripts / "normalize-results.mjs").write_text("// Fake node command is used by this test.\n")
 
             fake_bin = root / "bin"
