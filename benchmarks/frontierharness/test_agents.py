@@ -27,9 +27,16 @@ class _FakeBaseAgent:
     def _get_env(self, key: str, *_: str) -> str | None:
         return os.environ.get(key)
 
+    def populate_context_post_run(self, context: _FakeContext) -> None:
+        return None
+
     @classmethod
     def import_path(cls) -> str:
         return f"{cls.__module__}:{cls.__name__}"
+
+
+class _FakeInstalledAgent(_FakeBaseAgent):
+    pass
 
 
 class _FakeContext:
@@ -88,6 +95,8 @@ def _install_runner_stubs() -> None:
         _module(root)
         _module(f"{root}.agents")
         _module(f"{root}.agents.base", BaseAgent=_FakeBaseAgent)
+        _module(f"{root}.agents.installed")
+        _module(f"{root}.agents.installed.base", BaseInstalledAgent=_FakeInstalledAgent)
         _module(f"{root}.environments")
         _module(f"{root}.environments.base", BaseEnvironment=_Environment)
         _module(f"{root}.models")
@@ -102,7 +111,7 @@ class CarryAgentContractTests(unittest.TestCase):
         cls.harbor = importlib.import_module("carry_frontierharness.harbor_agent").CarryAgent
         cls.pier = importlib.import_module("carry_frontierharness.pier_agent").CarryAgent
 
-    def exercise(self, agent_type: type[_FakeBaseAgent]) -> None:
+    def exercise(self, agent_type: type[_FakeBaseAgent], *, invoke_post_run_hook: bool = True) -> _FakeContext:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             binary = root / "carry"
@@ -131,7 +140,8 @@ class CarryAgentContractTests(unittest.TestCase):
                 context = _FakeContext()
                 asyncio.run(agent.setup(environment))
                 asyncio.run(agent.run("solve the task", environment, context))
-                agent.populate_context_post_run(context)
+                if invoke_post_run_hook:
+                    agent.populate_context_post_run(context)
             finally:
                 os.environ.clear()
                 os.environ.update(old)
@@ -144,15 +154,20 @@ class CarryAgentContractTests(unittest.TestCase):
         self.assertIn("accounts/fireworks/models/kimi-k3", command)
         self.assertNotIn("runta-secret-stub", command)
         self.assertEqual(env, {"OPENAI_API_KEY": "runta-secret-stub"})
-        self.assertEqual(context.n_input_tokens, 8)
-        self.assertEqual(context.n_cache_tokens, 3)
-        self.assertEqual(context.n_output_tokens, 5)
+        if invoke_post_run_hook:
+            self.assertEqual(context.n_input_tokens, 8)
+            self.assertEqual(context.n_cache_tokens, 3)
+            self.assertEqual(context.n_output_tokens, 5)
+        return context
 
     def test_harbor_adapter_uploads_and_runs_carry(self) -> None:
         self.exercise(self.harbor)
 
     def test_pier_adapter_uploads_and_runs_carry(self) -> None:
         self.exercise(self.pier)
+
+    def test_pier_adapter_uses_pier_installed_agent_lifecycle(self) -> None:
+        self.assertTrue(issubclass(self.pier, _FakeInstalledAgent))
 
     def test_missing_trace_after_a_crash_is_an_infrastructure_error(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
