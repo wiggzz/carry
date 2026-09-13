@@ -49,7 +49,7 @@ class FrontierHarnessCiEntrypointTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.com"], check=True)
             subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
             for name in (
-                "test_adapter.py", "test_agents.py", "test_run_suite.py", "test_normalizer_cwd.py", "test_shards.py",
+                "test_adapter.py", "test_agents.py", "test_run_suite.py", "test_normalizer_cwd.py", "test_prepare_image.py", "test_shards.py",
                 "test_transport_retry.py", "test_ci_entrypoint.py", "test_merge_shards.py",
             ):
                 (tests / name).write_text("raise SystemExit(0)\n")

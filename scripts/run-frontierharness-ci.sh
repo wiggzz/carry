@@ -62,6 +62,7 @@ if [[ "$MODE" == plan ]]; then
   python3 "$SOURCE/benchmarks/frontierharness/test_agents.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_run_suite.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_normalizer_cwd.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_prepare_image.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_shards.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_transport_retry.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_install.py"
@@ -89,6 +90,8 @@ git clone --quiet https://github.com/frontier-harness-eval/eval.git "$FH"
 git -C "$FH" checkout --quiet "$FRONTIERHARNESS_COMMIT"
 python3 "$SOURCE/benchmarks/frontierharness/patch_usage_details.py" \
   --target "$FH/skills/frontierharness-eval/scripts/usage_details.py"
+python3 "$SOURCE/benchmarks/frontierharness/patch_prepare_image.py" \
+  --target "$FH/skills/frontierharness-eval/scripts/run-trials.sh"
 
 if [[ "$MODE" == provision ]]; then
   RUNTIME="carry-fh-build-${COMMIT:0:12}-${RUN_ID}"
