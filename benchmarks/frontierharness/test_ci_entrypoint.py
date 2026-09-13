@@ -50,7 +50,7 @@ class FrontierHarnessCiEntrypointTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
             for name in (
                 "test_adapter.py", "test_agents.py", "test_run_suite.py", "test_shards.py",
-                "test_ci_entrypoint.py", "test_merge_shards.py",
+                "test_transport_retry.py", "test_ci_entrypoint.py", "test_merge_shards.py",
             ):
                 (tests / name).write_text("raise SystemExit(0)\n")
             (tests / "test_install.py").write_text("raise SystemExit(37)\n")

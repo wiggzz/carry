@@ -2,6 +2,10 @@
 # Manual CI entry point for the pinned FrontierHarness Eval workflow.
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=frontierharness_transport_retry.sh
+source "$SCRIPT_DIR/frontierharness_transport_retry.sh"
+
 FRONTIERHARNESS_COMMIT=e837a70bd6beb4e72eeeda62dd06e3bd34f6cb63
 
 usage() {
@@ -58,6 +62,7 @@ if [[ "$MODE" == plan ]]; then
   python3 "$SOURCE/benchmarks/frontierharness/test_agents.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_run_suite.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_shards.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_transport_retry.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_install.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_ci_entrypoint.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_merge_shards.py"
@@ -89,7 +94,8 @@ if [[ "$MODE" == provision ]]; then
   RUNTIME=${RUNTIME:0:80}
   cleanup() { runta rm "$RUNTIME" >/dev/null 2>&1 || true; }
   trap cleanup EXIT
-  bash "$FH/skills/frontierharness-eval/scripts/provision-golden-checkpoint.sh" \
+  run_with_frontierharness_ready_retries \
+    bash "$FH/skills/frontierharness-eval/scripts/provision-golden-checkpoint.sh" \
     --runtime "$RUNTIME" --checkpoint "$CHECKPOINT" --harness carry \
     --provider fireworks --repo "$REPO" --commit "$COMMIT" \
     --cpus 4 --memory 8192 --disk-size-gib 50 --keep-runtime \
