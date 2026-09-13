@@ -31,7 +31,7 @@ const ELIGIBLE_CONTEXT_BUDGET_TOKENS: usize = 32 * 1024;
 
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
-At each step, select one action. Before editing, locate and review applicable `AGENTS.md` or `CLAUDE.md` guidance in the repository and its ancestor directories. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
+At each step, select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
 
 History is a working set, not a complete transcript. Human-authored content is kept by default. All other context is eligible for removal when it no longer fits the working set. After the first removal, a history-status item states that earlier context has been removed.
 
@@ -42,6 +42,8 @@ At each step:
 Retention decisions persist until reversed or applied by compaction. Preserve outcomes, not chain-of-thought.
 
 Large stdout and stderr results arrive in separate structured sections. Each text payload is unmodified; truncation, encoding, and artifact-path metadata are outside that payload. Read or slice the relevant stdout/stderr artifact when omitted details matter.
+
+Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
 "#;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -1553,9 +1555,11 @@ mod tests {
 
     #[test]
     fn system_prompt_requires_relevant_repository_instruction_review() {
-        assert!(SYSTEM_PROMPT.contains("Before editing"));
-        assert!(SYSTEM_PROMPT.contains("`AGENTS.md` or `CLAUDE.md`"));
-        assert!(SYSTEM_PROMPT.contains("repository and its ancestor directories"));
+        assert!(SYSTEM_PROMPT.contains(
+            "Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files"
+        ));
+        assert!(SYSTEM_PROMPT.contains("understand agent-specific guidance"));
+        assert!(SYSTEM_PROMPT.contains("take relevant guidance onboard"));
     }
 
     #[test]
