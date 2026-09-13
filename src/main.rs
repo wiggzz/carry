@@ -122,11 +122,11 @@ struct Cli {
     )]
     keep_lease_turns: Option<u64>,
 
-    /// Number of future requests used to amortize a compaction rewrite; one preserves next-request economics.
+    /// Number of future requests used to amortize a compaction rewrite; defaults to five.
     #[arg(
         long,
         env = "CARRY_COMPACTION_PAYOFF_REQUESTS",
-        default_value_t = 1,
+        default_value_t = 5,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     compaction_payoff_requests: u64,
@@ -595,9 +595,9 @@ mod tests {
     }
 
     #[test]
-    fn compaction_payoff_requests_defaults_to_one_and_requires_positive_value() {
+    fn compaction_payoff_requests_defaults_to_five_and_requires_positive_value() {
         let defaulted = Cli::try_parse_from(["carry", "continue"]).unwrap();
-        assert_eq!(defaulted.compaction_payoff_requests, 1);
+        assert_eq!(defaulted.compaction_payoff_requests, 5);
         let configured =
             Cli::try_parse_from(["carry", "--compaction-payoff-requests", "5", "continue"])
                 .unwrap();
