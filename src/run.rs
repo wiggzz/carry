@@ -41,7 +41,9 @@ At each step:
 
 Retention decisions persist until reversed or applied by compaction. Preserve outcomes, not chain-of-thought.
 
-Large text shell results arrive as structured `output_head` and `output_tail` previews with an absolute `full_output_path`. Non-text output is omitted from the model payload and available only through its artifact paths. Read or slice those session files when omitted details matter.
+Large stdout and stderr results arrive in separate structured sections. Each text payload is unmodified; truncation, encoding, and artifact-path metadata are outside that payload. Read or slice the relevant stdout/stderr artifact when omitted details matter.
+
+Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
 "#;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -176,7 +178,7 @@ pub enum UserInput {
 const TOOL_OUTPUT_INLINE_BYTES: usize = 10 * 1024;
 const TOOL_OUTPUT_PREVIEW_BYTES: usize = TOOL_OUTPUT_INLINE_BYTES / 2;
 const BINARY_OUTPUT_OMISSION_REASON: &str =
-    "Shell output is not UTF-8 text or appears binary; inspect full_output_path instead.";
+    "Shell stream is not UTF-8 text or appears binary; inspect its artifact path instead.";
 
 #[derive(Clone, Debug, Serialize)]
 struct ToolOutputPreview {
@@ -186,6 +188,12 @@ struct ToolOutputPreview {
     omitted_bytes: usize,
     omission_reason: Option<&'static str>,
     offloaded: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ShellOutputPreview {
+    stdout: ToolOutputPreview,
+    stderr: ToolOutputPreview,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -199,8 +207,7 @@ struct ShellResult {
     timed_out: bool,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
-    full_output_path: Option<PathBuf>,
-    prompt_output: ToolOutputPreview,
+    prompt_output: ShellOutputPreview,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -1169,14 +1176,9 @@ async fn execute_shell(
     let stdout_path = tokio::fs::canonicalize(stdout_path).await?;
     let stderr_path = tokio::fs::canonicalize(stderr_path).await?;
 
-    let full_output = combined_output(&stdout, &stderr);
-    let prompt_output = preview_tool_output(&full_output);
-    let full_output_path = if prompt_output.offloaded {
-        let path = run_dir.join("tools").join(format!("{call_id}.output"));
-        write_bytes(&path, &full_output).await?;
-        Some(tokio::fs::canonicalize(path).await?)
-    } else {
-        None
+    let prompt_output = ShellOutputPreview {
+        stdout: preview_tool_output(&stdout),
+        stderr: preview_tool_output(&stderr),
     };
     Ok(ShellResult {
         call_id,
@@ -1188,7 +1190,6 @@ async fn execute_shell(
         timed_out,
         stdout_path,
         stderr_path,
-        full_output_path,
         prompt_output,
     })
 }
@@ -1239,14 +1240,6 @@ async fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = tokio::fs::File::create(path).await?;
     file.write_all(bytes).await?;
     Ok(())
-}
-
-fn combined_output(stdout: &[u8], stderr: &[u8]) -> Vec<u8> {
-    let mut output = format!("STDOUT ({} bytes):\n", stdout.len()).into_bytes();
-    output.extend_from_slice(stdout);
-    output.extend_from_slice(format!("\nSTDERR ({} bytes):\n", stderr.len()).as_bytes());
-    output.extend_from_slice(stderr);
-    output
 }
 
 fn preview_tool_output(output: &[u8]) -> ToolOutputPreview {
@@ -1345,42 +1338,69 @@ fn json_string_size(value: &str) -> usize {
         .len()
 }
 
-fn render_tool_result(result: &ShellResult) -> String {
-    let mut payload = json!({
-        "context_id": result.call_id,
-        "exit_code": result.exit_code,
-        "timed_out": result.timed_out,
-        "duration_ms": result.duration_ms,
-        "stdout_bytes": result.stdout_bytes,
-        "stderr_bytes": result.stderr_bytes,
-        "full_stdout_path": result.stdout_path,
-        "full_stderr_path": result.stderr_path,
-        "output_truncated": result.prompt_output.offloaded,
-    });
-    if let Some(reason) = result.prompt_output.omission_reason {
-        payload["output_omitted_reason"] = json!(reason);
-        payload["output_omitted_bytes"] = json!(result.prompt_output.omitted_bytes);
-        payload["full_output_path"] = json!(
-            result
-                .full_output_path
-                .as_ref()
-                .expect("omitted shell output must have a full output path")
-        );
-    } else if let Some(tail) = result.prompt_output.tail.as_ref() {
-        payload["output_encoding"] = json!(result.prompt_output.encoding);
-        payload["output_head"] = json!(result.prompt_output.head);
-        payload["output_tail"] = json!(tail);
-        payload["output_omitted_bytes"] = json!(result.prompt_output.omitted_bytes);
-        payload["full_output_path"] = json!(
-            result
-                .full_output_path
-                .as_ref()
-                .expect("truncated shell output must have a full output path")
-        );
-    } else {
-        payload["output"] = json!(result.prompt_output.head);
+fn render_stream_output(preview: &ToolOutputPreview) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    if preview.encoding != "utf-8" {
+        metadata.insert("encoding".into(), json!(preview.encoding));
     }
-    serde_json::to_string_pretty(&payload).expect("serializing a shell result cannot fail")
+    if preview.offloaded {
+        metadata.insert("truncated".into(), json!(true));
+    }
+    if preview.omitted_bytes > 0 {
+        metadata.insert("omitted_bytes".into(), json!(preview.omitted_bytes));
+    }
+    if let Some(reason) = preview.omission_reason {
+        metadata.insert("omission_reason".into(), json!(reason));
+    }
+    let mut stream = serde_json::Map::new();
+    if !metadata.is_empty() {
+        stream.insert("metadata".into(), serde_json::Value::Object(metadata));
+    }
+    if preview.omission_reason.is_none() {
+        if let Some(tail) = preview.tail.as_ref() {
+            stream.insert("output_head".into(), json!(preview.head));
+            stream.insert("output_tail".into(), json!(tail));
+        } else {
+            stream.insert("output".into(), json!(preview.head));
+        }
+    }
+    serde_json::Value::Object(stream)
+}
+
+fn render_tool_result(result: &ShellResult) -> String {
+    let mut payload = serde_json::Map::new();
+    payload.insert("context_id".into(), json!(result.call_id));
+    if let Some(exit_code) = result.exit_code.filter(|code| *code != 0) {
+        payload.insert("exit_code".into(), json!(exit_code));
+    }
+    if result.timed_out {
+        payload.insert("timed_out".into(), json!(true));
+    }
+    if result.duration_ms > 0 {
+        payload.insert("duration_ms".into(), json!(result.duration_ms));
+    }
+    if result.stdout_bytes > 0 {
+        payload.insert("stdout_bytes".into(), json!(result.stdout_bytes));
+    }
+    if result.stderr_bytes > 0 {
+        payload.insert("stderr_bytes".into(), json!(result.stderr_bytes));
+    }
+    if result.prompt_output.stdout.offloaded {
+        payload.insert("full_stdout_path".into(), json!(result.stdout_path));
+    }
+    if result.prompt_output.stderr.offloaded {
+        payload.insert("full_stderr_path".into(), json!(result.stderr_path));
+    }
+    payload.insert(
+        "stdout".into(),
+        render_stream_output(&result.prompt_output.stdout),
+    );
+    payload.insert(
+        "stderr".into(),
+        render_stream_output(&result.prompt_output.stderr),
+    );
+    serde_json::to_string_pretty(&serde_json::Value::Object(payload))
+        .expect("serializing a shell result cannot fail")
 }
 
 fn function_call_output(
@@ -1578,11 +1598,20 @@ mod tests {
     }
 
     #[test]
-    fn small_combined_output_stays_inline() {
-        let full = combined_output(b"all stdout", b"all stderr");
-        let preview = preview_tool_output(&full);
+    fn system_prompt_requires_relevant_repository_instruction_review() {
+        assert!(SYSTEM_PROMPT.contains(
+            "Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files"
+        ));
+        assert!(SYSTEM_PROMPT.contains("understand agent-specific guidance"));
+        assert!(SYSTEM_PROMPT.contains("take relevant guidance onboard"));
+    }
+
+    #[test]
+    fn small_stream_output_stays_inline() {
+        let output = b"all stdout";
+        let preview = preview_tool_output(output);
         assert_eq!(preview.encoding, "utf-8");
-        assert_eq!(preview.head, String::from_utf8(full).unwrap());
+        assert_eq!(preview.head, String::from_utf8(output.to_vec()).unwrap());
         assert!(preview.tail.is_none());
         assert_eq!(preview.omitted_bytes, 0);
     }
@@ -1646,6 +1675,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_result_keeps_stdout_and_empty_stderr_as_separate_raw_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("session");
+        tokio::fs::create_dir_all(run_dir.join("tools"))
+            .await
+            .unwrap();
+        let result = execute_shell(
+            temp.path(),
+            &run_dir,
+            "tool-streams".into(),
+            "printf 'stdout text\\n'",
+            30,
+        )
+        .await
+        .unwrap();
+
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_tool_result(&result)).unwrap();
+        assert_eq!(rendered["stdout"]["output"], "stdout text\n");
+        assert_eq!(rendered["stderr"]["output"], "");
+        assert!(rendered["stdout"].get("metadata").is_none());
+        assert!(rendered["stderr"].get("metadata").is_none());
+        assert!(rendered.get("full_stdout_path").is_none());
+        assert!(rendered.get("full_stderr_path").is_none());
+        assert!(!render_tool_result(&result).contains("STDOUT ("));
+        assert!(!render_tool_result(&result).contains("STDERR ("));
+    }
+
+    #[tokio::test]
     async fn large_shell_output_is_offloaded_with_structured_head_and_tail() {
         let current_dir = std::env::current_dir().unwrap();
         let temp = tempfile::tempdir_in(&current_dir).unwrap();
@@ -1668,40 +1726,36 @@ mod tests {
 
         let rendered: serde_json::Value =
             serde_json::from_str(&render_tool_result(&result)).unwrap();
-        assert_eq!(rendered["output_truncated"], true);
-        assert_eq!(rendered["output_encoding"], "utf-8");
-        let head = rendered["output_head"].as_str().unwrap();
-        let tail = rendered["output_tail"].as_str().unwrap();
+        assert_eq!(rendered["stdout"]["metadata"]["truncated"], true);
+        assert!(rendered["stdout"]["metadata"].get("encoding").is_none());
+        let head = rendered["stdout"]["output_head"].as_str().unwrap();
+        let tail = rendered["stdout"]["output_tail"].as_str().unwrap();
         assert!(head.len() <= 5 * 1024 && head.len() > 4 * 1024);
         assert!(tail.len() <= 5 * 1024 && tail.len() > 4 * 1024);
         assert!(
             serde_json::to_string(head).unwrap().len() + serde_json::to_string(tail).unwrap().len()
                 <= 10 * 1024 + 4
         );
-        assert!(rendered.get("output").is_none());
-        assert!(rendered["output_omitted_bytes"].as_u64().unwrap() > 0);
-        let full_path = rendered["full_output_path"].as_str().unwrap();
-        assert!(std::path::Path::new(full_path).is_absolute());
-        assert!(std::path::Path::new(rendered["full_stdout_path"].as_str().unwrap()).is_absolute());
-        assert!(std::path::Path::new(rendered["full_stderr_path"].as_str().unwrap()).is_absolute());
-        let full = tokio::fs::read(full_path).await.unwrap();
-        assert!(full.starts_with(b"STDOUT ("));
+        assert!(rendered["stdout"].get("output").is_none());
         assert!(
-            full.windows(32)
+            rendered["stdout"]["metadata"]["omitted_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(rendered.get("full_output_path").is_none());
+        let stdout_path = rendered["full_stdout_path"].as_str().unwrap();
+        assert!(std::path::Path::new(stdout_path).is_absolute());
+        assert!(rendered.get("full_stderr_path").is_none());
+        let stdout = tokio::fs::read(stdout_path).await.unwrap();
+        assert!(stdout.starts_with(b"hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"));
+        assert!(
+            stdout
+                .windows(32)
                 .any(|window| window == b"mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm")
         );
-        assert!(
-            !rendered["output_head"]
-                .as_str()
-                .unwrap()
-                .contains("truncat")
-        );
-        assert!(
-            !rendered["output_tail"]
-                .as_str()
-                .unwrap()
-                .contains("truncat")
-        );
+        assert!(!head.contains("truncat"));
+        assert!(!tail.contains("truncat"));
     }
 
     #[test]
@@ -1946,17 +2000,17 @@ mod tests {
 
         let rendered: serde_json::Value =
             serde_json::from_str(&render_tool_result(&result)).unwrap();
-        assert_eq!(rendered["output_truncated"], true);
+        assert_eq!(rendered["stdout"]["metadata"]["truncated"], true);
         assert_eq!(
-            rendered["output_omitted_reason"],
+            rendered["stdout"]["metadata"]["omission_reason"],
             BINARY_OUTPUT_OMISSION_REASON
         );
-        assert!(rendered.get("output").is_none());
-        assert!(rendered.get("output_head").is_none());
-        assert!(rendered.get("output_tail").is_none());
-        let full_path = rendered["full_output_path"].as_str().unwrap();
-        let full = tokio::fs::read(full_path).await.unwrap();
-        assert!(full.windows(3).any(|window| window == [0xff, 0, 1]));
+        assert!(rendered["stdout"].get("output").is_none());
+        assert!(rendered["stdout"].get("output_head").is_none());
+        assert!(rendered["stdout"].get("output_tail").is_none());
+        let stdout_path = rendered["full_stdout_path"].as_str().unwrap();
+        let stdout = tokio::fs::read(stdout_path).await.unwrap();
+        assert_eq!(stdout, [0xff, 0, 1]);
     }
 
     #[test]
