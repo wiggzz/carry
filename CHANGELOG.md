@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.1](https://github.com/wiggzz/carry/compare/v0.8.0...v0.8.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* account for implicit OpenAI cache writes ([#94](https://github.com/wiggzz/carry/issues/94)) ([ffdf024](https://github.com/wiggzz/carry/commit/ffdf0249053987496babe97a4f90310f3a640a35))
+* allow legitimate repository actions ([#92](https://github.com/wiggzz/carry/issues/92)) ([330fe3b](https://github.com/wiggzz/carry/commit/330fe3bb59882e38916ac8bed3e51bdeab5b8252))
+* amortize compaction over five requests ([#104](https://github.com/wiggzz/carry/issues/104)) ([af803f7](https://github.com/wiggzz/carry/commit/af803f7632ba61b3f9e259d6a03014b8d05ea1ba))
+* preserve agent changes after git commits ([#102](https://github.com/wiggzz/carry/issues/102)) ([ca22c9d](https://github.com/wiggzz/carry/commit/ca22c9dda0e7a7b6550b19865c22c3405f57625b))
+* preserve human intent during compaction ([#99](https://github.com/wiggzz/carry/issues/99)) ([e7dc188](https://github.com/wiggzz/carry/commit/e7dc188c614d366c21fcd65b5a668d0c4595b4e4))
+* preserve raw stdout and stderr payloads ([#103](https://github.com/wiggzz/carry/issues/103)) ([366dc7d](https://github.com/wiggzz/carry/commit/366dc7dd1fccbdcc80f14ae0c882ccbcb04289f8))
+* prioritize critical context retention ([#105](https://github.com/wiggzz/carry/issues/105)) ([9d1ed13](https://github.com/wiggzz/carry/commit/9d1ed13c2c20142f72702d54ff42cd332a4dfa93))
+
 ## [0.8.0](https://github.com/wiggzz/carry/compare/v0.7.1...v0.8.0) (2026-09-11)
 
 
