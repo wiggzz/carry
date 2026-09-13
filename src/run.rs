@@ -72,6 +72,7 @@ pub struct RunConfig {
 
 const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 const CONTEXT_CHECKPOINT_FILE: &str = "context-state.json";
+const PATCH_BASELINE_FILE: &str = "patch-baseline-revision";
 const CONTEXT_CHECKPOINT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug)]
@@ -569,6 +570,7 @@ async fn run_loop(
     let implicit_cache_minimum_prefix_tokens =
         backend.implicit_cache_minimum_prefix_tokens(&config.model);
     tokio::fs::create_dir_all(config.session_dir.join("tools")).await?;
+    let patch_baseline = capture_patch_baseline(&config).await?;
     let resumed = config.resume_context.is_some();
     let mut trace_recovery = None;
     let mut logger = if config.resume_source.as_ref() == Some(&config.session_dir) {
@@ -663,6 +665,7 @@ async fn run_loop(
             )?;
             write_final_artifacts(
                 &config,
+                patch_baseline.as_deref(),
                 false,
                 None,
                 &metrics,
@@ -853,6 +856,7 @@ async fn run_loop(
                 {
                     write_final_artifacts(
                         &config,
+                        patch_baseline.as_deref(),
                         true,
                         None,
                         &metrics,
@@ -932,6 +936,7 @@ async fn run_loop(
 
                 write_final_artifacts(
                     &config,
+                    patch_baseline.as_deref(),
                     true,
                     answer.as_deref(),
                     &metrics,
@@ -1403,18 +1408,57 @@ fn function_output(function_call: &serde_json::Value, output: &str) -> Result<se
     }))
 }
 
+async fn capture_patch_baseline(config: &RunConfig) -> Result<Option<String>> {
+    let path = config.session_dir.join(PATCH_BASELINE_FILE);
+    if let Ok(existing) = tokio::fs::read_to_string(&path).await {
+        let revision = existing.trim();
+        if is_git_revision(revision) {
+            return Ok(Some(revision.to_owned()));
+        }
+    }
+
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(&config.cwd)
+        .output()
+        .await;
+    let Ok(output) = output else {
+        return Ok(None);
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let Ok(revision) = String::from_utf8(output.stdout) else {
+        return Ok(None);
+    };
+    let revision = revision.trim();
+    if !is_git_revision(revision) {
+        return Ok(None);
+    }
+    tokio::fs::write(&path, format!("{revision}\n")).await?;
+    Ok(Some(revision.to_owned()))
+}
+
+fn is_git_revision(revision: &str) -> bool {
+    matches!(revision.len(), 40 | 64) && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 async fn write_final_artifacts(
     config: &RunConfig,
+    patch_baseline: Option<&str>,
     completed: bool,
     answer: Option<&str>,
     metrics: &RunMetrics,
     elapsed_ms: u64,
 ) -> Result<()> {
-    let patch = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["diff", "--binary", "--no-ext-diff"])
-        .current_dir(&config.cwd)
-        .output()
-        .await;
+        .current_dir(&config.cwd);
+    if let Some(baseline) = patch_baseline {
+        command.arg(baseline);
+    }
+    let patch = command.output().await;
     let patch = match patch {
         Ok(output) if output.status.success() => output.stdout,
         _ => Vec::new(),
@@ -2015,6 +2059,73 @@ mod tests {
         assert!(!third.iter().any(|item| {
             item["role"] == "developer" && item["content"].to_string().contains("Retention review")
         }));
+    }
+
+    #[tokio::test]
+    async fn final_patch_includes_changes_committed_during_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("run");
+        let steps_file = temp.path().join("steps.jsonl");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("file.txt"), "before\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "file.txt"],
+            vec![
+                "-c",
+                "user.name=Carry test",
+                "-c",
+                "user.email=carry-test@example.invalid",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        tokio::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"shell","command":"printf 'after\\n' > file.txt && git add file.txt && git -c user.name=Carry -c user.email=carry@example.invalid commit -qm agent-change","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        run(
+            RunConfig {
+                cwd: workspace,
+                prompt: "Finish the task.".into(),
+                session_dir: session_dir.clone(),
+                model: "scripted".into(),
+                max_steps: Some(2),
+                shell_timeout_secs: 5,
+                compaction_mode: CompactionMode::Disabled,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 1,
+                resume_context: None,
+                resume_source: None,
+                prompt_cache_key: Some("carry-test-cache-key".into()),
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let patch = tokio::fs::read_to_string(session_dir.join("final.patch"))
+            .await
+            .unwrap();
+        assert!(
+            patch.contains("+after"),
+            "committed changes must remain in final.patch"
+        );
     }
 
     #[tokio::test]
