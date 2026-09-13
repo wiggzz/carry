@@ -65,7 +65,9 @@ class NormalizerWorkingDirectoryTests(unittest.TestCase):
             )
             run_trials.chmod(0o755)
             (scripts / "calculate-cost.py").write_text("before\n" + calculate_patch.OLD + "after\n")
-            (scripts / "provision-golden-checkpoint.sh").write_text("before\n" + provision_patch.OLD + "after\n")
+            (scripts / "provision-golden-checkpoint.sh").write_text(
+                "before\n" + provision_patch.REXEC_OLD + provision_patch.OLD + "after\n"
+            )
             (scripts / "normalize-results.mjs").write_text("// Fake node command is used by this test.\n")
 
             fake_bin = root / "bin"

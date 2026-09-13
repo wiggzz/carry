@@ -45,10 +45,38 @@ class ProvisionBaseToolsPatchTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(sum(line.startswith("install ") for line in log.read_text().splitlines()), 3)
 
+    def test_retries_a_transient_runtime_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            fake = root / "bin"
+            fake.mkdir()
+            log = root / "runta.log"
+            (fake / "runta").write_text(
+                "#!/usr/bin/env bash\n"
+                "set -eu\n"
+                "printf 'attempt\\n' >> \"$RUNTA_LOG\"\n"
+                "count=$(wc -l < \"$RUNTA_LOG\")\n"
+                "[ \"$count\" -ge 2 ]\n"
+            )
+            (fake / "runta").chmod(0o755)
+            script = root / "rexec.sh"
+            script.write_text(
+                "#!/usr/bin/env bash\nset -eu\n"
+                "retry_transport() { for attempt in 1 2 3; do \"$@\" && return 0; done; return 1; }\n"
+                "RUNTIME=test-runtime\n"
+                + patcher.REXEC_NEW
+                + "rexec 'true'\n"
+            )
+            script.chmod(0o755)
+            environment = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}", "RUNTA_LOG": str(log)}
+            completed = subprocess.run(["bash", str(script)], text=True, capture_output=True, env=environment)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(len(log.read_text().splitlines()), 2)
+
     def test_applies_once_and_rejects_unknown_layout(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             target = Path(raw) / "provision.sh"
-            target.write_text("before\n" + patcher.OLD + "after\n")
+            target.write_text("before\n" + patcher.REXEC_OLD + patcher.OLD + "after\n")
             patcher.apply(target)
             once = target.read_text()
             patcher.apply(target)
