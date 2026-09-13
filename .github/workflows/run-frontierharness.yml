@@ -56,6 +56,7 @@ jobs:
           python3 benchmarks/frontierharness/test_agents.py
           python3 benchmarks/frontierharness/test_run_suite.py
           python3 benchmarks/frontierharness/test_normalizer_cwd.py
+          python3 benchmarks/frontierharness/test_prepare_image.py
           python3 benchmarks/frontierharness/test_shards.py
           python3 benchmarks/frontierharness/test_transport_retry.py
           python3 benchmarks/frontierharness/test_install.py

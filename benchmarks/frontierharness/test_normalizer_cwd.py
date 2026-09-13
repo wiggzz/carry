@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -11,6 +12,11 @@ import unittest
 
 
 ENTRYPOINT = Path(__file__).parents[2] / "scripts" / "run-frontierharness-ci.sh"
+PREPARE_PATCH = Path(__file__).with_name("patch_prepare_image.py")
+spec = importlib.util.spec_from_file_location("patch_prepare_image", PREPARE_PATCH)
+assert spec and spec.loader
+prepare_patch = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(prepare_patch)
 
 
 class NormalizerWorkingDirectoryTests(unittest.TestCase):
@@ -21,6 +27,7 @@ class NormalizerWorkingDirectoryTests(unittest.TestCase):
             helper = source / "benchmarks" / "frontierharness" / "patch_usage_details.py"
             helper.parent.mkdir(parents=True)
             helper.write_text("raise SystemExit(0)\n")
+            (helper.parent / "patch_prepare_image.py").write_text(PREPARE_PATCH.read_text())
             subprocess.run(["git", "init", "-q", str(source)], check=True)
             subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.com"], check=True)
             subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
@@ -35,7 +42,9 @@ class NormalizerWorkingDirectoryTests(unittest.TestCase):
             run_trials = scripts / "run-trials.sh"
             run_trials.write_text(
                 "#!/usr/bin/env bash\n"
-                "set -euo pipefail\n"
+                + prepare_patch.OLD
+                + "\n"
+                + "set -euo pipefail\n"
                 "while [[ $# -gt 0 ]]; do\n"
                 "  case \"$1\" in --out) out=$2; shift 2 ;; --run-id) run_id=$2; shift 2 ;; *) shift ;; esac\n"
                 "done\n"
