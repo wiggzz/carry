@@ -61,6 +61,7 @@ if [[ "$MODE" == plan ]]; then
   python3 "$SOURCE/benchmarks/frontierharness/test_adapter.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_agents.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_run_suite.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_normalizer_cwd.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_shards.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_transport_retry.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_install.py"
@@ -129,5 +130,8 @@ bash "$FH/skills/frontierharness-eval/scripts/run-trials.sh" \
   --checkpoint "$CHECKPOINT" --harness carry --provider fireworks \
   --run-id "$RUN_ID" --tasks "$TASKS" --out "$OUT/runs" \
   --cmd '/work/harness/benchmarks/frontierharness/run-suite.sh {task} {suite} {model} {jobs}'
-node "$FH/skills/frontierharness-eval/scripts/normalize-results.mjs" \
-  --run "$OUT/runs/$RUN_ID" --label "Carry $COMMIT"
+(
+  cd "$FH"
+  node "skills/frontierharness-eval/scripts/normalize-results.mjs" \
+    --run "$OUT/runs/$RUN_ID" --label "Carry $COMMIT"
+)
