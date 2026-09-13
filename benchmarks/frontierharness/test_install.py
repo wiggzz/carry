@@ -49,6 +49,10 @@ class FrontierHarnessInstallTests(unittest.TestCase):
                 "set -euo pipefail\n"
                 "printf 'apt-get %s\\n' \"$*\" >> \"$TEST_LOG\"\n"
                 "if [[ $1 == install ]]; then\n"
+                "  if [[ ! -e \"$TEST_FAKE_BIN/apt-install-failed\" ]]; then\n"
+                "    : > \"$TEST_FAKE_BIN/apt-install-failed\"\n"
+                "    exit 100\n"
+                "  fi\n"
                 "  cat > \"$TEST_FAKE_BIN/cc\" <<'CC'\n"
                 "#!/usr/bin/env bash\n"
                 "exit 0\n"
@@ -60,7 +64,7 @@ class FrontierHarnessInstallTests(unittest.TestCase):
             # Isolate PATH without relying on whether a runner happens to expose
             # /bin/cc as a symlink.  Supply only the shell utilities the mocked
             # installer needs; notably, do not supply cc until fake apt-get does.
-            for command in ("bash", "sh", "mkdir", "cat", "chmod"):
+            for command in ("bash", "sh", "mkdir", "cat", "chmod", "sleep"):
                 resolved = shutil.which(command)
                 if resolved is None:
                     self.fail(f"required shell utility is unavailable: {command}")
@@ -82,7 +86,15 @@ class FrontierHarnessInstallTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             commands = log.read_text().splitlines()
-            self.assertEqual(commands[:2], ["apt-get update -qq", "apt-get install -y -qq build-essential"])
+            self.assertEqual(
+                commands[:4],
+                [
+                    "apt-get update -qq",
+                    "apt-get install -y -qq build-essential",
+                    "apt-get update -qq",
+                    "apt-get install -y -qq build-essential",
+                ],
+            )
             self.assertTrue(any(line.startswith("curl ") for line in commands))
             self.assertIn("cargo build --locked --release", commands)
             self.assertEqual(

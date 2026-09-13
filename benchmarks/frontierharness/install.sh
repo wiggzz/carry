@@ -7,8 +7,19 @@ set -euo pipefail
 if ! command -v cc >/dev/null 2>&1; then
   command -v apt-get >/dev/null 2>&1 || { echo "cargo requires a C compiler and apt-get is unavailable" >&2; exit 1; }
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq build-essential >/dev/null
+  # Ubuntu mirrors occasionally return transient 5xx responses while a fresh
+  # runtime is bootstrapping. Retry the idempotent refresh/install pair before
+  # declaring the checkpoint unusable.
+  for attempt in 1 2 3; do
+    if apt-get update -qq && apt-get install -y -qq build-essential >/dev/null; then
+      break
+    fi
+    if [[ "$attempt" == 3 ]]; then
+      echo "cargo requires build-essential; apt-get failed after 3 attempts" >&2
+      exit 1
+    fi
+    sleep "$attempt"
+  done
 fi
 command -v cc >/dev/null 2>&1 || { echo "cargo requires a C compiler" >&2; exit 1; }
 
