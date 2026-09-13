@@ -5,6 +5,8 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=frontierharness_transport_retry.sh
 source "$SCRIPT_DIR/frontierharness_transport_retry.sh"
+# shellcheck source=frontierharness_provision_artifacts.sh
+source "$SCRIPT_DIR/frontierharness_provision_artifacts.sh"
 
 FRONTIERHARNESS_COMMIT=e837a70bd6beb4e72eeeda62dd06e3bd34f6cb63
 
@@ -64,6 +66,7 @@ if [[ "$MODE" == plan ]]; then
   python3 "$SOURCE/benchmarks/frontierharness/test_normalizer_cwd.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_prepare_image.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_provision_base_tools.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_provision_artifacts.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_calculate_cost.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_calculate_cost_integration.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_pier_environment.py"
@@ -112,7 +115,8 @@ if [[ "$MODE" == provision ]]; then
     --provider fireworks --repo "$REPO" --commit "$COMMIT" \
     --cpus 4 --memory 8192 --disk-size-gib 50 --keep-runtime \
     --install-script "$SOURCE/benchmarks/frontierharness/install.sh"
-  runta cp "$RUNTIME:/work/manifest.json" "$OUT/manifest.json"
+  copy_verified_provision_manifest \
+    "$(pwd)/manifest-${CHECKPOINT}.json" "$OUT/manifest.json" "$COMMIT" "$CHECKPOINT"
   python3 - "$OUT/provision.json" "$COMMIT" "$FRONTIERHARNESS_COMMIT" "$CHECKPOINT" <<'PY'
 import json, sys
 from pathlib import Path
