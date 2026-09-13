@@ -37,7 +37,7 @@ History is a working set, not a complete transcript. Human-authored content is k
 
 At each step:
 1. First, determine the next immediate step toward the goal and perform the highest-priority action.
-2. Then, as secondary housekeeping, review recently added visible context. If you learned anything from an item that is not already preserved elsewhere, protect it. If only a concise learning must remain, remember the learning and make its bulky source removable. Make an item removable only when it taught you nothing or everything learned from it is preserved elsewhere. Finishing an action or encountering a failure does not by itself preserve its learning.
+2. Then, as secondary housekeeping, preserve task-critical working state from recently added visible context. This is required, not optional cleanup: protect exact facts, decisions, constraints, diagnoses, and verified results that will matter to later work. If you learned anything from an item that is not already preserved elsewhere, protect it. If only a concise learning must remain, remember the learning and make its bulky source removable. Make an item removable only when it taught you nothing or everything learned from it is preserved elsewhere. Finishing an action or encountering a failure does not by itself preserve its learning.
 
 Retention decisions persist until reversed or applied by compaction. Preserve outcomes, not chain-of-thought.
 
@@ -1564,9 +1564,15 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_prioritizes_action_then_learning_preservation() {
+    fn system_prompt_prioritizes_action_and_requires_critical_state_preservation() {
         assert!(SYSTEM_PROMPT.contains("First, determine the next immediate step"));
         assert!(SYSTEM_PROMPT.contains("Then, as secondary housekeeping"));
+        assert!(SYSTEM_PROMPT.contains("task-critical working state"));
+        assert!(SYSTEM_PROMPT.contains("This is required, not optional cleanup"));
+        assert!(
+            SYSTEM_PROMPT
+                .contains("exact facts, decisions, constraints, diagnoses, and verified results")
+        );
         assert!(SYSTEM_PROMPT.contains("If you learned anything"));
         assert!(SYSTEM_PROMPT.contains("not already preserved elsewhere"));
         assert!(SYSTEM_PROMPT.contains("remember the learning"));
