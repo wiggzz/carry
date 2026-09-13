@@ -1332,40 +1332,68 @@ fn json_string_size(value: &str) -> usize {
 }
 
 fn render_stream_output(preview: &ToolOutputPreview) -> serde_json::Value {
-    let mut metadata = json!({
-        "encoding": preview.encoding,
-        "truncated": preview.offloaded,
-        "omitted_bytes": preview.omitted_bytes,
-    });
-    if let Some(reason) = preview.omission_reason {
-        metadata["omission_reason"] = json!(reason);
+    let mut metadata = serde_json::Map::new();
+    if preview.encoding != "utf-8" {
+        metadata.insert("encoding".into(), json!(preview.encoding));
     }
-    let mut stream = json!({ "metadata": metadata });
+    if preview.offloaded {
+        metadata.insert("truncated".into(), json!(true));
+    }
+    if preview.omitted_bytes > 0 {
+        metadata.insert("omitted_bytes".into(), json!(preview.omitted_bytes));
+    }
+    if let Some(reason) = preview.omission_reason {
+        metadata.insert("omission_reason".into(), json!(reason));
+    }
+    let mut stream = serde_json::Map::new();
+    if !metadata.is_empty() {
+        stream.insert("metadata".into(), serde_json::Value::Object(metadata));
+    }
     if preview.omission_reason.is_none() {
         if let Some(tail) = preview.tail.as_ref() {
-            stream["output_head"] = json!(preview.head);
-            stream["output_tail"] = json!(tail);
+            stream.insert("output_head".into(), json!(preview.head));
+            stream.insert("output_tail".into(), json!(tail));
         } else {
-            stream["output"] = json!(preview.head);
+            stream.insert("output".into(), json!(preview.head));
         }
     }
-    stream
+    serde_json::Value::Object(stream)
 }
 
 fn render_tool_result(result: &ShellResult) -> String {
-    let payload = json!({
-        "context_id": result.call_id,
-        "exit_code": result.exit_code,
-        "timed_out": result.timed_out,
-        "duration_ms": result.duration_ms,
-        "stdout_bytes": result.stdout_bytes,
-        "stderr_bytes": result.stderr_bytes,
-        "full_stdout_path": result.stdout_path,
-        "full_stderr_path": result.stderr_path,
-        "stdout": render_stream_output(&result.prompt_output.stdout),
-        "stderr": render_stream_output(&result.prompt_output.stderr),
-    });
-    serde_json::to_string_pretty(&payload).expect("serializing a shell result cannot fail")
+    let mut payload = serde_json::Map::new();
+    payload.insert("context_id".into(), json!(result.call_id));
+    if let Some(exit_code) = result.exit_code.filter(|code| *code != 0) {
+        payload.insert("exit_code".into(), json!(exit_code));
+    }
+    if result.timed_out {
+        payload.insert("timed_out".into(), json!(true));
+    }
+    if result.duration_ms > 0 {
+        payload.insert("duration_ms".into(), json!(result.duration_ms));
+    }
+    if result.stdout_bytes > 0 {
+        payload.insert("stdout_bytes".into(), json!(result.stdout_bytes));
+    }
+    if result.stderr_bytes > 0 {
+        payload.insert("stderr_bytes".into(), json!(result.stderr_bytes));
+    }
+    if result.prompt_output.stdout.offloaded {
+        payload.insert("full_stdout_path".into(), json!(result.stdout_path));
+    }
+    if result.prompt_output.stderr.offloaded {
+        payload.insert("full_stderr_path".into(), json!(result.stderr_path));
+    }
+    payload.insert(
+        "stdout".into(),
+        render_stream_output(&result.prompt_output.stdout),
+    );
+    payload.insert(
+        "stderr".into(),
+        render_stream_output(&result.prompt_output.stderr),
+    );
+    serde_json::to_string_pretty(&serde_json::Value::Object(payload))
+        .expect("serializing a shell result cannot fail")
 }
 
 fn function_call_output(
@@ -1619,8 +1647,10 @@ mod tests {
             serde_json::from_str(&render_tool_result(&result)).unwrap();
         assert_eq!(rendered["stdout"]["output"], "stdout text\n");
         assert_eq!(rendered["stderr"]["output"], "");
-        assert_eq!(rendered["stdout"]["metadata"]["truncated"], false);
-        assert_eq!(rendered["stderr"]["metadata"]["truncated"], false);
+        assert!(rendered["stdout"].get("metadata").is_none());
+        assert!(rendered["stderr"].get("metadata").is_none());
+        assert!(rendered.get("full_stdout_path").is_none());
+        assert!(rendered.get("full_stderr_path").is_none());
         assert!(!render_tool_result(&result).contains("STDOUT ("));
         assert!(!render_tool_result(&result).contains("STDERR ("));
     }
@@ -1649,7 +1679,7 @@ mod tests {
         let rendered: serde_json::Value =
             serde_json::from_str(&render_tool_result(&result)).unwrap();
         assert_eq!(rendered["stdout"]["metadata"]["truncated"], true);
-        assert_eq!(rendered["stdout"]["metadata"]["encoding"], "utf-8");
+        assert!(rendered["stdout"]["metadata"].get("encoding").is_none());
         let head = rendered["stdout"]["output_head"].as_str().unwrap();
         let tail = rendered["stdout"]["output_tail"].as_str().unwrap();
         assert!(head.len() <= 5 * 1024 && head.len() > 4 * 1024);
@@ -1668,7 +1698,7 @@ mod tests {
         assert!(rendered.get("full_output_path").is_none());
         let stdout_path = rendered["full_stdout_path"].as_str().unwrap();
         assert!(std::path::Path::new(stdout_path).is_absolute());
-        assert!(std::path::Path::new(rendered["full_stderr_path"].as_str().unwrap()).is_absolute());
+        assert!(rendered.get("full_stderr_path").is_none());
         let stdout = tokio::fs::read(stdout_path).await.unwrap();
         assert!(stdout.starts_with(b"hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"));
         assert!(
