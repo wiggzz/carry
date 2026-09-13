@@ -262,6 +262,8 @@ jobs:
             --expected "$manifest" --shards frontierharness-shards --out merged-run > merge.json
           git clone --quiet https://github.com/frontier-harness-eval/eval.git evaluator
           git -C evaluator checkout --quiet e837a70bd6beb4e72eeeda62dd06e3bd34f6cb63
+          python3 benchmarks/frontierharness/patch_calculate_cost.py \
+            --target evaluator/skills/frontierharness-eval/scripts/calculate-cost.py
           python3 - "$manifest" > benchmark.json <<'PY'
           import json, sys
           task_ids = [line.split('#', 1)[0].strip() for line in open(sys.argv[1], encoding='utf-8')]
