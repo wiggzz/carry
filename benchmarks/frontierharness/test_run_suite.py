@@ -45,7 +45,7 @@ class RunSuiteTests(unittest.TestCase):
     def test_terminal_bench_uses_harbor_with_the_custom_agent(self) -> None:
         lines = self.invoke("terminal-bench")
         text = "\n".join(lines)
-        self.assertIn("binary_env=/work/harness/target/release/carry", text)
+        self.assertIn("binary_env=/work/harness/target/x86_64-unknown-linux-musl/release/carry", text)
         self.assertIn("key_present=yes", text)
         self.assertIn("arg=-a\narg=carry_frontierharness.harbor_agent:CarryAgent", text)
         self.assertIn("arg=-d\narg=terminal-bench@2.0\narg=-i\narg=regex-log", text)
@@ -58,7 +58,7 @@ class RunSuiteTests(unittest.TestCase):
     def test_datacurve_uses_pier_with_the_custom_agent(self) -> None:
         lines = self.invoke("datacurve")
         text = "\n".join(lines)
-        self.assertIn("binary_env=/work/harness/target/release/carry", text)
+        self.assertIn("binary_env=/work/harness/target/x86_64-unknown-linux-musl/release/carry", text)
         self.assertIn("key_present=yes", text)
         self.assertIn("arg=--agent-import-path\narg=carry_frontierharness.pier_agent:CarryAgent", text)
         self.assertIn("arg=--environment-import-path\narg=carry_frontierharness.pier_environment:RuntaDockerEnvironment", text)

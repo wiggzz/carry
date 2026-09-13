@@ -13,7 +13,7 @@ MODEL=$3
 JOBS_DIR=$4
 ROOT=/work/harness
 export PYTHONPATH="$ROOT/benchmarks/frontierharness${PYTHONPATH:+:$PYTHONPATH}"
-export CARRY_FRONTIER_BINARY="$ROOT/target/release/carry"
+export CARRY_FRONTIER_BINARY="$ROOT/target/x86_64-unknown-linux-musl/release/carry"
 export CARRY_FRONTIER_API_BASE=https://api.fireworks.ai/inference/v1
 # Runta injects the real key only into egress. Its secret-rule API can omit the
 # process-visible placeholder, so always provide a nonsecret value for SDKs that
