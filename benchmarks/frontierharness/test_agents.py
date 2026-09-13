@@ -154,10 +154,9 @@ class CarryAgentContractTests(unittest.TestCase):
         self.assertIn("accounts/fireworks/models/kimi-k3", command)
         self.assertNotIn("runta-secret-stub", command)
         self.assertEqual(env, {"OPENAI_API_KEY": "runta-secret-stub"})
-        if invoke_post_run_hook:
-            self.assertEqual(context.n_input_tokens, 8)
-            self.assertEqual(context.n_cache_tokens, 3)
-            self.assertEqual(context.n_output_tokens, 5)
+        self.assertEqual(context.n_input_tokens, 8)
+        self.assertEqual(context.n_cache_tokens, 3)
+        self.assertEqual(context.n_output_tokens, 5)
         return context
 
     def test_harbor_adapter_uploads_and_runs_carry(self) -> None:
@@ -166,8 +165,10 @@ class CarryAgentContractTests(unittest.TestCase):
     def test_pier_adapter_uploads_and_runs_carry(self) -> None:
         self.exercise(self.pier)
 
-    def test_pier_adapter_uses_pier_installed_agent_lifecycle(self) -> None:
-        self.assertTrue(issubclass(self.pier, _FakeInstalledAgent))
+    def test_pier_adapter_records_usage_without_a_build_time_install(self) -> None:
+        self.exercise(self.pier, invoke_post_run_hook=False)
+        self.assertTrue(issubclass(self.pier, _FakeBaseAgent))
+        self.assertFalse(issubclass(self.pier, _FakeInstalledAgent))
 
     def test_missing_trace_after_a_crash_is_an_infrastructure_error(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

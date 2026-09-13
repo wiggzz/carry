@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import tempfile
 
-from pier.agents.installed.base import BaseInstalledAgent
+from pier.agents.base import BaseAgent
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 
@@ -36,7 +36,7 @@ def _safe_output(value: object, secret: str) -> tuple[str, bool]:
     return _BEARER.sub(r"\1[REDACTED]", text), truncated
 
 
-class CarryAgent(BaseInstalledAgent):
+class CarryAgent(BaseAgent):
     """Run the pinned Carry binary inside each Pier task container."""
 
     @staticmethod
@@ -45,16 +45,6 @@ class CarryAgent(BaseInstalledAgent):
 
     def version(self) -> str | None:
         return os.environ.get("CARRY_FRONTIER_VERSION", "pinned-source")
-
-    def install_spec(self):
-        """Declare the pre-provisioned binary required by Pier's installed-agent API."""
-        from pier.models.agent.install import AgentInstallSpec, InstallStep
-
-        return AgentInstallSpec(
-            agent_name=self.name(),
-            version=self.version(),
-            steps=[InstallStep(run="test -x /usr/local/bin/carry")],
-        )
 
     def _value(self, key: str, default: str | None = None) -> str | None:
         return os.environ.get(key) or default
@@ -128,6 +118,11 @@ class CarryAgent(BaseInstalledAgent):
             "test -f /logs/agent/carry/trace.jsonl && cp /logs/agent/carry/trace.jsonl "
             "/logs/agent/carry-trace.jsonl || true"
         )
+        if trace.return_code == 0:
+            usage = read_usage(self.logs_dir / "carry-trace.jsonl")
+            context.n_input_tokens = usage.input_tokens
+            context.n_cache_tokens = usage.cached_input_tokens
+            context.n_output_tokens = usage.output_tokens
         if result.return_code != 0 and trace.return_code != 0:
             self._write_failure_diagnostic(result, api_key)
             raise RuntimeError("Carry exited without producing a model trace")
@@ -136,9 +131,3 @@ class CarryAgent(BaseInstalledAgent):
                 "Carry exited non-zero after producing evidence; leave task state to verifier",
                 extra={"return_code": result.return_code},
             )
-
-    def populate_context_post_run(self, context: AgentContext) -> None:
-        usage = read_usage(self.logs_dir / "carry-trace.jsonl")
-        context.n_input_tokens = usage.input_tokens
-        context.n_cache_tokens = usage.cached_input_tokens
-        context.n_output_tokens = usage.output_tokens
