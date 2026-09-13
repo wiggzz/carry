@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import tempfile
 
-from pier.agents.base import BaseAgent
+from pier.agents.installed.base import BaseInstalledAgent
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 
@@ -36,7 +36,7 @@ def _safe_output(value: object, secret: str) -> tuple[str, bool]:
     return _BEARER.sub(r"\1[REDACTED]", text), truncated
 
 
-class CarryAgent(BaseAgent):
+class CarryAgent(BaseInstalledAgent):
     """Run the pinned Carry binary inside each Pier task container."""
 
     @staticmethod
@@ -45,6 +45,16 @@ class CarryAgent(BaseAgent):
 
     def version(self) -> str | None:
         return os.environ.get("CARRY_FRONTIER_VERSION", "pinned-source")
+
+    def install_spec(self):
+        """Declare the pre-provisioned binary required by Pier's installed-agent API."""
+        from pier.models.agent.install import AgentInstallSpec, InstallStep
+
+        return AgentInstallSpec(
+            agent_name=self.name(),
+            version=self.version(),
+            steps=[InstallStep(run="test -x /usr/local/bin/carry")],
+        )
 
     def _value(self, key: str, default: str | None = None) -> str | None:
         return os.environ.get(key) or default
