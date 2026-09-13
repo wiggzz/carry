@@ -2,6 +2,13 @@
 # Executed inside a clean Runta runtime by FrontierHarness provisioning.
 set -euo pipefail
 
+# The FrontierHarness provisioning base image supplies Python tooling but not Rust.
+# Bootstrap a minimal toolchain only when the runtime does not already provide one.
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
 cargo build --locked --release
 ./target/release/carry --help >/dev/null 2>&1 || true
 python3 benchmarks/frontierharness/test_adapter.py

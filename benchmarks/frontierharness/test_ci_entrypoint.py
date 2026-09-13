@@ -39,6 +39,35 @@ class FrontierHarnessCiEntrypointTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("--tasks is valid only for smoke-2 and full-30", completed.stderr)
 
+    def test_plan_runs_clean_runtime_installation_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source"
+            tests = source / "benchmarks" / "frontierharness"
+            tests.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
+            for name in (
+                "test_adapter.py", "test_agents.py", "test_run_suite.py", "test_shards.py",
+                "test_ci_entrypoint.py", "test_merge_shards.py",
+            ):
+                (tests / name).write_text("raise SystemExit(0)\n")
+            (tests / "test_install.py").write_text("raise SystemExit(37)\n")
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-qm", "fixture"], check=True)
+            commit = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+            completed = subprocess.run(
+                [
+                    "bash", str(ENTRYPOINT), "--mode", "plan", "--source", str(source),
+                    "--commit", commit, "--repo", "https://example.invalid/carry.git",
+                    "--checkpoint", "test-checkpoint", "--run-id", "test-run", "--out", str(root / "out"),
+                ],
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(completed.returncode, 37, completed.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

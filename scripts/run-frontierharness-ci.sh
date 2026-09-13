@@ -57,6 +57,10 @@ if [[ "$MODE" == plan ]]; then
   python3 "$SOURCE/benchmarks/frontierharness/test_adapter.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_agents.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_run_suite.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_shards.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_install.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_ci_entrypoint.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_merge_shards.py"
   printf '{"mode":"plan","carry_commit":"%s","frontierharness_commit":"%s","checkpoint":"%s"}\n' \
     "$COMMIT" "$FRONTIERHARNESS_COMMIT" "$CHECKPOINT"
   exit 0
