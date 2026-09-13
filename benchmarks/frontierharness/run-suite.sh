@@ -31,7 +31,10 @@ case "$SUITE" in
   datacurve)
     exec pier run \
       -p "/work/deep-swe/tasks/$TASK" \
-      --agent-import-path carry_frontierharness.pier_agent:CarryAgent -m "$MODEL" \
+      --agent-import-path carry_frontierharness.pier_agent:CarryAgent \
+      --environment-import-path carry_frontierharness.pier_environment:RuntaDockerEnvironment \
+      --environment-kwarg runta_compose_file=/work/runta-ca-overlay.yaml \
+      -m "$MODEL" \
       --jobs-dir "$JOBS_DIR"
     ;;
   *)
