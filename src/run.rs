@@ -27,19 +27,19 @@ use crate::{
 
 // Initial policy hypothesis: keep a meaningful recent working set while leaving ample room in
 // the model context. Hysteresis compacts this 32 Ki-token high-water mark toward 24 Ki tokens.
-const NEUTRAL_VOLATILE_BUDGET_TOKENS: usize = 32 * 1024;
+const ELIGIBLE_CONTEXT_BUDGET_TOKENS: usize = 32 * 1024;
 
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
 At each step, select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
 
-History is a working set, not a complete transcript. Context items carry a [context integer stable|volatile] marker showing their current lifecycle. Stable items remain by default. Volatile items remain in the recent working window but may be removed automatically under budget pressure. Compaction may change a retained volatile item to stable. After the first removal, a history-status item states that earlier context has been removed.
+History is a working set, not a complete transcript. Human-authored content is kept by default. All other context is eligible for removal when it no longer fits the working set. After the first removal, a history-status item states that earlier context has been removed.
 
 At each step:
 1. First, determine the next immediate step toward the goal and perform the highest-priority action.
-2. Then, as secondary housekeeping, review recently added visible context. If you learned anything from a volatile item that is not already preserved elsewhere, protect it. If only a concise learning must remain, remember the learning and make its bulky source removable. Make an item removable only when it taught you nothing or everything learned from it is preserved elsewhere. Finishing an action or encountering a failure does not by itself preserve its learning.
+2. Then, as secondary housekeeping, review recently added visible context. If you learned anything from an item that is not already preserved elsewhere, protect it. If only a concise learning must remain, remember the learning and make its bulky source removable. Make an item removable only when it taught you nothing or everything learned from it is preserved elsewhere. Finishing an action or encountering a failure does not by itself preserve its learning.
 
-Retention decisions persist until reversed or applied by compaction. When compaction applies protection, the retained item becomes stable. Preserve outcomes, not chain-of-thought.
+Retention decisions persist until reversed or applied by compaction. Preserve outcomes, not chain-of-thought.
 
 Large text shell results arrive as structured `output_head` and `output_tail` previews with an absolute `full_output_path`. Non-text output is omitted from the model payload and available only through its artifact paths. Read or slice those session files when omitted details matter.
 "#;
@@ -1000,7 +1000,7 @@ fn maybe_compact(
     let Some(plan) = state.plan_compaction_with_neutral_budget(
         protected,
         policy,
-        NEUTRAL_VOLATILE_BUDGET_TOKENS,
+        ELIGIBLE_CONTEXT_BUDGET_TOKENS,
     ) else {
         return Ok(false);
     };
@@ -1527,9 +1527,10 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("not already preserved elsewhere"));
         assert!(SYSTEM_PROMPT.contains("remember the learning"));
         assert!(SYSTEM_PROMPT.contains("History is a working set"));
-        assert!(!SYSTEM_PROMPT.contains("only when changing its current retention state"));
-        assert!(!SYSTEM_PROMPT.contains("do not restate the same decision"));
-        assert!(!SYSTEM_PROMPT.contains("The normal choice is neutral"));
+        assert!(SYSTEM_PROMPT.contains("Human-authored content is kept by default"));
+        assert!(SYSTEM_PROMPT.contains("All other context is eligible for removal"));
+        assert!(!SYSTEM_PROMPT.contains("stable"));
+        assert!(!SYSTEM_PROMPT.contains("volatile"));
     }
 
     #[test]
@@ -2439,7 +2440,7 @@ mod tests {
                 item["type"] == "function_call_output"
                     && item["output"]
                         .as_str()
-                        .is_some_and(|output| output.ends_with("[context 2 volatile]"))
+                        .is_some_and(|output| output.ends_with("[context 2]"))
             })
             .unwrap();
         let steering = history
@@ -2447,9 +2448,6 @@ mod tests {
             .position(|item| item["content"][0]["text"] == "do not change the JSON format")
             .unwrap();
         assert!(tool_result < steering);
-        assert_eq!(
-            history[steering + 1]["content"][0]["text"],
-            "[context 3 stable]"
-        );
+        assert_eq!(history[steering + 1]["content"][0]["text"], "[context 3]");
     }
 }

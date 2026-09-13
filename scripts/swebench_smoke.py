@@ -579,7 +579,6 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
         "--env", f"OPENAI_BASE_URL={api_base}",
         "--env", f"AGENT_TIMEOUT_SECONDS={agent_timeout_seconds}",
         "--env", "CARRY_COMPACTION_POLICY",
-        "--env", "CARRY_KEEP_LEASE_TURNS",
         "--env", "CARRY_COMPACTION_PAYOFF_REQUESTS",
         "--env", f"AGENT_COMMAND={AGENT_COMMANDS[harness]}",
         "--env", "BENCHMARK_WORKSPACE=/testbed",
@@ -591,6 +590,8 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
         "--mount", f"type=bind,src={task_input.resolve()},dst=/benchmark/input,readonly",
         "--mount", f"type=bind,src={output.resolve()},dst=/benchmark/output",
     ]
+    if os.environ.get("CARRY_KEEP_LEASE_TURNS"):
+        command.extend(["--env", "CARRY_KEEP_LEASE_TURNS"])
     if resume_session is not None:
         command.extend([
             "--mount",
