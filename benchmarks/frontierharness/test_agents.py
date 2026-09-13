@@ -39,15 +39,25 @@ class _FakeContext:
 
 
 class _Result:
-    def __init__(self, return_code: int = 0, stdout: str = "") -> None:
+    def __init__(self, return_code: int = 0, stdout: str = "", stderr: str = "") -> None:
         self.return_code = return_code
         self.stdout = stdout
+        self.stderr = stderr
 
 
 class _Environment:
-    def __init__(self, *, carry_return_code: int = 0, trace_exists: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        carry_return_code: int = 0,
+        trace_exists: bool = True,
+        carry_stdout: str = "",
+        carry_stderr: str = "",
+    ) -> None:
         self.carry_return_code = carry_return_code
         self.trace_exists = trace_exists
+        self.carry_stdout = carry_stdout
+        self.carry_stderr = carry_stderr
         self.uploads: list[tuple[Path, str]] = []
         self.commands: list[tuple[str, dict[str, str] | None]] = []
 
@@ -62,7 +72,7 @@ class _Environment:
         if command == "test -s /logs/agent/carry/trace.jsonl":
             return _Result(0 if self.trace_exists else 1)
         if "--session-dir /logs/agent/carry" in command:
-            return _Result(self.carry_return_code)
+            return _Result(self.carry_return_code, self.carry_stdout, self.carry_stderr)
         return _Result()
 
 
@@ -160,6 +170,34 @@ class CarryAgentContractTests(unittest.TestCase):
             finally:
                 os.environ.clear()
                 os.environ.update(old)
+    def test_pier_failure_preserves_redacted_process_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            binary = root / "carry"
+            binary.write_bytes(b"binary")
+            logs = root / "logs"
+            logs.mkdir()
+            old = dict(os.environ)
+            os.environ.update({"CARRY_FRONTIER_BINARY": str(binary), "FIREWORKS_API_KEY": "secret-value"})
+            try:
+                agent = self.pier(logs, model_name="fireworks_ai/accounts/fireworks/models/kimi-k3")
+                environment = _Environment(
+                    carry_return_code=17,
+                    trace_exists=False,
+                    carry_stdout="started FIREWORKS_API_KEY=secret-value",
+                    carry_stderr="Authorization: Bearer secret-value failed",
+                )
+                asyncio.run(agent.setup(environment))
+                with self.assertRaisesRegex(RuntimeError, "without producing a model trace"):
+                    asyncio.run(agent.run("solve", environment, _FakeContext()))
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+            diagnostic = json.loads((logs / "carry-exec-failure.json").read_text())
+        self.assertEqual(diagnostic["exit_code"], 17)
+        self.assertIn("started", diagnostic["stdout"])
+        self.assertIn("failed", diagnostic["stderr"])
+        self.assertNotIn("secret-value", json.dumps(diagnostic))
 
 
 if __name__ == "__main__":

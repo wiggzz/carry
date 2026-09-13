@@ -5,8 +5,10 @@ This module is loaded by Pier inside the Runta runtime through --agent-import-pa
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import re
 import tempfile
 
 from pier.agents.base import BaseAgent
@@ -14,6 +16,24 @@ from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 
 from .common import FIREWORKS_RESPONSES_BASE, carry_model_id, read_usage, run_command
+
+
+_DIAGNOSTIC_LIMIT = 64 * 1024
+_SECRET_ASSIGNMENT = re.compile(r"(?im)^(\s*(?:OPENAI_API_KEY|FIREWORKS_API_KEY)\s*=\s*)\S+")
+_BEARER = re.compile(r"(?i)(Authorization\s*:\s*Bearer\s+)\S+")
+
+
+def _safe_output(value: object, secret: str) -> tuple[str, bool]:
+    text = str(value or "")
+    truncated = len(text.encode("utf-8", errors="replace")) > _DIAGNOSTIC_LIMIT
+    if truncated:
+        text = text.encode("utf-8", errors="replace")[-_DIAGNOSTIC_LIMIT:].decode(
+            "utf-8", errors="replace"
+        )
+    if secret:
+        text = text.replace(secret, "[REDACTED]")
+    text = _SECRET_ASSIGNMENT.sub(r"\1[REDACTED]", text)
+    return _BEARER.sub(r"\1[REDACTED]", text), truncated
 
 
 class CarryAgent(BaseAgent):
@@ -37,6 +57,29 @@ class CarryAgent(BaseAgent):
         result = await environment.exec("chmod 755 /usr/local/bin/carry", user="root")
         if result.return_code != 0:
             raise RuntimeError("could not make the Carry binary executable")
+
+    def _write_failure_diagnostic(self, result: object, secret: str) -> None:
+        stdout, stdout_truncated = _safe_output(getattr(result, "stdout", ""), secret)
+        stderr, stderr_truncated = _safe_output(getattr(result, "stderr", ""), secret)
+        payload = {
+            "exit_code": getattr(result, "return_code", None),
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+        }
+        target = self.logs_dir / "carry-exec-failure.json"
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.logs_dir, delete=False
+            ) as temporary:
+                temporary.write(json.dumps(payload, sort_keys=True) + "\n")
+                temporary.flush()
+                os.fchmod(temporary.fileno(), 0o600)
+                temporary_path = Path(temporary.name)
+            os.replace(temporary_path, target)
+        except OSError:
+            self.logger.warning("could not persist Carry failure diagnostics")
 
     async def run(
         self,
@@ -76,6 +119,7 @@ class CarryAgent(BaseAgent):
             "/logs/agent/carry-trace.jsonl || true"
         )
         if result.return_code != 0 and trace.return_code != 0:
+            self._write_failure_diagnostic(result, api_key)
             raise RuntimeError("Carry exited without producing a model trace")
         if result.return_code != 0:
             self.logger.warning(

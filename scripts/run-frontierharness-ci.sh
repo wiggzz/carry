@@ -63,6 +63,9 @@ if [[ "$MODE" == plan ]]; then
   python3 "$SOURCE/benchmarks/frontierharness/test_run_suite.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_normalizer_cwd.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_prepare_image.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_calculate_cost.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_calculate_cost_integration.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_pier_environment.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_shards.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_transport_retry.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_install.py"
@@ -90,6 +93,8 @@ git clone --quiet https://github.com/frontier-harness-eval/eval.git "$FH"
 git -C "$FH" checkout --quiet "$FRONTIERHARNESS_COMMIT"
 python3 "$SOURCE/benchmarks/frontierharness/patch_usage_details.py" \
   --target "$FH/skills/frontierharness-eval/scripts/usage_details.py"
+python3 "$SOURCE/benchmarks/frontierharness/patch_calculate_cost.py" \
+  --target "$FH/skills/frontierharness-eval/scripts/calculate-cost.py"
 python3 "$SOURCE/benchmarks/frontierharness/patch_prepare_image.py" \
   --target "$FH/skills/frontierharness-eval/scripts/run-trials.sh"
 

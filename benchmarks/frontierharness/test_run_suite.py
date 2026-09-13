@@ -61,6 +61,8 @@ class RunSuiteTests(unittest.TestCase):
         self.assertIn("binary_env=/work/harness/target/release/carry", text)
         self.assertIn("key_present=yes", text)
         self.assertIn("arg=--agent-import-path\narg=carry_frontierharness.pier_agent:CarryAgent", text)
+        self.assertIn("arg=--environment-import-path\narg=carry_frontierharness.pier_environment:RuntaDockerEnvironment", text)
+        self.assertIn("arg=--environment-kwarg\narg=runta_compose_file=/work/runta-ca-overlay.yaml", text)
         self.assertIn("arg=-p\narg=/work/deep-swe/tasks/regex-log", text)
         self.assertNotIn("runta-secret-stub", text)
 
