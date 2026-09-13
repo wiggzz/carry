@@ -43,8 +43,8 @@ fi
 command -v musl-gcc >/dev/null 2>&1 || { echo "static Carry builds require musl-gcc" >&2; exit 1; }
 
 # The FrontierHarness provisioning base image supplies Python tooling but not Rust.
-# Bootstrap a minimal toolchain only when the runtime does not already provide one.
-if ! command -v cargo >/dev/null 2>&1; then
+# A distro Cargo alone cannot add a Rust target, so require the matching Rustup CLI.
+if ! command -v cargo >/dev/null 2>&1 || ! command -v rustup >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
   export PATH="$HOME/.cargo/bin:$PATH"
 fi

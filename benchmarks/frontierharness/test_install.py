@@ -110,6 +110,7 @@ class FrontierHarnessInstallTests(unittest.TestCase):
                 ],
             )
             self.assertTrue(any(line.startswith("curl ") for line in commands))
+            self.assertIn("apt-get install -y -qq musl-tools", commands)
             self.assertIn("rustup target add x86_64-unknown-linux-musl", commands)
             self.assertIn("cargo build --locked --release --target x86_64-unknown-linux-musl", commands)
             self.assertEqual(
