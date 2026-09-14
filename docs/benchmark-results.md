@@ -21,13 +21,10 @@ response retries, and preserved the fixed denominator.
 
 Against the prior fixed-catalog references, Carry is **10 percentage points higher**
 in resolved rate and **12.8% lower** in modeled model cost than Pi; against Codex,
-it is **8 points higher** and **44.8% lower** in modeled model cost. This is not a fresh three-harness control: Carry's candidate/context policy
-changed, and each result is one stochastic trajectory. The Pi and Codex references
-remain grading-compatible, however: the shared harness in all three runs captured
-`git diff <initial HEAD>` after the agent finished. The later Carry fix preserves
-that same original-worktree diff inside Carry's own artifacts when it commits.
-Model cost is artifact-recorded usage priced by the benchmark, not a provider
-invoice; infrastructure cost is deliberately excluded from this table.
+it is **8 points higher** and **44.8% lower** in modeled model cost. These are single benchmark runs, so stochastic variance applies. They are useful
+indicators of performance and modeled cost, not conclusive rankings. Model cost is
+artifact-recorded usage priced by the benchmark, not a provider invoice;
+infrastructure cost is deliberately excluded from this table.
 
 ## FrontierHarness 30
 
