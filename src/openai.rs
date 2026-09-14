@@ -346,7 +346,30 @@ impl OpenAiClient {
             if status.is_success() && (is_stream || subscription_stream) {
                 // Read completed SSE frames as they arrive. `bytes()` would defer all progress
                 // until the model has finished its (possibly long) reasoning turn.
-                break read_sse_response(response, &mut progress).await?;
+                match read_sse_response(response, &mut progress).await {
+                    Ok(response) => break response,
+                    Err(error) if retries < MAX_RESPONSE_RETRIES => {
+                        let delay = transport_retry_delay(retries);
+                        if delay > MAX_TOTAL_RETRY_WAIT.saturating_sub(retry_wait) {
+                            return Err(error).context(format!(
+                                "Responses API stream read failed after {retries} retries and {}ms waiting",
+                                retry_wait.as_millis()
+                            ));
+                        }
+                        retries += 1;
+                        retry_wait += delay;
+                        eprintln!(
+                            "Responses API stream read failed: {error}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
+                            delay.as_millis(),
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error).context(format!(
+                        "Responses API stream read failed after {retries} retries and {}ms waiting",
+                        retry_wait.as_millis()
+                    )),
+                }
             }
             let response_body = match response.bytes().await {
                 Ok(body) => body,
@@ -1088,6 +1111,40 @@ mod tests {
         let reply = client.step("system", &[]).await.unwrap();
 
         assert_eq!(reply.response_id, "response-after-disconnect");
+        assert_eq!(reply.response_retries, 1);
+        assert_eq!(
+            requests.recv_timeout(Duration::from_secs(2)).unwrap(),
+            requests.recv_timeout(Duration::from_secs(2)).unwrap()
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_when_an_sse_stream_closes_before_completion() {
+        let completed = json!({
+            "id": "response-after-stream-close",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "finish",
+                "arguments": "{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
+            }],
+            "usage": {}
+        });
+        let partial = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
+        let truncated_stream = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
+            partial.len() + 1
+        );
+        let body =
+            format!("data: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\n");
+        let (api_base, requests, server) =
+            response_server(vec![truncated_stream, sse_response(&body)]);
+        let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
+
+        let reply = client.step("system", &[]).await.unwrap();
+
+        assert_eq!(reply.response_id, "response-after-stream-close");
         assert_eq!(reply.response_retries, 1);
         assert_eq!(
             requests.recv_timeout(Duration::from_secs(2)).unwrap(),
