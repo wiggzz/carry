@@ -1,31 +1,35 @@
 #!/usr/bin/env bash
-# Resume evidence transfer for the one retained Regex runtime. This never launches a task.
+# Resume a retained trial runtime's evidence transfer. This never launches a task.
 set -euo pipefail
 
-CHECKPOINT="carry-fh-fbafa2ad28bf"
-TASK="terminal-bench/regex-log"
 MODEL="fireworks_ai/accounts/fireworks/models/kimi-k3"
 CMD_TEMPLATE="/work/harness/benchmarks/frontierharness/run-suite.sh {task} {suite} {model} {jobs}"
-RUNNER_COMMAND="/work/harness/benchmarks/frontierharness/run-suite.sh 'regex-log' 'terminal-bench' 'fireworks_ai/accounts/fireworks/models/kimi-k3' '/work/jobs/terminal-bench-regex-log'"
 
 usage() {
   cat <<'EOF'
-usage: recover-frontierharness-regex-evidence.sh --evaluator PATH --runtime ID --run-id ID --out DIR
+usage: recover-frontierharness-evidence.sh --source PATH --evaluator PATH --task ID \
+       --runtime ID --checkpoint NAME --run-id ID --out DIR
 
-Resumes only the retained terminal-bench/regex-log runtime's evidence collection.
-It refuses a provider API key and delegates to the pinned evaluator's documented
-same-run recovery path; it never restores a checkpoint or launches an agent.
+Resumes only a task listed in the source's frozen tasks-30 manifest. It refuses a
+provider API key and delegates to the pinned evaluator's documented same-run
+recovery path; it never restores a checkpoint or launches an agent.
 EOF
 }
 
+SOURCE=""
 EVALUATOR=""
+TASK=""
 RUNTIME=""
+CHECKPOINT=""
 RUN_ID=""
 OUT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --source) SOURCE=$2; shift 2 ;;
     --evaluator) EVALUATOR=$2; shift 2 ;;
+    --task) TASK=$2; shift 2 ;;
     --runtime) RUNTIME=$2; shift 2 ;;
+    --checkpoint) CHECKPOINT=$2; shift 2 ;;
     --run-id) RUN_ID=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -33,8 +37,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+[[ "$TASK" =~ ^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$ ]] || { echo "unsafe --task" >&2; exit 2; }
 [[ "$RUNTIME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{2,80}$ ]] || { echo "unsafe --runtime" >&2; exit 2; }
+[[ "$CHECKPOINT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{2,80}$ ]] || { echo "unsafe --checkpoint" >&2; exit 2; }
 [[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{2,120}$ ]] || { echo "unsafe --run-id" >&2; exit 2; }
+[[ -f "$SOURCE/benchmarks/frontierharness/tasks-30.txt" ]] || { echo "frozen task manifest is missing" >&2; exit 2; }
+python3 - "$SOURCE/benchmarks/frontierharness/tasks-30.txt" "$TASK" <<'PY'
+import sys
+manifest, task = sys.argv[1:]
+tasks = {line.split('#', 1)[0].strip() for line in open(manifest, encoding='utf-8')}
+if task not in tasks:
+    raise SystemExit(f"{task} is not in the frozen task manifest")
+PY
 [[ -n "$OUT" ]] || { echo "--out is required" >&2; exit 2; }
 [[ -x "$EVALUATOR/skills/frontierharness-eval/scripts/run-trials.sh" ]] \
   || { echo "pinned evaluator run-trials.sh is missing or not executable" >&2; exit 2; }
@@ -46,8 +60,12 @@ TASKS=$(mktemp "$OUT/recovery-tasks.XXXXXX")
 trap 'rm -f "$TASKS"' EXIT
 printf '%s\n' "$TASK" > "$TASKS"
 
+SUITE=${TASK%%/*}
+TASK_NAME=${TASK#*/}
+SLUG=${TASK//\//-}
+RUNNER_COMMAND="/work/harness/benchmarks/frontierharness/run-suite.sh '$TASK_NAME' '$SUITE' '$MODEL' '/work/jobs/$SLUG'"
 RUN_DIR="$OUT/runs/$RUN_ID"
-TRIAL_DIR="$RUN_DIR/trials/terminal-bench-regex-log"
+TRIAL_DIR="$RUN_DIR/trials/$SLUG"
 mkdir -p "$TRIAL_DIR"
 python3 - "$TRIAL_DIR/trial.json" "$TASK" "$RUNTIME" "$CHECKPOINT" "$RUNNER_COMMAND" <<'PY'
 import json
@@ -55,7 +73,7 @@ import sys
 from pathlib import Path
 
 Path(sys.argv[1]).write_text(json.dumps({
-    "id": sys.argv[2], "title": "regex-log", "suite": "terminal-bench",
+    "id": sys.argv[2], "title": sys.argv[2].split("/", 1)[1], "suite": sys.argv[2].split("/", 1)[0],
     "status": "infra_invalid", "success": False, "runtime": sys.argv[3],
     "checkpoint": sys.argv[4],
     "error": "evidence transfer incomplete; runtime retained for recovery",

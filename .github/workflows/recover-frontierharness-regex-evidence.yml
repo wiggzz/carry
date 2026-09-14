@@ -2,6 +2,22 @@ name: Recover retained FrontierHarness Regex evidence
 
 on:
   workflow_dispatch:
+    inputs:
+      task_id:
+        description: Task from the frozen tasks-30 manifest whose retained runtime should be recovered
+        required: true
+        default: terminal-bench/regex-log
+        type: string
+      runtime_id:
+        description: Retained Runta runtime identifier from the infrastructure-invalid trial record
+        required: true
+        default: fh-9c1ec78442335b8e
+        type: string
+      checkpoint_name:
+        description: Original immutable checkpoint recorded by the infrastructure-invalid trial
+        required: true
+        default: carry-fh-fbafa2ad28bf
+        type: string
 
 permissions:
   contents: read
@@ -43,10 +59,13 @@ jobs:
             --target evaluator/skills/frontierharness-eval/scripts/usage_details.py
           python3 benchmarks/frontierharness/patch_calculate_cost.py \
             --target evaluator/skills/frontierharness-eval/scripts/calculate-cost.py
-          bash scripts/recover-frontierharness-regex-evidence.sh \
+          bash scripts/recover-frontierharness-evidence.sh \
+            --source "$GITHUB_WORKSPACE" \
             --evaluator "$GITHUB_WORKSPACE/evaluator" \
-            --runtime fh-9c1ec78442335b8e \
-            --run-id "regex-recovery-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --task '${{ inputs.task_id }}' \
+            --runtime '${{ inputs.runtime_id }}' \
+            --checkpoint '${{ inputs.checkpoint_name }}' \
+            --run-id "evidence-recovery-${{ github.run_id }}-${{ github.run_attempt }}" \
             --out "$GITHUB_WORKSPACE/frontierharness-recovery"
 
       - name: Upload recovered evidence

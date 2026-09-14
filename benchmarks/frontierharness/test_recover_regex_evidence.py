@@ -11,7 +11,7 @@ import tempfile
 import unittest
 
 
-RECOVER = Path(__file__).parents[2] / "scripts" / "recover-frontierharness-regex-evidence.sh"
+RECOVER = Path(__file__).parents[2] / "scripts" / "recover-frontierharness-evidence.sh"
 RUNTIME = "fh-9c1ec78442335b8e"
 RUN_ID = "recovery-regex-001"
 
@@ -48,7 +48,11 @@ class RecoverRegexEvidenceTests(unittest.TestCase):
         runner.chmod(0o755)
         return evaluator
 
-    def invoke(self, root: Path, evaluator: Path, runtime: str = RUNTIME) -> subprocess.CompletedProcess[str]:
+    def invoke(self, root: Path, evaluator: Path, runtime: str = RUNTIME, task: str = "terminal-bench/regex-log") -> subprocess.CompletedProcess[str]:
+        source = root / "source"
+        manifest = source / "benchmarks" / "frontierharness" / "tasks-30.txt"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("terminal-bench/regex-log\nterminal-bench/chess-best-move\n")
         environment = {
             key: value
             for key, value in os.environ.items()
@@ -61,8 +65,8 @@ class RecoverRegexEvidenceTests(unittest.TestCase):
         )
         return subprocess.run(
             [
-                "bash", str(RECOVER), "--evaluator", str(evaluator), "--runtime", runtime,
-                "--run-id", RUN_ID, "--out", str(root / "out"),
+                "bash", str(RECOVER), "--source", str(source), "--evaluator", str(evaluator), "--task", task, "--runtime", runtime,
+                "--checkpoint", "carry-fh-fbafa2ad28bf", "--run-id", RUN_ID, "--out", str(root / "out"),
             ],
             text=True,
             capture_output=True,
@@ -89,6 +93,14 @@ class RecoverRegexEvidenceTests(unittest.TestCase):
             completed = self.invoke(root, self.make_evaluator(root), runtime="fh-unsafe;command")
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("unsafe --runtime", completed.stderr)
+            self.assertFalse((root / "call.json").exists())
+
+    def test_rejects_a_task_outside_the_frozen_manifest_before_invoking_evaluator(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            completed = self.invoke(root, self.make_evaluator(root), task="terminal-bench/not-in-manifest")
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("is not in the frozen task manifest", completed.stderr)
             self.assertFalse((root / "call.json").exists())
 
     def test_fails_if_the_upstream_resumption_does_not_produce_complete_evidence(self) -> None:
