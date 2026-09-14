@@ -1,26 +1,57 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="920" height="430" viewBox="0 0 920 430" role="img" aria-labelledby="title desc">
-  <title id="title">FrontierHarness direct modeled token cost per resolved task</title>
-  <desc id="desc">A horizontal bar chart: Carry 1.37 dollars, Pi 2.43 dollars, DSH Creator 3.29 dollars, Codex 3.47 dollars, Claude Code 18.34 dollars. Carry's result is an artifact-gated 30-task run; published comparisons use a non-normalized protocol.</desc>
-  <rect width="920" height="430" fill="#fbfaf8"/>
-  <text x="44" y="48" fill="#1d252d" font-family="system-ui, sans-serif" font-size="25" font-weight="700">FrontierHarness: direct modeled token cost / resolved task</text>
-  <text x="44" y="76" fill="#69737e" font-family="system-ui, sans-serif" font-size="15">Lower is better · published runs are directional only; protocols are not normalized</text>
-  <g stroke="#dfe3e6" stroke-width="1">
-    <line x1="250" y1="102" x2="250" y2="385"/><line x1="420" y1="102" x2="420" y2="385"/>
-    <line x1="590" y1="102" x2="590" y2="385"/><line x1="760" y1="102" x2="760" y2="385"/>
-  </g>
-  <g fill="#69737e" font-family="system-ui, sans-serif" font-size="13">
-    <text x="250" y="404" text-anchor="middle">$0</text><text x="420" y="404" text-anchor="middle">$5</text>
-    <text x="590" y="404" text-anchor="middle">$10</text><text x="760" y="404" text-anchor="middle">$15</text>
-  </g>
-  <g font-family="system-ui, sans-serif" font-size="17" fill="#1d252d">
-    <text x="44" y="132">Carry · 63.3%</text><text x="44" y="184">Pi · 60.0%</text><text x="44" y="236">DSH Creator · 63.3%</text><text x="44" y="288">Codex · 66.7%</text><text x="44" y="340">Claude Code · 63.3%</text>
-  </g>
-  <g>
-    <rect x="250" y="110" width="47" height="28" rx="4" fill="#ff6418"/><rect x="250" y="162" width="83" height="28" rx="4" fill="#526b7b"/>
-    <rect x="250" y="214" width="112" height="28" rx="4" fill="#526b7b"/><rect x="250" y="266" width="118" height="28" rx="4" fill="#526b7b"/>
-    <rect x="250" y="318" width="624" height="28" rx="4" fill="#526b7b"/>
-  </g>
-  <g font-family="system-ui, sans-serif" font-size="15" font-weight="700">
-    <text x="307" y="131" fill="#9c390d">$1.37</text><text x="343" y="183" fill="#1d252d">$2.43</text><text x="372" y="235" fill="#1d252d">$3.29</text><text x="378" y="287" fill="#1d252d">$3.47</text><text x="884" y="339" fill="#1d252d" text-anchor="end">$18.34</text>
-  </g>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="690" viewBox="0 0 1000 690" role="img" aria-labelledby="title desc">
+  <title id="title">FrontierHarness performance versus direct modeled token cost</title>
+  <desc id="desc">A log-scale scatter plot where farther left is lower direct modeled token cost per resolved task and higher is a higher pass rate. Carry is highlighted at 63.3 percent and 1.3666 dollars per resolved task. Among the published directional references, Pi is at 60.0 percent and 2.433 dollars, Codex is at 66.7 percent and 3.468 dollars, DSH Creator is at 63.3 percent and 3.285 dollars, Claude Code is at 63.3 percent and 18.337 dollars, and Exo is at 53.3 percent and 1.045 dollars. Carry lies on the plotted directional efficiency frontier. Other published references: Claude Code 63.3% / $18.337; Codex 66.7% / $3.468; DSH Creator 63.3% / $3.285; DSH Minimal 56.7% / $4.718; DSH PTC 60.0% / $4.577; DSH Standard 60.0% / $3.459; Exo Harness 53.3% / $1.045; Hermes 50.0% / $2.904; Kimi Code 56.7% / $3.647; Oh My Pi 56.7% / $4.746; OpenCode 50.0% / $3.244; Pi 60.0% / $2.433.</desc>
+  <rect width="1000" height="690" fill="#fbfaf8"/>
+  <text x="54" y="50" fill="#1d252d" font-family="system-ui, sans-serif" font-size="26" font-weight="700">FrontierHarness: performance vs. direct modeled token cost</text>
+  <text x="54" y="78" fill="#69737e" font-family="system-ui, sans-serif" font-size="15">Up is better · left is cheaper · cost axis is logarithmic</text>
+  <rect x="125" y="130" width="760" height="355" rx="8" fill="#ffffff" stroke="#dfe3e6"/>
+  <line class="grid" x1="177.7" y1="130" x2="177.7" y2="485"/><text class="tick" x="177.7" y="516" text-anchor="middle">$1</text>
+  <line class="grid" x1="341.3" y1="130" x2="341.3" y2="485"/><text class="tick" x="341.3" y="516" text-anchor="middle">$2</text>
+  <line class="grid" x1="557.7" y1="130" x2="557.7" y2="485"/><text class="tick" x="557.7" y="516" text-anchor="middle">$5</text>
+  <line class="grid" x1="721.3" y1="130" x2="721.3" y2="485"/><text class="tick" x="721.3" y="516" text-anchor="middle">$10</text>
+  <line class="grid" x1="885.0" y1="130" x2="885.0" y2="485"/><text class="tick" x="885.0" y="516" text-anchor="middle">$20</text>
+  <line class="grid" x1="125" y1="451.2" x2="885" y2="451.2"/><text class="tick" x="111" y="456.2" text-anchor="end">50%</text>
+  <line class="grid" x1="125" y1="366.7" x2="885" y2="366.7"/><text class="tick" x="111" y="371.7" text-anchor="end">55%</text>
+  <line class="grid" x1="125" y1="282.1" x2="885" y2="282.1"/><text class="tick" x="111" y="287.1" text-anchor="end">60%</text>
+  <line class="grid" x1="125" y1="197.6" x2="885" y2="197.6"/><text class="tick" x="111" y="202.6" text-anchor="end">65%</text>
+  <polyline class="frontier" points="188.1,395.4 251.4,226.4 471.3,168.9"/>
+  <g><title>Claude Code: 63.3% pass rate; $18.337 direct modeled token cost per resolved task</title><circle class="public" cx="864.5" cy="226.4" r="7"/></g>
+  <g><title>Codex: 66.7% pass rate; $3.468 direct modeled token cost per resolved task</title><circle class="public" cx="471.3" cy="168.9" r="7"/></g>
+  <g><title>DSH Creator: 63.3% pass rate; $3.285 direct modeled token cost per resolved task</title><circle class="public" cx="458.5" cy="226.4" r="7"/></g>
+  <g><title>DSH Minimal: 56.7% pass rate; $4.718 direct modeled token cost per resolved task</title><circle class="public" cx="544.0" cy="337.9" r="7"/></g>
+  <g><title>DSH PTC: 60.0% pass rate; $4.577 direct modeled token cost per resolved task</title><circle class="public" cx="536.8" cy="282.1" r="7"/></g>
+  <g><title>DSH Standard: 60.0% pass rate; $3.459 direct modeled token cost per resolved task</title><circle class="public" cx="470.7" cy="282.1" r="7"/></g>
+  <g><title>Exo Harness: 53.3% pass rate; $1.045 direct modeled token cost per resolved task</title><circle class="public" cx="188.1" cy="395.4" r="7"/></g>
+  <g><title>Hermes: 50.0% pass rate; $2.904 direct modeled token cost per resolved task</title><circle class="public" cx="429.4" cy="451.2" r="7"/></g>
+  <g><title>Kimi Code: 56.7% pass rate; $3.647 direct modeled token cost per resolved task</title><circle class="public" cx="483.2" cy="337.9" r="7"/></g>
+  <g><title>Oh My Pi: 56.7% pass rate; $4.746 direct modeled token cost per resolved task</title><circle class="public" cx="545.4" cy="337.9" r="7"/></g>
+  <g><title>OpenCode: 50.0% pass rate; $3.244 direct modeled token cost per resolved task</title><circle class="public" cx="455.5" cy="451.2" r="7"/></g>
+  <g><title>Pi: 60.0% pass rate; $2.433 direct modeled token cost per resolved task</title><circle class="public" cx="387.6" cy="282.1" r="7"/></g>
+  <text class="label" x="178.1" y="418.4" text-anchor="end">Exo</text>
+  <text class="label" x="387.6" y="304.1" text-anchor="middle">Pi</text>
+  <text class="label" x="468.5" y="248.4" text-anchor="start">DSH Creator</text>
+  <text class="label" x="482.3" y="158.9" text-anchor="start">Codex</text>
+  <text class="label" x="854.5" y="216.4" text-anchor="end">Claude Code</text>
+  <g><title>Carry: 63.3% pass rate; $1.3666 direct modeled token cost per resolved task</title><circle class="carry-halo" cx="251.4" cy="226.4" r="15"/><circle class="carry" cx="251.4" cy="226.4" r="9"/></g>
+  <text class="carry-label" x="267.4" y="218.4">Carry</text>
+  <text class="carry-sub" x="267.4" y="239.4">63.3% · $1.37 / pass</text>
+  <text class="axis" x="505.0" y="560" text-anchor="middle">Direct modeled token cost per resolved task → lower is better</text>
+  <text class="axis" transform="translate(34 307.5) rotate(-90)" text-anchor="middle">Pass rate → higher is better</text>
+  <g transform="translate(125 565)"><line class="frontier" x1="0" y1="0" x2="30" y2="0"/><text class="legend" x="40" y="5">Directional efficiency frontier</text><circle class="public" cx="290" cy="0" r="7"/><text class="legend" x="304" y="5">Published reference</text><circle class="carry" cx="500" cy="0" r="8"/><text class="legend" x="514" y="5">Carry</text></g>
+  <text class="note" x="54" y="630">Carry: artifact-gated 19 / 30 result. Published points: non-normalized references; use directionally, not as a leaderboard.</text>
+  <text class="note" x="54" y="654">Cost is modeled token cost per resolved task; Carry is a lower bound and excludes runner, storage, checkpoint, and GitHub Actions costs.</text>
+  <style>
+    .grid { stroke:#e5e8ea; stroke-width:1; }
+    .tick { fill:#68737d; font:13px system-ui, sans-serif; }
+    .axis { fill:#45515b; font:15px system-ui, sans-serif; font-weight:650; }
+    .label { fill:#52616c; font:13px system-ui, sans-serif; font-weight:650; }
+    .public { fill:#697985; stroke:#fff; stroke-width:2; }
+    .frontier { fill:none; stroke:#ffb28a; stroke-width:3; stroke-linecap:round; stroke-linejoin:round; stroke-dasharray:5 7; }
+    .carry-halo { fill:#fff0e8; stroke:#ff6418; stroke-width:2; }
+    .carry { fill:#ff6418; stroke:#9c390d; stroke-width:2; }
+    .carry-label { fill:#9c390d; font:16px system-ui, sans-serif; font-weight:800; }
+    .carry-sub { fill:#9c390d; font:13px system-ui, sans-serif; font-weight:650; }
+    .legend { fill:#56636e; font:13px system-ui, sans-serif; }
+    .note { fill:#69737e; font:12px system-ui, sans-serif; }
+  </style>
 </svg>

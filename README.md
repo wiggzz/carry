@@ -50,11 +50,11 @@ with a **$25.9656411** direct modeled token-cost lower bound (**$1.3666 / pass**
 main run and its copy-only evidence recovery are
 [artifact-gated](docs/benchmark-results.md#frontierharness-30).
 
-![FrontierHarness direct modeled token cost per resolved task](docs/assets/frontierharness-cost-per-pass.svg)
+![FrontierHarness performance versus direct modeled token cost](docs/assets/frontierharness-cost-per-pass.svg)
 
-Against FrontierHarness's published Pi point, Carry is +3.3 points in pass rate,
-43.8% lower in direct modeled cost per resolved task, and 22.6% lower in median
-agent duration. **This is directional, not a head-to-head claim:** task IDs
+On this directional performance-versus-cost chart, Carry sits on the plotted
+efficiency frontier: **63.3%** resolved at a **$1.3666** direct modeled token-cost
+lower bound per pass. **It is directional, not a head-to-head claim:** task IDs
 partly overlap, but agent/model versions, evaluator/runtime/egress policy,
 timeouts, and verifier semantics are not normalized.
 

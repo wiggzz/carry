@@ -44,13 +44,15 @@ The original artifact was not rewritten.
 | Median recorded agent duration | 5m51s |
 | Workflow wall time | 5h19m45s |
 
-The chart in the README places that run beside FrontierHarness's published
-configurations. It is **directional only**: task IDs overlap, but agent/model
-versions, evaluator/runtime/egress policy, timeout behavior, and verifier
-semantics are not normalized. On the published Pi point, Carry is +3.3 points in
-pass rate (63.3% versus 60.0%), 43.8% lower in direct modeled cost per resolved
-task ($1.37 versus $2.43), and 22.6% lower in median agent duration (351s versus
-453s). Those differences are not a controlled head-to-head comparison.
+The chart in the README is a performance-versus-cost view. Carry sits on its
+plotted directional efficiency frontier at 63.3% pass rate and $1.3666 direct
+modeled token cost per resolved task. **It is directional only:** task IDs overlap,
+but agent/model versions, evaluator/runtime/egress policy, timeout behavior, and
+verifier semantics are not normalized. On the published Pi point, Carry is +3.3
+points in pass rate (63.3% versus 60.0%), 43.8% lower in direct modeled cost per
+resolved task ($1.37 versus $2.43), and 22.6% lower in median agent duration
+(351s versus 453s). Those differences are not a controlled head-to-head
+comparison.
 
 Published reference data: FrontierHarness `eval-data.json` commit
 `96922ac653d073a16271929fc21033f95875f957`, generated 2026-08-22, SHA-256
