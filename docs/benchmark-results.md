@@ -19,10 +19,11 @@ response retries, and preserved the fixed denominator.
 | [Pi — prior reference](https://github.com/wiggzz/carry/actions/runs/32549988183) | `763c04c` | 36 / 50 (72%) | $0.661475 | 45m00s |
 | [Codex — prior reference](https://github.com/wiggzz/carry/actions/runs/32547842935) | `763c04c` | 37 / 50 (74%) | $1.045054 | 46m38s |
 
-Against the prior Pi reference, Carry is **10 percentage points higher** in
-resolved rate and **12.8% lower** in modeled model cost. This is not a fresh
-three-harness control: Carry's candidate/context policy changed, while Pi and
-Codex have not yet rerun from the current candidate. Model cost is
+Against the prior fixed-catalog references, Carry is **10 percentage points higher**
+in resolved rate and **12.8% lower** in modeled model cost than Pi; against Codex,
+it is **8 points higher** and **44.8% lower** in modeled model cost. This is not a
+fresh three-harness control: Carry's candidate/context policy changed, while Pi
+and Codex have not yet rerun from the current candidate. Model cost is
 artifact-recorded usage priced by the benchmark, not a provider invoice;
 infrastructure cost is deliberately excluded from this table.
 

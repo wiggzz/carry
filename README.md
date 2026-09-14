@@ -1,23 +1,23 @@
 # Carry
 
-Carry is an experimental coding agent for people who want an inspectable trail of
-what the model did—not just a patch. It gives a model a shell, records its work,
-and saves the resulting patch, trace, and usage record.
+Carry is an experimental coding agent built to reduce context cost without
+throwing away the evidence needed to finish the job. It gives a model a shell,
+records its work, and saves the resulting patch, trace, and usage record.
 
 > **Safety:** use a disposable checkout. Carry's shell is **not** a security
 > boundary. Do not give it your home directory, secrets, credentials, or unrelated
 > work.
 
-## Why Carry
+## How Carry reduces cost
 
-- **Keep useful evidence.** Human-authored content is kept by default. The model
-  can protect evidence, mark stale tool output removable, or save a concise
-  learning from it.
-- **Compact only when it pays.** The default `economic` policy estimates whether
-  the next request becomes cheaper before rewriting context; otherwise it keeps
-  the existing history and its prompt-cache reuse.
-- **Inspect the result.** Each session retains `final.patch`, `result.json`,
-  `trace.jsonl`, and shell output. The trace has no API headers or keys.
+- **Model-directed context management.** Human-authored content is kept by
+default. The model can protect evidence, mark stale tool output removable, or
+save a concise learning from it.
+- **Cost-optimized compaction planning.** The default `economic` policy estimates
+whether the next request becomes cheaper before rewriting context; otherwise it
+keeps the existing history and its prompt-cache reuse.
+- **Inspectable results.** Each session retains `final.patch`, `result.json`,
+`trace.jsonl`, and shell output. The trace has no API headers or keys.
 
 Carry is an experiment, not a claim that compaction is always useful. See the
 [context-policy design](docs/context-policy.md) for the lifecycle and accounting
@@ -37,8 +37,9 @@ It resolved **41 / 50 (82%)** for **$0.576700** modeled model cost in **46m49s**
 | [Pi — prior fixed-catalog reference](https://github.com/wiggzz/carry/actions/runs/32549988183) | 36 / 50 (72%) | $0.661475 | 45m00s |
 | [Codex — prior fixed-catalog reference](https://github.com/wiggzz/carry/actions/runs/32547842935) | 37 / 50 (74%) | $1.045054 | 46m38s |
 
-Against that prior Pi reference, Carry is **10 percentage points higher** in
-resolved rate and **12.8% lower-cost**. This is promising but **not a fresh
+Against the prior fixed-catalog references, Carry is **10 percentage points higher**
+in resolved rate and **12.8% lower-cost** than Pi; against Codex, it is **8 points
+higher** and **44.8% lower-cost**. This is promising but **not a fresh
 three-harness control**: Carry's candidate and context policy changed, while Pi
 and Codex have not yet been rerun from the current candidate.
 
