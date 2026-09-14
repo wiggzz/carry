@@ -38,8 +38,10 @@
   <text class="axis" x="505.0" y="560" text-anchor="middle">Direct modeled token cost per resolved task → lower is better</text>
   <text class="axis" transform="translate(34 307.5) rotate(-90)" text-anchor="middle">Pass rate → higher is better</text>
   <g transform="translate(125 565)"><line class="frontier" x1="0" y1="0" x2="30" y2="0"/><text class="legend" x="40" y="5">Directional efficiency frontier</text><circle class="public" cx="290" cy="0" r="7"/><text class="legend" x="304" y="5">Published reference</text><circle class="carry" cx="500" cy="0" r="8"/><text class="legend" x="514" y="5">Carry</text></g>
-  <text class="note" x="54" y="630">Carry: artifact-gated 19 / 30 result. Published points: non-normalized references; use directionally, not as a leaderboard.</text>
-  <text class="note" x="54" y="654">Cost is modeled token cost per resolved task; Carry is a lower bound and excludes runner, storage, checkpoint, and GitHub Actions costs.</text>
+  <text class="comparison" x="125" y="608">Vs. published Pi: +5.5% pass rate · 43.8% lower cost / pass</text>
+  <text class="comparison" x="125" y="630">Vs. published Codex: −5.1% pass rate · 60.6% lower cost / pass</text>
+  <text class="note" x="54" y="654">Carry: artifact-gated 19 / 30 result. Published points: non-normalized references; use directionally, not as a leaderboard.</text>
+  <text class="note" x="54" y="678">Cost is modeled token cost per resolved task; Carry is a lower bound and excludes runner, storage, checkpoint, and GitHub Actions costs.</text>
   <style>
     .grid { stroke:#e5e8ea; stroke-width:1; }
     .tick { fill:#68737d; font:13px system-ui, sans-serif; }
@@ -52,6 +54,7 @@
     .carry-label { fill:#9c390d; font:16px system-ui, sans-serif; font-weight:800; }
     .carry-sub { fill:#9c390d; font:13px system-ui, sans-serif; font-weight:650; }
     .legend { fill:#56636e; font:13px system-ui, sans-serif; }
+    .comparison { fill:#9c390d; font:13px system-ui, sans-serif; font-weight:750; }
     .note { fill:#69737e; font:12px system-ui, sans-serif; }
   </style>
 </svg>

@@ -54,9 +54,12 @@ main run and its copy-only evidence recovery are
 
 On this directional performance-versus-cost chart, Carry sits on the plotted
 efficiency frontier: **63.3%** resolved at a **$1.3666** direct modeled token-cost
-lower bound per pass. **It is directional, not a head-to-head claim:** task IDs
-partly overlap, but agent/model versions, evaluator/runtime/egress policy,
-timeouts, and verifier semantics are not normalized.
+lower bound per pass. Versus the published Pi point, that is **5.5% higher pass
+rate** (+3.3 points) and **43.8% lower cost/pass**. Versus Codex, Carry is
+**60.6% lower cost/pass** but **5.1% lower** in pass rate (−3.4 points). **It is
+directional, not a head-to-head claim:** task IDs partly overlap, but agent/model
+versions, evaluator/runtime/egress policy, timeouts, and verifier semantics are
+not normalized.
 
 Read [benchmark evidence](docs/benchmark-results.md) for immutable run links,
 configuration, accounting, recovery provenance, and limitations. One run is
