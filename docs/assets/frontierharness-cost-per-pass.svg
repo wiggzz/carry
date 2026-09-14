@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="430" viewBox="0 0 920 430" role="img" aria-labelledby="title desc">
+  <title id="title">FrontierHarness direct modeled token cost per resolved task</title>
+  <desc id="desc">A horizontal bar chart: Carry 1.37 dollars, Pi 2.43 dollars, DSH Creator 3.29 dollars, Codex 3.47 dollars, Claude Code 18.34 dollars. Carry's result is an artifact-gated 30-task run; published comparisons use a non-normalized protocol.</desc>
+  <rect width="920" height="430" fill="#fbfaf8"/>
+  <text x="44" y="48" fill="#1d252d" font-family="system-ui, sans-serif" font-size="25" font-weight="700">FrontierHarness: direct modeled token cost / resolved task</text>
+  <text x="44" y="76" fill="#69737e" font-family="system-ui, sans-serif" font-size="15">Lower is better · published runs are directional only; protocols are not normalized</text>
+  <g stroke="#dfe3e6" stroke-width="1">
+    <line x1="250" y1="102" x2="250" y2="385"/><line x1="420" y1="102" x2="420" y2="385"/>
+    <line x1="590" y1="102" x2="590" y2="385"/><line x1="760" y1="102" x2="760" y2="385"/>
+  </g>
+  <g fill="#69737e" font-family="system-ui, sans-serif" font-size="13">
+    <text x="250" y="404" text-anchor="middle">$0</text><text x="420" y="404" text-anchor="middle">$5</text>
+    <text x="590" y="404" text-anchor="middle">$10</text><text x="760" y="404" text-anchor="middle">$15</text>
+  </g>
+  <g font-family="system-ui, sans-serif" font-size="17" fill="#1d252d">
+    <text x="44" y="132">Carry · 63.3%</text><text x="44" y="184">Pi · 60.0%</text><text x="44" y="236">DSH Creator · 63.3%</text><text x="44" y="288">Codex · 66.7%</text><text x="44" y="340">Claude Code · 63.3%</text>
+  </g>
+  <g>
+    <rect x="250" y="110" width="47" height="28" rx="4" fill="#ff6418"/><rect x="250" y="162" width="83" height="28" rx="4" fill="#526b7b"/>
+    <rect x="250" y="214" width="112" height="28" rx="4" fill="#526b7b"/><rect x="250" y="266" width="118" height="28" rx="4" fill="#526b7b"/>
+    <rect x="250" y="318" width="624" height="28" rx="4" fill="#526b7b"/>
+  </g>
+  <g font-family="system-ui, sans-serif" font-size="15" font-weight="700">
+    <text x="307" y="131" fill="#9c390d">$1.37</text><text x="343" y="183" fill="#1d252d">$2.43</text><text x="372" y="235" fill="#1d252d">$3.29</text><text x="378" y="287" fill="#1d252d">$3.47</text><text x="884" y="339" fill="#1d252d" text-anchor="end">$18.34</text>
+  </g>
+</svg>

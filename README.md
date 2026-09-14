@@ -1,91 +1,74 @@
 # Carry
 
-Carry is an experimental coding agent that tries to spend less context without
-throwing away the evidence needed to finish the job. It runs a model with a
-shell, keeps a chronological record of the work, and writes a patch plus a
-trace you can inspect afterward.
+Carry is an experimental coding agent built to reduce context cost without
+throwing away the evidence needed to finish the job. It gives a model a shell,
+records its work, and saves the resulting patch, trace, and usage record.
 
-Use it on a disposable checkout. Carry's shell is **not** a security boundary:
-never give it a repository, home directory, or container that contains secrets
-or unrelated work.
+> **Safety:** use a disposable checkout. Carry's shell is **not** a security
+> boundary. Do not give it your home directory, secrets, credentials, or unrelated
+> work.
 
-## Why Carry exists
+## How Carry reduces cost
 
-Most coding agents either keep every tool result in context or periodically
-summarize history with a fixed rule. Carry takes a different approach:
+- **Model-directed context management.** Human-authored content is kept by
+default. The model can protect evidence, mark stale tool output removable, or
+save a concise learning from it.
+- **Cost-optimized compaction planning.** The default `economic` policy estimates
+whether the next request becomes cheaper before rewriting context; otherwise it
+keeps the existing history and its prompt-cache reuse.
+- **Inspectable results.** Each session retains `final.patch`, `result.json`,
+`trace.jsonl`, and shell output. The trace has no API headers or keys.
 
-- The model marks recent evidence as protected, removable, or worth remembering.
-- A cache-aware planner decides whether rewriting context will make the **next**
-  request cheaper. If it will not, Carry keeps the existing history.
-- The result is a chronological, inspectable record instead of an opaque
-  summary. `trace.jsonl`, shell outputs, `result.json`, and `final.patch` stay
-  with the session.
+Carry is an experiment, not a claim that compaction is always useful. See the
+[context-policy design](docs/context-policy.md) for the lifecycle and accounting
+rules.
 
-This is still an experiment. The point is to make the tradeoff measurable, not
-claim that context compaction is always useful.
+## Evidence at a glance
 
-## Recent changes
+### Official SWE-bench Verified 50
 
-Carry now persists canonical `context-state.json` checkpoints, so a native
-continuation can begin a new task from the prior task's completed context without
-modifying the source session. The provider-native tool call and its matching
-function result are one compaction block, so a rewrite never leaves an orphaned
-call or result. Context history remains exact-prefix append-only between
-intentional rewrites, preserving prompt-cache reuse.
+Carry's latest fixed 50-task run used `gpt-5.6-luna`, medium reasoning, a
+360-second task limit, `economic` compaction, and the five-request payoff horizon.
+It resolved **41 / 50 (82%)** for **$0.576700** modeled model cost in **46m49s**.
 
-The default `economic` policy remains conservative: it evaluates the next
-request (`--compaction-payoff-requests 1`) and rewrites only when projected
-savings clear a 10% margin. Longer positive payoff horizons are explicit
-experiments, and `--keep-lease-turns N` provides opt-in, expiring protection
-for evidence that needs another review. Both settings are recorded in run
-provenance; keep leases are disabled by default. See the
-[context-policy design](docs/context-policy.md) for the exact lifecycle and
-safety rules.
+| Harness | Resolved | Modeled model cost | Workflow wall time |
+| --- | ---: | ---: | ---: |
+| [Carry — current context policy](https://github.com/wiggzz/carry/actions/runs/34779347812) | 41 / 50 (82%) | $0.576700 | 46m49s |
+| [Pi — prior fixed-catalog reference](https://github.com/wiggzz/carry/actions/runs/32549988183) | 36 / 50 (72%) | $0.661475 | 45m00s |
+| [Codex — prior fixed-catalog reference](https://github.com/wiggzz/carry/actions/runs/32547842935) | 37 / 50 (74%) | $1.045054 | 46m38s |
 
-## Benchmark evidence
+Against the prior fixed-catalog references, Carry is **10 percentage points higher**
+in resolved rate and **12.8% lower-cost** than Pi; against Codex, it is **8 points
+higher** and **44.8% lower-cost**. These are single benchmark runs, so stochastic variance applies. They are useful
+indicators of performance and modeled cost, not conclusive rankings.
 
-### Full-catalog snapshot
+### FrontierHarness 30
 
-A fixed 50-task SWE-bench Verified comparison ran `gpt-5.6-luna` at medium
-reasoning. All 150 Carry, Codex, and Pi slots were evaluated.
+Carry resolved **19 / 30 (63.3%)** on a frozen Terminal-Bench + DataCurve mix,
+with a **$25.9656411** direct modeled token-cost lower bound (**$1.3666 / pass**),
+**5m51s** median recorded agent time, and **5h19m45s** workflow wall time. The
+main run and its copy-only evidence recovery are
+[artifact-gated](docs/benchmark-results.md#frontierharness-30).
 
-| Harness | Resolved | Recorded model cost |
-| --- | ---: | ---: |
-| Carry | 40 / 50 | $0.536538 |
-| Codex | 41 / 50 | $1.092152 |
-| Pi | 39 / 50 | $0.649433 |
+![FrontierHarness direct modeled token cost per resolved task](docs/assets/frontierharness-cost-per-pass.svg)
 
-Carry was one task behind Codex and one ahead of Pi on that catalog while using
-less recorded model spend than either. These are artifact-recorded estimates,
-not provider invoices, and one 50-task run is evidence rather than a general
-performance claim. The [run artifact](https://github.com/wiggzz/carry/actions/runs/33029120967)
-contains the per-task outcomes, tokens, costs, and provenance.
+Against FrontierHarness's published Pi point, Carry is +3.3 points in pass rate,
+43.8% lower in direct modeled cost per resolved task, and 22.6% lower in median
+agent duration. **This is directional, not a head-to-head claim:** task IDs
+partly overlap, but agent/model versions, evaluator/runtime/egress policy,
+timeouts, and verifier semantics are not normalized.
 
-### Retained-context experiment
+Read [benchmark evidence](docs/benchmark-results.md) for immutable run links,
+configuration, accounting, recovery provenance, and limitations. One run is
+useful evidence, not a general quality ranking.
 
-The latest retained `session-20` experiment ran Carry sequentially through the
-first 20 positions of the frozen catalog. Each task still had a fresh prepared
-workspace and isolated SWE-bench evaluation; only Carry's completed native
-session was resumed. At source revision
-[`c47aa71`](https://github.com/wiggzz/carry/commit/c47aa71d275c3ed85b612818230e67a956a76425),
-with `gpt-5.6-luna`, `economic` compaction, payoff horizon 5, and an 8-turn
-keep lease, it resolved **16 / 20** tasks for **$0.369222** estimated model
-cost, with zero response retries. The
-[artifact](https://github.com/wiggzz/carry/actions/runs/33830628262) records
-all 20 outcomes, token accounting, configuration, and evaluator provenance.
-
-This is one retained-session trajectory, not a controlled comparison or a
-general solve-rate claim. It documents the current mechanism and its observed
-cost/outcome envelope; compare policies only on predeclared, matched task
-sets.
-
-## Try it
+## Install and try it
 
 ### Install a release
 
-Download the Linux x86_64 archive and its `SHA256SUMS` file from the
-[latest release](https://github.com/wiggzz/carry/releases/latest). Verify the
-archive before installing it:
+Download the Linux x86_64 archive and `SHA256SUMS` from the
+[latest release](https://github.com/wiggzz/carry/releases/latest), then verify
+before installing:
 
 ```sh
 sha256sum -c SHA256SUMS
@@ -95,7 +78,7 @@ install -m 0755 carry ~/.local/bin/carry
 carry --help
 ```
 
-### Or build from source
+### Build from source
 
 ```sh
 git clone https://github.com/wiggzz/carry.git
@@ -104,97 +87,55 @@ cargo build --release --locked
 ./target/release/carry --help
 ```
 
-### Run a task
+### Run an isolated task
 
-Set an OpenAI API key in the process environment, then point Carry at an
-isolated repository checkout:
+Set an API key in the process environment and point Carry at a disposable
+checkout:
 
 ```sh
 export OPENAI_API_KEY=...
 carry --cwd /path/to/disposable/repo fix the failing tests
 ```
 
-### ChatGPT subscription
-
-Instead of an API key, Carry can use an eligible ChatGPT subscription through the
-Codex endpoint. Sign in once; Carry stores the refreshable credential under
-`$CARRY_HOME/auth.json` (or `~/.carry/auth.json`) with owner-only permissions:
+An eligible ChatGPT subscription can use the Codex endpoint instead:
 
 ```sh
 carry login
-```
-
-That opens a browser and waits for the localhost callback. On a headless host,
-use a device code instead:
-
-```sh
+# headless host:
 carry login --device-auth
 ```
 
-`carry` automatically refreshes a stored subscription credential before it
-expires. An explicit `OPENAI_API_KEY` continues to take precedence, and it is
-required for a custom `OPENAI_BASE_URL`. Remove the local subscription
-credential with `carry logout`.
+`OPENAI_API_KEY` takes precedence and is required for a custom
+`OPENAI_BASE_URL`. Remove the stored subscription credential with `carry logout`.
+Use `-p` when the prompt begins with an option-like value.
 
-Use `-p` when the prompt itself starts with an option-like value:
+Run without a prompt for an interactive session, or add `--interactive` after an
+initial prompt. For the localhost-only UI, run:
 
 ```sh
-carry --cwd /path/to/disposable/repo -p "explain why --release is failing"
+carry --serve --cwd ../project
 ```
-
-Run `carry` without a prompt for an interactive session. You can also add
-`--interactive` after an initial prompt. While Carry works, type another
-instruction to queue it after the current shell action. `/help`, `/quit`, and
-`/exit` work at the prompt.
-
-Run `carry --serve --cwd ../project` to launch the embedded local UI at `http://127.0.0.1:8765`; use `--port` to choose another port. The UI submits the initial task and later steering through a local HTTP API, and receives activity over SSE. It is deliberately localhost-only. Context status appears as protected, removable, and removed pills on the relevant output. To continue an existing session in the browser, run `carry --resume SESSION --serve`, where `SESSION` is either a session directory or an ID below the configured session home; the UI's first message becomes the resumed session's fresh human turn.
-
-The default model is `gpt-5.6-luna`; override it with `--model` or `OPENAI_MODEL`. Sessions have no default step limit. Use `--max-steps N` only when an explicit per-turn cap is required. Responses API `429` responses with `error.code=rate_limit_exceeded` and connection failures before a response is received are retried up to five times. Carry honors `Retry-After-Ms`, numeric `Retry-After`, and HTTP-date `Retry-After`; the total wait budget is 60 seconds, and Carry stops rather than sending earlier when the server requests a longer delay. Missing or invalid delay headers and transport failures use bounded exponential backoff. Retries resend the identical request body; successful model-response events include the retry count, and exhausted errors include the retry/wait summary. Quota failures and ambiguous `5xx` POST failures are not replayed.
 
 ## Inspect a run
 
-Sessions are written under `$CARRY_HOME/sessions` or `~/.carry/sessions`.
-Choose another parent with `--session-home`, or choose the exact output directory with
-`--session-dir`. Resume by either a session directory or its ID under that home:
+Sessions live under `$CARRY_HOME/sessions` (or `~/.carry/sessions`). Continue a
+session by ID or path while writing the continuation elsewhere:
 
 ```sh
 carry --resume 20260827-123456-abcdef --session-home /path/to/carry-home -p "continue"
 carry --resume /path/to/prior-session --session-dir /path/to/fresh-output -p "new task"
 ```
 
-The second form reads only the prior conversation state and writes the continued run to
-its new output directory.
-
 Each session includes:
 
-- `context-state.json`: versioned canonical context checkpoint, atomically replaced after state changes
-- `final.patch`: the patch produced by the agent
-- `result.json`: outcome, aggregate token use, cost estimate, and compaction count
-- `trace.jsonl`: chronological structured events with no API headers or key
-- `trace.log` and shell-output files: human-readable execution evidence
+- `context-state.json` — atomically updated canonical context checkpoint
+- `final.patch` — the agent's resulting patch
+- `result.json` — outcome, usage, cost estimate, retries, and compactions
+- `trace.jsonl` and shell-output files — chronological execution evidence
 
-The terminal prints compact per-step input, cache-read, cache-write, and output
-token counts. `result.json` records the selected compaction policy and retries.
-
-## Context policy
-
-Carry retains human messages and model-authored memories by default. Tool
-interactions start in a recent working window. The model may protect evidence
-that must survive, mark evidence removable, or save one concise learning from
-a bulky tool result.
-
-The default `economic` policy compares the next model request with and without
-compaction, then rewrites only when the compacted request is already cheaper.
-For an ablation or control run, disable compaction explicitly:
-
-```sh
-carry --compaction-policy disabled --cwd /path/to/disposable/repo fix the tests
-# or: CARRY_COMPACTION_POLICY=disabled carry ...
-```
-
-Carry records the selected policy in `trace.jsonl` and `result.json`. See the
-[context-policy design](docs/context-policy.md) for the ledger, retention
-markers, cache frontier, and rewrite rules.
+The default model is `gpt-5.6-luna`; choose another with `--model` or
+`OPENAI_MODEL`. There is no default step limit; use `--max-steps N` only when a
+specific cap is required.
 
 ## Development
 
@@ -212,28 +153,18 @@ docker build --tag carry:dev .
 ./scripts/run-fixture.sh clamp scripted
 ```
 
-Live fixtures require `OPENAI_API_KEY`. Codex fixture comparisons also require
-a separately configured Codex CLI session; neither runs in CI.
+Live fixtures require `OPENAI_API_KEY`; Codex fixture comparisons also need a
+configured Codex CLI session. Neither runs in CI.
 
-## SWE-bench operations
+## Maintainer operations
 
-The manual, protected `Run SWE-bench` workflow is for maintainers. It has
-credential-free `bootstrap`, catalog-building `prepare-50`, pull-only
-`smoke-5`, and fixed-denominator `official-50` modes. Read
-[benchmark isolation](docs/benchmark-isolation.md) and
-[the workflow](.github/workflows/run-swebench.yml) before dispatching one.
+The protected SWE-bench workflow is for maintainers. Read
+[benchmark isolation](docs/benchmark-isolation.md) and the
+[workflow](.github/workflows/run-swebench.yml) before dispatching it. Every
+model-bearing official run uses disposable containers, a model-key-only agent
+environment, credential-free grading, immutable task images, and exact cleanup
+checks.
 
-Every official model-bearing run uses disposable containers, a model-key-only
-agent environment, separate credential-free grading, immutable task-image
-digests, and exact cleanup checks. The benchmark has real model and cloud cost;
-review its source commit, catalog digest, and expected spend before dispatch.
-
-## Releases and contributions
-
-Use a Conventional Commit title for each pull request. Release Please includes
-`feat`, `fix`, `perf`, and `revert` entries in release notes; ordinary
-non-release types such as `docs`, `refactor`, `test`, `ci`, `build`, `chore`, and
-`style` are valid but normally omitted. Use the optional `!` marker only for a
-real compatibility break. CI runs formatting, Clippy, unit tests, a release
-build, and the scripted fixture. Release Please opens a release PR; merging it
-publishes a Linux x86_64 binary and checksum.
+Contributions use Conventional Commit titles. CI runs formatting, Clippy, unit
+tests, a release build, and the scripted fixture. Release Please publishes the
+Linux x86_64 archive and checksum after its release PR merges.
