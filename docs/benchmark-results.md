@@ -5,22 +5,26 @@ leaderboard claims or evidence that one agent is generally better than another.
 
 ## Official SWE-bench Verified 50
 
-All three agents ran the same 50 tasks in the same order at source
-`763c04c1b40caa6b3c01a3eb2d9fc610c00805b3`, with SWE-bench Verified revision
+The latest Carry run used the same 50 tasks in the same order as the prior
+three-harness reference, with SWE-bench Verified revision
 `c104f840cc67f8b6eec6f759ebc8b2693d585d4a`, `gpt-5.6-luna`, medium reasoning,
-and a 360-second task limit. Each run produced 50 predictions and completed
-provenance and cleanup checks.
+and a 360-second task limit. Its source was
+`9d1ed13c2c20142f72702d54ff42cd332a4dfa93`, with `economic` compaction and a
+five-request payoff horizon. It completed all 50 evaluated slots, had zero
+response retries, and preserved the fixed denominator.
 
-| Harness | Resolved | Modeled model cost | Workflow wall time |
-| --- | ---: | ---: | ---: |
-| [Carry](https://github.com/wiggzz/carry/actions/runs/32545967486) | 32 / 50 (64%) | $0.598024 | 40m44s |
-| [Pi](https://github.com/wiggzz/carry/actions/runs/32549988183) | 36 / 50 (72%) | $0.661475 | 45m00s |
-| [Codex](https://github.com/wiggzz/carry/actions/runs/32547842935) | 37 / 50 (74%) | $1.045054 | 46m38s |
+| Harness | Candidate | Resolved | Modeled model cost | Workflow wall time |
+| --- | --- | ---: | ---: | ---: |
+| [Carry — current context policy](https://github.com/wiggzz/carry/actions/runs/34779347812) | `9d1ed13` | 41 / 50 (82%) | $0.576700 | 46m49s |
+| [Pi — prior reference](https://github.com/wiggzz/carry/actions/runs/32549988183) | `763c04c` | 36 / 50 (72%) | $0.661475 | 45m00s |
+| [Codex — prior reference](https://github.com/wiggzz/carry/actions/runs/32547842935) | `763c04c` | 37 / 50 (74%) | $1.045054 | 46m38s |
 
-Against Pi on this one matched catalog, Carry used **9.6% less modeled model
-cost** and finished **9.5% sooner**, while resolving **8 percentage points fewer
-tasks**. Model cost is artifact-recorded usage priced by the benchmark, not a
-provider invoice; infrastructure cost is deliberately excluded from this table.
+Against the prior Pi reference, Carry is **10 percentage points higher** in
+resolved rate and **12.8% lower** in modeled model cost. This is not a fresh
+three-harness control: Carry's candidate/context policy changed, while Pi and
+Codex have not yet rerun from the current candidate. Model cost is
+artifact-recorded usage priced by the benchmark, not a provider invoice;
+infrastructure cost is deliberately excluded from this table.
 
 ## FrontierHarness 30
 

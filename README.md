@@ -27,17 +27,20 @@ rules.
 
 ### Official SWE-bench Verified 50
 
-A matched 50-task run used the same source, task order, model, reasoning level,
-and limits for Carry, Pi, and Codex. Carry resolved **32 / 50 (64%)** for
-**$0.598024** modeled model cost in **40m44s**. Pi resolved **36 / 50 (72%)** for
-**$0.661475** in **45m00s**: Carry was **9.6% lower-cost** and **9.5% faster**,
-but **8 percentage points lower** in resolved rate.
+Carry's latest fixed 50-task run used `gpt-5.6-luna`, medium reasoning, a
+360-second task limit, `economic` compaction, and the five-request payoff horizon.
+It resolved **41 / 50 (82%)** for **$0.576700** modeled model cost in **46m49s**.
 
 | Harness | Resolved | Modeled model cost | Workflow wall time |
 | --- | ---: | ---: | ---: |
-| [Carry](https://github.com/wiggzz/carry/actions/runs/32545967486) | 32 / 50 (64%) | $0.598024 | 40m44s |
-| [Pi](https://github.com/wiggzz/carry/actions/runs/32549988183) | 36 / 50 (72%) | $0.661475 | 45m00s |
-| [Codex](https://github.com/wiggzz/carry/actions/runs/32547842935) | 37 / 50 (74%) | $1.045054 | 46m38s |
+| [Carry — current context policy](https://github.com/wiggzz/carry/actions/runs/34779347812) | 41 / 50 (82%) | $0.576700 | 46m49s |
+| [Pi — prior fixed-catalog reference](https://github.com/wiggzz/carry/actions/runs/32549988183) | 36 / 50 (72%) | $0.661475 | 45m00s |
+| [Codex — prior fixed-catalog reference](https://github.com/wiggzz/carry/actions/runs/32547842935) | 37 / 50 (74%) | $1.045054 | 46m38s |
+
+Against that prior Pi reference, Carry is **10 percentage points higher** in
+resolved rate and **12.8% lower-cost**. This is promising but **not a fresh
+three-harness control**: Carry's candidate and context policy changed, while Pi
+and Codex have not yet been rerun from the current candidate.
 
 ### FrontierHarness 30
 
