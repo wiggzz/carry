@@ -2,6 +2,12 @@
 # Manual CI entry point for the pinned FrontierHarness Eval workflow.
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=frontierharness_transport_retry.sh
+source "$SCRIPT_DIR/frontierharness_transport_retry.sh"
+# shellcheck source=frontierharness_provision_artifacts.sh
+source "$SCRIPT_DIR/frontierharness_provision_artifacts.sh"
+
 FRONTIERHARNESS_COMMIT=e837a70bd6beb4e72eeeda62dd06e3bd34f6cb63
 
 usage() {
@@ -57,6 +63,18 @@ if [[ "$MODE" == plan ]]; then
   python3 "$SOURCE/benchmarks/frontierharness/test_adapter.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_agents.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_run_suite.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_normalizer_cwd.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_prepare_image.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_provision_base_tools.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_provision_artifacts.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_calculate_cost.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_calculate_cost_integration.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_pier_environment.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_shards.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_transport_retry.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_install.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_ci_entrypoint.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_merge_shards.py"
   printf '{"mode":"plan","carry_commit":"%s","frontierharness_commit":"%s","checkpoint":"%s"}\n' \
     "$COMMIT" "$FRONTIERHARNESS_COMMIT" "$CHECKPOINT"
   exit 0
@@ -79,18 +97,26 @@ git clone --quiet https://github.com/frontier-harness-eval/eval.git "$FH"
 git -C "$FH" checkout --quiet "$FRONTIERHARNESS_COMMIT"
 python3 "$SOURCE/benchmarks/frontierharness/patch_usage_details.py" \
   --target "$FH/skills/frontierharness-eval/scripts/usage_details.py"
+python3 "$SOURCE/benchmarks/frontierharness/patch_calculate_cost.py" \
+  --target "$FH/skills/frontierharness-eval/scripts/calculate-cost.py"
+python3 "$SOURCE/benchmarks/frontierharness/patch_prepare_image.py" \
+  --target "$FH/skills/frontierharness-eval/scripts/run-trials.sh"
+python3 "$SOURCE/benchmarks/frontierharness/patch_provision_base_tools.py" \
+  --target "$FH/skills/frontierharness-eval/scripts/provision-golden-checkpoint.sh"
 
 if [[ "$MODE" == provision ]]; then
   RUNTIME="carry-fh-build-${COMMIT:0:12}-${RUN_ID}"
   RUNTIME=${RUNTIME:0:80}
   cleanup() { runta rm "$RUNTIME" >/dev/null 2>&1 || true; }
   trap cleanup EXIT
-  bash "$FH/skills/frontierharness-eval/scripts/provision-golden-checkpoint.sh" \
+  run_with_frontierharness_ready_retries \
+    bash "$FH/skills/frontierharness-eval/scripts/provision-golden-checkpoint.sh" \
     --runtime "$RUNTIME" --checkpoint "$CHECKPOINT" --harness carry \
     --provider fireworks --repo "$REPO" --commit "$COMMIT" \
     --cpus 4 --memory 8192 --disk-size-gib 50 --keep-runtime \
     --install-script "$SOURCE/benchmarks/frontierharness/install.sh"
-  runta cp "$RUNTIME:/work/manifest.json" "$OUT/manifest.json"
+  copy_verified_provision_manifest \
+    "$(pwd)/manifest-${CHECKPOINT}.json" "$OUT/manifest.json" "$COMMIT" "$CHECKPOINT"
   python3 - "$OUT/provision.json" "$COMMIT" "$FRONTIERHARNESS_COMMIT" "$CHECKPOINT" <<'PY'
 import json, sys
 from pathlib import Path
@@ -119,5 +145,8 @@ bash "$FH/skills/frontierharness-eval/scripts/run-trials.sh" \
   --checkpoint "$CHECKPOINT" --harness carry --provider fireworks \
   --run-id "$RUN_ID" --tasks "$TASKS" --out "$OUT/runs" \
   --cmd '/work/harness/benchmarks/frontierharness/run-suite.sh {task} {suite} {model} {jobs}'
-node "$FH/skills/frontierharness-eval/scripts/normalize-results.mjs" \
-  --run "$OUT/runs/$RUN_ID" --label "Carry $COMMIT"
+(
+  cd "$FH"
+  node "skills/frontierharness-eval/scripts/normalize-results.mjs" \
+    --run "$OUT/runs/$RUN_ID" --label "Carry $COMMIT"
+)

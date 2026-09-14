@@ -346,7 +346,30 @@ impl OpenAiClient {
             if status.is_success() && (is_stream || subscription_stream) {
                 // Read completed SSE frames as they arrive. `bytes()` would defer all progress
                 // until the model has finished its (possibly long) reasoning turn.
-                break read_sse_response(response, &mut progress).await?;
+                match read_sse_response(response, &mut progress).await {
+                    Ok(response) => break response,
+                    Err(error) if retries < MAX_RESPONSE_RETRIES => {
+                        let delay = transport_retry_delay(retries);
+                        if delay > MAX_TOTAL_RETRY_WAIT.saturating_sub(retry_wait) {
+                            return Err(error).context(format!(
+                                "Responses API stream read failed after {retries} retries and {}ms waiting",
+                                retry_wait.as_millis()
+                            ));
+                        }
+                        retries += 1;
+                        retry_wait += delay;
+                        eprintln!(
+                            "Responses API stream read failed: {error}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
+                            delay.as_millis(),
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error).context(format!(
+                        "Responses API stream read failed after {retries} retries and {}ms waiting",
+                        retry_wait.as_millis()
+                    )),
+                }
             }
             let response_body = match response.bytes().await {
                 Ok(body) => body,
@@ -676,11 +699,14 @@ mod tests {
 
     use std::{
         io::{ErrorKind, Read, Write},
-        net::TcpListener,
-        sync::mpsc,
+        net::{TcpListener, TcpStream},
+        process::{Command, Stdio},
+        sync::{Mutex, mpsc},
         thread,
         time::Instant as StdInstant,
     };
+
+    static SSL_CERT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn response_server(
         responses: Vec<String>,
@@ -791,6 +817,123 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    #[test]
+    fn reqwest_uses_ssl_cert_file_for_a_private_ca() {
+        let _env_lock = SSL_CERT_ENV_LOCK.lock().unwrap();
+        let certificates = tempfile::tempdir().unwrap();
+        let ca_certificate = certificates.path().join("private-ca.pem");
+        let ca_key = certificates.path().join("private-ca.key");
+        let server_certificate = certificates.path().join("server.pem");
+        let server_key = certificates.path().join("server.key");
+        let server_request = certificates.path().join("server.csr");
+        let server_extensions = certificates.path().join("server.ext");
+        std::fs::write(
+            &server_extensions,
+            "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n",
+        )
+        .unwrap();
+        let status = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=Carry test CA",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+                "-addext",
+                "keyUsage=critical,keyCertSign,cRLSign",
+                "-keyout",
+            ])
+            .arg(&ca_key)
+            .arg("-out")
+            .arg(&ca_certificate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("openssl")
+            .args([
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-subj",
+                "/CN=localhost",
+                "-keyout",
+            ])
+            .arg(&server_key)
+            .arg("-out")
+            .arg(&server_request)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("openssl")
+            .args(["x509", "-req", "-in"])
+            .arg(&server_request)
+            .arg("-CA")
+            .arg(&ca_certificate)
+            .arg("-CAkey")
+            .arg(&ca_key)
+            .arg("-CAcreateserial")
+            .arg("-days")
+            .arg("1")
+            .arg("-out")
+            .arg(&server_certificate)
+            .arg("-extfile")
+            .arg(&server_extensions)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut server = Command::new("openssl")
+            .args(["s_server", "-quiet", "-www", "-accept"])
+            .arg(port.to_string())
+            .arg("-cert")
+            .arg(&server_certificate)
+            .arg("-key")
+            .arg(&server_key)
+            .spawn()
+            .unwrap();
+        let address = format!("127.0.0.1:{port}");
+        let ready_at = StdInstant::now() + Duration::from_secs(2);
+        while TcpStream::connect(&address).is_err() {
+            assert!(
+                StdInstant::now() < ready_at,
+                "openssl TLS server never became ready"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let previous = std::env::var_os("SSL_CERT_FILE");
+        unsafe { std::env::set_var("SSL_CERT_FILE", &ca_certificate) };
+        let response = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            Client::new()
+                .get(format!("https://localhost:{port}"))
+                .send()
+                .await
+        });
+        match previous {
+            Some(path) => unsafe { std::env::set_var("SSL_CERT_FILE", path) },
+            None => unsafe { std::env::remove_var("SSL_CERT_FILE") },
+        }
+        server.kill().unwrap();
+        server.wait().unwrap();
+        assert!(response.unwrap().status().is_success());
     }
 
     #[tokio::test]
@@ -968,6 +1111,40 @@ mod tests {
         let reply = client.step("system", &[]).await.unwrap();
 
         assert_eq!(reply.response_id, "response-after-disconnect");
+        assert_eq!(reply.response_retries, 1);
+        assert_eq!(
+            requests.recv_timeout(Duration::from_secs(2)).unwrap(),
+            requests.recv_timeout(Duration::from_secs(2)).unwrap()
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_when_an_sse_stream_closes_before_completion() {
+        let completed = json!({
+            "id": "response-after-stream-close",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "finish",
+                "arguments": "{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
+            }],
+            "usage": {}
+        });
+        let partial = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
+        let truncated_stream = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
+            partial.len() + 1
+        );
+        let body =
+            format!("data: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\n");
+        let (api_base, requests, server) =
+            response_server(vec![truncated_stream, sse_response(&body)]);
+        let client = OpenAiClient::new(api_base, "secret".into(), "model".into(), "medium".into());
+
+        let reply = client.step("system", &[]).await.unwrap();
+
+        assert_eq!(reply.response_id, "response-after-stream-close");
         assert_eq!(reply.response_retries, 1);
         assert_eq!(
             requests.recv_timeout(Duration::from_secs(2)).unwrap(),

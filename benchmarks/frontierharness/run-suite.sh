@@ -13,11 +13,12 @@ MODEL=$3
 JOBS_DIR=$4
 ROOT=/work/harness
 export PYTHONPATH="$ROOT/benchmarks/frontierharness${PYTHONPATH:+:$PYTHONPATH}"
-# This process runs on the restored Runta runtime. FIREWORKS_API_KEY is a Runta
-# secret stub; the real value remains in the egress proxy and is never logged.
-export CARRY_FRONTIER_BINARY="$ROOT/target/release/carry"
+export CARRY_FRONTIER_BINARY="$ROOT/target/x86_64-unknown-linux-musl/release/carry"
 export CARRY_FRONTIER_API_BASE=https://api.fireworks.ai/inference/v1
-: "${FIREWORKS_API_KEY:?FIREWORKS_API_KEY stub is required}"
+# Runta injects the real key only into egress. Its secret-rule API can omit the
+# process-visible placeholder, so always provide a nonsecret value for SDKs that
+# refuse to start without one; the egress rule replaces the outbound credential.
+export FIREWORKS_API_KEY="${FIREWORKS_API_KEY:-runta-secret-stub}"
 
 case "$SUITE" in
   terminal-bench)
@@ -30,7 +31,10 @@ case "$SUITE" in
   datacurve)
     exec pier run \
       -p "/work/deep-swe/tasks/$TASK" \
-      --agent-import-path carry_frontierharness.pier_agent:CarryAgent -m "$MODEL" \
+      --agent-import-path carry_frontierharness.pier_agent:CarryAgent \
+      --environment-import-path carry_frontierharness.pier_environment:RuntaDockerEnvironment \
+      --environment-kwarg runta_compose_file=/work/runta-ca-overlay.yaml \
+      -m "$MODEL" \
       --jobs-dir "$JOBS_DIR"
     ;;
   *)

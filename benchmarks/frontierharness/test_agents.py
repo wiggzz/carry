@@ -27,9 +27,16 @@ class _FakeBaseAgent:
     def _get_env(self, key: str, *_: str) -> str | None:
         return os.environ.get(key)
 
+    def populate_context_post_run(self, context: _FakeContext) -> None:
+        return None
+
     @classmethod
     def import_path(cls) -> str:
         return f"{cls.__module__}:{cls.__name__}"
+
+
+class _FakeInstalledAgent(_FakeBaseAgent):
+    pass
 
 
 class _FakeContext:
@@ -39,15 +46,25 @@ class _FakeContext:
 
 
 class _Result:
-    def __init__(self, return_code: int = 0, stdout: str = "") -> None:
+    def __init__(self, return_code: int = 0, stdout: str = "", stderr: str = "") -> None:
         self.return_code = return_code
         self.stdout = stdout
+        self.stderr = stderr
 
 
 class _Environment:
-    def __init__(self, *, carry_return_code: int = 0, trace_exists: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        carry_return_code: int = 0,
+        trace_exists: bool = True,
+        carry_stdout: str = "",
+        carry_stderr: str = "",
+    ) -> None:
         self.carry_return_code = carry_return_code
         self.trace_exists = trace_exists
+        self.carry_stdout = carry_stdout
+        self.carry_stderr = carry_stderr
         self.uploads: list[tuple[Path, str]] = []
         self.commands: list[tuple[str, dict[str, str] | None]] = []
 
@@ -62,7 +79,7 @@ class _Environment:
         if command == "test -s /logs/agent/carry/trace.jsonl":
             return _Result(0 if self.trace_exists else 1)
         if "--session-dir /logs/agent/carry" in command:
-            return _Result(self.carry_return_code)
+            return _Result(self.carry_return_code, self.carry_stdout, self.carry_stderr)
         return _Result()
 
 
@@ -78,6 +95,8 @@ def _install_runner_stubs() -> None:
         _module(root)
         _module(f"{root}.agents")
         _module(f"{root}.agents.base", BaseAgent=_FakeBaseAgent)
+        _module(f"{root}.agents.installed")
+        _module(f"{root}.agents.installed.base", BaseInstalledAgent=_FakeInstalledAgent)
         _module(f"{root}.environments")
         _module(f"{root}.environments.base", BaseEnvironment=_Environment)
         _module(f"{root}.models")
@@ -92,7 +111,7 @@ class CarryAgentContractTests(unittest.TestCase):
         cls.harbor = importlib.import_module("carry_frontierharness.harbor_agent").CarryAgent
         cls.pier = importlib.import_module("carry_frontierharness.pier_agent").CarryAgent
 
-    def exercise(self, agent_type: type[_FakeBaseAgent]) -> None:
+    def exercise(self, agent_type: type[_FakeBaseAgent], *, invoke_post_run_hook: bool = True) -> _FakeContext:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             binary = root / "carry"
@@ -121,7 +140,8 @@ class CarryAgentContractTests(unittest.TestCase):
                 context = _FakeContext()
                 asyncio.run(agent.setup(environment))
                 asyncio.run(agent.run("solve the task", environment, context))
-                agent.populate_context_post_run(context)
+                if invoke_post_run_hook:
+                    agent.populate_context_post_run(context)
             finally:
                 os.environ.clear()
                 os.environ.update(old)
@@ -137,12 +157,18 @@ class CarryAgentContractTests(unittest.TestCase):
         self.assertEqual(context.n_input_tokens, 8)
         self.assertEqual(context.n_cache_tokens, 3)
         self.assertEqual(context.n_output_tokens, 5)
+        return context
 
     def test_harbor_adapter_uploads_and_runs_carry(self) -> None:
         self.exercise(self.harbor)
 
     def test_pier_adapter_uploads_and_runs_carry(self) -> None:
         self.exercise(self.pier)
+
+    def test_pier_adapter_records_usage_without_a_build_time_install(self) -> None:
+        self.exercise(self.pier, invoke_post_run_hook=False)
+        self.assertTrue(issubclass(self.pier, _FakeBaseAgent))
+        self.assertFalse(issubclass(self.pier, _FakeInstalledAgent))
 
     def test_missing_trace_after_a_crash_is_an_infrastructure_error(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -160,6 +186,34 @@ class CarryAgentContractTests(unittest.TestCase):
             finally:
                 os.environ.clear()
                 os.environ.update(old)
+    def test_pier_failure_preserves_redacted_process_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            binary = root / "carry"
+            binary.write_bytes(b"binary")
+            logs = root / "logs"
+            logs.mkdir()
+            old = dict(os.environ)
+            os.environ.update({"CARRY_FRONTIER_BINARY": str(binary), "FIREWORKS_API_KEY": "secret-value"})
+            try:
+                agent = self.pier(logs, model_name="fireworks_ai/accounts/fireworks/models/kimi-k3")
+                environment = _Environment(
+                    carry_return_code=17,
+                    trace_exists=False,
+                    carry_stdout="started FIREWORKS_API_KEY=secret-value",
+                    carry_stderr="Authorization: Bearer secret-value failed",
+                )
+                asyncio.run(agent.setup(environment))
+                with self.assertRaisesRegex(RuntimeError, "without producing a model trace"):
+                    asyncio.run(agent.run("solve", environment, _FakeContext()))
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+            diagnostic = json.loads((logs / "carry-exec-failure.json").read_text())
+        self.assertEqual(diagnostic["exit_code"], 17)
+        self.assertIn("started", diagnostic["stdout"])
+        self.assertIn("failed", diagnostic["stderr"])
+        self.assertNotIn("secret-value", json.dumps(diagnostic))
 
 
 if __name__ == "__main__":

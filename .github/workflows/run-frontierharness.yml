@@ -55,7 +55,16 @@ jobs:
           python3 benchmarks/frontierharness/test_adapter.py
           python3 benchmarks/frontierharness/test_agents.py
           python3 benchmarks/frontierharness/test_run_suite.py
+          python3 benchmarks/frontierharness/test_normalizer_cwd.py
+          python3 benchmarks/frontierharness/test_prepare_image.py
+          python3 benchmarks/frontierharness/test_provision_base_tools.py
+          python3 benchmarks/frontierharness/test_provision_artifacts.py
+          python3 benchmarks/frontierharness/test_calculate_cost.py
+          python3 benchmarks/frontierharness/test_calculate_cost_integration.py
+          python3 benchmarks/frontierharness/test_pier_environment.py
           python3 benchmarks/frontierharness/test_shards.py
+          python3 benchmarks/frontierharness/test_transport_retry.py
+          python3 benchmarks/frontierharness/test_install.py
           python3 benchmarks/frontierharness/test_ci_entrypoint.py
           python3 benchmarks/frontierharness/test_merge_shards.py
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
@@ -255,6 +264,8 @@ jobs:
             --expected "$manifest" --shards frontierharness-shards --out merged-run > merge.json
           git clone --quiet https://github.com/frontier-harness-eval/eval.git evaluator
           git -C evaluator checkout --quiet e837a70bd6beb4e72eeeda62dd06e3bd34f6cb63
+          python3 benchmarks/frontierharness/patch_calculate_cost.py \
+            --target evaluator/skills/frontierharness-eval/scripts/calculate-cost.py
           python3 - "$manifest" > benchmark.json <<'PY'
           import json, sys
           task_ids = [line.split('#', 1)[0].strip() for line in open(sys.argv[1], encoding='utf-8')]
