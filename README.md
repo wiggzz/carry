@@ -39,9 +39,11 @@ It resolved **41 / 50 (82%)** for **$0.576700** modeled model cost in **46m49s**
 
 Against the prior fixed-catalog references, Carry is **10 percentage points higher**
 in resolved rate and **12.8% lower-cost** than Pi; against Codex, it is **8 points
-higher** and **44.8% lower-cost**. This is promising but **not a fresh
-three-harness control**: Carry's candidate and context policy changed, while Pi
-and Codex have not yet been rerun from the current candidate.
+higher** and **44.8% lower-cost**. This is not a fresh three-harness control: Carry's candidate/context policy changed,
+and each result is one stochastic trajectory. The Pi and Codex references remain
+grading-compatible, however: the shared harness in all three runs captured
+`git diff <initial HEAD>` after the agent finished. The later Carry fix preserves
+that same original-worktree diff inside Carry's own artifacts when it commits.
 
 ### FrontierHarness 30
 
