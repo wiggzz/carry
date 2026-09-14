@@ -1,0 +1,59 @@
+name: Recover retained FrontierHarness Regex evidence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontierharness-regex-evidence-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    name: Copy retained Regex evidence (hosted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: frontierharness
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned Runta CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @runta/runta-cli@0.2.4
+          runta --version
+          jq --version
+
+      - name: Resume only existing evidence transfer
+        env:
+          RUNTA_TOKEN: ${{ secrets.RUNTA_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "${FIREWORKS_API_KEY:-}"
+          git clone --quiet https://github.com/frontier-harness-eval/eval.git evaluator
+          git -C evaluator checkout --quiet e837a70bd6beb4e72eeeda62dd06e3bd34f6cb63
+          python3 benchmarks/frontierharness/patch_usage_details.py \
+            --target evaluator/skills/frontierharness-eval/scripts/usage_details.py
+          python3 benchmarks/frontierharness/patch_calculate_cost.py \
+            --target evaluator/skills/frontierharness-eval/scripts/calculate-cost.py
+          bash scripts/recover-frontierharness-regex-evidence.sh \
+            --evaluator "$GITHUB_WORKSPACE/evaluator" \
+            --runtime fh-9c1ec78442335b8e \
+            --run-id "regex-recovery-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --out "$GITHUB_WORKSPACE/frontierharness-recovery"
+
+      - name: Upload recovered evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: frontierharness-regex-recovery-${{ github.sha }}-${{ github.run_id }}
+          path: frontierharness-recovery
+          if-no-files-found: warn
+          retention-days: 14

@@ -72,6 +72,7 @@ if [[ "$MODE" == plan ]]; then
   python3 "$SOURCE/benchmarks/frontierharness/test_pier_environment.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_shards.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_transport_retry.py"
+  python3 "$SOURCE/benchmarks/frontierharness/test_recover_regex_evidence.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_install.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_ci_entrypoint.py"
   python3 "$SOURCE/benchmarks/frontierharness/test_merge_shards.py"
