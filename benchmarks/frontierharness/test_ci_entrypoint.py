@@ -51,7 +51,7 @@ class FrontierHarnessCiEntrypointTests(unittest.TestCase):
             for name in (
                 "test_adapter.py", "test_agents.py", "test_run_suite.py", "test_normalizer_cwd.py", "test_prepare_image.py",
                 "test_provision_base_tools.py", "test_provision_artifacts.py", "test_calculate_cost.py", "test_calculate_cost_integration.py", "test_pier_environment.py", "test_shards.py",
-                "test_transport_retry.py", "test_ci_entrypoint.py", "test_merge_shards.py",
+                "test_transport_retry.py", "test_recover_regex_evidence.py", "test_ci_entrypoint.py", "test_merge_shards.py",
             ):
                 (tests / name).write_text("raise SystemExit(0)\n")
             (tests / "test_install.py").write_text("raise SystemExit(37)\n")
