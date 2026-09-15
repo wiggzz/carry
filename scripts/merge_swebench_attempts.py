@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge three artifact-gated independent SWE-bench 50 replications."""
+"""Merge artifact-gated independent official-50 attempts."""
 from __future__ import annotations
 
 import argparse
@@ -12,7 +12,21 @@ from typing import Any
 
 
 HARNESSES = ("carry", "codex", "pi")
-EXPECTED_ATTEMPTS = (1, 2, 3)
+MAX_ATTEMPTS = 10
+
+
+IMMUTABLE_PROVENANCE_FIELDS = (
+    "dataset", "dataset_revision", "swebench_version", "source_commit", "model", "reasoning",
+    "carry_compaction_policy", "carry_keep_lease_turns", "carry_compaction_payoff_requests",
+    "pricing_usd_per_million", "images", "harnesses",
+)
+
+
+def immutable_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
+    missing = [key for key in IMMUTABLE_PROVENANCE_FIELDS if key not in provenance]
+    if missing:
+        raise ValueError(f"attempt provenance is missing immutable fields: {', '.join(missing)}")
+    return {key: provenance[key] for key in IMMUTABLE_PROVENANCE_FIELDS}
 
 
 def load_worker() -> Any:
@@ -23,6 +37,12 @@ def load_worker() -> Any:
     worker = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(worker)
     return worker
+
+
+def declared_attempt_numbers(total: int) -> tuple[int, ...]:
+    if not 1 <= total <= MAX_ATTEMPTS:
+        raise ValueError(f"attempts must be an integer from 1 through {MAX_ATTEMPTS}")
+    return tuple(range(1, total + 1))
 
 
 def selected_harnesses(value: str) -> tuple[str, ...]:
@@ -44,13 +64,16 @@ def task_ids(path: pathlib.Path) -> list[str]:
 
 
 def load_attempt_artifacts(root: pathlib.Path, *, tasks: list[dict[str, str]],
-                           harnesses: tuple[str, ...], worker: Any) -> tuple[list[dict[str, Any]], list[str], str]:
+                           harnesses: tuple[str, ...], attempts: tuple[int, ...],
+                           worker: Any) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
     paths = sorted(root.rglob("records.json"))
-    if len(paths) != len(EXPECTED_ATTEMPTS):
-        raise ValueError("expected exactly three attempt artifacts")
+    if len(paths) != len(attempts):
+        raise ValueError(f"expected exactly {len(attempts)} attempt artifacts")
     records: list[dict[str, Any]] = []
     observed_attempts: set[int] = set()
     candidate_commits: set[str] = set()
+    immutable_identity: str | None = None
+    canonical_provenance: dict[str, Any] | None = None
     sources: list[str] = []
     expected_denominator = len(tasks) * len(harnesses)
     for records_path in paths:
@@ -59,19 +82,30 @@ def load_attempt_artifacts(root: pathlib.Path, *, tasks: list[dict[str, str]],
             raise ValueError(f"attempt artifacts must include report.json: {records_path}")
         report = json.loads(report_path.read_text(encoding="utf-8"))
         provenance = report.get("provenance") if isinstance(report, dict) else None
-        replication = provenance.get("replication") if isinstance(provenance, dict) else None
-        attempt = replication.get("attempt") if isinstance(replication, dict) else None
+        attempt_metadata = provenance.get("attempt") if isinstance(provenance, dict) else None
+        attempt = attempt_metadata.get("number") if isinstance(attempt_metadata, dict) else None
         source_commit = provenance.get("source_commit") if isinstance(provenance, dict) else None
         if (report.get("denominator") != expected_denominator
+                or report.get("attempt_numbers") != [attempt]
                 or not isinstance(provenance, dict)
-                or provenance.get("mode") != "replicated-50"
+                or provenance.get("mode") != "official-50"
                 or provenance.get("phase") != "complete"
-                or not isinstance(replication, dict)
-                or replication.get("attempts_per_task_harness") != 3
+                or not isinstance(attempt_metadata, dict)
+                or attempt_metadata.get("total") != len(attempts)
+                or attempt_metadata.get("independent_fresh_workspaces") is not True
                 or not isinstance(source_commit, str)
                 or not re.fullmatch(r"[0-9a-f]{40}", source_commit)
-                or attempt not in EXPECTED_ATTEMPTS):
-            raise ValueError(f"invalid replication provenance: {records_path}")
+                or attempt not in attempts):
+            raise ValueError(f"invalid official-50 attempt provenance: {records_path}")
+        if candidate_commits and source_commit not in candidate_commits:
+            raise ValueError("attempt artifacts must have identical candidate commits")
+        candidate_commits.add(source_commit)
+        immutable = immutable_provenance(provenance)
+        identity = json.dumps(immutable, sort_keys=True, separators=(",", ":"))
+        if immutable_identity is None:
+            immutable_identity, canonical_provenance = identity, immutable
+        elif immutable_identity != identity:
+            raise ValueError("attempt artifacts must have identical immutable provenance")
         payload = json.loads(records_path.read_text(encoding="utf-8"))
         if not isinstance(payload, list):
             raise ValueError(f"attempt artifact records must be a list: {records_path}")
@@ -79,14 +113,13 @@ def load_attempt_artifacts(root: pathlib.Path, *, tasks: list[dict[str, str]],
         if attempt in observed_attempts:
             raise ValueError("duplicate attempt artifacts")
         observed_attempts.add(attempt)
-        candidate_commits.add(source_commit)
         records.extend(payload)
         sources.append(records_path.relative_to(root).as_posix())
-    if observed_attempts != set(EXPECTED_ATTEMPTS):
-        raise ValueError("attempt artifacts must contain attempts 1, 2, and 3 exactly once")
-    if len(candidate_commits) != 1:
+    if observed_attempts != set(attempts):
+        raise ValueError("attempt artifacts must contain every declared attempt exactly once")
+    if len(candidate_commits) != 1 or canonical_provenance is None:
         raise ValueError("attempt artifacts must have identical candidate commits")
-    return records, sources, candidate_commits.pop()
+    return records, sources, canonical_provenance
 
 
 def main() -> int:
@@ -94,27 +127,30 @@ def main() -> int:
     parser.add_argument("--artifacts", type=pathlib.Path, required=True)
     parser.add_argument("--manifest", type=pathlib.Path, required=True)
     parser.add_argument("--harness", required=True, choices=(*HARNESSES, "all"))
+    parser.add_argument("--attempts", type=int, required=True)
     parser.add_argument("--out", type=pathlib.Path, required=True)
     args = parser.parse_args()
     try:
         worker = load_worker()
+        attempts = declared_attempt_numbers(args.attempts)
         ids = task_ids(args.manifest)
         harnesses = selected_harnesses(args.harness)
         tasks = [{"instance_id": instance_id} for instance_id in ids]
-        records, sources, source_commit = load_attempt_artifacts(
-            args.artifacts, tasks=tasks, harnesses=harnesses, worker=worker,
+        records, sources, canonical_provenance = load_attempt_artifacts(
+            args.artifacts, tasks=tasks, harnesses=harnesses, attempts=attempts, worker=worker,
         )
         worker.finalize(
             tasks=tasks, records=records, output=args.out,
             provenance={
-                "mode": "replicated-50", "phase": "complete", "source_commit": source_commit,
-                "attempts_per_task_harness": 3,
+                **canonical_provenance,
+                "mode": "official-50", "phase": "complete",
+                "attempt": {"total": len(attempts), "independent_fresh_workspaces": True},
                 "source_record_artifacts": sources,
             },
-            harnesses=harnesses, attempt_numbers=EXPECTED_ATTEMPTS,
+            harnesses=harnesses, attempt_numbers=attempts,
         )
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
-        print(f"replication merge failed: {error}", file=sys.stderr)
+        print(f"official-50 attempt merge failed: {error}", file=sys.stderr)
         return 1
     return 0
 

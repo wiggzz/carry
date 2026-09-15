@@ -361,7 +361,7 @@ def task_image_references(repository: str, cache_key: str) -> dict[str, str]:
 
 def agent_concurrency_for_mode(values: Mapping[str, str], mode: str) -> int:
     """Return a bounded agent parallelism that fits the selected benchmark mode."""
-    default = "5" if mode in {"official-50", "replicated-50"} else "1" if mode in {"session-smoke-5", "session-20"} else "3"
+    default = "5" if mode == "official-50" else "1" if mode in {"session-smoke-5", "session-20"} else "3"
     concurrency = int(values.get("AGENT_CONCURRENCY", default))
     if concurrency < 1 or concurrency > 5:
         raise ValueError("AGENT_CONCURRENCY must be between 1 and 5")
@@ -1514,23 +1514,26 @@ def selection_for_mode(frozen_ids: list[str], mode: str,
         return list(smoke_ids)
     if mode == "session-20":
         return list(frozen_ids[:20])
-    if mode in {"official-50", "replicated-50"}:
+    if mode == "official-50":
         return list(frozen_ids)
     raise ValueError(f"unsupported benchmark mode: {mode}")
 
 
-def replication_attempt_numbers(config: Mapping[str, str], mode: str) -> tuple[int, ...]:
+def official_attempt_numbers(config: Mapping[str, str], mode: str) -> tuple[int, ...]:
     """Validate the one independent trajectory assigned to this worker."""
-    if mode != "replicated-50":
-        return (1,)
-    total = config.get("REPLICATION_ATTEMPTS", "")
-    selected = config.get("REPLICATION_ATTEMPT", "")
-    if total != "3" or not selected.isascii() or not selected.isdecimal():
-        raise ValueError("replicated mode requires exactly three declared attempts")
+    total = config.get("BENCHMARK_ATTEMPTS", "1")
+    selected = config.get("BENCHMARK_ATTEMPT", "1")
+    if not total.isascii() or not total.isdecimal() or not selected.isascii() or not selected.isdecimal():
+        raise ValueError("official-50 attempts must be decimal integers")
+    attempts = int(total)
     attempt = int(selected)
-    if attempt not in (1, 2, 3):
-        raise ValueError("replicated mode attempt must be 1, 2, or 3")
-    return (attempt,)
+    if mode == "official-50":
+        if not 1 <= attempts <= 10 or not 1 <= attempt <= attempts:
+            raise ValueError("official-50 attempts must be 1 through 10 and include the declared worker attempt")
+        return (attempt,)
+    if attempts != 1 or attempt != 1:
+        raise ValueError("non-official modes require one declared attempt")
+    return (1,)
 
 
 def validate_session_mode(mode: str, harnesses: tuple[str, ...]) -> None:
@@ -2002,7 +2005,7 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
             "| Task | Agent | Status | Resolved | Agent seconds | Tokens | Estimated cost |\n"
             "|---|---|---|---:|---:|---:|---:|\n"
         )
-    replication_section = ""
+    attempt_section = ""
     if attempt_count > 1:
         task_lines = "\n".join(
             f"| {key.rsplit('/', 1)[0]} | {key.rsplit('/', 1)[1]} | {values['attempts']} | "
@@ -2011,17 +2014,17 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
             f"{cost_text(values['estimated_cost_usd'])} |"
             for key, values in task_harness_reports.items()
         )
-        replication_section = (
+        attempt_section = (
             f"\n- Independent attempts per task/harness: {attempt_count}\n"
-            "\n## Task-harness replication summaries\n\n"
+            "\n## Task-harness attempt summaries\n\n"
             "| Task | Agent | Attempts | Resolved | Resolve rate | Wilson 95% | Estimated cost |\n"
             "|---|---|---:|---:|---:|---:|---:|\n" + task_lines + "\n"
         )
-    title = "# SWE-bench Verified replication study" if attempt_count > 1 else "# SWE-bench Verified baseline"
+    title = "# SWE-bench Verified official-50 attempts" if attempt_count > 1 else "# SWE-bench Verified baseline"
     (output / "report.md").write_text(
         title + "\n\n"
         f"- Denominator: {denominator}\n- Completed: {completed}\n- Resolved: {resolved}\n"
-        + replication_section + "\n"
+        + attempt_section + "\n"
         + harness_lines
         + "\n\n## Agent runs\n\n"
         + slot_header
@@ -2138,8 +2141,8 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     pricing = pricing_for_model(validated["MODEL"])
     mode = config.get("BENCHMARK_MODE", "smoke-5")
     validate_session_mode(mode, harnesses)
-    attempt_numbers = replication_attempt_numbers(config, mode)
-    phase_limits = official_phase_limits(config) if mode in {"official-50", "replicated-50"} else None
+    attempt_numbers = official_attempt_numbers(config, mode)
+    phase_limits = official_phase_limits(config) if mode == "official-50" else None
     frozen_ids = json.loads(
         (source / "benchmarks" / "swe-bench-verified-50.json").read_text(encoding="utf-8")
     )["instance_ids"]
@@ -2189,7 +2192,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     readiness_concurrency = int(config.get("READINESS_CONCURRENCY", "5"))
     evaluator_timeout = int(config.get("EVALUATOR_TIMEOUT_SECONDS", "270"))
     evaluator_concurrency = int(config.get("EVALUATOR_CONCURRENCY", "5"))
-    if mode in {"official-50", "replicated-50"} and (
+    if mode == "official-50" and (
             concurrency != 5 or agent_timeout != 360
             or readiness_timeout != 180 or readiness_concurrency != 5
             or evaluator_timeout != 270 or evaluator_concurrency != 5):
@@ -2207,9 +2210,9 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "mode": mode, "harnesses": list(harnesses), "phase": "planned",
         "pricing_usd_per_million": pricing,
     }
-    if mode == "replicated-50":
-        provenance_payload["replication"] = {
-            "attempt": attempt_numbers[0], "attempts_per_task_harness": 3,
+    if mode == "official-50":
+        provenance_payload["attempt"] = {
+            "number": attempt_numbers[0], "total": int(config.get("BENCHMARK_ATTEMPTS", "1")),
             "independent_fresh_workspaces": True,
         }
     if mode in {"session-smoke-5", "session-20"}:

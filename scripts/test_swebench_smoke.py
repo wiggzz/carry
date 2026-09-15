@@ -994,7 +994,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         with tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory)
             self.worker.finalize(
-                tasks=tasks, records=records, output=output, provenance={"mode": "replicated-50"},
+                tasks=tasks, records=records, output=output, provenance={"mode": "official-50"},
                 harnesses=("carry",), attempt_numbers=(1, 2, 3),
             )
             report = json.loads((output / "report.json").read_text())
@@ -1195,22 +1195,23 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         self.assertEqual(self.worker.selection_for_mode(frozen, "official-50", smoke), frozen)
         self.assertEqual(self.worker.selection_for_mode(frozen, "session-20", smoke), frozen[:20])
 
-    def test_replicated_mode_selects_the_frozen_manifest_and_one_declared_attempt(self):
+    def test_official_mode_selects_the_frozen_manifest_with_one_declared_attempt(self):
         frozen = [f"task-{number:02d}" for number in range(50)]
-        self.assertEqual(self.worker.selection_for_mode(frozen, "replicated-50"), frozen)
+        self.assertEqual(self.worker.selection_for_mode(frozen, "official-50"), frozen)
         self.assertEqual(
-            self.worker.replication_attempt_numbers(
-                {"REPLICATION_ATTEMPTS": "3", "REPLICATION_ATTEMPT": "2"}, "replicated-50"
+            self.worker.official_attempt_numbers(
+                {"BENCHMARK_ATTEMPTS": "4", "BENCHMARK_ATTEMPT": "2"}, "official-50"
             ),
             (2,),
         )
         for config in (
-            {"REPLICATION_ATTEMPTS": "2", "REPLICATION_ATTEMPT": "1"},
-            {"REPLICATION_ATTEMPTS": "3", "REPLICATION_ATTEMPT": "0"},
-            {"REPLICATION_ATTEMPTS": "3", "REPLICATION_ATTEMPT": "4"},
+            {"BENCHMARK_ATTEMPTS": "0", "BENCHMARK_ATTEMPT": "1"},
+            {"BENCHMARK_ATTEMPTS": "4", "BENCHMARK_ATTEMPT": "0"},
+            {"BENCHMARK_ATTEMPTS": "4", "BENCHMARK_ATTEMPT": "5"},
+            {"BENCHMARK_ATTEMPTS": "11", "BENCHMARK_ATTEMPT": "1"},
         ):
-            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "replicated mode"):
-                self.worker.replication_attempt_numbers(config, "replicated-50")
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "official-50 attempts"):
+                self.worker.official_attempt_numbers(config, "official-50")
 
     def test_session_smoke_uses_the_frozen_smoke_order_and_permits_exactly_one_native_harness(self):
         frozen = [f"task-{number:02d}" for number in range(50)]

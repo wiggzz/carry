@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavior tests for merging independently executed SWE-bench replications."""
+"""Behavior tests for merging independent official-50 attempts."""
 import json
 import pathlib
 import subprocess
@@ -7,12 +7,12 @@ import tempfile
 import unittest
 
 
-SCRIPT = pathlib.Path(__file__).with_name("merge_swebench_replications.py")
+SCRIPT = pathlib.Path(__file__).with_name("merge_swebench_attempts.py")
 
 
-class ReplicationMergeTests(unittest.TestCase):
+class AttemptMergeTests(unittest.TestCase):
     def write_attempt(self, root: pathlib.Path, attempt: int, tasks: list[str],
-                      source_commit: str = "a" * 40) -> None:
+                      total: int = 3, source_commit: str = "a" * 40) -> None:
         artifact = root / f"attempt-{attempt}"
         artifact.mkdir()
         records = [
@@ -28,33 +28,40 @@ class ReplicationMergeTests(unittest.TestCase):
             "denominator": 150,
             "attempt_numbers": [attempt],
             "provenance": {
-                "mode": "replicated-50", "phase": "complete", "source_commit": source_commit,
-                "replication": {"attempt": attempt, "attempts_per_task_harness": 3},
+                "mode": "official-50", "phase": "complete", "source_commit": source_commit,
+                "dataset": "SWE-bench/SWE-bench_Verified", "dataset_revision": "frozen",
+                "swebench_version": "4.1.0", "model": "test-model", "reasoning": "medium",
+                "carry_compaction_policy": "economic", "carry_keep_lease_turns": "0",
+                "carry_compaction_payoff_requests": "1", "pricing_usd_per_million": {"input": 1},
+                "images": {"task": "sha256:test"}, "harnesses": ["carry", "codex", "pi"],
+                "attempt": {"number": attempt, "total": total, "independent_fresh_workspaces": True},
             },
         }), encoding="utf-8")
 
-    def test_cli_merges_exactly_three_attempt_artifacts_into_one_replication_study(self):
+    def test_cli_merges_a_declared_four_attempt_official_study(self):
         tasks = [f"task-{index:02d}" for index in range(50)]
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             artifacts = root / "artifacts"
             artifacts.mkdir()
-            for attempt in (1, 2, 3):
-                self.write_attempt(artifacts, attempt, tasks)
+            for attempt in (1, 2, 3, 4):
+                self.write_attempt(artifacts, attempt, tasks, total=4)
             manifest = root / "tasks.json"
             manifest.write_text(json.dumps({"instance_ids": tasks}), encoding="utf-8")
             output = root / "out"
             result = subprocess.run(
                 ["python3", str(SCRIPT), "--artifacts", str(artifacts), "--manifest", str(manifest),
-                 "--harness", "all", "--out", str(output)],
+                 "--harness", "all", "--attempts", "4", "--out", str(output)],
                 text=True, capture_output=True, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             report = json.loads((output / "report.json").read_text(encoding="utf-8"))
-            self.assertEqual((report["denominator"], report["attempts_per_task_harness"]), (450, 3))
-            self.assertEqual(report["harnesses"]["carry"]["denominator"], 150)
-            self.assertEqual(report["task_harnesses"]["task-00/carry"]["resolved"], 2)
-            self.assertIn("replication study", (output / "report.md").read_text(encoding="utf-8"))
+            self.assertEqual((report["denominator"], report["attempts_per_task_harness"]), (600, 4))
+            self.assertEqual(report["harnesses"]["carry"]["denominator"], 200)
+            self.assertEqual(report["task_harnesses"]["task-00/carry"]["resolved"], 3)
+            self.assertEqual(report["provenance"]["model"], "test-model")
+            self.assertEqual(report["provenance"]["source_commit"], "a" * 40)
+            self.assertIn("official-50 attempts", (output / "report.md").read_text(encoding="utf-8"))
 
     def test_cli_rejects_missing_or_duplicate_attempt_artifacts(self):
         tasks = [f"task-{index:02d}" for index in range(50)]
@@ -68,7 +75,7 @@ class ReplicationMergeTests(unittest.TestCase):
             manifest.write_text(json.dumps({"instance_ids": tasks}), encoding="utf-8")
             result = subprocess.run(
                 ["python3", str(SCRIPT), "--artifacts", str(artifacts), "--manifest", str(manifest),
-                 "--harness", "all", "--out", str(root / "out")],
+                 "--harness", "all", "--attempts", "3", "--out", str(root / "out")],
                 text=True, capture_output=True, check=False,
             )
             self.assertNotEqual(result.returncode, 0)
@@ -86,11 +93,33 @@ class ReplicationMergeTests(unittest.TestCase):
             manifest.write_text(json.dumps({"instance_ids": tasks}), encoding="utf-8")
             result = subprocess.run(
                 ["python3", str(SCRIPT), "--artifacts", str(artifacts), "--manifest", str(manifest),
-                 "--harness", "all", "--out", str(root / "out")],
+                 "--harness", "all", "--attempts", "3", "--out", str(root / "out")],
                 text=True, capture_output=True, check=False,
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("candidate commits", result.stderr)
+
+    def test_cli_rejects_attempts_with_different_immutable_provenance(self):
+        tasks = [f"task-{index:02d}" for index in range(50)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
+            for attempt in (1, 2):
+                self.write_attempt(artifacts, attempt, tasks, total=2)
+            second_report = artifacts / "attempt-2" / "report.json"
+            payload = json.loads(second_report.read_text(encoding="utf-8"))
+            payload["provenance"]["model"] = "different-model"
+            second_report.write_text(json.dumps(payload), encoding="utf-8")
+            manifest = root / "tasks.json"
+            manifest.write_text(json.dumps({"instance_ids": tasks}), encoding="utf-8")
+            result = subprocess.run(
+                ["python3", str(SCRIPT), "--artifacts", str(artifacts), "--manifest", str(manifest),
+                 "--harness", "all", "--attempts", "2", "--out", str(root / "out")],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("identical immutable provenance", result.stderr)
 
 
 if __name__ == "__main__":
