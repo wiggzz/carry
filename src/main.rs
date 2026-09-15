@@ -4,6 +4,7 @@ mod log;
 mod openai;
 mod protocol;
 mod run;
+mod terminal;
 mod web;
 
 use std::{
@@ -28,7 +29,8 @@ const EXAMPLES: &str = r#"Examples:
   carry --cwd ../project add tests for the parser
   carry --interactive -p "investigate the flaky test"
   carry
-  carry --serve --cwd ../project
+  carry --cwd ../project
+  carry --print < task.txt
 "#;
 
 #[derive(Debug, Parser)]
@@ -51,16 +53,24 @@ struct Cli {
     #[arg(short, long, conflicts_with = "serve")]
     interactive: bool,
 
-    /// Continue this session interactively from its saved conversation.
+    /// Run once in the terminal, reading stdin when no prompt is supplied.
+    #[arg(long, conflicts_with_all = ["serve", "interactive"])]
+    print: bool,
+
+    /// Continue this session from its saved conversation.
     #[arg(long, value_name = "SESSION_DIR")]
     resume: Option<PathBuf>,
 
-    /// Launch a local browser UI and SSE API.
+    /// Launch a local browser UI and SSE API (default when no prompt is supplied).
     #[arg(long)]
     serve: bool,
 
-    /// Local port used by --serve.
-    #[arg(long, default_value_t = 8765, requires = "serve")]
+    /// Do not automatically open the browser when serving.
+    #[arg(long, conflicts_with_all = ["interactive", "print"])]
+    no_open: bool,
+
+    /// Local port used by the browser UI.
+    #[arg(long, default_value_t = 8765, conflicts_with_all = ["interactive", "print"])]
     port: u16,
 
     /// Repository or working directory the shell tool may modify.
@@ -116,10 +126,11 @@ struct Cli {
     )]
     compaction_policy: CompactionPolicyArg,
 
-    /// Experimentally revalidate model-protected context after this many later model turns.
+    /// Revalidate model-protected context after this many later model turns (batched reviews).
     #[arg(
         long,
         env = "CARRY_KEEP_LEASE_TURNS",
+        default_value = "8",
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     keep_lease_turns: Option<u64>,
@@ -289,13 +300,11 @@ async fn run_command(args: Cli) -> Result<()> {
     if args.interactive && !stdin_is_terminal {
         bail!("--interactive requires a terminal on stdin");
     }
-    let interactive = args.interactive
-        || (!args.serve
-            && args.prompt.is_none()
-            && args.prompt_words.is_empty()
-            && stdin_is_terminal);
+    let interactive = args.interactive;
+    let serve = args.serve
+        || (!interactive && !args.print && args.prompt.is_none() && args.prompt_words.is_empty());
     let mut input = None;
-    let prompt = if args.serve {
+    let prompt = if serve {
         String::new()
     } else if let Some(prompt) = args.prompt {
         prompt
@@ -308,7 +317,7 @@ async fn run_command(args: Cli) -> Result<()> {
             .context("failed to read prompt from stdin")?;
         prompt
     } else {
-        eprint!("carry> ");
+        eprint!("carry (/help for multiline input)> ");
         let _ = std::io::stderr().flush();
         input = Some(spawn_input_reader());
         match input
@@ -321,7 +330,7 @@ async fn run_command(args: Cli) -> Result<()> {
             Some(UserInput::Exit) | None => return Ok(()),
         }
     };
-    if !args.serve && prompt.trim().is_empty() {
+    if !serve && prompt.trim().is_empty() {
         bail!("prompt must not be empty");
     }
 
@@ -403,7 +412,7 @@ async fn run_command(args: Cli) -> Result<()> {
 
     let config = RunConfig {
         cwd,
-        prompt: prompt.trim().to_owned(),
+        prompt,
         session_dir: session_dir.clone(),
         model,
         max_steps: args.max_steps,
@@ -421,11 +430,10 @@ async fn run_command(args: Cli) -> Result<()> {
         prompt_cache_key: Some(prompt_cache_key),
     };
 
-    if args.serve {
+    if serve {
         let address = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
-        eprintln!("carry web UI: http://{address}");
         tokio::select! {
-            result = web::serve(address, config, backend) => result?,
+            result = web::serve(address, config, backend, !args.no_open) => result?,
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("session interrupted by Ctrl-C");
                 print_resume_hint(&session_dir);
@@ -453,7 +461,7 @@ async fn run_command(args: Cli) -> Result<()> {
     print_resume_hint(&outcome.session_dir);
     if outcome.completed {
         if !interactive {
-            println!("{}", outcome.answer.unwrap_or_default());
+            terminal::print_answer(&outcome.answer.unwrap_or_default());
         }
         Ok(())
     } else {
@@ -476,33 +484,21 @@ fn spawn_input_reader() -> mpsc::UnboundedReceiver<UserInput> {
     let (sender, receiver) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
-        let mut lines = stdin.lock().lines();
-        loop {
-            let Some(line) = lines.next() else {
-                let _ = sender.send(UserInput::Exit);
-                break;
-            };
-            let Ok(line) = line else {
-                let _ = sender.send(UserInput::Exit);
-                break;
-            };
-            let line = line.trim();
-            match line {
-                "" => continue,
-                "/quit" | "/exit" => {
-                    let _ = sender.send(UserInput::Exit);
-                    break;
-                }
-                "/help" => {
-                    eprintln!("Enter steering at any time. Commands: /help, /quit, /exit");
-                }
-                message => {
-                    if sender.send(UserInput::Message(message.to_owned())).is_err() {
-                        break;
+        let mut input = terminal::Input::default();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            match input.line(&line) {
+                terminal::Entry::Message(message) => {
+                    if sender.send(UserInput::Message(message)).is_err() {
+                        return;
                     }
                 }
+                terminal::Entry::Notice(message) => eprintln!("{message}"),
+                terminal::Entry::Exit => break,
+                terminal::Entry::Pending => {}
             }
         }
+        let _ = sender.send(UserInput::Exit);
     });
     receiver
 }
@@ -610,6 +606,18 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
+    fn default_web_port_does_not_require_serve_flag() {
+        assert!(Cli::try_parse_from(["carry", "--port", "9000"]).is_ok());
+    }
+
+    #[test]
+    fn print_mode_is_explicit_and_exclusive() {
+        assert!(Cli::try_parse_from(["carry", "--print", "-p", "hello"]).is_ok());
+        assert!(Cli::try_parse_from(["carry", "--print", "--serve"]).is_err());
+        assert!(Cli::try_parse_from(["carry", "--print", "--interactive"]).is_err());
+    }
+
+    #[test]
     fn positional_and_explicit_prompts_are_supported() {
         let positional = Cli::try_parse_from(["carry", "fix", "the", "tests"]).unwrap();
         assert_eq!(positional.prompt_words, ["fix", "the", "tests"]);
@@ -630,12 +638,12 @@ mod tests {
     }
 
     #[test]
-    fn keep_lease_turns_is_opt_in_and_requires_positive_value() {
-        let disabled = Cli::try_parse_from(["carry", "continue"]).unwrap();
-        assert_eq!(disabled.keep_lease_turns, None);
+    fn keep_lease_turns_defaults_to_eight_and_requires_positive_value() {
+        let defaulted = Cli::try_parse_from(["carry", "continue"]).unwrap();
+        assert_eq!(defaulted.keep_lease_turns, Some(8));
         let enabled =
-            Cli::try_parse_from(["carry", "--keep-lease-turns", "8", "continue"]).unwrap();
-        assert_eq!(enabled.keep_lease_turns, Some(8));
+            Cli::try_parse_from(["carry", "--keep-lease-turns", "3", "continue"]).unwrap();
+        assert_eq!(enabled.keep_lease_turns, Some(3));
         assert!(Cli::try_parse_from(["carry", "--keep-lease-turns", "0", "continue"]).is_err());
     }
 

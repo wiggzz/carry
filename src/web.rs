@@ -41,7 +41,12 @@ struct Session {
     state: &'static str,
 }
 
-pub async fn serve(address: SocketAddr, config: RunConfig, backend: Backend) -> Result<()> {
+pub async fn serve(
+    address: SocketAddr,
+    config: RunConfig,
+    backend: Backend,
+    open_browser: bool,
+) -> Result<()> {
     let (input, receiver) = mpsc::unbounded_channel();
     let (events, _) = broadcast::channel(256);
     let shutdown = Arc::new(Notify::new());
@@ -118,6 +123,11 @@ pub async fn serve(address: SocketAddr, config: RunConfig, backend: Backend) -> 
         .route("/api/v1/events", get(sse_events))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(address).await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    eprintln!("carry web UI: {url}");
+    if open_browser {
+        crate::auth::open_browser(&url);
+    }
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.notified().await })
         .await?;

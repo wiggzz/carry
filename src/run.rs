@@ -730,6 +730,7 @@ async fn run_loop(
 
         let progress_events = events.clone();
         let mut last_progress = None;
+        let mut displayed_preview = String::new();
         let reply = match backend
             .step_with_progress(&history, |progress| {
                 if last_progress
@@ -742,13 +743,26 @@ async fn run_loop(
                 {
                     return;
                 }
-                eprint!(
-                    "\r  model streaming · ~{} output tokens · {} events",
-                    progress.output_tokens, progress.output_events
-                );
+                let terminal_preview = progress
+                    .terminal_preview
+                    .as_ref()
+                    .unwrap_or(&progress.preview);
+                if !terminal_preview.is_empty() && *terminal_preview != displayed_preview {
+                    use std::io::{IsTerminal, Write};
+                    if std::io::stderr().is_terminal() {
+                        if let Some(delta) = terminal_preview.strip_prefix(&displayed_preview) {
+                            eprint!("{delta}");
+                        } else {
+                            eprint!("\n[stream restarted]\n{}", terminal_preview);
+                        }
+                        let _ = std::io::stderr().flush();
+                    }
+                    displayed_preview = terminal_preview.clone();
+                }
                 if let Some(events) = &progress_events {
                     let _ = events.send(json!({"event":"model_progress", "data": {
                         "step": step_index,
+                        "preview": progress.preview,
                         "output_tokens": progress.output_tokens,
                         "reasoning_output_tokens": progress.reasoning_output_tokens,
                         "output_events": progress.output_events,
@@ -777,7 +791,7 @@ async fn run_loop(
                 return Err(error);
             }
         };
-        if last_progress.is_some() {
+        if !displayed_preview.is_empty() {
             eprintln!();
         }
         metrics.record(&reply.usage, reply.latency_ms, reply.response_retries);
@@ -790,6 +804,7 @@ async fn run_loop(
                 "response_id": reply.response_id,
                 "latency_ms": reply.latency_ms,
                 "response_retries": reply.response_retries,
+                "estimated_cost_usd": crate::openai::estimated_cost_usd(&config.model, &reply.usage),
                 "usage": reply.usage,
                 "parsed": &reply.step,
                 "raw": reply.raw
@@ -859,7 +874,7 @@ async fn run_loop(
                 persist_context_checkpoint(&config, &context_state)?;
 
                 if let Some(receiver) = input.as_mut()
-                    && drain_user_input(receiver, &mut context_state, &mut logger, &config)?
+                    && drain_user_input(receiver, &mut context_state, &mut logger, &config)?.0
                 {
                     write_final_artifacts(
                         &config,
@@ -926,10 +941,10 @@ async fn run_loop(
                     &terminal_finished(step_index, &metrics.usage),
                 )?;
                 if let Some(receiver) = input.as_mut() {
-                    println!("{}", answer.as_deref().unwrap_or_default());
-                    let mut should_exit =
+                    crate::terminal::print_answer(answer.as_deref().unwrap_or_default());
+                    let (mut should_exit, had_messages) =
                         drain_user_input(receiver, &mut context_state, &mut logger, &config)?;
-                    if !should_exit {
+                    if !should_exit && !had_messages {
                         eprint!("carry> ");
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                         match receiver.recv().await {
@@ -975,17 +990,19 @@ fn drain_user_input(
     state: &mut ContextState,
     logger: &mut RunLogger,
     config: &RunConfig,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let mut should_exit = false;
+    let mut had_messages = false;
     while let Ok(input) = receiver.try_recv() {
         match input {
             UserInput::Message(message) => {
+                had_messages = true;
                 append_user_message(config, state, logger, message, true)?;
             }
             UserInput::Exit => should_exit = true,
         }
     }
-    Ok(should_exit)
+    Ok((should_exit, had_messages))
 }
 
 fn append_user_message(
@@ -2757,6 +2774,59 @@ mod tests {
             !survivor.exists(),
             "a descendant continued modifying the workspace after timeout"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_steering_at_finish_starts_another_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("session");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"finish","answer":"first"},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+                "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[2],"removable":[],"remember":[]}}"#,
+                "\n"
+            ),
+        )
+        .await
+        .unwrap();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        sender
+            .send(UserInput::Message("do not change the JSON format".into()))
+            .unwrap();
+        drop(sender);
+
+        let outcome = run_interactive(
+            RunConfig {
+                cwd: workspace,
+                prompt: "initial task".into(),
+                session_dir: session_dir.clone(),
+                model: "scripted".into(),
+                max_steps: None,
+                shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Economic,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 1,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
+                resume_context: None,
+                resume_source: None,
+                prompt_cache_key: None,
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+            receiver,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.completed);
+        assert_eq!(outcome.answer.as_deref(), Some("done"));
     }
 
     #[tokio::test]

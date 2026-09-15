@@ -43,7 +43,9 @@ pub(crate) fn prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabi
 
 fn exact_model_prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabilities> {
     match model {
-        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" => Some(OPENAI_GPT_56_PROMPT_CACHE),
+        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-astra" => {
+            Some(OPENAI_GPT_56_PROMPT_CACHE)
+        }
         _ => None,
     }
 }
@@ -92,8 +94,33 @@ pub struct Usage {
     pub total_tokens: u64,
 }
 
+/// Modeled USD rates from scripts/swebench_smoke.py, not a billing quote.
+pub(crate) fn estimated_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
+    if model != "gpt-5.6-luna" {
+        return None;
+    }
+    let cached = usage.cached_input_tokens.min(usage.input_tokens);
+    let written = usage
+        .cache_write_input_tokens
+        .min(usage.input_tokens - cached);
+    let ordinary = usage.input_tokens - cached - written;
+    Some(
+        (ordinary as f64 * 0.20
+            + cached as f64 * 0.02
+            + written as f64 * 0.25
+            + usage.output_tokens as f64 * 1.20)
+            / 1_000_000.0,
+    )
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ModelProgress {
+    pub preview: String,
+    pub terminal_preview: Option<String>,
+    #[serde(skip)]
+    function_name: String,
+    #[serde(skip)]
+    arguments: String,
     /// Estimated while streaming; replaced with the API total on completion.
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
@@ -615,8 +642,98 @@ where
         output_tokens: usage.output_tokens,
         reasoning_output_tokens: usage.reasoning_tokens,
         output_events: current.output_events,
+        ..ModelProgress::default()
     });
     Ok(response)
+}
+
+// Scan only top-level string fields. Decode complete JSON string prefixes so split
+// escapes (including Unicode surrogate pairs) are never displayed as raw JSON.
+fn partial_string_field(json: &str, field: &str) -> String {
+    let bytes = json.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth -= 1,
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return String::new();
+                }
+                let key = &json[start..=i];
+                let mut next = i + 1;
+                while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                if depth == 1
+                    && bytes.get(next) == Some(&b':')
+                    && serde_json::from_str::<String>(key).ok().as_deref() == Some(field)
+                {
+                    next += 1;
+                    while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                        next += 1;
+                    }
+                    if bytes.get(next) != Some(&b'"') {
+                        return String::new();
+                    }
+                    let start = next;
+                    next += 1;
+                    let mut end = next;
+                    while next < bytes.len() {
+                        if bytes[next] == b'"' {
+                            break;
+                        }
+                        if bytes[next] == b'\\' {
+                            next += 1;
+                            if next >= bytes.len() {
+                                break;
+                            }
+                            if bytes[next] == b'u' {
+                                if next + 4 >= bytes.len() {
+                                    break;
+                                }
+                                next += 4;
+                            }
+                        }
+                        next += 1;
+                        end = next;
+                    }
+                    // At most one incomplete surrogate pair needs trimming.
+                    for _ in 0..7 {
+                        if let Ok(value) =
+                            serde_json::from_str::<String>(&format!("{}\"", &json[start..end]))
+                        {
+                            return value;
+                        }
+                        if end <= start + 1 {
+                            break;
+                        }
+                        end -= 1;
+                        while !json.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                    }
+                    return String::new();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    String::new()
 }
 
 fn sse_frame_end(pending: &[u8]) -> Option<(usize, usize)> {
@@ -654,7 +771,43 @@ where
     let event: Value =
         serde_json::from_str(&data).context("Responses API stream contained invalid JSON")?;
     let event_type = event["type"].as_str().unwrap_or_default();
+    if event_type == "response.output_item.added" {
+        current.function_name = event["item"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        current.terminal_preview = (current.function_name == "shell").then(String::new);
+        current.arguments.clear();
+        current.preview.clear();
+    }
     if let Some(delta) = event["delta"].as_str() {
+        if event_type == "response.function_call_arguments.delta" {
+            current.arguments.push_str(delta);
+            let field = match current.function_name.as_str() {
+                "finish" => Some("answer"),
+                "shell" => Some("message"),
+                _ => None,
+            };
+            if let Some(field) = field {
+                current.preview = partial_string_field(&current.arguments, field);
+                if current.function_name == "shell" {
+                    let command = partial_string_field(&current.arguments, "command");
+                    current.terminal_preview = Some(if command.is_empty() {
+                        String::new()
+                    } else {
+                        format!("$ {command}")
+                    });
+                    if !command.is_empty() {
+                        current
+                            .preview
+                            .push_str(&format!("\n\n```sh\n{command}\n```"));
+                    }
+                }
+            }
+        } else if event_type == "response.output_text.delta" {
+            current.preview.push_str(delta);
+        }
+
         // Private reasoning tokens are not exposed as token deltas. This is an explicit
         // approximate activity counter and is corrected by final usage on completion.
         current.output_tokens += (delta.len().max(1) as u64).div_ceil(4);
@@ -679,6 +832,121 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_preview_handles_split_escapes_and_ignores_nested_fields() {
+        assert_eq!(partial_string_field(r#"{"answer":"hi\""#, "answer"), "hi\"");
+        assert_eq!(partial_string_field(r#"{"answer":"hi\"#, "answer"), "hi");
+        assert_eq!(
+            partial_string_field(r#"{"answer":"hi\uD83D"#, "answer"),
+            "hi"
+        );
+        assert_eq!(
+            partial_string_field(r#"{"answer":"hi\uD83D\uDE00"#, "answer"),
+            "hi😀"
+        );
+        assert_eq!(
+            partial_string_field(r#"{"context":{"answer":"hidden"},"answer":"世界"#, "answer"),
+            "世界"
+        );
+    }
+
+    #[test]
+    fn function_arguments_stream_readable_answer_not_context_json() {
+        let mut current = ModelProgress::default();
+        let mut completed = None;
+        let mut items = Vec::new();
+        let mut updates = Vec::new();
+        for event in [
+            json!({"type":"response.output_item.added", "item":{"type":"function_call", "name":"finish"}}),
+            json!({"type":"response.function_call_arguments.delta", "delta":r#"{"context":{"remember":["secret"]},"answer":"Hello\nwo"#}),
+            json!({"type":"response.function_call_arguments.delta", "delta":r#"rld","context":{}}"#}),
+        ] {
+            process_sse_frame(
+                format!("data: {event}").as_bytes(),
+                &mut completed,
+                &mut items,
+                &mut current,
+                &mut |p| updates.push(p),
+            )
+            .unwrap();
+        }
+        assert_eq!(updates[0].preview, "Hello\nwo");
+        assert_eq!(updates[1].preview, "Hello\nworld");
+    }
+
+    #[test]
+    fn cost_estimate_matches_benchmark_rates_without_guessing_unknown_prices() {
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 400_000,
+            cache_write_input_tokens: 200_000,
+            output_tokens: 100_000,
+            ..Usage::default()
+        };
+        assert_eq!(estimated_cost_usd("gpt-5.6-luna", &usage), Some(0.258));
+        assert_eq!(estimated_cost_usd("custom-model", &usage), None);
+        assert_eq!(estimated_cost_usd("gpt-5.6-astra", &usage), None);
+    }
+
+    #[test]
+    fn shell_terminal_preview_only_appends_when_command_and_message_arrive() {
+        let mut current = ModelProgress::default();
+        let mut completed = None;
+        let mut items = Vec::new();
+        let mut previous = String::new();
+        for event in [
+            json!({"type":"response.output_item.added","item":{"name":"shell"}}),
+            json!({"type":"response.function_call_arguments.delta","delta":r#"{"command":"echo"#}),
+            json!({"type":"response.function_call_arguments.delta","delta":r#" hello","message":"Checking"#}),
+            json!({"type":"response.function_call_arguments.delta","delta":r#" output"}"#}),
+        ] {
+            process_sse_frame(
+                format!("data: {event}").as_bytes(),
+                &mut completed,
+                &mut items,
+                &mut current,
+                &mut |_| {},
+            )
+            .unwrap();
+            let text = current
+                .terminal_preview
+                .as_ref()
+                .unwrap_or(&current.preview);
+            assert!(
+                text.starts_with(&previous),
+                "preview rewrote previously printed text: {text:?}"
+            );
+            previous = text.clone();
+        }
+        assert_eq!(previous, "$ echo hello");
+    }
+
+    #[test]
+    fn shell_command_is_previewed_while_arguments_arrive() {
+        let mut current = ModelProgress::default();
+        let mut completed = None;
+        let mut items = Vec::new();
+        for event in [
+            json!({"type":"response.output_item.added","item":{"name":"shell"}}),
+            json!({"type":"response.function_call_arguments.delta","delta":r#"{"command":"echo hello"#}),
+        ] {
+            process_sse_frame(
+                format!("data: {event}").as_bytes(),
+                &mut completed,
+                &mut items,
+                &mut current,
+                &mut |_| {},
+            )
+            .unwrap();
+        }
+        assert!(current.preview.contains("echo hello"));
+    }
+
+    #[test]
+    fn astra_is_explicitly_recognized() {
+        assert!(exact_model_prompt_cache_capabilities("gpt-5.6-astra").is_some());
+    }
 
     #[test]
     fn known_openai_models_resolve_prompt_cache_capabilities() {

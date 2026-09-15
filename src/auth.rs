@@ -450,7 +450,7 @@ where
     }
 }
 
-fn open_browser(url: &str) {
+pub(crate) fn open_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let command = "open";
     #[cfg(target_os = "windows")]
@@ -464,8 +464,19 @@ fn open_browser(url: &str) {
         .spawn();
     #[cfg(not(target_os = "windows"))]
     let result = std::process::Command::new(command).arg(url).spawn();
-    if let Err(error) = result {
-        eprintln!("could not open a browser ({error}); paste the URL above into one");
+    match result {
+        Ok(mut child) => {
+            std::thread::spawn(move || match child.wait() {
+                Ok(status) if status.success() => {}
+                Ok(status) => eprintln!(
+                    "browser launcher exited with {status}; paste the URL above into a browser"
+                ),
+                Err(error) => eprintln!(
+                    "could not wait for browser launcher ({error}); paste the URL above into a browser"
+                ),
+            });
+        }
+        Err(error) => eprintln!("could not open a browser ({error}); paste the URL above into one"),
     }
 }
 
