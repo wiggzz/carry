@@ -15,6 +15,11 @@ on:
         default: bootstrap
         type: choice
         options: [bootstrap, prepare-50, smoke-5, session-smoke-5, session-20, official-50, cleanup]
+      attempts:
+        description: Independent official-50 attempts per task/harness (1-10); other modes require 1
+        required: true
+        default: "1"
+        type: string
       harness:
         description: Agent harness, or all three in one prepared environment
         required: true
@@ -57,9 +62,45 @@ permissions:
   contents: read
 
 jobs:
-  bootstrap-worker:
-    name: ${{ inputs.mode }} ${{ inputs.harness }} ${{ inputs.carry_ref }}
+  plan-attempts:
+    name: validate benchmark attempts
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      total: ${{ steps.plan.outputs.total }}
+    steps:
+      - id: plan
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          ATTEMPTS: ${{ inputs.attempts }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          mode = os.environ["MODE"]
+          value = os.environ["ATTEMPTS"]
+          if not value.isdecimal():
+              raise SystemExit("attempts must be a decimal integer")
+          attempts = int(value)
+          if mode == "official-50":
+              valid = 1 <= attempts <= 10
+          else:
+              valid = attempts == 1
+          if not valid:
+              raise SystemExit("attempts must be 1-10 for official-50 and exactly 1 for other modes")
+          print("matrix=" + json.dumps({"attempt": list(range(1, attempts + 1))}, separators=(",", ":")))
+          print(f"total={attempts}")
+          PY
+
+  bootstrap-worker:
+    name: ${{ inputs.mode }} ${{ inputs.harness }} attempt ${{ matrix.attempt }} ${{ inputs.carry_ref }}
+    needs: plan-attempts
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs['plan-attempts'].outputs.matrix) }}
     timeout-minutes: 360
     concurrency:
       # Only the deliberate 20-task retained study uses separate workers.
@@ -79,6 +120,8 @@ jobs:
       BOOTSTRAP_WAIT_SECONDS: ${{ inputs.bootstrap_wait_seconds }}
       BENCHMARK_MODE: ${{ inputs.mode }}
       BENCHMARK_HARNESS: ${{ inputs.harness }}
+      BENCHMARK_ATTEMPT: ${{ matrix.attempt }}
+      BENCHMARK_ATTEMPTS: ${{ needs['plan-attempts'].outputs.total }}
       CARRY_COMPACTION_POLICY: ${{ inputs.carry_compaction_policy }}
       CARRY_KEEP_LEASE_TURNS: ${{ inputs.carry_keep_lease_turns }}
       CARRY_COMPACTION_PAYOFF_REQUESTS: ${{ inputs.carry_compaction_payoff_requests }}
@@ -158,8 +201,8 @@ jobs:
           TARGET_RUN_ID: ${{ inputs.cleanup_run_id }}
         run: |
           set -euo pipefail
-          [[ "$TARGET_RUN_ID" =~ ^gh-[0-9]+-[1-9][0-9]*$ ]] || {
-            echo "cleanup_run_id must be an exact gh-RUN_ID-ATTEMPT" >&2
+          [[ "$TARGET_RUN_ID" =~ ^gh-[0-9]+-[1-9][0-9]*(-attempt-([1-9]|10))?$ ]] || {
+            echo "cleanup_run_id must be an exact gh-RUN_ID-ATTEMPT optionally suffixed -attempt-1 through -attempt-10" >&2
             exit 1
           }
           for required in ARTIFACT_BUCKET ARTIFACT_SESSION_ROLE_ARN; do
@@ -244,7 +287,18 @@ jobs:
               [[ -n "${!required}" ]] || { echo "missing preparation configuration: $required" >&2; exit 1; }
             done
           fi
+          if [[ "$BENCHMARK_MODE" == official-50 ]]; then
+            [[ "$BENCHMARK_ATTEMPTS" =~ ^[1-9][0-9]*$ && "$BENCHMARK_ATTEMPT" =~ ^[1-9][0-9]*$ ]] \
+              && (( BENCHMARK_ATTEMPTS <= 10 && BENCHMARK_ATTEMPT <= BENCHMARK_ATTEMPTS )) || {
+              echo "official-50 attempts must be 1-10 and include this worker attempt" >&2; exit 1;
+            }
+          else
+            [[ "$BENCHMARK_ATTEMPTS" == 1 && "$BENCHMARK_ATTEMPT" == 1 ]] || {
+              echo "non-official modes must use benchmark attempt 1 of 1" >&2; exit 1;
+            }
+          fi
           RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if (( BENCHMARK_ATTEMPTS > 1 )); then RUN_ID+="-attempt-${BENCHMARK_ATTEMPT}"; fi
           BASE_AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
           BASE_AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
           BASE_AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN
@@ -332,7 +386,8 @@ jobs:
           SOURCE_URL="$SOURCE_URL" KEY_URL="$KEY_URL" DOCKER_AUTH_URL="$DOCKER_AUTH_URL" \
           REGISTRY_AUTH_URL="$REGISTRY_AUTH_URL" RESULT_URL="$RESULT_URL" CONTROL_URL="$CONTROL_URL" \
           SOURCE_SHA256="$SOURCE_SHA256" SOURCE_COMMIT="$SOURCE_COMMIT" BENCHMARK_MODE="$BENCHMARK_MODE" \
-          BENCHMARK_HARNESS="$BENCHMARK_HARNESS" CARRY_COMPACTION_POLICY="$CARRY_COMPACTION_POLICY" \
+          BENCHMARK_HARNESS="$BENCHMARK_HARNESS" BENCHMARK_ATTEMPT="$BENCHMARK_ATTEMPT" \
+          BENCHMARK_ATTEMPTS="$BENCHMARK_ATTEMPTS" CARRY_COMPACTION_POLICY="$CARRY_COMPACTION_POLICY" \
           CARRY_KEEP_LEASE_TURNS="$CARRY_KEEP_LEASE_TURNS" \
           CARRY_COMPACTION_PAYOFF_REQUESTS="$CARRY_COMPACTION_PAYOFF_REQUESTS" \
           BOOTSTRAP_WAIT_SECONDS="$BOOTSTRAP_WAIT_SECONDS" RUN_ID="$RUN_ID" MODEL="$MODEL" \
@@ -348,7 +403,7 @@ jobs:
               'RESULT_URL_B64': encoded['RESULT_URL'], 'CONTROL_URL_B64': encoded['CONTROL_URL'],
               **{key: os.environ[key] for key in (
                   'SOURCE_SHA256', 'SOURCE_COMMIT', 'BENCHMARK_MODE', 'BENCHMARK_HARNESS',
-                  'CARRY_COMPACTION_POLICY', 'CARRY_KEEP_LEASE_TURNS',
+                  'BENCHMARK_ATTEMPT', 'BENCHMARK_ATTEMPTS', 'CARRY_COMPACTION_POLICY', 'CARRY_KEEP_LEASE_TURNS',
                   'CARRY_COMPACTION_PAYOFF_REQUESTS', 'BOOTSTRAP_WAIT_SECONDS', 'RUN_ID',
                   'MODEL', 'REASONING', 'TASK_IMAGE_REPOSITORY', 'TASK_IMAGE_CATALOG')},
           }
@@ -395,6 +450,7 @@ jobs:
         env:
           RESULT_GET_URL: ${{ steps.stage.outputs.result_get_url }}
           PREFIX: ${{ steps.stage.outputs.prefix }}
+          RUN_ID: ${{ steps.stage.outputs.run_id }}
         run: |
           set -euo pipefail
           mkdir -p benchmark-artifact
@@ -420,7 +476,7 @@ jobs:
             export AWS_SESSION_TOKEN=$BASE_AWS_SESSION_TOKEN
             ASSUMED=$(aws sts assume-role --role-arn "$ARTIFACT_SESSION_ROLE_ARN" \
               --role-session-name "carry-rotate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-              --tags "Key=RunId,Value=gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              --tags "Key=RunId,Value=$RUN_ID" \
               --query Credentials --output json) || return
             eval "$(python3 - "$ASSUMED" <<'PY'
           import json, shlex, sys
@@ -501,16 +557,26 @@ jobs:
           python3 - <<'PY'
           import json, os
           records=json.load(open('benchmark-artifact/records.json', encoding='utf-8'))
-          pairs={(r.get('instance_id'),r.get('harness')) for r in records}
-          frozen=json.load(open('benchmarks/swe-bench-verified-50.json', encoding='utf-8'))['instance_ids']
           mode=os.environ['BENCHMARK_MODE']
-          selected=(frozen if mode=='official-50' else frozen[:20] if mode=='session-20' else
+          attempt=int(os.environ['BENCHMARK_ATTEMPT'])
+          attempts=int(os.environ['BENCHMARK_ATTEMPTS'])
+          frozen=json.load(open('benchmarks/swe-bench-verified-50.json', encoding='utf-8'))['instance_ids']
+          selected=(frozen if mode == 'official-50' else frozen[:20] if mode=='session-20' else
                     json.load(open('benchmarks/swe-bench-verified-smoke-5.json', encoding='utf-8'))['instance_ids'])
           harnesses=('carry','codex','pi') if os.environ['BENCHMARK_HARNESS']=='all' else (os.environ['BENCHMARK_HARNESS'],)
-          expected={(instance_id,harness) for instance_id in selected for harness in harnesses}
-          assert len(records)==len(expected) and pairs==expected, 'artifact does not contain exact fixed denominator'
+          expected={(instance_id,harness,attempt) for instance_id in selected for harness in harnesses}
+          slots={(r.get('instance_id'),r.get('harness'),r.get('attempt', 1)) for r in records}
+          assert len(records)==len(expected) and slots==expected, 'artifact does not contain exact fixed denominator and attempt'
           report=json.load(open('benchmark-artifact/report.json', encoding='utf-8'))
           assert report['denominator']==len(expected), 'canonical report denominator does not match records'
+          assert report['attempt_numbers']==[attempt], 'canonical report does not identify the worker attempt'
+          if mode == 'official-50':
+              assert 1 <= attempts <= 10 and 1 <= attempt <= attempts, 'invalid official attempt identity'
+              assert report['provenance']['attempt'] == {
+                  'number': attempt, 'total': attempts, 'independent_fresh_workspaces': True,
+              }, 'official worker has incomplete attempt provenance'
+          else:
+              assert attempts == 1 and attempt == 1, 'non-official worker has unexpected attempt identity'
           assert report['provenance']['phase']=='complete', 'benchmark did not complete official grading'
           blocked={'not-run', 'evaluator-failed'}
           assert not any(r.get('status') in blocked for r in records), 'benchmark has unexecuted or ungraded slots'
@@ -570,7 +636,7 @@ jobs:
         if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50')
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
-          name: swebench-${{ inputs.mode }}-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swebench-${{ inputs.mode }}-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}-attempt-${{ matrix.attempt }}
           path: benchmark-artifact
           if-no-files-found: warn
           retention-days: 14
@@ -580,9 +646,10 @@ jobs:
         shell: bash
         env:
           PREFIX: ${{ steps.stage.outputs.prefix }}
+          RUN_ID: ${{ steps.stage.outputs.run_id }}
         run: |
           set -euo pipefail
-          RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          RUN_ID=${RUN_ID:-"gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"}
           worker_ids=()
           if [[ "${WORKER_INSTANCE_ID:-}" =~ ^i-[0-9a-f]+$ ]]; then
             worker_ids+=("$WORKER_INSTANCE_ID")
@@ -612,3 +679,45 @@ jobs:
               aws s3 rm "s3://$ARTIFACT_BUCKET/$PREFIX/$object" --only-show-errors || true
             done
           fi
+
+  merge-official-attempts:
+    name: merge official-50 ${{ inputs.harness }} attempts
+    if: inputs.mode == 'official-50' && needs['plan-attempts'].outputs.total != '1' && needs['bootstrap-worker'].result == 'success'
+    needs: [plan-attempts, bootstrap-worker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.carry_ref }}
+          fetch-depth: 1
+
+      - name: Download all validated official-50 attempt artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: swebench-official-50-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}-attempt-*
+          path: official-attempts
+
+      - name: Merge independent attempts into an artifact-gated study
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/merge_swebench_attempts.py \
+            --artifacts official-attempts \
+            --manifest benchmarks/swe-bench-verified-50.json \
+            --harness '${{ inputs.harness }}' \
+            --attempts '${{ needs['plan-attempts'].outputs.total }}' \
+            --out official-attempt-study
+          test -s official-attempt-study/report.json
+          test -s official-attempt-study/records.json
+          cat official-attempt-study/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload combined official-50 attempt study
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: swebench-official-50-attempt-study-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: official-attempt-study
+          if-no-files-found: error
+          retention-days: 14

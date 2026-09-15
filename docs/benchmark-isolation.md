@@ -50,6 +50,33 @@ There is no build-on-cache-miss path in a model-bearing run.
 official 50; fixed-denominator validation requires all selected task/harness records.
 `harness=all` runs all three arms against one digest-pinned environment set.
 
+### Independent official-50 attempts
+
+`official-50` has an `attempts` input (default `1`, bounded to `1`–`10`). An
+attempt count above one expands the same official lane into serial disposable workers,
+one per declared attempt index. Every worker gets the same immutable candidate SHA,
+catalog digest, 50-task manifest, model/reasoning configuration, and timeout/policy
+inputs, while receiving a fresh EC2 instance, repositories, workspaces, containers,
+evaluator run IDs, and an attempt-specific object prefix. No response retry within an
+agent trajectory is counted as an independent attempt.
+
+Each worker artifact contains exactly 150 records when `harness=all` (50 tasks × 3
+harnesses × one declared attempt). Its record identity and evidence path include
+`(instance_id, harness, attempt)` and `slots/<task>/<harness>/attempt-XX`, so retries
+or subsequent attempts cannot overwrite a patch, evaluator report, or metadata. When
+`attempts > 1`, an artifact-gated merge job accepts every declared complete worker
+artifact and requires the exact combined attempt-record count before publishing
+`report.json`, `records.json`, and `report.md`.
+
+The combined report keeps both denominators explicit: `50 × attempts` executions per
+harness and 50 unique task instances per harness. It reports every attempt record's
+modeled model cost, runtime, status, and evidence location; per task/harness it reports
+resolved attempts and resolve rate. Total modeled cost and elapsed execution are sums
+across all attempts. Any task-level "resolved at least once" view is supplementary and
+must be named as such; it is never silently substituted for the attempt-level rate.
+Repeated results reduce variance uncertainty but do not create a normalized formal
+leaderboard.
+
 The worker builds each selected pinned harness image once. Carry is a portable static
 executable from the archived commit; Codex is fixed at `@openai/codex@0.147.0`; Pi is
 fixed at `@earendil-works/pi-coding-agent@0.84.2`. The worker exports exactly the
