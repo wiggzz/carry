@@ -54,8 +54,12 @@ enum McpCommand {
     },
     /// Authenticate with an HTTP MCP server using OAuth.
     Auth { server: String },
-    /// List all tools exposed by configured servers.
-    List,
+    /// List tools exposed by configured servers.
+    List {
+        /// List tools from only this server.
+        #[arg(long)]
+        server: Option<String>,
+    },
     /// Show a tool's description and input schema.
     Describe { tool: String },
     /// Invoke a tool with a JSON object containing its arguments.
@@ -69,6 +73,9 @@ enum McpCommand {
         /// Print only the value matching this RFC 6901 JSON Pointer.
         #[arg(long)]
         json_pointer: Option<String>,
+        /// Preserve JSON encoding when the selected value is a string.
+        #[arg(long, requires = "json_pointer")]
+        json: bool,
     },
 }
 
@@ -89,16 +96,24 @@ pub(crate) async fn run(cli: McpCli, carry_home: &Path) -> Result<()> {
     match cli.command {
         McpCommand::Add { name, url, command } => add(carry_home, name, url, command),
         McpCommand::Auth { server } => authorize(carry_home, &server).await,
-        McpCommand::List => list(carry_home).await,
-        McpCommand::Describe { tool } => inspect(carry_home, &tool, None, None).await,
+        McpCommand::List { server } => list(carry_home, server.as_deref()).await,
+        McpCommand::Describe { tool } => inspect(carry_home, &tool, None, None, false).await,
         McpCommand::Call {
             tool,
             arguments,
             stdin,
             json_pointer,
+            json,
         } => {
             let arguments = parse_arguments(arguments, stdin, std::io::stdin().lock())?;
-            inspect(carry_home, &tool, Some(arguments), json_pointer.as_deref()).await
+            inspect(
+                carry_home,
+                &tool,
+                Some(arguments),
+                json_pointer.as_deref(),
+                json,
+            )
+            .await
         }
     }
 }
@@ -131,10 +146,18 @@ fn add(carry_home: &Path, name: String, url: Option<String>, command: Vec<String
     Ok(())
 }
 
-async fn list(carry_home: &Path) -> Result<()> {
+async fn list(carry_home: &Path, wanted_server: Option<&str>) -> Result<()> {
     let config = load(carry_home)?;
+    if let Some(name) = wanted_server
+        && !config.servers.contains_key(name)
+    {
+        bail!("MCP server not found: {name}");
+    }
     let mut output = Vec::new();
     for (server_name, server) in &config.servers {
+        if wanted_server.is_some_and(|wanted| wanted != server_name) {
+            continue;
+        }
         let tools = server_tools(carry_home, server_name, server).await?;
         for tool in tools {
             output.push(format!("{server_name}/{}", tool.name));
@@ -148,6 +171,7 @@ async fn inspect(
     reference: &str,
     arguments: Option<JsonObject>,
     json_pointer: Option<&str>,
+    json: bool,
 ) -> Result<()> {
     let config = load(carry_home)?;
     if config.servers.is_empty() {
@@ -191,7 +215,8 @@ async fn inspect(
             "tool": tool,
         })
     };
-    print_json(&select_output(result, json_pointer)?)
+    let selected = select_output(result, json_pointer)?;
+    print_output(&selected, json_pointer.is_some(), json)
 }
 
 fn parse_arguments(
@@ -560,6 +585,10 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn configured_server_names(carry_home: &Path) -> Result<Vec<String>> {
+    Ok(load(carry_home)?.servers.into_keys().collect())
+}
+
 fn load(carry_home: &Path) -> Result<Config> {
     let path = carry_home.join(CONFIG_FILE);
     match std::fs::read(&path) {
@@ -606,6 +635,21 @@ fn save(carry_home: &Path, config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn format_output(value: &Value, selected: bool, json: bool) -> Result<String> {
+    if selected
+        && !json
+        && let Some(text) = value.as_str()
+    {
+        return Ok(text.to_owned());
+    }
+    serde_json::to_string_pretty(value).context("failed to serialize MCP output")
+}
+
+fn print_output(value: &Value, selected: bool, json: bool) -> Result<()> {
+    println!("{}", format_output(value, selected, json)?);
+    Ok(())
+}
+
 fn print_json(value: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -620,6 +664,58 @@ mod tests {
     fn reads_call_arguments_from_stdin() {
         let arguments = parse_arguments(None, true, br#"{"query":"roadmap"}"#.as_slice()).unwrap();
         assert_eq!(arguments["query"], "roadmap");
+    }
+
+    #[test]
+    fn parses_server_scoped_list() {
+        let cli = McpCli::try_parse_from(["carry", "list", "--server", "notion"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            McpCommand::List { server: Some(ref server) } if server == "notion"
+        ));
+    }
+
+    #[test]
+    fn pointer_selected_strings_are_raw_unless_json_is_requested() {
+        assert_eq!(
+            format_output(&json!("done\n"), true, false).unwrap(),
+            "done\n"
+        );
+        assert_eq!(
+            format_output(&json!("done\n"), true, true).unwrap(),
+            "\"done\\n\""
+        );
+        assert_eq!(
+            format_output(&json!({"done": true}), true, false).unwrap(),
+            "{\n  \"done\": true\n}"
+        );
+    }
+
+    #[test]
+    fn reads_configured_server_names_without_connecting() {
+        let home = tempdir().unwrap();
+        let config = Config {
+            servers: BTreeMap::from([
+                (
+                    "notion".into(),
+                    Server::Http {
+                        url: "https://example.test".into(),
+                    },
+                ),
+                (
+                    "github".into(),
+                    Server::Stdio {
+                        command: "server".into(),
+                        args: vec![],
+                    },
+                ),
+            ]),
+        };
+        save(home.path(), &config).unwrap();
+        assert_eq!(
+            configured_server_names(home.path()).unwrap(),
+            vec!["github", "notion"]
+        );
     }
 
     #[test]
