@@ -105,7 +105,7 @@ if [[ "$BENCHMARK_MODE" == bootstrap ]]; then
   exit 0
 fi
 case "$BENCHMARK_MODE" in
-  smoke-5|session-smoke-5|session-20|official-50|prepare-50) ;;
+  smoke-5|session-smoke-5|session-20|official-50|replicated-50|prepare-50) ;;
   *) echo "unknown benchmark mode" >&2; exit 2 ;;
 esac
 if [[ "$BENCHMARK_MODE" =~ ^session-(smoke-5|20)$ && "$BENCHMARK_HARNESS" != carry && "$BENCHMARK_HARNESS" != codex && "$BENCHMARK_HARNESS" != pi ]]; then
@@ -167,7 +167,7 @@ fi
 "$CARRY_ROOT/venv/bin/pip" install --disable-pip-version-check \
   'swebench==4.1.0' 'datasets>=2.19,<4'
 export PATH="$CARRY_ROOT/venv/bin:$PATH"
-export RUN_ID SOURCE_COMMIT MODEL REASONING BENCHMARK_MODE BENCHMARK_HARNESS CARRY_COMPACTION_POLICY CARRY_KEEP_LEASE_TURNS CARRY_COMPACTION_PAYOFF_REQUESTS TASK_IMAGE_REPOSITORY TASK_IMAGE_CATALOG
+export RUN_ID SOURCE_COMMIT MODEL REASONING BENCHMARK_MODE BENCHMARK_HARNESS REPLICATION_ATTEMPT REPLICATION_ATTEMPTS CARRY_COMPACTION_POLICY CARRY_KEEP_LEASE_TURNS CARRY_COMPACTION_PAYOFF_REQUESTS TASK_IMAGE_REPOSITORY TASK_IMAGE_CATALOG
 export BASE_IMAGE='node@sha256:afff6d8c97964a438d2e6a9c96509367e45d8bf93f790ad561a1eaea926303d9'
 export CARRY_BASE_IMAGE='rust@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff'
 export CODEX_VERSION='0.147.0'
@@ -178,7 +178,7 @@ export EVALUATOR_TIMEOUT_SECONDS=270
 export AGENT_CONCURRENCY=3
 export READINESS_CONCURRENCY=5
 
-if [[ "$BENCHMARK_MODE" == official-50 ]]; then
+if [[ "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == replicated-50 ]]; then
   # Five concurrent Docker creates have been reliable; ten repeatedly saturated
   # the daemon and left half of a shard without evaluator outcomes.
   export AGENT_CONCURRENCY=5

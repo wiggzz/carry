@@ -981,6 +981,48 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertEqual(set(report["harnesses"]), {"carry"})
             self.assertEqual(len(json.loads((output / "records.json").read_text())), 5)
 
+    def test_finalize_preserves_three_independent_attempts_per_task_and_harness(self):
+        tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
+        records = [
+            {
+                "instance_id": task["instance_id"], "harness": "carry", "attempt": attempt,
+                "status": "evaluated", "patch": "", "resolved": attempt != 2,
+                "estimated_cost_usd": 0.1 * attempt,
+            }
+            for task in tasks for attempt in (1, 2, 3)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            self.worker.finalize(
+                tasks=tasks, records=records, output=output, provenance={"mode": "replicated-50"},
+                harnesses=("carry",), attempt_numbers=(1, 2, 3),
+            )
+            report = json.loads((output / "report.json").read_text())
+            self.assertEqual(report["denominator"], 15)
+            self.assertEqual(report["attempts_per_task_harness"], 3)
+            self.assertEqual(report["harnesses"]["carry"]["denominator"], 15)
+            summary = report["task_harnesses"]["task-0/carry"]
+            self.assertEqual(summary["attempts"], 3)
+            self.assertEqual(summary["completed"], 3)
+            self.assertEqual(summary["estimated_cost_usd"], 0.6)
+            self.assertEqual(summary["resolved"], 2)
+            self.assertEqual(summary["resolve_rate"], 2 / 3)
+            self.assertTrue(summary["solved_at_least_once"])
+            self.assertEqual(len(summary["wilson_95_interval"]), 2)
+            self.assertLess(summary["wilson_95_interval"][0], 2 / 3)
+            self.assertGreater(summary["wilson_95_interval"][1], 2 / 3)
+            summary = (output / "report.md").read_text()
+            self.assertIn("Independent attempts per task/harness: 3", summary)
+            self.assertIn("| Attempt |", summary)
+            self.assertIn("slots/task-0/carry/attempt-01", summary)
+            self.assertIn("| task-0 | carry | 3 | 2/3 |", summary)
+
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(ValueError, "15 unique"):
+            self.worker.finalize(
+                tasks=tasks, records=records[:-1] + [records[0]], output=pathlib.Path(directory),
+                provenance={}, harnesses=("carry",), attempt_numbers=(1, 2, 3),
+            )
+
     def test_finalize_accepts_twenty_task_retained_session_denominator(self):
         tasks = [{"instance_id": f"task-{number}"} for number in range(20)]
         records = [
@@ -1152,6 +1194,23 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         self.assertEqual(self.worker.selection_for_mode(frozen, "smoke-5", smoke), smoke)
         self.assertEqual(self.worker.selection_for_mode(frozen, "official-50", smoke), frozen)
         self.assertEqual(self.worker.selection_for_mode(frozen, "session-20", smoke), frozen[:20])
+
+    def test_replicated_mode_selects_the_frozen_manifest_and_one_declared_attempt(self):
+        frozen = [f"task-{number:02d}" for number in range(50)]
+        self.assertEqual(self.worker.selection_for_mode(frozen, "replicated-50"), frozen)
+        self.assertEqual(
+            self.worker.replication_attempt_numbers(
+                {"REPLICATION_ATTEMPTS": "3", "REPLICATION_ATTEMPT": "2"}, "replicated-50"
+            ),
+            (2,),
+        )
+        for config in (
+            {"REPLICATION_ATTEMPTS": "2", "REPLICATION_ATTEMPT": "1"},
+            {"REPLICATION_ATTEMPTS": "3", "REPLICATION_ATTEMPT": "0"},
+            {"REPLICATION_ATTEMPTS": "3", "REPLICATION_ATTEMPT": "4"},
+        ):
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "replicated mode"):
+                self.worker.replication_attempt_numbers(config, "replicated-50")
 
     def test_session_smoke_uses_the_frozen_smoke_order_and_permits_exactly_one_native_harness(self):
         frozen = [f"task-{number:02d}" for number in range(50)]
@@ -1419,7 +1478,10 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             if position == 1:
                 self.assertIsNone(kwargs["resume_session"])
             else:
-                self.assertEqual(kwargs["resume_session"], output / "slots" / smoke[position - 2] / "carry")
+                self.assertEqual(
+                    kwargs["resume_session"],
+                    output / "slots" / smoke[position - 2] / "carry" / "attempt-01",
+                )
             (kwargs["output"] / "context-state.json").write_text(
                 f"context-{position}", encoding="utf-8"
             )

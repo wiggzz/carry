@@ -361,7 +361,7 @@ def task_image_references(repository: str, cache_key: str) -> dict[str, str]:
 
 def agent_concurrency_for_mode(values: Mapping[str, str], mode: str) -> int:
     """Return a bounded agent parallelism that fits the selected benchmark mode."""
-    default = "5" if mode == "official-50" else "1" if mode in {"session-smoke-5", "session-20"} else "3"
+    default = "5" if mode in {"official-50", "replicated-50"} else "1" if mode in {"session-smoke-5", "session-20"} else "3"
     concurrency = int(values.get("AGENT_CONCURRENCY", default))
     if concurrency < 1 or concurrency > 5:
         raise ValueError("AGENT_CONCURRENCY must be between 1 and 5")
@@ -1514,9 +1514,23 @@ def selection_for_mode(frozen_ids: list[str], mode: str,
         return list(smoke_ids)
     if mode == "session-20":
         return list(frozen_ids[:20])
-    if mode == "official-50":
+    if mode in {"official-50", "replicated-50"}:
         return list(frozen_ids)
     raise ValueError(f"unsupported benchmark mode: {mode}")
+
+
+def replication_attempt_numbers(config: Mapping[str, str], mode: str) -> tuple[int, ...]:
+    """Validate the one independent trajectory assigned to this worker."""
+    if mode != "replicated-50":
+        return (1,)
+    total = config.get("REPLICATION_ATTEMPTS", "")
+    selected = config.get("REPLICATION_ATTEMPT", "")
+    if total != "3" or not selected.isascii() or not selected.isdecimal():
+        raise ValueError("replicated mode requires exactly three declared attempts")
+    attempt = int(selected)
+    if attempt not in (1, 2, 3):
+        raise ValueError("replicated mode attempt must be 1, 2, or 3")
+    return (attempt,)
 
 
 def validate_session_mode(mode: str, harnesses: tuple[str, ...]) -> None:
@@ -1809,26 +1823,39 @@ def _validate_records(
     tasks: list[dict[str, Any]],
     records: list[dict[str, Any]],
     harnesses: tuple[str, ...] = HARNESSES,
+    attempt_numbers: tuple[int, ...] = (1,),
 ) -> None:
     task_count = len(tasks)
     if task_count not in (5, 20, 50):
         raise ValueError("benchmark must contain exactly 5, 20, or 50 tasks")
-    expected = {(task["instance_id"], harness) for task in tasks for harness in harnesses}
-    actual = [(record.get("instance_id"), record.get("harness")) for record in records]
-    expected_count = task_count * len(harnesses)
+    if (not attempt_numbers or any(isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1
+                                   for attempt in attempt_numbers)
+            or len(set(attempt_numbers)) != len(attempt_numbers)):
+        raise ValueError("attempt numbers must be unique positive integers")
+    expected = {
+        (task["instance_id"], harness, attempt)
+        for task in tasks for harness in harnesses for attempt in attempt_numbers
+    }
+    actual = [(record.get("instance_id"), record.get("harness"), record.get("attempt", 1)) for record in records]
+    expected_count = task_count * len(harnesses) * len(attempt_numbers)
     if (len(expected) != expected_count or len(actual) != expected_count
             or set(actual) != expected or len(set(actual)) != expected_count):
-        raise ValueError(f"expected exactly {expected_count} unique task/harness records")
+        raise ValueError(f"expected exactly {expected_count} unique task/harness/attempt records")
 
 
 def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], output: pathlib.Path,
-             provenance: dict[str, Any], harnesses: tuple[str, ...] = HARNESSES) -> None:
-    _validate_records(tasks, records, harnesses)
+             provenance: dict[str, Any], harnesses: tuple[str, ...] = HARNESSES,
+             attempt_numbers: tuple[int, ...] = (1,)) -> None:
+    _validate_records(tasks, records, harnesses, attempt_numbers)
     output.mkdir(parents=True, exist_ok=True)
     normalized = []
     predictions = []
     for record in records:
         item = dict(record)
+        item.setdefault("attempt", 1)
+        item.setdefault(
+            "evidence_path", f"slots/{item['instance_id']}/{item['harness']}/attempt-{item['attempt']:02d}",
+        )
         item.setdefault("patch", "")
         item.setdefault("error", None)
         item.setdefault("resolved", False)
@@ -1871,14 +1898,15 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
     completed = sum(item["status"] == "evaluated" for item in normalized)
     resolved = sum(bool(item["resolved"]) for item in normalized)
     task_count = len(tasks)
-    denominator = task_count * len(harnesses)
+    attempt_count = len(attempt_numbers)
+    denominator = task_count * len(harnesses) * attempt_count
     harness_reports = {}
     for harness in harnesses:
         harness_records = [item for item in normalized if item["harness"] == harness]
         costs = [item["estimated_cost_usd"] for item in harness_records
                  if item["estimated_cost_usd"] is not None]
         harness_reports[harness] = {
-            "denominator": task_count,
+            "denominator": task_count * attempt_count,
             "completed": sum(item["status"] == "evaluated" for item in harness_records),
             "resolved": sum(bool(item["resolved"]) for item in harness_records),
             "response_retries": sum(item["response_retries"] for item in harness_records),
@@ -1897,9 +1925,41 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
             "costed_slots": len(costs),
             "statuses": dict(sorted(Counter(item["status"] for item in harness_records).items())),
         }
+    task_harness_reports = {}
+    def wilson_95_interval(successes: int, trials: int) -> list[float]:
+        # Fixed 1.96 z-score keeps the human-facing uncertainty interval deterministic.
+        z = 1.96
+        proportion = successes / trials
+        denominator = 1 + z * z / trials
+        center = (proportion + z * z / (2 * trials)) / denominator
+        margin = z * math.sqrt(
+            proportion * (1 - proportion) / trials + z * z / (4 * trials * trials)
+        ) / denominator
+        return [round(max(0.0, center - margin), 6), round(min(1.0, center + margin), 6)]
+
+    for task in tasks:
+        for harness in harnesses:
+            task_records = [
+                item for item in normalized
+                if item["instance_id"] == task["instance_id"] and item["harness"] == harness
+            ]
+            costs = [item["estimated_cost_usd"] for item in task_records
+                     if item["estimated_cost_usd"] is not None]
+            resolved_count = sum(bool(item["resolved"]) for item in task_records)
+            task_harness_reports[f"{task['instance_id']}/{harness}"] = {
+                "attempts": attempt_count,
+                "completed": sum(item["status"] == "evaluated" for item in task_records),
+                "estimated_cost_usd": round(sum(costs), 6) if costs else None,
+                "resolved": resolved_count,
+                "resolve_rate": resolved_count / attempt_count,
+                "solved_at_least_once": bool(resolved_count),
+                "wilson_95_interval": wilson_95_interval(resolved_count, attempt_count),
+            }
     report = {
-        "denominator": denominator, "completed": completed, "resolved": resolved,
-        "harnesses": harness_reports, "provenance": provenance,
+        "denominator": denominator, "attempts_per_task_harness": attempt_count,
+        "attempt_numbers": list(attempt_numbers), "completed": completed, "resolved": resolved,
+        "harnesses": harness_reports, "task_harnesses": task_harness_reports,
+        "provenance": provenance,
     }
     (output / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     def cost_text(value: float | None) -> str:
@@ -1919,19 +1979,52 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
         f"{values['usage']['total_tokens']} tokens; {harness_cost_text(values)} estimated"
         for harness, values in harness_reports.items()
     )
-    slot_lines = "\n".join(
-        f"| {item['instance_id']} | {item['harness']} | {item['status']} | "
-        f"{'yes' if item['resolved'] else 'no'} | {item['elapsed_seconds']:.3f} | "
-        f"{item['usage']['total_tokens']} | {cost_text(item['estimated_cost_usd'])} |"
-        for item in normalized
-    )
+    if attempt_count > 1:
+        slot_lines = "\n".join(
+            f"| {item['instance_id']} | {item['harness']} | {item['attempt']} | {item['status']} | "
+            f"{'yes' if item['resolved'] else 'no'} | {item['elapsed_seconds']:.3f} | "
+            f"{item['usage']['total_tokens']} | {cost_text(item['estimated_cost_usd'])} | "
+            f"`{item['evidence_path']}` |"
+            for item in normalized
+        )
+        slot_header = (
+            "| Task | Agent | Attempt | Status | Resolved | Agent seconds | Tokens | Estimated cost | Evidence |\n"
+            "|---|---|---:|---|---:|---:|---:|---:|---|\n"
+        )
+    else:
+        slot_lines = "\n".join(
+            f"| {item['instance_id']} | {item['harness']} | {item['status']} | "
+            f"{'yes' if item['resolved'] else 'no'} | {item['elapsed_seconds']:.3f} | "
+            f"{item['usage']['total_tokens']} | {cost_text(item['estimated_cost_usd'])} |"
+            for item in normalized
+        )
+        slot_header = (
+            "| Task | Agent | Status | Resolved | Agent seconds | Tokens | Estimated cost |\n"
+            "|---|---|---|---:|---:|---:|---:|\n"
+        )
+    replication_section = ""
+    if attempt_count > 1:
+        task_lines = "\n".join(
+            f"| {key.rsplit('/', 1)[0]} | {key.rsplit('/', 1)[1]} | {values['attempts']} | "
+            f"{values['resolved']}/{values['attempts']} | {values['resolve_rate']:.1%} | "
+            f"{values['wilson_95_interval'][0]:.1%}–{values['wilson_95_interval'][1]:.1%} | "
+            f"{cost_text(values['estimated_cost_usd'])} |"
+            for key, values in task_harness_reports.items()
+        )
+        replication_section = (
+            f"\n- Independent attempts per task/harness: {attempt_count}\n"
+            "\n## Task-harness replication summaries\n\n"
+            "| Task | Agent | Attempts | Resolved | Resolve rate | Wilson 95% | Estimated cost |\n"
+            "|---|---|---:|---:|---:|---:|---:|\n" + task_lines + "\n"
+        )
+    title = "# SWE-bench Verified replication study" if attempt_count > 1 else "# SWE-bench Verified baseline"
     (output / "report.md").write_text(
-        "# SWE-bench Verified baseline\n\n"
-        f"- Denominator: {denominator}\n- Completed: {completed}\n- Resolved: {resolved}\n\n"
+        title + "\n\n"
+        f"- Denominator: {denominator}\n- Completed: {completed}\n- Resolved: {resolved}\n"
+        + replication_section + "\n"
         + harness_lines
         + "\n\n## Agent runs\n\n"
-        + "| Task | Agent | Status | Resolved | Agent seconds | Tokens | Estimated cost |\n"
-        + "|---|---|---|---:|---:|---:|---:|\n"
+        + slot_header
         + slot_lines + "\n",
         encoding="utf-8",
     )
@@ -2045,7 +2138,8 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     pricing = pricing_for_model(validated["MODEL"])
     mode = config.get("BENCHMARK_MODE", "smoke-5")
     validate_session_mode(mode, harnesses)
-    phase_limits = official_phase_limits(config) if mode == "official-50" else None
+    attempt_numbers = replication_attempt_numbers(config, mode)
+    phase_limits = official_phase_limits(config) if mode in {"official-50", "replicated-50"} else None
     frozen_ids = json.loads(
         (source / "benchmarks" / "swe-bench-verified-50.json").read_text(encoding="utf-8")
     )["instance_ids"]
@@ -2095,7 +2189,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     readiness_concurrency = int(config.get("READINESS_CONCURRENCY", "5"))
     evaluator_timeout = int(config.get("EVALUATOR_TIMEOUT_SECONDS", "270"))
     evaluator_concurrency = int(config.get("EVALUATOR_CONCURRENCY", "5"))
-    if mode == "official-50" and (
+    if mode in {"official-50", "replicated-50"} and (
             concurrency != 5 or agent_timeout != 360
             or readiness_timeout != 180 or readiness_concurrency != 5
             or evaluator_timeout != 270 or evaluator_concurrency != 5):
@@ -2103,7 +2197,8 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
 
     provenance_payload = {
         "dataset": DATASET, "dataset_revision": DATASET_REVISION,
-        "swebench_version": "4.1.0", "model": validated["MODEL"],
+        "swebench_version": "4.1.0", "source_commit": config.get("SOURCE_COMMIT"),
+        "model": validated["MODEL"],
         "reasoning": validated["REASONING"],
         "carry_compaction_policy": validated["CARRY_COMPACTION_POLICY"],
         "carry_keep_lease_turns": validated["CARRY_KEEP_LEASE_TURNS"],
@@ -2112,6 +2207,11 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "mode": mode, "harnesses": list(harnesses), "phase": "planned",
         "pricing_usd_per_million": pricing,
     }
+    if mode == "replicated-50":
+        provenance_payload["replication"] = {
+            "attempt": attempt_numbers[0], "attempts_per_task_harness": 3,
+            "independent_fresh_workspaces": True,
+        }
     if mode in {"session-smoke-5", "session-20"}:
         provenance_payload.update({
             "retained_context": True,
@@ -2130,14 +2230,17 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "base_commit": record["base_commit"], "problem_statement": record["problem_statement"],
     } for record in selected_records]
     records = [{
-        "instance_id": task["instance_id"], "harness": harness,
+        "instance_id": task["instance_id"], "harness": harness, "attempt": attempt_numbers[0],
         "status": "not-run", "patch": "", "error": "slot did not complete before checkpoint",
         "attempts": 0, "retries": 0, "response_retries": 0, "resolved": False,
         "model": validated["MODEL"], "reasoning": validated["REASONING"],
     } for task in tasks for harness in harnesses]
-    records_by_slot = {(record["instance_id"], record["harness"]): record for record in records}
+    records_by_slot = {
+        (record["instance_id"], record["harness"], record["attempt"]): record for record in records
+    }
     # Persist the exact denominator before any model-bearing slot starts.
-    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
+    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload,
+             harnesses=harnesses, attempt_numbers=attempt_numbers)
 
     mirrors: dict[str, pathlib.Path] = {}
 
@@ -2175,7 +2278,8 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     provenance["execution_limits"] = execution_limits
     provenance_payload["images"] = provenance
     provenance_payload["phase"] = "resolving-task-images"
-    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
+    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload,
+             harnesses=harnesses, attempt_numbers=attempt_numbers)
     preparation_started = time.monotonic()
     try:
         prepared = resolve_task_environments(
@@ -2192,7 +2296,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     except Exception:
         provenance_payload["phase"] = "preparation-failed"
         finalize(tasks=tasks, records=records, output=output,
-                 provenance=provenance_payload, harnesses=harnesses)
+                 provenance=provenance_payload, harnesses=harnesses, attempt_numbers=attempt_numbers)
         shutil.rmtree(work / "repositories", ignore_errors=True)
         os.environ.pop("OPENAI_API_KEY", None)
         secret_file = os.environ.pop("OPENAI_SECRET_FILE", "")
@@ -2212,7 +2316,8 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         for instance_id, item in prepared.items()
     }
     provenance_payload["phase"] = "agents"
-    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
+    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload,
+                     harnesses=harnesses, attempt_numbers=attempt_numbers)
     agent_deadline = (
         time.monotonic() + phase_limits["agent_seconds"]
         if phase_limits is not None else None
@@ -2229,20 +2334,21 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         for task in shard_tasks:
             task_root = shard_root / "tasks" / task["instance_id"]
             for harness in harnesses:
-                slot_output = output / "slots" / task["instance_id"] / harness
+                attempt = attempt_numbers[0]
+                slot_output = output / "slots" / task["instance_id"] / harness / f"attempt-{attempt:02d}"
                 slot_output.mkdir(parents=True, exist_ok=True)
-                slots.append((task, harness, task_root, slot_output))
+                slots.append((task, harness, attempt, task_root, slot_output))
 
         def execute_slot(slot: tuple[Any, ...]) -> dict[str, Any]:
             nonlocal session_source, codex_thread
-            task, harness, task_root, slot_output = slot
+            task, harness, attempt, task_root, slot_output = slot
             session_position = selection.index(task["instance_id"]) + 1 if mode in {"session-smoke-5", "session-20"} else None
             slot_timeout = agent_timeout
             if agent_deadline is not None:
                 remaining = math.ceil(agent_deadline - time.monotonic())
                 if remaining <= 0:
                     return {
-                        "instance_id": task["instance_id"], "harness": harness,
+                        "instance_id": task["instance_id"], "harness": harness, "attempt": attempt,
                         "status": "agent-budget-exhausted", "patch": "",
                         "error": "official agent phase budget exhausted before launch",
                         "attempts": 0, "retries": 0, "response_retries": 0,
@@ -2256,7 +2362,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                     or (harness == "pi" and (pi_session_file is None or not pi_session_file.is_file()))
                 ):
                     return {
-                        "instance_id": task["instance_id"], "harness": harness,
+                        "instance_id": task["instance_id"], "harness": harness, "attempt": attempt,
                         "status": "agent-session-context-missing", "patch": "",
                         "error": "retained native source session is unavailable before this task",
                         "attempts": 0, "retries": 0, "response_retries": 0,
@@ -2299,6 +2405,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 codex_thread=codex_thread if harness == "codex" else None,
                 pi_session_dir=pi_session_dir if session_position is not None and harness == "pi" else None,
             )
+            record["attempt"] = attempt
             record["model"] = validated["MODEL"]
             record["reasoning"] = validated["REASONING"]
             if session_position is not None:
@@ -2342,12 +2449,13 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
                 for record in executor.map(execute_slot, slots):
-                    records_by_slot[(record["instance_id"], record["harness"])].update(record)
+                    records_by_slot[(record["instance_id"], record["harness"], record["attempt"])].update(record)
                     agent_budget_exhausted |= (
                         record["status"] == "agent-budget-exhausted"
                         or bool(record.get("timed_out"))
                     )
-            finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
+            finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload,
+                     harnesses=harnesses, attempt_numbers=attempt_numbers)
         finally:
             # Agent workspaces are no longer needed after patch capture. Keeping only
             # mirrors and outputs bounds disk use before official evaluation starts.
@@ -2363,7 +2471,8 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
 
     # Preserve the complete fixed-denominator checkpoint before slower grading.
     provenance_payload["phase"] = "grading"
-    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
+    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload,
+                     harnesses=harnesses, attempt_numbers=attempt_numbers)
     evaluation_deadline = (
         time.monotonic() + phase_limits["evaluation_seconds"]
         if phase_limits is not None else None
@@ -2377,7 +2486,9 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 report_dir = report_dir / f"shard-{shard_index:02d}"
             prediction_file = report_dir / "predictions.jsonl"
             prediction_file.parent.mkdir(parents=True, exist_ok=True)
-            shard_records = [records_by_slot[(instance_id, harness)] for instance_id in shard_ids]
+            shard_records = [
+                records_by_slot[(instance_id, harness, attempt_numbers[0])] for instance_id in shard_ids
+            ]
             prediction_file.write_text("".join(json.dumps({
                 "instance_id": record["instance_id"], "model_name_or_path": harness,
                 "model_patch": record["patch"],
@@ -2397,7 +2508,8 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 run_official_evaluation(
                     predictions=prediction_file, canonical_dataset=work / "canonical-dataset.json",
                     instance_ids=shard_ids,
-                    run_id=f"{config['RUN_ID']}-{harness}-{shard_index:02d}", output=report_dir,
+                    run_id=(f"{config['RUN_ID']}-{harness}-attempt-{attempt_numbers[0]:02d}-"
+                            f"{shard_index:02d}"), output=report_dir,
                     process_timeout_seconds=process_timeout,
                     max_workers=evaluator_concurrency,
                 )
@@ -2415,12 +2527,15 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                     "instance_id": record["instance_id"], "harness": harness,
                     "state": "graded", "status": record["status"],
                 }, sort_keys=True), flush=True)
-            finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
+            finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload,
+                     harnesses=harnesses, attempt_numbers=attempt_numbers)
     evaluation_unknown = official_evaluation_unknowns(records)
     provenance_payload["phase"] = "incomplete" if evaluation_unknown else "complete"
-    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload, harnesses=harnesses)
+    finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload,
+                     harnesses=harnesses, attempt_numbers=attempt_numbers)
     for record in records:
-        slot = output / "slots" / record["instance_id"] / record["harness"]
+        slot = (output / "slots" / record["instance_id"] / record["harness"]
+                / f"attempt-{record['attempt']:02d}")
         (slot / "metadata.json").write_text(
             json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )

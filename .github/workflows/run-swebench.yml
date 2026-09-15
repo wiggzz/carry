@@ -14,7 +14,7 @@ on:
         required: true
         default: bootstrap
         type: choice
-        options: [bootstrap, prepare-50, smoke-5, session-smoke-5, session-20, official-50, cleanup]
+        options: [bootstrap, prepare-50, smoke-5, session-smoke-5, session-20, official-50, replicated-50, cleanup]
       harness:
         description: Agent harness, or all three in one prepared environment
         required: true
@@ -58,8 +58,13 @@ permissions:
 
 jobs:
   bootstrap-worker:
-    name: ${{ inputs.mode }} ${{ inputs.harness }} ${{ inputs.carry_ref }}
+    name: ${{ inputs.mode }} ${{ inputs.harness }} attempt ${{ matrix.replication_attempt }} ${{ inputs.carry_ref }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        replication_attempt: ${{ fromJSON(inputs.mode == 'replicated-50' && '[1,2,3]' || '[1]') }}
     timeout-minutes: 360
     concurrency:
       # Only the deliberate 20-task retained study uses separate workers.
@@ -79,6 +84,8 @@ jobs:
       BOOTSTRAP_WAIT_SECONDS: ${{ inputs.bootstrap_wait_seconds }}
       BENCHMARK_MODE: ${{ inputs.mode }}
       BENCHMARK_HARNESS: ${{ inputs.harness }}
+      REPLICATION_ATTEMPT: ${{ matrix.replication_attempt }}
+      REPLICATION_ATTEMPTS: ${{ inputs.mode == 'replicated-50' && '3' || '1' }}
       CARRY_COMPACTION_POLICY: ${{ inputs.carry_compaction_policy }}
       CARRY_KEEP_LEASE_TURNS: ${{ inputs.carry_keep_lease_turns }}
       CARRY_COMPACTION_PAYOFF_REQUESTS: ${{ inputs.carry_compaction_payoff_requests }}
@@ -158,8 +165,8 @@ jobs:
           TARGET_RUN_ID: ${{ inputs.cleanup_run_id }}
         run: |
           set -euo pipefail
-          [[ "$TARGET_RUN_ID" =~ ^gh-[0-9]+-[1-9][0-9]*$ ]] || {
-            echo "cleanup_run_id must be an exact gh-RUN_ID-ATTEMPT" >&2
+          [[ "$TARGET_RUN_ID" =~ ^gh-[0-9]+-[1-9][0-9]*(-replica-[1-3])?$ ]] || {
+            echo "cleanup_run_id must be an exact gh-RUN_ID-ATTEMPT optionally suffixed -replica-1, -replica-2, or -replica-3" >&2
             exit 1
           }
           for required in ARTIFACT_BUCKET ARTIFACT_SESSION_ROLE_ARN; do
@@ -184,7 +191,7 @@ jobs:
           echo "sanitized exact run prefix $TARGET_RUN_ID"
 
       - name: Install pinned pre-signing client
-        if: inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50'
+        if: inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50' || inputs.mode == 'replicated-50'
         shell: bash
         run: |
           set -euo pipefail
@@ -199,9 +206,9 @@ jobs:
         env:
           SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
           SOURCE_SHA256: ${{ steps.source.outputs.source_sha256 }}
-          OPENAI_API_KEY: ${{ (inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50') && secrets.OPENAI_API_KEY || '' }}
-          DOCKERHUB_USERNAME: ${{ (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50') && secrets.DOCKERHUB_USERNAME || '' }}
-          DOCKERHUB_TOKEN: ${{ (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50') && secrets.DOCKERHUB_TOKEN || '' }}
+          OPENAI_API_KEY: ${{ (inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50' || inputs.mode == 'replicated-50') && secrets.OPENAI_API_KEY || '' }}
+          DOCKERHUB_USERNAME: ${{ (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50' || inputs.mode == 'replicated-50') && secrets.DOCKERHUB_USERNAME || '' }}
+          DOCKERHUB_TOKEN: ${{ (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50' || inputs.mode == 'replicated-50') && secrets.DOCKERHUB_TOKEN || '' }}
         run: |
           set -euo pipefail
           for required in AWS_REGION ARTIFACT_BUCKET ARTIFACT_SESSION_ROLE_ARN WORKER_LAUNCH_TEMPLATES SOURCE_COMMIT; do
@@ -215,7 +222,7 @@ jobs:
             echo "retained-session modes require one BENCHMARK_HARNESS=carry, codex, or pi" >&2
             exit 1
           fi
-          if [[ "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == session-smoke-5 || "$BENCHMARK_MODE" == session-20 || "$BENCHMARK_MODE" == official-50 ]]; then
+          if [[ "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == session-smoke-5 || "$BENCHMARK_MODE" == session-20 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == replicated-50 ]]; then
             for required in OPENAI_API_KEY DOCKERHUB_USERNAME DOCKERHUB_TOKEN MODEL REASONING TASK_IMAGE_REPOSITORY TASK_IMAGE_CATALOG; do
               [[ -n "${!required}" ]] || { echo "missing benchmark configuration: $required" >&2; exit 1; }
             done
@@ -244,7 +251,17 @@ jobs:
               [[ -n "${!required}" ]] || { echo "missing preparation configuration: $required" >&2; exit 1; }
             done
           fi
+          if [[ "$BENCHMARK_MODE" == replicated-50 ]]; then
+            [[ "$REPLICATION_ATTEMPTS" == 3 && "$REPLICATION_ATTEMPT" =~ ^[1-3]$ ]] || {
+              echo "replicated-50 requires exactly one of attempts 1, 2, or 3" >&2; exit 1;
+            }
+          else
+            [[ "$REPLICATION_ATTEMPTS" == 1 && "$REPLICATION_ATTEMPT" == 1 ]] || {
+              echo "non-replicated modes must use replication attempt 1 of 1" >&2; exit 1;
+            }
+          fi
           RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ "$BENCHMARK_MODE" == replicated-50 ]]; then RUN_ID+="-replica-${REPLICATION_ATTEMPT}"; fi
           BASE_AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
           BASE_AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
           BASE_AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN
@@ -263,7 +280,7 @@ jobs:
           set -a; source "$RUNNER_TEMP/artifact-session.env"; set +a
           PREFIX="runs/$RUN_ID"
           aws s3 cp carry-source.tar.gz "s3://$ARTIFACT_BUCKET/$PREFIX/carry-source.tar.gz" --sse AES256 --only-show-errors
-          if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == session-smoke-5 || "$BENCHMARK_MODE" == session-20 || "$BENCHMARK_MODE" == official-50 ]]; then
+          if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == session-smoke-5 || "$BENCHMARK_MODE" == session-20 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == replicated-50 ]]; then
             DOCKER_AUTH_FILE="$RUNNER_TEMP/dockerhub-auth.json"
             python3 - "$DOCKER_AUTH_FILE" <<'PY'
           import json, os, sys
@@ -311,7 +328,7 @@ jobs:
             fi
             RESULT_URL=$(python3 scripts/presign_s3.py put "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 3600)
             RESULT_GET_URL=$(python3 scripts/presign_s3.py get "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 3600)
-            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == official-50 ]]; then
+            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == replicated-50 ]]; then
               CONTROL_URL=$(python3 scripts/presign_s3.py get "$ARTIFACT_BUCKET" "$PREFIX/control.json" --expires 3600)
               CONTROL_URL="$CONTROL_URL" RESULT_URL="$RESULT_URL" python3 - "$RUNNER_TEMP/control.json" <<'PY'
           import json, os, sys
@@ -332,7 +349,8 @@ jobs:
           SOURCE_URL="$SOURCE_URL" KEY_URL="$KEY_URL" DOCKER_AUTH_URL="$DOCKER_AUTH_URL" \
           REGISTRY_AUTH_URL="$REGISTRY_AUTH_URL" RESULT_URL="$RESULT_URL" CONTROL_URL="$CONTROL_URL" \
           SOURCE_SHA256="$SOURCE_SHA256" SOURCE_COMMIT="$SOURCE_COMMIT" BENCHMARK_MODE="$BENCHMARK_MODE" \
-          BENCHMARK_HARNESS="$BENCHMARK_HARNESS" CARRY_COMPACTION_POLICY="$CARRY_COMPACTION_POLICY" \
+          BENCHMARK_HARNESS="$BENCHMARK_HARNESS" REPLICATION_ATTEMPT="$REPLICATION_ATTEMPT" \
+          REPLICATION_ATTEMPTS="$REPLICATION_ATTEMPTS" CARRY_COMPACTION_POLICY="$CARRY_COMPACTION_POLICY" \
           CARRY_KEEP_LEASE_TURNS="$CARRY_KEEP_LEASE_TURNS" \
           CARRY_COMPACTION_PAYOFF_REQUESTS="$CARRY_COMPACTION_PAYOFF_REQUESTS" \
           BOOTSTRAP_WAIT_SECONDS="$BOOTSTRAP_WAIT_SECONDS" RUN_ID="$RUN_ID" MODEL="$MODEL" \
@@ -348,7 +366,7 @@ jobs:
               'RESULT_URL_B64': encoded['RESULT_URL'], 'CONTROL_URL_B64': encoded['CONTROL_URL'],
               **{key: os.environ[key] for key in (
                   'SOURCE_SHA256', 'SOURCE_COMMIT', 'BENCHMARK_MODE', 'BENCHMARK_HARNESS',
-                  'CARRY_COMPACTION_POLICY', 'CARRY_KEEP_LEASE_TURNS',
+                  'REPLICATION_ATTEMPT', 'REPLICATION_ATTEMPTS', 'CARRY_COMPACTION_POLICY', 'CARRY_KEEP_LEASE_TURNS',
                   'CARRY_COMPACTION_PAYOFF_REQUESTS', 'BOOTSTRAP_WAIT_SECONDS', 'RUN_ID',
                   'MODEL', 'REASONING', 'TASK_IMAGE_REPOSITORY', 'TASK_IMAGE_CATALOG')},
           }
@@ -390,15 +408,16 @@ jobs:
           echo "WORKER_INSTANCE_ID=$WORKER_INSTANCE_ID" >> "$GITHUB_ENV"
 
       - name: Wait for protected benchmark result
-        if: inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50'
+        if: inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50' || inputs.mode == 'replicated-50'
         shell: bash
         env:
           RESULT_GET_URL: ${{ steps.stage.outputs.result_get_url }}
           PREFIX: ${{ steps.stage.outputs.prefix }}
+          RUN_ID: ${{ steps.stage.outputs.run_id }}
         run: |
           set -euo pipefail
           mkdir -p benchmark-artifact
-          if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == official-50 ]]; then
+          if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == replicated-50 ]]; then
             # Allow twenty minutes for EC2 launch/boot around the worker's
             # five-and-a-quarter-hour wall clock; preserve twenty-five minutes
             # of the six-hour job for result validation and exact cleanup.
@@ -420,7 +439,7 @@ jobs:
             export AWS_SESSION_TOKEN=$BASE_AWS_SESSION_TOKEN
             ASSUMED=$(aws sts assume-role --role-arn "$ARTIFACT_SESSION_ROLE_ARN" \
               --role-session-name "carry-rotate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-              --tags "Key=RunId,Value=gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              --tags "Key=RunId,Value=$RUN_ID" \
               --query Credentials --output json) || return
             eval "$(python3 - "$ASSUMED" <<'PY'
           import json, shlex, sys
@@ -458,7 +477,7 @@ jobs:
             fi
             rm -f benchmark-artifact/results.tar.gz.tmp
             stream_progress
-            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == session-20 ]] && (( SECONDS >= next_rotation )); then
+            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == replicated-50 || "$BENCHMARK_MODE" == session-20 ]] && (( SECONDS >= next_rotation )); then
               if rotate_capabilities; then
                 next_rotation=$((SECONDS + 1500))
               else
@@ -472,7 +491,7 @@ jobs:
           exit 1
 
       - name: Refresh protected AWS dispatch identity after benchmark
-        if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50')
+        if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50' || inputs.mode == 'replicated-50')
         uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8
         with:
           role-to-assume: ${{ env.DISPATCH_ROLE_ARN }}
@@ -488,7 +507,7 @@ jobs:
         run: scripts/wait_for_ec2_termination.sh "$WORKER_INSTANCE_ID"
 
       - name: Validate fixed-denominator results
-        if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50')
+        if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50' || inputs.mode == 'replicated-50')
         shell: bash
         run: |
           set -euo pipefail
@@ -501,16 +520,25 @@ jobs:
           python3 - <<'PY'
           import json, os
           records=json.load(open('benchmark-artifact/records.json', encoding='utf-8'))
-          pairs={(r.get('instance_id'),r.get('harness')) for r in records}
-          frozen=json.load(open('benchmarks/swe-bench-verified-50.json', encoding='utf-8'))['instance_ids']
           mode=os.environ['BENCHMARK_MODE']
-          selected=(frozen if mode=='official-50' else frozen[:20] if mode=='session-20' else
+          attempt=int(os.environ['REPLICATION_ATTEMPT'])
+          attempts=int(os.environ['REPLICATION_ATTEMPTS'])
+          frozen=json.load(open('benchmarks/swe-bench-verified-50.json', encoding='utf-8'))['instance_ids']
+          selected=(frozen if mode in {'official-50','replicated-50'} else frozen[:20] if mode=='session-20' else
                     json.load(open('benchmarks/swe-bench-verified-smoke-5.json', encoding='utf-8'))['instance_ids'])
           harnesses=('carry','codex','pi') if os.environ['BENCHMARK_HARNESS']=='all' else (os.environ['BENCHMARK_HARNESS'],)
-          expected={(instance_id,harness) for instance_id in selected for harness in harnesses}
-          assert len(records)==len(expected) and pairs==expected, 'artifact does not contain exact fixed denominator'
+          expected={(instance_id,harness,attempt) for instance_id in selected for harness in harnesses}
+          slots={(r.get('instance_id'),r.get('harness'),r.get('attempt', 1)) for r in records}
+          assert len(records)==len(expected) and slots==expected, 'artifact does not contain exact fixed denominator and attempt'
           report=json.load(open('benchmark-artifact/report.json', encoding='utf-8'))
           assert report['denominator']==len(expected), 'canonical report denominator does not match records'
+          assert report['attempt_numbers']==[attempt], 'canonical report does not identify the worker attempt'
+          if mode == 'replicated-50':
+              assert attempts == 3 and report['provenance']['replication'] == {
+                  'attempt': attempt, 'attempts_per_task_harness': 3, 'independent_fresh_workspaces': True,
+              }, 'replicated worker has incomplete provenance'
+          else:
+              assert attempts == 1 and attempt == 1, 'non-replicated worker has unexpected replication identity'
           assert report['provenance']['phase']=='complete', 'benchmark did not complete official grading'
           blocked={'not-run', 'evaluator-failed'}
           assert not any(r.get('status') in blocked for r in records), 'benchmark has unexecuted or ungraded slots'
@@ -557,7 +585,7 @@ jobs:
           fi
 
       - name: Publish benchmark performance summary
-        if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50')
+        if: always() && (inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50' || inputs.mode == 'replicated-50')
         shell: bash
         run: |
           if [[ -f benchmark-artifact/report.md ]]; then
@@ -567,10 +595,10 @@ jobs:
           fi
 
       - name: Upload results and diagnostics
-        if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50')
+        if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'smoke-5' || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || inputs.mode == 'official-50' || inputs.mode == 'replicated-50')
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
-          name: swebench-${{ inputs.mode }}-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: swebench-${{ inputs.mode }}-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}-attempt-${{ matrix.replication_attempt }}
           path: benchmark-artifact
           if-no-files-found: warn
           retention-days: 14
@@ -580,9 +608,10 @@ jobs:
         shell: bash
         env:
           PREFIX: ${{ steps.stage.outputs.prefix }}
+          RUN_ID: ${{ steps.stage.outputs.run_id }}
         run: |
           set -euo pipefail
-          RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          RUN_ID=${RUN_ID:-"gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"}
           worker_ids=()
           if [[ "${WORKER_INSTANCE_ID:-}" =~ ^i-[0-9a-f]+$ ]]; then
             worker_ids+=("$WORKER_INSTANCE_ID")
@@ -612,3 +641,44 @@ jobs:
               aws s3 rm "s3://$ARTIFACT_BUCKET/$PREFIX/$object" --only-show-errors || true
             done
           fi
+
+  merge-replicated-study:
+    name: merge replicated-50 ${{ inputs.harness }} study
+    if: inputs.mode == 'replicated-50' && needs.bootstrap-worker.result == 'success'
+    needs: bootstrap-worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.carry_ref }}
+          fetch-depth: 1
+
+      - name: Download all three validated attempt artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: swebench-replicated-50-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}-attempt-*
+          path: replication-attempts
+
+      - name: Merge independent attempts into an artifact-gated study
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/merge_swebench_replications.py \
+            --artifacts replication-attempts \
+            --manifest benchmarks/swe-bench-verified-50.json \
+            --harness '${{ inputs.harness }}' \
+            --out replication-study
+          test -s replication-study/report.json
+          test -s replication-study/records.json
+          cat replication-study/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload combined replication study
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: swebench-replicated-50-study-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: replication-study
+          if-no-files-found: error
+          retention-days: 14

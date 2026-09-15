@@ -151,7 +151,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             self.assertIn("retained-session modes require exactly one BENCHMARK_HARNESS=carry, codex, or pi", (carry_root / "results" / "worker.log").read_text())
             self.assertFalse((root / "secret").exists())
 
-    def test_official_worker_launches_runner_with_bounded_agent_and_evaluator_concurrency(self):
+    def test_replicated_worker_forwards_one_declared_attempt_with_official_limits(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             payload = root / "payload"
@@ -194,7 +194,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 "fi\n"
                 "case \"$*\" in\n"
                 "  *swebench_smoke.py*)\n"
-                "    printf 'agent=%s\\nevaluator=%s\\nmode=%s\\npolicy=%s\\nlease=%s\\nworker=%s\\nagent_phase=%s\\n' \"$AGENT_CONCURRENCY\" \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" \"${CARRY_COMPACTION_POLICY-unset}\" \"${CARRY_KEEP_LEASE_TURNS-unset}\" \"$OFFICIAL_WORKER_SECONDS\" \"$OFFICIAL_AGENT_PHASE_SECONDS\" > \"$FAKE_RUNNER_ENV\";;\n"
+                "    printf 'agent=%s\\nevaluator=%s\\nmode=%s\\nreplication_attempt=%s\\nreplication_attempts=%s\\npolicy=%s\\nlease=%s\\nworker=%s\\nagent_phase=%s\\n' \"$AGENT_CONCURRENCY\" \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" \"$REPLICATION_ATTEMPT\" \"$REPLICATION_ATTEMPTS\" \"${CARRY_COMPACTION_POLICY-unset}\" \"${CARRY_KEEP_LEASE_TURNS-unset}\" \"$OFFICIAL_WORKER_SECONDS\" \"$OFFICIAL_AGENT_PHASE_SECONDS\" > \"$FAKE_RUNNER_ENV\";;\n"
                 "esac\n"
                 "exit 0\n"
             )
@@ -212,8 +212,10 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 RESULT_URL_B64="",
                 SOURCE_SHA256=hashlib.sha256(archive.read_bytes()).hexdigest(),
                 SOURCE_COMMIT="a" * 40,
-                BENCHMARK_MODE="official-50",
+                BENCHMARK_MODE="replicated-50",
                 BENCHMARK_HARNESS="carry",
+                REPLICATION_ATTEMPT="2",
+                REPLICATION_ATTEMPTS="3",
                 BOOTSTRAP_WAIT_SECONDS="1",
                 RUN_ID="gh-test-2",
                 CARRY_ROOT=str(carry_root),
@@ -231,7 +233,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual(
                 runner_env.read_text(),
-                "agent=5\nevaluator=5\nmode=official-50\npolicy=disabled\nlease=8\nworker=18900\n"
+                "agent=5\nevaluator=5\nmode=replicated-50\nreplication_attempt=2\nreplication_attempts=3\npolicy=disabled\nlease=8\nworker=18900\n"
                 "agent_phase=4500\n",
             )
 
