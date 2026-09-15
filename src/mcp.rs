@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::OpenOptions,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -61,8 +61,14 @@ enum McpCommand {
     /// Invoke a tool with a JSON object containing its arguments.
     Call {
         tool: String,
-        #[arg(default_value = "{}")]
-        arguments: String,
+        /// JSON object containing the tool arguments.
+        arguments: Option<String>,
+        /// Read the tool arguments as JSON from stdin.
+        #[arg(long, conflicts_with = "arguments")]
+        stdin: bool,
+        /// Print only the value matching this RFC 6901 JSON Pointer.
+        #[arg(long)]
+        json_pointer: Option<String>,
     },
 }
 
@@ -84,15 +90,15 @@ pub(crate) async fn run(cli: McpCli, carry_home: &Path) -> Result<()> {
         McpCommand::Add { name, url, command } => add(carry_home, name, url, command),
         McpCommand::Auth { server } => authorize(carry_home, &server).await,
         McpCommand::List => list(carry_home).await,
-        McpCommand::Describe { tool } => inspect(carry_home, &tool, None).await,
-        McpCommand::Call { tool, arguments } => {
-            let arguments: Value = serde_json::from_str(&arguments)
-                .with_context(|| "MCP tool arguments must be valid JSON")?;
-            let arguments = arguments
-                .as_object()
-                .cloned()
-                .context("MCP tool arguments must be a JSON object")?;
-            inspect(carry_home, &tool, Some(arguments)).await
+        McpCommand::Describe { tool } => inspect(carry_home, &tool, None, None).await,
+        McpCommand::Call {
+            tool,
+            arguments,
+            stdin,
+            json_pointer,
+        } => {
+            let arguments = parse_arguments(arguments, stdin, std::io::stdin().lock())?;
+            inspect(carry_home, &tool, Some(arguments), json_pointer.as_deref()).await
         }
     }
 }
@@ -131,18 +137,18 @@ async fn list(carry_home: &Path) -> Result<()> {
     for (server_name, server) in &config.servers {
         let tools = server_tools(carry_home, server_name, server).await?;
         for tool in tools {
-            output.push(json!({
-                "name": format!("{server_name}/{}", tool.name),
-                "server": server_name,
-                "tool": tool.name,
-                "description": tool.description,
-            }));
+            output.push(format!("{server_name}/{}", tool.name));
         }
     }
     print_json(&output)
 }
 
-async fn inspect(carry_home: &Path, reference: &str, arguments: Option<JsonObject>) -> Result<()> {
+async fn inspect(
+    carry_home: &Path,
+    reference: &str,
+    arguments: Option<JsonObject>,
+    json_pointer: Option<&str>,
+) -> Result<()> {
     let config = load(carry_home)?;
     if config.servers.is_empty() {
         bail!("no MCP servers configured; add one with `carry mcp add`");
@@ -185,7 +191,39 @@ async fn inspect(carry_home: &Path, reference: &str, arguments: Option<JsonObjec
             "tool": tool,
         })
     };
-    print_json(&result)
+    print_json(&select_output(result, json_pointer)?)
+}
+
+fn parse_arguments(
+    arguments: Option<String>,
+    stdin: bool,
+    mut reader: impl Read,
+) -> Result<JsonObject> {
+    let input = if stdin {
+        let mut input = String::new();
+        reader
+            .read_to_string(&mut input)
+            .context("failed to read MCP tool arguments from stdin")?;
+        input
+    } else {
+        arguments.unwrap_or_else(|| "{}".into())
+    };
+    let arguments: Value =
+        serde_json::from_str(&input).context("MCP tool arguments must be valid JSON")?;
+    arguments
+        .as_object()
+        .cloned()
+        .context("MCP tool arguments must be a JSON object")
+}
+
+fn select_output(output: Value, json_pointer: Option<&str>) -> Result<Value> {
+    match json_pointer {
+        Some(pointer) => output
+            .pointer(pointer)
+            .cloned()
+            .with_context(|| format!("JSON pointer did not match MCP output: {pointer}")),
+        None => Ok(output),
+    }
 }
 
 fn split_reference(reference: &str) -> (Option<&str>, &str) {
@@ -577,6 +615,27 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn reads_call_arguments_from_stdin() {
+        let arguments = parse_arguments(None, true, br#"{"query":"roadmap"}"#.as_slice()).unwrap();
+        assert_eq!(arguments["query"], "roadmap");
+    }
+
+    #[test]
+    fn selects_call_output_with_json_pointer() {
+        let output = json!({"content": [{"text": "done"}]});
+        assert_eq!(
+            select_output(output, Some("/content/0/text")).unwrap(),
+            json!("done")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_json_pointer() {
+        let error = select_output(json!({"content": []}), Some("/content/0/text")).unwrap_err();
+        assert!(error.to_string().contains("JSON pointer did not match"));
+    }
 
     #[test]
     fn stores_http_and_stdio_servers() {
