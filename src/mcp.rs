@@ -52,6 +52,8 @@ enum McpCommand {
         #[arg(last = true, required_unless_present = "url")]
         command: Vec<String>,
     },
+    /// Remove a configured MCP server and its saved credentials.
+    Remove { server: String },
     /// Authenticate with an HTTP MCP server using OAuth.
     Auth { server: String },
     /// List tools exposed by configured servers.
@@ -95,6 +97,7 @@ enum Server {
 pub(crate) async fn run(cli: McpCli, carry_home: &Path) -> Result<()> {
     match cli.command {
         McpCommand::Add { name, url, command } => add(carry_home, name, url, command),
+        McpCommand::Remove { server } => remove(carry_home, &server),
         McpCommand::Auth { server } => authorize(carry_home, &server).await,
         McpCommand::List { server } => list(carry_home, server.as_deref()).await,
         McpCommand::Describe { tool } => inspect(carry_home, &tool, None, None, false).await,
@@ -146,6 +149,17 @@ fn add(carry_home: &Path, name: String, url: Option<String>, command: Vec<String
     Ok(())
 }
 
+fn remove(carry_home: &Path, name: &str) -> Result<()> {
+    let mut config = load(carry_home)?;
+    if config.servers.remove(name).is_none() {
+        bail!("MCP server not found: {name}");
+    }
+    save(carry_home, &config)?;
+    clear_credentials(carry_home, name)?;
+    println!("removed MCP server {name}");
+    Ok(())
+}
+
 async fn list(carry_home: &Path, wanted_server: Option<&str>) -> Result<()> {
     let config = load(carry_home)?;
     if let Some(name) = wanted_server
@@ -158,9 +172,16 @@ async fn list(carry_home: &Path, wanted_server: Option<&str>) -> Result<()> {
         if wanted_server.is_some_and(|wanted| wanted != server_name) {
             continue;
         }
-        let tools = server_tools(carry_home, server_name, server).await?;
-        for tool in tools {
-            output.push(format!("{server_name}/{}", tool.name));
+        match server_tools(carry_home, server_name, server).await {
+            Ok(tools) => {
+                for tool in tools {
+                    output.push(format!("{server_name}/{}", tool.name));
+                }
+            }
+            Err(error) if wanted_server.is_none() => {
+                eprintln!("warning: failed to list MCP server {server_name}: {error:#}");
+            }
+            Err(error) => return Err(error),
         }
     }
     print_json(&output)
@@ -178,37 +199,50 @@ async fn inspect(
         bail!("no MCP servers configured; add one with `carry mcp add`");
     }
     let (wanted_server, wanted_tool) = split_reference(reference);
-    let mut found = Vec::new();
 
-    for (server_name, server) in &config.servers {
-        if wanted_server.is_some_and(|wanted| wanted != server_name) {
-            continue;
+    let (server_name, server, tool) = if let Some(server_name) = wanted_server {
+        let server = config
+            .servers
+            .get(server_name)
+            .with_context(|| format!("MCP server not found: {server_name}"))?;
+        // Calls are validated by the server itself. Avoid listing tools first, which
+        // otherwise opens a second MCP connection for every qualified call.
+        if let Some(arguments) = arguments {
+            let result = call_tool(carry_home, server_name, server, wanted_tool, arguments).await?;
+            let selected = select_output(result, json_pointer)?;
+            return print_output(&selected, json_pointer.is_some(), json);
         }
-        let tools = server_tools(carry_home, server_name, server).await?;
-        if tools.iter().any(|tool| tool.name == wanted_tool) {
-            found.push((server_name, server));
-        }
-    }
-    if found.is_empty() {
-        bail!("MCP tool not found: {reference}");
-    }
-    if found.len() > 1 {
-        let names = found
-            .iter()
-            .map(|(server, _)| format!("{server}/{wanted_tool}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!("MCP tool name is ambiguous; use one of: {names}");
-    }
-    let (server_name, server) = found[0];
-    let result = if let Some(arguments) = arguments {
-        call_tool(carry_home, server_name, server, wanted_tool, arguments).await?
-    } else {
         let tool = server_tools(carry_home, server_name, server)
             .await?
             .into_iter()
             .find(|tool| tool.name == wanted_tool)
-            .expect("tool was found above");
+            .with_context(|| format!("MCP tool not found: {reference}"))?;
+        (server_name, server, tool)
+    } else {
+        let mut found = Vec::new();
+        for (server_name, server) in &config.servers {
+            let tools = server_tools(carry_home, server_name, server).await?;
+            if let Some(tool) = tools.into_iter().find(|tool| tool.name == wanted_tool) {
+                found.push((server_name.as_str(), server, tool));
+            }
+        }
+        if found.is_empty() {
+            bail!("MCP tool not found: {reference}");
+        }
+        if found.len() > 1 {
+            let names = found
+                .iter()
+                .map(|(server, _, _)| format!("{server}/{wanted_tool}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("MCP tool name is ambiguous; use one of: {names}");
+        }
+        found.pop().expect("one tool was found")
+    };
+
+    let result = if let Some(arguments) = arguments {
+        call_tool(carry_home, server_name, server, wanted_tool, arguments).await?
+    } else {
         json!({
             "name": format!("{server_name}/{}", tool.name),
             "server": server_name,
@@ -659,6 +693,58 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn parses_remove_command() {
+        let cli = McpCli::try_parse_from(["carry", "remove", "notion"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            McpCommand::Remove { ref server } if server == "notion"
+        ));
+    }
+
+    #[test]
+    fn removes_server_and_its_credentials() {
+        let home = tempdir().unwrap();
+        add(
+            home.path(),
+            "remote".into(),
+            Some("https://example.test/mcp".into()),
+            vec![],
+        )
+        .unwrap();
+        let credentials = credential_store(home.path(), "remote").path;
+        save_private_json(
+            &credentials,
+            &StoredCredentials::new("client".into(), None, vec![], None),
+        )
+        .unwrap();
+
+        remove(home.path(), "remote").unwrap();
+
+        assert!(!load(home.path()).unwrap().servers.contains_key("remote"));
+        assert!(!credentials.exists());
+    }
+
+    #[tokio::test]
+    async fn global_list_ignores_unavailable_servers() {
+        let home = tempdir().unwrap();
+        save(
+            home.path(),
+            &Config {
+                servers: BTreeMap::from([(
+                    "down".into(),
+                    Server::Stdio {
+                        command: home.path().join("missing-server").display().to_string(),
+                        args: vec![],
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+
+        list(home.path(), None).await.unwrap();
+    }
 
     #[test]
     fn reads_call_arguments_from_stdin() {
