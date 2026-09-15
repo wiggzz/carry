@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.2](https://github.com/wiggzz/carry/compare/v0.8.1...v0.8.2) (2026-09-14)
+
+
+### Bug Fixes
+
+* add copy-only Regex evidence recovery ([#107](https://github.com/wiggzz/carry/issues/107)) ([22a2327](https://github.com/wiggzz/carry/commit/22a232792e24a6e9da08b858acd79d0e147433e5))
+* harden FrontierHarness checkpoint and evidence pipeline ([#101](https://github.com/wiggzz/carry/issues/101)) ([d2a50af](https://github.com/wiggzz/carry/commit/d2a50af09242543c481ba1f2922fc49df3abf0b6))
+
 ## [0.8.1](https://github.com/wiggzz/carry/compare/v0.8.0...v0.8.1) (2026-09-13)
 
 
