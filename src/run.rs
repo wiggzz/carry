@@ -16,8 +16,10 @@ use tokio::{
 };
 
 use crate::{
+    auth,
     context::{CompactionPolicy, ContextState, PricedBreakpoint, RenderedBreakpoint},
     log::RunLogger,
+    mcp,
     openai::{
         ModelProgress, ModelReply, OpenAiClient, PromptCacheCapabilities, Usage,
         prompt_cache_capabilities,
@@ -41,10 +43,22 @@ At each step:
 
 Retention decisions persist until reversed or applied by compaction. Preserve outcomes, not chain-of-thought.
 
+MCP tools are available through the exact Carry executable in `$CARRY_SELF`. Discover tool names with `"$CARRY_SELF" mcp list` or scope discovery with `"$CARRY_SELF" mcp list --server SERVER`, inspect a tool's full description and schema with `"$CARRY_SELF" mcp describe SERVER/TOOL`, and invoke it with `"$CARRY_SELF" mcp call SERVER/TOOL '{"argument":"value"}'`. For complex arguments, pipe a JSON object to `"$CARRY_SELF" mcp call SERVER/TOOL --stdin`. MCP command output is JSON by default; `--json-pointer /path/to/value` selects part of call output and prints a selected string as raw text unless `--json` is passed. If a server requires authorization, ask the user to run `"$CARRY_SELF" mcp auth SERVER`.
+
 Large stdout and stderr results arrive in separate structured sections. Each text payload is unmodified; truncation, encoding, and artifact-path metadata are outside that payload. Read or slice the relevant stdout/stderr artifact when omitted details matter.
 
 Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
 "#;
+
+fn system_prompt(mcp_servers: &[String]) -> String {
+    if mcp_servers.is_empty() {
+        return SYSTEM_PROMPT.to_owned();
+    }
+    format!(
+        "{SYSTEM_PROMPT}\nConfigured MCP servers: {}.\n",
+        mcp_servers.join(", ")
+    )
+}
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -492,9 +506,13 @@ impl Backend {
         }
     }
 
-    fn request_body(&self, history: &[serde_json::Value]) -> Option<serde_json::Value> {
+    fn request_body(
+        &self,
+        system_prompt: &str,
+        history: &[serde_json::Value],
+    ) -> Option<serde_json::Value> {
         match self {
-            Self::OpenAi(client) => Some(client.request_body(SYSTEM_PROMPT, history)),
+            Self::OpenAi(client) => Some(client.request_body(system_prompt, history)),
             Self::Scripted { .. } => None,
         }
     }
@@ -511,6 +529,7 @@ impl Backend {
 
     async fn step_with_progress<F>(
         &mut self,
+        system_prompt: &str,
         history: &[serde_json::Value],
         progress: F,
     ) -> Result<ModelReply>
@@ -520,7 +539,7 @@ impl Backend {
         match self {
             Self::OpenAi(client) => {
                 client
-                    .step_with_progress(SYSTEM_PROMPT, history, progress)
+                    .step_with_progress(system_prompt, history, progress)
                     .await
             }
             Self::Scripted { steps, emitted } => {
@@ -573,6 +592,11 @@ async fn run_loop(
     events: Option<broadcast::Sender<serde_json::Value>>,
 ) -> Result<RunOutcome> {
     let run_started = Instant::now();
+    let mcp_servers = auth::carry_home()
+        .ok()
+        .and_then(|home| mcp::configured_server_names(&home).ok())
+        .unwrap_or_default();
+    let system_prompt = system_prompt(&mcp_servers);
     let prompt_cache_capabilities = backend.prompt_cache_capabilities();
     let implicit_cache_minimum_prefix_tokens =
         backend.implicit_cache_minimum_prefix_tokens(&config.model);
@@ -712,7 +736,7 @@ async fn run_loop(
             context_state.estimated_tokens(),
         );
         protected_until_request.clear();
-        let request = backend.request_body(&history);
+        let request = backend.request_body(&system_prompt, &history);
         let request_started = Instant::now();
         logger.raw_event_silent(
             "model_request",
@@ -727,7 +751,7 @@ async fn run_loop(
         let progress_events = events.clone();
         let mut last_progress = None;
         let reply = match backend
-            .step_with_progress(&history, |progress| {
+            .step_with_progress(&system_prompt, &history, |progress| {
                 if last_progress
                     .as_ref()
                     .is_some_and(|previous: &ModelProgress| {
@@ -1107,6 +1131,13 @@ fn compact_bytes(value: usize) -> String {
     }
 }
 
+fn current_executable() -> Result<PathBuf> {
+    std::env::current_exe()
+        .context("failed to locate the running carry executable")?
+        .canonicalize()
+        .context("failed to canonicalize the running carry executable")
+}
+
 async fn execute_shell(
     cwd: &Path,
     run_dir: &Path,
@@ -1120,6 +1151,7 @@ async fn execute_shell(
         .arg("-lc")
         .arg(command)
         .current_dir(cwd)
+        .env("CARRY_SELF", current_executable()?)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1576,9 +1608,22 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_surfaces_configured_mcp_servers() {
+        let prompt = system_prompt(&["github".into(), "notion".into()]);
+        assert!(prompt.contains("Configured MCP servers: github, notion."));
+        assert!(prompt.contains("mcp list --server SERVER"));
+        assert!(prompt.contains("selected string as raw text"));
+        assert!(prompt.contains("--json"));
+    }
+
+    #[test]
     fn system_prompt_requires_reproduction_without_soliciting_future_fixes() {
         assert!(SYSTEM_PROMPT.contains("minimal failing reproduction"));
         assert!(SYSTEM_PROMPT.contains("affected tests"));
+        assert!(SYSTEM_PROMPT.contains("$CARRY_SELF"));
+        assert!(SYSTEM_PROMPT.contains("mcp describe SERVER/TOOL"));
+        assert!(SYSTEM_PROMPT.contains("--stdin"));
+        assert!(SYSTEM_PROMPT.contains("--json-pointer"));
         assert!(!SYSTEM_PROMPT.contains("later fixes"));
         assert!(!SYSTEM_PROMPT.contains("upstream fix"));
     }

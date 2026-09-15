@@ -1,6 +1,7 @@
 mod auth;
 mod context;
 mod log;
+mod mcp;
 mod openai;
 mod protocol;
 mod run;
@@ -200,6 +201,10 @@ async fn main() -> Result<()> {
                 auth::LoginMethod::Browser
             };
             return auth::login(&auth::carry_home()?, method).await;
+        }
+        Some("mcp") => {
+            argv.remove(1);
+            return mcp::run(mcp::McpCli::parse_from(argv), &auth::carry_home()?).await;
         }
         Some("logout") => {
             argv.remove(1);
