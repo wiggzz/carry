@@ -282,6 +282,7 @@ impl OpenAiClient {
         let mut body = self.request_body(system, history);
         body["stream"] = json!(true);
         let auth = self.auth_for_step().await?;
+        let client_request_id = new_prompt_cache_key();
         let started = Instant::now();
         let mut retries = 0;
         let mut retry_wait = Duration::ZERO;
@@ -303,7 +304,7 @@ impl OpenAiClient {
                     .header("OpenAI-Beta", "responses=experimental")
                     .header("Accept", "text/event-stream")
                     .header("session-id", &self.prompt_cache_key)
-                    .header("x-client-request-id", &self.prompt_cache_key)
+                    .header("x-client-request-id", &client_request_id)
                     .header("originator", "carry")
                     .header("User-Agent", concat!("carry/", env!("CARGO_PKG_VERSION"))),
             };
@@ -1018,8 +1019,15 @@ mod tests {
         assert!(headers.contains("originator: carry"));
         assert!(headers.contains("openai-beta: responses=experimental"));
         assert!(headers.contains("accept: text/event-stream"));
-        assert!(headers.contains("session-id:"));
-        assert!(headers.contains("x-client-request-id:"));
+        let header_value = |name: &str| {
+            headers.lines().find_map(|line| {
+                let (header, value) = line.split_once(':')?;
+                header.eq_ignore_ascii_case(name).then(|| value.trim())
+            })
+        };
+        let session_id = header_value("session-id").expect("session id header");
+        let request_id = header_value("x-client-request-id").expect("client request id header");
+        assert_ne!(session_id, request_id);
         server.join().unwrap();
     }
 
