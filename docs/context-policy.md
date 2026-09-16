@@ -52,28 +52,32 @@ materializes the memory as an assistant message with the same ID.
 ## Economic compaction
 
 Between rewrites, retained history grows by exact appends so the model provider
-can reuse a stable prompt-cache prefix. Before a model request, the planner
-prices retaining the cached history against paying for a rewrite. The payoff period is configured with `--compaction-payoff-requests N` (or
-`CARRY_COMPACTION_PAYOFF_REQUESTS=N`). `N` must be a positive integer and defaults
-to `5`; benchmark wrappers record the explicit configured value in provenance.
+can reuse a stable prompt-cache prefix. Without rollout sampling, the planner
+uses `--compaction-payoff-requests N` (or
+`CARRY_COMPACTION_PAYOFF_REQUESTS=N`) as its deterministic payoff period; `N`
+must be positive and defaults to `5`.
 
 `--compaction-rollout-samples N` (or
-`CARRY_COMPACTION_ROLLOUT_SAMPLES=N`) is an opt-in deterministic V0 guard with
-`0` disabling it and `1`–`64` samples allowed. For an otherwise economic
-candidate, Carry compares “compact now” with “keep” across `N` flat scenarios
-for the configured payoff horizon: it preserves exact known item sizes, appends
-one virtual compactible item sized to the current post-compaction mean, chooses
-a uniform count from 0 through 4, and uniformly drops that many non-human IDs
-from the post-compaction payload. The same seeded samples are applied to both
-branches. A candidate must be non-negative on the direct next request and is
-deferred when its simulated expected savings miss the ordinary payback
-threshold. This is a structural sensitivity test, not a semantic prediction of model behavior;
-its inputs and branch costs are recorded in the compaction trace event.
+`CARRY_COMPACTION_ROLLOUT_SAMPLES=N`) is an opt-in deterministic V0 selection
+policy with `0` disabling it and `1`–`64` samples allowed. In rollout mode,
+`compaction-payoff-requests` is only the bounded simulation horizon, not a
+separate economic admission check. Carry compares every structurally valid
+“compact now” candidate with “keep” across `N` flat scenarios: it preserves
+exact known item sizes, appends one virtual compactible item sized to the
+current post-compaction mean, chooses a uniform count from 0 through 4, and
+uniformly drops that many non-human IDs from the post-compaction payload. The
+same seeded samples are applied to both branches. Carry selects the candidate
+with the largest expected horizon saving when that saving exceeds 10% of the
+simulated keep-path cost. Direct next-request savings are telemetry, not a
+gate: the rollout can approve an initial loss when its expected horizon value
+repays it. This is a structural sensitivity test, not a semantic prediction of
+model behavior; its inputs and branch costs are recorded in the compaction
+trace event.
 
-It also requires projected savings to exceed 10% of the retained-path payoff
-cost. This deliberately avoids rewrites that only barely repay their cache
-invalidation. A compaction still begins a new cache generation; the model-visible
-history is otherwise prefix-continuous.
+The deterministic fallback likewise requires projected savings to exceed 10% of
+the retained-path payoff cost. This deliberately avoids rewrites that only
+barely repay their cache invalidation. A compaction still begins a new cache
+generation; the model-visible history is otherwise prefix-continuous.
 
 A compaction can remove explicitly removable items and selected neutral volatile
 items, retain protected evidence, preserve chronology, and establish a new
