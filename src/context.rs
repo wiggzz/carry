@@ -646,6 +646,82 @@ impl ContextState {
             })
     }
 
+    pub(crate) fn flat_rollout_estimate(
+        &self,
+        plan: &CompactionPlan,
+        _protected: &[u64],
+        policy: CompactionPolicy,
+        config: FlatRolloutConfig,
+    ) -> FlatRolloutEstimate {
+        debug_assert!(config.samples > 0);
+        debug_assert!(config.horizon > 0);
+        let mut compacted = self.clone();
+        compacted.compact(plan.clone());
+        let retained_ids = compacted
+            .items
+            .iter()
+            .filter(|item| item.kind != ContextItemKind::User)
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let mean_virtual_item_tokens = compacted
+            .items
+            .iter()
+            .filter(|item| item.kind != ContextItemKind::User)
+            .map(|item| item.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN))
+            .sum::<usize>()
+            .checked_div(retained_ids.len())
+            .unwrap_or(1)
+            .max(1);
+        let initial_compact_cost = compact_request_cost(plan);
+        let initial_keep_cost = keep_request_cost(self.estimated_tokens(), &policy);
+        let mut total_compact_cost = 0.0;
+        let mut total_keep_cost = 0.0;
+        let mut max_sampled_drops = 0usize;
+
+        for sample in 0..config.samples {
+            let mut compact_branch = compacted.clone();
+            let mut keep_branch = self.clone();
+            let mut compact_cost = initial_compact_cost;
+            let mut keep_cost = initial_keep_cost;
+            let mut rng = FlatRolloutRng::new(config.seed ^ u64::from(sample));
+            for _ in 1..config.horizon {
+                let count = rng.range_inclusive(retained_ids.len().min(4));
+                max_sampled_drops = max_sampled_drops.max(count);
+                let dropped_ids = sample_ids_without_replacement(&retained_ids, count, &mut rng);
+                compact_cost += simulate_rollout_turn(
+                    &mut compact_branch,
+                    &dropped_ids,
+                    mean_virtual_item_tokens,
+                    plan.neutral_budget_tokens,
+                    &policy,
+                );
+                keep_cost += simulate_rollout_turn(
+                    &mut keep_branch,
+                    &dropped_ids,
+                    mean_virtual_item_tokens,
+                    plan.neutral_budget_tokens,
+                    &policy,
+                );
+            }
+            total_compact_cost += compact_cost;
+            total_keep_cost += keep_cost;
+        }
+
+        let samples = f64::from(config.samples);
+        let expected_compact_cost = total_compact_cost / samples;
+        let expected_keep_cost = total_keep_cost / samples;
+        FlatRolloutEstimate {
+            samples: config.samples,
+            horizon: config.horizon,
+            seed: config.seed,
+            mean_virtual_item_tokens,
+            max_sampled_drops,
+            expected_compact_cost,
+            expected_keep_cost,
+            expected_savings_input_units: expected_keep_cost - expected_compact_cost,
+        }
+    }
+
     fn compaction_candidate(
         &self,
         dropped: Vec<u64>,
@@ -904,13 +980,144 @@ fn payoff_savings_input_units(
     compact_first_cost: f64,
     payoff_requests: u64,
 ) -> f64 {
-    let keep_first = implicit_cached_tokens as f64 * CACHE_READ_RATE
-        + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE;
+    let keep_first = keep_request_cost_with_implicit(implicit_cached_tokens, current_tokens);
     let compact_first = compact_first_cost;
     let later_requests = payoff_requests.saturating_sub(1) as f64;
     keep_first + later_requests * current_tokens as f64 * CACHE_READ_RATE
         - compact_first
         - later_requests * retained_tokens as f64 * CACHE_READ_RATE
+}
+
+fn keep_request_cost(current_tokens: usize, policy: &CompactionPolicy) -> f64 {
+    keep_request_cost_with_implicit(
+        policy.implicit_cached_tokens.min(current_tokens),
+        current_tokens,
+    )
+}
+
+fn keep_request_cost_with_implicit(implicit_cached_tokens: usize, current_tokens: usize) -> f64 {
+    implicit_cached_tokens as f64 * CACHE_READ_RATE
+        + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE
+}
+
+fn compact_request_cost(plan: &CompactionPlan) -> f64 {
+    plan.retained_tokens.saturating_sub(plan.rewrite_tokens) as f64 * CACHE_READ_RATE
+        + plan.rewrite_tokens as f64 * CACHE_WRITE_RATE
+}
+
+fn simulate_rollout_turn(
+    state: &mut ContextState,
+    dropped_ids: &[u64],
+    virtual_item_tokens: usize,
+    neutral_budget_tokens: usize,
+    base_policy: &CompactionPolicy,
+) -> f64 {
+    let cached_before_virtual_item = state.estimated_tokens();
+    let virtual_id = state.add_simulated_tool_item(virtual_item_tokens);
+    for id in dropped_ids {
+        if let Some(item) = state.items.iter_mut().find(|item| item.id == *id) {
+            item.signal = RetentionSignal::Drop;
+        }
+    }
+    let policy = CompactionPolicy {
+        implicit_cached_tokens: cached_before_virtual_item,
+        breakpoints: state
+            .rendered_breakpoints()
+            .into_iter()
+            .map(|breakpoint| PricedBreakpoint {
+                generation: breakpoint.generation,
+                cached_tokens: breakpoint.prefix_tokens,
+            })
+            .collect(),
+        payoff_requests: base_policy.payoff_requests,
+    };
+    let Some(plan) = state.plan_compaction_with_neutral_budget(
+        &[virtual_id],
+        policy.clone(),
+        neutral_budget_tokens,
+    ) else {
+        return keep_request_cost(state.estimated_tokens(), &policy);
+    };
+    let cost = compact_request_cost(&plan);
+    state.compact(plan);
+    cost
+}
+
+impl ContextState {
+    fn add_simulated_tool_item(&mut self, estimated_tokens: usize) -> u64 {
+        let id = self.allocate_id();
+        let bytes = estimated_tokens.saturating_mul(ESTIMATED_BYTES_PER_TOKEN);
+        self.items.push(ContextItem::new(
+            id,
+            ContextItemKind::Tool,
+            Retention::Eligible,
+            vec![json!({
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "x".repeat(bytes)}]
+            })],
+        ));
+        id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FlatRolloutConfig {
+    pub samples: u32,
+    pub horizon: u64,
+    pub seed: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct FlatRolloutEstimate {
+    pub samples: u32,
+    pub horizon: u64,
+    pub seed: u64,
+    pub mean_virtual_item_tokens: usize,
+    pub max_sampled_drops: usize,
+    pub expected_compact_cost: f64,
+    pub expected_keep_cost: f64,
+    pub expected_savings_input_units: f64,
+}
+
+#[derive(Clone, Copy)]
+struct FlatRolloutRng(u64);
+
+impl FlatRolloutRng {
+    fn new(seed: u64) -> Self {
+        Self(seed ^ 0x9e37_79b9_7f4a_7c15)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.0
+    }
+
+    fn range_inclusive(&mut self, upper: usize) -> usize {
+        if upper == 0 {
+            0
+        } else {
+            (self.next_u64() % (upper as u64 + 1)) as usize
+        }
+    }
+
+    fn range_exclusive(&mut self, upper: usize) -> usize {
+        debug_assert!(upper > 0);
+        (self.next_u64() % upper as u64) as usize
+    }
+}
+
+fn sample_ids_without_replacement(
+    candidates: &[u64],
+    count: usize,
+    rng: &mut FlatRolloutRng,
+) -> Vec<u64> {
+    let mut ids = candidates.to_vec();
+    for index in 0..count {
+        let selected = index + rng.range_exclusive(ids.len() - index);
+        ids.swap(index, selected);
+    }
+    ids.truncate(count);
+    ids
 }
 
 fn unique_ids(ids: &[u64]) -> Vec<u64> {
@@ -1172,6 +1379,61 @@ mod tests {
             .unwrap();
         assert!(second_plan.dropped.contains(&status));
         assert!(second_plan.dropped.contains(&next));
+    }
+
+    #[test]
+    fn flat_rollout_is_seeded_nonmutating_and_caps_random_drops_at_four() {
+        let mut state = ContextState::new("initial".into());
+        let oldest = add_tool_with_output(&mut state, &"old ".repeat(4_000));
+        let middle = add_tool_with_output(&mut state, &"middle ".repeat(1_000));
+        let newest = add_tool_with_output(&mut state, &"new ".repeat(1_000));
+        let budget = state.item_estimated_tokens(middle) + state.item_estimated_tokens(newest);
+        let policy = CompactionPolicy {
+            implicit_cached_tokens: 0,
+            breakpoints: Vec::new(),
+            payoff_requests: 5,
+        };
+        let plan = state
+            .plan_compaction_with_neutral_budget(&[], policy.clone(), budget)
+            .expect("initial plan should remove the old tool result");
+        assert!(plan.dropped.contains(&oldest));
+        let before = state.encode().unwrap();
+
+        let config = FlatRolloutConfig {
+            samples: 16,
+            horizon: 5,
+            seed: 7,
+        };
+        let first = state.flat_rollout_estimate(&plan, &[], policy.clone(), config);
+        let second = state.flat_rollout_estimate(&plan, &[], policy, config);
+
+        assert_eq!(first, second);
+        assert_eq!(first.samples, 16);
+        assert!(first.max_sampled_drops <= 4);
+        assert!(first.mean_virtual_item_tokens > 0);
+        assert_eq!(state.encode().unwrap(), before);
+    }
+
+    #[test]
+    fn rollout_virtual_item_is_priced_as_a_cache_write() {
+        let mut state = ContextState::new("initial".into());
+        add_tool_with_output(&mut state, &"x".repeat(4_000));
+        let previous_tokens = state.estimated_tokens();
+        let cost = simulate_rollout_turn(
+            &mut state,
+            &[],
+            1_000,
+            usize::MAX,
+            &CompactionPolicy {
+                implicit_cached_tokens: 0,
+                breakpoints: Vec::new(),
+                payoff_requests: 5,
+            },
+        );
+        let current_tokens = state.estimated_tokens();
+        let expected = previous_tokens as f64 * CACHE_READ_RATE
+            + current_tokens.saturating_sub(previous_tokens) as f64 * CACHE_WRITE_RATE;
+        assert_eq!(cost, expected);
     }
 
     #[test]

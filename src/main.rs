@@ -131,6 +131,15 @@ struct Cli {
     )]
     compaction_payoff_requests: u64,
 
+    /// Deterministic flat-drop rollout samples used to gate economic compaction; zero disables it.
+    #[arg(
+        long,
+        env = "CARRY_COMPACTION_ROLLOUT_SAMPLES",
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u32).range(0..=64)
+    )]
+    compaction_rollout_samples: u32,
+
     /// JSONL Step objects to use instead of calling a model.
     #[arg(long, hide = true)]
     scripted_steps: Option<PathBuf>,
@@ -371,6 +380,7 @@ async fn run_command(args: Cli) -> Result<()> {
         compaction_mode: args.compaction_policy.into(),
         keep_lease_turns: args.keep_lease_turns,
         compaction_payoff_requests: args.compaction_payoff_requests,
+        compaction_rollout_samples: args.compaction_rollout_samples,
         resume_context: resume.map(|resume| resume.context),
         resume_source,
         prompt_cache_key: Some(prompt_cache_key),
@@ -604,6 +614,20 @@ mod tests {
         assert_eq!(configured.compaction_payoff_requests, 5);
         assert!(
             Cli::try_parse_from(["carry", "--compaction-payoff-requests", "0", "continue",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn compaction_rollout_samples_are_opt_in_and_bounded() {
+        let disabled = Cli::try_parse_from(["carry", "continue"]).unwrap();
+        assert_eq!(disabled.compaction_rollout_samples, 0);
+        let enabled =
+            Cli::try_parse_from(["carry", "--compaction-rollout-samples", "16", "continue"])
+                .unwrap();
+        assert_eq!(enabled.compaction_rollout_samples, 16);
+        assert!(
+            Cli::try_parse_from(["carry", "--compaction-rollout-samples", "65", "continue",])
                 .is_err()
         );
     }

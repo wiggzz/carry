@@ -40,8 +40,14 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(config["PI_VERSION"], "0.84.2")
         self.assertEqual(config["CARRY_COMPACTION_POLICY"], "economic")
         self.assertEqual(config["CARRY_COMPACTION_PAYOFF_REQUESTS"], "1")
+        self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "0")
+        rollout = self.worker.validate_config(
+            dict(valid, CARRY_COMPACTION_ROLLOUT_SAMPLES="16")
+        )
+        self.assertEqual(rollout["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "16")
         for key, value in (("BASE_IMAGE", "node:22"), ("CODEX_VERSION", "latest"),
-                           ("CARRY_COMPACTION_POLICY", "adaptive")):
+                           ("CARRY_COMPACTION_POLICY", "adaptive"),
+                           ("CARRY_COMPACTION_ROLLOUT_SAMPLES", "65")):
             bad = dict(valid)
             bad[key] = value
             with self.assertRaises(ValueError):

@@ -44,6 +44,10 @@ payoff_requests = os.environ.get("CARRY_COMPACTION_PAYOFF_REQUESTS", "1")
 if (not payoff_requests.isascii() or not payoff_requests.isdecimal()
         or int(payoff_requests) < 1):
     parser.error("CARRY_COMPACTION_PAYOFF_REQUESTS must be a positive ASCII decimal integer")
+rollout_samples = os.environ.get("CARRY_COMPACTION_ROLLOUT_SAMPLES", "0")
+if (not rollout_samples.isascii() or not rollout_samples.isdecimal()
+        or int(rollout_samples) > 64):
+    parser.error("CARRY_COMPACTION_ROLLOUT_SAMPLES must be an ASCII decimal integer from 0 through 64")
 
 output = pathlib.Path(args.output)
 output.mkdir(parents=True, exist_ok=True)
@@ -75,6 +79,7 @@ if args.harness == "carry" and keep_lease_turns:
     command.extend(["--keep-lease-turns", keep_lease_turns])
 if args.harness == "carry":
     command.extend(["--compaction-payoff-requests", payoff_requests])
+    command.extend(["--compaction-rollout-samples", rollout_samples])
 if args.resume_session:
     command.extend(["--resume", str(args.resume_session)])
 if args.codex_session and args.codex_thread:

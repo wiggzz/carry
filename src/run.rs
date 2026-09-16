@@ -16,7 +16,9 @@ use tokio::{
 };
 
 use crate::{
-    context::{CompactionPolicy, ContextState, PricedBreakpoint, RenderedBreakpoint},
+    context::{
+        CompactionPolicy, ContextState, FlatRolloutConfig, PricedBreakpoint, RenderedBreakpoint,
+    },
     log::RunLogger,
     openai::{
         ModelProgress, ModelReply, OpenAiClient, PromptCacheCapabilities, Usage,
@@ -66,6 +68,8 @@ pub struct RunConfig {
     pub keep_lease_turns: Option<u64>,
     /// Number of future requests used to amortize a compaction rewrite; one is next-request economics.
     pub compaction_payoff_requests: u64,
+    /// Zero disables deterministic flat-drop scenario rollouts before compaction.
+    pub compaction_rollout_samples: u32,
     pub resume_context: Option<ContextState>,
     pub resume_source: Option<PathBuf>,
     /// Stable provider cache affinity, retained with the resumable state.
@@ -1011,17 +1015,53 @@ fn maybe_compact(
     let policy = cache.policy_for_history(&state.input_items(), config.compaction_payoff_requests);
     let Some(plan) = state.plan_compaction_with_neutral_budget(
         protected,
-        policy,
+        policy.clone(),
         ELIGIBLE_CONTEXT_BUDGET_TOKENS,
     ) else {
         return Ok(false);
     };
+    let rollout = (config.compaction_rollout_samples > 0).then(|| {
+        state.flat_rollout_estimate(
+            &plan,
+            protected,
+            policy,
+            FlatRolloutConfig {
+                samples: config.compaction_rollout_samples,
+                horizon: config.compaction_payoff_requests,
+                seed: 0,
+            },
+        )
+    });
+    if let Some(estimate) = &rollout
+        && estimate.expected_savings_input_units < plan.minimum_payback_input_units
+    {
+        logger.raw_event(
+            "compaction_rollout_rejected",
+            json!({
+                "trigger": trigger,
+                "candidate": &plan,
+                "rollout": estimate,
+                "reason": "flat_rollout_below_minimum_payback",
+            }),
+            &format!(
+                "  compact deferred · flat rollout expects ~{} input-equivalent tok below ~{} minimum",
+                compact_number(estimate.expected_savings_input_units.max(0.0).round() as u64),
+                compact_number(plan.minimum_payback_input_units.round() as u64),
+            ),
+        )?;
+        return Ok(false);
+    }
     let change = state.compact(plan);
     cache.mark_compaction(&change.invalidated_generations);
     metrics.record_compaction();
     logger.raw_event(
         "context_compacted",
-        json!({"trigger": trigger, "compaction": &change, "retained_context": state.snapshot()}),
+        json!({
+            "trigger": trigger,
+            "compaction": &change,
+            "retained_context": state.snapshot(),
+            "rollout": rollout,
+        }),
         &format!(
             "  compact · -{} items / ~{} tok · {} retained · {} rewritten · reuse {} · invalidate {} generations / {} cached tok · next request saves ~{} input-equivalent tok",
             change.dropped.len(),
@@ -2085,6 +2125,7 @@ mod tests {
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: Some(1),
                 compaction_payoff_requests: 1,
+                compaction_rollout_samples: 0,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2170,6 +2211,7 @@ mod tests {
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_rollout_samples: 0,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2186,6 +2228,77 @@ mod tests {
             patch.contains("+after"),
             "committed changes must remain in final.patch"
         );
+    }
+
+    #[tokio::test]
+    async fn scripted_run_emits_flat_rollout_telemetry_before_a_compaction_decision() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("run");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"shell","command":"true","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+                "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        let mut context = ContextState::new("initial task".into());
+        for call in 0..3 {
+            context
+                .add_tool(
+                    vec![json!({
+                        "type": "function_call", "call_id": format!("call-{call}"),
+                        "name": "shell", "arguments": "{}"
+                    })],
+                    json!({
+                        "type": "function_call_output", "call_id": format!("call-{call}"),
+                        "output": "large output ".repeat(7_000)
+                    }),
+                )
+                .unwrap();
+        }
+
+        run(
+            RunConfig {
+                cwd: workspace,
+                prompt: "Finish the task.".into(),
+                session_dir: session_dir.clone(),
+                model: "scripted".into(),
+                max_steps: Some(2),
+                shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Economic,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 5,
+                compaction_rollout_samples: 4,
+                resume_context: Some(context),
+                resume_source: None,
+                prompt_cache_key: Some("carry-test-cache-key".into()),
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let trace = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap();
+        let decision = trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| {
+                matches!(
+                    event["event"].as_str(),
+                    Some("context_compacted") | Some("compaction_rollout_rejected")
+                )
+            })
+            .expect("large resumed context should make a compaction decision");
+        assert_eq!(decision["data"]["rollout"]["samples"], 4);
+        assert_eq!(decision["data"]["rollout"]["horizon"], 5);
     }
 
     #[tokio::test]
@@ -2213,6 +2326,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_rollout_samples: 0,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2296,6 +2410,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_rollout_samples: 0,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("resumable-cache-affinity".into()),
@@ -2318,6 +2433,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_rollout_samples: 0,
                 resume_context: Some(resume.context),
                 resume_source: Some(first_session),
                 prompt_cache_key,
@@ -2383,6 +2499,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_rollout_samples: 0,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2426,6 +2543,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_rollout_samples: 0,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2484,6 +2602,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_rollout_samples: 0,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2576,6 +2695,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_rollout_samples: 0,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
