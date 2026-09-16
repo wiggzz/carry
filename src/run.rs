@@ -1033,7 +1033,8 @@ fn maybe_compact(
         )
     });
     if let Some(estimate) = &rollout
-        && estimate.expected_savings_input_units < plan.minimum_payback_input_units
+        && (estimate.direct_next_request_savings_input_units < 0.0
+            || estimate.expected_savings_input_units < plan.minimum_payback_input_units)
     {
         logger.raw_event(
             "compaction_rollout_rejected",
