@@ -524,6 +524,26 @@ impl ContextState {
         policy: CompactionPolicy,
         neutral_budget_tokens: usize,
     ) -> Option<CompactionPlan> {
+        self.compaction_candidates_with_neutral_budget(protected, policy, neutral_budget_tokens)
+            .into_iter()
+            .filter(|plan| {
+                meets_payback_threshold(
+                    plan.estimated_savings_input_units,
+                    plan.minimum_payback_input_units,
+                )
+            })
+            .max_by(|left, right| {
+                left.estimated_savings_input_units
+                    .total_cmp(&right.estimated_savings_input_units)
+            })
+    }
+
+    pub(crate) fn compaction_candidates_with_neutral_budget(
+        &self,
+        protected: &[u64],
+        policy: CompactionPolicy,
+        neutral_budget_tokens: usize,
+    ) -> Vec<CompactionPlan> {
         let protected = protected.iter().copied().collect::<HashSet<_>>();
         let newest_id = self.items.last().map_or(0, |item| item.id);
         // Explicit keep/drop signals remain authoritative. Neutral eligible items compete for
@@ -633,17 +653,6 @@ impl ContextState {
         }
 
         candidates
-            .into_iter()
-            .filter(|plan| {
-                meets_payback_threshold(
-                    plan.estimated_savings_input_units,
-                    plan.minimum_payback_input_units,
-                )
-            })
-            .max_by(|left, right| {
-                left.estimated_savings_input_units
-                    .total_cmp(&right.estimated_savings_input_units)
-            })
     }
 
     pub(crate) fn flat_rollout_estimate(
@@ -979,6 +988,13 @@ fn meets_payback_threshold(savings: f64, minimum_payback: f64) -> bool {
     savings > minimum_payback
 }
 
+pub(crate) fn meets_rollout_payback_threshold(estimate: &FlatRolloutEstimate) -> bool {
+    meets_payback_threshold(
+        estimate.expected_savings_input_units,
+        estimate.expected_keep_cost * COMPACTION_MIN_PAYBACK_RATIO,
+    )
+}
+
 fn direct_next_request_savings(
     implicit_cached_tokens: usize,
     current_tokens: usize,
@@ -1045,14 +1061,22 @@ fn simulate_rollout_turn(
             .collect(),
         payoff_requests: base_policy.payoff_requests,
     };
-    let Some(plan) = state.plan_compaction_with_neutral_budget(
-        &[virtual_id],
-        policy.clone(),
-        neutral_budget_tokens,
-    ) else {
-        return keep_request_cost(state.estimated_tokens(), &policy);
+    let keep_cost = keep_request_cost(state.estimated_tokens(), &policy);
+    let Some(plan) = state
+        .compaction_candidates_with_neutral_budget(
+            &[virtual_id],
+            policy.clone(),
+            neutral_budget_tokens,
+        )
+        .into_iter()
+        .min_by(|left, right| compact_request_cost(left).total_cmp(&compact_request_cost(right)))
+    else {
+        return keep_cost;
     };
     let cost = compact_request_cost(&plan);
+    if cost >= keep_cost {
+        return keep_cost;
+    }
     state.compact(plan);
     cost
 }
@@ -1462,6 +1486,23 @@ mod tests {
         assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 1) < 0.0);
         assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 5) > 0.0);
         assert!(direct_next_request_savings(312_141, 313_063, 54_562.5) < 0.0);
+    }
+
+    #[test]
+    fn rollout_payback_can_repay_an_initial_loss() {
+        let estimate = FlatRolloutEstimate {
+            samples: 1,
+            horizon: 5,
+            seed: 0,
+            mean_virtual_item_tokens: 1,
+            max_sampled_drops: 0,
+            expected_compact_cost: 80.0,
+            expected_keep_cost: 100.0,
+            direct_next_request_savings_input_units: -5.0,
+            expected_savings_input_units: 20.0,
+        };
+
+        assert!(meets_rollout_payback_threshold(&estimate));
     }
 
     #[test]

@@ -18,6 +18,7 @@ use tokio::{
 use crate::{
     context::{
         CompactionPolicy, ContextState, FlatRolloutConfig, PricedBreakpoint, RenderedBreakpoint,
+        meets_rollout_payback_threshold,
     },
     log::RunLogger,
     openai::{
@@ -1013,45 +1014,42 @@ fn maybe_compact(
     trigger: &str,
 ) -> Result<bool> {
     let policy = cache.policy_for_history(&state.input_items(), config.compaction_payoff_requests);
-    let Some(plan) = state.plan_compaction_with_neutral_budget(
-        protected,
-        policy.clone(),
-        ELIGIBLE_CONTEXT_BUDGET_TOKENS,
-    ) else {
-        return Ok(false);
-    };
-    let rollout = (config.compaction_rollout_samples > 0).then(|| {
-        state.flat_rollout_estimate(
-            &plan,
+    let (plan, rollout) = if config.compaction_rollout_samples > 0 {
+        let config = FlatRolloutConfig {
+            samples: config.compaction_rollout_samples,
+            horizon: config.compaction_payoff_requests,
+            seed: 0,
+        };
+        let Some((plan, rollout)) = state
+            .compaction_candidates_with_neutral_budget(
+                protected,
+                policy.clone(),
+                ELIGIBLE_CONTEXT_BUDGET_TOKENS,
+            )
+            .into_iter()
+            .map(|plan| {
+                let rollout = state.flat_rollout_estimate(&plan, protected, policy.clone(), config);
+                (plan, rollout)
+            })
+            .filter(|(_, rollout)| meets_rollout_payback_threshold(rollout))
+            .max_by(|(_, left), (_, right)| {
+                left.expected_savings_input_units
+                    .total_cmp(&right.expected_savings_input_units)
+            })
+        else {
+            return Ok(false);
+        };
+        (plan, Some(rollout))
+    } else {
+        let Some(plan) = state.plan_compaction_with_neutral_budget(
             protected,
-            policy,
-            FlatRolloutConfig {
-                samples: config.compaction_rollout_samples,
-                horizon: config.compaction_payoff_requests,
-                seed: 0,
-            },
-        )
-    });
-    if let Some(estimate) = &rollout
-        && (estimate.direct_next_request_savings_input_units < 0.0
-            || estimate.expected_savings_input_units < plan.minimum_payback_input_units)
-    {
-        logger.raw_event(
-            "compaction_rollout_rejected",
-            json!({
-                "trigger": trigger,
-                "candidate": &plan,
-                "rollout": estimate,
-                "reason": "flat_rollout_below_minimum_payback",
-            }),
-            &format!(
-                "  compact deferred · flat rollout expects ~{} input-equivalent tok below ~{} minimum",
-                compact_number(estimate.expected_savings_input_units.max(0.0).round() as u64),
-                compact_number(plan.minimum_payback_input_units.round() as u64),
-            ),
-        )?;
-        return Ok(false);
-    }
+            policy.clone(),
+            ELIGIBLE_CONTEXT_BUDGET_TOKENS,
+        ) else {
+            return Ok(false);
+        };
+        (plan, None)
+    };
     let change = state.compact(plan);
     cache.mark_compaction(&change.invalidated_generations);
     metrics.record_compaction();
