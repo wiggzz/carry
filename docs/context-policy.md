@@ -53,11 +53,23 @@ materializes the memory as an assistant message with the same ID.
 
 Between rewrites, retained history grows by exact appends so the model provider
 can reuse a stable prompt-cache prefix. Before a model request, the planner
-prices retaining the cached history against paying for a rewrite. The economic
-The payoff period is configured with `--compaction-payoff-requests N` (or
+prices retaining the cached history against paying for a rewrite. The payoff period is configured with `--compaction-payoff-requests N` (or
 `CARRY_COMPACTION_PAYOFF_REQUESTS=N`). `N` must be a positive integer and defaults
-to `1`, preserving the original next-request economic policy. Benchmarks record
-this value in provenance; non-default experiments must pass it explicitly.
+to `5`; benchmark wrappers record the explicit configured value in provenance.
+
+`--compaction-rollout-samples N` (or
+`CARRY_COMPACTION_ROLLOUT_SAMPLES=N`) is an opt-in deterministic V0 guard with
+`0` disabling it and `1`–`64` samples allowed. For an otherwise economic
+candidate, Carry compares “compact now” with “keep” across `N` flat scenarios
+for the configured payoff horizon: it preserves exact known item sizes, appends
+one virtual compactible item sized to the current post-compaction mean, chooses
+a uniform count from 0 through 4, and uniformly drops that many non-human IDs
+from the post-compaction payload. The same seeded samples are applied to both
+branches. A candidate remains subject to the ordinary direct-payback check and
+is deferred when its simulated expected savings also miss that threshold. This
+is a structural sensitivity test, not a semantic prediction of model behavior;
+its inputs and branch costs are recorded in the compaction trace event.
+
 It also requires projected savings to exceed 10% of the retained-path payoff
 cost. This deliberately avoids rewrites that only barely repay their cache
 invalidation. A compaction still begins a new cache generation; the model-visible

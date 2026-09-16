@@ -396,6 +396,9 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
     config["CARRY_COMPACTION_PAYOFF_REQUESTS"] = values.get(
         "CARRY_COMPACTION_PAYOFF_REQUESTS", "1"
     )
+    config["CARRY_COMPACTION_ROLLOUT_SAMPLES"] = values.get(
+        "CARRY_COMPACTION_ROLLOUT_SAMPLES", "0"
+    )
     if config["CARRY_COMPACTION_POLICY"] not in {"economic", "disabled"}:
         raise ValueError("CARRY_COMPACTION_POLICY must be economic or disabled")
     if config["CARRY_KEEP_LEASE_TURNS"] and (
@@ -407,6 +410,10 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
             or not config["CARRY_COMPACTION_PAYOFF_REQUESTS"].isdecimal()
             or int(config["CARRY_COMPACTION_PAYOFF_REQUESTS"]) < 1):
         raise ValueError("CARRY_COMPACTION_PAYOFF_REQUESTS must be a positive ASCII decimal integer")
+    if (not config["CARRY_COMPACTION_ROLLOUT_SAMPLES"].isascii()
+            or not config["CARRY_COMPACTION_ROLLOUT_SAMPLES"].isdecimal()
+            or int(config["CARRY_COMPACTION_ROLLOUT_SAMPLES"]) > 64):
+        raise ValueError("CARRY_COMPACTION_ROLLOUT_SAMPLES must be an ASCII decimal integer from 0 through 64")
     if not DIGEST_IMAGE.fullmatch(config["BASE_IMAGE"]):
         raise ValueError("BASE_IMAGE must use an immutable sha256 digest")
     for key in ("CODEX_VERSION", "PI_VERSION"):
@@ -580,6 +587,7 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
         "--env", f"AGENT_TIMEOUT_SECONDS={agent_timeout_seconds}",
         "--env", "CARRY_COMPACTION_POLICY",
         "--env", "CARRY_COMPACTION_PAYOFF_REQUESTS",
+        "--env", "CARRY_COMPACTION_ROLLOUT_SAMPLES",
         "--env", f"AGENT_COMMAND={AGENT_COMMANDS[harness]}",
         "--env", "BENCHMARK_WORKSPACE=/testbed",
         "--env", "HOME=/agent-home", "--env", "XDG_CONFIG_HOME=/agent-home/.config",
@@ -2225,6 +2233,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "carry_compaction_policy": validated["CARRY_COMPACTION_POLICY"],
         "carry_keep_lease_turns": validated["CARRY_KEEP_LEASE_TURNS"],
         "carry_compaction_payoff_requests": validated["CARRY_COMPACTION_PAYOFF_REQUESTS"],
+        "carry_compaction_rollout_samples": validated["CARRY_COMPACTION_ROLLOUT_SAMPLES"],
         "images": {},
         "mode": mode, "harnesses": list(harnesses), "phase": "planned",
         "pricing_usd_per_million": pricing,
