@@ -65,9 +65,9 @@ for the configured payoff horizon: it preserves exact known item sizes, appends
 one virtual compactible item sized to the current post-compaction mean, chooses
 a uniform count from 0 through 4, and uniformly drops that many non-human IDs
 from the post-compaction payload. The same seeded samples are applied to both
-branches. A candidate remains subject to the ordinary direct-payback check and
-is deferred when its simulated expected savings also miss that threshold. This
-is a structural sensitivity test, not a semantic prediction of model behavior;
+branches. A candidate must be non-negative on the direct next request and is
+deferred when its simulated expected savings miss the ordinary payback
+threshold. This is a structural sensitivity test, not a semantic prediction of model behavior;
 its inputs and branch costs are recorded in the compaction trace event.
 
 It also requires projected savings to exceed 10% of the retained-path payoff
