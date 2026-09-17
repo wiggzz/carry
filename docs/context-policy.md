@@ -59,13 +59,19 @@ must be positive and defaults to `5`.
 
 `--compaction-rollout-samples N` (or
 `CARRY_COMPACTION_ROLLOUT_SAMPLES=N`) is an opt-in deterministic V0 selection
-policy with `0` disabling it and `1`–`64` samples allowed. In rollout mode,
+policy with `0` disabling it and `1`–`64` samples allowed. Its per-future-turn
+stop probability is `--compaction-rollout-stop-probability-percent N` (or
+`CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT=N`), bounded 0–100 and
+defaulting to 10. In rollout mode,
 `compaction-payoff-requests` is only the bounded simulation horizon, not a
 separate economic admission check. Carry compares every structurally valid
 “compact now” candidate with “keep” across `N` flat scenarios: it preserves
 exact known item sizes, appends one virtual compactible item sized to the
-current post-compaction mean, chooses a uniform count from 0 through 4, and
-uniformly drops that many non-human IDs from the post-compaction payload. The
+current post-compaction mean, and, before each simulated *future* turn, samples
+a per-turn task-stop event (default 10%; the immediate next request is always
+priced). A stopped scenario contributes no further virtual item, cleanup, or
+request cost. Surviving turns choose a uniform count from 0 through 4 and
+uniformly drop that many non-human IDs from the post-compaction payload. The
 same seeded samples are applied to both branches. Carry selects the candidate
 with the largest expected horizon saving when that saving exceeds 10% of the
 simulated keep-path cost. Direct next-request savings are telemetry, not a

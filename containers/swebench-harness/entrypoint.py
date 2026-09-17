@@ -48,6 +48,10 @@ rollout_samples = os.environ.get("CARRY_COMPACTION_ROLLOUT_SAMPLES", "0")
 if (not rollout_samples.isascii() or not rollout_samples.isdecimal()
         or int(rollout_samples) > 64):
     parser.error("CARRY_COMPACTION_ROLLOUT_SAMPLES must be an ASCII decimal integer from 0 through 64")
+rollout_stop_probability_percent = os.environ.get("CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT", "10")
+if (not rollout_stop_probability_percent.isascii() or not rollout_stop_probability_percent.isdecimal()
+        or int(rollout_stop_probability_percent) > 100):
+    parser.error("CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT must be an ASCII decimal integer from 0 through 100")
 
 output = pathlib.Path(args.output)
 output.mkdir(parents=True, exist_ok=True)
@@ -80,6 +84,7 @@ if args.harness == "carry" and keep_lease_turns:
 if args.harness == "carry":
     command.extend(["--compaction-payoff-requests", payoff_requests])
     command.extend(["--compaction-rollout-samples", rollout_samples])
+    command.extend(["--compaction-rollout-stop-probability-percent", rollout_stop_probability_percent])
 if args.resume_session:
     command.extend(["--resume", str(args.resume_session)])
 if args.codex_session and args.codex_thread:

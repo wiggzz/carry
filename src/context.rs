@@ -664,6 +664,7 @@ impl ContextState {
     ) -> FlatRolloutEstimate {
         debug_assert!(config.samples > 0);
         debug_assert!(config.horizon > 0);
+        debug_assert!(config.stop_probability_percent <= 100);
         let mut compacted = self.clone();
         compacted.compact(plan.clone());
         let retained_ids = compacted
@@ -691,6 +692,8 @@ impl ContextState {
         let mut total_compact_cost = 0.0;
         let mut total_keep_cost = 0.0;
         let mut max_sampled_drops = 0usize;
+        let mut total_simulated_followup_turns = 0u64;
+        let mut stopped_samples = 0u32;
 
         for sample in 0..config.samples {
             let mut compact_branch = compacted.clone();
@@ -699,6 +702,10 @@ impl ContextState {
             let mut keep_cost = initial_keep_cost;
             let mut rng = FlatRolloutRng::new(config.seed ^ u64::from(sample));
             for _ in 1..config.horizon {
+                if rng.stops_with_probability(config.stop_probability_percent) {
+                    stopped_samples += 1;
+                    break;
+                }
                 let count = rng.range_inclusive(retained_ids.len().min(4));
                 max_sampled_drops = max_sampled_drops.max(count);
                 let dropped_ids = sample_ids_without_replacement(&retained_ids, count, &mut rng);
@@ -716,6 +723,7 @@ impl ContextState {
                     plan.neutral_budget_tokens,
                     &policy,
                 );
+                total_simulated_followup_turns += 1;
             }
             total_compact_cost += compact_cost;
             total_keep_cost += keep_cost;
@@ -728,8 +736,11 @@ impl ContextState {
             samples: config.samples,
             horizon: config.horizon,
             seed: config.seed,
+            stop_probability_percent: config.stop_probability_percent,
             mean_virtual_item_tokens,
             max_sampled_drops,
+            average_simulated_followup_turns: total_simulated_followup_turns as f64 / samples,
+            stopped_samples,
             expected_compact_cost,
             expected_keep_cost,
             direct_next_request_savings_input_units,
@@ -1103,6 +1114,8 @@ pub(crate) struct FlatRolloutConfig {
     pub samples: u32,
     pub horizon: u64,
     pub seed: u64,
+    /// Per simulated forward turn; the direct next request is always priced.
+    pub stop_probability_percent: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1110,8 +1123,11 @@ pub(crate) struct FlatRolloutEstimate {
     pub samples: u32,
     pub horizon: u64,
     pub seed: u64,
+    pub stop_probability_percent: u8,
     pub mean_virtual_item_tokens: usize,
     pub max_sampled_drops: usize,
+    pub average_simulated_followup_turns: f64,
+    pub stopped_samples: u32,
     pub expected_compact_cost: f64,
     pub expected_keep_cost: f64,
     pub direct_next_request_savings_input_units: f64,
@@ -1142,6 +1158,14 @@ impl FlatRolloutRng {
     fn range_exclusive(&mut self, upper: usize) -> usize {
         debug_assert!(upper > 0);
         (self.next_u64() % upper as u64) as usize
+    }
+
+    fn stops_with_probability(&mut self, probability_percent: u8) -> bool {
+        match probability_percent {
+            0 => false,
+            100.. => true,
+            probability => self.range_exclusive(100) < usize::from(probability),
+        }
     }
 }
 
@@ -1442,6 +1466,7 @@ mod tests {
             samples: 16,
             horizon: 5,
             seed: 7,
+            stop_probability_percent: 0,
         };
         let first = state.flat_rollout_estimate(&plan, &[], policy.clone(), config);
         let second = state.flat_rollout_estimate(&plan, &[], policy, config);
@@ -1451,6 +1476,44 @@ mod tests {
         assert!(first.max_sampled_drops <= 4);
         assert!(first.mean_virtual_item_tokens > 0);
         assert_eq!(state.encode().unwrap(), before);
+    }
+
+    #[test]
+    fn flat_rollout_stops_forward_simulation_when_stop_probability_is_certain() {
+        let mut state = ContextState::new("initial".into());
+        let oldest = add_tool_with_output(&mut state, &"old ".repeat(4_000));
+        let middle = add_tool_with_output(&mut state, &"middle ".repeat(1_000));
+        let newest = add_tool_with_output(&mut state, &"new ".repeat(1_000));
+        let budget = state.item_estimated_tokens(middle) + state.item_estimated_tokens(newest);
+        let policy = CompactionPolicy {
+            implicit_cached_tokens: 0,
+            breakpoints: Vec::new(),
+            payoff_requests: 5,
+        };
+        let plan = state
+            .plan_compaction_with_neutral_budget(&[], policy.clone(), budget)
+            .expect("initial plan should remove the old tool result");
+        assert!(plan.dropped.contains(&oldest));
+
+        let estimate = state.flat_rollout_estimate(
+            &plan,
+            &[],
+            policy.clone(),
+            FlatRolloutConfig {
+                samples: 4,
+                horizon: 5,
+                seed: 7,
+                stop_probability_percent: 100,
+            },
+        );
+
+        assert_eq!(estimate.stopped_samples, 4);
+        assert_eq!(estimate.average_simulated_followup_turns, 0.0);
+        assert_eq!(estimate.expected_compact_cost, compact_request_cost(&plan));
+        assert_eq!(
+            estimate.expected_keep_cost,
+            keep_request_cost(state.estimated_tokens(), &policy)
+        );
     }
 
     #[test]
@@ -1494,8 +1557,11 @@ mod tests {
             samples: 1,
             horizon: 5,
             seed: 0,
+            stop_probability_percent: 0,
             mean_virtual_item_tokens: 1,
             max_sampled_drops: 0,
+            average_simulated_followup_turns: 0.0,
+            stopped_samples: 0,
             expected_compact_cost: 80.0,
             expected_keep_cost: 100.0,
             direct_next_request_savings_input_units: -5.0,

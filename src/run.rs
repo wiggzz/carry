@@ -71,6 +71,8 @@ pub struct RunConfig {
     pub compaction_payoff_requests: u64,
     /// Zero disables deterministic flat-drop scenario rollouts before compaction.
     pub compaction_rollout_samples: u32,
+    /// Per simulated future turn probability (percent) that the task ends.
+    pub compaction_rollout_stop_probability_percent: u8,
     pub resume_context: Option<ContextState>,
     pub resume_source: Option<PathBuf>,
     /// Stable provider cache affinity, retained with the resumable state.
@@ -1019,6 +1021,7 @@ fn maybe_compact(
             samples: config.compaction_rollout_samples,
             horizon: config.compaction_payoff_requests,
             seed: 0,
+            stop_probability_percent: config.compaction_rollout_stop_probability_percent,
         };
         let Some((plan, rollout)) = state
             .compaction_candidates_with_neutral_budget(
@@ -2125,6 +2128,7 @@ mod tests {
                 keep_lease_turns: Some(1),
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2211,6 +2215,7 @@ mod tests {
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2274,6 +2279,7 @@ mod tests {
                 keep_lease_turns: None,
                 compaction_payoff_requests: 5,
                 compaction_rollout_samples: 4,
+                compaction_rollout_stop_probability_percent: 10,
                 resume_context: Some(context),
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2298,6 +2304,12 @@ mod tests {
             .expect("large resumed context should make a compaction decision");
         assert_eq!(decision["data"]["rollout"]["samples"], 4);
         assert_eq!(decision["data"]["rollout"]["horizon"], 5);
+        assert_eq!(decision["data"]["rollout"]["stop_probability_percent"], 10);
+        assert!(
+            decision["data"]["rollout"]["average_simulated_followup_turns"]
+                .as_f64()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2326,6 +2338,7 @@ mod tests {
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2410,6 +2423,7 @@ mod tests {
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("resumable-cache-affinity".into()),
@@ -2433,6 +2447,7 @@ mod tests {
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
                 resume_context: Some(resume.context),
                 resume_source: Some(first_session),
                 prompt_cache_key,
@@ -2499,6 +2514,7 @@ mod tests {
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2543,6 +2559,7 @@ mod tests {
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2602,6 +2619,7 @@ mod tests {
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2695,6 +2713,7 @@ mod tests {
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,

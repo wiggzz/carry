@@ -41,10 +41,12 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(config["CARRY_COMPACTION_POLICY"], "economic")
         self.assertEqual(config["CARRY_COMPACTION_PAYOFF_REQUESTS"], "1")
         self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "0")
+        self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"], "10")
         rollout = self.worker.validate_config(
             dict(valid, CARRY_COMPACTION_ROLLOUT_SAMPLES="16")
         )
         self.assertEqual(rollout["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "16")
+        self.assertEqual(rollout["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"], "10")
         for key, value in (("BASE_IMAGE", "node:22"), ("CODEX_VERSION", "latest"),
                            ("CARRY_COMPACTION_POLICY", "adaptive"),
                            ("CARRY_COMPACTION_ROLLOUT_SAMPLES", "65")):
