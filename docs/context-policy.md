@@ -52,16 +52,38 @@ materializes the memory as an assistant message with the same ID.
 ## Economic compaction
 
 Between rewrites, retained history grows by exact appends so the model provider
-can reuse a stable prompt-cache prefix. Before a model request, the planner
-prices retaining the cached history against paying for a rewrite. The economic
-The payoff period is configured with `--compaction-payoff-requests N` (or
-`CARRY_COMPACTION_PAYOFF_REQUESTS=N`). `N` must be a positive integer and defaults
-to `1`, preserving the original next-request economic policy. Benchmarks record
-this value in provenance; non-default experiments must pass it explicitly.
-It also requires projected savings to exceed 10% of the retained-path payoff
-cost. This deliberately avoids rewrites that only barely repay their cache
-invalidation. A compaction still begins a new cache generation; the model-visible
-history is otherwise prefix-continuous.
+can reuse a stable prompt-cache prefix. Without rollout sampling, the planner
+uses `--compaction-payoff-requests N` (or
+`CARRY_COMPACTION_PAYOFF_REQUESTS=N`) as its deterministic payoff period; `N`
+must be positive and defaults to `5`.
+
+`--compaction-rollout-samples N` (or
+`CARRY_COMPACTION_ROLLOUT_SAMPLES=N`) is an opt-in deterministic V0 selection
+policy with `0` disabling it and `1`–`64` samples allowed. Its per-future-turn
+stop probability is `--compaction-rollout-stop-probability-percent N` (or
+`CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT=N`), bounded 0–100 and
+defaulting to 10. In rollout mode,
+`compaction-payoff-requests` is only the bounded simulation horizon, not a
+separate economic admission check. Carry compares every structurally valid
+“compact now” candidate with “keep” across `N` flat scenarios: it preserves
+exact known item sizes, appends one virtual compactible item sized to the
+current post-compaction mean, and, before each simulated *future* turn, samples
+a per-turn task-stop event (default 10%; the immediate next request is always
+priced). A stopped scenario contributes no further virtual item, cleanup, or
+request cost. Surviving turns choose a uniform count from 0 through 4 and
+uniformly drop that many non-human IDs from the post-compaction payload. The
+same seeded samples are applied to both branches. Carry selects the candidate
+with the largest expected horizon saving when that saving exceeds 10% of the
+simulated keep-path cost. Direct next-request savings are telemetry, not a
+gate: the rollout can approve an initial loss when its expected horizon value
+repays it. This is a structural sensitivity test, not a semantic prediction of
+model behavior; its inputs and branch costs are recorded in the compaction
+trace event.
+
+The deterministic fallback likewise requires projected savings to exceed 10% of
+the retained-path payoff cost. This deliberately avoids rewrites that only
+barely repay their cache invalidation. A compaction still begins a new cache
+generation; the model-visible history is otherwise prefix-continuous.
 
 A compaction can remove explicitly removable items and selected neutral volatile
 items, retain protected evidence, preserve chronology, and establish a new

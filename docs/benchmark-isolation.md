@@ -66,7 +66,11 @@ harnesses × one declared attempt). Its record identity and evidence path includ
 or subsequent attempts cannot overwrite a patch, evaluator report, or metadata. When
 `attempts > 1`, an artifact-gated merge job accepts every declared complete worker
 artifact and requires the exact combined attempt-record count before publishing
-`report.json`, `records.json`, and `report.md`.
+`report.json`, `records.json`, and `report.md`. A task agent timeout is a terminal
+`task-timeout` record with `resolved: false`, so it remains in the declared
+denominator; it does not invalidate an otherwise complete attempt. A timeout caused
+by clipping a slot to the overall agent-phase budget still fails the attempt.
+Worker, evaluator, identity, and coverage failures also fail closed.
 
 The combined report keeps both denominators explicit: `50 × attempts` executions per
 harness and 50 unique task instances per harness. It reports every attempt record's

@@ -66,6 +66,10 @@ class HarnessEntrypointTests(unittest.TestCase):
                 "assert sys.argv[lease + 1] == '8', sys.argv\n"
                 "payoff=sys.argv.index('--compaction-payoff-requests')\n"
                 "assert sys.argv[payoff + 1] == '5', sys.argv\n"
+                "rollout=sys.argv.index('--compaction-rollout-samples')\n"
+                "assert sys.argv[rollout + 1] == '16', sys.argv\n"
+                "stop=sys.argv.index('--compaction-rollout-stop-probability-percent')\n"
+                "assert sys.argv[stop + 1] == '10', sys.argv\n"
                 "pathlib.Path('file.txt').write_text('after\\n')\n"
             )
             binary.chmod(0o755)
@@ -73,7 +77,9 @@ class HarnessEntrypointTests(unittest.TestCase):
                        OPENAI_BASE_URL="http://openai-proxy:8080/v1",
                        PREPARED_HARNESS_ROOT=str(root), AGENT_TIMEOUT_SECONDS="30",
                        BENCHMARK_WORKSPACE=str(repo), CARRY_COMPACTION_POLICY="disabled",
-                       CARRY_KEEP_LEASE_TURNS="8", CARRY_COMPACTION_PAYOFF_REQUESTS="5")
+                       CARRY_KEEP_LEASE_TURNS="8", CARRY_COMPACTION_PAYOFF_REQUESTS="5",
+                       CARRY_COMPACTION_ROLLOUT_SAMPLES="16",
+                       CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT="10")
             run = subprocess.run(
                 ["python3", str(ENTRYPOINT), "run", "--harness", "carry",
                  "--model", "model", "--reasoning", "medium",

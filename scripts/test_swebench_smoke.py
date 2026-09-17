@@ -40,8 +40,16 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(config["PI_VERSION"], "0.84.2")
         self.assertEqual(config["CARRY_COMPACTION_POLICY"], "economic")
         self.assertEqual(config["CARRY_COMPACTION_PAYOFF_REQUESTS"], "1")
+        self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "0")
+        self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"], "10")
+        rollout = self.worker.validate_config(
+            dict(valid, CARRY_COMPACTION_ROLLOUT_SAMPLES="16")
+        )
+        self.assertEqual(rollout["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "16")
+        self.assertEqual(rollout["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"], "10")
         for key, value in (("BASE_IMAGE", "node:22"), ("CODEX_VERSION", "latest"),
-                           ("CARRY_COMPACTION_POLICY", "adaptive")):
+                           ("CARRY_COMPACTION_POLICY", "adaptive"),
+                           ("CARRY_COMPACTION_ROLLOUT_SAMPLES", "65")):
             bad = dict(valid)
             bad[key] = value
             with self.assertRaises(ValueError):
@@ -1304,6 +1312,31 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
 
         self.worker.require_complete_official_evaluations(records[:2])
 
+    def test_official_agent_timeout_is_a_terminal_task_failure(self):
+        records = [{
+            "instance_id": "timed-out", "harness": "carry", "status": "agent-failed",
+            "timed_out": True, "resolved": True,
+        }]
+        outcomes = {
+            "resolved_ids": set(), "unresolved_ids": set(), "empty_patch_ids": set(),
+            "error_ids": set(), "incomplete_ids": set(), "completed_ids": set(),
+        }
+        self.worker.apply_official_outcomes(records, outcomes)
+        self.assertEqual(records[0]["status"], "task-timeout")
+        self.assertFalse(records[0]["resolved"])
+        self.worker.require_complete_official_evaluations(records)
+
+    def test_task_timeout_does_not_exhaust_the_agent_phase_budget(self):
+        self.assertFalse(self.worker.agent_phase_budget_exhausted({
+            "status": "task-timeout", "timed_out": True, "phase_budget_limited": False,
+        }))
+        self.assertTrue(self.worker.agent_phase_budget_exhausted({
+            "status": "task-timeout", "timed_out": True, "phase_budget_limited": True,
+        }))
+        self.assertTrue(self.worker.agent_phase_budget_exhausted({
+            "status": "agent-budget-exhausted", "timed_out": False,
+        }))
+
     def test_official_outcomes_do_not_overwrite_agent_failures(self):
         records = [
             {"instance_id": "failed", "harness": "codex", "status": "agent-failed", "resolved": False},
@@ -1346,6 +1379,10 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             execution_events.append(("agent", kwargs["instance_id"]))
             self.assertEqual(kwargs["image"], f"prepared:{kwargs['instance_id']}")
             self.assertEqual(kwargs["harness_bundle"].name, kwargs["harness"])
+            if kwargs["instance_id"] == frozen[0] and kwargs["harness"] == "carry":
+                return {"instance_id": kwargs["instance_id"], "harness": kwargs["harness"],
+                        "status": "agent-failed", "patch": "", "error": "task timed out",
+                        "attempts": 1, "retries": 0, "response_retries": 0, "timed_out": True}
             return {"instance_id": kwargs["instance_id"], "harness": kwargs["harness"],
                     "status": "agent-completed", "patch": "", "error": None,
                     "attempts": 1, "retries": 0,
@@ -1439,9 +1476,11 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertFalse(secret.exists())
             self.assertFalse((work / "agent-shards").exists())
             report = json.loads((output / "report.json").read_text())
-            self.assertEqual((report["denominator"], report["completed"]), (150, 150))
+            self.assertEqual((report["denominator"], report["completed"]), (150, 149))
+            self.assertEqual(report["resolved"], 0)
+            self.assertEqual(report["harnesses"]["carry"]["statuses"], {"evaluated": 49, "task-timeout": 1})
             self.assertEqual(set(report["harnesses"]), set(self.worker.HARNESSES))
-            self.assertEqual(report["harnesses"]["carry"]["response_retries"], 100)
+            self.assertEqual(report["harnesses"]["carry"]["response_retries"], 98)
             self.assertEqual(report["harnesses"]["codex"]["response_retries"], 0)
             self.assertEqual(report["harnesses"]["pi"]["response_retries"], 0)
             limits = report["provenance"]["images"]["execution_limits"]
@@ -1760,6 +1799,27 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertIn("agent stopped", record["error"])
             self.assertEqual((record["attempts"], record["retries"]), (1, 0))
             self.assertEqual(record["response_retries"], 0)
+
+    def test_run_agent_marks_container_timeout_exit_124(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for name in ("repo", "input", "output"):
+                (root / name).mkdir()
+            def fake_run(command, **_kwargs):
+                if command[:2] == ["docker", "run"]:
+                    raise subprocess.CalledProcessError(124, command)
+                return mock.Mock(returncode=0, stdout="")
+
+            with mock.patch.object(self.worker.subprocess, "run", side_effect=fake_run):
+                record = self.worker.run_agent(
+                    instance_id="task-1", harness="carry", image="carry:run",
+                    repo=root / "repo", harness_bundle=root / "repo",
+                    task_input=root / "input", output=root / "output",
+                    model="gpt-5.6-luna", reasoning="medium",
+                    network="internal", proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
+                )
+            self.assertEqual(record["status"], "agent-failed")
+            self.assertTrue(record["timed_out"])
 
     def test_run_agent_surfaces_carry_response_retries(self):
         with tempfile.TemporaryDirectory() as directory:

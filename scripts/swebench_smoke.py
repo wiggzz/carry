@@ -396,6 +396,12 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
     config["CARRY_COMPACTION_PAYOFF_REQUESTS"] = values.get(
         "CARRY_COMPACTION_PAYOFF_REQUESTS", "1"
     )
+    config["CARRY_COMPACTION_ROLLOUT_SAMPLES"] = values.get(
+        "CARRY_COMPACTION_ROLLOUT_SAMPLES", "0"
+    )
+    config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"] = values.get(
+        "CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT", "10"
+    )
     if config["CARRY_COMPACTION_POLICY"] not in {"economic", "disabled"}:
         raise ValueError("CARRY_COMPACTION_POLICY must be economic or disabled")
     if config["CARRY_KEEP_LEASE_TURNS"] and (
@@ -407,6 +413,14 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
             or not config["CARRY_COMPACTION_PAYOFF_REQUESTS"].isdecimal()
             or int(config["CARRY_COMPACTION_PAYOFF_REQUESTS"]) < 1):
         raise ValueError("CARRY_COMPACTION_PAYOFF_REQUESTS must be a positive ASCII decimal integer")
+    if (not config["CARRY_COMPACTION_ROLLOUT_SAMPLES"].isascii()
+            or not config["CARRY_COMPACTION_ROLLOUT_SAMPLES"].isdecimal()
+            or int(config["CARRY_COMPACTION_ROLLOUT_SAMPLES"]) > 64):
+        raise ValueError("CARRY_COMPACTION_ROLLOUT_SAMPLES must be an ASCII decimal integer from 0 through 64")
+    if (not config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"].isascii()
+            or not config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"].isdecimal()
+            or int(config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"]) > 100):
+        raise ValueError("CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT must be an ASCII decimal integer from 0 through 100")
     if not DIGEST_IMAGE.fullmatch(config["BASE_IMAGE"]):
         raise ValueError("BASE_IMAGE must use an immutable sha256 digest")
     for key in ("CODEX_VERSION", "PI_VERSION"):
@@ -580,6 +594,8 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
         "--env", f"AGENT_TIMEOUT_SECONDS={agent_timeout_seconds}",
         "--env", "CARRY_COMPACTION_POLICY",
         "--env", "CARRY_COMPACTION_PAYOFF_REQUESTS",
+        "--env", "CARRY_COMPACTION_ROLLOUT_SAMPLES",
+        "--env", "CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT",
         "--env", f"AGENT_COMMAND={AGENT_COMMANDS[harness]}",
         "--env", "BENCHMARK_WORKSPACE=/testbed",
         "--env", "HOME=/agent-home", "--env", "XDG_CONFIG_HOME=/agent-home/.config",
@@ -1356,6 +1372,13 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
         cleanup_agent_network(network)
 
 
+def agent_timed_out(error: BaseException) -> bool:
+    return (
+        isinstance(error, subprocess.TimeoutExpired)
+        or (isinstance(error, subprocess.CalledProcessError) and error.returncode == 124)
+    )
+
+
 def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
               harness_bundle: pathlib.Path, task_input: pathlib.Path,
               output: pathlib.Path, model: str, reasoning: str,
@@ -1409,14 +1432,15 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
                   "response_retries": response_retries}
     except (OSError, RuntimeError, json.JSONDecodeError,
             subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        if isinstance(error, subprocess.TimeoutExpired):
+        timed_out = agent_timed_out(error)
+        if timed_out:
             force_remove_container(container_name, exact_name=True)
         patch_file = output / "final.patch"
         patch = patch_file.read_text(encoding="utf-8") if patch_file.is_file() else ""
         record = {"instance_id": instance_id, "harness": harness, "status": "agent-failed",
                   "patch": patch, "error": str(error), "attempts": 1, "retries": 0,
                   "response_retries": 0,
-                  "timed_out": isinstance(error, subprocess.TimeoutExpired)}
+                  "timed_out": timed_out}
     record["elapsed_seconds"] = round(time.monotonic() - started, 3)
     record["round_input_tokens"] = load_proxy_round_input_tokens(proxy_container)
     record["max_round_input_tokens"] = max_observed_input_tokens(record["round_input_tokens"])
@@ -1578,8 +1602,12 @@ def status_for_official_outcome(instance_id: str, outcomes: Mapping[str, set[str
 def apply_official_outcomes(
     records: list[dict[str, Any]], outcomes: Mapping[str, set[str]]
 ) -> None:
-    """Apply grading only to slots whose agent process completed successfully."""
+    """Apply grading and terminal task timeouts to official benchmark slots."""
     for record in records:
+        if record.get("status") == "agent-failed" and record.get("timed_out") is True:
+            record["resolved"] = False
+            record["status"] = "task-timeout"
+            continue
         if record.get("status") != "agent-completed":
             continue
         instance_id = record["instance_id"]
@@ -1589,8 +1617,15 @@ def apply_official_outcomes(
 
 def official_evaluation_unknowns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
-        (record for record in records if record.get("status") not in {"evaluated", "empty-patch"}),
+        (record for record in records if record.get("status") not in {"evaluated", "empty-patch", "task-timeout"}),
         key=lambda record: (record["instance_id"], record["harness"]),
+    )
+
+
+def agent_phase_budget_exhausted(record: Mapping[str, Any]) -> bool:
+    return (
+        record.get("status") == "agent-budget-exhausted"
+        or (record.get("timed_out") is True and record.get("phase_budget_limited") is True)
     )
 
 
@@ -2206,6 +2241,8 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "carry_compaction_policy": validated["CARRY_COMPACTION_POLICY"],
         "carry_keep_lease_turns": validated["CARRY_KEEP_LEASE_TURNS"],
         "carry_compaction_payoff_requests": validated["CARRY_COMPACTION_PAYOFF_REQUESTS"],
+        "carry_compaction_rollout_samples": validated["CARRY_COMPACTION_ROLLOUT_SAMPLES"],
+        "carry_compaction_rollout_stop_probability_percent": validated["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"],
         "images": {},
         "mode": mode, "harnesses": list(harnesses), "phase": "planned",
         "pricing_usd_per_million": pricing,
@@ -2347,6 +2384,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
             task, harness, attempt, task_root, slot_output = slot
             session_position = selection.index(task["instance_id"]) + 1 if mode in {"session-smoke-5", "session-20"} else None
             slot_timeout = agent_timeout
+            phase_budget_limited = False
             if agent_deadline is not None:
                 remaining = math.ceil(agent_deadline - time.monotonic())
                 if remaining <= 0:
@@ -2357,6 +2395,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                         "attempts": 0, "retries": 0, "response_retries": 0,
                         "model": validated["MODEL"], "reasoning": validated["REASONING"],
                     }
+                phase_budget_limited = remaining < agent_timeout
                 slot_timeout = min(slot_timeout, remaining)
             if session_position is not None:
                 if session_position > 1 and (
@@ -2408,6 +2447,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 codex_thread=codex_thread if harness == "codex" else None,
                 pi_session_dir=pi_session_dir if session_position is not None and harness == "pi" else None,
             )
+            record["phase_budget_limited"] = phase_budget_limited
             record["attempt"] = attempt
             record["model"] = validated["MODEL"]
             record["reasoning"] = validated["REASONING"]
@@ -2453,10 +2493,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
             with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
                 for record in executor.map(execute_slot, slots):
                     records_by_slot[(record["instance_id"], record["harness"], record["attempt"])].update(record)
-                    agent_budget_exhausted |= (
-                        record["status"] == "agent-budget-exhausted"
-                        or bool(record.get("timed_out"))
-                    )
+                    agent_budget_exhausted |= agent_phase_budget_exhausted(record)
             finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload,
                      harnesses=harnesses, attempt_numbers=attempt_numbers)
         finally:
