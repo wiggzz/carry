@@ -32,8 +32,33 @@ class AttemptMergeTests(unittest.TestCase):
                 "dataset": "SWE-bench/SWE-bench_Verified", "dataset_revision": "frozen",
                 "swebench_version": "4.1.0", "model": "test-model", "reasoning": "medium",
                 "carry_compaction_policy": "economic", "carry_keep_lease_turns": "0",
-                "carry_compaction_payoff_requests": "1", "pricing_usd_per_million": {"input": 1},
-                "images": {"task": "sha256:test"}, "harnesses": ["carry", "codex", "pi"],
+                "carry_compaction_payoff_requests": "1", "carry_compaction_rollout_samples": "16",
+                "carry_compaction_rollout_stop_probability_percent": "10",
+                "pricing_usd_per_million": {"input": 1},
+                "images": {
+                    "carry": {
+                        "tag": f"swebench-attempt-{attempt}-carry",
+                        "image_id": f"sha256:{attempt:064x}",
+                        "base_resolved_digest": "rust@sha256:test",
+                        "dockerfile_sha256": "carry-dockerfile",
+                        "package_version": source_commit,
+                    },
+                    "codex": {
+                        "tag": f"swebench-attempt-{attempt}-codex",
+                        "image_id": f"sha256:{attempt + 10:064x}",
+                        "base_resolved_digest": "node@sha256:test",
+                        "dockerfile_sha256": "node-dockerfile",
+                        "package_version": "test-codex",
+                    },
+                    "pi": {
+                        "tag": f"swebench-attempt-{attempt}-pi",
+                        "image_id": f"sha256:{attempt + 20:064x}",
+                        "base_resolved_digest": "node@sha256:test",
+                        "dockerfile_sha256": "node-dockerfile",
+                        "package_version": "test-pi",
+                    },
+                    "execution_limits": {"agent_concurrency": 5, "agent_timeout_seconds": 360},
+                }, "harnesses": ["carry", "codex", "pi"],
                 "attempt": {"number": attempt, "total": total, "independent_fresh_workspaces": True},
             },
         }), encoding="utf-8")
@@ -61,6 +86,8 @@ class AttemptMergeTests(unittest.TestCase):
             self.assertEqual(report["task_harnesses"]["task-00/carry"]["resolved"], 3)
             self.assertEqual(report["provenance"]["model"], "test-model")
             self.assertEqual(report["provenance"]["source_commit"], "a" * 40)
+            self.assertEqual(report["provenance"]["carry_compaction_rollout_samples"], "16")
+            self.assertEqual(report["provenance"]["carry_compaction_rollout_stop_probability_percent"], "10")
             self.assertIn("official-50 attempts", (output / "report.md").read_text(encoding="utf-8"))
 
     def test_cli_rejects_missing_or_duplicate_attempt_artifacts(self):

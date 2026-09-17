@@ -18,15 +18,47 @@ MAX_ATTEMPTS = 10
 IMMUTABLE_PROVENANCE_FIELDS = (
     "dataset", "dataset_revision", "swebench_version", "source_commit", "model", "reasoning",
     "carry_compaction_policy", "carry_keep_lease_turns", "carry_compaction_payoff_requests",
+    "carry_compaction_rollout_samples", "carry_compaction_rollout_stop_probability_percent",
     "pricing_usd_per_million", "images", "harnesses",
 )
+
+
+IMMUTABLE_IMAGE_FIELDS = (
+    "base_resolved_digest", "dockerfile_sha256", "package_version",
+)
+
+
+def immutable_images(images: Any) -> dict[str, Any]:
+    """Keep run-local image tags/IDs out of cross-attempt identity."""
+    if not isinstance(images, dict):
+        raise ValueError("attempt provenance images must be a mapping")
+    expected = set(HARNESSES) | {"execution_limits"}
+    if set(images) != expected:
+        raise ValueError("attempt provenance images must include every harness and execution limits")
+    execution_limits = images["execution_limits"]
+    if not isinstance(execution_limits, dict) or not execution_limits:
+        raise ValueError("attempt provenance execution limits must be a nonempty mapping")
+    normalized: dict[str, Any] = {"execution_limits": execution_limits}
+    for harness in HARNESSES:
+        image = images[harness]
+        if not isinstance(image, dict):
+            raise ValueError("attempt provenance images must map harness names to metadata")
+        missing = [field for field in IMMUTABLE_IMAGE_FIELDS if field not in image]
+        if missing:
+            raise ValueError(
+                "attempt provenance image is missing immutable fields: " + ", ".join(missing)
+            )
+        normalized[harness] = {field: image[field] for field in IMMUTABLE_IMAGE_FIELDS}
+    return normalized
 
 
 def immutable_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
     missing = [key for key in IMMUTABLE_PROVENANCE_FIELDS if key not in provenance]
     if missing:
         raise ValueError(f"attempt provenance is missing immutable fields: {', '.join(missing)}")
-    return {key: provenance[key] for key in IMMUTABLE_PROVENANCE_FIELDS}
+    immutable = {key: provenance[key] for key in IMMUTABLE_PROVENANCE_FIELDS}
+    immutable["images"] = immutable_images(provenance["images"])
+    return immutable
 
 
 def load_worker() -> Any:
