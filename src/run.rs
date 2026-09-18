@@ -34,7 +34,7 @@ const ELIGIBLE_CONTEXT_BUDGET_TOKENS: usize = 32 * 1024;
 
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
-Make task progress first: understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
+Make task progress first: understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. When practical, identify the root cause and make the smallest correct fix at the appropriate layer; use local history to investigate regressions when it is available. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
 
 Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
 
@@ -1632,9 +1632,13 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_requires_reproduction_without_soliciting_future_fixes() {
+    fn system_prompt_requires_reproduction_and_root_cause_investigation() {
         assert!(SYSTEM_PROMPT.contains("minimal failing reproduction"));
         assert!(SYSTEM_PROMPT.contains("affected tests"));
+        assert!(SYSTEM_PROMPT.contains(
+            "identify the root cause and make the smallest correct fix at the appropriate layer"
+        ));
+        assert!(SYSTEM_PROMPT.contains("use local history to investigate regressions"));
         assert!(!SYSTEM_PROMPT.contains("later fixes"));
         assert!(!SYSTEM_PROMPT.contains("upstream fix"));
     }
