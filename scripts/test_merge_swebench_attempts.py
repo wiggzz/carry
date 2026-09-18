@@ -152,6 +152,32 @@ class AttemptMergeTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("identical immutable provenance", result.stderr)
 
+    def test_cli_merges_legacy_default_watermark_provenance(self):
+        tasks = [f"task-{index:02d}" for index in range(50)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
+            for attempt in (1, 2):
+                self.write_attempt(artifacts, attempt, tasks, total=2)
+            legacy_report = artifacts / "attempt-1" / "report.json"
+            payload = json.loads(legacy_report.read_text(encoding="utf-8"))
+            payload["provenance"].pop("carry_compaction_neutral_high_watermark_tokens")
+            payload["provenance"].pop("carry_compaction_neutral_low_watermark_tokens")
+            legacy_report.write_text(json.dumps(payload), encoding="utf-8")
+            manifest = root / "tasks.json"
+            manifest.write_text(json.dumps({"instance_ids": tasks}), encoding="utf-8")
+            output = root / "out"
+            result = subprocess.run(
+                ["python3", str(SCRIPT), "--artifacts", str(artifacts), "--manifest", str(manifest),
+                 "--harness", "all", "--attempts", "2", "--out", str(output)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            provenance = json.loads((output / "report.json").read_text(encoding="utf-8"))["provenance"]
+            self.assertEqual(provenance["carry_compaction_neutral_high_watermark_tokens"], "32768")
+            self.assertEqual(provenance["carry_compaction_neutral_low_watermark_tokens"], "24576")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
