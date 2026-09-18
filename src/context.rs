@@ -243,10 +243,6 @@ impl ContextState {
         self.retention_turn = self.retention_turn.saturating_add(1);
     }
 
-    pub fn retention_turn(&self) -> u64 {
-        self.retention_turn
-    }
-
     pub fn arm_keep_leases(&mut self, ids: &[u64], turns: u64) {
         if turns == 0 {
             return;
@@ -260,24 +256,56 @@ impl ContextState {
         }
     }
 
-    /// At a sweep, attach one immutable review to the newest completed tool block.
-    /// The review is resolved only after the next model response has seen it.
+    /// Return a metadata-only view in which every due, non-human lease is releasable.
+    /// The source state is unchanged; callers use this only to ask whether a release wave
+    /// could make the normal compaction planner worthwhile.
+    pub(crate) fn virtual_release_due_keep_leases(&self) -> Option<(Self, Vec<u64>)> {
+        let mut released = self.clone();
+        let mut released_ids = Vec::new();
+        for item in &mut released.items {
+            let due = item
+                .keep_lease_expires_at_turn
+                .is_some_and(|expires_at| expires_at <= released.retention_turn);
+            if item.kind != ContextItemKind::User && item.signal != RetentionSignal::Drop && due {
+                item.signal = RetentionSignal::Drop;
+                item.retention = Retention::Eligible;
+                released_ids.push(item.id);
+            }
+        }
+        (!released_ids.is_empty()).then_some((released, released_ids))
+    }
+
+    /// Attach one cache-safe review for the four largest due leases. The review is
+    /// resolved only after the next model response has seen it.
     pub fn attach_due_keep_lease_review(&mut self) -> KeepLeaseReview {
+        const MAX_REVIEWED_KEEP_LEASES: usize = 4;
+
         if !self.pending_keep_lease_review.is_empty() {
             return KeepLeaseReview {
                 item_ids: Vec::new(),
             };
         }
-        let item_ids = self
+        let mut due = self
             .items
             .iter()
             .filter(|item| {
-                item.signal != RetentionSignal::Drop
+                item.kind != ContextItemKind::User
+                    && item.signal != RetentionSignal::Drop
                     && item
                         .keep_lease_expires_at_turn
                         .is_some_and(|expires_at| expires_at <= self.retention_turn)
             })
-            .map(|item| item.id)
+            .map(|item| (item.id, item.bytes))
+            .collect::<Vec<_>>();
+        due.sort_unstable_by(|(left_id, left_bytes), (right_id, right_bytes)| {
+            right_bytes
+                .cmp(left_bytes)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let item_ids = due
+            .into_iter()
+            .take(MAX_REVIEWED_KEEP_LEASES)
+            .map(|(id, _)| id)
             .collect::<Vec<_>>();
         if !item_ids.is_empty() {
             let ids = item_ids
@@ -286,7 +314,7 @@ impl ContextState {
                 .collect::<Vec<_>>()
                 .join(", ");
             let text = format!(
-                "Previously protected items {ids} may be removed soon. If their learnings need to be preserved exactly, protect them. If there are learnings that can be summarized, remember those."
+                "Working-memory review: IDs {ids} are due. Include only IDs with unique near-term state in context.protected. Omitted IDs are released from working memory and will be removed in the next compaction. Use context.remember only for a concise durable learning."
             );
             if let Some(item) = self
                 .items
@@ -1847,7 +1875,7 @@ mod tests {
         assert!(
             serde_json::to_string(&state.input_items())
                 .unwrap()
-                .contains("Previously protected items")
+                .contains("Working-memory review")
         );
 
         let expired = state.resolve_keep_lease_review(&[]);
@@ -1862,6 +1890,54 @@ mod tests {
                 .retention,
             Retention::Eligible
         );
+    }
+
+    #[test]
+    fn virtual_due_lease_release_includes_all_due_items_without_mutating_source() {
+        let mut state = ContextState::new("initial".into());
+        let first = add_tool(&mut state);
+        let second = add_tool(&mut state);
+        let third = add_tool(&mut state);
+        let source = add_tool(&mut state);
+        let change = state.record_signals(&update(&[first, second, third], &[], &[]), source);
+        state.arm_keep_leases(&change.keep, 1);
+        state.advance_retention_turn();
+
+        let (virtual_release, released_ids) = state
+            .virtual_release_due_keep_leases()
+            .expect("all due leases should be released in the virtual planner state");
+
+        assert_eq!(released_ids, vec![first, second, third]);
+        for id in &released_ids {
+            assert_eq!(state.signal_for(*id), Some(RetentionSignal::Keep));
+            assert_eq!(virtual_release.signal_for(*id), Some(RetentionSignal::Drop));
+        }
+    }
+
+    #[test]
+    fn keep_lease_review_batches_four_largest_due_items_and_explains_release() {
+        let mut state = ContextState::new("initial".into());
+        let tiny = add_tool_with_output(&mut state, &"tiny ".repeat(10));
+        let small = add_tool_with_output(&mut state, &"small ".repeat(20));
+        let medium = add_tool_with_output(&mut state, &"medium ".repeat(30));
+        let large = add_tool_with_output(&mut state, &"large ".repeat(40));
+        let largest = add_tool_with_output(&mut state, &"largest ".repeat(50));
+        let source = add_tool(&mut state);
+        let change = state.record_signals(
+            &update(&[tiny, small, medium, large, largest], &[], &[]),
+            source,
+        );
+        state.arm_keep_leases(&change.keep, 1);
+        state.advance_retention_turn();
+
+        let review = state.attach_due_keep_lease_review();
+
+        assert_eq!(review.item_ids, vec![largest, large, medium, small]);
+        let rendered = serde_json::to_string(&state.input_items()).unwrap();
+        assert!(rendered.contains("Working-memory review"));
+        assert!(rendered.contains("context.protected"));
+        assert!(rendered.contains("Omitted IDs are released from working memory"));
+        assert!(!rendered.contains(&format!("ID {tiny}")));
     }
 
     #[test]

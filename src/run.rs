@@ -17,8 +17,8 @@ use tokio::{
 
 use crate::{
     context::{
-        CompactionPolicy, ContextState, FlatRolloutConfig, PricedBreakpoint, RenderedBreakpoint,
-        meets_rollout_payback_threshold,
+        CompactionPlan, CompactionPolicy, ContextState, FlatRolloutConfig, FlatRolloutEstimate,
+        PricedBreakpoint, RenderedBreakpoint, meets_rollout_payback_threshold,
     },
     log::RunLogger,
     openai::{
@@ -699,7 +699,7 @@ async fn run_loop(
             "economic"
         };
         if config.compaction_mode == CompactionMode::Economic && (!resumed || sent_model_request) {
-            maybe_compact(
+            let compacted = maybe_compact(
                 &mut context_state,
                 &protected_until_request,
                 &mut cache,
@@ -708,6 +708,31 @@ async fn run_loop(
                 &config,
                 trigger,
             )?;
+            if !compacted
+                && config.keep_lease_turns.is_some()
+                && let Some((virtual_release, virtually_released_ids)) =
+                    context_state.virtual_release_due_keep_leases()
+            {
+                let virtual_protected = protected_until_request
+                    .iter()
+                    .copied()
+                    .filter(|id| !virtually_released_ids.contains(id))
+                    .collect::<Vec<_>>();
+                if select_compaction_plan(&virtual_release, &virtual_protected, &cache, &config)
+                    .is_some()
+                {
+                    let review = context_state.attach_due_keep_lease_review();
+                    if !review.item_ids.is_empty() {
+                        logger.raw_event_silent(
+                            "retention_revalidation_requested",
+                            json!({
+                                "item_ids": review.item_ids,
+                                "selection_scope": "all_due_virtual_release"
+                            }),
+                        )?;
+                    }
+                }
+            }
             persist_context_checkpoint(&config, &context_state)?;
         }
         step_index += 1;
@@ -845,18 +870,6 @@ async fn run_loop(
                 } else {
                     Vec::new()
                 };
-                if let Some(lease_turns) = config.keep_lease_turns
-                    && context_state.retention_turn().is_multiple_of(lease_turns)
-                {
-                    let review = context_state.attach_due_keep_lease_review();
-                    if !review.item_ids.is_empty() {
-                        protected_until_request.extend(review.item_ids.iter().copied());
-                        logger.raw_event_silent(
-                            "retention_revalidation_requested",
-                            json!({"item_ids": review.item_ids}),
-                        )?;
-                    }
-                }
                 protected_until_request.push(item_id);
                 protected_until_request.extend(signals.added.iter().copied());
                 logger.raw_event_silent(
@@ -1006,6 +1019,45 @@ fn append_user_message(
     persist_context_checkpoint(config, state)
 }
 
+fn select_compaction_plan(
+    state: &ContextState,
+    protected: &[u64],
+    cache: &CacheTracker,
+    config: &RunConfig,
+) -> Option<(CompactionPlan, Option<FlatRolloutEstimate>)> {
+    let policy = cache.policy_for_history(&state.input_items(), config.compaction_payoff_requests);
+    if config.compaction_rollout_samples > 0 {
+        let rollout_config = FlatRolloutConfig {
+            samples: config.compaction_rollout_samples,
+            horizon: config.compaction_payoff_requests,
+            seed: 0,
+            stop_probability_percent: config.compaction_rollout_stop_probability_percent,
+        };
+        state
+            .compaction_candidates_with_neutral_budget(
+                protected,
+                policy.clone(),
+                ELIGIBLE_CONTEXT_BUDGET_TOKENS,
+            )
+            .into_iter()
+            .map(|plan| {
+                let rollout =
+                    state.flat_rollout_estimate(&plan, protected, policy.clone(), rollout_config);
+                (plan, rollout)
+            })
+            .filter(|(_, rollout)| meets_rollout_payback_threshold(rollout))
+            .max_by(|(_, left), (_, right)| {
+                left.expected_savings_input_units
+                    .total_cmp(&right.expected_savings_input_units)
+            })
+            .map(|(plan, rollout)| (plan, Some(rollout)))
+    } else {
+        state
+            .plan_compaction_with_neutral_budget(protected, policy, ELIGIBLE_CONTEXT_BUDGET_TOKENS)
+            .map(|plan| (plan, None))
+    }
+}
+
 fn maybe_compact(
     state: &mut ContextState,
     protected: &[u64],
@@ -1015,43 +1067,8 @@ fn maybe_compact(
     config: &RunConfig,
     trigger: &str,
 ) -> Result<bool> {
-    let policy = cache.policy_for_history(&state.input_items(), config.compaction_payoff_requests);
-    let (plan, rollout) = if config.compaction_rollout_samples > 0 {
-        let config = FlatRolloutConfig {
-            samples: config.compaction_rollout_samples,
-            horizon: config.compaction_payoff_requests,
-            seed: 0,
-            stop_probability_percent: config.compaction_rollout_stop_probability_percent,
-        };
-        let Some((plan, rollout)) = state
-            .compaction_candidates_with_neutral_budget(
-                protected,
-                policy.clone(),
-                ELIGIBLE_CONTEXT_BUDGET_TOKENS,
-            )
-            .into_iter()
-            .map(|plan| {
-                let rollout = state.flat_rollout_estimate(&plan, protected, policy.clone(), config);
-                (plan, rollout)
-            })
-            .filter(|(_, rollout)| meets_rollout_payback_threshold(rollout))
-            .max_by(|(_, left), (_, right)| {
-                left.expected_savings_input_units
-                    .total_cmp(&right.expected_savings_input_units)
-            })
-        else {
-            return Ok(false);
-        };
-        (plan, Some(rollout))
-    } else {
-        let Some(plan) = state.plan_compaction_with_neutral_budget(
-            protected,
-            policy.clone(),
-            ELIGIBLE_CONTEXT_BUDGET_TOKENS,
-        ) else {
-            return Ok(false);
-        };
-        (plan, None)
+    let Some((plan, rollout)) = select_compaction_plan(state, protected, cache, config) else {
+        return Ok(false);
     };
     let change = state.compact(plan);
     cache.mark_compaction(&change.invalidated_generations);
@@ -2100,7 +2117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keep_lease_review_extends_cached_request_history_without_rewrite() {
+    async fn keep_lease_review_is_planner_gated_and_cache_safe() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let session_dir = temp.path().join("run");
@@ -2124,7 +2141,7 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: Some(3),
                 shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Disabled,
+                compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: Some(1),
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
@@ -2149,18 +2166,23 @@ mod tests {
             .map(|event| event["data"]["history"].as_array().unwrap().clone())
             .collect::<Vec<_>>();
         assert_eq!(histories.len(), 3);
-        for pair in histories.windows(2) {
-            assert_eq!(pair[1][..pair[0].len()], pair[0]);
-        }
-        let third = &histories[2];
-        let review_in_tool_result = third.iter().any(|item| {
-            item["type"] == "function_call_output"
-                && item["output"].as_str().is_some_and(|output| {
-                    output.contains("Previously protected items 2 may be removed soon")
+        let review_index = histories
+            .iter()
+            .position(|history| {
+                history.iter().any(|item| {
+                    item["type"] == "function_call_output"
+                        && item["output"]
+                            .as_str()
+                            .is_some_and(|output| output.contains("Working-memory review: IDs 2"))
                 })
-        });
-        assert!(review_in_tool_result);
-        assert!(!third.iter().any(|item| {
+            })
+            .expect("planner-qualified lease review should be rendered in a tool result");
+        assert!(review_index > 0);
+        assert_eq!(
+            histories[review_index][..histories[review_index - 1].len()],
+            histories[review_index - 1]
+        );
+        assert!(!histories[review_index].iter().any(|item| {
             item["role"] == "developer" && item["content"].to_string().contains("Retention review")
         }));
     }
