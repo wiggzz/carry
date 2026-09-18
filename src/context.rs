@@ -314,7 +314,7 @@ impl ContextState {
                 .collect::<Vec<_>>()
                 .join(", ");
             let text = format!(
-                "Working-memory review: IDs {ids} are due. Include only IDs with unique near-term state in context.protected. Omitted IDs are released from working memory and will be removed in the next compaction. Use context.remember only for a concise durable learning."
+                "Review protected items: IDs {ids} are expiring. Re-protect only if their information is still needed for this task and either is not represented elsewhere or cannot be accurately captured with context.remember. Otherwise omit them to release them for normal compaction."
             );
             if let Some(item) = self
                 .items
@@ -1875,7 +1875,7 @@ mod tests {
         assert!(
             serde_json::to_string(&state.input_items())
                 .unwrap()
-                .contains("Working-memory review")
+                .contains("Review protected items")
         );
 
         let expired = state.resolve_keep_lease_review(&[]);
@@ -1934,9 +1934,10 @@ mod tests {
 
         assert_eq!(review.item_ids, vec![largest, large, medium, small]);
         let rendered = serde_json::to_string(&state.input_items()).unwrap();
-        assert!(rendered.contains("Working-memory review"));
-        assert!(rendered.contains("context.protected"));
-        assert!(rendered.contains("Omitted IDs are released from working memory"));
+        assert!(rendered.contains("Review protected items"));
+        assert!(rendered.contains("are expiring"));
+        assert!(rendered.contains("context.remember"));
+        assert!(rendered.contains("release them for normal compaction"));
         assert!(!rendered.contains(&format!("ID {tiny}")));
     }
 

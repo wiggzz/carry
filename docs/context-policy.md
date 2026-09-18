@@ -39,15 +39,18 @@ Each action makes progress and may attach a sparse context update:
 ```
 
 `protected` and `removable` each accept up to four IDs per turn. Protect an
-item only when it contains learning not represented elsewhere. Mark an item
-removable when it taught nothing, or after its learning has been preserved.
-A later opposite signal reverses the earlier opinion. If both name the same ID
-in one response, protection wins. Unknown and stale IDs are ignored.
+item only when it contains learning not represented elsewhere. Leave eligible
+items unlisted; use `removable` to release an already protected item only when
+it taught nothing, or after its learning has been preserved. A later opposite
+signal reverses the earlier opinion. If both name the same ID in one response,
+protection wins. Unknown and stale IDs are ignored.
 
-`remember` accepts one concise learning per turn. The memory stays associated
-with its source tool result without duplicating the text in the rendered
-history. If a later compaction removes the source but retains the memory, Carry
-materializes the memory as an assistant message with the same ID.
+`remember` accepts one concise learning per turn. When it safely represents a
+bulky source, leave that source eligible or mark it `removable` if it was
+protected. The memory stays associated with its source tool result without
+duplicating the text in the rendered history. If a later compaction removes the
+source but retains the memory, Carry materializes the memory as an assistant
+message with the same ID.
 
 ## Economic compaction
 
