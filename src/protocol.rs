@@ -159,7 +159,7 @@ fn context_schema() -> Value {
             },
             "removable": {
                 "type": "array",
-                "description": "Leave eligible items unlisted. Mark up to four already protected context IDs removable only when you learned nothing from them, or when everything learned from them is preserved elsewhere. Finishing an action does not preserve its learning. Marking an ID removable reverses protection.",
+                "description": "Use this to release up to four already protected context IDs when you learned nothing from them, or when everything learned from them is preserved elsewhere. Leave eligible items unlisted. Finishing an action does not preserve its learning. Marking an ID removable reverses protection.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
@@ -266,8 +266,14 @@ mod tests {
         );
         assert!(protected.contains("learned anything"));
         assert!(protected.contains("leave its bulky source removable"));
+        assert!(
+            removable.starts_with("Use this to release up to four already protected context IDs")
+        );
         assert!(removable.contains("Leave eligible items unlisted"));
-        assert!(removable.contains("already protected"));
+        assert!(
+            removable.find("Use this to release up to four already protected context IDs")
+                < removable.find("Leave eligible items unlisted")
+        );
         assert!(removable.contains("learned nothing"));
         assert!(removable.contains("preserved elsewhere"));
         assert!(remember.contains("concise learning"));
