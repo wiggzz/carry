@@ -34,20 +34,17 @@ const ELIGIBLE_CONTEXT_BUDGET_TOKENS: usize = 32 * 1024;
 
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
-Select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
+Make task progress first: understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
 
-History is a working set, not a complete transcript. Human-authored content is kept by default. All other context is eligible for removal when it no longer fits the working set. After the first removal, a history-status item states that earlier context has been removed.
-
-At each step:
-1. First, determine the next immediate step toward the goal and perform the highest-priority action.
-2. Then, as secondary housekeeping, preserve task-critical working state from recently added visible context. This is required, not optional cleanup: protect exact facts, decisions, constraints, diagnoses, and verified results that will matter to later work. If you learned anything from an item that is not already preserved elsewhere, protect it. If only a concise learning must remain, remember it and leave its bulky source removable, or mark it removable if it was protected. Do either only when it taught you nothing or everything learned from it is preserved elsewhere. Finishing an action or encountering a failure does not by itself preserve its learning.
-
-Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise. Preserve outcomes, not chain-of-thought.
+Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
 
 Large stdout and stderr results arrive in separate structured sections. Each text payload is unmodified; truncation, encoding, and artifact-path metadata are outside that payload. Read or slice the relevant stdout/stderr artifact when omitted details matter.
 
-Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
-"#;
+History is a working set, not a complete transcript. Human-authored content is kept by default. All other context is eligible for removal when it no longer fits the working set. After the first removal, a history-status item states that earlier context has been removed.
+
+As required secondary housekeeping, preserve task-critical working state from recently added visible context. This is required, not optional cleanup: protect exact facts, decisions, constraints, diagnoses, and verified results that will matter to later work. If you learned anything from an item that is not already preserved elsewhere, protect it. If only a concise learning must remain, remember it and leave its bulky source removable, or mark it removable if it was protected. Leave or mark an item removable only when it taught you nothing or everything learned from it is preserved elsewhere. Finishing an action or encountering a failure does not by itself preserve its learning.
+
+Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise. Preserve outcomes, not chain-of-thought."#;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1643,9 +1640,13 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_prioritizes_action_and_requires_critical_state_preservation() {
-        assert!(SYSTEM_PROMPT.contains("First, determine the next immediate step"));
-        assert!(SYSTEM_PROMPT.contains("Then, as secondary housekeeping"));
+    fn system_prompt_prioritizes_task_progress_and_requires_critical_state_preservation() {
+        assert!(SYSTEM_PROMPT.contains("Make task progress first"));
+        assert!(SYSTEM_PROMPT.contains("As required secondary housekeeping"));
+        assert!(
+            SYSTEM_PROMPT.find("Make task progress first")
+                < SYSTEM_PROMPT.find("As required secondary housekeeping")
+        );
         assert!(SYSTEM_PROMPT.contains("task-critical working state"));
         assert!(SYSTEM_PROMPT.contains("This is required, not optional cleanup"));
         assert!(
@@ -1658,10 +1659,11 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("History is a working set"));
         assert!(SYSTEM_PROMPT.contains("Human-authored content is kept by default"));
         assert!(SYSTEM_PROMPT.contains("All other context is eligible for removal"));
-        assert!(!SYSTEM_PROMPT.contains("At each step, select one action"));
-        assert!(SYSTEM_PROMPT.contains("At each step:\n1. First"));
+        assert!(!SYSTEM_PROMPT.contains("Select one action"));
+        assert!(!SYSTEM_PROMPT.contains("At each step:"));
         assert!(SYSTEM_PROMPT.contains("leave its bulky source removable"));
         assert!(SYSTEM_PROMPT.contains("or mark it removable if it was protected"));
+        assert!(SYSTEM_PROMPT.contains("Leave or mark an item removable only"));
         assert!(SYSTEM_PROMPT.contains("or explicitly noted otherwise"));
         assert!(!SYSTEM_PROMPT.contains("Make an item removable only"));
         assert!(!SYSTEM_PROMPT.contains("stable"));
