@@ -88,6 +88,17 @@ the retained-path payoff cost. This deliberately avoids rewrites that only
 barely repay their cache invalidation. A compaction still begins a new cache
 generation; the model-visible history is otherwise prefix-continuous.
 
+Neutral working-set hysteresis is configurable with
+`--compaction-neutral-high-watermark-tokens N` / `CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS=N`
+and `--compaction-neutral-low-watermark-tokens N` /
+`CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS=N`. The defaults preserve the
+existing policy: a 32 Ki-token high watermark and a 24 Ki-token post-compaction
+target. The low watermark must not exceed the high watermark. Setting **both to
+zero** disables the automatic neutral working set: every otherwise eligible
+neutral item is a drop candidate at each planner boundary. It does not bypass
+ordinary economic admission, cache-safety, human retention, or explicit model
+protection; it only removes the neutral-budget reason to retain an item.
+
 A compaction can remove explicitly removable items and selected neutral volatile
 items, retain protected evidence, preserve chronology, and establish a new
 explicit cache frontier. After the first rewrite that removes history, Carry

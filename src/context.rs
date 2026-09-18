@@ -11,7 +11,9 @@ const CACHE_READ_RATE: f64 = 0.10;
 const CACHE_WRITE_RATE: f64 = 1.25;
 const COMPACTION_MIN_PAYBACK_RATIO: f64 = 0.10;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
+#[cfg(test)]
 const NEUTRAL_TARGET_NUMERATOR: usize = 3;
+#[cfg(test)]
 const NEUTRAL_TARGET_DENOMINATOR: usize = 4;
 const HISTORY_COMPACTED_STATUS: &str =
     "[history status: earlier context has been removed by compaction]";
@@ -546,32 +548,59 @@ impl ContextState {
         self.plan_compaction_with_neutral_budget(protected, policy, 0)
     }
 
+    #[cfg(test)]
     pub fn plan_compaction_with_neutral_budget(
         &self,
         protected: &[u64],
         policy: CompactionPolicy,
         neutral_budget_tokens: usize,
     ) -> Option<CompactionPlan> {
-        self.compaction_candidates_with_neutral_budget(protected, policy, neutral_budget_tokens)
-            .into_iter()
-            .filter(|plan| {
-                meets_payback_threshold(
-                    plan.estimated_savings_input_units,
-                    plan.minimum_payback_input_units,
-                )
-            })
-            .max_by(|left, right| {
-                left.estimated_savings_input_units
-                    .total_cmp(&right.estimated_savings_input_units)
-            })
+        let neutral_target_tokens = neutral_budget_tokens.saturating_mul(NEUTRAL_TARGET_NUMERATOR)
+            / NEUTRAL_TARGET_DENOMINATOR;
+        self.plan_compaction_with_neutral_watermarks(
+            protected,
+            policy,
+            neutral_budget_tokens,
+            neutral_target_tokens,
+        )
     }
 
-    pub(crate) fn compaction_candidates_with_neutral_budget(
+    pub fn plan_compaction_with_neutral_watermarks(
         &self,
         protected: &[u64],
         policy: CompactionPolicy,
-        neutral_budget_tokens: usize,
+        neutral_high_watermark_tokens: usize,
+        neutral_low_watermark_tokens: usize,
+    ) -> Option<CompactionPlan> {
+        self.compaction_candidates_with_neutral_watermarks(
+            protected,
+            policy,
+            neutral_high_watermark_tokens,
+            neutral_low_watermark_tokens,
+        )
+        .into_iter()
+        .filter(|plan| {
+            meets_payback_threshold(
+                plan.estimated_savings_input_units,
+                plan.minimum_payback_input_units,
+            )
+        })
+        .max_by(|left, right| {
+            left.estimated_savings_input_units
+                .total_cmp(&right.estimated_savings_input_units)
+        })
+    }
+
+    pub(crate) fn compaction_candidates_with_neutral_watermarks(
+        &self,
+        protected: &[u64],
+        policy: CompactionPolicy,
+        neutral_high_watermark_tokens: usize,
+        neutral_low_watermark_tokens: usize,
     ) -> Vec<CompactionPlan> {
+        assert!(neutral_low_watermark_tokens <= neutral_high_watermark_tokens);
+        let neutral_budget_tokens = neutral_high_watermark_tokens;
+        let neutral_target_tokens = neutral_low_watermark_tokens;
         let protected = protected.iter().copied().collect::<HashSet<_>>();
         let newest_id = self.items.last().map_or(0, |item| item.id);
         // Explicit keep/drop signals remain authoritative. Neutral eligible items compete for
@@ -603,8 +632,6 @@ impl ContextState {
             .fold(0usize, usize::saturating_add);
         // Only cross the neutral high-water mark before collecting neutral items, then compact
         // toward a lower target so one new result does not trigger another compaction next turn.
-        let neutral_target_tokens = neutral_budget_tokens.saturating_mul(NEUTRAL_TARGET_NUMERATOR)
-            / NEUTRAL_TARGET_DENOMINATOR;
         let neutral_over_budget = neutral_total_tokens > neutral_budget_tokens;
         let mut neutral_retained = Vec::new();
         let mut neutral_retained_tokens = neutral
@@ -742,6 +769,7 @@ impl ContextState {
                     &dropped_ids,
                     mean_virtual_item_tokens,
                     plan.neutral_budget_tokens,
+                    plan.neutral_target_tokens,
                     &policy,
                 );
                 keep_cost += simulate_rollout_turn(
@@ -749,6 +777,7 @@ impl ContextState {
                     &dropped_ids,
                     mean_virtual_item_tokens,
                     plan.neutral_budget_tokens,
+                    plan.neutral_target_tokens,
                     &policy,
                 );
                 total_simulated_followup_turns += 1;
@@ -1078,7 +1107,8 @@ fn simulate_rollout_turn(
     state: &mut ContextState,
     dropped_ids: &[u64],
     virtual_item_tokens: usize,
-    neutral_budget_tokens: usize,
+    neutral_high_watermark_tokens: usize,
+    neutral_low_watermark_tokens: usize,
     base_policy: &CompactionPolicy,
 ) -> f64 {
     let cached_before_virtual_item = state.estimated_tokens();
@@ -1102,10 +1132,11 @@ fn simulate_rollout_turn(
     };
     let keep_cost = keep_request_cost(state.estimated_tokens(), &policy);
     let Some(plan) = state
-        .compaction_candidates_with_neutral_budget(
+        .compaction_candidates_with_neutral_watermarks(
             &[virtual_id],
             policy.clone(),
-            neutral_budget_tokens,
+            neutral_high_watermark_tokens,
+            neutral_low_watermark_tokens,
         )
         .into_iter()
         .min_by(|left, right| compact_request_cost(left).total_cmp(&compact_request_cost(right)))
@@ -1554,6 +1585,7 @@ mod tests {
             &[],
             1_000,
             usize::MAX,
+            usize::MAX / 4 * 3,
             &CompactionPolicy {
                 implicit_cached_tokens: 0,
                 breakpoints: Vec::new(),
@@ -1636,6 +1668,35 @@ mod tests {
             vec![newest, middle]
         );
         assert!(plan.neutral_retained[0].score > plan.neutral_retained[1].score);
+    }
+
+    #[test]
+    fn zero_neutral_watermarks_drop_all_eligible_items() {
+        let mut state = ContextState::new("initial".into());
+        let first = add_tool_with_output(&mut state, &"first ".repeat(100));
+        let second = add_tool_with_output(&mut state, &"second ".repeat(100));
+
+        let plan = state
+            .plan_compaction_with_neutral_watermarks(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                    payoff_requests: 1,
+                },
+                0,
+                0,
+            )
+            .expect("zero watermarks should make every eligible item removable");
+
+        assert_eq!(plan.dropped, vec![first, second]);
+        assert!(plan.neutral_retained.is_empty());
+        state.compact(plan);
+        assert!(state.input_items().iter().any(|item| {
+            item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text == "initial")
+        }));
     }
 
     #[test]

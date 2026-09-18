@@ -169,7 +169,9 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 "SOURCE_COMMIT=" + "a" * 40 + "\n"
                 "BENCHMARK_MODE=official-50\nBENCHMARK_HARNESS=carry\n"
                 "BENCHMARK_ATTEMPT=2\nBENCHMARK_ATTEMPTS=3\nBOOTSTRAP_WAIT_SECONDS=1\nRUN_ID=gh-test-2\n"
-                "CARRY_COMPACTION_POLICY=disabled\nCARRY_KEEP_LEASE_TURNS=8\n",
+                "CARRY_COMPACTION_POLICY=disabled\nCARRY_KEEP_LEASE_TURNS=8\n"
+                "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS=0\n"
+                "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS=0\n",
                 encoding="utf-8",
             )
 
@@ -209,7 +211,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 "fi\n"
                 "case \"$*\" in\n"
                 "  *swebench_smoke.py*)\n"
-                "    printf 'agent=%s\\nevaluator=%s\\nmode=%s\\nbenchmark_attempt=%s\\nbenchmark_attempts=%s\\npolicy=%s\\nlease=%s\\nworker=%s\\nagent_phase=%s\\n' \"$AGENT_CONCURRENCY\" \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" \"$BENCHMARK_ATTEMPT\" \"$BENCHMARK_ATTEMPTS\" \"${CARRY_COMPACTION_POLICY-unset}\" \"${CARRY_KEEP_LEASE_TURNS-unset}\" \"$OFFICIAL_WORKER_SECONDS\" \"$OFFICIAL_AGENT_PHASE_SECONDS\" > \"$FAKE_RUNNER_ENV\";;\n"
+                "    printf 'agent=%s\\nevaluator=%s\\nmode=%s\\nbenchmark_attempt=%s\\nbenchmark_attempts=%s\\npolicy=%s\\nlease=%s\\nhigh=%s\\nlow=%s\\nworker=%s\\nagent_phase=%s\\n' \"$AGENT_CONCURRENCY\" \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" \"$BENCHMARK_ATTEMPT\" \"$BENCHMARK_ATTEMPTS\" \"${CARRY_COMPACTION_POLICY-unset}\" \"${CARRY_KEEP_LEASE_TURNS-unset}\" \"${CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS-unset}\" \"${CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS-unset}\" \"$OFFICIAL_WORKER_SECONDS\" \"$OFFICIAL_AGENT_PHASE_SECONDS\" > \"$FAKE_RUNNER_ENV\";;\n"
                 "esac\n"
                 "exit 0\n"
             )
@@ -234,7 +236,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual(
                 runner_env.read_text(),
-                "agent=5\nevaluator=5\nmode=official-50\nbenchmark_attempt=2\nbenchmark_attempts=3\npolicy=disabled\nlease=8\nworker=18900\n"
+                "agent=5\nevaluator=5\nmode=official-50\nbenchmark_attempt=2\nbenchmark_attempts=3\npolicy=disabled\nlease=8\nhigh=0\nlow=0\nworker=18900\n"
                 "agent_phase=4500\n",
             )
 

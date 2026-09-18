@@ -28,10 +28,6 @@ use crate::{
     protocol::{ActionKind, Step},
 };
 
-// Initial policy hypothesis: keep a meaningful recent working set while leaving ample room in
-// the model context. Hysteresis compacts this 32 Ki-token high-water mark toward 24 Ki tokens.
-const ELIGIBLE_CONTEXT_BUDGET_TOKENS: usize = 32 * 1024;
-
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
 Make task progress first: understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. When practical, identify the root cause and make the smallest correct fix at the appropriate layer; use local history to investigate regressions when it is available. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
@@ -70,6 +66,10 @@ pub struct RunConfig {
     pub compaction_rollout_samples: u32,
     /// Per simulated future turn probability (percent) that the task ends.
     pub compaction_rollout_stop_probability_percent: u8,
+    /// Eligible neutral token high-water mark before automatic compaction.
+    pub compaction_neutral_high_watermark_tokens: usize,
+    /// Eligible neutral token target after automatic compaction.
+    pub compaction_neutral_low_watermark_tokens: usize,
     pub resume_context: Option<ContextState>,
     pub resume_source: Option<PathBuf>,
     /// Stable provider cache affinity, retained with the resumable state.
@@ -1031,10 +1031,11 @@ fn select_compaction_plan(
             stop_probability_percent: config.compaction_rollout_stop_probability_percent,
         };
         state
-            .compaction_candidates_with_neutral_budget(
+            .compaction_candidates_with_neutral_watermarks(
                 protected,
                 policy.clone(),
-                ELIGIBLE_CONTEXT_BUDGET_TOKENS,
+                config.compaction_neutral_high_watermark_tokens,
+                config.compaction_neutral_low_watermark_tokens,
             )
             .into_iter()
             .map(|plan| {
@@ -1050,7 +1051,12 @@ fn select_compaction_plan(
             .map(|(plan, rollout)| (plan, Some(rollout)))
     } else {
         state
-            .plan_compaction_with_neutral_budget(protected, policy, ELIGIBLE_CONTEXT_BUDGET_TOKENS)
+            .plan_compaction_with_neutral_watermarks(
+                protected,
+                policy,
+                config.compaction_neutral_high_watermark_tokens,
+                config.compaction_neutral_low_watermark_tokens,
+            )
             .map(|plan| (plan, None))
     }
 }
@@ -2158,6 +2164,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2250,6 +2258,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2314,6 +2324,8 @@ mod tests {
                 compaction_payoff_requests: 5,
                 compaction_rollout_samples: 4,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: Some(context),
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2373,6 +2385,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2458,6 +2472,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("resumable-cache-affinity".into()),
@@ -2482,6 +2498,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: Some(resume.context),
                 resume_source: Some(first_session),
                 prompt_cache_key,
@@ -2549,6 +2567,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2594,6 +2614,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2654,6 +2676,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2748,6 +2772,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,

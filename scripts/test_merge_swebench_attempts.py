@@ -34,6 +34,8 @@ class AttemptMergeTests(unittest.TestCase):
                 "carry_compaction_policy": "economic", "carry_keep_lease_turns": "0",
                 "carry_compaction_payoff_requests": "1", "carry_compaction_rollout_samples": "16",
                 "carry_compaction_rollout_stop_probability_percent": "10",
+                "carry_compaction_neutral_high_watermark_tokens": "32768",
+                "carry_compaction_neutral_low_watermark_tokens": "24576",
                 "pricing_usd_per_million": {"input": 1},
                 "images": {
                     "carry": {
@@ -88,6 +90,8 @@ class AttemptMergeTests(unittest.TestCase):
             self.assertEqual(report["provenance"]["source_commit"], "a" * 40)
             self.assertEqual(report["provenance"]["carry_compaction_rollout_samples"], "16")
             self.assertEqual(report["provenance"]["carry_compaction_rollout_stop_probability_percent"], "10")
+            self.assertEqual(report["provenance"]["carry_compaction_neutral_high_watermark_tokens"], "32768")
+            self.assertEqual(report["provenance"]["carry_compaction_neutral_low_watermark_tokens"], "24576")
             self.assertIn("official-50 attempts", (output / "report.md").read_text(encoding="utf-8"))
 
     def test_cli_rejects_missing_or_duplicate_attempt_artifacts(self):
@@ -136,7 +140,7 @@ class AttemptMergeTests(unittest.TestCase):
                 self.write_attempt(artifacts, attempt, tasks, total=2)
             second_report = artifacts / "attempt-2" / "report.json"
             payload = json.loads(second_report.read_text(encoding="utf-8"))
-            payload["provenance"]["model"] = "different-model"
+            payload["provenance"]["carry_compaction_neutral_high_watermark_tokens"] = "0"
             second_report.write_text(json.dumps(payload), encoding="utf-8")
             manifest = root / "tasks.json"
             manifest.write_text(json.dumps({"instance_ids": tasks}), encoding="utf-8")

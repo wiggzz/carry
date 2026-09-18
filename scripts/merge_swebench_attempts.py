@@ -19,6 +19,7 @@ IMMUTABLE_PROVENANCE_FIELDS = (
     "dataset", "dataset_revision", "swebench_version", "source_commit", "model", "reasoning",
     "carry_compaction_policy", "carry_keep_lease_turns", "carry_compaction_payoff_requests",
     "carry_compaction_rollout_samples", "carry_compaction_rollout_stop_probability_percent",
+    "carry_compaction_neutral_high_watermark_tokens", "carry_compaction_neutral_low_watermark_tokens",
     "pricing_usd_per_million", "images", "harnesses",
 )
 

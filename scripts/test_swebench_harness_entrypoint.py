@@ -70,6 +70,10 @@ class HarnessEntrypointTests(unittest.TestCase):
                 "assert sys.argv[rollout + 1] == '16', sys.argv\n"
                 "stop=sys.argv.index('--compaction-rollout-stop-probability-percent')\n"
                 "assert sys.argv[stop + 1] == '10', sys.argv\n"
+                "high=sys.argv.index('--compaction-neutral-high-watermark-tokens')\n"
+                "assert sys.argv[high + 1] == '0', sys.argv\n"
+                "low=sys.argv.index('--compaction-neutral-low-watermark-tokens')\n"
+                "assert sys.argv[low + 1] == '0', sys.argv\n"
                 "pathlib.Path('file.txt').write_text('after\\n')\n"
             )
             binary.chmod(0o755)
@@ -79,7 +83,9 @@ class HarnessEntrypointTests(unittest.TestCase):
                        BENCHMARK_WORKSPACE=str(repo), CARRY_COMPACTION_POLICY="disabled",
                        CARRY_KEEP_LEASE_TURNS="8", CARRY_COMPACTION_PAYOFF_REQUESTS="5",
                        CARRY_COMPACTION_ROLLOUT_SAMPLES="16",
-                       CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT="10")
+                       CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT="10",
+                       CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS="0",
+                       CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS="0")
             run = subprocess.run(
                 ["python3", str(ENTRYPOINT), "run", "--harness", "carry",
                  "--model", "model", "--reasoning", "medium",

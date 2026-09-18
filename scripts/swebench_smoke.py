@@ -402,6 +402,12 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
     config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"] = values.get(
         "CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT", "10"
     )
+    config["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"] = values.get(
+        "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS", "32768"
+    )
+    config["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"] = values.get(
+        "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS", "24576"
+    )
     if config["CARRY_COMPACTION_POLICY"] not in {"economic", "disabled"}:
         raise ValueError("CARRY_COMPACTION_POLICY must be economic or disabled")
     if config["CARRY_KEEP_LEASE_TURNS"] and (
@@ -421,6 +427,12 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
             or not config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"].isdecimal()
             or int(config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"]) > 100):
         raise ValueError("CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT must be an ASCII decimal integer from 0 through 100")
+    for key in ("CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS", "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"):
+        if not config[key].isascii() or not config[key].isdecimal():
+            raise ValueError(f"{key} must be an ASCII decimal integer")
+    if (int(config["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"])
+            > int(config["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"])):
+        raise ValueError("CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS must not exceed CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS")
     if not DIGEST_IMAGE.fullmatch(config["BASE_IMAGE"]):
         raise ValueError("BASE_IMAGE must use an immutable sha256 digest")
     for key in ("CODEX_VERSION", "PI_VERSION"):
@@ -596,6 +608,8 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
         "--env", "CARRY_COMPACTION_PAYOFF_REQUESTS",
         "--env", "CARRY_COMPACTION_ROLLOUT_SAMPLES",
         "--env", "CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT",
+        "--env", "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS",
+        "--env", "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS",
         "--env", f"AGENT_COMMAND={AGENT_COMMANDS[harness]}",
         "--env", "BENCHMARK_WORKSPACE=/testbed",
         "--env", "HOME=/agent-home", "--env", "XDG_CONFIG_HOME=/agent-home/.config",
@@ -2243,6 +2257,8 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "carry_compaction_payoff_requests": validated["CARRY_COMPACTION_PAYOFF_REQUESTS"],
         "carry_compaction_rollout_samples": validated["CARRY_COMPACTION_ROLLOUT_SAMPLES"],
         "carry_compaction_rollout_stop_probability_percent": validated["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"],
+        "carry_compaction_neutral_high_watermark_tokens": validated["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"],
+        "carry_compaction_neutral_low_watermark_tokens": validated["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"],
         "images": {},
         "mode": mode, "harnesses": list(harnesses), "phase": "planned",
         "pricing_usd_per_million": pricing,

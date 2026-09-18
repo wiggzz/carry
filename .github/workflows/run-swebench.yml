@@ -52,6 +52,16 @@ on:
         required: true
         default: "10"
         type: string
+      carry_compaction_neutral_high_watermark_tokens:
+        description: Carry neutral working-set high watermark in tokens; zero disables the retained-neutral budget
+        required: true
+        default: "32768"
+        type: string
+      carry_compaction_neutral_low_watermark_tokens:
+        description: Carry neutral working-set target after compaction; must not exceed the high watermark
+        required: true
+        default: "24576"
+        type: string
       catalog_digest:
         description: Immutable prepare-50 catalog digest (sha256:... or 64 lowercase hex); required for model-bearing modes
         required: false
@@ -137,6 +147,8 @@ jobs:
       CARRY_COMPACTION_PAYOFF_REQUESTS: ${{ inputs.carry_compaction_payoff_requests }}
       CARRY_COMPACTION_ROLLOUT_SAMPLES: ${{ inputs.carry_compaction_rollout_samples }}
       CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT: ${{ inputs.carry_compaction_rollout_stop_probability_percent }}
+      CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS: ${{ inputs.carry_compaction_neutral_high_watermark_tokens }}
+      CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS: ${{ inputs.carry_compaction_neutral_low_watermark_tokens }}
       MODEL: ${{ vars.BENCHMARK_MODEL || 'gpt-5.6-luna' }}
       REASONING: ${{ vars.BENCHMARK_REASONING || 'medium' }}
     steps:
@@ -294,6 +306,11 @@ jobs:
               echo "carry compaction rollout stop probability must be an integer from 0 through 100" >&2
               exit 1
             }
+            [[ "$CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS" =~ ^[0-9]+$ && "$CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS" =~ ^[0-9]+$ ]] \
+              && (( CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS <= CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS )) || {
+              echo "carry neutral compaction watermarks must be nonnegative integers with low not exceeding high" >&2
+              exit 1
+            }
             [[ -z "$CARRY_KEEP_LEASE_TURNS" || "$CARRY_KEEP_LEASE_TURNS" =~ ^[1-9][0-9]*$ ]] || {
               echo "carry keep lease turns must be blank or a positive integer" >&2
               exit 1
@@ -412,6 +429,8 @@ jobs:
           CARRY_COMPACTION_PAYOFF_REQUESTS="$CARRY_COMPACTION_PAYOFF_REQUESTS" \
           CARRY_COMPACTION_ROLLOUT_SAMPLES="$CARRY_COMPACTION_ROLLOUT_SAMPLES" \
           CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT="$CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT" \
+          CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS="$CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS" \
+          CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS="$CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS" \
           BOOTSTRAP_WAIT_SECONDS="$BOOTSTRAP_WAIT_SECONDS" RUN_ID="$RUN_ID" MODEL="$MODEL" \
           REASONING="$REASONING" TASK_IMAGE_REPOSITORY="$TASK_IMAGE_REPOSITORY" \
           TASK_IMAGE_CATALOG="$TASK_IMAGE_CATALOG" python3 - "$BOOTSTRAP_CONFIG_FILE" <<'PY'
@@ -426,7 +445,8 @@ jobs:
               **{key: os.environ[key] for key in (
                   'SOURCE_SHA256', 'SOURCE_COMMIT', 'BENCHMARK_MODE', 'BENCHMARK_HARNESS',
                   'BENCHMARK_ATTEMPT', 'BENCHMARK_ATTEMPTS', 'CARRY_COMPACTION_POLICY', 'CARRY_KEEP_LEASE_TURNS',
-                  'CARRY_COMPACTION_PAYOFF_REQUESTS', 'CARRY_COMPACTION_ROLLOUT_SAMPLES', 'CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT', 'BOOTSTRAP_WAIT_SECONDS', 'RUN_ID',
+                  'CARRY_COMPACTION_PAYOFF_REQUESTS', 'CARRY_COMPACTION_ROLLOUT_SAMPLES', 'CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT',
+                  'CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS', 'CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS', 'BOOTSTRAP_WAIT_SECONDS', 'RUN_ID',
                   'MODEL', 'REASONING', 'TASK_IMAGE_REPOSITORY', 'TASK_IMAGE_CATALOG')},
           }
           with open(sys.argv[1], 'w', encoding='utf-8') as stream:

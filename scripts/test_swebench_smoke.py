@@ -42,6 +42,13 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(config["CARRY_COMPACTION_PAYOFF_REQUESTS"], "1")
         self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "0")
         self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"], "10")
+        self.assertEqual(config["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"], "32768")
+        self.assertEqual(config["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"], "24576")
+        no_neutral_budget = self.worker.validate_config(
+            dict(valid, CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS="0", CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS="0")
+        )
+        self.assertEqual(no_neutral_budget["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"], "0")
+        self.assertEqual(no_neutral_budget["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"], "0")
         rollout = self.worker.validate_config(
             dict(valid, CARRY_COMPACTION_ROLLOUT_SAMPLES="16")
         )
@@ -54,6 +61,10 @@ class SmokeWorkerTests(unittest.TestCase):
             bad[key] = value
             with self.assertRaises(ValueError):
                 self.worker.validate_config(bad)
+        with self.assertRaises(ValueError):
+            self.worker.validate_config(
+                dict(valid, CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS="0", CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS="1")
+            )
 
     def test_proxy_round_usage_records_maximum_and_non_monotonic_inputs(self):
         log = "noise\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 120}\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 90}\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 180}\n"
