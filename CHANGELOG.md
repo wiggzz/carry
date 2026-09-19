@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.10.0](https://github.com/wiggzz/carry/compare/v0.9.0...v0.10.0) (2026-09-19)
+
+
+### Features
+
+* **compaction:** add paired rollout policy ([#114](https://github.com/wiggzz/carry/issues/114)) ([ebb4f0a](https://github.com/wiggzz/carry/commit/ebb4f0ad2b413bc16e582679df4be3f689bf3675))
+* **context:** gate keep-lease review by planner ([#116](https://github.com/wiggzz/carry/issues/116)) ([3211310](https://github.com/wiggzz/carry/commit/32113105f11e49627acb7307b3b8e2111733066b))
+
+
+### Bug Fixes
+
+* **benchmark:** account timed-out Carry usage ([#117](https://github.com/wiggzz/carry/issues/117)) ([af6d913](https://github.com/wiggzz/carry/commit/af6d9136b74a42734b3490fa5c74fa5acf22d88b))
+
 ## [0.9.0](https://github.com/wiggzz/carry/compare/v0.8.2...v0.9.0) (2026-09-15)
 
 
