@@ -334,7 +334,7 @@ jobs:
               [[ -n "${!required}" ]] || { echo "missing preparation configuration: $required" >&2; exit 1; }
             done
           fi
-          if [[ "$BENCHMARK_MODE" == official-50 ]]; then
+          if [[ "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 ]]; then
             [[ "$BENCHMARK_ATTEMPTS" =~ ^[1-9][0-9]*$ && "$BENCHMARK_ATTEMPT" =~ ^[1-9][0-9]*$ ]] \
               && (( BENCHMARK_ATTEMPTS <= 10 && BENCHMARK_ATTEMPT <= BENCHMARK_ATTEMPTS )) || {
               echo "official-50 attempts must be 1-10 and include this worker attempt" >&2; exit 1;
@@ -412,7 +412,7 @@ jobs:
             fi
             RESULT_URL=$(python3 scripts/presign_s3.py put "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 3600)
             RESULT_GET_URL=$(python3 scripts/presign_s3.py get "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 3600)
-            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == official-50 ]]; then
+            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 ]]; then
               CONTROL_URL=$(python3 scripts/presign_s3.py get "$ARTIFACT_BUCKET" "$PREFIX/control.json" --expires 3600)
               CONTROL_URL="$CONTROL_URL" RESULT_URL="$RESULT_URL" python3 - "$RUNNER_TEMP/control.json" <<'PY'
           import json, os, sys
@@ -507,7 +507,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p benchmark-artifact
-          if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == official-50 ]]; then
+          if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 ]]; then
             # Allow twenty minutes for EC2 launch/boot around the worker's
             # five-and-a-quarter-hour wall clock; preserve twenty-five minutes
             # of the six-hour job for result validation and exact cleanup.
@@ -567,7 +567,7 @@ jobs:
             fi
             rm -f benchmark-artifact/results.tar.gz.tmp
             stream_progress
-            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == session-20 ]] && (( SECONDS >= next_rotation )); then
+            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 || "$BENCHMARK_MODE" == session-20 ]] && (( SECONDS >= next_rotation )); then
               if rotate_capabilities; then
                 next_rotation=$((SECONDS + 1500))
               else
@@ -650,9 +650,10 @@ jobs:
             exit 1
           }
           python3 - <<'PY'
-          import json, re
+          import json, os, re
           report=json.load(open('benchmark-artifact/preparation-report.json', encoding='utf-8'))
-          frozen=json.load(open('benchmarks/swe-bench-verified-50.json', encoding='utf-8'))['instance_ids']
+          manifest='benchmarks/swe-bench-verified-long-trajectory-50.json' if os.environ['BENCHMARK_MODE']=='prepare-long-50' else 'benchmarks/swe-bench-verified-50.json'
+          frozen=json.load(open(manifest, encoding='utf-8'))['instance_ids']
           assert report['schema']=='carry.swebench-task-catalog.v1'
           assert report['phase']=='complete'
           assert re.fullmatch(r'.+@sha256:[0-9a-f]{64}', report['catalog_reference'])
