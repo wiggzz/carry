@@ -290,10 +290,17 @@ impl ContextState {
                 item_ids: Vec::new(),
             };
         }
-        let fresh_host = self
-            .items
-            .last()
-            .is_some_and(|item| item.id == host_id && item.kind == ContextItemKind::Tool);
+        let Some(host_index) = self.items.iter().position(|item| item.id == host_id) else {
+            return KeepLeaseReview {
+                item_ids: Vec::new(),
+            };
+        };
+        let fresh_host = self.items[host_index].kind == ContextItemKind::Tool
+            && self.items[host_index + 1..].iter().all(|item| {
+                item.memory
+                    .as_ref()
+                    .is_some_and(|memory| memory.source_id == host_id)
+            });
         if !fresh_host {
             return KeepLeaseReview {
                 item_ids: Vec::new(),
