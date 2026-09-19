@@ -83,14 +83,33 @@ def load_agent_usage(harness: str, output: pathlib.Path) -> dict[str, int]:
     usage = empty_usage()
     if harness == "carry":
         path = output / "result.json"
-        if not path.is_file():
+        if path.is_file():
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8")).get("usage", {})
+            except (OSError, json.JSONDecodeError):
+                raw = {}
+            if isinstance(raw, dict) and any(key in raw for key in USAGE_KEYS):
+                return {key: _nonnegative_int(raw.get(key)) for key in USAGE_KEYS}
+        trace = output / "trace.jsonl"
+        if not trace.is_file():
             return usage
         try:
-            raw = json.loads(path.read_text(encoding="utf-8")).get("usage", {})
-        except (OSError, json.JSONDecodeError):
+            lines = trace.read_text(encoding="utf-8").splitlines()
+        except OSError:
             return usage
-        if isinstance(raw, dict):
-            return {key: _nonnegative_int(raw.get(key)) for key in USAGE_KEYS}
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict) or event.get("event") != "model_response":
+                continue
+            data = event.get("data", {})
+            raw = data.get("usage", {}) if isinstance(data, dict) else {}
+            if not isinstance(raw, dict):
+                continue
+            for key in USAGE_KEYS:
+                usage[key] += _nonnegative_int(raw.get(key))
         return usage
 
     path = output / "trace.log"
@@ -1613,14 +1632,21 @@ def status_for_official_outcome(instance_id: str, outcomes: Mapping[str, set[str
     return "evaluation-incomplete"
 
 
+def is_terminal_timeout_failure(record: Mapping[str, Any]) -> bool:
+    return (
+        record.get("status") == "agent-failed"
+        and record.get("timed_out") is True
+        and record.get("phase_budget_limited") is not True
+    )
+
+
 def apply_official_outcomes(
     records: list[dict[str, Any]], outcomes: Mapping[str, set[str]]
 ) -> None:
-    """Apply grading and terminal task timeouts to official benchmark slots."""
+    """Apply grading while preserving ordinary task timeouts as terminal failures."""
     for record in records:
-        if record.get("status") == "agent-failed" and record.get("timed_out") is True:
+        if is_terminal_timeout_failure(record):
             record["resolved"] = False
-            record["status"] = "task-timeout"
             continue
         if record.get("status") != "agent-completed":
             continue
@@ -1631,7 +1657,11 @@ def apply_official_outcomes(
 
 def official_evaluation_unknowns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
-        (record for record in records if record.get("status") not in {"evaluated", "empty-patch", "task-timeout"}),
+        (
+            record for record in records
+            if record.get("status") not in {"evaluated", "empty-patch", "task-timeout"}
+            and not is_terminal_timeout_failure(record)
+        ),
         key=lambda record: (record["instance_id"], record["harness"]),
     )
 
