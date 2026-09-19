@@ -13,6 +13,7 @@ import sys
 import tempfile
 import types
 import unittest
+import yaml
 import zlib
 from unittest import mock
 
@@ -42,6 +43,13 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(config["CARRY_COMPACTION_PAYOFF_REQUESTS"], "1")
         self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "0")
         self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"], "10")
+        self.assertEqual(config["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"], "0")
+        self.assertEqual(config["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"], "0")
+        configured_budget = self.worker.validate_config(
+            dict(valid, CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS="32768", CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS="24576")
+        )
+        self.assertEqual(configured_budget["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"], "32768")
+        self.assertEqual(configured_budget["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"], "24576")
         rollout = self.worker.validate_config(
             dict(valid, CARRY_COMPACTION_ROLLOUT_SAMPLES="16")
         )
@@ -54,6 +62,17 @@ class SmokeWorkerTests(unittest.TestCase):
             bad[key] = value
             with self.assertRaises(ValueError):
                 self.worker.validate_config(bad)
+        with self.assertRaises(ValueError):
+            self.worker.validate_config(
+                dict(valid, CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS="0", CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS="1")
+            )
+
+    def test_workflow_defaults_neutral_watermarks_to_zero(self):
+        workflow = pathlib.Path(__file__).parents[1] / ".github" / "workflows" / "run-swebench.yml"
+        contents = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        inputs = contents[True]["workflow_dispatch"]["inputs"]
+        self.assertEqual(inputs["carry_compaction_neutral_high_watermark_tokens"]["default"], "0")
+        self.assertEqual(inputs["carry_compaction_neutral_low_watermark_tokens"]["default"], "0")
 
     def test_proxy_round_usage_records_maximum_and_non_monotonic_inputs(self):
         log = "noise\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 120}\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 90}\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 180}\n"

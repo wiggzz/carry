@@ -17,8 +17,8 @@ use tokio::{
 
 use crate::{
     context::{
-        CompactionPolicy, ContextState, FlatRolloutConfig, PricedBreakpoint, RenderedBreakpoint,
-        meets_rollout_payback_threshold,
+        CompactionPlan, CompactionPolicy, ContextState, FlatRolloutConfig, FlatRolloutEstimate,
+        PricedBreakpoint, RenderedBreakpoint, meets_rollout_payback_threshold,
     },
     log::RunLogger,
     openai::{
@@ -28,26 +28,19 @@ use crate::{
     protocol::{ActionKind, Step},
 };
 
-// Initial policy hypothesis: keep a meaningful recent working set while leaving ample room in
-// the model context. Hysteresis compacts this 32 Ki-token high-water mark toward 24 Ki tokens.
-const ELIGIBLE_CONTEXT_BUDGET_TOKENS: usize = 32 * 1024;
-
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
-At each step, select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
+Make task progress first: understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. When practical, identify the root cause and make the smallest correct fix at the appropriate layer; use local history to investigate regressions when it is available. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
 
-History is a working set, not a complete transcript. Human-authored content is kept by default. All other context is eligible for removal when it no longer fits the working set. After the first removal, a history-status item states that earlier context has been removed.
-
-At each step:
-1. First, determine the next immediate step toward the goal and perform the highest-priority action.
-2. Then, as secondary housekeeping, preserve task-critical working state from recently added visible context. This is required, not optional cleanup: protect exact facts, decisions, constraints, diagnoses, and verified results that will matter to later work. If you learned anything from an item that is not already preserved elsewhere, protect it. If only a concise learning must remain, remember the learning and make its bulky source removable. Make an item removable only when it taught you nothing or everything learned from it is preserved elsewhere. Finishing an action or encountering a failure does not by itself preserve its learning.
-
-Retention decisions persist until reversed or applied by compaction. Preserve outcomes, not chain-of-thought.
+Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
 
 Large stdout and stderr results arrive in separate structured sections. Each text payload is unmodified; truncation, encoding, and artifact-path metadata are outside that payload. Read or slice the relevant stdout/stderr artifact when omitted details matter.
 
-Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
-"#;
+History is a working set, not a complete transcript. Human-authored content is kept by default. All other context is eligible for removal when it no longer fits the working set. After the first removal, a history-status item states that earlier context has been removed.
+
+As required secondary housekeeping, preserve task-critical working state from recently added visible context. This is required, not optional cleanup: protect exact facts, decisions, constraints, diagnoses, and verified results that will matter to later work. If you learned anything from an item that is not already preserved elsewhere, protect it. If only a concise learning must remain, remember it and leave its bulky source removable, or mark it removable if it was protected. Leave or mark an item removable only when it taught you nothing or everything learned from it is preserved elsewhere. Finishing an action or encountering a failure does not by itself preserve its learning.
+
+Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise. Preserve outcomes, not chain-of-thought."#;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +66,10 @@ pub struct RunConfig {
     pub compaction_rollout_samples: u32,
     /// Per simulated future turn probability (percent) that the task ends.
     pub compaction_rollout_stop_probability_percent: u8,
+    /// Eligible neutral token high-water mark before automatic compaction.
+    pub compaction_neutral_high_watermark_tokens: usize,
+    /// Eligible neutral token target after automatic compaction.
+    pub compaction_neutral_low_watermark_tokens: usize,
     pub resume_context: Option<ContextState>,
     pub resume_source: Option<PathBuf>,
     /// Stable provider cache affinity, retained with the resumable state.
@@ -699,7 +696,7 @@ async fn run_loop(
             "economic"
         };
         if config.compaction_mode == CompactionMode::Economic && (!resumed || sent_model_request) {
-            maybe_compact(
+            let compacted = maybe_compact(
                 &mut context_state,
                 &protected_until_request,
                 &mut cache,
@@ -708,6 +705,31 @@ async fn run_loop(
                 &config,
                 trigger,
             )?;
+            if !compacted
+                && config.keep_lease_turns.is_some()
+                && let Some((virtual_release, virtually_released_ids)) =
+                    context_state.virtual_release_due_keep_leases()
+            {
+                let virtual_protected = protected_until_request
+                    .iter()
+                    .copied()
+                    .filter(|id| !virtually_released_ids.contains(id))
+                    .collect::<Vec<_>>();
+                if select_compaction_plan(&virtual_release, &virtual_protected, &cache, &config)
+                    .is_some()
+                {
+                    let review = context_state.attach_due_keep_lease_review();
+                    if !review.item_ids.is_empty() {
+                        logger.raw_event_silent(
+                            "retention_revalidation_requested",
+                            json!({
+                                "item_ids": review.item_ids,
+                                "selection_scope": "all_due_virtual_release"
+                            }),
+                        )?;
+                    }
+                }
+            }
             persist_context_checkpoint(&config, &context_state)?;
         }
         step_index += 1;
@@ -845,18 +867,6 @@ async fn run_loop(
                 } else {
                     Vec::new()
                 };
-                if let Some(lease_turns) = config.keep_lease_turns
-                    && context_state.retention_turn().is_multiple_of(lease_turns)
-                {
-                    let review = context_state.attach_due_keep_lease_review();
-                    if !review.item_ids.is_empty() {
-                        protected_until_request.extend(review.item_ids.iter().copied());
-                        logger.raw_event_silent(
-                            "retention_revalidation_requested",
-                            json!({"item_ids": review.item_ids}),
-                        )?;
-                    }
-                }
                 protected_until_request.push(item_id);
                 protected_until_request.extend(signals.added.iter().copied());
                 logger.raw_event_silent(
@@ -1006,6 +1016,51 @@ fn append_user_message(
     persist_context_checkpoint(config, state)
 }
 
+fn select_compaction_plan(
+    state: &ContextState,
+    protected: &[u64],
+    cache: &CacheTracker,
+    config: &RunConfig,
+) -> Option<(CompactionPlan, Option<FlatRolloutEstimate>)> {
+    let policy = cache.policy_for_history(&state.input_items(), config.compaction_payoff_requests);
+    if config.compaction_rollout_samples > 0 {
+        let rollout_config = FlatRolloutConfig {
+            samples: config.compaction_rollout_samples,
+            horizon: config.compaction_payoff_requests,
+            seed: 0,
+            stop_probability_percent: config.compaction_rollout_stop_probability_percent,
+        };
+        state
+            .compaction_candidates_with_neutral_watermarks(
+                protected,
+                policy.clone(),
+                config.compaction_neutral_high_watermark_tokens,
+                config.compaction_neutral_low_watermark_tokens,
+            )
+            .into_iter()
+            .map(|plan| {
+                let rollout =
+                    state.flat_rollout_estimate(&plan, protected, policy.clone(), rollout_config);
+                (plan, rollout)
+            })
+            .filter(|(_, rollout)| meets_rollout_payback_threshold(rollout))
+            .max_by(|(_, left), (_, right)| {
+                left.expected_savings_input_units
+                    .total_cmp(&right.expected_savings_input_units)
+            })
+            .map(|(plan, rollout)| (plan, Some(rollout)))
+    } else {
+        state
+            .plan_compaction_with_neutral_watermarks(
+                protected,
+                policy,
+                config.compaction_neutral_high_watermark_tokens,
+                config.compaction_neutral_low_watermark_tokens,
+            )
+            .map(|plan| (plan, None))
+    }
+}
+
 fn maybe_compact(
     state: &mut ContextState,
     protected: &[u64],
@@ -1015,43 +1070,8 @@ fn maybe_compact(
     config: &RunConfig,
     trigger: &str,
 ) -> Result<bool> {
-    let policy = cache.policy_for_history(&state.input_items(), config.compaction_payoff_requests);
-    let (plan, rollout) = if config.compaction_rollout_samples > 0 {
-        let config = FlatRolloutConfig {
-            samples: config.compaction_rollout_samples,
-            horizon: config.compaction_payoff_requests,
-            seed: 0,
-            stop_probability_percent: config.compaction_rollout_stop_probability_percent,
-        };
-        let Some((plan, rollout)) = state
-            .compaction_candidates_with_neutral_budget(
-                protected,
-                policy.clone(),
-                ELIGIBLE_CONTEXT_BUDGET_TOKENS,
-            )
-            .into_iter()
-            .map(|plan| {
-                let rollout = state.flat_rollout_estimate(&plan, protected, policy.clone(), config);
-                (plan, rollout)
-            })
-            .filter(|(_, rollout)| meets_rollout_payback_threshold(rollout))
-            .max_by(|(_, left), (_, right)| {
-                left.expected_savings_input_units
-                    .total_cmp(&right.expected_savings_input_units)
-            })
-        else {
-            return Ok(false);
-        };
-        (plan, Some(rollout))
-    } else {
-        let Some(plan) = state.plan_compaction_with_neutral_budget(
-            protected,
-            policy.clone(),
-            ELIGIBLE_CONTEXT_BUDGET_TOKENS,
-        ) else {
-            return Ok(false);
-        };
-        (plan, None)
+    let Some((plan, rollout)) = select_compaction_plan(state, protected, cache, config) else {
+        return Ok(false);
     };
     let change = state.compact(plan);
     cache.mark_compaction(&change.invalidated_generations);
@@ -1618,17 +1638,25 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_requires_reproduction_without_soliciting_future_fixes() {
+    fn system_prompt_requires_reproduction_and_root_cause_investigation() {
         assert!(SYSTEM_PROMPT.contains("minimal failing reproduction"));
         assert!(SYSTEM_PROMPT.contains("affected tests"));
+        assert!(SYSTEM_PROMPT.contains(
+            "identify the root cause and make the smallest correct fix at the appropriate layer"
+        ));
+        assert!(SYSTEM_PROMPT.contains("use local history to investigate regressions"));
         assert!(!SYSTEM_PROMPT.contains("later fixes"));
         assert!(!SYSTEM_PROMPT.contains("upstream fix"));
     }
 
     #[test]
-    fn system_prompt_prioritizes_action_and_requires_critical_state_preservation() {
-        assert!(SYSTEM_PROMPT.contains("First, determine the next immediate step"));
-        assert!(SYSTEM_PROMPT.contains("Then, as secondary housekeeping"));
+    fn system_prompt_prioritizes_task_progress_and_requires_critical_state_preservation() {
+        assert!(SYSTEM_PROMPT.contains("Make task progress first"));
+        assert!(SYSTEM_PROMPT.contains("As required secondary housekeeping"));
+        assert!(
+            SYSTEM_PROMPT.find("Make task progress first")
+                < SYSTEM_PROMPT.find("As required secondary housekeeping")
+        );
         assert!(SYSTEM_PROMPT.contains("task-critical working state"));
         assert!(SYSTEM_PROMPT.contains("This is required, not optional cleanup"));
         assert!(
@@ -1637,10 +1665,17 @@ mod tests {
         );
         assert!(SYSTEM_PROMPT.contains("If you learned anything"));
         assert!(SYSTEM_PROMPT.contains("not already preserved elsewhere"));
-        assert!(SYSTEM_PROMPT.contains("remember the learning"));
+        assert!(SYSTEM_PROMPT.contains("remember it"));
         assert!(SYSTEM_PROMPT.contains("History is a working set"));
         assert!(SYSTEM_PROMPT.contains("Human-authored content is kept by default"));
         assert!(SYSTEM_PROMPT.contains("All other context is eligible for removal"));
+        assert!(!SYSTEM_PROMPT.contains("Select one action"));
+        assert!(!SYSTEM_PROMPT.contains("At each step:"));
+        assert!(SYSTEM_PROMPT.contains("leave its bulky source removable"));
+        assert!(SYSTEM_PROMPT.contains("or mark it removable if it was protected"));
+        assert!(SYSTEM_PROMPT.contains("Leave or mark an item removable only"));
+        assert!(SYSTEM_PROMPT.contains("or explicitly noted otherwise"));
+        assert!(!SYSTEM_PROMPT.contains("Make an item removable only"));
         assert!(!SYSTEM_PROMPT.contains("stable"));
         assert!(!SYSTEM_PROMPT.contains("volatile"));
     }
@@ -2100,7 +2135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keep_lease_review_extends_cached_request_history_without_rewrite() {
+    async fn keep_lease_review_is_planner_gated_and_cache_safe() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let session_dir = temp.path().join("run");
@@ -2124,11 +2159,13 @@ mod tests {
                 model: "scripted".into(),
                 max_steps: Some(3),
                 shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Disabled,
+                compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: Some(1),
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2149,18 +2186,23 @@ mod tests {
             .map(|event| event["data"]["history"].as_array().unwrap().clone())
             .collect::<Vec<_>>();
         assert_eq!(histories.len(), 3);
-        for pair in histories.windows(2) {
-            assert_eq!(pair[1][..pair[0].len()], pair[0]);
-        }
-        let third = &histories[2];
-        let review_in_tool_result = third.iter().any(|item| {
-            item["type"] == "function_call_output"
-                && item["output"].as_str().is_some_and(|output| {
-                    output.contains("Previously protected items 2 may be removed soon")
+        let review_index = histories
+            .iter()
+            .position(|history| {
+                history.iter().any(|item| {
+                    item["type"] == "function_call_output"
+                        && item["output"]
+                            .as_str()
+                            .is_some_and(|output| output.contains("Review protected items: IDs 2"))
                 })
-        });
-        assert!(review_in_tool_result);
-        assert!(!third.iter().any(|item| {
+            })
+            .expect("planner-qualified lease review should be rendered in a tool result");
+        assert!(review_index > 0);
+        assert_eq!(
+            histories[review_index][..histories[review_index - 1].len()],
+            histories[review_index - 1]
+        );
+        assert!(!histories[review_index].iter().any(|item| {
             item["role"] == "developer" && item["content"].to_string().contains("Retention review")
         }));
     }
@@ -2216,6 +2258,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2280,6 +2324,8 @@ mod tests {
                 compaction_payoff_requests: 5,
                 compaction_rollout_samples: 4,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: Some(context),
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2339,6 +2385,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2424,6 +2472,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("resumable-cache-affinity".into()),
@@ -2448,6 +2498,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: Some(resume.context),
                 resume_source: Some(first_session),
                 prompt_cache_key,
@@ -2515,6 +2567,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2560,6 +2614,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2620,6 +2676,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2714,6 +2772,8 @@ mod tests {
                 compaction_payoff_requests: 1,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,

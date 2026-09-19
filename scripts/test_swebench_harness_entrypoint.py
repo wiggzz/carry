@@ -45,7 +45,7 @@ class HarnessEntrypointTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn("+after", (output / "final.patch").read_text())
 
-    def test_carry_forwards_compaction_policy_and_keep_lease_to_native_cli(self):
+    def test_carry_defaults_neutral_watermarks_to_zero(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             repo, prompt_dir, output = root / "repo", root / "input", root / "output"
@@ -70,6 +70,10 @@ class HarnessEntrypointTests(unittest.TestCase):
                 "assert sys.argv[rollout + 1] == '16', sys.argv\n"
                 "stop=sys.argv.index('--compaction-rollout-stop-probability-percent')\n"
                 "assert sys.argv[stop + 1] == '10', sys.argv\n"
+                "high=sys.argv.index('--compaction-neutral-high-watermark-tokens')\n"
+                "assert sys.argv[high + 1] == '0', sys.argv\n"
+                "low=sys.argv.index('--compaction-neutral-low-watermark-tokens')\n"
+                "assert sys.argv[low + 1] == '0', sys.argv\n"
                 "pathlib.Path('file.txt').write_text('after\\n')\n"
             )
             binary.chmod(0o755)

@@ -11,7 +11,9 @@ const CACHE_READ_RATE: f64 = 0.10;
 const CACHE_WRITE_RATE: f64 = 1.25;
 const COMPACTION_MIN_PAYBACK_RATIO: f64 = 0.10;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
+#[cfg(test)]
 const NEUTRAL_TARGET_NUMERATOR: usize = 3;
+#[cfg(test)]
 const NEUTRAL_TARGET_DENOMINATOR: usize = 4;
 const HISTORY_COMPACTED_STATUS: &str =
     "[history status: earlier context has been removed by compaction]";
@@ -243,10 +245,6 @@ impl ContextState {
         self.retention_turn = self.retention_turn.saturating_add(1);
     }
 
-    pub fn retention_turn(&self) -> u64 {
-        self.retention_turn
-    }
-
     pub fn arm_keep_leases(&mut self, ids: &[u64], turns: u64) {
         if turns == 0 {
             return;
@@ -260,24 +258,56 @@ impl ContextState {
         }
     }
 
-    /// At a sweep, attach one immutable review to the newest completed tool block.
-    /// The review is resolved only after the next model response has seen it.
+    /// Return a metadata-only view in which every due, non-human lease is releasable.
+    /// The source state is unchanged; callers use this only to ask whether a release wave
+    /// could make the normal compaction planner worthwhile.
+    pub(crate) fn virtual_release_due_keep_leases(&self) -> Option<(Self, Vec<u64>)> {
+        let mut released = self.clone();
+        let mut released_ids = Vec::new();
+        for item in &mut released.items {
+            let due = item
+                .keep_lease_expires_at_turn
+                .is_some_and(|expires_at| expires_at <= released.retention_turn);
+            if item.kind != ContextItemKind::User && item.signal != RetentionSignal::Drop && due {
+                item.signal = RetentionSignal::Drop;
+                item.retention = Retention::Eligible;
+                released_ids.push(item.id);
+            }
+        }
+        (!released_ids.is_empty()).then_some((released, released_ids))
+    }
+
+    /// Attach one cache-safe review for the four largest due leases. The review is
+    /// resolved only after the next model response has seen it.
     pub fn attach_due_keep_lease_review(&mut self) -> KeepLeaseReview {
+        const MAX_REVIEWED_KEEP_LEASES: usize = 4;
+
         if !self.pending_keep_lease_review.is_empty() {
             return KeepLeaseReview {
                 item_ids: Vec::new(),
             };
         }
-        let item_ids = self
+        let mut due = self
             .items
             .iter()
             .filter(|item| {
-                item.signal != RetentionSignal::Drop
+                item.kind != ContextItemKind::User
+                    && item.signal != RetentionSignal::Drop
                     && item
                         .keep_lease_expires_at_turn
                         .is_some_and(|expires_at| expires_at <= self.retention_turn)
             })
-            .map(|item| item.id)
+            .map(|item| (item.id, item.bytes))
+            .collect::<Vec<_>>();
+        due.sort_unstable_by(|(left_id, left_bytes), (right_id, right_bytes)| {
+            right_bytes
+                .cmp(left_bytes)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let item_ids = due
+            .into_iter()
+            .take(MAX_REVIEWED_KEEP_LEASES)
+            .map(|(id, _)| id)
             .collect::<Vec<_>>();
         if !item_ids.is_empty() {
             let ids = item_ids
@@ -286,7 +316,7 @@ impl ContextState {
                 .collect::<Vec<_>>()
                 .join(", ");
             let text = format!(
-                "Previously protected items {ids} may be removed soon. If their learnings need to be preserved exactly, protect them. If there are learnings that can be summarized, remember those."
+                "Review protected items: IDs {ids} are expiring. Re-protect only if their information is still needed for this task and either is not represented elsewhere or cannot be accurately captured with context.remember. Otherwise omit them to release them for normal compaction."
             );
             if let Some(item) = self
                 .items
@@ -518,32 +548,59 @@ impl ContextState {
         self.plan_compaction_with_neutral_budget(protected, policy, 0)
     }
 
+    #[cfg(test)]
     pub fn plan_compaction_with_neutral_budget(
         &self,
         protected: &[u64],
         policy: CompactionPolicy,
         neutral_budget_tokens: usize,
     ) -> Option<CompactionPlan> {
-        self.compaction_candidates_with_neutral_budget(protected, policy, neutral_budget_tokens)
-            .into_iter()
-            .filter(|plan| {
-                meets_payback_threshold(
-                    plan.estimated_savings_input_units,
-                    plan.minimum_payback_input_units,
-                )
-            })
-            .max_by(|left, right| {
-                left.estimated_savings_input_units
-                    .total_cmp(&right.estimated_savings_input_units)
-            })
+        let neutral_target_tokens = neutral_budget_tokens.saturating_mul(NEUTRAL_TARGET_NUMERATOR)
+            / NEUTRAL_TARGET_DENOMINATOR;
+        self.plan_compaction_with_neutral_watermarks(
+            protected,
+            policy,
+            neutral_budget_tokens,
+            neutral_target_tokens,
+        )
     }
 
-    pub(crate) fn compaction_candidates_with_neutral_budget(
+    pub fn plan_compaction_with_neutral_watermarks(
         &self,
         protected: &[u64],
         policy: CompactionPolicy,
-        neutral_budget_tokens: usize,
+        neutral_high_watermark_tokens: usize,
+        neutral_low_watermark_tokens: usize,
+    ) -> Option<CompactionPlan> {
+        self.compaction_candidates_with_neutral_watermarks(
+            protected,
+            policy,
+            neutral_high_watermark_tokens,
+            neutral_low_watermark_tokens,
+        )
+        .into_iter()
+        .filter(|plan| {
+            meets_payback_threshold(
+                plan.estimated_savings_input_units,
+                plan.minimum_payback_input_units,
+            )
+        })
+        .max_by(|left, right| {
+            left.estimated_savings_input_units
+                .total_cmp(&right.estimated_savings_input_units)
+        })
+    }
+
+    pub(crate) fn compaction_candidates_with_neutral_watermarks(
+        &self,
+        protected: &[u64],
+        policy: CompactionPolicy,
+        neutral_high_watermark_tokens: usize,
+        neutral_low_watermark_tokens: usize,
     ) -> Vec<CompactionPlan> {
+        assert!(neutral_low_watermark_tokens <= neutral_high_watermark_tokens);
+        let neutral_budget_tokens = neutral_high_watermark_tokens;
+        let neutral_target_tokens = neutral_low_watermark_tokens;
         let protected = protected.iter().copied().collect::<HashSet<_>>();
         let newest_id = self.items.last().map_or(0, |item| item.id);
         // Explicit keep/drop signals remain authoritative. Neutral eligible items compete for
@@ -575,8 +632,6 @@ impl ContextState {
             .fold(0usize, usize::saturating_add);
         // Only cross the neutral high-water mark before collecting neutral items, then compact
         // toward a lower target so one new result does not trigger another compaction next turn.
-        let neutral_target_tokens = neutral_budget_tokens.saturating_mul(NEUTRAL_TARGET_NUMERATOR)
-            / NEUTRAL_TARGET_DENOMINATOR;
         let neutral_over_budget = neutral_total_tokens > neutral_budget_tokens;
         let mut neutral_retained = Vec::new();
         let mut neutral_retained_tokens = neutral
@@ -714,6 +769,7 @@ impl ContextState {
                     &dropped_ids,
                     mean_virtual_item_tokens,
                     plan.neutral_budget_tokens,
+                    plan.neutral_target_tokens,
                     &policy,
                 );
                 keep_cost += simulate_rollout_turn(
@@ -721,6 +777,7 @@ impl ContextState {
                     &dropped_ids,
                     mean_virtual_item_tokens,
                     plan.neutral_budget_tokens,
+                    plan.neutral_target_tokens,
                     &policy,
                 );
                 total_simulated_followup_turns += 1;
@@ -1050,7 +1107,8 @@ fn simulate_rollout_turn(
     state: &mut ContextState,
     dropped_ids: &[u64],
     virtual_item_tokens: usize,
-    neutral_budget_tokens: usize,
+    neutral_high_watermark_tokens: usize,
+    neutral_low_watermark_tokens: usize,
     base_policy: &CompactionPolicy,
 ) -> f64 {
     let cached_before_virtual_item = state.estimated_tokens();
@@ -1074,10 +1132,11 @@ fn simulate_rollout_turn(
     };
     let keep_cost = keep_request_cost(state.estimated_tokens(), &policy);
     let Some(plan) = state
-        .compaction_candidates_with_neutral_budget(
+        .compaction_candidates_with_neutral_watermarks(
             &[virtual_id],
             policy.clone(),
-            neutral_budget_tokens,
+            neutral_high_watermark_tokens,
+            neutral_low_watermark_tokens,
         )
         .into_iter()
         .min_by(|left, right| compact_request_cost(left).total_cmp(&compact_request_cost(right)))
@@ -1526,6 +1585,7 @@ mod tests {
             &[],
             1_000,
             usize::MAX,
+            usize::MAX / 4 * 3,
             &CompactionPolicy {
                 implicit_cached_tokens: 0,
                 breakpoints: Vec::new(),
@@ -1608,6 +1668,35 @@ mod tests {
             vec![newest, middle]
         );
         assert!(plan.neutral_retained[0].score > plan.neutral_retained[1].score);
+    }
+
+    #[test]
+    fn zero_neutral_watermarks_drop_all_eligible_items() {
+        let mut state = ContextState::new("initial".into());
+        let first = add_tool_with_output(&mut state, &"first ".repeat(100));
+        let second = add_tool_with_output(&mut state, &"second ".repeat(100));
+
+        let plan = state
+            .plan_compaction_with_neutral_watermarks(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                    payoff_requests: 1,
+                },
+                0,
+                0,
+            )
+            .expect("zero watermarks should make every eligible item removable");
+
+        assert_eq!(plan.dropped, vec![first, second]);
+        assert!(plan.neutral_retained.is_empty());
+        state.compact(plan);
+        assert!(state.input_items().iter().any(|item| {
+            item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text == "initial")
+        }));
     }
 
     #[test]
@@ -1847,7 +1936,7 @@ mod tests {
         assert!(
             serde_json::to_string(&state.input_items())
                 .unwrap()
-                .contains("Previously protected items")
+                .contains("Review protected items")
         );
 
         let expired = state.resolve_keep_lease_review(&[]);
@@ -1862,6 +1951,55 @@ mod tests {
                 .retention,
             Retention::Eligible
         );
+    }
+
+    #[test]
+    fn virtual_due_lease_release_includes_all_due_items_without_mutating_source() {
+        let mut state = ContextState::new("initial".into());
+        let first = add_tool(&mut state);
+        let second = add_tool(&mut state);
+        let third = add_tool(&mut state);
+        let source = add_tool(&mut state);
+        let change = state.record_signals(&update(&[first, second, third], &[], &[]), source);
+        state.arm_keep_leases(&change.keep, 1);
+        state.advance_retention_turn();
+
+        let (virtual_release, released_ids) = state
+            .virtual_release_due_keep_leases()
+            .expect("all due leases should be released in the virtual planner state");
+
+        assert_eq!(released_ids, vec![first, second, third]);
+        for id in &released_ids {
+            assert_eq!(state.signal_for(*id), Some(RetentionSignal::Keep));
+            assert_eq!(virtual_release.signal_for(*id), Some(RetentionSignal::Drop));
+        }
+    }
+
+    #[test]
+    fn keep_lease_review_batches_four_largest_due_items_and_explains_release() {
+        let mut state = ContextState::new("initial".into());
+        let tiny = add_tool_with_output(&mut state, &"tiny ".repeat(10));
+        let small = add_tool_with_output(&mut state, &"small ".repeat(20));
+        let medium = add_tool_with_output(&mut state, &"medium ".repeat(30));
+        let large = add_tool_with_output(&mut state, &"large ".repeat(40));
+        let largest = add_tool_with_output(&mut state, &"largest ".repeat(50));
+        let source = add_tool(&mut state);
+        let change = state.record_signals(
+            &update(&[tiny, small, medium, large, largest], &[], &[]),
+            source,
+        );
+        state.arm_keep_leases(&change.keep, 1);
+        state.advance_retention_turn();
+
+        let review = state.attach_due_keep_lease_review();
+
+        assert_eq!(review.item_ids, vec![largest, large, medium, small]);
+        let rendered = serde_json::to_string(&state.input_items()).unwrap();
+        assert!(rendered.contains("Review protected items"));
+        assert!(rendered.contains("are expiring"));
+        assert!(rendered.contains("context.remember"));
+        assert!(rendered.contains("release them for normal compaction"));
+        assert!(!rendered.contains(&format!("ID {tiny}")));
     }
 
     #[test]

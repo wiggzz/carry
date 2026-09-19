@@ -39,15 +39,18 @@ Each action makes progress and may attach a sparse context update:
 ```
 
 `protected` and `removable` each accept up to four IDs per turn. Protect an
-item only when it contains learning not represented elsewhere. Mark an item
-removable when it taught nothing, or after its learning has been preserved.
-A later opposite signal reverses the earlier opinion. If both name the same ID
-in one response, protection wins. Unknown and stale IDs are ignored.
+item only when it contains learning not represented elsewhere. Leave eligible
+items unlisted; use `removable` to release an already protected item only when
+it taught nothing, or after its learning has been preserved. A later opposite
+signal reverses the earlier opinion. If both name the same ID in one response,
+protection wins. Unknown and stale IDs are ignored.
 
-`remember` accepts one concise learning per turn. The memory stays associated
-with its source tool result without duplicating the text in the rendered
-history. If a later compaction removes the source but retains the memory, Carry
-materializes the memory as an assistant message with the same ID.
+`remember` accepts one concise learning per turn. When it safely represents a
+bulky source, leave that source eligible or mark it `removable` if it was
+protected. The memory stays associated with its source tool result without
+duplicating the text in the rendered history. If a later compaction removes the
+source but retains the memory, Carry materializes the memory as an assistant
+message with the same ID.
 
 ## Economic compaction
 
@@ -85,6 +88,19 @@ the retained-path payoff cost. This deliberately avoids rewrites that only
 barely repay their cache invalidation. A compaction still begins a new cache
 generation; the model-visible history is otherwise prefix-continuous.
 
+Neutral working-set hysteresis is configurable with
+`--compaction-neutral-high-watermark-tokens N` / `CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS=N`
+and `--compaction-neutral-low-watermark-tokens N` /
+`CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS=N`. Both default to **zero**,
+so Carry retains no ordinary neutral working set after a qualifying compaction.
+The low watermark must not exceed the high watermark. Setting both to `32768`
+and `24576`, respectively, restores the former 32 Ki-token high watermark and
+24 Ki-token post-compaction target. With the zero defaults, every otherwise
+eligible neutral item is a drop candidate at each planner boundary. This does
+not bypass ordinary economic admission, cache-safety, human retention, or
+explicit model protection; it only removes the neutral-budget reason to retain
+an item.
+
 A compaction can remove explicitly removable items and selected neutral volatile
 items, retain protected evidence, preserve chronology, and establish a new
 explicit cache frontier. After the first rewrite that removes history, Carry
@@ -99,26 +115,35 @@ and `trace.jsonl`.
 
 `--keep-lease-turns N` (or `CARRY_KEEP_LEASE_TURNS=N`) is disabled by default.
 When enabled, a model `protected` signal is a lease for `N` later model turns,
-not a permanent lock. Carry sweeps on the persisted `N`-turn cadence (rather
-than on every individual expiry) and batches every due lease into prose appended
-after the *newly completed* tool result. The next model action can renew an ID
-only by naming it again in `protected`; after that action completes, an
-unrenewed reviewed ID becomes neutral and volatile. Expiry is not an implicit
-`removable` decision and never deletes an item by itself—the normal economic
-planner may choose a later whole-round rewrite.
+not a permanent lock. Once one or more leases are due, Carry first asks the
+ordinary planner a metadata-only counterfactual: whether releasing **all** due,
+non-human leases could make a normal rewrite worthwhile. It emits no review
+unless that full release set qualifies, and it never emits a review when
+compaction is disabled.
+
+A qualifying review names at most the four largest due blocks, matching the
+`protected` field's four-ID limit. The concise tool-result annotation directs
+the model to renew an ID only by naming it in `context.protected`; it can use
+`context.remember` for one concise durable learning. Any reviewed ID that is
+not renewed is released from working memory: after the next model response it
+becomes neutral and eligible for the next normal compaction. Unreviewed due
+leases stay protected and due, so a later review advances to the next largest
+set rather than asking the model to decide more IDs than it can renew. Expiry
+is not an implicit `removable` signal and never deletes an item by itself.
 
 A resume and final answer do not independently create a review/status block:
-reviews are emitted only with completed real tool results. The tool result plus
-its optional review is checkpointed as one immutable context block before the
-next provider request, preserving prompt-cache prefix continuity until an
+reviews are attached only to completed real tool results. The tool result plus
+its optional review is checkpointed as one context block before the next
+provider request, preserving prompt-cache prefix continuity until an
 intentional compaction rewrite.
 
 Each `context_compacted` trace event includes `retention_audit`, with every
 pre-rewrite item’s ID, estimated tokens, kept/removed outcome, and reason
 (active lease, expired lease, explicit removable, neutral policy, or stable
-baseline). Lease review and expiry events are also persisted in `trace.jsonl`.
-The review is appended to persisted native context, so it extends the previous
-request history and preserves prompt-cache continuity until a normal rewrite.
+baseline). A `retention_revalidation_requested` event records the reviewed IDs
+and the `all_due_virtual_release` selection scope. The review is appended to
+persisted native context, so it extends the previous request history and
+preserves prompt-cache continuity until a normal rewrite.
 
 ## Session-persistence benchmark mode
 

@@ -19,8 +19,18 @@ IMMUTABLE_PROVENANCE_FIELDS = (
     "dataset", "dataset_revision", "swebench_version", "source_commit", "model", "reasoning",
     "carry_compaction_policy", "carry_keep_lease_turns", "carry_compaction_payoff_requests",
     "carry_compaction_rollout_samples", "carry_compaction_rollout_stop_probability_percent",
+    "carry_compaction_neutral_high_watermark_tokens", "carry_compaction_neutral_low_watermark_tokens",
     "pricing_usd_per_million", "images", "harnesses",
 )
+
+# Reports produced before configurable neutral watermarks existed necessarily used
+# the then-hard-coded hysteresis. Normalize only those absent legacy fields so a
+# historical default-policy study remains mergeable; explicit non-default values
+# still differ from this identity and are rejected.
+LEGACY_NEUTRAL_WATERMARK_DEFAULTS = {
+    "carry_compaction_neutral_high_watermark_tokens": "32768",
+    "carry_compaction_neutral_low_watermark_tokens": "24576",
+}
 
 
 IMMUTABLE_IMAGE_FIELDS = (
@@ -52,12 +62,20 @@ def immutable_images(images: Any) -> dict[str, Any]:
     return normalized
 
 
+def normalize_legacy_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(provenance)
+    for key, value in LEGACY_NEUTRAL_WATERMARK_DEFAULTS.items():
+        normalized.setdefault(key, value)
+    return normalized
+
+
 def immutable_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
-    missing = [key for key in IMMUTABLE_PROVENANCE_FIELDS if key not in provenance]
+    normalized = normalize_legacy_provenance(provenance)
+    missing = [key for key in IMMUTABLE_PROVENANCE_FIELDS if key not in normalized]
     if missing:
         raise ValueError(f"attempt provenance is missing immutable fields: {', '.join(missing)}")
-    immutable = {key: provenance[key] for key in IMMUTABLE_PROVENANCE_FIELDS}
-    immutable["images"] = immutable_images(provenance["images"])
+    immutable = {key: normalized[key] for key in IMMUTABLE_PROVENANCE_FIELDS}
+    immutable["images"] = immutable_images(normalized["images"])
     return immutable
 
 
@@ -114,6 +132,8 @@ def load_attempt_artifacts(root: pathlib.Path, *, tasks: list[dict[str, str]],
             raise ValueError(f"attempt artifacts must include report.json: {records_path}")
         report = json.loads(report_path.read_text(encoding="utf-8"))
         provenance = report.get("provenance") if isinstance(report, dict) else None
+        if isinstance(provenance, dict):
+            provenance = normalize_legacy_provenance(provenance)
         attempt_metadata = provenance.get("attempt") if isinstance(provenance, dict) else None
         attempt = attempt_metadata.get("number") if isinstance(attempt_metadata, dict) else None
         source_commit = provenance.get("source_commit") if isinstance(provenance, dict) else None

@@ -19,6 +19,8 @@ use tokio::sync::mpsc;
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
+const DEFAULT_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS: usize = 0;
+const DEFAULT_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS: usize = 0;
 
 const EXAMPLES: &str = r#"Examples:
   carry fix the failing tests
@@ -149,6 +151,22 @@ struct Cli {
     )]
     compaction_rollout_stop_probability_percent: u8,
 
+    /// Eligible neutral context token high-water mark before automatic compaction.
+    #[arg(
+        long,
+        env = "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS",
+        default_value_t = DEFAULT_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS
+    )]
+    compaction_neutral_high_watermark_tokens: usize,
+
+    /// Eligible neutral context token target after automatic compaction; may be zero.
+    #[arg(
+        long,
+        env = "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS",
+        default_value_t = DEFAULT_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS
+    )]
+    compaction_neutral_low_watermark_tokens: usize,
+
     /// JSONL Step objects to use instead of calling a model.
     #[arg(long, hide = true)]
     scripted_steps: Option<PathBuf>,
@@ -233,7 +251,11 @@ async fn main() -> Result<()> {
     }
 }
 
-fn validate_args(_args: &Cli) -> Result<()> {
+fn validate_args(args: &Cli) -> Result<()> {
+    if args.compaction_neutral_low_watermark_tokens > args.compaction_neutral_high_watermark_tokens
+    {
+        bail!("compaction neutral low watermark must not exceed the high watermark");
+    }
     Ok(())
 }
 
@@ -392,6 +414,8 @@ async fn run_command(args: Cli) -> Result<()> {
         compaction_rollout_samples: args.compaction_rollout_samples,
         compaction_rollout_stop_probability_percent: args
             .compaction_rollout_stop_probability_percent,
+        compaction_neutral_high_watermark_tokens: args.compaction_neutral_high_watermark_tokens,
+        compaction_neutral_low_watermark_tokens: args.compaction_neutral_low_watermark_tokens,
         resume_context: resume.map(|resume| resume.context),
         resume_source,
         prompt_cache_key: Some(prompt_cache_key),
@@ -641,6 +665,40 @@ mod tests {
             Cli::try_parse_from(["carry", "--compaction-rollout-samples", "65", "continue",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn neutral_watermarks_default_to_zero_and_accept_nonzero() {
+        let defaulted = Cli::try_parse_from(["carry", "continue"]).unwrap();
+        assert_eq!(defaulted.compaction_neutral_high_watermark_tokens, 0);
+        assert_eq!(defaulted.compaction_neutral_low_watermark_tokens, 0);
+        let configured_budget = Cli::try_parse_from([
+            "carry",
+            "--compaction-neutral-high-watermark-tokens",
+            "32768",
+            "--compaction-neutral-low-watermark-tokens",
+            "24576",
+            "continue",
+        ])
+        .unwrap();
+        assert_eq!(
+            configured_budget.compaction_neutral_high_watermark_tokens,
+            32 * 1024
+        );
+        assert_eq!(
+            configured_budget.compaction_neutral_low_watermark_tokens,
+            24 * 1024
+        );
+        let invalid = Cli::try_parse_from([
+            "carry",
+            "--compaction-neutral-high-watermark-tokens",
+            "0",
+            "--compaction-neutral-low-watermark-tokens",
+            "1",
+            "continue",
+        ])
+        .unwrap();
+        assert!(validate_args(&invalid).is_err());
     }
 
     #[test]

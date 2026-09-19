@@ -52,6 +52,16 @@ rollout_stop_probability_percent = os.environ.get("CARRY_COMPACTION_ROLLOUT_STOP
 if (not rollout_stop_probability_percent.isascii() or not rollout_stop_probability_percent.isdecimal()
         or int(rollout_stop_probability_percent) > 100):
     parser.error("CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT must be an ASCII decimal integer from 0 through 100")
+neutral_high_watermark_tokens = os.environ.get(
+    "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS", "0"
+)
+neutral_low_watermark_tokens = os.environ.get(
+    "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS", "0"
+)
+if (not neutral_high_watermark_tokens.isascii() or not neutral_high_watermark_tokens.isdecimal()
+        or not neutral_low_watermark_tokens.isascii() or not neutral_low_watermark_tokens.isdecimal()
+        or int(neutral_low_watermark_tokens) > int(neutral_high_watermark_tokens)):
+    parser.error("neutral compaction watermarks must be ASCII decimal integers with low not exceeding high")
 
 output = pathlib.Path(args.output)
 output.mkdir(parents=True, exist_ok=True)
@@ -85,6 +95,8 @@ if args.harness == "carry":
     command.extend(["--compaction-payoff-requests", payoff_requests])
     command.extend(["--compaction-rollout-samples", rollout_samples])
     command.extend(["--compaction-rollout-stop-probability-percent", rollout_stop_probability_percent])
+    command.extend(["--compaction-neutral-high-watermark-tokens", neutral_high_watermark_tokens])
+    command.extend(["--compaction-neutral-low-watermark-tokens", neutral_low_watermark_tokens])
 if args.resume_session:
     command.extend(["--resume", str(args.resume_session)])
 if args.codex_session and args.codex_thread:
