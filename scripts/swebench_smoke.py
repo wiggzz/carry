@@ -396,6 +396,9 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
     config["CARRY_COMPACTION_PAYOFF_REQUESTS"] = values.get(
         "CARRY_COMPACTION_PAYOFF_REQUESTS", "1"
     )
+    config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"] = values.get(
+        "CARRY_COMPACTION_MIN_PAYBACK_PERCENT", "25"
+    )
     config["CARRY_COMPACTION_ROLLOUT_SAMPLES"] = values.get(
         "CARRY_COMPACTION_ROLLOUT_SAMPLES", "0"
     )
@@ -419,6 +422,10 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
             or not config["CARRY_COMPACTION_PAYOFF_REQUESTS"].isdecimal()
             or int(config["CARRY_COMPACTION_PAYOFF_REQUESTS"]) < 1):
         raise ValueError("CARRY_COMPACTION_PAYOFF_REQUESTS must be a positive ASCII decimal integer")
+    if (not config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"].isascii()
+            or not config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"].isdecimal()
+            or int(config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"]) > 100):
+        raise ValueError("CARRY_COMPACTION_MIN_PAYBACK_PERCENT must be an ASCII decimal integer from 0 through 100")
     if (not config["CARRY_COMPACTION_ROLLOUT_SAMPLES"].isascii()
             or not config["CARRY_COMPACTION_ROLLOUT_SAMPLES"].isdecimal()
             or int(config["CARRY_COMPACTION_ROLLOUT_SAMPLES"]) > 64):
@@ -606,6 +613,7 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
         "--env", f"AGENT_TIMEOUT_SECONDS={agent_timeout_seconds}",
         "--env", "CARRY_COMPACTION_POLICY",
         "--env", "CARRY_COMPACTION_PAYOFF_REQUESTS",
+        "--env", "CARRY_COMPACTION_MIN_PAYBACK_PERCENT",
         "--env", "CARRY_COMPACTION_ROLLOUT_SAMPLES",
         "--env", "CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT",
         "--env", "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS",
@@ -2255,6 +2263,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "carry_compaction_policy": validated["CARRY_COMPACTION_POLICY"],
         "carry_keep_lease_turns": validated["CARRY_KEEP_LEASE_TURNS"],
         "carry_compaction_payoff_requests": validated["CARRY_COMPACTION_PAYOFF_REQUESTS"],
+        "carry_compaction_min_payback_percent": validated["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"],
         "carry_compaction_rollout_samples": validated["CARRY_COMPACTION_ROLLOUT_SAMPLES"],
         "carry_compaction_rollout_stop_probability_percent": validated["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"],
         "carry_compaction_neutral_high_watermark_tokens": validated["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"],

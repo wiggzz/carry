@@ -9,7 +9,7 @@ use crate::protocol::ContextManagement;
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 const CACHE_READ_RATE: f64 = 0.10;
 const CACHE_WRITE_RATE: f64 = 1.25;
-const COMPACTION_MIN_PAYBACK_RATIO: f64 = 0.10;
+pub(crate) const DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT: u8 = 25;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
 #[cfg(test)]
 const NEUTRAL_TARGET_NUMERATOR: usize = 3;
@@ -800,6 +800,8 @@ impl ContextState {
             stopped_samples,
             expected_compact_cost,
             expected_keep_cost,
+            minimum_payback_input_units: expected_keep_cost * f64::from(policy.min_payback_percent)
+                / 100.0,
             direct_next_request_savings_input_units,
             expected_savings_input_units: expected_keep_cost - expected_compact_cost,
         }
@@ -912,7 +914,9 @@ impl ContextState {
             invalidated_generations,
             invalidated_cache_tokens,
             estimated_savings_input_units: payoff_savings,
-            minimum_payback_input_units: keep_payoff_cost * COMPACTION_MIN_PAYBACK_RATIO,
+            min_payback_percent: policy.min_payback_percent,
+            minimum_payback_input_units: keep_payoff_cost * f64::from(policy.min_payback_percent)
+                / 100.0,
         }
     }
 
@@ -1030,6 +1034,8 @@ impl ContextState {
             invalidated_generations: plan.invalidated_generations,
             invalidated_cache_tokens: plan.invalidated_cache_tokens,
             estimated_savings_input_units: plan.estimated_savings_input_units,
+            min_payback_percent: plan.min_payback_percent,
+            minimum_payback_input_units: plan.minimum_payback_input_units,
             generation: self.generation,
             protected_frontier: self.protected_frontier_id(),
             retained_bytes: self.retained_bytes(),
@@ -1059,7 +1065,7 @@ fn meets_payback_threshold(savings: f64, minimum_payback: f64) -> bool {
 pub(crate) fn meets_rollout_payback_threshold(estimate: &FlatRolloutEstimate) -> bool {
     meets_payback_threshold(
         estimate.expected_savings_input_units,
-        estimate.expected_keep_cost * COMPACTION_MIN_PAYBACK_RATIO,
+        estimate.minimum_payback_input_units,
     )
 }
 
@@ -1129,6 +1135,7 @@ fn simulate_rollout_turn(
             })
             .collect(),
         payoff_requests: base_policy.payoff_requests,
+        min_payback_percent: base_policy.min_payback_percent,
     };
     let keep_cost = keep_request_cost(state.estimated_tokens(), &policy);
     let Some(plan) = state
@@ -1189,6 +1196,7 @@ pub(crate) struct FlatRolloutEstimate {
     pub stopped_samples: u32,
     pub expected_compact_cost: f64,
     pub expected_keep_cost: f64,
+    pub minimum_payback_input_units: f64,
     pub direct_next_request_savings_input_units: f64,
     pub expected_savings_input_units: f64,
 }
@@ -1268,6 +1276,8 @@ pub struct CompactionPolicy {
     pub breakpoints: Vec<PricedBreakpoint>,
     /// Fixed number of requests over which a rewrite is amortized; must be positive.
     pub payoff_requests: u64,
+    /// Minimum modeled saving, as a percent of the retained-path payoff cost.
+    pub min_payback_percent: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1296,6 +1306,7 @@ pub(crate) struct CompactionPlan {
     pub invalidated_generations: Vec<u64>,
     pub invalidated_cache_tokens: usize,
     pub estimated_savings_input_units: f64,
+    pub min_payback_percent: u8,
     pub minimum_payback_input_units: f64,
 }
 
@@ -1360,6 +1371,8 @@ pub(crate) struct ContextChange {
     pub invalidated_generations: Vec<u64>,
     pub invalidated_cache_tokens: usize,
     pub estimated_savings_input_units: f64,
+    pub min_payback_percent: u8,
+    pub minimum_payback_input_units: f64,
     pub generation: u64,
     pub protected_frontier: Option<u64>,
     pub retained_bytes: usize,
@@ -1428,6 +1441,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 0,
             )
@@ -1444,6 +1458,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 0,
             )
@@ -1473,6 +1488,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 0,
             )
@@ -1495,6 +1511,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 0,
             )
@@ -1514,6 +1531,7 @@ mod tests {
             implicit_cached_tokens: 0,
             breakpoints: Vec::new(),
             payoff_requests: 5,
+            min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
         };
         let plan = state
             .plan_compaction_with_neutral_budget(&[], policy.clone(), budget)
@@ -1548,6 +1566,7 @@ mod tests {
             implicit_cached_tokens: 0,
             breakpoints: Vec::new(),
             payoff_requests: 5,
+            min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
         };
         let plan = state
             .plan_compaction_with_neutral_budget(&[], policy.clone(), budget)
@@ -1590,6 +1609,7 @@ mod tests {
                 implicit_cached_tokens: 0,
                 breakpoints: Vec::new(),
                 payoff_requests: 5,
+                min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
             },
         );
         let current_tokens = state.estimated_tokens();
@@ -1604,6 +1624,7 @@ mod tests {
             implicit_cached_tokens: 0,
             breakpoints: Vec::new(),
             payoff_requests: 5,
+            min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
         };
         assert_eq!(policy.payoff_requests, 5);
         assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 1) < 0.0);
@@ -1624,11 +1645,44 @@ mod tests {
             stopped_samples: 0,
             expected_compact_cost: 80.0,
             expected_keep_cost: 100.0,
+            minimum_payback_input_units: 10.0,
             direct_next_request_savings_input_units: -5.0,
             expected_savings_input_units: 20.0,
         };
 
         assert!(meets_rollout_payback_threshold(&estimate));
+        let stricter = FlatRolloutEstimate {
+            minimum_payback_input_units: 25.0,
+            ..estimate
+        };
+        assert!(!meets_rollout_payback_threshold(&stricter));
+    }
+
+    #[test]
+    fn configurable_min_payback_margin_rejects_a_plan_that_zero_accepts() {
+        let mut state = ContextState::new("initial".into());
+        add_tool_with_output(&mut state, &"x".repeat(8_000));
+        let no_margin = CompactionPolicy {
+            implicit_cached_tokens: 0,
+            breakpoints: Vec::new(),
+            payoff_requests: 1,
+            min_payback_percent: 0,
+        };
+        let accepted = state
+            .plan_compaction(&[], no_margin.clone())
+            .expect("positive saving compacts");
+        assert_eq!(accepted.min_payback_percent, 0);
+        assert!(
+            state
+                .plan_compaction(
+                    &[],
+                    CompactionPolicy {
+                        min_payback_percent: 100,
+                        ..no_margin
+                    }
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -1654,6 +1708,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
                 budget,
             )
@@ -1683,6 +1738,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 0,
                 0,
@@ -1716,6 +1772,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
                 budget,
             )
@@ -1749,6 +1806,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
                 budget,
             )
@@ -1779,6 +1837,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 budget,
             )
@@ -1811,6 +1870,7 @@ mod tests {
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
                         payoff_requests: 1,
+                        min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                     },
                     budget,
                 )
@@ -1847,6 +1907,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 usize::MAX,
             )
@@ -1869,6 +1930,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -1908,6 +1970,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -2023,6 +2086,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 0,
             )
@@ -2134,6 +2198,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -2174,6 +2239,7 @@ mod tests {
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
                         payoff_requests: 1,
+                        min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                     },
                 )
                 .is_none()
@@ -2196,6 +2262,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -2264,6 +2331,7 @@ mod tests {
                 implicit_cached_tokens: usize::MAX,
                 breakpoints: Vec::new(),
                 payoff_requests: 1,
+                min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
             },
         );
         assert!(short.is_none());
@@ -2276,6 +2344,7 @@ mod tests {
                         implicit_cached_tokens: usize::MAX,
                         breakpoints: Vec::new(),
                         payoff_requests: 1,
+                        min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                     },
                 )
                 .is_none()
@@ -2300,6 +2369,7 @@ mod tests {
                         cached_tokens: 1_200,
                     }],
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -2321,6 +2391,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -2335,6 +2406,7 @@ mod tests {
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
                         payoff_requests: 1,
+                        min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                     },
                 )
                 .is_none()
@@ -2355,6 +2427,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -2393,6 +2466,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -2419,6 +2493,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
                 usize::MAX,
             )
@@ -2445,6 +2520,7 @@ mod tests {
                         cached_tokens: 1_200,
                     }],
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
                 usize::MAX,
             )
@@ -2494,6 +2570,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
             )
             .unwrap();
@@ -2526,6 +2603,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
             )
             .unwrap();
@@ -2540,6 +2618,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
             )
             .unwrap();

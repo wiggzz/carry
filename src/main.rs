@@ -14,6 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
+use context::DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT;
 use run::{Backend, CompactionMode, RunConfig, UserInput};
 use tokio::sync::mpsc;
 
@@ -132,6 +133,15 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     compaction_payoff_requests: u64,
+
+    /// Minimum projected saving (percent of retained-path payoff cost) required to compact.
+    #[arg(
+        long,
+        env = "CARRY_COMPACTION_MIN_PAYBACK_PERCENT",
+        default_value_t = DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
+        value_parser = clap::value_parser!(u8).range(0..=100)
+    )]
+    compaction_min_payback_percent: u8,
 
     /// Deterministic flat-drop rollout samples used to gate economic compaction; zero disables it.
     #[arg(
@@ -411,6 +421,7 @@ async fn run_command(args: Cli) -> Result<()> {
         compaction_mode: args.compaction_policy.into(),
         keep_lease_turns: args.keep_lease_turns,
         compaction_payoff_requests: args.compaction_payoff_requests,
+        compaction_min_payback_percent: args.compaction_min_payback_percent,
         compaction_rollout_samples: args.compaction_rollout_samples,
         compaction_rollout_stop_probability_percent: args
             .compaction_rollout_stop_probability_percent,
@@ -650,6 +661,29 @@ mod tests {
         assert!(
             Cli::try_parse_from(["carry", "--compaction-payoff-requests", "0", "continue",])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn compaction_min_payback_percent_defaults_to_twenty_five_and_is_bounded() {
+        let defaulted = Cli::try_parse_from(["carry", "continue"]).unwrap();
+        assert_eq!(defaulted.compaction_min_payback_percent, 25);
+        let configured = Cli::try_parse_from([
+            "carry",
+            "--compaction-min-payback-percent",
+            "25",
+            "continue",
+        ])
+        .unwrap();
+        assert_eq!(configured.compaction_min_payback_percent, 25);
+        assert!(
+            Cli::try_parse_from([
+                "carry",
+                "--compaction-min-payback-percent",
+                "101",
+                "continue",
+            ])
+            .is_err()
         );
     }
 

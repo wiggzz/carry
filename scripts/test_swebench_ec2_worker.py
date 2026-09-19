@@ -151,6 +151,47 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             self.assertIn("retained-session modes require exactly one BENCHMARK_HARNESS=carry, codex, or pi", (carry_root / "results" / "worker.log").read_text())
             self.assertFalse((root / "secret").exists())
 
+    def test_worker_rejects_an_oversized_payback_percent_before_fetching_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            payload = root / "payload"; payload.mkdir()
+            archive = root / "source.tar.gz"
+            with tarfile.open(archive, "w:gz") as stream:
+                stream.add(payload, arcname="payload")
+            fake_bin = root / "bin"; fake_bin.mkdir()
+            for command in ("dnf", "systemctl"):
+                path = fake_bin / command
+                path.write_text("#!/bin/sh\nexit 0\n")
+                path.chmod(0o755)
+            curl = fake_bin / "curl"
+            curl.write_text(
+                "#!/bin/sh\n"
+                "while [ $# -gt 0 ]; do\n"
+                "  if [ \"$1\" = -o ]; then\n"
+                "    if [ \"$2\" = \"$CARRY_ROOT/source.tar.gz\" ]; then cp \"$FAKE_SOURCE_ARCHIVE\" \"$2\"; exit 0; fi\n"
+                "    touch \"$CREDENTIAL_FETCHED\"; exit 99\n"
+                "  fi\n"
+                "  shift\n"
+                "done\nexit 2\n"
+            )
+            curl.chmod(0o755)
+            carry_root = root / "worker"
+            env = dict(
+                os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}",
+                SOURCE_URL_B64=base64.b64encode(b"https://example.invalid/source").decode(),
+                KEY_URL_B64="", DOCKER_AUTH_URL_B64="", RESULT_URL_B64="",
+                SOURCE_SHA256=hashlib.sha256(archive.read_bytes()).hexdigest(), SOURCE_COMMIT="a" * 40,
+                BENCHMARK_MODE="session-smoke-5", BENCHMARK_HARNESS="carry", BOOTSTRAP_WAIT_SECONDS="1",
+                RUN_ID="gh-test-payback-overflow", CARRY_ROOT=str(carry_root), SECRET_FILE=str(root / "secret"),
+                PYTHON_BIN="python3", SKIP_SHUTDOWN="1", FAKE_SOURCE_ARCHIVE=str(archive),
+                CREDENTIAL_FETCHED=str(root / "credential-fetched"),
+                CARRY_COMPACTION_MIN_PAYBACK_PERCENT="9" * 36,
+            )
+            run = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
+            self.assertEqual(run.returncode, 2)
+            self.assertIn("CARRY_COMPACTION_MIN_PAYBACK_PERCENT must be an integer from 0 through 100", (carry_root / "results" / "worker.log").read_text())
+            self.assertFalse((root / "credential-fetched").exists())
+
     def test_official_worker_forwards_one_declared_attempt_with_official_limits(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -170,6 +211,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 "BENCHMARK_MODE=official-50\nBENCHMARK_HARNESS=carry\n"
                 "BENCHMARK_ATTEMPT=2\nBENCHMARK_ATTEMPTS=3\nBOOTSTRAP_WAIT_SECONDS=1\nRUN_ID=gh-test-2\n"
                 "CARRY_COMPACTION_POLICY=disabled\nCARRY_KEEP_LEASE_TURNS=8\n"
+                "CARRY_COMPACTION_MIN_PAYBACK_PERCENT=25\n"
                 "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS=0\n"
                 "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS=0\n",
                 encoding="utf-8",
@@ -211,7 +253,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 "fi\n"
                 "case \"$*\" in\n"
                 "  *swebench_smoke.py*)\n"
-                "    printf 'agent=%s\\nevaluator=%s\\nmode=%s\\nbenchmark_attempt=%s\\nbenchmark_attempts=%s\\npolicy=%s\\nlease=%s\\nhigh=%s\\nlow=%s\\nworker=%s\\nagent_phase=%s\\n' \"$AGENT_CONCURRENCY\" \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" \"$BENCHMARK_ATTEMPT\" \"$BENCHMARK_ATTEMPTS\" \"${CARRY_COMPACTION_POLICY-unset}\" \"${CARRY_KEEP_LEASE_TURNS-unset}\" \"${CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS-unset}\" \"${CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS-unset}\" \"$OFFICIAL_WORKER_SECONDS\" \"$OFFICIAL_AGENT_PHASE_SECONDS\" > \"$FAKE_RUNNER_ENV\";;\n"
+                "    printf 'agent=%s\\nevaluator=%s\\nmode=%s\\nbenchmark_attempt=%s\\nbenchmark_attempts=%s\\npolicy=%s\\nlease=%s\\nmargin=%s\\nhigh=%s\\nlow=%s\\nworker=%s\\nagent_phase=%s\\n' \"$AGENT_CONCURRENCY\" \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" \"$BENCHMARK_ATTEMPT\" \"$BENCHMARK_ATTEMPTS\" \"${CARRY_COMPACTION_POLICY-unset}\" \"${CARRY_KEEP_LEASE_TURNS-unset}\" \"${CARRY_COMPACTION_MIN_PAYBACK_PERCENT-unset}\" \"${CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS-unset}\" \"${CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS-unset}\" \"$OFFICIAL_WORKER_SECONDS\" \"$OFFICIAL_AGENT_PHASE_SECONDS\" > \"$FAKE_RUNNER_ENV\";;\n"
                 "esac\n"
                 "exit 0\n"
             )
@@ -236,7 +278,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual(
                 runner_env.read_text(),
-                "agent=5\nevaluator=5\nmode=official-50\nbenchmark_attempt=2\nbenchmark_attempts=3\npolicy=disabled\nlease=8\nhigh=0\nlow=0\nworker=18900\n"
+                "agent=5\nevaluator=5\nmode=official-50\nbenchmark_attempt=2\nbenchmark_attempts=3\npolicy=disabled\nlease=8\nmargin=25\nhigh=0\nlow=0\nworker=18900\n"
                 "agent_phase=4500\n",
             )
 
