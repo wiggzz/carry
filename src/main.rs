@@ -19,8 +19,8 @@ use tokio::sync::mpsc;
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
-const DEFAULT_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS: usize = 32 * 1024;
-const DEFAULT_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS: usize = 24 * 1024;
+const DEFAULT_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS: usize = 0;
+const DEFAULT_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS: usize = 0;
 
 const EXAMPLES: &str = r#"Examples:
   carry fix the failing tests
@@ -668,27 +668,27 @@ mod tests {
     }
 
     #[test]
-    fn neutral_watermarks_default_and_accept_zero() {
+    fn neutral_watermarks_default_to_zero_and_accept_nonzero() {
         let defaulted = Cli::try_parse_from(["carry", "continue"]).unwrap();
-        assert_eq!(
-            defaulted.compaction_neutral_high_watermark_tokens,
-            32 * 1024
-        );
-        assert_eq!(defaulted.compaction_neutral_low_watermark_tokens, 24 * 1024);
-        let no_neutral_budget = Cli::try_parse_from([
+        assert_eq!(defaulted.compaction_neutral_high_watermark_tokens, 0);
+        assert_eq!(defaulted.compaction_neutral_low_watermark_tokens, 0);
+        let configured_budget = Cli::try_parse_from([
             "carry",
             "--compaction-neutral-high-watermark-tokens",
-            "0",
+            "32768",
             "--compaction-neutral-low-watermark-tokens",
-            "0",
+            "24576",
             "continue",
         ])
         .unwrap();
         assert_eq!(
-            no_neutral_budget.compaction_neutral_high_watermark_tokens,
-            0
+            configured_budget.compaction_neutral_high_watermark_tokens,
+            32 * 1024
         );
-        assert_eq!(no_neutral_budget.compaction_neutral_low_watermark_tokens, 0);
+        assert_eq!(
+            configured_budget.compaction_neutral_low_watermark_tokens,
+            24 * 1024
+        );
         let invalid = Cli::try_parse_from([
             "carry",
             "--compaction-neutral-high-watermark-tokens",

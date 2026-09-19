@@ -53,14 +53,14 @@ on:
         default: "10"
         type: string
       carry_compaction_neutral_high_watermark_tokens:
-        description: Carry neutral working-set high watermark in tokens; zero disables the retained-neutral budget
+        description: Carry neutral working-set high watermark in tokens; defaults to no retained-neutral budget
         required: true
-        default: "32768"
+        default: "0"
         type: string
       carry_compaction_neutral_low_watermark_tokens:
-        description: Carry neutral working-set target after compaction; must not exceed the high watermark
+        description: Carry neutral working-set target after compaction; defaults to no retained-neutral budget and must not exceed the high watermark
         required: true
-        default: "24576"
+        default: "0"
         type: string
       catalog_digest:
         description: Immutable prepare-50 catalog digest (sha256:... or 64 lowercase hex); required for model-bearing modes

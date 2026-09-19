@@ -45,7 +45,7 @@ class HarnessEntrypointTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn("+after", (output / "final.patch").read_text())
 
-    def test_carry_forwards_compaction_policy_and_keep_lease_to_native_cli(self):
+    def test_carry_defaults_neutral_watermarks_to_zero(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             repo, prompt_dir, output = root / "repo", root / "input", root / "output"
@@ -83,9 +83,7 @@ class HarnessEntrypointTests(unittest.TestCase):
                        BENCHMARK_WORKSPACE=str(repo), CARRY_COMPACTION_POLICY="disabled",
                        CARRY_KEEP_LEASE_TURNS="8", CARRY_COMPACTION_PAYOFF_REQUESTS="5",
                        CARRY_COMPACTION_ROLLOUT_SAMPLES="16",
-                       CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT="10",
-                       CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS="0",
-                       CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS="0")
+                       CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT="10")
             run = subprocess.run(
                 ["python3", str(ENTRYPOINT), "run", "--harness", "carry",
                  "--model", "model", "--reasoning", "medium",

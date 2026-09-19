@@ -403,10 +403,10 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
         "CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT", "10"
     )
     config["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"] = values.get(
-        "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS", "32768"
+        "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS", "0"
     )
     config["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"] = values.get(
-        "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS", "24576"
+        "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS", "0"
     )
     if config["CARRY_COMPACTION_POLICY"] not in {"economic", "disabled"}:
         raise ValueError("CARRY_COMPACTION_POLICY must be economic or disabled")

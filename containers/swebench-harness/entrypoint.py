@@ -53,10 +53,10 @@ if (not rollout_stop_probability_percent.isascii() or not rollout_stop_probabili
         or int(rollout_stop_probability_percent) > 100):
     parser.error("CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT must be an ASCII decimal integer from 0 through 100")
 neutral_high_watermark_tokens = os.environ.get(
-    "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS", "32768"
+    "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS", "0"
 )
 neutral_low_watermark_tokens = os.environ.get(
-    "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS", "24576"
+    "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS", "0"
 )
 if (not neutral_high_watermark_tokens.isascii() or not neutral_high_watermark_tokens.isdecimal()
         or not neutral_low_watermark_tokens.isascii() or not neutral_low_watermark_tokens.isdecimal()
