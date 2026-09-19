@@ -696,7 +696,7 @@ async fn run_loop(
             "economic"
         };
         if config.compaction_mode == CompactionMode::Economic && (!resumed || sent_model_request) {
-            let compacted = maybe_compact(
+            maybe_compact(
                 &mut context_state,
                 &protected_until_request,
                 &mut cache,
@@ -705,31 +705,6 @@ async fn run_loop(
                 &config,
                 trigger,
             )?;
-            if !compacted
-                && config.keep_lease_turns.is_some()
-                && let Some((virtual_release, virtually_released_ids)) =
-                    context_state.virtual_release_due_keep_leases()
-            {
-                let virtual_protected = protected_until_request
-                    .iter()
-                    .copied()
-                    .filter(|id| !virtually_released_ids.contains(id))
-                    .collect::<Vec<_>>();
-                if select_compaction_plan(&virtual_release, &virtual_protected, &cache, &config)
-                    .is_some()
-                {
-                    let review = context_state.attach_due_keep_lease_review();
-                    if !review.item_ids.is_empty() {
-                        logger.raw_event_silent(
-                            "retention_revalidation_requested",
-                            json!({
-                                "item_ids": review.item_ids,
-                                "selection_scope": "all_due_virtual_release"
-                            }),
-                        )?;
-                    }
-                }
-            }
             persist_context_checkpoint(&config, &context_state)?;
         }
         step_index += 1;
@@ -869,6 +844,14 @@ async fn run_loop(
                 };
                 protected_until_request.push(item_id);
                 protected_until_request.extend(signals.added.iter().copied());
+                maybe_attach_keep_lease_review(
+                    &mut context_state,
+                    &protected_until_request,
+                    &mut cache,
+                    &mut logger,
+                    &config,
+                    item_id,
+                )?;
                 logger.raw_event_silent(
                     "context_signals",
                     json!({"source_id": item_id, "signals": &signals, "expired_keep_leases": expired_keep_leases}),
@@ -913,6 +896,16 @@ async fn run_loop(
                 };
                 protected_until_request.push(item_id);
                 protected_until_request.extend(signals.added.iter().copied());
+                if input.is_some() {
+                    maybe_attach_keep_lease_review(
+                        &mut context_state,
+                        &protected_until_request,
+                        &mut cache,
+                        &mut logger,
+                        &config,
+                        item_id,
+                    )?;
+                }
                 logger.raw_event_silent(
                     "context_signals",
                     json!({"source_id": item_id, "signals": &signals, "expired_keep_leases": expired_keep_leases}),
@@ -1059,6 +1052,47 @@ fn select_compaction_plan(
             )
             .map(|plan| (plan, None))
     }
+}
+
+/// Attach a keep-lease review to the tool result that was just returned, while
+/// it is still fresh trailing content. Rewriting an older, already-rendered
+/// result instead would invalidate the cached prefix. This keeps the planner
+/// gate from `select_compaction_plan`: the review only fires when releasing
+/// the due leases would make a compaction worthwhile.
+fn maybe_attach_keep_lease_review(
+    state: &mut ContextState,
+    protected_until_request: &[u64],
+    cache: &mut CacheTracker,
+    logger: &mut RunLogger,
+    config: &RunConfig,
+    host_id: u64,
+) -> Result<()> {
+    if config.keep_lease_turns.is_none() {
+        return Ok(());
+    }
+    let Some((virtual_release, virtually_released_ids)) = state.virtual_release_due_keep_leases()
+    else {
+        return Ok(());
+    };
+    let virtual_protected = protected_until_request
+        .iter()
+        .copied()
+        .filter(|id| !virtually_released_ids.contains(id))
+        .collect::<Vec<_>>();
+    if select_compaction_plan(&virtual_release, &virtual_protected, cache, config).is_none() {
+        return Ok(());
+    }
+    let review = state.attach_due_keep_lease_review_to(host_id);
+    if !review.item_ids.is_empty() {
+        logger.raw_event_silent(
+            "retention_revalidation_requested",
+            json!({
+                "item_ids": review.item_ids,
+                "selection_scope": "all_due_virtual_release"
+            }),
+        )?;
+    }
+    Ok(())
 }
 
 fn maybe_compact(
