@@ -108,7 +108,7 @@ if [[ "$BENCHMARK_MODE" == bootstrap ]]; then
   exit 0
 fi
 case "$BENCHMARK_MODE" in
-  smoke-5|session-smoke-5|session-20|official-50|prepare-50) ;;
+  smoke-5|long-smoke-5|session-smoke-5|session-20|official-50|long-official-50|prepare-50|prepare-long-50) ;;
   *) echo "unknown benchmark mode" >&2; exit 2 ;;
 esac
 if [[ "$BENCHMARK_MODE" =~ ^session-(smoke-5|20)$ && "$BENCHMARK_HARNESS" != carry && "$BENCHMARK_HARNESS" != codex && "$BENCHMARK_HARNESS" != pi ]]; then
@@ -145,7 +145,7 @@ export DOCKER_CONFIG
 "$PYTHON_BIN" "$CARRY_ROOT/source/scripts/docker_registry_login.py" \
   "$DOCKER_AUTH_FILE" "$DOCKER_CONFIG"
 
-if [[ "$BENCHMARK_MODE" == prepare-50 ]]; then
+if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 ]]; then
   registry_auth_url=$(printf '%s' "$REGISTRY_AUTH_URL_B64" | base64 -d)
   [[ -n "$registry_auth_url" && -n "${TASK_IMAGE_REPOSITORY:-}" ]] || {
     echo "missing task-registry publication configuration" >&2
@@ -167,7 +167,7 @@ if [[ -n "$control_url" ]]; then
   capability_refresh_pid=$!
 fi
 
-if [[ "$BENCHMARK_MODE" != prepare-50 ]]; then
+if [[ "$BENCHMARK_MODE" != prepare-50 && "$BENCHMARK_MODE" != prepare-long-50 ]]; then
   key_url=$(printf '%s' "$KEY_URL_B64" | base64 -d)
   [[ -n "$key_url" ]] || { echo "missing model credential capability" >&2; exit 2; }
   curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
@@ -193,7 +193,7 @@ export EVALUATOR_TIMEOUT_SECONDS=270
 export AGENT_CONCURRENCY=3
 export READINESS_CONCURRENCY=5
 
-if [[ "$BENCHMARK_MODE" == official-50 ]]; then
+if [[ "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 ]]; then
   # Five concurrent Docker creates have been reliable; ten repeatedly saturated
   # the daemon and left half of a shard without evaluator outcomes.
   export AGENT_CONCURRENCY=5
@@ -209,7 +209,7 @@ if [[ "$BENCHMARK_MODE" == official-50 ]]; then
     echo "official worker budget exhausted during setup" >&2
     exit 124
   }
-elif [[ "$BENCHMARK_MODE" == prepare-50 ]]; then
+elif [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 ]]; then
   export EVALUATOR_CONCURRENCY=5
   OVERALL_TIMEOUT_SECONDS=18000
 elif [[ "$BENCHMARK_MODE" == session-smoke-5 ]]; then
@@ -225,7 +225,7 @@ else
   OVERALL_TIMEOUT_SECONDS=3000
 fi
 runner_mode=--run
-[[ "$BENCHMARK_MODE" == prepare-50 ]] && runner_mode=--prepare-images
+[[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 ]] && runner_mode=--prepare-images
 timeout --signal=TERM --kill-after=30s "$OVERALL_TIMEOUT_SECONDS" python3 "$CARRY_ROOT/source/scripts/swebench_smoke.py" \
   "$runner_mode" --source "$CARRY_ROOT/source" --work "$CARRY_ROOT/work" \
   --output "$CARRY_ROOT/results" --harness "$BENCHMARK_HARNESS"

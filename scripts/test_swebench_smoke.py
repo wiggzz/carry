@@ -1222,8 +1222,24 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         frozen = [f"task-{number:02d}" for number in range(50)]
         smoke = [frozen[index] for index in (0, 25, 40, 45, 49)]
         self.assertEqual(self.worker.selection_for_mode(frozen, "smoke-5", smoke), smoke)
+        self.assertEqual(self.worker.selection_for_mode(frozen, "long-smoke-5", smoke), smoke)
         self.assertEqual(self.worker.selection_for_mode(frozen, "official-50", smoke), frozen)
+        self.assertEqual(self.worker.selection_for_mode(frozen, "long-official-50", smoke), frozen)
         self.assertEqual(self.worker.selection_for_mode(frozen, "session-20", smoke), frozen[:20])
+
+    def test_long_modes_use_the_separate_long_trajectory_manifests(self):
+        self.assertEqual(
+            self.worker.selection_manifest_names("long-smoke-5"),
+            ("swe-bench-verified-long-trajectory-50.json", "swe-bench-verified-long-trajectory-smoke-5.json"),
+        )
+        self.assertEqual(
+            self.worker.selection_manifest_names("long-official-50"),
+            ("swe-bench-verified-long-trajectory-50.json", None),
+        )
+        self.assertEqual(
+            self.worker.selection_manifest_names("smoke-5"),
+            ("swe-bench-verified-50.json", "swe-bench-verified-smoke-5.json"),
+        )
 
     def test_official_mode_selects_the_frozen_manifest_with_one_declared_attempt(self):
         frozen = [f"task-{number:02d}" for number in range(50)]

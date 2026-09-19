@@ -1549,18 +1549,30 @@ def load_resolved_ids(report_dir: pathlib.Path) -> set[str]:
     return load_official_report(report_dir)["resolved_ids"]
 
 
+def selection_manifest_names(mode: str) -> tuple[str, str | None]:
+    if mode in {"long-smoke-5", "long-official-50", "prepare-long-50"}:
+        return (
+            "swe-bench-verified-long-trajectory-50.json",
+            "swe-bench-verified-long-trajectory-smoke-5.json" if mode == "long-smoke-5" else None,
+        )
+    return (
+        "swe-bench-verified-50.json",
+        "swe-bench-verified-smoke-5.json" if mode in {"smoke-5", "session-smoke-5"} else None,
+    )
+
+
 def selection_for_mode(frozen_ids: list[str], mode: str,
                        smoke_ids: list[str] | None = None) -> list[str]:
     if len(frozen_ids) != 50 or len(set(frozen_ids)) != 50:
         raise ValueError("frozen official manifest must contain exactly 50 unique IDs")
-    if mode in {"smoke-5", "session-smoke-5"}:
+    if mode in {"smoke-5", "long-smoke-5", "session-smoke-5"}:
         if (smoke_ids is None or len(smoke_ids) != 5 or len(set(smoke_ids)) != 5
                 or not set(smoke_ids).issubset(frozen_ids)):
             raise ValueError("smoke manifest must contain five unique frozen task IDs")
         return list(smoke_ids)
     if mode == "session-20":
         return list(frozen_ids[:20])
-    if mode == "official-50":
+    if mode in {"official-50", "long-official-50"}:
         return list(frozen_ids)
     raise ValueError(f"unsupported benchmark mode: {mode}")
 
@@ -1573,7 +1585,7 @@ def official_attempt_numbers(config: Mapping[str, str], mode: str) -> tuple[int,
         raise ValueError("official-50 attempts must be decimal integers")
     attempts = int(total)
     attempt = int(selected)
-    if mode == "official-50":
+    if mode in {"official-50", "long-official-50"}:
         if not 1 <= attempts <= 10 or not 1 <= attempt <= attempts:
             raise ValueError("official-50 attempts must be 1 through 10 and include the declared worker attempt")
         return (attempt,)
@@ -2098,12 +2110,15 @@ def execute_preparation(*, source: pathlib.Path, work: pathlib.Path, output: pat
     validated = validate_config(config)
     repository = config.get("TASK_IMAGE_REPOSITORY", "")
     task_image_references(repository, "0" * 64)
-    if config.get("BENCHMARK_MODE") != "prepare-50":
-        raise ValueError("image publisher requires BENCHMARK_MODE=prepare-50")
+    preparation_modes = {"prepare-50", "prepare-long-50"}
+    mode = config.get("BENCHMARK_MODE")
+    if mode not in preparation_modes:
+        raise ValueError("image publisher requires a prepare-50 benchmark mode")
+    manifest_name, _ = selection_manifest_names(mode)
     frozen_ids = json.loads(
-        (source / "benchmarks" / "swe-bench-verified-50.json").read_text(encoding="utf-8")
+        (source / "benchmarks" / manifest_name).read_text(encoding="utf-8")
     )["instance_ids"]
-    selection_for_mode(frozen_ids, "official-50")
+    selection_for_mode(frozen_ids, "long-official-50" if mode == "prepare-long-50" else "official-50")
 
     from datasets import load_dataset  # installed only on the disposable worker
     dataset = load_dataset(DATASET, split="test", revision=DATASET_REVISION)
@@ -2199,17 +2214,18 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     mode = config.get("BENCHMARK_MODE", "smoke-5")
     validate_session_mode(mode, harnesses)
     attempt_numbers = official_attempt_numbers(config, mode)
-    phase_limits = official_phase_limits(config) if mode == "official-50" else None
+    phase_limits = official_phase_limits(config) if mode in {"official-50", "long-official-50"} else None
+    manifest_name, smoke_manifest_name = selection_manifest_names(mode)
     frozen_ids = json.loads(
-        (source / "benchmarks" / "swe-bench-verified-50.json").read_text(encoding="utf-8")
+        (source / "benchmarks" / manifest_name).read_text(encoding="utf-8")
     )["instance_ids"]
     smoke_ids = None
-    if mode in {"smoke-5", "session-smoke-5"}:
+    if smoke_manifest_name is not None:
         smoke_ids = json.loads(
-            (source / "benchmarks" / "swe-bench-verified-smoke-5.json").read_text(encoding="utf-8")
+            (source / "benchmarks" / smoke_manifest_name).read_text(encoding="utf-8")
         )["instance_ids"]
     selection = selection_for_mode(frozen_ids, mode, smoke_ids)
-    agent_shard_size = 5 if mode in {"smoke-5", "session-smoke-5"} else 10
+    agent_shard_size = 5 if mode in {"smoke-5", "long-smoke-5", "session-smoke-5"} else 10
     evaluator_shard_size = 5
     agent_shards = ordered_shards(selection, agent_shard_size)
     evaluator_shards = ordered_shards(selection, evaluator_shard_size)
@@ -2249,7 +2265,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     readiness_concurrency = int(config.get("READINESS_CONCURRENCY", "5"))
     evaluator_timeout = int(config.get("EVALUATOR_TIMEOUT_SECONDS", "270"))
     evaluator_concurrency = int(config.get("EVALUATOR_CONCURRENCY", "5"))
-    if mode == "official-50" and (
+    if mode in {"official-50", "long-official-50"} and (
             concurrency != 5 or agent_timeout != 360
             or readiness_timeout != 180 or readiness_concurrency != 5
             or evaluator_timeout != 270 or evaluator_concurrency != 5):
