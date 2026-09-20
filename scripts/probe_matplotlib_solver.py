@@ -187,10 +187,26 @@ def run_probe(evidence, work, *, solver_url=SOLVER_URL, solver_sha256=SOLVER_SHA
         (evidence / "environment.yml").write_bytes(data)
         requirements, pip_requirements = parse_requirements(data)
         report["environment_size_bytes"] = len(data)
+        # Conda 23.11.0 ignores the bare execute attribute here; micromamba
+        # 2.3.3 instead treats the interior brackets as part of the package name.
+        # Canonicalize only this checksum-pinned input, not arbitrary extras.
+        original_spec = "nbconvert[execute]!=6.0.0,!=6.0.1"
+        canonical_spec = "nbconvert[version='!=6.0.0,!=6.0.1']"
+        effective = data.replace(("  - " + original_spec + "\n").encode(),
+                                 ("  - " + canonical_spec + "\n").encode())
+        effective_path = evidence / "effective-environment.yml"
+        effective_path.write_bytes(effective)
+        report["effective_environment_sha256"] = hashlib.sha256(effective).hexdigest()
+        report["effective_environment_size_bytes"] = len(effective)
+        report["spec_canonicalization"] = {
+            "original": original_spec, "effective": canonical_spec,
+            "basis": "Conda 23.11.0 MatchSpec equality; original did not enforce a pip extra",
+        }
+        report["experimental_changes"].append("canonicalize the nbconvert request to historical Conda semantics")
         solver = work / "micromamba"
         command = [str(solver), "create", "--no-rc", "--no-env",
                    "--root-prefix", str(work / "mamba"), "--prefix", str(work / "env"),
-                   "--file", str(evidence / "environment.yml"),
+                   "--file", str(effective_path),
                    "-c", "conda-forge", "-c", "defaults",
                    "--channel-priority", "flexible", "--platform", "linux-64",
                    "python=3.11", "--dry-run", "--json", "--yes"]

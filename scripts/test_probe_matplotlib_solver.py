@@ -53,6 +53,9 @@ class ProbeTests(unittest.TestCase):
             solver.write_text("#!/usr/bin/env python3\nimport json,sys\n"
                               "from pathlib import Path\n"
                               "Path(__file__).with_suffix('.argv').write_text(json.dumps(sys.argv))\n"
+                              "data=Path(sys.argv[sys.argv.index('--file')+1]).read_bytes()\n"
+                              "assert b\"  - nbconvert[version='!=6.0.0,!=6.0.1']\\n\" in data\n"
+                              "assert b'nbconvert[execute]' not in data\n"
                               "print(" + repr(json.dumps(plan)) + ")\n")
             status = probe.run_probe(root / "evidence", root / "work",
                                      solver_url=solver.as_uri(),
@@ -63,6 +66,13 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(report["status"], "conda-dry-run-validated")
             self.assertFalse(report["environment_ready"])
             self.assertEqual((root / "evidence/environment.yml").read_bytes(), environment.read_bytes())
+            effective = (root / "evidence/effective-environment.yml").read_bytes()
+            self.assertEqual(effective, environment.read_bytes().replace(
+                b"  - nbconvert[execute]!=6.0.0,!=6.0.1\n",
+                b"  - nbconvert[version='!=6.0.0,!=6.0.1']\n"))
+            self.assertEqual(report["effective_environment_sha256"], hashlib.sha256(effective).hexdigest())
+            self.assertEqual(report["effective_environment_size_bytes"], len(effective))
+            self.assertEqual(report["environment_sha256"], hashlib.sha256(environment.read_bytes()).hexdigest())
             self.assertEqual(set(report["validation"]["conda_dependencies"]), set(names))
             self.assertEqual(report["validation"]["pip_not_validated"],
                              ["mpl-sphinx-theme", "sphinxcontrib-svg2pdfconverter", "pikepdf"])
