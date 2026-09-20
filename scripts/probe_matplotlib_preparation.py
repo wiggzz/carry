@@ -337,6 +337,8 @@ def main():
     args = parser.parse_args()
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
         parser.error("real image probes are restricted to an opt-in GitHub-hosted job")
+    if os.geteuid() != 0:
+        parser.error("image diagnostic must run as root, matching production checkout ownership")
     return run_probe(args.evidence_dir, args.work_dir)
 
 

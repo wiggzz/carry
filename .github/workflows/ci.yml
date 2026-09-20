@@ -62,7 +62,10 @@ jobs:
                 --work-dir "$RUNNER_TEMP/matplotlib-solver-work"
               ;;
             image)
-              "$RUNNER_TEMP/swebench-image-probe/bin/python" scripts/probe_matplotlib_preparation.py \
+              # Match the production root worker's checkout ownership. Readiness
+              # drops all capabilities, so root cannot override runner-owned 0755.
+              sudo --non-interactive --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_SHA,GITHUB_RUN_ID \
+                "$RUNNER_TEMP/swebench-image-probe/bin/python" scripts/probe_matplotlib_preparation.py \
                 --evidence-dir "$RUNNER_TEMP/matplotlib-solver-evidence" \
                 --work-dir "$RUNNER_TEMP/matplotlib-image-work"
               ;;
@@ -75,7 +78,9 @@ jobs:
           SOLVER_STEP_OUTCOME: ${{ steps.solver.outcome }}
           PREPARATION_PROBE_STAGE: ${{ inputs.preparation_probe_stage || 'solve' }}
         run: |
-          python3 - <<'PY'
+          # The image supervisor owns this evidence directory as root; keep the
+          # outcome writer on the same side of that ownership boundary.
+          sudo --non-interactive --preserve-env=RUNNER_TEMP,SOLVER_STEP_OUTCOME,PREPARATION_PROBE_STAGE,GITHUB_SHA python3 - <<'PY'
           import json, os
           from pathlib import Path
           evidence = Path(os.environ["RUNNER_TEMP"]) / "matplotlib-solver-evidence"

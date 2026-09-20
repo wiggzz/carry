@@ -240,6 +240,52 @@ class ImageProbeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertFalse((root / "evidence").exists())
 
+    def test_hosted_cli_rejects_mismatched_checkout_owner_before_build(self):
+        import os
+        import sys
+        with mock.patch.dict(os.environ, GITHUB_ACTIONS="true", RUNNER_ENVIRONMENT="github-hosted"), \
+             mock.patch.object(probe.os, "geteuid", return_value=1001), \
+             mock.patch.object(sys, "argv", ["probe", "--evidence-dir", "unused", "--work-dir", "unused-work"]), \
+             mock.patch.object(probe, "run_probe", return_value=0) as stage:
+            with self.assertRaises(SystemExit) as failure:
+                probe.main()
+            self.assertEqual(failure.exception.code, 2)
+            stage.assert_not_called()
+
+    def test_workflow_outcome_writer_handles_restricted_image_evidence(self):
+        import os
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML unavailable; pinned-harness CI executes workflow fixture")
+        workflow = yaml.load((Path(__file__).parent.parent / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+        step = next(s for s in workflow["jobs"]["preparation-solver-probe"]["steps"]
+                    if s.get("name") == "Record job outcome even if checkout or tests failed")
+        for stage in ("solve", "image"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                evidence = root / "matplotlib-solver-evidence"
+                evidence.mkdir()
+                (evidence / "result.json").write_text('{}')
+                # Emulate the denied non-owner write without requiring local root.
+                evidence.chmod(0o555 if stage == "image" else 0o755)
+                sudo = root / "sudo"
+                sudo.write_text('#!/bin/bash\nset -eu\n'
+                    '[[ "$1" == --non-interactive ]]\nshift\n'
+                    '[[ "$1" == --preserve-env=RUNNER_TEMP,SOLVER_STEP_OUTCOME,PREPARATION_PROBE_STAGE,GITHUB_SHA ]]\n'
+                    'shift\nchmod u+w "$RUNNER_TEMP/matplotlib-solver-evidence"\nexec "$@"\n')
+                sudo.chmod(0o700)
+                try:
+                    result = subprocess.run(["bash", "-eu", "-c", step["run"]], capture_output=True, text=True,
+                        env=dict(os.environ, PATH=str(root)+os.pathsep+os.environ["PATH"], RUNNER_TEMP=str(root),
+                                 SOLVER_STEP_OUTCOME="failure", PREPARATION_PROBE_STAGE=stage, GITHUB_SHA="a"*40))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    saved = json.loads((evidence / "job-outcome.json").read_text())
+                    self.assertEqual(saved, {"solver_step_outcome": "failure", "preparation_probe_stage": stage,
+                                            "github_sha": "a"*40, "result_present": True})
+                finally:
+                    evidence.chmod(0o755)
+
     def test_workflow_stage_dispatch_executes_only_selected_diagnostic(self):
         try:
             import yaml
@@ -257,8 +303,17 @@ class ImageProbeTests(unittest.TestCase):
             root = Path(directory)
             (root / "swebench-image-probe/bin").mkdir(parents=True)
             for path in (root / "python3", root / "swebench-image-probe/bin/python"):
-                path.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CALLS"\n')
+                path.write_text('#!/bin/bash\nset -eu\n'
+                                'if [[ "$0" == */swebench-image-probe/bin/python ]]; then '
+                                '[[ "${PROBE_TEST_SUDO:-0}" == 1 ]] || exit 97; fi\n'
+                                'printf "%s\\n" "$*" >> "$CALLS"\n')
                 path.chmod(0o700)
+            sudo = root / "sudo"
+            sudo.write_text('#!/bin/bash\nset -eu\n'
+                            '[[ "$1" == --non-interactive ]]\nshift\n'
+                            '[[ "$1" == --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_SHA,GITHUB_RUN_ID ]]\n'
+                            'shift\nexport PROBE_TEST_SUDO=1\nexec "$@"\n')
+            sudo.chmod(0o700)
             for stage, script in (("solve", "probe_matplotlib_solver.py"), ("image", "probe_matplotlib_preparation.py"), ("bad", None)):
                 calls = root / (stage + "-calls")
                 result = subprocess.run(["bash", "-eu", "-c", command], capture_output=True, text=True,
