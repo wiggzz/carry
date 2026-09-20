@@ -158,14 +158,70 @@ python() { [ -f installed ] || return 98; [ "$MALLOC_ARENA_MAX" = 13 ] || return
             data = (Path(__file__).parent / "fixtures/matplotlib-24627-environment.yml").read_bytes()
             self.assertEqual(observed, data.replace(b"nbconvert[execute]!=6.0.0,!=6.0.1",
                                                    b"nbconvert[version='!=6.0.0,!=6.0.1']"))
-            self.assertEqual((root / "python-calls").read_text().splitlines()[-1],
-                             original.env_script_list[-1].removeprefix("python ").replace(
-                                 "typing-extensions==4.7.1", "typing-extensions==4.13.0") + " pandas==2.3.3")
+            self.assertEqual((root / "python-calls").read_text().splitlines(), [
+                original.env_script_list[-1].removeprefix("python ").replace(
+                    "typing-extensions==4.7.1", "typing-extensions==4.13.0") + " pandas==2.3.3",
+                "-", "-m pip uninstall --yes vcs-versioning",
+            ])
+        self.assertIn("matplotlib-remove-orphan-vcs-versioning", report["tasks"][original.instance_id]["repairs"])
         self.assertIn("matplotlib-pandas-2.3.3", report["tasks"][original.instance_id]["repairs"])
         self.assertIn("matplotlib-typing-extensions-4.13.0", report["tasks"][original.instance_id]["repairs"])
         for field in ("eval_script_list", "FAIL_TO_PASS", "PASS_TO_PASS"):
             self.assertEqual(getattr(original, field), getattr(changed[0], field))
         self.assertIn("matplotlib-micromamba-2.3.3", report["tasks"][original.instance_id]["repairs"])
+
+    def test_matplotlib_orphan_plugin_cleanup_checks_installed_metadata(self):
+        import sys
+        cases = (("7.1.0", None, True), ("8.0.0", None, False),
+                 ("7.1.0", "vcs_versioning>=2", False),
+                 ("7.1.0", "vcs-versioning; python_version < '0'", False))
+        for scm_version, requirement, allowed in cases:
+            with self.subTest(version=scm_version, requirement=requirement), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                metadata_dir = root / "metadata"
+                metadata_dir.mkdir()
+                for name, version, requires in (("setuptools-scm", scm_version, None),
+                                                ("consumer", "1.0", requirement)):
+                    info = metadata_dir / (name.replace("-", "_") + "-" + version + ".dist-info")
+                    info.mkdir()
+                    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n" +
+                                                   (f"Requires-Dist: {requires}\n" if requires else ""))
+                wrapper = root / "metadata_runner.py"
+                wrapper.write_text('''import sys
+from importlib import metadata
+from packaging.utils import canonicalize_name
+real_distributions = metadata.distributions
+metadata.distributions = lambda: real_distributions(path=[sys.argv[1]])
+def version(name):
+    for distribution in metadata.distributions():
+        if canonicalize_name(distribution.metadata["Name"]) == canonicalize_name(name):
+            return distribution.version
+    raise metadata.PackageNotFoundError(name)
+metadata.version = version
+exec(sys.stdin.read())
+''')
+                changed, _ = transform_test_specs([matplotlib_spec()], swebench_version="4.1.0")
+                commands = changed[0].env_script_list
+                index = next(i for i, command in enumerate(commands) if command.startswith("python -m pip install "))
+                shell = '''set -eu
+python() {
+    if [ "$1" = - ]; then
+        "$REAL_PYTHON" "$METADATA_RUNNER" "$METADATA_DIR"
+    elif [ "$1 $2 $3" = '-m pip install' ]; then
+        touch pinned-install
+    elif [ "$*" = '-m pip uninstall --yes vcs-versioning' ]; then
+        test -f pinned-install
+        touch orphan-removed
+    else
+        return 99
+    fi
+}
+'''
+                process = subprocess.run(["bash", "-c", shell + "\n".join(commands[index:])], cwd=root,
+                    env=dict(os.environ, REAL_PYTHON=sys.executable, METADATA_RUNNER=str(wrapper),
+                             METADATA_DIR=str(metadata_dir)), capture_output=True, text=True, timeout=15)
+                self.assertEqual(process.returncode == 0, allowed, process.stderr)
+                self.assertEqual((root / "orphan-removed").exists(), allowed, process.stderr)
 
     def test_matplotlib_exact_recipe_guard_and_architecture_fail_closed(self):
         original = matplotlib_spec()

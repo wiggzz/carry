@@ -71,6 +71,23 @@ def _repair_matplotlib_solver(spec: Any, original_sha256: str) -> None:
     spec.env_script_list[-1] = (
         pip_command.replace(old_pin, "typing-extensions==4.13.0", 1) + " pandas==2.3.3"
     )
+    spec.env_script_list.extend([
+        # Remove only the orphan plugin left by the official SCM downgrade.
+        # Conservatively reject even conditional/extra requirements: installed
+        # metadata alone cannot prove which extras the task will exercise.
+        "python - <<'PY_SCM_GUARD'\n"
+        "from importlib import metadata\n"
+        "from packaging.requirements import Requirement\n"
+        "from packaging.utils import canonicalize_name\n"
+        "if metadata.version('setuptools-scm') != '7.1.0':\n"
+        "    raise RuntimeError('unexpected Matplotlib setuptools-scm version')\n"
+        "for distribution in metadata.distributions():\n"
+        "    for raw in distribution.requires or []:\n"
+        "        if canonicalize_name(Requirement(raw).name) == 'vcs-versioning':\n"
+        "            raise RuntimeError('refusing to remove required vcs-versioning: ' + distribution.metadata['Name'])\n"
+        "PY_SCM_GUARD",
+        "python -m pip uninstall --yes vcs-versioning",
+    ])
     # Conda 23.11 ignores bare [execute]; equivalent canonical MatchSpec is
     # necessary for micromamba. All other YAML bytes (including pip) survive.
     spec.env_script_list[1] = spec.env_script_list[1].replace(
@@ -189,7 +206,7 @@ def transform_test_specs(
         if spec.instance_id == MPL_SOLVER_TASK:
             _repair_matplotlib_solver(spec, original_sha256)
             repairs.extend(["matplotlib-micromamba-2.3.3", "matplotlib-typing-extensions-4.13.0",
-                            "matplotlib-pandas-2.3.3"])
+                            "matplotlib-pandas-2.3.3", "matplotlib-remove-orphan-vcs-versioning"])
         elif spec.repo == "matplotlib/matplotlib" and spec.version in MPL_CONDA_VERSIONS:
             # Work around the observed libsolv solver_addrule assertion without
             # removing/replacing packages. Classic solver success is not assumed.
