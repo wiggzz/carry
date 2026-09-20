@@ -44,6 +44,26 @@ QHULL_ORIGINAL = [
 MPL_CONDA_VERSIONS = {"3.5", "3.6", "3.7", "3.8", "3.9"}
 MPL_QHULL_VERSIONS = {"3.0", "3.1", "3.2", "3.3", "3.4"} | MPL_CONDA_VERSIONS
 
+# These base commits declare docutils>=0.12 and latex.py explicitly supports the
+# standalone roman fallback. The retained images have docutils 0.23, which no
+# longer bundles docutils.utils.roman, and no standalone roman. Restore only that
+# missing provider; do not downgrade docutils or re-resolve other dependencies.
+# roman 3.3 (2020-07-12) retains the historical toRoman API. Local Python 3.9
+# probes reproduced the import failure at all three commits; adding only this
+# package let tests/test_util.py execute (8 passed each). Full readiness remains
+# mandatory. Exact ORIGINAL setup hashes include both env and repository scripts.
+SPHINX_ROMAN_RECIPES = {
+    "sphinx-doc__sphinx-7440": (
+        "3.0", "d1c3c02f7c21db76c04289f7d8e6a8ca3e8203feebcd0857b0c75a6671ca9d39",
+    ),
+    "sphinx-doc__sphinx-7590": (
+        "3.1", "c686a763ee4b9b213e748a11cde37f9d1c3654eeaac1e8949181f23350f5388b",
+    ),
+    "sphinx-doc__sphinx-8056": (
+        "3.2", "acaa62b82df5825ae2c807364f8b963441dc7840fc473fe8c4e5b3e0e3f47244",
+    ),
+}
+
 
 def preparation_compatibility_sha256() -> str:
     """Bind cache/catalog provenance to the complete local compatibility policy."""
@@ -97,6 +117,16 @@ def transform_test_specs(
     for spec in result:
         original_sha256 = _recipe_sha256(spec)
         repairs = []
+        if spec.instance_id in SPHINX_ROMAN_RECIPES:
+            expected_version, expected_hash = SPHINX_ROMAN_RECIPES[spec.instance_id]
+            if (spec.repo != "sphinx-doc/sphinx" or spec.version != expected_version
+                    or original_sha256 != expected_hash):
+                raise ValueError("unexpected Sphinx preparation recipe")
+            index = _original_block_index(
+                spec.repo_script_list, ["python -m pip install -e .[test]"],
+            )
+            spec.repo_script_list.insert(index + 1, "python -m pip install --no-deps roman==3.3")
+            repairs.append("sphinx-roman-3.3")
         if spec.repo == "scikit-learn/scikit-learn" and spec.version in {"1.3", "1.4", "1.5", "1.6"}:
             if spec.env_script_list != SKLEARN_ENV or PIP_PIN in spec.repo_script_list:
                 raise ValueError("unexpected scikit-learn preparation environment")

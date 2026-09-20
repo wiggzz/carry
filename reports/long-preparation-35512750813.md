@@ -1,0 +1,37 @@
+# Full preparation failure: 35512750813
+
+Source: `b07716895485d9e91614516177ad4c0c9b44a98d`. Artifact: `swebench-prepare-long-50-carry-35512750813-1-attempt-1` (ID `10607580591`). The result archive and controller diagnostics were retained; exact-worker termination and cleanup passed. No model calls occurred.
+
+## Reconciled outcome
+
+The attempt checkpoint contains all 50 frozen task IDs: 34 published evaluator/agent pairs, 15 readiness failures, and one environment-blocked task. The completed-pair checkpoint contains exactly 34 entries. No complete catalog was published.
+
+- Twelve historical SymPy tasks ran `bin/test -C --verbose --timeout 15 --split 1/500`; each output reports zero tests. Exit zero is not readiness success.
+- Three Sphinx tasks (`7440`, `7590`, `8056`) failed importing `sphinx.testing.fixtures` because `roman` was absent.
+- `matplotlib__matplotlib-24627` was blocked by its shared environment. The classic Conda solver was killed with exit 137 at 13:38:57 UTC. Kernel OOM evidence was not captured, so exit 137 alone does not establish OOM.
+
+`matplotlib__matplotlib-21568` and `scikit-learn__scikit-learn-25102` passed the existing readiness gate and were published: the earlier Qhull and legacy-pip repairs progressed successfully on this run.
+
+## Timing and resource evidence
+
+- Workflow creation through terminal update: 5,632 seconds (about 94 minutes).
+- Preparation checkpoint elapsed: 5,456.497736 seconds (about 91 minutes).
+- Dependency-build stage: 3,222.205588 seconds (about 54 minutes).
+- Remaining preparation: 2,234.292148 seconds (about 37 minutes), including readiness and publication.
+- Retained controller evidence: 90 preparation heartbeats and 171 polls; final outcome `archive-received` and observed worker state `terminated`.
+
+During the Matplotlib solve, available host memory fell from 21.76 GiB at 13:36:31 UTC to 13.97 GiB at 13:37:31 and 3.35 GiB at 13:38:31, then recovered to 28.29 GiB at 13:39:31. Load was approximately one before the kill. This supports investigating solver memory growth; it does not prove a kernel OOM kill or justify blaming the five-build concurrency limit. Serializing alone is unlikely to address a mostly single-active solver phase.
+
+## Repair acceptance
+
+Keep the original full-50 selection, evaluator commands, dependency requirements, gold separation, readiness requirement, and existing worker/controller deadlines. Reproduce the empty historical SymPy shard with public source; choose bounded public tests that actually execute. Scope dependency/solver compatibility repairs to validated upstream recipes, record provenance, and test the real command behavior where possible.
+
+The shared compatibility module participates in every prepared-image recipe hash. Changing it invalidates all prior ready-pair cache identities, including the 34 pairs from this attempt. Those published artifacts remain intact but must not be silently reused under a changed identity. Do not describe retained artifacts as cache hits unless the current policy validates them.
+
+The follow-up branch incorporates merged PR #118 before combined testing. This failure run itself predates #118 and is not evidence for that code.
+
+## Locally reproduced repairs
+
+- SymPy: historical runners split files, so the first of 500 shards can be empty. Select the fixed public module `sympy/core/tests/test_basic.py`, present with tests at all 15 cohort SymPy base commits. Genuine Python 3.9 runner/SWE-bench parser probes produced 15, 20, and 22 parsed passing tests at three representative commits; the old probe produced zero, zero, and nine. Preserve the 15-second per-test bound, 180-second outer timeout, and nonzero parsed-test requirement. Selection never reads gold/test patches or evaluator selectors.
+- Sphinx: add only `roman==3.3` with `--no-deps`, for the three failing task IDs under exact original setup-hash guards. Real Python 3.9 probes reproduced the missing import, then passed eight public tests at each base commit after adding that package. Existing dependencies and evaluator instructions are unchanged.
+- Matplotlib remains unresolved. A checksum-verified micromamba 2.3.3 experiment retained the YAML/channel order and applied the already-required Python 3.11 constraint upfront, but the local 1-GiB safety cap was exhausted while parsing package metadata. This is neither a successful solve nor evidence that the dependency set is unsatisfiable. The local host has only 3.7 GiB total memory, so increasing its cap would endanger unrelated services. A bounded, no-secret hosted diagnostic is required before changing production solver behavior or spending another full-50 preparation attempt.

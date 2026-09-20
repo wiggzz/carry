@@ -788,8 +788,10 @@ def streamable_public_test_command(command: str) -> str:
     if any(token.lstrip("./") == "bin/test" for token in tokens):
         if not any(token == "--timeout" or token.startswith("--timeout=") for token in tokens):
             tokens.extend(("--timeout", "15"))
-        if not any(token == "--split" or token.startswith("--split=") for token in tokens):
-            tokens.extend(("--split", "1/500"))
+        # Historical SymPy splits files, not test cases; 1/500 can select zero
+        # files and still exit successfully. Use one stable public core unit,
+        # independent of the task's patch and FAIL_TO_PASS/PASS_TO_PASS metadata.
+        tokens.append("sympy/core/tests/test_basic.py")
         return shlex.join(tokens)
     return command
 

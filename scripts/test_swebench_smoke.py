@@ -720,6 +720,59 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertNotIn("HIDDEN GOLD TEST", script)
         self.assertNotIn("git apply", script)
 
+    def test_sympy_readiness_executes_a_fixed_public_file_in_small_historical_suites(self):
+        # Old SymPy split_list partitions FILES with floor division: fewer than
+        # 500 files makes split 1/500 empty, even though bin/test exits zero.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "bin").mkdir()
+            tests = root / "sympy/core/tests"
+            tests.mkdir(parents=True)
+            (tests / "test_basic.py").write_text(
+                "from pathlib import Path\n"
+                "def test_public_basic():\n"
+                "    Path('executed').write_text('public basic test')\n"
+                "    assert 2 + 2 == 4\n"
+            )
+            (tests / "test_unrelated.py").write_text(
+                "raise RuntimeError('readiness must not run the entire suite')\n"
+            )
+            runner = root / "bin/test"
+            runner.write_text(
+                f"#!{sys.executable}\n"
+                "import argparse, pathlib, runpy\n"
+                "p = argparse.ArgumentParser()\n"
+                "p.add_argument('-C', action='store_true')\n"
+                "p.add_argument('--verbose', action='store_true')\n"
+                "p.add_argument('--timeout', type=int)\n"
+                "p.add_argument('--split')\n"
+                "p.add_argument('paths', nargs='*')\n"
+                "a = p.parse_args()\n"
+                "assert a.verbose and a.timeout == 15\n"
+                "files = sorted(pathlib.Path('sympy').rglob('test_*.py'))\n"
+                "if a.paths:\n"
+                "    files = [f for f in files if any(s in str(f) for s in a.paths)]\n"
+                "if a.split:\n"
+                "    i, n = map(int, a.split.split('/'))\n"
+                "    files = files[(i-1)*len(files)//n:i*len(files)//n]\n"
+                "for f in files:\n"
+                "    for name, test in runpy.run_path(str(f)).items():\n"
+                "        if name.startswith('test_'):\n"
+                "            test()\n"
+                "            print(name + ' ok', flush=True)\n"
+            )
+            runner.chmod(0o755)
+            command = self.worker.streamable_public_test_command(
+                "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' bin/test -C --verbose"
+            )
+            result = subprocess.run(
+                ["bash", "-c", command], cwd=root, text=True,
+                capture_output=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((root / "executed").exists(), result.stdout)
+            self.assertEqual(result.stdout.strip(), "test_public_basic ok")
+
     def test_streamable_public_test_command_bounds_each_sympy_test(self):
         bounded = self.worker.streamable_public_test_command(
             "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' bin/test -C --verbose"
@@ -729,7 +782,7 @@ class SmokeWorkerTests(unittest.TestCase):
             [
                 "PYTHONWARNINGS=ignore::UserWarning,ignore::SyntaxWarning",
                 "bin/test", "-C", "--verbose", "--timeout", "15",
-                "--split", "1/500",
+                "sympy/core/tests/test_basic.py",
             ],
         )
         existing = self.worker.streamable_public_test_command(
@@ -737,7 +790,7 @@ class SmokeWorkerTests(unittest.TestCase):
         )
         self.assertEqual(
             shlex.split(existing),
-            ["bin/test", "-C", "--verbose", "--timeout", "17", "--split", "1/500"],
+            ["bin/test", "-C", "--verbose", "--timeout", "17", "sympy/core/tests/test_basic.py"],
         )
 
     def test_run_task_readiness_persists_diagnostics_and_accepts_test_failure(self):
