@@ -648,6 +648,22 @@ exec {shutil.which('rm')} "$@"
             assert log is not None
             self.assertNotIn(self.sentinel, log.read().decode())
 
+    def test_sigpipe_preserves_failure_and_runs_cleanup_with_dead_logger(self):
+        self.write_command("tee", '''
+import sys
+print(sys.stdin.readline(), end='', flush=True)
+sys.exit(19)
+''', python=True)
+        self.write_command("dnf", 'sleep 0.2\nkill -PIPE "$PPID"\nsleep 0.1\n')
+        secret = pathlib.Path(self.env["SECRET_FILE"])
+        secret.write_text(self.sentinel)
+        run = self.run_worker()
+        self.assertEqual(run.returncode, 141, run.stdout + run.stderr)
+        self.assertFalse(secret.exists())
+        self.assertTrue((self.root / "shutdown").exists())
+        self.assertIn({"stage": "worker_exit", "exit_code": 141}, self.events())
+        self.assertEqual(self.events()[-1], {"stage": "finished", "exit_code": 141})
+
     def test_early_log_writer_exit_still_sanitizes_and_shuts_down(self):
         self.write_command("tee", '''
 import sys

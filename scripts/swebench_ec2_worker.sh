@@ -23,7 +23,10 @@ finish() {
   worker_status=$status
   delivery_status=0
   trap - EXIT
+  trap '' PIPE
   set +e
+  # A dead logger must not send a second SIGPIPE through the exit handler.
+  exec 1>&3 2>&4
   worker_event worker_exit "$status"
   for pid in "$capability_refresh_pid" "$preparation_telemetry_pid"; do
     [[ -n "$pid" ]] || continue
@@ -46,8 +49,7 @@ finish() {
     worker_event sanitize_failed "$delivery_status"
     [[ "$status" != 0 ]] || status=$delivery_status
   fi
-  # Close the log pipe and bound its drain before tar snapshots worker.log.
-  exec 1>&3 2>&4
+  # Bound the logger drain before tar snapshots worker.log.
   if [[ -n "$worker_log_pid" ]]; then
     log_status=0
     if timeout --signal=KILL 5s tail --pid="$worker_log_pid" -f /dev/null >/dev/null 2>&1; then
@@ -63,6 +65,7 @@ finish() {
     fi
   fi
   if [[ "$delivery_status" == 0 && -n "$result_url" && -d "$CARRY_ROOT/results" ]]; then
+    worker_event worker_exit "$worker_status" >> "$CARRY_ROOT/results/worker.log"
     printf '%s\n' "$worker_status" > "$CARRY_ROOT/results/worker-exit-status"
     worker_event archive
     if timeout --signal=TERM --kill-after=5s 120s \
@@ -89,6 +92,7 @@ finish() {
   exit "$status"
 }
 trap finish EXIT
+trap 'exit 141' PIPE
 
 mkdir -p "$CARRY_ROOT/results" "$CARRY_ROOT/source" "$CARRY_ROOT/work"
 exec > >(exec tee -a "$CARRY_ROOT/results/worker.log") 2>&1
