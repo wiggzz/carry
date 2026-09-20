@@ -192,6 +192,21 @@ class ProbeTests(unittest.TestCase):
                 probe.validate_plan({"success": True, "dry_run": True,
                                      "actions": {"LINK": altered}}, requirements, pip)
 
+    def test_post_release_versions_honor_declared_constraints(self):
+        probe = self.load_probe()
+        def plan(version):
+            return {"success": True, "dry_run": True, "actions": {"LINK": [
+                {"name": "python", "version": "3.11.9"},
+                {"name": "python-dateutil", "version": version}]}}
+        for version in ("2.9.0.post0", "2.1.post0"):
+            self.assertEqual(probe.validate_plan(plan(version), ["python-dateutil>=2.1"], [])
+                             ["conda_dependencies"], ["python-dateutil"])
+        with self.assertRaises(ValueError):
+            probe.validate_plan(plan("2.0.post99"), ["python-dateutil>=2.1"], [])
+        with self.assertRaises(ValueError):
+            probe.validate_plan(plan("2.9.0"), ["python-dateutil!=2.9.0"], [])
+        probe.validate_plan(plan("2.9.0.post0"), ["python-dateutil!=2.9.0"], [])
+
     def test_cli_refuses_a_real_solve_off_hosted_ci(self):
         import os
         import subprocess

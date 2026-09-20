@@ -92,7 +92,167 @@ def sphinx_spec(task):
     return item
 
 
+def matplotlib_spec():
+    """Frozen public SWE-bench 4.1.0 setup; not image-build evidence."""
+    item = spec("matplotlib/matplotlib", "3.6")
+    item.instance_id = "matplotlib__matplotlib-24627"
+    item.arch = "x86_64"
+    data = (Path(__file__).parent / "fixtures/matplotlib-24627-environment.yml").read_text()
+    item.env_script_list = [
+        "source /opt/miniconda3/bin/activate",
+        "cat <<'EOF_59812759871' > environment.yml\n" + data + "EOF_59812759871",
+        "conda env create --file environment.yml",
+        "conda activate testbed && conda install python=3.11 -y",
+        "rm environment.yml", "conda activate testbed",
+        "python -m pip install contourpy==1.1.0 cycler==0.11.0 fonttools==4.42.1 ghostscript kiwisolver==1.4.5 numpy==1.25.2 packaging==23.1 pillow==10.0.0 pikepdf pyparsing==3.0.9 python-dateutil==2.8.2 six==1.16.0 setuptools==68.1.2 setuptools-scm==7.1.0 typing-extensions==4.7.1",
+    ]
+    # Shared upstream clone/historical checkout sequence, with this actual base.
+    item.repo_script_list = [line.replace("sphinx-doc/sphinx", "matplotlib/matplotlib")
+        .replace(SPHINX_TASKS["7440"][1], "9d22ab09d52d279b125d8770967569de070913b2")
+        for line in sphinx_spec("7440").repo_script_list[:15]] + [
+        "apt-get -y update && apt-get -y upgrade && DEBIAN_FRONTEND=noninteractive apt-get install -y imagemagick ffmpeg texlive texlive-latex-extra texlive-fonts-recommended texlive-xetex texlive-luatex cm-super dvipng",
+        *QHULL_ORIGINAL, "python -m pip install -e .",
+        "git config --global user.email setup@swebench.config",
+        "git config --global user.name SWE-bench",
+        "git commit --allow-empty -am SWE-bench",
+    ]
+    return item
+
+
 class CompatibilityTests(unittest.TestCase):
+    def test_bound_matplotlib_recipe_installs_once_preserving_all_pip_inputs(self):
+        original = matplotlib_spec()
+        changed, report = transform_test_specs([original], swebench_version="4.1.0")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # Deliberately synthetic executable: verifies the emitted install
+            # contract, not actual dependency installation or solvability.
+            binary = root / "solver-fixture"
+            binary.write_text('#!/bin/bash\nset -eu\nprintf "%s\\n" "$*" >> calls\n'
+                              'cp environment.yml observed.yml\ntouch installed\n')
+            digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+            with mock.patch.object(compat, "MPL_SOLVER_SHA256", digest, create=True):
+                changed, report = transform_test_specs([original], swebench_version="4.1.0")
+            shell = '''set -euo pipefail
+source() { :; }
+conda() { [ "$*" = 'activate testbed' ] && [ -f installed ]; }
+wget() { cp solver-fixture micromamba-preparation; }
+timeout() { [ "$1" = --kill-after=5s ] || return 97; shift 2; "$@"; }
+python() { [ -f installed ] || return 98; printf '%s\\n' "$*" >> python-calls; }
+'''
+            result = subprocess.run(["bash", "-c", shell + "\n".join(changed[0].env_script_list)],
+                                    cwd=root, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = (root / "calls").read_text().splitlines()
+            self.assertEqual(len(calls), 1)
+            tokens = calls[0].split()
+            self.assertEqual(tokens[0], "create")
+            self.assertEqual(tokens[tokens.index("--prefix") + 1], "/opt/miniconda3/envs/testbed")
+            self.assertIn("python=3.11", tokens)
+            self.assertNotIn("--dry-run", tokens)
+            self.assertIn("--no-rc", tokens)
+            self.assertIn("--no-env", tokens)
+            observed = (root / "observed.yml").read_bytes()
+            data = (Path(__file__).parent / "fixtures/matplotlib-24627-environment.yml").read_bytes()
+            self.assertEqual(observed, data.replace(b"nbconvert[execute]!=6.0.0,!=6.0.1",
+                                                   b"nbconvert[version='!=6.0.0,!=6.0.1']"))
+            self.assertEqual((root / "python-calls").read_text().splitlines()[-1],
+                             original.env_script_list[-1].removeprefix("python "))
+        for field in ("eval_script_list", "FAIL_TO_PASS", "PASS_TO_PASS"):
+            self.assertEqual(getattr(original, field), getattr(changed[0], field))
+        self.assertIn("matplotlib-micromamba-2.3.3", report["tasks"][original.instance_id]["repairs"])
+
+    def test_matplotlib_exact_recipe_guard_and_architecture_fail_closed(self):
+        original = matplotlib_spec()
+        cases = []
+        for field in ("env_script_list", "repo_script_list"):
+            for position in range(len(getattr(original, field))):
+                changed = copy.deepcopy(original)
+                getattr(changed, field)[position] += " # drift"
+                cases.append(changed)
+        for field, value in (("repo", "other/repo"), ("version", "3.7"), ("arch", "arm64")):
+            changed = copy.deepcopy(original)
+            setattr(changed, field, value)
+            cases.append(changed)
+        cases += transform_test_specs([original], swebench_version="4.1.0")[0]
+        for changed in cases:
+            before = copy.deepcopy(changed)
+            with self.subTest(recipe=changed), self.assertRaisesRegex(ValueError, "unexpected Matplotlib"):
+                transform_test_specs([changed], swebench_version="4.1.0")
+            self.assertEqual(changed, before)
+        # Other task IDs still follow the existing policy, not the new solver.
+        other = copy.deepcopy(original)
+        other.instance_id = "matplotlib__matplotlib-unknown"
+        _, report = transform_test_specs([other], swebench_version="4.1.0")
+        self.assertEqual(report["tasks"][other.instance_id]["repairs"],
+                         ["matplotlib-classic-solver", "matplotlib-qhull-https-sha256"])
+
+    def test_matplotlib_bad_download_checksum_timeout_and_install_stop_setup(self):
+        for failure in ("download", "checksum", "install", "timeout"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root / "fixture"
+                binary.write_text("#!/bin/bash\nexit 47\n")
+                digest = "0" * 64 if failure == "checksum" else hashlib.sha256(binary.read_bytes()).hexdigest()
+                with mock.patch.object(compat, "MPL_SOLVER_SHA256", digest):
+                    changed, _ = transform_test_specs([matplotlib_spec()], swebench_version="4.1.0")
+                shell = '''set -euo pipefail
+source() { :; }
+conda() { printf 'activation-reached'; }
+python() { printf 'pip-reached'; }
+timeout() {
+    [ "$1" = --kill-after=5s ] || return 90
+    if [ "$2" = 120s ]; then
+        [ "$(ulimit -f)" = 32768 ] || return 91
+    else
+        [ "$2" = 1200s ] && [ "$(ulimit -v)" = 6291456 ] && [ "$(ulimit -t)" = 1200 ] || return 92
+        [ "$FAILURE" != timeout ] || return 124
+    fi
+    shift 2; "$@"
+}
+wget() {
+    [ "$1" = --https-only ] && [ "$2" = --max-redirect=5 ] && [ "$3" = --timeout=30 ] && [ "$4" = --tries=1 ] || return 93
+    [ "$FAILURE" != download ] || return 4
+    cp fixture micromamba-preparation
+}
+'''
+                result = subprocess.run(["bash", "-c", shell + "\n".join(changed[0].env_script_list)],
+                    cwd=root, env=dict(os.environ, FAILURE=failure), capture_output=True, text=True)
+                self.assertEqual(result.returncode, {"download": 4, "checksum": 1, "install": 47, "timeout": 124}[failure], result.stderr)
+                self.assertNotIn("activation-reached", result.stdout)
+                self.assertNotIn("pip-reached", result.stdout)
+
+    def test_pinned_harness_real_matplotlib_recipe_matches_guard_without_network(self):
+        try:
+            from importlib.metadata import version
+            from dataclasses import asdict
+            from swebench.harness.test_spec import python as recipes
+            from swebench.harness.test_spec.test_spec import make_test_spec
+        except ImportError:
+            self.skipTest("optional pinned SWE-bench harness is not installed")
+        self.assertEqual(version("swebench"), "4.1.0")
+        original = matplotlib_spec()
+        data = (Path(__file__).parent / "fixtures/matplotlib-24627-environment.yml").read_text()
+        # Public upstream YAML API excludes the heredoc's appended newline.
+        with mock.patch.object(recipes, "get_environment_yml", return_value=data[:-1]):
+            actual = make_test_spec({
+                "instance_id": original.instance_id, "repo": original.repo, "version": original.version,
+                "base_commit": "9d22ab09d52d279b125d8770967569de070913b2",
+                "environment_setup_commit": "73909bcb408886a22e2b84581d6b9e6d9907c813",
+                "test_patch": "", "FAIL_TO_PASS": ["private-test"], "PASS_TO_PASS": ["private-pass"],
+            })
+        self.assertEqual(actual.env_script_list, original.env_script_list)
+        self.assertEqual(actual.repo_script_list, original.repo_script_list)
+        changed, _ = transform_test_specs([actual], swebench_version=version("swebench"))
+        for key, value in asdict(actual).items():
+            if key not in {"env_script_list", "repo_script_list", "instance_image_tag"}:
+                self.assertEqual(getattr(changed[0], key), value)
+        self.assertNotEqual(changed[0].env_image_key, actual.env_image_key)
+        self.assertNotEqual(changed[0].instance_image_key, actual.instance_image_key)
+        for script in (changed[0].setup_env_script, changed[0].install_repo_script):
+            result = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_sphinx_restores_missing_roman_without_changing_other_dependencies(self):
         for task in SPHINX_TASKS:
             with self.subTest(task=task):

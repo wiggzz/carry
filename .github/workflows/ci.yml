@@ -9,20 +9,26 @@ on:
   workflow_dispatch:
     inputs:
       preparation_solver_probe:
-        description: 'Probe only: bounded Matplotlib Conda dry-run (no model or cloud worker)'
+        description: 'Probe only: bounded Matplotlib preparation (no model or cloud worker)'
         type: boolean
         required: false
         default: false
+      preparation_probe_stage:
+        description: 'solve: Conda dry-run; image: actual official image + public readiness'
+        type: choice
+        required: false
+        default: solve
+        options: [solve, image]
 
 permissions:
   contents: read
 
 jobs:
   preparation-solver-probe:
-    name: Matplotlib preparation solver diagnostic
+    name: Matplotlib preparation diagnostic
     if: github.event_name == 'workflow_dispatch' && inputs.preparation_solver_probe
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: ${{ inputs.preparation_probe_stage == 'image' && 40 || 20 }}
     permissions:
       contents: read
     steps:
@@ -31,19 +37,43 @@ jobs:
           persist-credentials: false
 
       - name: Test diagnostic failure and evidence paths offline
-        run: python3 -m unittest -v scripts/test_probe_matplotlib_solver.py
-
-      - name: Bounded full-environment Conda dry-run
-        id: solver
         run: >-
-          python3 scripts/probe_matplotlib_solver.py
-          --evidence-dir "$RUNNER_TEMP/matplotlib-solver-evidence"
-          --work-dir "$RUNNER_TEMP/matplotlib-solver-work"
+          python3 -m unittest -v scripts/test_probe_matplotlib_solver.py
+          scripts/test_probe_matplotlib_preparation.py scripts/test_swebench_preparation_compat.py
+
+      - name: Install pinned official harness for actual-image diagnostic
+        if: inputs.preparation_probe_stage == 'image'
+        timeout-minutes: 5
+        run: |
+          python3 -m venv "$RUNNER_TEMP/swebench-image-probe"
+          "$RUNNER_TEMP/swebench-image-probe/bin/python" -m pip install 'swebench==4.1.0'
+          "$RUNNER_TEMP/swebench-image-probe/bin/python" -m unittest -v \
+            scripts.test_probe_matplotlib_preparation scripts.test_swebench_preparation_compat
+
+      - name: Run selected bounded preparation diagnostic
+        id: solver
+        env:
+          PREPARATION_PROBE_STAGE: ${{ inputs.preparation_probe_stage || 'solve' }}
+        run: |
+          case "$PREPARATION_PROBE_STAGE" in
+            solve)
+              python3 scripts/probe_matplotlib_solver.py \
+                --evidence-dir "$RUNNER_TEMP/matplotlib-solver-evidence" \
+                --work-dir "$RUNNER_TEMP/matplotlib-solver-work"
+              ;;
+            image)
+              "$RUNNER_TEMP/swebench-image-probe/bin/python" scripts/probe_matplotlib_preparation.py \
+                --evidence-dir "$RUNNER_TEMP/matplotlib-solver-evidence" \
+                --work-dir "$RUNNER_TEMP/matplotlib-image-work"
+              ;;
+            *) printf 'Unsupported preparation probe stage\n' >&2; exit 2 ;;
+          esac
 
       - name: Record job outcome even if checkout or tests failed
         if: always()
         env:
           SOLVER_STEP_OUTCOME: ${{ steps.solver.outcome }}
+          PREPARATION_PROBE_STAGE: ${{ inputs.preparation_probe_stage || 'solve' }}
         run: |
           python3 - <<'PY'
           import json, os
@@ -52,6 +82,7 @@ jobs:
           evidence.mkdir(parents=True, exist_ok=True)
           (evidence / "job-outcome.json").write_text(json.dumps({
               "solver_step_outcome": os.environ["SOLVER_STEP_OUTCOME"],
+              "preparation_probe_stage": os.environ["PREPARATION_PROBE_STAGE"],
               "github_sha": os.environ["GITHUB_SHA"],
               "result_present": (evidence / "result.json").is_file(),
           }, indent=2) + "\n")
@@ -62,7 +93,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
-          name: matplotlib-solver-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          name: matplotlib-${{ inputs.preparation_probe_stage == 'image' && 'image' || 'solver' }}-probe-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/matplotlib-solver-evidence/
           if-no-files-found: error
           retention-days: 7
@@ -156,6 +187,7 @@ jobs:
           scripts/test_swebench_smoke.py
           scripts/test_swebench_preparation_compat.py
           scripts/test_probe_matplotlib_solver.py
+          scripts/test_probe_matplotlib_preparation.py
           scripts/test_build_long_swebench_selection.py
           scripts/test_merge_swebench_attempts.py
           scripts/test_swebench_harness_entrypoint.py
@@ -171,7 +203,8 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/swebench-contract"
           "$RUNNER_TEMP/swebench-contract/bin/python" -m pip install 'swebench==4.1.0'
           "$RUNNER_TEMP/swebench-contract/bin/python" -m unittest -v \
-            scripts.test_swebench_preparation_compat scripts.test_swebench_smoke
+            scripts.test_swebench_preparation_compat scripts.test_swebench_smoke \
+            scripts.test_probe_matplotlib_preparation
 
       - name: Build one portable release binary
         run: |

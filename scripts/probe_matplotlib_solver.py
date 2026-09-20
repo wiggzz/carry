@@ -73,14 +73,16 @@ def validate_plan(plan, requirements, pip_requirements):
             raise ValueError("unsupported declared spec: " + spec)
         name, constraints = match.groups()
         version = records.get(name, "")
-        if not re.fullmatch(r"\d+(?:\.\d+)*", version):
+        parsed_version = re.fullmatch(r"(\d+(?:\.\d+)*)(?:\.post(\d+))?", version)
+        if not parsed_version:
             raise ValueError("missing or unsupported planned version: " + name)
-        actual = tuple(int(part) for part in version.split("."))
+        actual = tuple(int(part) for part in parsed_version.group(1).split("."))
+        is_postrelease = parsed_version.group(2) is not None
         for op, value in re.findall(r"(>=|!=)([\d.]+)", constraints):
             required = tuple(int(part) for part in value.split("."))
             length = max(len(actual), len(required))
             left, right = actual + (0,) * (length - len(actual)), required + (0,) * (length - len(required))
-            if (op == ">=" and left < right) or (op == "!=" and left == right):
+            if (op == ">=" and left < right) or (op == "!=" and left == right and not is_postrelease):
                 raise ValueError("planned version violates " + spec)
         verified.append(name)
     return {"python": python, "conda_dependencies": verified,

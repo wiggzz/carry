@@ -44,6 +44,45 @@ QHULL_ORIGINAL = [
 MPL_CONDA_VERSIONS = {"3.5", "3.6", "3.7", "3.8", "3.9"}
 MPL_QHULL_VERSIONS = {"3.0", "3.1", "3.2", "3.3", "3.4"} | MPL_CONDA_VERSIONS
 
+# The only solver replacement is this exact immutable 4.1.0 task recipe.
+# A successful hosted dry-run is NOT build/readiness proof. The real image
+# resolves against Ubuntu 22.04's virtual packages, never the hosted plan.
+MPL_SOLVER_TASK = "matplotlib__matplotlib-24627"
+MPL_SOLVER_RECIPE_SHA256 = "30bc9cbdb163ff1aeb1c60c906fddd65f8791f8cf45c5e6328c9d0cb857c7fb0"
+MPL_SOLVER_URL = ("https://github.com/mamba-org/micromamba-releases/releases/"
+                  "download/2.3.3-0/micromamba-linux-64")
+MPL_SOLVER_SHA256 = "9496f94a8b78c536573c93d946ec9bba74bd9ff79ee55aaa4b546e30db8f511b"
+
+
+def _repair_matplotlib_solver(spec: Any, original_sha256: str) -> None:
+    if (spec.repo != "matplotlib/matplotlib" or spec.version != "3.6"
+            or getattr(spec, "arch", None) != "x86_64"
+            or original_sha256 != MPL_SOLVER_RECIPE_SHA256):
+        raise ValueError("unexpected Matplotlib solver preparation recipe")
+    # Conda 23.11 ignores bare [execute]; equivalent canonical MatchSpec is
+    # necessary for micromamba. All other YAML bytes (including pip) survive.
+    spec.env_script_list[1] = spec.env_script_list[1].replace(
+        "  - nbconvert[execute]!=6.0.0,!=6.0.1\n",
+        "  - nbconvert[version='!=6.0.0,!=6.0.1']\n",
+    )
+    spec.env_script_list[2:4] = [
+        # 32 MiB file limit, 120s wall bound, HTTPS-only redirects and checksum
+        # before chmod/execute. No mutable latest endpoint or fallback solver.
+        "(ulimit -f 32768; timeout --kill-after=5s 120s wget --https-only "
+        "--max-redirect=5 --timeout=30 --tries=1 -O micromamba-preparation " + MPL_SOLVER_URL + ")",
+        f"printf '%s  %s\\n' '{MPL_SOLVER_SHA256}' micromamba-preparation | sha256sum --check --strict -",
+        "chmod 0500 micromamba-preparation",
+        # Use Conda's exact named prefix for downstream activation/list/overlay.
+        # Installation includes YAML pip requirements. No second Conda solve.
+        "(ulimit -v 6291456; ulimit -t 1200; timeout --kill-after=5s 1200s "
+        "./micromamba-preparation create --no-rc --no-env "
+        "--root-prefix /opt/miniconda3 --prefix /opt/miniconda3/envs/testbed "
+        "--file environment.yml -c conda-forge -c defaults "
+        "--channel-priority flexible --platform linux-64 python=3.11 --yes)",
+        "rm micromamba-preparation",
+    ]
+
+
 # These base commits declare docutils>=0.12 and latex.py explicitly supports the
 # standalone roman fallback. The retained images have docutils 0.23, which no
 # longer bundles docutils.utils.roman, and no standalone roman. Restore only that
@@ -133,7 +172,10 @@ def transform_test_specs(
             index = _original_block_index(spec.repo_script_list, [SKLEARN_INSTALL])
             spec.repo_script_list.insert(index, PIP_PIN)
             repairs.append("sklearn-legacy-pip-25.2")
-        if spec.repo == "matplotlib/matplotlib" and spec.version in MPL_CONDA_VERSIONS:
+        if spec.instance_id == MPL_SOLVER_TASK:
+            _repair_matplotlib_solver(spec, original_sha256)
+            repairs.append("matplotlib-micromamba-2.3.3")
+        elif spec.repo == "matplotlib/matplotlib" and spec.version in MPL_CONDA_VERSIONS:
             # Work around the observed libsolv solver_addrule assertion without
             # removing/replacing packages. Classic solver success is not assumed.
             for old, new in (
