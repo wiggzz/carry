@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Behavior tests for the executable protected-worker benchmark."""
 import concurrent.futures
+import contextlib
+import copy
 import hashlib
 import importlib.util
+import itertools
 import json
 import os
 import pathlib
@@ -17,8 +20,28 @@ import yaml
 import zlib
 from unittest import mock
 
+from scripts import swebench_preparation_compat as compat
+
 
 SCRIPT = pathlib.Path(__file__).with_name("swebench_smoke.py")
+
+
+class RecipeSpec(types.SimpleNamespace):
+    """Offline TestSpec fixture with upstream 4.1.0's computed image keys."""
+    def __init__(self, **kwargs):
+        super().__init__(namespace=None, instance_image_tag="latest",
+                         env_script_list=["conda activate testbed", f"echo {kwargs.get('instance_id', '')}"],
+                         repo_script_list=["python -m pip install -e ."], **kwargs)
+
+    @property
+    def instance_image_key(self):
+        key = f"sweb.eval.x86_64.{self.instance_id.lower()}:{self.instance_image_tag}"
+        return f"{self.namespace}/{key}".replace("__", "_1776_") if self.namespace else key
+
+    @property
+    def env_image_key(self):
+        digest = hashlib.sha256(str(self.env_script_list).encode()).hexdigest()[:22]
+        return f"sweb.env.py.x86_64.{digest}:latest"
 
 
 class SmokeWorkerTests(unittest.TestCase):
@@ -148,6 +171,24 @@ class SmokeWorkerTests(unittest.TestCase):
             prepare.assert_called_once()
             benchmark.assert_not_called()
 
+    def assert_agent_mounts(self, command, root, extra=()):
+        mounts = [command[index + 1] for index, arg in enumerate(command) if arg == "--mount"]
+        expected = [
+            f"type=bind,src={(root / 'repo').resolve()},dst=/testbed",
+            f"type=bind,src={(root / 'harness').resolve()},dst=/opt/swebench-harness,readonly",
+            f"type=bind,src={(root / 'input').resolve()},dst=/benchmark/input,readonly",
+            f"type=bind,src={(root / 'output').resolve()},dst=/benchmark/output",
+            *extra,
+        ]
+        self.assertCountEqual(mounts, expected)
+        sources = {pathlib.Path(field.removeprefix("src=")).resolve()
+                   for mount in mounts for field in mount.split(",") if field.startswith("src=")}
+        self.assertTrue(sources.isdisjoint({pathlib.Path.home().resolve(),
+                                           pathlib.Path("/var/run/docker.sock").resolve(),
+                                           pathlib.Path("/run/docker.sock").resolve()}))
+        self.assertNotIn("-v", command)
+        self.assertNotIn("--volume", command)
+
     def test_agent_command_mounts_only_workspace_prompt_and_output_and_key_by_name(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -168,7 +209,7 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertIn("--add-host\nopenai-proxy:172.28.0.2", rendered)
             self.assertIn("OPENAI_BASE_URL=http://openai-proxy:8080/v1", rendered)
             self.assertNotIn("/var/run/docker.sock", rendered)
-            self.assertNotIn(str(pathlib.Path.home()), rendered)
+            self.assert_agent_mounts(command, root)
             self.assertEqual(rendered.count("type=bind"), 4)
             self.assertIn(f"src={(root / 'harness').resolve()},dst=/opt/swebench-harness,readonly", rendered)
             self.assertEqual(rendered.count("dst=/opt/swebench-harness,readonly"), 1)
@@ -235,7 +276,9 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertIn(f"src={session.resolve()},dst=/benchmark/session,readonly", rendered)
         self.assertIn("--resume-session\n/benchmark/session", rendered)
         self.assertNotIn("/var/run/docker.sock", rendered)
-        self.assertNotIn(str(pathlib.Path.home()), rendered)
+        self.assert_agent_mounts(command, root, (
+            f"type=bind,src={session.resolve()},dst=/benchmark/session,readonly",
+        ))
         with self.assertRaisesRegex(ValueError, "Carry"):
             self.worker.agent_docker_command(
                 image="smoke-codex:run", harness="codex", repo=root / "repo",
@@ -266,7 +309,9 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertNotIn(f"src={session_dir.resolve()},dst=/benchmark/pi-session,readonly", rendered)
         self.assertIn("--pi-session-dir\n/benchmark/pi-session", rendered)
         self.assertNotIn("/var/run/docker.sock", rendered)
-        self.assertNotIn(str(pathlib.Path.home()), rendered)
+        self.assert_agent_mounts(command, root, (
+            f"type=bind,src={session_dir.resolve()},dst=/benchmark/pi-session",
+        ))
 
     def test_readiness_command_has_no_network_secret_or_evaluator_mounts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -362,6 +407,47 @@ class SmokeWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "TASK_IMAGE_REPOSITORY"):
             self.worker.task_image_references("", key)
 
+    def test_compatibility_policy_change_invalidates_cache_and_frozen_catalog(self):
+        record = dict(instance_id="owner__repo-1", repo="owner/repo", version="1.0", base_commit="a" * 40)
+        repository = "registry.example/tasks"
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory)
+            for relative in (
+                "containers/swebench-harness/Dockerfile.prepared",
+                "containers/swebench-harness/prepared-entrypoint.sh",
+                "containers/swebench-harness/apply-testbed-overlay.sh",
+                "scripts/swebench_preparation_compat.py",
+            ):
+                destination = source / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(SCRIPT.parents[1] / relative, destination)
+            before = self.worker.prepared_image_recipe_sha256(source)
+            old_key = self.worker.task_image_cache_key(
+                record, prepared_dockerfile_sha256=before, base_dockerfile_sha256="e" * 64,
+            )
+            catalog = self.worker.task_catalog_payload(
+                published={record["instance_id"]: {
+                    "cache_key": old_key, "preparation_compatibility": {},
+                    "agent_image": {"resolved_digest": repository + "@sha256:" + "a" * 64},
+                    "evaluator_image": {"resolved_digest": repository + "@sha256:" + "b" * 64},
+                }}, repository=repository, prepared_recipe_sha256=before, base_recipe_sha256="e" * 64,
+            )
+            policy = source / "scripts/swebench_preparation_compat.py"
+            policy.write_bytes(policy.read_bytes() + b"\n# policy revision\n")
+            after = self.worker.prepared_image_recipe_sha256(source)
+            self.assertNotEqual(before, after)
+            new_key = self.worker.task_image_cache_key(
+                record, prepared_dockerfile_sha256=after, base_dockerfile_sha256="e" * 64,
+            )
+            self.assertNotEqual(old_key, new_key)
+            self.assertNotEqual(self.worker.task_image_references(repository, old_key),
+                                self.worker.task_image_references(repository, new_key))
+            with self.assertRaisesRegex(RuntimeError, "metadata"):
+                self.worker.validate_task_catalog(
+                    catalog=catalog, records=[record], repository=repository,
+                    prepared_recipe_sha256=after, base_recipe_sha256="e" * 64,
+                )
+
     def test_frozen_catalog_validates_inputs_and_publishes_an_immutable_reference(self):
         record = {
             "instance_id": "owner__repo-1", "repo": "owner/repo",
@@ -375,7 +461,7 @@ class SmokeWorkerTests(unittest.TestCase):
         )
         repository = "public.ecr.aws/example/tasks"
         published = {record["instance_id"]: {
-            "cache_key": cache_key,
+            "cache_key": cache_key, "preparation_compatibility": {},
             "evaluator_image": {"resolved_digest": repository + "@sha256:" + "a" * 64},
             "agent_image": {"resolved_digest": repository + "@sha256:" + "b" * 64},
         }}
@@ -476,7 +562,7 @@ class SmokeWorkerTests(unittest.TestCase):
         agent_digest = "public.ecr.aws/example/tasks@sha256:" + "d" * 64
         catalog = self.worker.task_catalog_payload(
             published={record["instance_id"]: {
-                "cache_key": cache_key,
+                "cache_key": cache_key, "preparation_compatibility": {},
                 "evaluator_image": {"resolved_digest": evaluator_digest},
                 "agent_image": {"resolved_digest": agent_digest},
             }},
@@ -517,7 +603,7 @@ class SmokeWorkerTests(unittest.TestCase):
             resolved = self.worker.resolve_task_environments(
                 records=[record], source=SCRIPT.parents[1],
                 repository="public.ecr.aws/example/tasks",
-                output=pathlib.Path(directory), get_specs=lambda _records: specs,
+                output=pathlib.Path(directory), get_specs=lambda _records, **kwargs: specs,
                 base_dockerfile_sha256="e" * 64,
                 catalog=catalog,
                 execute=execute,
@@ -550,7 +636,7 @@ class SmokeWorkerTests(unittest.TestCase):
         agent_digest = "registry.example/tasks@sha256:" + "d" * 64
         catalog = self.worker.task_catalog_payload(
             published={"task-1": {
-                "cache_key": key,
+                "cache_key": key, "preparation_compatibility": {},
                 "evaluator_image": {"resolved_digest": evaluator_digest},
                 "agent_image": {"resolved_digest": agent_digest},
             }},
@@ -581,7 +667,7 @@ class SmokeWorkerTests(unittest.TestCase):
                 output=pathlib.Path(directory),
                 base_dockerfile_sha256="e" * 64,
                 catalog=catalog,
-                get_specs=lambda _records: [types.SimpleNamespace(
+                get_specs=lambda _records, **kwargs: [types.SimpleNamespace(
                     instance_id="task-1", instance_image_key="official:task-1",
                 )],
                 execute=execute,
@@ -708,6 +794,459 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertIn("COPY --from=trusted_certs /etc/ssl/certs", templates["py"])
         self.assertNotIn("\nRUN apt update", templates["py"])
 
+    @contextlib.contextmanager
+    def preparation_fixture(self, count=3):
+        """Run real publication/readiness helpers against a stateful Docker seam."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            records = [dict(instance_id=f"owner__repo-{index}", repo="owner/repo",
+                            version="1.0", base_commit=f"{index:040x}")
+                       for index in range(1, count + 1)]
+            specs = [RecipeSpec(
+                instance_id=row["instance_id"], repo=row["repo"], version=row["version"],
+                eval_script_list=["cd /testbed", "git config --global --add safe.directory /testbed",
+                                  "git apply -v hidden", ": '>>>>> Start Test Output'", "pytest -rA"],
+            ) for row in records]
+            state = types.SimpleNamespace(
+                root=root, records=records, specs=specs, images={}, remote={}, calls=[],
+                builds=[], built_specs=[], build_inputs=[], omitted=set(), build_failed=set(), readiness_failed=set(),
+                push_failed=set(), prepared_failed=set(), checkpoints=[], build_error=False,
+            )
+
+            class ImageNotFound(Exception):
+                pass
+
+            def get_image(key):
+                if key not in state.images:
+                    raise ImageNotFound(key)
+                payload = state.images[key]
+                state.images[payload["Id"]] = payload
+                return types.SimpleNamespace(id=payload["Id"])
+
+            def build_instances(client, dataset, **kwargs):
+                self.assertEqual(kwargs["max_workers"], 5)
+                # Like upstream, records regenerate recipes; TestSpecs pass through.
+                effective = [next(spec for spec in specs if spec.instance_id == item["instance_id"])
+                             if isinstance(item, dict) else item for item in dataset]
+                state.build_inputs.extend(dataset)
+                state.built_specs.extend(effective)
+                state.builds.append([spec.instance_id for spec in effective])
+                for spec in effective:
+                    task = spec.instance_id
+                    if task in state.omitted:
+                        continue
+                    state.images[spec.env_image_key] = {"Id": "sha256:" + "e" * 64}
+                    if task not in state.build_failed:
+                        state.images[spec.instance_image_key] = {
+                            "Id": "sha256:" + hashlib.sha256(task.encode()).hexdigest(),
+                            "Config": {"Labels": {}},
+                        }
+                if state.build_error:
+                    raise RuntimeError("upstream failed after building independent images")
+                # Model upstream's omission of tasks blocked by failed environments.
+                return [], [spec for spec in specs if spec.instance_id in state.build_failed]
+
+            def execute(command, **kwargs):
+                state.calls.append(command)
+                if command[:2] == ["docker", "pull"]:
+                    state.images[command[-1]] = state.remote[command[-1]]
+                elif command[:3] == ["docker", "image", "tag"]:
+                    state.images[command[-1]] = state.images[command[-2]]
+                elif command[:2] == ["docker", "build"]:
+                    tag = command[command.index("--tag") + 1]
+                    task = next(row["instance_id"] for row in records
+                                if tag == f"swebench-run-prepared-{row['instance_id']}")
+                    if task in state.prepared_failed:
+                        raise subprocess.CalledProcessError(1, command)
+                    args = dict(command[index + 1].split("=", 1)
+                                for index, arg in enumerate(command) if arg == "--build-arg")
+                    payload = {"Id": "sha256:" + hashlib.sha256(tag.encode()).hexdigest(),
+                               "Config": {"Labels": {
+                                   "org.carry.swebench.task-cache-key": args["TASK_CACHE_KEY"],
+                                   "org.carry.swebench.evaluator-image-id": args["TASK_IMAGE_ID"],
+                               }}}
+                    state.images[tag] = payload
+                elif command[:2] == ["docker", "push"]:
+                    reference = command[-1]
+                    task = next(task for task, refs in state.refs.items() if reference in refs.values())
+                    if (task, "agent" if "swebench-ready-" in reference else "evaluator") in state.push_failed:
+                        raise subprocess.CalledProcessError(1, command)
+                    payload = dict(state.images[reference])
+                    payload["RepoDigests"] = ["registry.example/tasks@sha256:" +
+                                              hashlib.sha256(reference.encode()).hexdigest()]
+                    state.remote[reference] = payload
+                    state.remote[payload["RepoDigests"][0]] = payload
+                    state.checkpoints.append(json.loads(
+                        (state.kwargs["output"] / "preparation-attempt.json").read_text()
+                    ) if (state.kwargs["output"] / "preparation-attempt.json").exists() else None)
+                elif command[:3] == ["docker", "image", "inspect"]:
+                    payload = state.images[command[-1]]
+                    return types.SimpleNamespace(returncode=0, stdout=(
+                        payload["Id"] if command[4] == "{{.Id}}" else json.dumps(payload)), stderr="")
+                elif command[:2] == ["docker", "run"]:
+                    if "conda list --json" in command[-1]:
+                        return types.SimpleNamespace(returncode=0, stdout='[{"name":"pytest","version":"8"}]', stderr="")
+                    if "sha256sum" in command:
+                        return types.SimpleNamespace(returncode=0, stdout="a" * 64 +
+                                                     "  /opt/swebench-prepared/testbed-overlay.tar\n", stderr="")
+                    image = next(arg for arg in command if arg.startswith("swebench-run-prepared-"))
+                    task = image.removeprefix("swebench-run-prepared-")
+                    return types.SimpleNamespace(returncode=1,
+                                                 stdout="" if task in state.readiness_failed else "FAILED test_public\n",
+                                                 stderr="")
+                else:
+                    raise AssertionError(f"unexpected Docker operation: {command}")
+                # Make source image IDs addressable, as in real Docker.
+                state.images.update({payload["Id"]: payload for payload in list(state.images.values())})
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def clone(repo, commit, destination):
+                destination.mkdir(parents=True)
+
+            state.refs = {row["instance_id"]: self.worker.task_image_references(
+                "registry.example/tasks", self.worker.task_image_cache_key(
+                    row, prepared_dockerfile_sha256=self.worker.prepared_image_recipe_sha256(SCRIPT.parents[1]),
+                    base_dockerfile_sha256="e" * 64,
+                )) for row in records}
+            state.kwargs = dict(
+                records=records, source=SCRIPT.parents[1], run_id="run", repository="registry.example/tasks",
+                work=root / "work", output=root / "output", clone=clone,
+                client=types.SimpleNamespace(images=types.SimpleNamespace(get=get_image)),
+                build_instances=build_instances, get_specs=lambda rows: specs, swebench_version="4.1.0",
+                parsers={"owner/repo": lambda text, spec: {"test_public": "FAILED"} if text else {}},
+                repo_specs={"owner/repo": {"1.0": {"test_cmd": "pytest -rA"}}},
+                base_dockerfile_sha256="e" * 64,
+                remote_exists=lambda reference: reference in state.remote, execute=execute,
+            )
+            # Readiness invokes subprocess dynamically; image/manifest helpers use execute.
+            with mock.patch.object(self.worker.subprocess, "run", side_effect=execute):
+                yield state
+
+    @contextlib.contextmanager
+    def repaired_preparation_fixture(self):
+        with self.preparation_fixture(count=1) as state:
+            record, original = state.records[0], state.specs[0]
+            record.update(repo="scikit-learn/scikit-learn", version="1.3")
+            original.repo, original.version = record["repo"], record["version"]
+            original.env_script_list = compat.SKLEARN_ENV.copy()
+            original.repo_script_list = [compat.SKLEARN_INSTALL]
+            state.kwargs["parsers"][record["repo"]] = lambda text, spec: {"public": "FAILED"} if text else {}
+            state.kwargs["repo_specs"][record["repo"]] = {"1.3": {"test_cmd": "pytest -rA"}}
+            task = record["instance_id"]
+            state.refs[task] = self.worker.task_image_references(
+                state.kwargs["repository"], self.worker.task_image_cache_key(
+                    record, prepared_dockerfile_sha256=self.worker.prepared_image_recipe_sha256(SCRIPT.parents[1]),
+                    base_dockerfile_sha256="e" * 64,
+                ),
+            )
+            yield state
+
+    def test_publisher_builds_repaired_specs_and_persists_recipe_provenance(self):
+        with self.repaired_preparation_fixture() as state:
+            original = state.specs[0]
+            task = original.instance_id
+            with mock.patch.object(self.worker, "trusted_readiness_script", wraps=self.worker.trusted_readiness_script) as readiness, \
+                    mock.patch.object(self.worker, "run_task_readiness", wraps=self.worker.run_task_readiness) as probe:
+                published = self.worker.publish_task_environments(**state.kwargs)
+            built = state.built_specs[0]
+            self.assertIn(compat.PIP_PIN, built.repo_script_list)
+            self.assertIs(state.build_inputs[0], built, "upstream must receive specs, not regenerate records")
+            self.assertIs(readiness.call_args.args[0], built)
+            self.assertIs(probe.call_args.kwargs["test_spec"], built)
+            self.assertNotIn(compat.PIP_PIN, original.repo_script_list)
+            self.assertEqual(built.eval_script_list, original.eval_script_list)
+            self.assertNotEqual(built.instance_image_key, original.instance_image_key)
+            self.assertEqual(published[task]["source_task_image"], built.instance_image_key)
+            provenance = published[task]["preparation_compatibility"]
+            self.assertEqual(provenance["repairs"], ["sklearn-legacy-pip-25.2"])
+            self.assertEqual(provenance["compatibility_sha256"], compat.preparation_compatibility_sha256())
+            self.assertEqual(provenance["swebench_version"], "4.1.0")
+            self.assertNotEqual(provenance["original_recipe_sha256"], provenance["effective_recipe_sha256"])
+            self.assertEqual(provenance["instance_image_tag"], built.instance_image_tag)
+            attempt = json.loads((state.kwargs["output"] / "preparation-attempt.json").read_text())
+            prepared = json.loads((state.kwargs["output"] / "preparation.json").read_text())
+            self.assertEqual(attempt["tasks"][task]["preparation_compatibility"], provenance)
+            self.assertEqual(prepared[task]["preparation_compatibility"], provenance)
+            cached = self.worker.publish_task_environments(**state.kwargs)
+            self.assertEqual(cached[task]["status"], "cached")
+            self.assertEqual(cached[task]["preparation_compatibility"], provenance)
+            self.assertEqual(len(state.builds), 1)
+            catalog = self.worker.task_catalog_payload(
+                published=cached, repository=state.kwargs["repository"],
+                prepared_recipe_sha256=self.worker.prepared_image_recipe_sha256(SCRIPT.parents[1]),
+                base_recipe_sha256="e" * 64,
+            )
+            self.assertIn("preparation_compatibility", catalog["tasks"][task])
+            self.assertEqual(catalog["tasks"][task]["preparation_compatibility"], provenance)
+            normalized = self.worker.validate_task_catalog(
+                catalog=catalog, records=state.records, repository=state.kwargs["repository"],
+                prepared_recipe_sha256=self.worker.prepared_image_recipe_sha256(SCRIPT.parents[1]),
+                base_recipe_sha256="e" * 64,
+            )
+            self.assertEqual(normalized["tasks"][task]["preparation_compatibility"], provenance)
+
+    def test_pulled_repaired_evaluator_is_retagged_for_the_official_subprocess(self):
+        with self.repaired_preparation_fixture() as state:
+            published = self.worker.publish_task_environments(**state.kwargs)
+            task = state.records[0]["instance_id"]
+            catalog = self.worker.task_catalog_payload(
+                published=published, repository=state.kwargs["repository"],
+                prepared_recipe_sha256=self.worker.prepared_image_recipe_sha256(SCRIPT.parents[1]),
+                base_recipe_sha256="e" * 64,
+            )
+            # A different worker has only registry digests, not the publisher's tags.
+            state.images.clear()
+            state.calls.clear()
+
+            def get_specs(records, namespace=None, instance_image_tag="latest", **kwargs):
+                specs = copy.deepcopy(state.specs)
+                for spec in specs:
+                    spec.namespace = namespace
+                    spec.instance_image_tag = instance_image_tag
+                return specs
+
+            resolved = self.worker.resolve_task_environments(
+                records=state.records, source=SCRIPT.parents[1], repository=state.kwargs["repository"],
+                output=state.root / "resolved", base_dockerfile_sha256="e" * 64,
+                catalog=catalog, get_specs=get_specs, execute=state.kwargs["execute"],
+            )
+            official_spec = get_specs(state.records, namespace="swebench")[0]
+            self.assertIn(official_spec.instance_image_key, state.images)
+            evaluator = published[task]["evaluator_image"]
+            self.assertEqual(state.images[official_spec.instance_image_key]["Id"], evaluator["image_id"])
+            self.assertNotEqual(official_spec.instance_image_key, published[task]["source_task_image"])
+            self.assertEqual(resolved[task]["preparation_compatibility"],
+                             published[task]["preparation_compatibility"])
+            self.assertFalse(any(command[:2] == ["docker", "build"] for command in state.calls))
+
+            def evaluator_process(command, **kwargs):
+                self.assertEqual(command[1:3], ["-m", "swebench.harness.run_evaluation"])
+                # run_evaluation regenerates unmodified recipes, with this namespace
+                # and tag. Its remote-image branch reuses images.get(key), no build.
+                namespace = command[command.index("--namespace") + 1]
+                tag = command[command.index("--instance_image_tag") + 1]
+                regenerated = get_specs(state.records, namespace=namespace, instance_image_tag=tag)[0]
+                self.assertNotIn(compat.PIP_PIN, regenerated.repo_script_list)
+                self.assertEqual(state.images[regenerated.instance_image_key]["Id"], evaluator["image_id"])
+                return types.SimpleNamespace(returncode=0)
+
+            with mock.patch.object(self.worker.subprocess, "run", side_effect=evaluator_process) as process, \
+                    mock.patch.object(self.worker, "cleanup_evaluator_containers"):
+                self.worker.run_official_evaluation(
+                    predictions=state.root / "predictions.json", canonical_dataset=state.root / "dataset.json",
+                    instance_ids=[task], run_id="evaluator", output=state.root, environment={},
+                )
+            process.assert_called_once()
+
+    def test_publisher_preserves_independent_pairs_and_reuses_them_after_partial_build_failure(self):
+        with self.preparation_fixture() as state:
+            state.omitted.add("owner__repo-1")
+            state.build_failed.add("owner__repo-2")
+            with self.assertRaises(RuntimeError):
+                self.worker.publish_task_environments(**state.kwargs)
+            self.assertIn(state.refs["owner__repo-3"]["agent"], state.remote)
+            progress = json.loads((state.root / "output" / "preparation.json").read_text())
+            self.assertEqual(set(progress), {"owner__repo-3"})
+            attempt = json.loads((state.root / "output" / "preparation-attempt.json").read_text())
+            self.assertEqual(attempt["denominator"], 3)
+            self.assertEqual(set(attempt["tasks"]), {row["instance_id"] for row in state.records})
+            self.assertEqual(attempt["tasks"]["owner__repo-1"]["status"], "blocked_by_environment")
+            self.assertEqual(attempt["tasks"]["owner__repo-2"]["status"], "failed")
+            self.assertEqual(attempt["tasks"]["owner__repo-3"]["status"], "published")
+            self.assertTrue(all(state.checkpoints))
+            state.omitted.clear()
+            state.build_failed.clear()
+            published = self.worker.publish_task_environments(**state.kwargs)
+            self.assertEqual(len(published), 3)
+            self.assertEqual(published["owner__repo-3"]["status"], "cached")
+            self.assertEqual(state.builds[-1], ["owner__repo-1", "owner__repo-2"])
+
+    def test_publisher_records_monotonic_stage_timings_cache_counts_and_readiness_failure(self):
+        with self.preparation_fixture() as state:
+            state.readiness_failed.add("owner__repo-1")
+            with mock.patch.object(self.worker.time, "monotonic", side_effect=itertools.count(1000)), \
+                    mock.patch.object(self.worker.time, "time", side_effect=AssertionError("wall clock")):
+                with self.assertRaises(RuntimeError):
+                    self.worker.publish_task_environments(**state.kwargs)
+            attempt = json.loads((state.root / "output" / "preparation-attempt.json").read_text())
+            self.assertGreater(attempt.get("elapsed_seconds", 0), 0)
+            self.assertEqual(attempt["cache_counts"], {"hit": 0, "miss": 3, "error": 0})
+            build = attempt["stages"]["dependency_build"]
+            self.assertGreater(build["elapsed_seconds"], 0)
+            self.assertEqual(build["status"], "completed")
+            self.assertEqual(build["expected_task_count"], 3)
+            self.assertEqual(build["verified_image_count"], 3)
+            stages = {"cache_lookup", "instance_image", "prepared_image", "dependency_manifest",
+                      "clone", "readiness", "evaluator_push", "agent_push", "pair_verification"}
+            for task in ("owner__repo-2", "owner__repo-3"):
+                self.assertEqual(set(attempt["tasks"][task]["stages"]), stages)
+                for stage in attempt["tasks"][task]["stages"].values():
+                    self.assertEqual(stage["status"], "completed")
+                    self.assertGreater(stage["elapsed_seconds"], 0)
+            failure = attempt["tasks"]["owner__repo-1"]
+            self.assertEqual(failure["failure_stage"], "readiness")
+            self.assertEqual(failure["stages"]["readiness"]["status"], "failed")
+            self.assertGreater(failure["stages"]["readiness"]["elapsed_seconds"], 0)
+            self.assertNotIn("agent_push", failure["stages"])
+            self.assertNotIn(state.refs["owner__repo-1"]["agent"], state.remote)
+            self.assertEqual(attempt["status_counts"], {"failed": 1, "published": 2})
+            self.assertEqual(attempt["phase"], "failed")
+            self.assertFalse((state.root / "work" / "readiness").exists())
+            # Earlier successful tasks are durable while later pair pushes run.
+            self.assertTrue(any(checkpoint["status_counts"].get("published", 0) == 1
+                                for checkpoint in state.checkpoints))
+            state.readiness_failed.clear()
+            self.worker.publish_task_environments(**state.kwargs)
+            self.worker.publish_task_environments(**state.kwargs)
+            cached = json.loads((state.root / "output" / "preparation-attempt.json").read_text())
+            self.assertEqual(cached["cache_counts"], {"hit": 3, "miss": 0, "error": 0})
+            self.assertEqual(cached["stages"]["dependency_build"]["status"], "skipped")
+            self.assertEqual(cached["phase"], "complete")
+
+    def test_full_preparation_cli_withholds_catalog_until_all_fifty_pairs_are_ready(self):
+        with self.preparation_fixture(count=50) as state:
+            source = state.root / "source"
+            (source / "benchmarks").mkdir(parents=True)
+            (source / "containers").symlink_to(SCRIPT.parents[1] / "containers", target_is_directory=True)
+            (source / "scripts").symlink_to(SCRIPT.parent, target_is_directory=True)
+            manifest, _ = self.worker.selection_manifest_names("prepare-50")
+            (source / "benchmarks" / manifest).write_text(json.dumps({
+                "instance_ids": [row["instance_id"] for row in state.records],
+            }))
+            output = state.root / "cli-output"
+            state.kwargs["output"] = output / "preparation"
+            state.omitted.add("owner__repo-1")
+            argv = [str(SCRIPT), "--prepare-images", "--source", str(source),
+                    "--work", str(state.root / "work"), "--output", str(output)]
+            environment = {
+                "BASE_IMAGE": "node@sha256:" + "a" * 64, "CODEX_VERSION": "1.2.3",
+                "PI_VERSION": "0.84.2", "MODEL": "gpt-5.6-luna", "REASONING": "medium",
+                "TASK_IMAGE_REPOSITORY": "registry.example/tasks", "RUN_ID": "run",
+                "BENCHMARK_MODE": "prepare-50",
+            }
+            real_publish = self.worker.publish_task_environments
+
+            def publish_with_fake_docker(**kwargs):
+                self.assertEqual(kwargs["records"], state.records)
+                for key in ("client", "build_instances", "get_specs", "parsers", "repo_specs",
+                            "execute", "remote_exists", "clone", "swebench_version"):
+                    kwargs[key] = state.kwargs[key]
+                return real_publish(**kwargs)
+
+            dataset_module = types.ModuleType("datasets")
+            dataset_module.load_dataset = mock.Mock(return_value=state.records)
+            dockerfiles_module = types.ModuleType("swebench.harness.dockerfiles")
+            dockerfiles_module._DOCKERFILE_BASE = {"py": "fixture"}
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(sys, "argv", argv), \
+                    mock.patch.dict(sys.modules, {"datasets": dataset_module,
+                                                 "swebench.harness.dockerfiles": dockerfiles_module}), \
+                    mock.patch.object(self.worker, "enforce_https_swebench_base_images", return_value="e" * 64), \
+                    mock.patch.object(self.worker, "publish_task_environments", side_effect=publish_with_fake_docker), \
+                    mock.patch.object(self.worker, "publish_task_catalog_image", return_value=
+                                      "registry.example/tasks@sha256:" + "f" * 64) as catalog, \
+                    mock.patch.object(self.worker, "execute_benchmark") as benchmark:
+                with self.assertRaisesRegex(RuntimeError, "49/50"):
+                    self.worker.main()
+                catalog.assert_not_called()
+                benchmark.assert_not_called()
+                self.assertFalse((output / "catalog.json").exists())
+                self.assertFalse((output / "preparation-report.json").exists())
+                attempt = json.loads((output / "preparation" / "preparation-attempt.json").read_text())
+                progress = json.loads((output / "preparation" / "preparation.json").read_text())
+                self.assertEqual(attempt["denominator"], 50)
+                self.assertEqual(len(attempt["tasks"]), 50)
+                self.assertEqual(len(progress), 49)
+                state.omitted.clear()
+                self.assertEqual(self.worker.main(), 0)
+                catalog.assert_called_once()
+                self.assertEqual(len(catalog.call_args.kwargs["catalog"]["tasks"]), 50)
+                self.assertEqual(state.builds[-1], ["owner__repo-1"])
+                report = json.loads((output / "preparation-report.json").read_text())
+                self.assertEqual(report["denominator"], 50)
+                self.assertEqual(report["status_counts"], {"cached": 49, "published": 1})
+                for task, item in report["tasks"].items():
+                    self.assertIn("preparation_compatibility", item)
+                    self.assertEqual(item["preparation_compatibility"],
+                                     catalog.call_args.kwargs["catalog"]["tasks"][task]["preparation_compatibility"])
+                benchmark.assert_not_called()
+
+    def test_publisher_retains_other_pairs_after_prepared_or_push_failures(self):
+        for failure in ("prepared_image", "evaluator_push", "agent_push"):
+            with self.subTest(stage=failure), self.preparation_fixture() as state:
+                if failure == "prepared_image":
+                    state.prepared_failed.add("owner__repo-1")
+                else:
+                    state.push_failed.add(("owner__repo-1", failure.removesuffix("_push")))
+                with self.assertRaises(RuntimeError):
+                    self.worker.publish_task_environments(**state.kwargs)
+                progress = json.loads((state.root / "output" / "preparation.json").read_text())
+                self.assertEqual(set(progress), {"owner__repo-2", "owner__repo-3"})
+                attempt = json.loads((state.root / "output" / "preparation-attempt.json").read_text())
+                self.assertEqual(attempt["tasks"]["owner__repo-1"]["failure_stage"], failure)
+                self.assertEqual(attempt["tasks"]["owner__repo-1"]["stages"][failure]["status"], "failed")
+                self.assertNotIn(state.refs["owner__repo-1"]["agent"], state.remote)
+                self.assertFalse((state.root / "work" / "readiness").exists())
+                state.prepared_failed.clear()
+                state.push_failed.clear()
+                published = self.worker.publish_task_environments(**state.kwargs)
+                self.assertEqual(len(published), 3)
+                self.assertEqual(state.builds[-1], ["owner__repo-1"])
+
+    def test_publisher_diagnoses_environment_omissions_even_with_no_reported_build_failures(self):
+        with self.preparation_fixture() as state:
+            state.omitted.add("owner__repo-1")
+            with self.assertRaises(RuntimeError):
+                self.worker.publish_task_environments(**state.kwargs)
+            attempt = json.loads((state.root / "output" / "preparation-attempt.json").read_text())
+            build = attempt["stages"]["dependency_build"]
+            self.assertEqual(build["status"], "incomplete")
+            self.assertEqual(attempt["build_reported_failure_count"], 0)
+            self.assertEqual(build["verified_image_count"], 2)
+            self.assertEqual(build["expected_task_count"], 3)
+            task = attempt["tasks"]["owner__repo-1"]
+            self.assertEqual(task["status"], "blocked_by_environment")
+            self.assertEqual(task["environment_image"], state.specs[0].env_image_key)
+            self.assertEqual(task["source_task_image"], state.specs[0].instance_image_key)
+
+    def test_publisher_retains_pairs_after_batch_exception_and_rejects_invalid_cached_pair(self):
+        with self.preparation_fixture() as state:
+            state.omitted.add("owner__repo-1")
+            state.build_error = True
+            with self.assertRaises(RuntimeError):
+                self.worker.publish_task_environments(**state.kwargs)
+            attempt = json.loads((state.root / "output" / "preparation-attempt.json").read_text())
+            self.assertEqual(attempt["stages"]["dependency_build"]["status"], "failed")
+            self.assertEqual(attempt["build_error_type"], "RuntimeError")
+            self.assertEqual(attempt["status_counts"], {"blocked_by_environment": 1, "published": 2})
+            state.build_error = False
+            state.omitted.clear()
+            agent = state.remote[state.refs["owner__repo-2"]["agent"]]
+            agent["Config"]["Labels"]["org.carry.swebench.evaluator-image-id"] = "sha256:" + "0" * 64
+            with self.assertRaises(RuntimeError):
+                self.worker.publish_task_environments(**state.kwargs)
+            progress = json.loads((state.root / "output" / "preparation.json").read_text())
+            self.assertEqual(set(progress), {"owner__repo-1", "owner__repo-3"})
+            attempt = json.loads((state.root / "output" / "preparation-attempt.json").read_text())
+            self.assertEqual(attempt["cache_counts"], {"hit": 1, "miss": 1, "error": 1})
+            self.assertEqual(attempt["tasks"]["owner__repo-2"]["failure_stage"], "cache_lookup")
+            self.assertEqual(state.builds[-1], ["owner__repo-1"])
+
+    def test_publisher_checkpoints_all_ready_pairs_but_does_not_hide_a_batch_exception(self):
+        with self.preparation_fixture() as state:
+            state.build_error = True
+            with self.assertRaisesRegex(RuntimeError, "3/3"):
+                self.worker.publish_task_environments(**state.kwargs)
+            progress = json.loads((state.root / "output" / "preparation.json").read_text())
+            attempt = json.loads((state.root / "output" / "preparation-attempt.json").read_text())
+            self.assertEqual(len(progress), 3)
+            self.assertEqual(attempt["phase"], "failed")
+            self.assertEqual(attempt["build_error_type"], "RuntimeError")
+            self.assertEqual(attempt["status_counts"], {"published": 3})
+            published = self.worker.publish_task_environments(**state.kwargs)
+            self.assertTrue(all(task["status"] == "cached" for task in published.values()))
+            self.assertEqual(len(state.builds), 1)
+
     def test_catalog_publisher_builds_only_ready_cache_misses_and_pushes_ready_last(self):
         records = [
             {"instance_id": "owner__repo-1", "repo": "owner/repo", "version": "1.0", "base_commit": "a" * 40},
@@ -715,6 +1254,8 @@ class SmokeWorkerTests(unittest.TestCase):
         ]
         specs = [types.SimpleNamespace(
             instance_id=record["instance_id"], instance_image_key=f"source:{record['instance_id']}",
+            repo=record["repo"], version=record["version"], instance_image_tag="latest",
+            env_script_list=["conda activate testbed"], repo_script_list=["pip install -e ."],
             eval_script_list=[
                 "source /opt/miniconda3/bin/activate", "conda activate testbed", "cd /testbed",
                 "git config --global --add safe.directory /testbed",
@@ -732,8 +1273,8 @@ class SmokeWorkerTests(unittest.TestCase):
         events = []
 
         def build_instances(_client, dataset, **kwargs):
-            events.append(("build", [row["instance_id"] for row in dataset]))
-            return ["source:" + row["instance_id"] for row in dataset], []
+            events.append(("build", [spec.instance_id for spec in dataset]))
+            return [spec.instance_image_key for spec in dataset], []
 
         def clone(_repo, _commit, destination):
             destination.mkdir(parents=True)
@@ -799,7 +1340,7 @@ class SmokeWorkerTests(unittest.TestCase):
                 records=records, source=SCRIPT.parents[1], run_id="run-1",
                 repository="registry.example/tasks", work=root / "work", output=root / "output",
                 clone=clone, client=client, build_instances=build_instances,
-                get_specs=lambda dataset: specs,
+                get_specs=lambda dataset: specs, swebench_version="4.1.0",
                 parsers={"owner/repo": lambda *_args: {"test": "PASSED"}},
                 repo_specs={"owner/repo": {"1.0": {"test_cmd": "pytest -rA"}}},
                 dockerfile_templates={"py": (

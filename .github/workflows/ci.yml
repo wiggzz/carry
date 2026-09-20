@@ -94,6 +94,9 @@ jobs:
           scripts/test_swebench_benchmark.py
           scripts/test_swebench_live_runner.py
           scripts/test_swebench_smoke.py
+          scripts/test_swebench_preparation_compat.py
+          scripts/test_build_long_swebench_selection.py
+          scripts/test_merge_swebench_attempts.py
           scripts/test_swebench_harness_entrypoint.py
           scripts/test_prepared_swebench_image.py
           scripts/test_swebench_ec2_worker.py
@@ -101,6 +104,13 @@ jobs:
           scripts/test_presign_s3.py
           scripts/test_validate_pr_title.py
           scripts/test_wait_for_ec2_termination.py
+
+      - name: Verify preparation against pinned SWE-bench recipes
+        run: |
+          python3 -m venv "$RUNNER_TEMP/swebench-contract"
+          "$RUNNER_TEMP/swebench-contract/bin/python" -m pip install 'swebench==4.1.0'
+          "$RUNNER_TEMP/swebench-contract/bin/python" -m unittest -v \
+            scripts.test_swebench_preparation_compat scripts.test_swebench_smoke
 
       - name: Build one portable release binary
         run: |
