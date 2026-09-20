@@ -120,7 +120,7 @@ def matplotlib_spec():
 
 
 class CompatibilityTests(unittest.TestCase):
-    def test_bound_matplotlib_recipe_installs_once_preserving_all_pip_inputs(self):
+    def test_bound_matplotlib_recipe_installs_once_with_narrow_pip_repairs(self):
         original = matplotlib_spec()
         changed, report = transform_test_specs([original], swebench_version="4.1.0")
         with tempfile.TemporaryDirectory() as directory:
@@ -159,7 +159,10 @@ python() { [ -f installed ] || return 98; [ "$MALLOC_ARENA_MAX" = 13 ] || return
             self.assertEqual(observed, data.replace(b"nbconvert[execute]!=6.0.0,!=6.0.1",
                                                    b"nbconvert[version='!=6.0.0,!=6.0.1']"))
             self.assertEqual((root / "python-calls").read_text().splitlines()[-1],
-                             original.env_script_list[-1].removeprefix("python "))
+                             original.env_script_list[-1].removeprefix("python ").replace(
+                                 "typing-extensions==4.7.1", "typing-extensions==4.13.0") + " pandas==2.3.3")
+        self.assertIn("matplotlib-pandas-2.3.3", report["tasks"][original.instance_id]["repairs"])
+        self.assertIn("matplotlib-typing-extensions-4.13.0", report["tasks"][original.instance_id]["repairs"])
         for field in ("eval_script_list", "FAIL_TO_PASS", "PASS_TO_PASS"):
             self.assertEqual(getattr(original, field), getattr(changed[0], field))
         self.assertIn("matplotlib-micromamba-2.3.3", report["tasks"][original.instance_id]["repairs"])
@@ -185,7 +188,8 @@ python() { [ -f installed ] || return 98; [ "$MALLOC_ARENA_MAX" = 13 ] || return
         # Other task IDs still follow the existing policy, not the new solver.
         other = copy.deepcopy(original)
         other.instance_id = "matplotlib__matplotlib-unknown"
-        _, report = transform_test_specs([other], swebench_version="4.1.0")
+        unchanged, report = transform_test_specs([other], swebench_version="4.1.0")
+        self.assertEqual(unchanged[0].env_script_list[-1], other.env_script_list[-1])
         self.assertEqual(report["tasks"][other.instance_id]["repairs"],
                          ["matplotlib-classic-solver", "matplotlib-qhull-https-sha256"])
 

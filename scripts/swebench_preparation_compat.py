@@ -59,6 +59,18 @@ def _repair_matplotlib_solver(spec: Any, original_sha256: str) -> None:
             or getattr(spec, "arch", None) != "x86_64"
             or original_sha256 != MPL_SOLVER_RECIPE_SHA256):
         raise ValueError("unexpected Matplotlib solver preparation recipe")
+    # The official later pip pin downgrades the solved typing_extensions and
+    # breaks Jupyter's TypedDict(extra_items=...). Keep its proven minimum.
+    # pandas 3.x also cannot import with the later fixed NumPy 1.25.2; the
+    # compatible pandas pin retains that core NumPy pin and the YAML exclusion.
+    # Both changes remain under the original full-recipe guard.
+    pip_command = spec.env_script_list[-1]
+    old_pin = "typing-extensions==4.7.1"
+    if not pip_command.startswith("python -m pip install ") or pip_command.split().count(old_pin) != 1:
+        raise ValueError("unexpected Matplotlib typing-extensions preparation pin")
+    spec.env_script_list[-1] = (
+        pip_command.replace(old_pin, "typing-extensions==4.13.0", 1) + " pandas==2.3.3"
+    )
     # Conda 23.11 ignores bare [execute]; equivalent canonical MatchSpec is
     # necessary for micromamba. All other YAML bytes (including pip) survive.
     spec.env_script_list[1] = spec.env_script_list[1].replace(
@@ -176,7 +188,8 @@ def transform_test_specs(
             repairs.append("sklearn-legacy-pip-25.2")
         if spec.instance_id == MPL_SOLVER_TASK:
             _repair_matplotlib_solver(spec, original_sha256)
-            repairs.append("matplotlib-micromamba-2.3.3")
+            repairs.extend(["matplotlib-micromamba-2.3.3", "matplotlib-typing-extensions-4.13.0",
+                            "matplotlib-pandas-2.3.3"])
         elif spec.repo == "matplotlib/matplotlib" and spec.version in MPL_CONDA_VERSIONS:
             # Work around the observed libsolv solver_addrule assertion without
             # removing/replacing packages. Classic solver success is not assumed.
