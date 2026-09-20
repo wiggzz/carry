@@ -1151,6 +1151,32 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                 "reasoning_tokens": 5, "total_tokens": 52,
             })
 
+    def test_carry_usage_falls_back_to_completed_trace_responses_when_result_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            (output / "result.json").write_text(
+                json.dumps({"usage": {}}), encoding="utf-8"
+            )
+            (output / "trace.jsonl").write_text("\n".join((
+                json.dumps({"event": "model_response", "data": {"usage": {
+                    "input_tokens": 100, "cached_input_tokens": 40,
+                    "cache_write_input_tokens": 10, "output_tokens": 20,
+                    "reasoning_tokens": 5, "total_tokens": 120,
+                }}}),
+                json.dumps({"event": "model_response", "data": {"usage": {
+                    "input_tokens": 200, "cached_input_tokens": 80,
+                    "cache_write_input_tokens": 20, "output_tokens": 30,
+                    "reasoning_tokens": 7, "total_tokens": 230,
+                }}}),
+                json.dumps({"event": "model_error", "data": {"usage": {"input_tokens": 999}}}),
+            )), encoding="utf-8")
+
+            self.assertEqual(self.worker.load_agent_usage("carry", output), {
+                "input_tokens": 300, "cached_input_tokens": 120,
+                "cache_write_input_tokens": 30, "output_tokens": 50,
+                "reasoning_tokens": 12, "total_tokens": 350,
+            })
+
     def test_model_pricing_accounts_for_reads_writes_and_output(self):
         pricing = self.worker.pricing_for_model("gpt-5.6-luna")
         usage = {"input_tokens": 1_000_000, "cached_input_tokens": 400_000,
@@ -1350,26 +1376,26 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
 
         self.worker.require_complete_official_evaluations(records[:2])
 
-    def test_official_agent_timeout_is_a_terminal_task_failure(self):
+    def test_official_agent_timeout_is_a_terminal_agent_failure(self):
         records = [{
             "instance_id": "timed-out", "harness": "carry", "status": "agent-failed",
-            "timed_out": True, "resolved": True,
+            "timed_out": True, "resolved": True, "phase_budget_limited": False,
         }]
         outcomes = {
             "resolved_ids": set(), "unresolved_ids": set(), "empty_patch_ids": set(),
             "error_ids": set(), "incomplete_ids": set(), "completed_ids": set(),
         }
         self.worker.apply_official_outcomes(records, outcomes)
-        self.assertEqual(records[0]["status"], "task-timeout")
+        self.assertEqual(records[0]["status"], "agent-failed")
         self.assertFalse(records[0]["resolved"])
         self.worker.require_complete_official_evaluations(records)
 
     def test_task_timeout_does_not_exhaust_the_agent_phase_budget(self):
         self.assertFalse(self.worker.agent_phase_budget_exhausted({
-            "status": "task-timeout", "timed_out": True, "phase_budget_limited": False,
+            "status": "agent-failed", "timed_out": True, "phase_budget_limited": False,
         }))
         self.assertTrue(self.worker.agent_phase_budget_exhausted({
-            "status": "task-timeout", "timed_out": True, "phase_budget_limited": True,
+            "status": "agent-failed", "timed_out": True, "phase_budget_limited": True,
         }))
         self.assertTrue(self.worker.agent_phase_budget_exhausted({
             "status": "agent-budget-exhausted", "timed_out": False,
@@ -1516,7 +1542,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             report = json.loads((output / "report.json").read_text())
             self.assertEqual((report["denominator"], report["completed"]), (150, 149))
             self.assertEqual(report["resolved"], 0)
-            self.assertEqual(report["harnesses"]["carry"]["statuses"], {"evaluated": 49, "task-timeout": 1})
+            self.assertEqual(report["harnesses"]["carry"]["statuses"], {"agent-failed": 1, "evaluated": 49})
             self.assertEqual(set(report["harnesses"]), set(self.worker.HARNESSES))
             self.assertEqual(report["harnesses"]["carry"]["response_retries"], 98)
             self.assertEqual(report["harnesses"]["codex"]["response_retries"], 0)
@@ -1848,16 +1874,26 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                     raise subprocess.CalledProcessError(124, command)
                 return mock.Mock(returncode=0, stdout="")
 
+            (root / "output" / "trace.jsonl").write_text(json.dumps({
+                "event": "model_response", "data": {"usage": {
+                    "input_tokens": 100, "cached_input_tokens": 40,
+                    "cache_write_input_tokens": 10, "output_tokens": 20,
+                    "reasoning_tokens": 5, "total_tokens": 120,
+                }},
+            }) + "\n", encoding="utf-8")
+            pricing = self.worker.pricing_for_model("gpt-5.6-luna")
             with mock.patch.object(self.worker.subprocess, "run", side_effect=fake_run):
                 record = self.worker.run_agent(
                     instance_id="task-1", harness="carry", image="carry:run",
                     repo=root / "repo", harness_bundle=root / "repo",
                     task_input=root / "input", output=root / "output",
-                    model="gpt-5.6-luna", reasoning="medium",
+                    model="gpt-5.6-luna", reasoning="medium", pricing=pricing,
                     network="internal", proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
                 )
             self.assertEqual(record["status"], "agent-failed")
             self.assertTrue(record["timed_out"])
+            self.assertEqual(record["usage"]["total_tokens"], 120)
+            self.assertEqual(record["estimated_cost_usd"], 0.000037)
 
     def test_run_agent_surfaces_carry_response_retries(self):
         with tempfile.TemporaryDirectory() as directory:
