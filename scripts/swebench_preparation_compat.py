@@ -75,7 +75,9 @@ def _repair_matplotlib_solver(spec: Any, original_sha256: str) -> None:
         # Use Conda's exact named prefix for downstream activation/list/overlay.
         # Installation includes YAML pip requirements. No second Conda solve.
         "(ulimit -v 6291456; ulimit -t 1200; timeout --kill-after=5s 1200s "
-        "./micromamba-preparation create --no-rc --no-env "
+        # Bound glibc arena reservations, not package selection or resource caps.
+        # Per-package task threads can otherwise exhaust RLIMIT_AS with low RSS.
+        "env MALLOC_ARENA_MAX=2 ./micromamba-preparation create --no-rc --no-env "
         "--root-prefix /opt/miniconda3 --prefix /opt/miniconda3/envs/testbed "
         "--file environment.yml -c conda-forge -c defaults "
         "--channel-priority flexible --platform linux-64 python=3.11 --yes)",

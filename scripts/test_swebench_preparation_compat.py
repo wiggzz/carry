@@ -128,7 +128,8 @@ class CompatibilityTests(unittest.TestCase):
             # Deliberately synthetic executable: verifies the emitted install
             # contract, not actual dependency installation or solvability.
             binary = root / "solver-fixture"
-            binary.write_text('#!/bin/bash\nset -eu\nprintf "%s\\n" "$*" >> calls\n'
+            binary.write_text('#!/bin/bash\nset -eu\n[ "${MALLOC_ARENA_MAX:-unset}" = 2 ]\n'
+                              'printf "%s\\n" "$*" >> calls\n'
                               'cp environment.yml observed.yml\ntouch installed\n')
             digest = hashlib.sha256(binary.read_bytes()).hexdigest()
             with mock.patch.object(compat, "MPL_SOLVER_SHA256", digest, create=True):
@@ -138,10 +139,11 @@ source() { :; }
 conda() { [ "$*" = 'activate testbed' ] && [ -f installed ]; }
 wget() { cp solver-fixture micromamba-preparation; }
 timeout() { [ "$1" = --kill-after=5s ] || return 97; shift 2; "$@"; }
-python() { [ -f installed ] || return 98; printf '%s\\n' "$*" >> python-calls; }
+python() { [ -f installed ] || return 98; [ "$MALLOC_ARENA_MAX" = 13 ] || return 99; printf '%s\\n' "$*" >> python-calls; }
 '''
             result = subprocess.run(["bash", "-c", shell + "\n".join(changed[0].env_script_list)],
-                                    cwd=root, capture_output=True, text=True)
+                                    cwd=root, capture_output=True, text=True,
+                                    env=dict(os.environ, MALLOC_ARENA_MAX="13"))
             self.assertEqual(result.returncode, 0, result.stderr)
             calls = (root / "calls").read_text().splitlines()
             self.assertEqual(len(calls), 1)
