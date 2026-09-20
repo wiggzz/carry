@@ -7,12 +7,68 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      preparation_solver_probe:
+        description: 'Probe only: bounded Matplotlib Conda dry-run (no model or cloud worker)'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  preparation-solver-probe:
+    name: Matplotlib preparation solver diagnostic
+    if: github.event_name == 'workflow_dispatch' && inputs.preparation_solver_probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Test diagnostic failure and evidence paths offline
+        run: python3 -m unittest -v scripts/test_probe_matplotlib_solver.py
+
+      - name: Bounded full-environment Conda dry-run
+        id: solver
+        run: >-
+          python3 scripts/probe_matplotlib_solver.py
+          --evidence-dir "$RUNNER_TEMP/matplotlib-solver-evidence"
+          --work-dir "$RUNNER_TEMP/matplotlib-solver-work"
+
+      - name: Record job outcome even if checkout or tests failed
+        if: always()
+        env:
+          SOLVER_STEP_OUTCOME: ${{ steps.solver.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "matplotlib-solver-evidence"
+          evidence.mkdir(parents=True, exist_ok=True)
+          (evidence / "job-outcome.json").write_text(json.dumps({
+              "solver_step_outcome": os.environ["SOLVER_STEP_OUTCOME"],
+              "github_sha": os.environ["GITHUB_SHA"],
+              "result_present": (evidence / "result.json").is_file(),
+          }, indent=2) + "\n")
+          PY
+
+      # Never upload the solver cache/prefix, let alone dataset or gold content.
+      - name: Retain bounded diagnostic evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: matplotlib-solver-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/matplotlib-solver-evidence/
+          if-no-files-found: error
+          retention-days: 7
+
   infra:
+    if: github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe
     name: Terraform infrastructure
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -58,6 +114,7 @@ jobs:
           terraform -chdir=infra validate
 
   test:
+    if: github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -98,6 +155,7 @@ jobs:
           scripts/test_swebench_live_runner.py
           scripts/test_swebench_smoke.py
           scripts/test_swebench_preparation_compat.py
+          scripts/test_probe_matplotlib_solver.py
           scripts/test_build_long_swebench_selection.py
           scripts/test_merge_swebench_attempts.py
           scripts/test_swebench_harness_entrypoint.py
