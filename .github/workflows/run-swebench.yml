@@ -553,20 +553,50 @@ jobs:
             rm -f "$RUNNER_TEMP/control.json"
           }
           stream_progress() {
-            aws ec2 get-console-output --instance-id "$WORKER_INSTANCE_ID" --latest \
-              --query Output --output text 2>/dev/null \
-              | python3 scripts/benchmark_progress.py --state "$RUNNER_TEMP/benchmark-progress-seen.json" \
-              || true
+            BASE_AWS_ACCESS_KEY_ID="$BASE_AWS_ACCESS_KEY_ID" \
+            BASE_AWS_SECRET_ACCESS_KEY="$BASE_AWS_SECRET_ACCESS_KEY" \
+            BASE_AWS_SESSION_TOKEN="$BASE_AWS_SESSION_TOKEN" \
+              python3 scripts/benchmark_worker_diagnostics.py \
+                --output benchmark-artifact/worker-diagnostics.json \
+                --instance-id "$WORKER_INSTANCE_ID" \
+                --archive-exit-code "$archive_exit_code" \
+                --archive-http-status "$archive_http_status" "$@"
           }
+          archive_exit_code=125
+          archive_http_status=000
+          outcome=interrupted
+          final_diagnostics() {
+            local status=$?
+            trap - EXIT
+            rm -f benchmark-artifact/results.tar.gz.tmp
+            stream_progress --final --outcome "$outcome" || status=1
+            exit "$status"
+          }
+          trap final_diagnostics EXIT
           while (( SECONDS < deadline )); do
-            if curl --proto '=https' --tlsv1.2 --fail --silent \
-              "$RESULT_GET_URL" -o benchmark-artifact/results.tar.gz.tmp; then
+            if archive_http_status=$(curl --proto '=https' --tlsv1.2 --fail --silent \
+              --connect-timeout 10 --max-time 60 --write-out '%{http_code}' \
+              "$RESULT_GET_URL" -o benchmark-artifact/results.tar.gz.tmp); then
+              archive_exit_code=0
               mv benchmark-artifact/results.tar.gz.tmp benchmark-artifact/results.tar.gz
-              stream_progress
+              outcome=archive-received
               exit 0
+            else
+              archive_exit_code=$?
             fi
             rm -f benchmark-artifact/results.tar.gz.tmp
-            stream_progress
+            if stream_progress; then
+              :
+            else
+              diagnostics_status=$?
+              if (( diagnostics_status == 3 )); then
+                outcome=worker-unavailable
+                echo "worker unavailable and result absent after two grace polls" >&2
+              else
+                echo "unable to retain worker diagnostics" >&2
+              fi
+              exit 1
+            fi
             if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 || "$BENCHMARK_MODE" == session-20 ]] && (( SECONDS >= next_rotation )); then
               if rotate_capabilities; then
                 next_rotation=$((SECONDS + 1500))
@@ -577,6 +607,7 @@ jobs:
             fi
             sleep 30
           done
+          outcome=deadline-exceeded
           echo "timed out waiting for benchmark result" >&2
           exit 1
 
@@ -689,13 +720,25 @@ jobs:
             printf '# SWE-bench report\n\nNo report was produced. See the worker diagnostics artifact.\n' >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Retain final worker diagnostics
+        if: always() && ((inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50'))
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Refreshed dispatch credentials, before exact-worker/object cleanup.
+          # Also creates evidence if launch or the wait step never completed.
+          python3 scripts/benchmark_worker_diagnostics.py \
+            --output benchmark-artifact/worker-diagnostics.json \
+            --instance-id "${WORKER_INSTANCE_ID:-}" --final
+          test -s benchmark-artifact/worker-diagnostics.json
+
       - name: Upload results and diagnostics
         if: always() && ((inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50'))
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
           name: swebench-${{ inputs.mode }}-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}-attempt-${{ matrix.attempt }}
           path: benchmark-artifact
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
       - name: Terminate the exact worker and delete exact run objects

@@ -91,6 +91,9 @@ jobs:
         run: >-
           python3 -m unittest -v
           scripts/test_benchmark_progress.py
+          scripts/test_benchmark_preparation_telemetry.py
+          scripts/test_benchmark_worker_diagnostics.py
+          scripts/test_render_swebench_worker_user_data.py
           scripts/test_swebench_benchmark.py
           scripts/test_swebench_live_runner.py
           scripts/test_swebench_smoke.py
