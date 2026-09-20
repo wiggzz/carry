@@ -277,12 +277,31 @@ impl ContextState {
         (!released_ids.is_empty()).then_some((released, released_ids))
     }
 
-    /// Attach one cache-safe review for the four largest due leases. The review is
-    /// resolved only after the next model response has seen it.
-    pub fn attach_due_keep_lease_review(&mut self) -> KeepLeaseReview {
+    /// Attach one cache-safe review for the four largest due leases to the tool
+    /// result that was just returned. The host must be the latest item: the
+    /// review is rendered inside the host's output, so attaching it to an
+    /// older result would rewrite the cached prefix. The review is resolved
+    /// only after the next model response has seen it.
+    pub fn attach_due_keep_lease_review_to(&mut self, host_id: u64) -> KeepLeaseReview {
         const MAX_REVIEWED_KEEP_LEASES: usize = 4;
 
         if !self.pending_keep_lease_review.is_empty() {
+            return KeepLeaseReview {
+                item_ids: Vec::new(),
+            };
+        }
+        let Some(host_index) = self.items.iter().position(|item| item.id == host_id) else {
+            return KeepLeaseReview {
+                item_ids: Vec::new(),
+            };
+        };
+        let fresh_host = self.items[host_index].kind == ContextItemKind::Tool
+            && self.items[host_index + 1..].iter().all(|item| {
+                item.memory
+                    .as_ref()
+                    .is_some_and(|memory| memory.source_id == host_id)
+            });
+        if !fresh_host {
             return KeepLeaseReview {
                 item_ids: Vec::new(),
             };
@@ -318,12 +337,7 @@ impl ContextState {
             let text = format!(
                 "Review protected items: IDs {ids} are expiring. Re-protect only if their information is still needed for this task and either is not represented elsewhere or cannot be accurately captured with context.remember. Otherwise omit them to release them for normal compaction."
             );
-            if let Some(item) = self
-                .items
-                .iter_mut()
-                .rev()
-                .find(|item| item.kind == ContextItemKind::Tool)
-            {
+            if let Some(item) = self.items.iter_mut().find(|item| item.id == host_id) {
                 item.keep_lease_review = Some(text);
                 self.pending_keep_lease_review = item_ids.clone();
             }
@@ -1931,7 +1945,7 @@ mod tests {
         state.arm_keep_leases(&change.keep, 1);
 
         state.advance_retention_turn();
-        let review = state.attach_due_keep_lease_review();
+        let review = state.attach_due_keep_lease_review_to(source);
         assert_eq!(review.item_ids, vec![protected]);
         assert!(
             serde_json::to_string(&state.input_items())
@@ -1991,7 +2005,7 @@ mod tests {
         state.arm_keep_leases(&change.keep, 1);
         state.advance_retention_turn();
 
-        let review = state.attach_due_keep_lease_review();
+        let review = state.attach_due_keep_lease_review_to(source);
 
         assert_eq!(review.item_ids, vec![largest, large, medium, small]);
         let rendered = serde_json::to_string(&state.input_items()).unwrap();
@@ -2000,6 +2014,25 @@ mod tests {
         assert!(rendered.contains("context.remember"));
         assert!(rendered.contains("release them for normal compaction"));
         assert!(!rendered.contains(&format!("ID {tiny}")));
+    }
+
+    #[test]
+    fn keep_lease_review_must_not_rewrite_an_already_rendered_tool_result() {
+        let mut state = ContextState::new("initial".into());
+        let protected = add_tool(&mut state);
+        let source = add_tool(&mut state);
+        let change = state.record_signals(&update(&[protected], &[], &[]), source);
+        state.arm_keep_leases(&change.keep, 1);
+
+        state.advance_retention_turn();
+        state.add_user("steer: focus on the deploy script".into());
+        let rendered_before = serde_json::to_string(&state.input_items()).unwrap();
+
+        let review = state.attach_due_keep_lease_review_to(source);
+        let rendered_after = serde_json::to_string(&state.input_items()).unwrap();
+
+        assert!(review.item_ids.is_empty());
+        assert_eq!(rendered_before, rendered_after);
     }
 
     #[test]
@@ -2012,7 +2045,7 @@ mod tests {
         state.arm_keep_leases(&change.keep, 2);
         state.advance_retention_turn();
         state.advance_retention_turn();
-        state.attach_due_keep_lease_review();
+        state.attach_due_keep_lease_review_to(source);
         state.resolve_keep_lease_review(&[active]);
         state.arm_keep_leases(&[active], 2);
 
