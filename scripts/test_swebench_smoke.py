@@ -337,10 +337,11 @@ class SmokeWorkerTests(unittest.TestCase):
         result = self.worker.validate_readiness_result(
             returncode=1,
             timed_out=False,
-            parsed_tests={"tests/test_public.py::test_bug": "FAILED"},
+            parsed_tests={"tests/test_public.py::test_bug": "FAILED", "optional": "SKIPPED"},
         )
         self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["parsed_test_count"], 1)
+        self.assertEqual(result["parsed_test_count"], 2)
+        self.assertEqual(result["executed_test_count"], 1)
         self.assertEqual(result["baseline_exit_code"], 1)
 
     def test_readiness_rejects_runner_that_never_executes_a_test(self):
@@ -350,6 +351,48 @@ class SmokeWorkerTests(unittest.TestCase):
                 timed_out=False,
                 parsed_tests={},
             )
+
+    def test_readiness_rejects_skip_and_collection_error_only_results(self):
+        for parsed in (
+            {"test_optional.py": "SKIPPED"},
+            {"test_import.py": "ERROR"},
+            {"test_optional.py": "SKIPPED", "test_import.py": "ERROR"},
+            {"test_unknown.py": "UNKNOWN"},
+        ):
+            with self.subTest(parsed=parsed), self.assertRaisesRegex(
+                RuntimeError, "did not execute any parseable public tests"
+            ):
+                self.worker.validate_readiness_result(
+                    returncode=1, timed_out=False, parsed_tests=parsed,
+                )
+
+    def test_matplotlib_collection_error_fails_readiness_with_official_parser(self):
+        try:
+            from swebench.harness.log_parsers import MAP_REPO_TO_PARSER
+        except ImportError:
+            self.skipTest("pinned SWE-bench harness unavailable")
+        captured = (
+            "collecting ... collected 1035 items / 1 error / 1 skipped\n"
+            "SKIPPED [1] lib/matplotlib/tests/test_backend_macosx.py:10: These are mac only tests\n"
+            "ERROR lib/matplotlib/tests/test_backend_nbagg.py - TypeError: unexpected keyword 'extra_items'\n"
+            "!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            output = root / "evidence"
+            with mock.patch.object(self.worker.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout=captured, stderr=""
+            )), self.assertRaisesRegex(RuntimeError, "PASSED or FAILED required"):
+                self.worker.run_task_readiness(
+                    instance_id="matplotlib__matplotlib-24627", image="probe", repo=repo,
+                    script="pytest -rA -vv --maxfail=1", test_command="pytest -rA -vv --maxfail=1",
+                    parser=MAP_REPO_TO_PARSER["matplotlib/matplotlib"], test_spec=None,
+                    output=output, timeout_seconds=180,
+                )
+            self.assertEqual(json.loads((output / "metadata.json").read_text())["status"], "not-ready")
+            self.assertEqual((output / "test-output.txt").read_text(), captured)
 
     def test_task_catalog_references_are_deterministic_and_content_addressed(self):
         record = {
@@ -447,6 +490,30 @@ class SmokeWorkerTests(unittest.TestCase):
                     catalog=catalog, records=[record], repository=repository,
                     prepared_recipe_sha256=after, base_recipe_sha256="e" * 64,
                 )
+
+    def test_readiness_policy_change_invalidates_cache_and_frozen_catalog(self):
+        source = SCRIPT.parents[1]
+        record = dict(instance_id="owner__repo-1", repo="owner/repo", version="1.0", base_commit="a" * 40)
+        repository = "registry.example/tasks"
+        with mock.patch.object(self.worker, "READINESS_EXECUTED_STATUSES", ("PASSED", "FAILED", "ERROR", "SKIPPED")):
+            before = self.worker.prepared_image_recipe_sha256(source)
+        after = self.worker.prepared_image_recipe_sha256(source)
+        self.assertNotEqual(before, after)
+        old_key = self.worker.task_image_cache_key(record, prepared_dockerfile_sha256=before,
+                                                   base_dockerfile_sha256="e" * 64)
+        new_key = self.worker.task_image_cache_key(record, prepared_dockerfile_sha256=after,
+                                                   base_dockerfile_sha256="e" * 64)
+        self.assertNotEqual(old_key, new_key)
+        catalog = self.worker.task_catalog_payload(
+            published={record["instance_id"]: {
+                "cache_key": old_key, "preparation_compatibility": {},
+                "agent_image": {"resolved_digest": repository + "@sha256:" + "a" * 64},
+                "evaluator_image": {"resolved_digest": repository + "@sha256:" + "b" * 64},
+            }}, repository=repository, prepared_recipe_sha256=before, base_recipe_sha256="e" * 64,
+        )
+        with self.assertRaisesRegex(RuntimeError, "metadata"):
+            self.worker.validate_task_catalog(catalog=catalog, records=[record], repository=repository,
+                                             prepared_recipe_sha256=after, base_recipe_sha256="e" * 64)
 
     def test_frozen_catalog_validates_inputs_and_publishes_an_immutable_reference(self):
         record = {

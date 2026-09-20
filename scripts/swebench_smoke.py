@@ -257,6 +257,9 @@ AGENT_COMMANDS = {
 }
 
 
+READINESS_EXECUTED_STATUSES = ("PASSED", "FAILED")
+
+
 def prepared_image_recipe_sha256(source: pathlib.Path) -> str:
     """Hash the reusable image inputs AND its upstream preparation repair policy.
 
@@ -270,6 +273,10 @@ def prepared_image_recipe_sha256(source: pathlib.Path) -> str:
         "scripts/swebench_preparation_compat.py",
     )
     digest = hashlib.sha256()
+    # A tag certified by a weaker execution gate must not bypass readiness.
+    digest.update(json.dumps({"readiness_executed_statuses": READINESS_EXECUTED_STATUSES},
+                             sort_keys=True).encode())
+    digest.update(b"\0")
     for relative in relative_paths:
         content = (source / relative).read_bytes()
         digest.update(relative.encode())
@@ -715,10 +722,12 @@ def readiness_docker_command(*, image: str, container_name: str, repo: pathlib.P
 def validate_readiness_result(*, returncode: int, timed_out: bool,
                               parsed_tests: Mapping[str, str]) -> dict[str, Any]:
     """Accept buggy baseline failures only after the official parser saw tests run."""
-    if not parsed_tests:
-        raise RuntimeError("readiness command did not execute any parseable public tests")
+    executed_count = sum(status in READINESS_EXECUTED_STATUSES for status in parsed_tests.values())
+    if not executed_count:
+        raise RuntimeError("readiness command did not execute any parseable public tests (PASSED or FAILED required)")
     return {
         "status": "ready",
+        "executed_test_count": executed_count,
         "baseline_exit_code": returncode,
         "timed_out_after_tests_started": timed_out,
         "parsed_test_count": len(parsed_tests),
