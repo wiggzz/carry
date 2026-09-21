@@ -169,6 +169,7 @@ pub enum Backend {
 #[derive(Debug)]
 pub struct RunOutcome {
     pub completed: bool,
+    pub answer_streamed: bool,
     pub answer: Option<String>,
     pub session_dir: PathBuf,
 }
@@ -686,6 +687,7 @@ async fn run_loop(
             persist_context_checkpoint(&config, &context_state)?;
             return Ok(RunOutcome {
                 completed: false,
+                answer_streamed: false,
                 answer: None,
                 session_dir: config.session_dir,
             });
@@ -731,6 +733,7 @@ async fn run_loop(
         let progress_events = events.clone();
         let mut last_progress = None;
         let mut displayed_preview = String::new();
+        let mut stream_output = crate::terminal::StreamOutput::default();
         let reply = match backend
             .step_with_progress(&history, |progress| {
                 if last_progress
@@ -748,16 +751,16 @@ async fn run_loop(
                     .as_ref()
                     .unwrap_or(&progress.preview);
                 if !terminal_preview.is_empty() && *terminal_preview != displayed_preview {
-                    use std::io::{IsTerminal, Write};
+                    use std::io::IsTerminal;
                     if std::io::stderr().is_terminal() {
                         if let Some(delta) = terminal_preview.strip_prefix(&displayed_preview) {
-                            eprint!("{delta}");
+                            stream_output.push(delta);
                         } else {
-                            eprint!("\n[stream restarted]\n{}", terminal_preview);
+                            stream_output
+                                .push(&format!("\n[stream restarted]\n{}", terminal_preview));
                         }
-                        let _ = std::io::stderr().flush();
+                        displayed_preview = terminal_preview.clone();
                     }
-                    displayed_preview = terminal_preview.clone();
                 }
                 if let Some(events) = &progress_events {
                     let _ = events.send(json!({"event":"model_progress", "data": {
@@ -775,6 +778,9 @@ async fn run_loop(
         {
             Ok(reply) => reply,
             Err(error) => {
+                if !displayed_preview.is_empty() {
+                    stream_output.finish();
+                }
                 logger.raw_event(
                     "model_error",
                     json!({
@@ -792,7 +798,7 @@ async fn run_loop(
             }
         };
         if !displayed_preview.is_empty() {
-            eprintln!();
+            stream_output.finish();
         }
         metrics.record(&reply.usage, reply.latency_ms, reply.response_retries);
         sent_model_request = true;
@@ -888,6 +894,7 @@ async fn run_loop(
                     persist_context_checkpoint(&config, &context_state)?;
                     return Ok(RunOutcome {
                         completed: true,
+                        answer_streamed: false,
                         answer: None,
                         session_dir: config.session_dir,
                     });
@@ -940,13 +947,19 @@ async fn run_loop(
                     }),
                     &terminal_finished(step_index, &metrics.usage),
                 )?;
+                use std::io::IsTerminal;
+                let answer_streamed = !crate::terminal::should_print_answer(
+                    answer.as_deref().unwrap_or_default(),
+                    &displayed_preview,
+                    std::io::stdout().is_terminal(),
+                );
                 if let Some(receiver) = input.as_mut() {
-                    crate::terminal::print_answer(answer.as_deref().unwrap_or_default());
+                    if !answer_streamed {
+                        crate::terminal::print_answer(answer.as_deref().unwrap_or_default());
+                    }
                     let (mut should_exit, had_messages) =
                         drain_user_input(receiver, &mut context_state, &mut logger, &config)?;
                     if !should_exit && !had_messages {
-                        eprint!("carry> ");
-                        let _ = std::io::Write::flush(&mut std::io::stderr());
                         match receiver.recv().await {
                             Some(UserInput::Message(message)) => {
                                 append_user_message(
@@ -977,6 +990,7 @@ async fn run_loop(
                 .await?;
                 return Ok(RunOutcome {
                     completed: true,
+                    answer_streamed,
                     answer,
                     session_dir: config.session_dir,
                 });

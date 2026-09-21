@@ -792,11 +792,7 @@ where
                 current.preview = partial_string_field(&current.arguments, field);
                 if current.function_name == "shell" {
                     let command = partial_string_field(&current.arguments, "command");
-                    current.terminal_preview = Some(if command.is_empty() {
-                        String::new()
-                    } else {
-                        format!("$ {command}")
-                    });
+                    current.terminal_preview = Some(String::new());
                     if !command.is_empty() {
                         current
                             .preview
@@ -919,7 +915,7 @@ mod tests {
             );
             previous = text.clone();
         }
-        assert_eq!(previous, "$ echo hello");
+        assert_eq!(previous, "");
     }
 
     #[test]

@@ -43,7 +43,7 @@ impl Input {
                 Entry::Notice("Multiline input: /end on its own line sends; /cancel discards.")
             }
             "/help" => Entry::Notice(
-                "Enter sends. /paste starts multiline input; /end sends; /cancel discards. /quit or /exit exits. EOF discards unfinished drafts.",
+                "Enter sends; Alt+Enter or Ctrl+J inserts a newline; paste inserts without sending. Ctrl+C clears the draft. /paste also starts multiline input; /end sends; /cancel discards. /quit or /exit exits. EOF discards unfinished drafts.",
             ),
             _ => Entry::Message(line.to_owned()),
         }
@@ -121,7 +121,12 @@ pub fn print_answer(text: &str) {
     let color = std::io::stdout().is_terminal()
         && std::env::var_os("NO_COLOR").is_none()
         && std::env::var("TERM").as_deref() != Ok("dumb");
-    println!("{}", markdown(text, color));
+    let rendered = markdown(text, color);
+    if std::io::stdout().is_terminal() && editor_active() {
+        output(&rendered);
+    } else {
+        println!("{rendered}");
+    }
 }
 
 #[cfg(test)]
@@ -160,5 +165,133 @@ mod tests {
     fn redirected_and_no_color_output_preserve_markdown() {
         let text = "# Heading\n**bold** and `code`\n";
         assert_eq!(markdown(text, false), text);
+    }
+}
+
+/// Redirected stdout must always receive the complete answer, even when stderr
+/// was used for a live preview.
+pub fn should_print_answer(answer: &str, streamed: &str, stdout_is_terminal: bool) -> bool {
+    !stdout_is_terminal || streamed.is_empty() || answer != streamed
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    #[test]
+    fn completed_stream_is_not_printed_twice_but_redirects_and_partial_streams_are_complete() {
+        assert!(!should_print_answer("hello", "hello", true));
+        assert!(should_print_answer("hello", "hello", false));
+        assert!(should_print_answer("hello", "hel", true));
+        assert!(should_print_answer("hello", "", true));
+    }
+}
+
+type Printer = Box<dyn FnMut(String) + Send>;
+static PRINTER: std::sync::Mutex<Option<Printer>> = std::sync::Mutex::new(None);
+
+pub fn output(message: &str) {
+    let mut printer = PRINTER.lock().unwrap();
+    if let Some(print) = printer.as_mut() {
+        print(message.to_owned());
+    } else {
+        eprintln!("{message}");
+    }
+}
+
+pub fn editor_active() -> bool {
+    PRINTER.lock().unwrap().is_some()
+}
+
+pub fn read_input(sender: tokio::sync::mpsc::UnboundedSender<crate::run::UserInput>) {
+    use reedline::{
+        DefaultPrompt, DefaultPromptSegment, EditCommand, Emacs, ExternalPrinter, KeyCode,
+        KeyModifiers, Reedline, ReedlineEvent, Signal, default_emacs_keybindings,
+    };
+    let result = (|| -> std::io::Result<()> {
+        let mut keys = default_emacs_keybindings();
+        for (modifiers, key) in [
+            (KeyModifiers::ALT, KeyCode::Enter),
+            (KeyModifiers::SHIFT, KeyCode::Enter),
+            (KeyModifiers::CONTROL, KeyCode::Char('j')),
+        ] {
+            keys.add_binding(
+                modifiers,
+                key,
+                ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
+            );
+        }
+        let printer = ExternalPrinter::default();
+        let mut editor = Reedline::create()
+            .with_edit_mode(Box::new(Emacs::new(keys)))
+            .use_bracketed_paste(true)
+            .with_external_printer(printer.clone())
+            .with_ansi_colors(std::env::var_os("NO_COLOR").is_none());
+        *PRINTER.lock().unwrap() = Some(Box::new(move |message| {
+            let _ = printer.print(message);
+        }));
+        let prompt = DefaultPrompt {
+            left_prompt: DefaultPromptSegment::Basic("carry".into()),
+            right_prompt: DefaultPromptSegment::Empty,
+        };
+        let mut input = Input::default();
+        loop {
+            let line = match editor.read_line(&prompt)? {
+                Signal::Success(line) => line,
+                Signal::CtrlC => {
+                    input = Input::default();
+                    continue;
+                }
+                Signal::CtrlD => break,
+            };
+            match input.line(&line) {
+                Entry::Message(message) => {
+                    if sender
+                        .send(crate::run::UserInput::Message(message))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Entry::Notice(message) => output(message),
+                Entry::Exit => break,
+                Entry::Pending => {}
+            }
+        }
+        Ok(())
+    })();
+    *PRINTER.lock().unwrap() = None;
+    if let Err(error) = result {
+        eprintln!("terminal editor failed: {error}");
+    }
+    let _ = sender.send(crate::run::UserInput::Exit);
+}
+
+/// External printers work in lines: buffer a partial line rather than repainting
+/// the input for every token or putting every fragment on its own line.
+#[derive(Default)]
+pub struct StreamOutput {
+    pending: String,
+}
+impl StreamOutput {
+    pub fn push(&mut self, delta: &str) {
+        use std::io::Write;
+        if editor_active() {
+            self.pending.push_str(delta);
+            while let Some(end) = self.pending.find('\n') {
+                let line: String = self.pending.drain(..=end).collect();
+                output(line.trim_end_matches('\n'));
+            }
+        } else {
+            eprint!("{delta}");
+            let _ = std::io::stderr().flush();
+        }
+    }
+    pub fn finish(&mut self) {
+        if !self.pending.is_empty() {
+            output(&std::mem::take(&mut self.pending));
+        } else if !editor_active() {
+            eprintln!();
+        }
     }
 }
