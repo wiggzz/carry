@@ -163,7 +163,7 @@ PYLINT_GIT_RECIPES = {
 # pins and the upstream warning policy; this pin has public-source RED/GREEN proof.
 ASTROPY_NUMPY_RECIPES = {
     "astropy__astropy-13398": (
-        "5.1", "f86ff4361a98403f1fdc81c9ae146c3f1533fea011cc15195b6cf026e1e16c03",
+        "5.0", "f86ff4361a98403f1fdc81c9ae146c3f1533fea011cc15195b6cf026e1e16c03",
     ),
     "astropy__astropy-14598": (
         "5.2", "0221e8455a85ac1a05d23b05e86eeeb5c57fc69835250dbfb6ce05703abf1024",

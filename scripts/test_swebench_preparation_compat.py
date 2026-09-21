@@ -182,7 +182,9 @@ class CompatibilityTests(unittest.TestCase):
         })
 
     def test_astropy_numpy_repair_executes_exact_pin_and_rejects_drift(self):
-        cases = (("13398", "5.1", "6500928dc0e57be8f06d1162eacc3ba5e2eff692"),
+        # Release labels come from the pinned canonical dataset, not the source
+        # package's development version (13398 is labeled 5.0, not 5.1).
+        cases = (("13398", "5.0", "6500928dc0e57be8f06d1162eacc3ba5e2eff692"),
                  ("14598", "5.2", "80c3854a5f4f4a6ab86c03d9db7854767fcd83c1"))
         for task, release, commit in cases:
             original = self.public_setup_spec("astropy__astropy-" + task, "astropy/astropy", release, commit)
