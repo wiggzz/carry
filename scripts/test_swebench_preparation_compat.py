@@ -37,7 +37,7 @@ SKLEARN_ENV = [
 
 def spec(repo="scikit-learn/scikit-learn", version="1.3"):
     return SimpleNamespace(
-        instance_id="scikit-learn__scikit-learn-25102", repo=repo, version=version,
+        instance_id="scikit-learn__scikit-learn-123", repo=repo, version=version,
         env_script_list=SKLEARN_ENV.copy(), repo_script_list=[INSTALL],
         eval_script_list=[INSTALL, "git apply hidden-test.patch", "pytest -rA"],
         instance_image_tag="latest",
@@ -49,6 +49,9 @@ SPHINX_TASKS = {
     "7440": ("3.0", "9bb204dcabe6ba0fc422bf4a45ad0c79c680d90b"),
     "7590": ("3.1", "2e506c5ab457cba743bb47eb5b8c8eb9dd51d23d"),
     "8056": ("3.2", "e188d56ed1248dead58f3f8018c0e9a3f99193f7"),
+    "8548": ("3.4", "dd1615c59dc6fff633e27dbb3861f2d27e1fb976"),
+    "8551": ("3.4", "57ed10c68057c96491acbd3e62254ccfaf9e3861"),
+    "8721": ("3.5", "82ef497a8c88f0f6e50d84520e7276bfbf65025d"),
 }
 
 
@@ -92,6 +95,54 @@ def sphinx_spec(task):
     return item
 
 
+PYLINT_TASKS = {
+    "7080": ("2.15", "3c5eca2ded3dd2b59ebaf23eb289453b5d2930f0"),
+    "8898": ("3.0", "1f8c4d9eb185c16a2c1d881c054f015e1c2eb334"),
+}
+
+
+def pylint_spec(task):
+    """Public 4.1.0 preparation fixture; requirements use the setup commit."""
+    release, commit = PYLINT_TASKS[task]
+    item = spec("pylint-dev/pylint", release)
+    item.instance_id = "pylint-dev__pylint-" + task
+    requirements = {
+        "7080": (
+            "black==22.6.0\nflake8==5.0.4\nflake8-typing-imports==1.13.0\n"
+            "isort==5.10.1\nmypy==0.971\n\nastroid==2.12.13  # Pinned to a specific version for tests\n"
+            "typing-extensions~=4.4\npy~=1.11.0\npytest~=7.2\npytest-benchmark~=4.0\n"
+            "pytest-timeout~=2.1\ntowncrier~=22.8\nrequests\n\ncoveralls~=3.3\ncoverage~=6.4\n"
+            "pre-commit~=2.20\ntbump~=6.9.0\ncontributors-txt>=0.9.0\npytest-cov~=3.0\n"
+            "pytest-profiling~=1.7\npytest-xdist~=2.5\ntypes-setuptools\ntox>=3\n"
+        ),
+        "8898": (
+            "astroid==3.0.0a9  # Pinned to a specific version for tests\n"
+            "typing-extensions~=4.7\npy~=1.11.0\npytest~=7.4\npytest-benchmark~=4.0\n"
+            "pytest-timeout~=2.1\ntowncrier~=23.6\nrequests\nsetuptools==41.6.0\n\n"
+            "coverage~=7.3\ntbump~=6.10.0\ncontributors-txt>=1.0.0\npytest-cov~=4.1\n"
+            "pytest-profiling~=1.7\npytest-xdist~=3.3\nsix\ntypes-setuptools\ntox>=3\n"
+        ),
+    }[task]
+    item.env_script_list = [
+        "source /opt/miniconda3/bin/activate",
+        "conda create -n testbed python=3.9 -y",
+        "cat <<'EOF_59812759871' > $HOME/requirements.txt\n" + requirements + "\nEOF_59812759871",
+        "conda activate testbed && python -m pip install -r $HOME/requirements.txt",
+        "rm $HOME/requirements.txt", "conda activate testbed",
+    ]
+    if task == "8898":
+        item.env_script_list.append("python -m pip install astroid==3.0.0a6 setuptools")
+    item.repo_script_list = [line.replace("sphinx-doc/sphinx", "pylint-dev/pylint")
+        .replace(SPHINX_TASKS["7440"][1], commit)
+        for line in sphinx_spec("7440").repo_script_list[:15]] + [
+        "python -m pip install -e .",
+        "git config --global user.email setup@swebench.config",
+        "git config --global user.name SWE-bench",
+        "git commit --allow-empty -am SWE-bench",
+    ]
+    return item
+
+
 def matplotlib_spec():
     """Frozen public SWE-bench 4.1.0 setup; not image-build evidence."""
     item = spec("matplotlib/matplotlib", "3.6")
@@ -120,6 +171,202 @@ def matplotlib_spec():
 
 
 class CompatibilityTests(unittest.TestCase):
+    def public_setup_spec(self, task, repo, release, commit):
+        try:
+            from swebench.harness.test_spec.test_spec import make_test_spec
+        except ImportError:
+            self.skipTest("optional pinned SWE-bench harness is not installed")
+        return make_test_spec({
+            "instance_id": task, "repo": repo, "version": release,
+            "base_commit": commit, "test_patch": "", "FAIL_TO_PASS": [], "PASS_TO_PASS": [],
+        })
+
+    def test_astropy_numpy_repair_executes_exact_pin_and_rejects_drift(self):
+        cases = (("13398", "5.1", "6500928dc0e57be8f06d1162eacc3ba5e2eff692"),
+                 ("14598", "5.2", "80c3854a5f4f4a6ab86c03d9db7854767fcd83c1"))
+        for task, release, commit in cases:
+            original = self.public_setup_spec("astropy__astropy-" + task, "astropy/astropy", release, commit)
+            changed, report = transform_test_specs([original], swebench_version="4.1.0")
+            # Execute the entire pip command and record its argv, without network.
+            result = subprocess.run(["bash", "-c", "set -eu\npython() { printf '%s\\n' \"$@\"; }\n"
+                                     + changed[0].env_script_list[-1]], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = original.env_script_list[-1].split()[1:]
+            expected[expected.index("numpy==1.25.2")] = "numpy==1.24.4"
+            self.assertEqual(result.stdout.splitlines(), expected)
+            self.assertEqual(changed[0].repo_script_list, original.repo_script_list)
+            self.assertEqual(changed[0].eval_script_list, original.eval_script_list)
+            self.assertIn("astropy-numpy-1.24.4", report["tasks"][original.instance_id]["repairs"])
+            with self.assertRaisesRegex(ValueError, "unexpected Astropy"):
+                transform_test_specs(changed, swebench_version="4.1.0")
+            for field, value in (("version", "5.3"), ("arch", "arm64"), ("repo", "other/repo")):
+                drift = copy.deepcopy(original)
+                setattr(drift, field, value)
+                with self.assertRaisesRegex(ValueError, "unexpected Astropy"):
+                    transform_test_specs([drift], swebench_version="4.1.0")
+            drift = copy.deepcopy(original)
+            drift.env_script_list[-1] += " wheel"
+            with self.assertRaisesRegex(ValueError, "unexpected Astropy"):
+                transform_test_specs([drift], swebench_version="4.1.0")
+            unrelated = copy.deepcopy(original)
+            unrelated.instance_id = "astropy__astropy-123"
+            unchanged, _ = transform_test_specs([unrelated], swebench_version="4.1.0")
+            self.assertEqual(unchanged[0], unrelated)
+
+    def test_sklearn_bound_setuptools_prevents_recursive_isolated_build(self):
+        original = self.public_setup_spec(
+            "scikit-learn__scikit-learn-25102", "scikit-learn/scikit-learn", "1.3",
+            "f9a1cf072da9d7375d6c2163f68a6038b13b310f",
+        )
+        changed, report = transform_test_specs([original], swebench_version="4.1.0")
+        for fail_pin in (False, True):
+            shell = '''set -eu
+pip_ready=0
+setuptools_ready=0
+python() {
+ case "$*" in
+  '-m pip install pip==25.2') pip_ready=1 ;;
+  '-m pip install --no-deps setuptools==59.8.0')
+    [ "$FAIL_PIN" = False ] || return 47
+    setuptools_ready=1 ;;
+  '-m pip install -v --no-use-pep517 --no-build-isolation -e .')
+    [ "$pip_ready" = 1 ] && [ "$setuptools_ready" = 1 ] || return 48
+    printf 'editable-built\\n' ;;
+  *) return 49 ;;
+ esac
+}
+'''
+            start = original.repo_script_list.index(INSTALL)
+            commands = changed[0].repo_script_list[start:changed[0].repo_script_list.index(INSTALL) + 1]
+            result = subprocess.run(["bash", "-c", shell + "\n".join(commands)],
+                env=dict(os.environ, FAIL_PIN=str(fail_pin)), capture_output=True, text=True)
+            self.assertEqual(result.returncode, 47 if fail_pin else 0, result.stderr)
+            self.assertEqual(result.stdout, "" if fail_pin else "editable-built\n")
+        self.assertEqual(changed[0].env_script_list, original.env_script_list)
+        self.assertEqual(changed[0].eval_script_list, original.eval_script_list)
+        self.assertEqual(report["tasks"][original.instance_id]["repairs"],
+                         ["sklearn-legacy-pip-25.2", "sklearn-legacy-setuptools-59.8.0"])
+        for field, value in (("arch", "arm64"), ("version", "1.4"), ("repo", "other/repo")):
+            drift = copy.deepcopy(original)
+            setattr(drift, field, value)
+            with self.assertRaisesRegex(ValueError, "unexpected scikit-learn"):
+                transform_test_specs([drift], swebench_version="4.1.0")
+        drift = copy.deepcopy(original)
+        drift.repo_script_list.append("true")
+        with self.assertRaisesRegex(ValueError, "unexpected scikit-learn"):
+            transform_test_specs([drift], swebench_version="4.1.0")
+        with self.assertRaisesRegex(ValueError, "unexpected scikit-learn"):
+            transform_test_specs(changed, swebench_version="4.1.0")
+
+    def test_pylint_installs_missing_testutils_dependency_closure_without_resolving_others(self):
+        for task in PYLINT_TASKS:
+            for failure in (False, True):
+                with self.subTest(task=task, failure=failure):
+                    original = pylint_spec(task)
+                    before = copy.deepcopy(original)
+                    changed, report = transform_test_specs([original], swebench_version="4.1.0")
+                    start = original.repo_script_list.index("python -m pip install -e .")
+                    # Executed shell seam, not an installation/readiness claim.
+                    shell = '''set -eu
+available=0
+setuptools_pinned=0
+python() {
+    case "$*" in
+        '-m pip install -e .') : ;;
+        '-m pip install --no-deps GitPython==3.1.43 gitdb==4.0.11 smmap==5.0.1')
+            [ "$FAILURE" = False ] || return 47
+            available=1 ;;
+        '-m pip install --no-deps setuptools==67.4.0')
+            [ "$TASK" = 7080 ] && [ "$available" = 1 ] || return 49
+            setuptools_pinned=1 ;;
+        *) return 99 ;;
+    esac
+}
+git() {
+    [ "$available" = 1 ] || return 48
+    [ "$TASK" != 7080 ] || [ "$setuptools_pinned" = 1 ] || return 50
+}
+'''
+                    result = subprocess.run(["bash", "-c", shell + "\n".join(changed[0].repo_script_list[start:])],
+                        env=dict(os.environ, FAILURE=str(failure), TASK=task), capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 47 if failure else 0, result.stderr)
+                    expected = copy.deepcopy(original)
+                    expected.repo_script_list.insert(start + 1,
+                        "python -m pip install --no-deps GitPython==3.1.43 gitdb==4.0.11 smmap==5.0.1")
+                    expected_repairs = ["pylint-testutils-gitpython-3.1.43"]
+                    if task == "7080":
+                        expected.repo_script_list.insert(start + 2,
+                            "python -m pip install --no-deps setuptools==67.4.0")
+                        expected_repairs.append("pylint-setuptools-67.4.0")
+                    expected.instance_image_tag = changed[0].instance_image_tag
+                    self.assertEqual(changed[0], expected)
+                    self.assertEqual(original, before)
+                    entry = report["tasks"][original.instance_id]
+                    self.assertEqual(entry["repairs"], expected_repairs)
+                    self.assertNotEqual(entry["original_recipe_sha256"], entry["effective_recipe_sha256"])
+                    self.assertNotEqual(changed[0].instance_image_tag, original.instance_image_tag)
+
+    def test_pylint_guard_rejects_every_setup_change_but_ignores_evaluation_state(self):
+        for task in PYLINT_TASKS:
+            original = pylint_spec(task)
+            _, expected_report = transform_test_specs([original], swebench_version="4.1.0")
+            altered = copy.deepcopy(original)
+            altered.eval_script_list = ["another evaluator"]
+            altered.FAIL_TO_PASS = ["other expectation"]
+            altered.PASS_TO_PASS = []
+            changed, report = transform_test_specs([altered], swebench_version="4.1.0")
+            self.assertEqual(report, expected_report)
+            for field in ("eval_script_list", "FAIL_TO_PASS", "PASS_TO_PASS"):
+                self.assertEqual(getattr(changed[0], field), getattr(altered, field))
+            cases = changed
+            for field in ("env_script_list", "repo_script_list"):
+                for index in range(len(getattr(original, field))):
+                    altered = copy.deepcopy(original)
+                    getattr(altered, field)[index] += " # drift"
+                    cases.append(altered)
+            for field, value in (("repo", "other/repo"), ("version", "other")):
+                altered = copy.deepcopy(original)
+                setattr(altered, field, value)
+                cases.append(altered)
+            for altered in cases:
+                before = copy.deepcopy(altered)
+                with self.subTest(task=task, altered=altered), self.assertRaisesRegex(ValueError, "unexpected Pylint"):
+                    transform_test_specs([altered], swebench_version="4.1.0")
+                self.assertEqual(altered, before)
+            original.instance_id = "pylint-dev__pylint-other"
+            unchanged, report = transform_test_specs([original], swebench_version="4.1.0")
+            self.assertEqual(unchanged, [original])
+            self.assertEqual(report["tasks"][original.instance_id]["repairs"], [])
+
+    def test_pinned_harness_pylint_recipes_match_fixtures_without_network(self):
+        try:
+            from importlib.metadata import version
+            from dataclasses import asdict
+            from swebench.harness.test_spec import python as recipes
+            from swebench.harness.test_spec.test_spec import make_test_spec
+        except ImportError:
+            self.skipTest("optional pinned SWE-bench harness is not installed")
+        self.assertEqual(version("swebench"), "4.1.0")
+        for task, (release, commit) in PYLINT_TASKS.items():
+            frozen = pylint_spec(task)
+            requirements = frozen.env_script_list[2].split("\n", 1)[1].removesuffix("\nEOF_59812759871")
+            with self.subTest(task=task), mock.patch.object(recipes, "get_requirements", return_value=requirements):
+                original = make_test_spec({
+                    "instance_id": frozen.instance_id, "repo": frozen.repo, "version": release,
+                    "base_commit": commit, "test_patch": "", "FAIL_TO_PASS": [], "PASS_TO_PASS": [],
+                })
+                self.assertEqual(original.env_script_list, frozen.env_script_list)
+                self.assertEqual(original.repo_script_list, frozen.repo_script_list)
+                changed, _ = transform_test_specs([original], swebench_version=version("swebench"))
+                self.assertEqual(changed[0].env_image_key, original.env_image_key)
+                self.assertNotEqual(changed[0].instance_image_key, original.instance_image_key)
+                for key, value in asdict(original).items():
+                    if key not in {"repo_script_list", "instance_image_tag"}:
+                        self.assertEqual(getattr(changed[0], key), value, key)
+                checked = subprocess.run(["bash", "-n"], input=changed[0].install_repo_script,
+                                         text=True, capture_output=True, timeout=10)
+                self.assertEqual(checked.returncode, 0, checked.stderr)
+
     def test_bound_matplotlib_recipe_installs_once_with_narrow_pip_repairs(self):
         original = matplotlib_spec()
         changed, report = transform_test_specs([original], swebench_version="4.1.0")
@@ -315,22 +562,25 @@ wget() {
             result = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_sphinx_restores_missing_roman_without_changing_other_dependencies(self):
+    def test_sphinx_installs_only_task_bound_roman_and_docutils_repairs(self):
         for task in SPHINX_TASKS:
             with self.subTest(task=task):
                 original = sphinx_spec(task)
                 before = copy.deepcopy(original)
                 changed, report = transform_test_specs([original], swebench_version="4.1.0")
-                # Execute the emitted installation seam. The original editable
-                # install succeeds but does not supply either Roman provider.
                 install = original.repo_script_list.index("python -m pip install -e .[test]")
+                needs_docutils = task in {"8548", "8551", "8721"}
                 shell = '''
 set -eu
 roman_available=0
+docutils_pinned=0
 python() {
     case "$*" in
         '-m pip install -e .[test]') : ;;
         '-m pip install --no-deps roman==3.3') roman_available=1 ;;
+        '-m pip install --no-deps docutils==0.16')
+            [ "$roman_available" = 1 ] || return 48
+            docutils_pinned=1 ;;
         *) return 99 ;;
     esac
 }
@@ -338,18 +588,23 @@ git() { :; }
 '''
                 result = subprocess.run(
                     ["bash", "-c", shell + "\n".join(changed[0].repo_script_list[install:])
-                     + '\n[ "$roman_available" = 1 ]'],
+                     + '\n[ "$roman_available" = 1 ]\n[ "$docutils_pinned" = "$NEEDS_DOCUTILS" ]'],
+                    env=dict(os.environ, NEEDS_DOCUTILS=str(int(needs_docutils))),
                     capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 expected = copy.deepcopy(original)
                 expected.repo_script_list.insert(install + 1, "python -m pip install --no-deps roman==3.3")
+                expected_repairs = ["sphinx-roman-3.3"]
+                if needs_docutils:
+                    expected.repo_script_list.insert(install + 2, "python -m pip install --no-deps docutils==0.16")
+                    expected_repairs.append("sphinx-docutils-0.16")
                 expected.instance_image_tag = changed[0].instance_image_tag
                 self.assertEqual(changed[0], expected)
                 self.assertEqual(original, before)
                 self.assertNotEqual(changed[0].instance_image_tag, original.instance_image_tag)
                 entry = report["tasks"][original.instance_id]
-                self.assertEqual(entry["repairs"], ["sphinx-roman-3.3"])
+                self.assertEqual(entry["repairs"], expected_repairs)
                 self.assertNotEqual(entry["original_recipe_sha256"], entry["effective_recipe_sha256"])
 
     def test_sphinx_hash_guard_rejects_all_setup_drift_and_double_application(self):

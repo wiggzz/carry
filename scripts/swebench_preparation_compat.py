@@ -116,8 +116,9 @@ def _repair_matplotlib_solver(spec: Any, original_sha256: str) -> None:
 
 # These base commits declare docutils>=0.12 and latex.py explicitly supports the
 # standalone roman fallback. The retained images have docutils 0.23, which no
-# longer bundles docutils.utils.roman, and no standalone roman. Restore only that
-# missing provider; do not downgrade docutils or re-resolve other dependencies.
+# longer bundles docutils.utils.roman, and no standalone roman. Restore that
+# provider without re-resolving dependencies. Only the separately proven 3.4/3.5
+# task repairs below also restore their historically configured docutils version.
 # roman 3.3 (2020-07-12) retains the historical toRoman API. Local Python 3.9
 # probes reproduced the import failure at all three commits; adding only this
 # package let tests/test_util.py execute (8 passed each). Full readiness remains
@@ -131,6 +132,41 @@ SPHINX_ROMAN_RECIPES = {
     ),
     "sphinx-doc__sphinx-8056": (
         "3.2", "acaa62b82df5825ae2c807364f8b963441dc7840fc473fe8c4e5b3e0e3f47244",
+    ),
+    "sphinx-doc__sphinx-8548": (
+        "3.4", "25d698cb70846dc24994dfdab5e9c3fd3b276fe1181b56c6cd87b744f7b3b259",
+    ),
+    "sphinx-doc__sphinx-8551": (
+        "3.4", "797d38594fe65f0b16d5bb3e2cbc388b08403f15dafbab7aa32c80ba179d1aa9",
+    ),
+    "sphinx-doc__sphinx-8721": (
+        "3.5", "f58acf8b69ddcd369b6a1e8d1a2da4c406efffd0299486f0890d0a2978dc7828",
+    ),
+}
+
+
+# Public testutils extras in both historical bases require gitpython>3, but
+# upstream installs only the runtime package. Pin the missing provider and its
+# small dependency closure; --no-deps leaves every existing dependency intact.
+PYLINT_GIT_RECIPES = {
+    "pylint-dev__pylint-7080": (
+        "2.15", "44012a8818598a9a91a8f65113018fc99d3de7e01af58e76ded6ba2bd54acd0a",
+    ),
+    "pylint-dev__pylint-8898": (
+        "3.0", "8ca8094c8af5d6506909f6ece3b64961e2cb7a12ebb860408be5819e43928e41",
+    ),
+}
+
+
+# NumPy 1.25 introduced a warning in float(np.diff(...)) which these exact
+# historical bases promote to an error during collection. Preserve all other
+# pins and the upstream warning policy; this pin has public-source RED/GREEN proof.
+ASTROPY_NUMPY_RECIPES = {
+    "astropy__astropy-13398": (
+        "5.1", "f86ff4361a98403f1fdc81c9ae146c3f1533fea011cc15195b6cf026e1e16c03",
+    ),
+    "astropy__astropy-14598": (
+        "5.2", "0221e8455a85ac1a05d23b05e86eeeb5c57fc69835250dbfb6ce05703abf1024",
     ),
 }
 
@@ -187,6 +223,31 @@ def transform_test_specs(
     for spec in result:
         original_sha256 = _recipe_sha256(spec)
         repairs = []
+        if spec.instance_id in ASTROPY_NUMPY_RECIPES:
+            expected_version, expected_hash = ASTROPY_NUMPY_RECIPES[spec.instance_id]
+            if (spec.repo != "astropy/astropy" or spec.version != expected_version
+                    or getattr(spec, "arch", None) != "x86_64"
+                    or original_sha256 != expected_hash):
+                raise ValueError("unexpected Astropy preparation recipe")
+            spec.env_script_list[-1] = spec.env_script_list[-1].replace(
+                "numpy==1.25.2", "numpy==1.24.4", 1,
+            )
+            repairs.append("astropy-numpy-1.24.4")
+        if spec.instance_id in PYLINT_GIT_RECIPES:
+            expected_version, expected_hash = PYLINT_GIT_RECIPES[spec.instance_id]
+            if (spec.repo != "pylint-dev/pylint" or spec.version != expected_version
+                    or original_sha256 != expected_hash):
+                raise ValueError("unexpected Pylint preparation recipe")
+            index = _original_block_index(spec.repo_script_list, ["python -m pip install -e ."])
+            spec.repo_script_list.insert(index + 1,
+                "python -m pip install --no-deps GitPython==3.1.43 gitdb==4.0.11 smmap==5.0.1")
+            repairs.append("pylint-testutils-gitpython-3.1.43")
+            if spec.instance_id == "pylint-dev__pylint-7080":
+                # Last release before pkg_resources' import-time deprecation:
+                # astroid imports it into a public CLI's tested-empty stderr.
+                spec.repo_script_list.insert(index + 2,
+                    "python -m pip install --no-deps setuptools==67.4.0")
+                repairs.append("pylint-setuptools-67.4.0")
         if spec.instance_id in SPHINX_ROMAN_RECIPES:
             expected_version, expected_hash = SPHINX_ROMAN_RECIPES[spec.instance_id]
             if (spec.repo != "sphinx-doc/sphinx" or spec.version != expected_version
@@ -197,12 +258,29 @@ def transform_test_specs(
             )
             spec.repo_script_list.insert(index + 1, "python -m pip install --no-deps roman==3.3")
             repairs.append("sphinx-roman-3.3")
+            if spec.instance_id in {"sphinx-doc__sphinx-8548", "sphinx-doc__sphinx-8551",
+                                    "sphinx-doc__sphinx-8721"}:
+                # These exact bases explicitly configure docutils 0.16 in tox.
+                # 0.23 breaks public meta registration and text/docinfo output.
+                spec.repo_script_list.insert(index + 2, "python -m pip install --no-deps docutils==0.16")
+                repairs.append("sphinx-docutils-0.16")
         if spec.repo == "scikit-learn/scikit-learn" and spec.version in {"1.3", "1.4", "1.5", "1.6"}:
             if spec.env_script_list != SKLEARN_ENV or PIP_PIN in spec.repo_script_list:
                 raise ValueError("unexpected scikit-learn preparation environment")
             index = _original_block_index(spec.repo_script_list, [SKLEARN_INSTALL])
             spec.repo_script_list.insert(index, PIP_PIN)
             repairs.append("sklearn-legacy-pip-25.2")
+        if spec.instance_id == "scikit-learn__scikit-learn-25102":
+            if (spec.repo != "scikit-learn/scikit-learn" or spec.version != "1.3"
+                    or getattr(spec, "arch", None) != "x86_64"
+                    or original_sha256 != "47942c3d3568db54b97bd3ebb1f65115751ac18d9f6eae9506989925d592270f"):
+                raise ValueError("unexpected scikit-learn legacy setuptools recipe")
+            # New setuptools develop spawns nested isolated pip despite the outer
+            # --no-build-isolation; its newer Cython drops the public RowMajor
+            # enum export. Honor this base's pyproject setuptools<60 contract.
+            index = _original_block_index(spec.repo_script_list, [SKLEARN_INSTALL])
+            spec.repo_script_list.insert(index, "python -m pip install --no-deps setuptools==59.8.0")
+            repairs.append("sklearn-legacy-setuptools-59.8.0")
         if spec.instance_id == MPL_SOLVER_TASK:
             _repair_matplotlib_solver(spec, original_sha256)
             repairs.extend(["matplotlib-micromamba-2.3.3", "matplotlib-typing-extensions-4.13.0",
