@@ -258,6 +258,10 @@ AGENT_COMMANDS = {
 
 
 READINESS_EXECUTED_STATUSES = ("PASSED", "FAILED")
+ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x1b\x07]*(?:\x07|\x1b\\))")
+PYTEST_PROGRESS_RE = re.compile(
+    r"(?m)^(.*\s(?:FAILED|PASSED|SKIPPED|ERROR|XFAIL))[ \t]+\[[ \t]*\d+%\][ \t]*$"
+)
 
 
 def prepared_image_recipe_sha256(source: pathlib.Path) -> str:
@@ -888,7 +892,9 @@ def run_task_readiness(*, instance_id: str, image: str, repo: pathlib.Path,
         "prepared_image": image,
     }
     try:
-        parsed_tests = parser(captured, test_spec)
+        parser_input = ANSI_ESCAPE_RE.sub("", captured)
+        parser_input = PYTEST_PROGRESS_RE.sub(r"\1", parser_input)
+        parsed_tests = parser(parser_input, test_spec)
         result = validate_readiness_result(
             returncode=returncode, timed_out=timed_out, parsed_tests=parsed_tests,
         )

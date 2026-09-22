@@ -394,6 +394,34 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertEqual(json.loads((output / "metadata.json").read_text())["status"], "not-ready")
             self.assertEqual((output / "test-output.txt").read_text(), captured)
 
+    def test_readiness_strips_ansi_before_official_parser_but_preserves_raw_evidence(self):
+        captured = "tests/test_public.py::test_ok \x1b[32mPASSED\x1b[0m [  6%]\n"
+        parsed_inputs = []
+
+        def parser(output, _spec):
+            parsed_inputs.append(output)
+            if output.strip() == "tests/test_public.py::test_ok PASSED":
+                return {"tests/test_public.py::test_ok": "PASSED"}
+            return {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            output = root / "evidence"
+            with mock.patch.object(self.worker.subprocess, "run", return_value=mock.Mock(
+                returncode=124, stdout=captured, stderr=""
+            )):
+                result = self.worker.run_task_readiness(
+                    instance_id="scikit-learn__scikit-learn-25102", image="probe", repo=repo,
+                    script="pytest -rA -vv --maxfail=1", test_command="pytest -rA -vv --maxfail=1",
+                    parser=parser, test_spec=None, output=output, timeout_seconds=180,
+                )
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(result["executed_test_count"], 1)
+            self.assertEqual(parsed_inputs, ["tests/test_public.py::test_ok PASSED\n"])
+            self.assertEqual((output / "test-output.txt").read_text(), captured)
+
     def test_task_catalog_references_are_deterministic_and_content_addressed(self):
         record = {
             "instance_id": "owner__repo-1", "repo": "owner/repo",
@@ -3036,6 +3064,182 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             (root / "report.json").write_text(json.dumps({"resolved": 2}))
             with self.assertRaisesRegex(RuntimeError, "outcome ID sets"):
                 self.worker.load_resolved_ids(root)
+
+
+class SklearnReadinessParserTests(unittest.TestCase):
+    """Replay public output through SWE-bench 4.1.0, not a stand-in parser."""
+
+    # Verbatim lines from preparation 35553663118, sklearn-25102/test-output.txt.
+    # Raw artifact SHA-256: 307847441b4090a47c511994b9a4322cd0bd6d49a3361605a9898595d2000a34.
+    # Keep tiny excerpts inline; CI must not depend on the retained local artifact.
+    PASSED_NODE = "sklearn/_config.py::sklearn._config.config_context"
+    PASSED_LINE = (
+        PASSED_NODE + " \x1b[32mPASSED\x1b[0m\x1b[33m                [  0%]\x1b[0m\n"
+    )
+
+    SKIPPED_NODE = (
+        "sklearn/cluster/tests/test_affinity_propagation.py::test_affinity_propagation[42-float32]"
+    )
+    SKIPPED_LINE = SKIPPED_NODE + " \x1b[33mSKIPPED\x1b[0m\x1b[33m [  5%]\x1b[0m\n"
+    SPACE_ID_LINE = (
+        "sklearn/_loss/tests/test_loss.py::test_init_gradient_and_hessian_raises[params0-Valid "
+        "options for 'dtype' are .* Got dtype=<class 'numpy.int64'> instead.-HalfSquaredError] "
+        "\x1b[32mPASSED\x1b[0m\x1b[33m [  5%]\x1b[0m\n"
+    )
+    # Preserve the upstream whitespace-tokenization quirk, not an invented pass.
+    SPACE_ID_PARSED = {
+        "sklearn/_loss/tests/test_loss.py::test_init_gradient_and_hessian_raises[params0-Valid": "options",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            if version("swebench") != "4.1.0":
+                raise unittest.SkipTest("requires pinned SWE-bench 4.1.0")
+            from swebench.harness.log_parsers import MAP_REPO_TO_PARSER
+        except (ImportError, PackageNotFoundError):
+            raise unittest.SkipTest("pinned SWE-bench harness unavailable")
+        cls.parser = staticmethod(MAP_REPO_TO_PARSER["scikit-learn/scikit-learn"])
+        spec = importlib.util.spec_from_file_location("swebench_smoke", SCRIPT)
+        cls.worker = importlib.util.module_from_spec(spec)
+        assert spec.loader
+        spec.loader.exec_module(cls.worker)
+
+    def assert_readiness(self, captured, normalized, expected, *, ready=True,
+                         timed_out=False, returncode=124):
+        # Only the Docker transport is mocked; parsing, readiness and persistence run.
+        parser = mock.Mock(wraps=self.parser)
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            output = root / "evidence"
+            with mock.patch.object(self.worker.subprocess, "run", return_value=mock.Mock(
+                returncode=returncode, stdout=captured, stderr=""
+            )) as run, mock.patch.object(self.worker, "force_remove_container") as cleanup:
+                if timed_out:
+                    run.side_effect = subprocess.TimeoutExpired(
+                        "docker", 180, output=captured.encode("utf-8"), stderr=b"",
+                    )
+                kwargs = dict(
+                    instance_id="scikit-learn__scikit-learn-25102", image="probe", repo=repo,
+                    script="pytest -rA -vv --maxfail=1", test_command="pytest -rA -vv --maxfail=1",
+                    parser=parser, test_spec=None, output=output, timeout_seconds=180,
+                )
+                if ready:
+                    result = self.worker.run_task_readiness(**kwargs)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "PASSED or FAILED required"):
+                        self.worker.run_task_readiness(**kwargs)
+            if timed_out:
+                cleanup.assert_called_once()
+            else:
+                cleanup.assert_not_called()
+            parser.assert_called_once_with(normalized, None)
+            self.assertEqual(self.parser(normalized, None), expected)
+            self.assertEqual((output / "test-output.txt").read_bytes(), captured.encode("utf-8"))
+            metadata = json.loads((output / "metadata.json").read_text())
+            self.assertEqual(metadata["status"], "ready" if ready else "not-ready")
+            self.assertEqual(metadata["baseline_exit_code"], 124 if timed_out else returncode)
+            self.assertEqual(metadata["timed_out_after_tests_started"], timed_out)
+            if ready:
+                self.assertEqual(metadata, result)
+                self.assertEqual(result["parsed_test_count"], len(expected))
+                self.assertEqual(result["executed_test_count"], sum(
+                    status in ("PASSED", "FAILED") for status in expected.values()
+                ))
+                self.assertEqual(result["parsed_statuses"], {
+                    status: list(expected.values()).count(status) for status in set(expected.values())
+                })
+
+    def test_combined_ansi_progress_replay_preserves_raw_evidence(self):
+        self.assertEqual(self.parser(self.PASSED_LINE, None), {})
+        for timed_out in (False, True):
+            with self.subTest(timed_out=timed_out):
+                self.assert_readiness(
+                    self.PASSED_LINE, self.PASSED_NODE + " PASSED\n",
+                    {self.PASSED_NODE: "PASSED"}, timed_out=timed_out,
+                )
+
+    def test_ansi_only_retains_existing_parser_result(self):
+        captured = self.PASSED_LINE.replace("\x1b[33m                [  0%]\x1b[0m", "")
+        expected = {self.PASSED_NODE: "PASSED"}
+        # 4.1.0 already handles these simple SGR escapes without a progress field.
+        self.assertEqual(self.parser(captured, None), expected)
+        self.assert_readiness(captured, self.PASSED_NODE + " PASSED\n", expected)
+
+    def test_progress_only_becomes_parseable(self):
+        captured = self.PASSED_LINE.replace("\x1b[32m", "").replace("\x1b[33m", "").replace("\x1b[0m", "")
+        self.assertEqual(self.parser(captured, None), {})
+        self.assert_readiness(captured, self.PASSED_NODE + " PASSED\n", {self.PASSED_NODE: "PASSED"})
+
+    def test_plain_status_lines_are_unchanged(self):
+        # Explicit synthetic status/orientation controls derived from the same node.
+        for status in ("PASSED", "FAILED", "SKIPPED", "ERROR", "XFAIL", "UNKNOWN"):
+            for status_first in (False, True):
+                with self.subTest(status=status, status_first=status_first):
+                    captured = (
+                        f"{status} {self.PASSED_NODE}\n" if status_first
+                        else f"{self.PASSED_NODE} {status}\n"
+                    )
+                    expected = {} if status == "UNKNOWN" else {self.PASSED_NODE: status}
+                    self.assertEqual(self.parser(captured, None), expected)
+                    self.assert_readiness(
+                        captured, captured, expected, ready=status in ("PASSED", "FAILED"),
+                        returncode=1 if status == "FAILED" else 0,
+                    )
+
+    def test_decorated_nonexecuted_statuses_remain_not_ready(self):
+        self.assert_readiness(
+            self.SKIPPED_LINE, self.SKIPPED_NODE + " SKIPPED\n",
+            {self.SKIPPED_NODE: "SKIPPED"}, ready=False, returncode=0,
+        )
+        # These are negative mutations, NOT outcomes claimed for the retained run.
+        for status in ("ERROR", "XFAIL", "UNKNOWN"):
+            with self.subTest(status=status):
+                captured = self.PASSED_LINE.replace("PASSED", status)
+                normalized = self.PASSED_NODE + f" {status}\n"
+                expected = {self.PASSED_NODE: status}
+                if status == "UNKNOWN":
+                    # Unknown status is not in the normalization/parser allowlist.
+                    normalized = self.PASSED_NODE + " UNKNOWN                [  0%]\n"
+                    expected = {}
+                self.assert_readiness(captured, normalized, expected, ready=False, returncode=0)
+
+    def test_decorated_failed_baseline_is_ready(self):
+        # Synthetic failure control; the retained excerpt actually passed.
+        self.assert_readiness(
+            self.PASSED_LINE.replace("PASSED", "FAILED"), self.PASSED_NODE + " FAILED\n",
+            {self.PASSED_NODE: "FAILED"}, returncode=1,
+        )
+
+    def test_whitespace_parameter_unknown_status_is_not_promoted_to_passed(self):
+        normalized = self.SPACE_ID_LINE.replace("\x1b[32m", "").replace("\x1b[0m", "")
+        normalized = normalized.replace("\x1b[33m [  5%]", "")
+        self.assert_readiness(self.SPACE_ID_LINE, normalized, self.SPACE_ID_PARSED, ready=False, returncode=0)
+
+    def test_mixed_results_count_only_executed_statuses(self):
+        normalized_space_id = self.SPACE_ID_LINE.replace("\x1b[32m", "").replace("\x1b[0m", "")
+        normalized_space_id = normalized_space_id.replace("\x1b[33m [  5%]", "")
+        self.assert_readiness(
+            self.PASSED_LINE + self.SKIPPED_LINE + self.SPACE_ID_LINE,
+            self.PASSED_NODE + " PASSED\n" + self.SKIPPED_NODE + " SKIPPED\n" + normalized_space_id,
+            {self.PASSED_NODE: "PASSED", self.SKIPPED_NODE: "SKIPPED", **self.SPACE_ID_PARSED},
+        )
+
+    def test_no_completed_test_lines_remain_not_ready(self):
+        # Verbatim collection and interrupted final-test lines from the artifact.
+        captured = (
+            "\x1b[1mcollecting ... \x1b[0mcollected 27814 items / 2 skipped\n"
+            "sklearn/cluster/tests/test_k_means.py::test_minibatch_with_many_reassignments "
+        )
+        normalized = captured.replace("\x1b[1m", "").replace("\x1b[0m", "")
+        for timed_out in (False, True):
+            with self.subTest(timed_out=timed_out):
+                self.assert_readiness(captured, normalized, {}, ready=False, timed_out=timed_out, returncode=0)
+        self.assert_readiness("", "", {}, ready=False, returncode=0)
 
 
 if __name__ == "__main__":
