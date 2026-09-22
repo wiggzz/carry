@@ -95,6 +95,13 @@ class GoldTests(unittest.TestCase):
             self.assertEqual(safe["fail_to_pass_count"], 1)
             self.assertEqual(safe["pass_to_pass_count"], 1)
             self.assertNotIn(row["patch"], json.dumps(safe))
+            log = folder / "test_output.txt"
+            original_log = log.read_text()
+            log.write_text(original_log.replace("PASSED tests/a.py::test_base",
+                "PASSED tests/a.py::test_base\nFAILED tests/a.py::test_unrelated"))
+            self.assertEqual(p.validate_grade(root, row, "fixture")["pass_to_pass_count"], 1,
+                "official grading ignores unrelated failures when every target passes")
+            log.write_text(original_log)
             target = root / "gold.fixture.json"
             for field, value in (("completed_ids", []), ("resolved_ids", [TASK["instance_id"]]*2), ("error_ids", [TASK["instance_id"]]), ("total_instances", 5)):
                 altered = dict(aggregate, **{field: value})
@@ -454,7 +461,8 @@ def injected_worker_failure(work, run_id, stage, abrupt=False):
             elif stage == "grade_test_output_invalid":
                 content += "Traceback (most recent call last):" + sentinel
             elif stage == "grade_test_execution_invalid":
-                content = content.replace("PASSED tests/a.py::test_base", "ERROR tests/a.py::test_base")
+                content = content.replace("PASSED tests/a.py::test_fix", sentinel)
+                content = content.replace("PASSED tests/a.py::test_base", sentinel)
             elif stage == "grade_target_coverage_invalid":
                 content = content.replace("PASSED tests/a.py::test_base", sentinel)
             log.write_text(content)

@@ -159,7 +159,7 @@ def validate_grade(output, row, run_id, checkpoint=lambda stage, reason: None):
         raise ValueError("official script or patch identity/application")
     checkpoint("grade", "grade_test_execution_invalid")
     statuses, found = get_logs_eval(spec, str(log))
-    if not found or not statuses or any(s in {"ERROR", "FAILED"} for s in statuses.values()):
+    if not found or not statuses:
         raise ValueError("test execution error")
     checkpoint("grade", "grade_target_coverage_invalid")
     counts = {}
