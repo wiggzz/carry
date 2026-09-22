@@ -9,26 +9,26 @@ on:
   workflow_dispatch:
     inputs:
       preparation_solver_probe:
-        description: 'Probe only: bounded Matplotlib preparation (no model or cloud worker)'
+        description: 'Probe only: bounded preparation/evaluator diagnostics (no model or cloud worker)'
         type: boolean
         required: false
         default: false
       preparation_probe_stage:
-        description: 'solve: Conda dry-run; image: actual official image + public readiness'
+        description: 'solve: Conda; image: Matplotlib readiness; pylint-evaluator: exact-image install differential'
         type: choice
         required: false
         default: solve
-        options: [solve, image]
+        options: [solve, image, pylint-evaluator]
 
 permissions:
   contents: read
 
 jobs:
   preparation-solver-probe:
-    name: Matplotlib preparation diagnostic
+    name: Preparation / evaluator diagnostic
     if: github.event_name == 'workflow_dispatch' && inputs.preparation_solver_probe
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ inputs.preparation_probe_stage == 'image' && 40 || 20 }}
+    timeout-minutes: ${{ inputs.preparation_probe_stage != 'solve' && 40 || 20 }}
     permissions:
       contents: read
     steps:
@@ -40,15 +40,17 @@ jobs:
         run: >-
           python3 -m unittest -v scripts/test_probe_matplotlib_solver.py
           scripts/test_probe_matplotlib_preparation.py scripts/test_swebench_preparation_compat.py
+          scripts/test_probe_pylint_evaluator.py
 
       - name: Install pinned official harness for actual-image diagnostic
-        if: inputs.preparation_probe_stage == 'image'
+        if: inputs.preparation_probe_stage == 'image' || inputs.preparation_probe_stage == 'pylint-evaluator'
         timeout-minutes: 5
         run: |
           python3 -m venv "$RUNNER_TEMP/swebench-image-probe"
           "$RUNNER_TEMP/swebench-image-probe/bin/python" -m pip install 'swebench==4.1.0'
           "$RUNNER_TEMP/swebench-image-probe/bin/python" -m unittest -v \
-            scripts.test_probe_matplotlib_preparation scripts.test_swebench_preparation_compat
+            scripts.test_probe_matplotlib_preparation scripts.test_swebench_preparation_compat \
+            scripts.test_probe_pylint_evaluator
 
       - name: Run selected bounded preparation diagnostic
         id: solver
@@ -68,6 +70,12 @@ jobs:
                 "$RUNNER_TEMP/swebench-image-probe/bin/python" scripts/probe_matplotlib_preparation.py \
                 --evidence-dir "$RUNNER_TEMP/matplotlib-solver-evidence" \
                 --work-dir "$RUNNER_TEMP/matplotlib-image-work"
+              ;;
+            pylint-evaluator)
+              sudo --non-interactive --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_SHA,GITHUB_RUN_ID \
+                "$RUNNER_TEMP/swebench-image-probe/bin/python" scripts/probe_pylint_evaluator.py \
+                --evidence-dir "$RUNNER_TEMP/matplotlib-solver-evidence" \
+                --work-dir "$RUNNER_TEMP/pylint-evaluator-work"
               ;;
             *) printf 'Unsupported preparation probe stage\n' >&2; exit 2 ;;
           esac
@@ -98,7 +106,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
-          name: matplotlib-${{ inputs.preparation_probe_stage == 'image' && 'image' || 'solver' }}-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ inputs.preparation_probe_stage == 'pylint-evaluator' && 'pylint-evaluator' || inputs.preparation_probe_stage == 'image' && 'matplotlib-image' || 'matplotlib-solver' }}-probe-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/matplotlib-solver-evidence/
           if-no-files-found: error
           retention-days: 7
@@ -193,6 +201,7 @@ jobs:
           scripts/test_swebench_preparation_compat.py
           scripts/test_probe_matplotlib_solver.py
           scripts/test_probe_matplotlib_preparation.py
+          scripts/test_probe_pylint_evaluator.py
           scripts/test_build_long_swebench_selection.py
           scripts/test_merge_swebench_attempts.py
           scripts/test_swebench_harness_entrypoint.py
@@ -209,7 +218,7 @@ jobs:
           "$RUNNER_TEMP/swebench-contract/bin/python" -m pip install 'swebench==4.1.0'
           "$RUNNER_TEMP/swebench-contract/bin/python" -m unittest -v \
             scripts.test_swebench_preparation_compat scripts.test_swebench_smoke \
-            scripts.test_probe_matplotlib_preparation
+            scripts.test_probe_matplotlib_preparation scripts.test_probe_pylint_evaluator
 
       - name: Build one portable release binary
         run: |
