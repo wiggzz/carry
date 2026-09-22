@@ -16,7 +16,9 @@ probe = __import__("scripts.probe_pylint_evaluator", fromlist=["*"]) if SPEC els
 
 def observation(positive=False):
     return {
-        "snapshot": {"base_commit": "3c5eca2ded3dd2b59ebaf23eb289453b5d2930f0",
+        "snapshot": {"base_commit": "d" * 40,
+            "source_identity": {"parents": [probe.TASK["base_commit"]],
+                                "tree": "e" * 40, "base_tree": "e" * 40, "subject": "SWE-bench"},
             "clean": True, "python": [3, 9], "versions": {"pylint": "2.15.0.dev0", "astroid": "2.11.7", "setuptools": "67.4.0"},
             "origins": {"pylint": "/testbed/pylint/__init__.py", "astroid": "/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/astroid/__init__.py"},
             "sys_path": ["/testbed"] if positive else ["/diagnostic", "/opt/miniconda3/envs/testbed/lib/python3.9/site-packages"],
@@ -139,6 +141,29 @@ class OrchestrationTests(unittest.TestCase):
             self.assertFalse(report["diagnostic_validated"])
             self.assertTrue(report["cleanup_verified"])
 
+    def test_invalid_source_mapping_stops_before_tests_or_install(self):
+        for key, value in (("parents", ["f" * 40]), ("parents", [probe.TASK["base_commit"], "f" * 40]),
+                           ("tree", "f" * 40), ("tree", "malformed"),
+                           ("base_tree", None), ("subject", "other"), (None, None)):
+            with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as d:
+                root, docker = Path(d), FakeDocker()
+                def invalid(command, **kwargs):
+                    result = docker(command, **kwargs)
+                    if kwargs["label"].endswith("-snapshot"):
+                        snapshot = probe.parse_payload(result)
+                        if key is None:
+                            snapshot.pop("source_identity")
+                        else:
+                            snapshot["source_identity"][key] = value
+                        result.stdout = "PROBE_JSON=" + json.dumps(snapshot)
+                    return result
+                self.assertEqual(self.run_fake(root, invalid), 1)
+                result = json.loads((root / "evidence/result.json").read_text())
+                self.assertTrue(result["cleanup_verified"])
+                self.assertFalse(result["diagnostic_validated"])
+                self.assertFalse(any(label.endswith(("-install", "-tests", "-checkers", "-cli"))
+                                     for _, label in docker.calls))
+
     def test_disk_watch_accounts_for_docker_daemon_filesystem(self):
         self.assertTrue(hasattr(probe.Transport, "watch_disk"), "daemon disk watchdog missing")
         from types import SimpleNamespace as S
@@ -215,6 +240,56 @@ class OrchestrationTests(unittest.TestCase):
 
 class InsideAndWorkflowTests(unittest.TestCase):
 
+    def test_setup_commit_is_bound_to_dataset_parent_and_unchanged_tree(self):
+        from types import SimpleNamespace as S
+        with tempfile.TemporaryDirectory() as d:
+            repo, site = Path(d) / "repo", Path(d) / "site"
+            (repo / "tests").mkdir(parents=True)
+            site.mkdir()
+            (repo / "tests/test_self.py").write_text("# public fixture\n")
+            def git(*args):
+                return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                                      capture_output=True, text=True).stdout.strip()
+            git("init", "-q")
+            git("config", "user.name", "SWE-bench")
+            git("config", "user.email", "setup@swebench.config")
+            git("add", ".")
+            git("commit", "-qm", "public base")
+            base = git("rev-parse", "HEAD")
+            git("commit", "--allow-empty", "-am", "SWE-bench")
+            setup = git("rev-parse", "HEAD")
+            self.assertNotEqual(setup, base)
+            with mock.patch.dict(probe.TASK, base_commit=base), \
+                 mock.patch.dict(sys.modules, pylint=S(__file__="/testbed/pylint/__init__.py"), astroid=S(__file__="/opt/astroid/__init__.py")), \
+                 mock.patch("importlib.metadata.version", return_value="fixture"):
+                def arms():
+                    actual = probe.snapshot(repo=repo, site=site)
+                    result = {p: observation(p.startswith("control")) for p in probe.PHASES}
+                    for arm in result.values():
+                        # Keep synthetic runtime outcomes separate from real Git evidence.
+                        for key in ("base_commit", "clean", "source_identity"):
+                            if key in actual:
+                                arm["snapshot"][key] = actual[key]
+                    return result
+                self.assertTrue(probe.validate_observations(arms())["diagnostic_validated"])
+                for fault in ("extra-parent", "tree", "dirty", "wrong-base", "missing"):
+                    git("reset", "--hard", setup)
+                    if fault == "extra-parent":
+                        git("commit", "--allow-empty", "-am", "SWE-bench")
+                    elif fault in ("tree", "dirty"):
+                        (repo / "tests/test_self.py").write_text("# changed fixture\n")
+                        if fault == "tree":
+                            git("commit", "--amend", "-am", "SWE-bench")
+                    broken = arms()
+                    if fault == "wrong-base":
+                        for arm in broken.values():
+                            arm["snapshot"]["source_identity"]["parents"] = ["f" * 40]
+                    elif fault == "missing":
+                        for arm in broken.values():
+                            arm["snapshot"].pop("source_identity")
+                    with self.subTest(fault=fault), self.assertRaises(ValueError):
+                        probe.validate_observations(broken)
+
     def test_snapshot_records_only_public_layout_and_rejects_dirty_checkout(self):
         self.assertTrue(hasattr(probe, "snapshot"), "actual installed-layout inspection missing")
         from types import SimpleNamespace as S
@@ -230,7 +305,10 @@ class InsideAndWorkflowTests(unittest.TestCase):
             (site / "private.txt").write_text("never-export")
             for args in (("init", "-q"), ("add", "."), ("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")):
                 subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
-            with mock.patch.dict(sys.modules, pylint=S(__file__="/testbed/pylint/__init__.py"), astroid=S(__file__="/opt/astroid/__init__.py")), \
+            base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+            with mock.patch.dict(probe.TASK, base_commit=base), \
+                 mock.patch.dict(sys.modules, pylint=S(__file__="/testbed/pylint/__init__.py"), astroid=S(__file__="/opt/astroid/__init__.py")), \
                  mock.patch("importlib.metadata.version", return_value="fixture"):
                 snap = probe.snapshot(repo=repo, site=site)
                 self.assertTrue(snap["clean"])

@@ -236,7 +236,8 @@ def run_probe(evidence, work, *, execute=None):
             # Fail before any installer if source/image/version is wrong.
             snapshot = arm["snapshot"]
             expected = phase.startswith("control")
-            if (snapshot["base_commit"] != TASK["base_commit"] or not snapshot["clean"]
+            validate_source_identity(snapshot)
+            if (not snapshot["clean"]
                     or snapshot["python"] != [3, 9]
                     or snapshot["versions"].get("pylint") != "2.15.0.dev0"
                     or snapshot["versions"].get("astroid") != "2.11.7"
@@ -254,7 +255,8 @@ def run_probe(evidence, work, *, execute=None):
                           "unknown_message": "UnknownMessageError" in log and "c-extension-no-member" in log}
             arm["tests"] = inside("tests", phase, allowed=(0, 1))
             after = inside("snapshot", phase)
-            if (not after["clean"] or any(after[key] != snapshot[key] for key in ("base_commit", "public_test_sha256"))):
+            validate_source_identity(after)
+            if (not after["clean"] or any(after[key] != snapshot[key] for key in ("base_commit", "source_identity", "public_test_sha256"))):
                 raise ValueError("public source mutated during tests")
             report["arms"][phase] = arm
             write_json(evidence / "result.json", report)
@@ -283,6 +285,28 @@ def run_probe(evidence, work, *, execute=None):
 
 
 
+def validate_source_identity(snapshot):
+    """Bind the setup commit to the dataset base, without trusting its build-time SHA.
+
+    SWE-bench 4.1.0 test_spec/python.py:make_repo_script_list_py finishes
+    with `git commit --allow-empty -am SWE-bench`. Pylint 2.15 has only
+    the editable install, no source-changing pre_install. Require an unchanged
+    tree and exactly that base as parent; never accept arbitrary descendants.
+    Legacy snapshots without this evidence deliberately fail closed.
+    """
+    import re
+    identity = snapshot.get("source_identity", {})
+    if (not isinstance(identity, dict)
+            or not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value)
+                       for value in (snapshot.get("base_commit"), identity.get("tree"), identity.get("base_tree")))
+            or identity.get("parents") != [TASK["base_commit"]]
+            or identity.get("tree") != identity.get("base_tree")
+            or identity.get("subject") != "SWE-bench"
+            or snapshot.get("base_commit") == TASK["base_commit"]
+            or snapshot.get("clean") is not True):
+        raise ValueError("source identity requires unchanged SWE-bench setup commit directly on dataset base")
+
+
 def validate_observations(arms):
     """A successful diagnostic proves the differential, not evaluator validity."""
     if set(arms) != set(PHASES):
@@ -292,7 +316,8 @@ def validate_observations(arms):
         arm = arms[phase]
         snapshot = arm["snapshot"]
         positive = phase.startswith("control")
-        if (snapshot["base_commit"] != TASK["base_commit"] or snapshot["clean"] is not True
+        validate_source_identity(snapshot)
+        if (snapshot["clean"] is not True
                 or snapshot["python"] != [3, 9]
                 or snapshot["versions"].get("pylint") != "2.15.0.dev0"
                 or snapshot["versions"].get("astroid") != "2.11.7"
@@ -361,7 +386,12 @@ def snapshot(repo=Path("/testbed"), site=None):
         if total > 256 * 1024:
             raise ValueError("layout evidence budget exceeded")
         files[str(path)] = {"sha256": hashlib.sha256(data).hexdigest(), "content": data.decode()}
+    # `base_commit` is the legacy field name for actual HEAD, not dataset base.
     return {"base_commit": git("rev-parse", "HEAD"),
+            "source_identity": {"parents": git("show", "-s", "--format=%P", "HEAD").split(),
+                                "tree": git("rev-parse", "HEAD^{tree}"),
+                                "base_tree": git("rev-parse", TASK["base_commit"] + "^{tree}"),
+                                "subject": git("show", "-s", "--format=%s", "HEAD")},
             "clean": not git("status", "--porcelain", "--untracked-files=no"),
             "python": list(sys.version_info[:2]), "executable": sys.executable,
             "versions": {name: metadata.version(name) for name in ("pylint", "astroid", "setuptools", "pip", "pytest")},
