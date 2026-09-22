@@ -19,6 +19,7 @@ from scripts import probe_pylint_evaluator as diagnostic
 TASK = diagnostic.TASK
 WALL_SECONDS = 1800
 EVALUATOR_SECONDS = 270
+BUILD_OPERATIONS = {"setup", "official_images", "evaluator_identity", "prepared_image", "pair_identity"}
 WORKER_STAGES = {"build", "source", "dataset", "alias", "evaluate", "events", "grade", "complete"}
 WORKER_REASONS = {"in_progress", "worker_exception", "validated", "official_gold_unresolved",
                   "grade_aggregate_invalid", "grade_report_coverage_invalid", "grade_test_patch_unproven",
@@ -34,11 +35,60 @@ def exception_class(error):
 
 
 def safe_diagnostics(summary):
-    allowed = {"worker_stage": WORKER_STAGES, "worker_reason": WORKER_REASONS,
+    allowed = {"build_operation": BUILD_OPERATIONS, "worker_stage": WORKER_STAGES, "worker_reason": WORKER_REASONS,
                "worker_exception_type": {cls.__name__ for cls in SAFE_EXCEPTIONS}}
     return {key: summary[key] for key, values in allowed.items()
             if isinstance(summary.get(key), str) and summary[key] in values}
 
+
+
+def public_build_evidence(work):
+    """Only call while the durable checkpoint proves dataset load never began.
+
+    One upstream build_image.log per layer; never transport/evaluator output,
+    recipes, arbitrary filenames, links, or exception arguments. Hash the bounded
+    raw tail, not an unread whole file. Marker classification is not root cause.
+    """
+    import stat
+    logs = []
+    root = work / "build-logs"
+    result = {"capture_phase": "before_dataset", "logs": logs}
+    if root.is_symlink() or not root.is_dir():
+        return result
+    for layer in ("base", "env", "instances"):
+        directory = root / layer
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        # This one-task fresh workspace has at most one build per layer. Refuse
+        # ambiguous/unexpected trees instead of exporting arbitrary extra logs.
+        with os.scandir(directory) as entries:
+            folders = []
+            for index, entry in enumerate(entries):
+                if index >= 16:
+                    folders = []
+                    break
+                if entry.is_dir(follow_symlinks=False):
+                    folders.append(Path(entry.path))
+        if len(folders) != 1:
+            continue
+        path = folders[0] / "build_image.log"
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    continue
+                stream.seek(max(0, info.st_size - 8192))
+                tail = stream.read(8192)
+            logs.append({"layer": layer, "bytes": info.st_size,
+                         "truncated": info.st_size > len(tail),
+                         "tail_sha256": hashlib.sha256(tail).hexdigest(),
+                         "tail": tail.decode("utf-8", errors="replace"),
+                         "classification": "docker_build_error" if b"docker.errors.BuildError" in tail
+                         else "unclassified"})
+        except OSError:
+            continue
+    return result
 
 
 def setup_specs():
@@ -140,27 +190,32 @@ def verify_source(image, run_id):
     return hashlib.sha256(json.dumps(snapshot["source_identity"], sort_keys=True).encode()).hexdigest()
 
 
-def build_pair(work, run_id, client, checkpoint=lambda stage: None):
+def build_pair(work, run_id, client, checkpoint=lambda stage, **kwargs: None):
     """Production transform, upstream builder and sanitized layer, without publish."""
     from swebench.harness import docker_build, dockerfiles
     source = Path(__file__).resolve().parent.parent
+    checkpoint("build", build_operation="setup")
     original, spec, identity = setup_specs()
     base_hash = smoke.enforce_https_swebench_base_images(dockerfiles._DOCKERFILE_BASE, preparation.TRUSTED_CA_IMAGE)
     cache_key = smoke.task_image_cache_key(TASK,
         prepared_dockerfile_sha256=smoke.prepared_image_recipe_sha256(source), base_dockerfile_sha256=base_hash)
     for kind, attr in (("base", "BASE_IMAGE_BUILD_DIR"), ("env", "ENV_IMAGE_BUILD_DIR"), ("instances", "INSTANCE_IMAGE_BUILD_DIR")):
         setattr(docker_build, attr, work / "build-logs" / kind)
+    checkpoint("build", build_operation="official_images")
     preparation.install_build_limits(client, diagnostic.MEMORY_BYTES)
     _, failed = docker_build.build_instance_images(client, [spec], force_rebuild=False,
         max_workers=1, tag="latest", env_image_tag="latest")
     if failed:
         raise ValueError("official build failed")
+    checkpoint("build", build_operation="evaluator_identity")
     image = client.images.get(spec.instance_image_key)
     if not smoke.LOCAL_IMAGE_ID.fullmatch(image.id):
         raise ValueError("invalid local evaluator identity")
+    checkpoint("build", build_operation="prepared_image")
     prepared = smoke.build_prepared_task_image(source=source, run_id=run_id,
         instance_id=TASK["instance_id"], task_image_id=image.id, cache_key=cache_key,
         execute=preparation.bounded_execute(diagnostic.MEMORY_BYTES))
+    checkpoint("build", build_operation="pair_identity")
     labels = client.images.get(prepared["image_id"]).attrs.get("Config", {}).get("Labels", {})
     if (labels.get("org.carry.swebench.evaluator-image-id") != image.id
             or labels.get("org.carry.swebench.task-cache-key") != cache_key):
@@ -229,9 +284,13 @@ def worker(work, run_id):
     import signal
     summary = {}
     client = None
-    def checkpoint(stage, reason="in_progress"):
+    def checkpoint(stage, reason="in_progress", *, build_operation=None):
         if stage not in WORKER_STAGES or reason not in WORKER_REASONS:
             raise ValueError("invalid worker checkpoint")
+        if build_operation is not None:
+            if build_operation not in BUILD_OPERATIONS:
+                raise ValueError("invalid build operation")
+            summary["build_operation"] = build_operation
         summary.update(worker_stage=stage, worker_reason=reason)
         preparation.write_json(work / "worker-summary.json", summary)
     checkpoint("build")
@@ -345,6 +404,10 @@ def run_probe(evidence, work, *, execute=None):
                 if summary_path.is_file():
                     summary = json.loads(summary_path.read_text())
                     report.update(safe_diagnostics(summary))
+                    # Dataset checkpoint is atomically persisted BEFORE load.
+                    # Never reread even setup-named files once gold may exist.
+                    if report.get("worker_stage") in {"build", "source"}:
+                        report["public_build"] = public_build_evidence(run_work)
                     if isinstance(summary.get("identity"), dict):
                         report["identity"] = summary["identity"]
                 processes = list((run_work / "private-transport").glob("*-worker/process.json"))

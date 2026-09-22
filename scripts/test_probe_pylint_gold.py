@@ -342,6 +342,9 @@ class GoldTests(unittest.TestCase):
 
 
 
+PUBLIC_BUILD_END = "\ndocker.errors.BuildError: command returned a non-zero code: 42\n"
+
+
 def injected_worker_failure(work, run_id, stage, abrupt=False):
     """Real worker in a real child; only external build/data/eval seams are fake."""
     import contextlib
@@ -364,11 +367,29 @@ def injected_worker_failure(work, run_id, stage, abrupt=False):
     labels = {}
     client.images.get.return_value.attrs = {"Config": {"Labels": labels}}
     def fail(*args, **kwargs):
+        if stage not in {"build", "source", "public_build_failure"}:
+            # Poison even an otherwise allowlisted setup filename after the
+            # durable dataset checkpoint. The supervisor must not inspect it.
+            for path in (work / "build-logs").glob("*/*/build_image.log"):
+                path.write_text(sentinel + TEST_PATCH)
         print(sentinel, flush=True)
         if abrupt:
             os.kill(os.getpid(), signal.SIGKILL)
         # Even a dynamically named exception must not export its private name.
         raise type(sentinel, (ValueError,), {})(sentinel)
+    def public_build(*args, **kwargs):
+        folder = work / "build-logs/env/synthetic"
+        folder.mkdir(parents=True)
+        (folder / "build_image.log").write_text("x" * 20000 + PUBLIC_BUILD_END)
+        (folder / "test_output.txt").write_text(sentinel)
+        (work / "build-logs/instances").mkdir()
+        (work / "build-logs/instances/private").symlink_to(folder, target_is_directory=True)
+        if stage == "public_build_failure":
+            if abrupt:
+                fail()
+            return [], ["synthetic"]
+        return [], []
+
     def prepare(**kwargs):
         labels.update({"org.carry.swebench.evaluator-image-id": image,
                        "org.carry.swebench.task-cache-key": kwargs["cache_key"]})
@@ -409,7 +430,7 @@ def injected_worker_failure(work, run_id, stage, abrupt=False):
     replacements = [
         (harness_python, "get_requirements", dict(return_value=requirements)),
         (docker, "from_env", dict(return_value=client)),
-        (docker_build, "build_instance_images", dict(return_value=([], []))),
+        (docker_build, "build_instance_images", dict(side_effect=public_build)),
         (p.preparation, "install_build_limits", {}),
         (p.smoke, "build_prepared_task_image", dict(side_effect=prepare)),
         (p, "verify_source", dict(return_value="c" * 64)),
@@ -483,6 +504,55 @@ class FailureEvidenceTests(unittest.TestCase):
         self.assertNotIn("diff --git", result.read_text())
         return report
 
+    def test_public_build_evidence_survives_supervisor_failure(self):
+        import hashlib
+        GoldTests().harness()
+        for abrupt in (False, True):
+            with self.subTest(abrupt=abrupt), tempfile.TemporaryDirectory() as directory:
+                report = self.supervise(Path(directory), "public_build_failure", abrupt)
+                self.assertEqual(report.get("worker_stage"), "build")
+                self.assertEqual(report.get("build_operation"), "official_images")
+                self.assertEqual(report["worker_returncode"], -9 if abrupt else 1)
+                self.assertIn("public_build", report)
+                evidence = report["public_build"]
+                self.assertEqual(evidence["capture_phase"], "before_dataset")
+                self.assertEqual(len(evidence["logs"]), 1)
+                log = evidence["logs"][0]
+                self.assertEqual(log["layer"], "env")
+                self.assertEqual(log["classification"], "docker_build_error")
+                self.assertEqual(log["bytes"], 20000 + len(PUBLIC_BUILD_END))
+                self.assertTrue(log["truncated"])
+                self.assertLessEqual(len(log["tail"].encode()), 8192)
+                self.assertIn("non-zero code: 42", log["tail"])
+                self.assertEqual(log["tail_sha256"], hashlib.sha256(log["tail"].encode()).hexdigest())
+
+    def test_public_build_log_allowlist_rejects_links_and_private_files(self):
+        p = probe()
+        for link in ("root", "layer", "folder", "file", "hardlink", "fifo"):
+            with self.subTest(link=link), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                private = root / "private"
+                private.mkdir()
+                secret = private / "build_image.log"
+                secret.write_text("NEVER-UPLOAD-GOLD")
+                work = root / "work"
+                work.mkdir()
+                path = work / "build-logs/env/image/build_image.log"
+                if link in {"root", "layer", "folder"}:
+                    target = {"root": work / "build-logs", "layer": path.parents[1],
+                              "folder": path.parent}[link]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(private, target_is_directory=True)
+                else:
+                    path.parent.mkdir(parents=True)
+                    if link == "file":
+                        path.symlink_to(secret)
+                    elif link == "hardlink":
+                        os.link(secret, path)
+                    else:
+                        os.mkfifo(path)
+                self.assertEqual(p.public_build_evidence(work)["logs"], [])
+
     def test_interrupted_atomic_checkpoint_keeps_previous_complete_json(self):
         GoldTests().harness()
         with tempfile.TemporaryDirectory() as directory:
@@ -535,6 +605,8 @@ class FailureEvidenceTests(unittest.TestCase):
                     self.assertEqual(report.get("worker_exception_type"), None if abrupt else "ValueError")
                     self.assertEqual(report["worker_returncode"], -9 if abrupt else 1)
                     self.assertIsNone(report["worker_stop_reason"])
+                    if stage not in {"build", "source"}:
+                        self.assertNotIn("public_build", report)
 
 
 if __name__ == "__main__":
