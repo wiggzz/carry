@@ -1,0 +1,366 @@
+{
+  "instance_ids": [
+    "sphinx-doc__sphinx-9229",
+    "pylint-dev__pylint-7080",
+    "sympy__sympy-14248",
+    "sympy__sympy-13878",
+    "sympy__sympy-13798",
+    "django__django-13112",
+    "django__django-15957",
+    "sphinx-doc__sphinx-9461",
+    "scikit-learn__scikit-learn-25102",
+    "django__django-15022",
+    "sympy__sympy-19040",
+    "pydata__xarray-3305",
+    "matplotlib__matplotlib-24627",
+    "django__django-10554",
+    "sphinx-doc__sphinx-7440",
+    "sympy__sympy-13031",
+    "sympy__sympy-13974",
+    "django__django-11149",
+    "mwaskom__seaborn-3187",
+    "sympy__sympy-16597",
+    "astropy__astropy-13398",
+    "django__django-15280",
+    "sphinx-doc__sphinx-7590",
+    "sphinx-doc__sphinx-8548",
+    "django__django-16263",
+    "sympy__sympy-18698",
+    "django__django-11885",
+    "matplotlib__matplotlib-21568",
+    "sympy__sympy-12489",
+    "sympy__sympy-22080",
+    "django__django-13121",
+    "sympy__sympy-13877",
+    "sympy__sympy-13091",
+    "django__django-12858",
+    "django__django-15098",
+    "pylint-dev__pylint-8898",
+    "django__django-17084",
+    "mwaskom__seaborn-3069",
+    "sympy__sympy-13551",
+    "sympy__sympy-16792",
+    "django__django-11734",
+    "django__django-12965",
+    "psf__requests-1921",
+    "pydata__xarray-7229",
+    "pytest-dev__pytest-6197",
+    "sphinx-doc__sphinx-8551",
+    "sphinx-doc__sphinx-8056",
+    "sphinx-doc__sphinx-8721",
+    "sympy__sympy-12419",
+    "astropy__astropy-14598"
+  ],
+  "ranking": [
+    {
+      "api_calls": 125,
+      "instance_cost_usd": 2.6613013000000008,
+      "instance_id": "sphinx-doc__sphinx-9229",
+      "rank": 1
+    },
+    {
+      "api_calls": 110,
+      "instance_cost_usd": 2.2766366,
+      "instance_id": "pylint-dev__pylint-7080",
+      "rank": 2
+    },
+    {
+      "api_calls": 104,
+      "instance_cost_usd": 1.3986773500000003,
+      "instance_id": "sympy__sympy-14248",
+      "rank": 3
+    },
+    {
+      "api_calls": 102,
+      "instance_cost_usd": 1.3049158499999995,
+      "instance_id": "sympy__sympy-13878",
+      "rank": 4
+    },
+    {
+      "api_calls": 96,
+      "instance_cost_usd": 1.1157404999999998,
+      "instance_id": "sympy__sympy-13798",
+      "rank": 5
+    },
+    {
+      "api_calls": 95,
+      "instance_cost_usd": 2.2335085500000003,
+      "instance_id": "django__django-13112",
+      "rank": 6
+    },
+    {
+      "api_calls": 85,
+      "instance_cost_usd": 1.9256684999999996,
+      "instance_id": "django__django-15957",
+      "rank": 7
+    },
+    {
+      "api_calls": 84,
+      "instance_cost_usd": 1.30680935,
+      "instance_id": "sphinx-doc__sphinx-9461",
+      "rank": 8
+    },
+    {
+      "api_calls": 82,
+      "instance_cost_usd": 1.3446065500000006,
+      "instance_id": "scikit-learn__scikit-learn-25102",
+      "rank": 9
+    },
+    {
+      "api_calls": 78,
+      "instance_cost_usd": 1.9653413499999997,
+      "instance_id": "django__django-15022",
+      "rank": 10
+    },
+    {
+      "api_calls": 78,
+      "instance_cost_usd": 1.3831832,
+      "instance_id": "sympy__sympy-19040",
+      "rank": 11
+    },
+    {
+      "api_calls": 76,
+      "instance_cost_usd": 0.7266493500000001,
+      "instance_id": "pydata__xarray-3305",
+      "rank": 12
+    },
+    {
+      "api_calls": 74,
+      "instance_cost_usd": 0.9829571499999998,
+      "instance_id": "matplotlib__matplotlib-24627",
+      "rank": 13
+    },
+    {
+      "api_calls": 73,
+      "instance_cost_usd": 2.3390181500000002,
+      "instance_id": "django__django-10554",
+      "rank": 14
+    },
+    {
+      "api_calls": 73,
+      "instance_cost_usd": 0.9851316999999999,
+      "instance_id": "sphinx-doc__sphinx-7440",
+      "rank": 15
+    },
+    {
+      "api_calls": 73,
+      "instance_cost_usd": 0.6397069000000002,
+      "instance_id": "sympy__sympy-13031",
+      "rank": 16
+    },
+    {
+      "api_calls": 73,
+      "instance_cost_usd": 0.7472793999999997,
+      "instance_id": "sympy__sympy-13974",
+      "rank": 17
+    },
+    {
+      "api_calls": 72,
+      "instance_cost_usd": 1.4345470999999999,
+      "instance_id": "django__django-11149",
+      "rank": 18
+    },
+    {
+      "api_calls": 72,
+      "instance_cost_usd": 1.04829655,
+      "instance_id": "mwaskom__seaborn-3187",
+      "rank": 19
+    },
+    {
+      "api_calls": 71,
+      "instance_cost_usd": 1.1531513,
+      "instance_id": "sympy__sympy-16597",
+      "rank": 20
+    },
+    {
+      "api_calls": 70,
+      "instance_cost_usd": 2.1274974,
+      "instance_id": "astropy__astropy-13398",
+      "rank": 21
+    },
+    {
+      "api_calls": 70,
+      "instance_cost_usd": 1.18404055,
+      "instance_id": "django__django-15280",
+      "rank": 22
+    },
+    {
+      "api_calls": 70,
+      "instance_cost_usd": 1.18470065,
+      "instance_id": "sphinx-doc__sphinx-7590",
+      "rank": 23
+    },
+    {
+      "api_calls": 70,
+      "instance_cost_usd": 1.4646964499999997,
+      "instance_id": "sphinx-doc__sphinx-8548",
+      "rank": 24
+    },
+    {
+      "api_calls": 69,
+      "instance_cost_usd": 2.2146551,
+      "instance_id": "django__django-16263",
+      "rank": 25
+    },
+    {
+      "api_calls": 69,
+      "instance_cost_usd": 1.3854984499999998,
+      "instance_id": "sympy__sympy-18698",
+      "rank": 26
+    },
+    {
+      "api_calls": 68,
+      "instance_cost_usd": 1.6896256999999995,
+      "instance_id": "django__django-11885",
+      "rank": 27
+    },
+    {
+      "api_calls": 68,
+      "instance_cost_usd": 1.3304486999999998,
+      "instance_id": "matplotlib__matplotlib-21568",
+      "rank": 28
+    },
+    {
+      "api_calls": 68,
+      "instance_cost_usd": 1.2509447999999999,
+      "instance_id": "sympy__sympy-12489",
+      "rank": 29
+    },
+    {
+      "api_calls": 68,
+      "instance_cost_usd": 1.0827435499999998,
+      "instance_id": "sympy__sympy-22080",
+      "rank": 30
+    },
+    {
+      "api_calls": 67,
+      "instance_cost_usd": 0.941122,
+      "instance_id": "django__django-13121",
+      "rank": 31
+    },
+    {
+      "api_calls": 66,
+      "instance_cost_usd": 0.6553715,
+      "instance_id": "sympy__sympy-13877",
+      "rank": 32
+    },
+    {
+      "api_calls": 65,
+      "instance_cost_usd": 0.6583262,
+      "instance_id": "sympy__sympy-13091",
+      "rank": 33
+    },
+    {
+      "api_calls": 64,
+      "instance_cost_usd": 1.3709794000000004,
+      "instance_id": "django__django-12858",
+      "rank": 34
+    },
+    {
+      "api_calls": 64,
+      "instance_cost_usd": 0.8931699000000001,
+      "instance_id": "django__django-15098",
+      "rank": 35
+    },
+    {
+      "api_calls": 64,
+      "instance_cost_usd": 1.2032356,
+      "instance_id": "pylint-dev__pylint-8898",
+      "rank": 36
+    },
+    {
+      "api_calls": 63,
+      "instance_cost_usd": 0.776251,
+      "instance_id": "django__django-17084",
+      "rank": 37
+    },
+    {
+      "api_calls": 63,
+      "instance_cost_usd": 1.17943735,
+      "instance_id": "mwaskom__seaborn-3069",
+      "rank": 38
+    },
+    {
+      "api_calls": 63,
+      "instance_cost_usd": 0.8903951000000001,
+      "instance_id": "sympy__sympy-13551",
+      "rank": 39
+    },
+    {
+      "api_calls": 62,
+      "instance_cost_usd": 0.9059396499999999,
+      "instance_id": "sympy__sympy-16792",
+      "rank": 40
+    },
+    {
+      "api_calls": 61,
+      "instance_cost_usd": 1.1116633499999997,
+      "instance_id": "django__django-11734",
+      "rank": 41
+    },
+    {
+      "api_calls": 60,
+      "instance_cost_usd": 1.65730495,
+      "instance_id": "django__django-12965",
+      "rank": 42
+    },
+    {
+      "api_calls": 60,
+      "instance_cost_usd": 0.44864785000000007,
+      "instance_id": "psf__requests-1921",
+      "rank": 43
+    },
+    {
+      "api_calls": 60,
+      "instance_cost_usd": 0.8556590000000001,
+      "instance_id": "pydata__xarray-7229",
+      "rank": 44
+    },
+    {
+      "api_calls": 60,
+      "instance_cost_usd": 1.5339155999999998,
+      "instance_id": "pytest-dev__pytest-6197",
+      "rank": 45
+    },
+    {
+      "api_calls": 60,
+      "instance_cost_usd": 0.5482400000000001,
+      "instance_id": "sphinx-doc__sphinx-8551",
+      "rank": 46
+    },
+    {
+      "api_calls": 59,
+      "instance_cost_usd": 0.7365029000000002,
+      "instance_id": "sphinx-doc__sphinx-8056",
+      "rank": 47
+    },
+    {
+      "api_calls": 59,
+      "instance_cost_usd": 0.5564762000000002,
+      "instance_id": "sphinx-doc__sphinx-8721",
+      "rank": 48
+    },
+    {
+      "api_calls": 59,
+      "instance_cost_usd": 0.7606732,
+      "instance_id": "sympy__sympy-12419",
+      "rank": 49
+    },
+    {
+      "api_calls": 57,
+      "instance_cost_usd": 1.3258146999999998,
+      "instance_id": "astropy__astropy-14598",
+      "rank": 50
+    }
+  ],
+  "schema": "carry.swe-bench-long-trajectory-selection.v1",
+  "source_dataset": "princeton-nlp/SWE-bench_Verified",
+  "source_manifest_sha256": "e0604e07c3520297dffe03b7213fb99dd966cd7e2f80cf54611e8c2a21777962",
+  "trajectory_source": {
+    "measurement_count": 500,
+    "measurement_sha256": "a529918fdfa4e2f8d591925e81738f5e0cf7a5794b2400a27defcf162794b7dc",
+    "metric": "info.model_stats.api_calls",
+    "rank_order": "api_calls desc, instance_id asc",
+    "trajectory_format": "mini-swe-agent-1.1"
+  }
+}

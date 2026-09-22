@@ -7,12 +7,121 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      preparation_solver_probe:
+        description: 'Probe only: bounded preparation/evaluator diagnostics (no model or cloud worker)'
+        type: boolean
+        required: false
+        default: false
+      preparation_probe_stage:
+        description: 'solve: Conda; image: Matplotlib; pylint-evaluator: differential; pylint-gold: rebuilt official gold'
+        type: choice
+        required: false
+        default: solve
+        options: [solve, image, pylint-evaluator, pylint-gold]
 
 permissions:
   contents: read
 
 jobs:
+  preparation-solver-probe:
+    name: Preparation / evaluator diagnostic
+    if: github.event_name == 'workflow_dispatch' && inputs.preparation_solver_probe
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.preparation_probe_stage != 'solve' && 40 || 20 }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Test diagnostic failure and evidence paths offline
+        run: >-
+          python3 -m unittest -v scripts/test_probe_matplotlib_solver.py
+          scripts/test_probe_matplotlib_preparation.py scripts/test_swebench_preparation_compat.py
+          scripts/test_probe_pylint_evaluator.py scripts/test_probe_pylint_gold.py
+
+      - name: Install pinned official harness for actual-image diagnostic
+        if: inputs.preparation_probe_stage != 'solve'
+        timeout-minutes: 5
+        run: |
+          python3 -m venv "$RUNNER_TEMP/swebench-image-probe"
+          "$RUNNER_TEMP/swebench-image-probe/bin/python" -m pip install 'swebench==4.1.0'
+          "$RUNNER_TEMP/swebench-image-probe/bin/python" -m unittest -v \
+            scripts.test_probe_matplotlib_preparation scripts.test_swebench_preparation_compat \
+            scripts.test_probe_pylint_evaluator scripts.test_probe_pylint_gold
+
+      - name: Run selected bounded preparation diagnostic
+        id: solver
+        env:
+          PREPARATION_PROBE_STAGE: ${{ inputs.preparation_probe_stage || 'solve' }}
+        run: |
+          case "$PREPARATION_PROBE_STAGE" in
+            solve)
+              python3 scripts/probe_matplotlib_solver.py \
+                --evidence-dir "$RUNNER_TEMP/matplotlib-solver-evidence" \
+                --work-dir "$RUNNER_TEMP/matplotlib-solver-work"
+              ;;
+            image)
+              # Match the production root worker's checkout ownership. Readiness
+              # drops all capabilities, so root cannot override runner-owned 0755.
+              sudo --non-interactive --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_SHA,GITHUB_RUN_ID \
+                "$RUNNER_TEMP/swebench-image-probe/bin/python" scripts/probe_matplotlib_preparation.py \
+                --evidence-dir "$RUNNER_TEMP/matplotlib-solver-evidence" \
+                --work-dir "$RUNNER_TEMP/matplotlib-image-work"
+              ;;
+            pylint-evaluator)
+              sudo --non-interactive --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_SHA,GITHUB_RUN_ID \
+                "$RUNNER_TEMP/swebench-image-probe/bin/python" scripts/probe_pylint_evaluator.py \
+                --evidence-dir "$RUNNER_TEMP/matplotlib-solver-evidence" \
+                --work-dir "$RUNNER_TEMP/pylint-evaluator-work"
+              ;;
+            pylint-gold)
+              # Private evaluator payloads never enter the uploaded evidence dir.
+              sudo --non-interactive --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_SHA,GITHUB_RUN_ID \
+                "$RUNNER_TEMP/swebench-image-probe/bin/python" scripts/probe_pylint_gold.py \
+                --evidence-dir "$RUNNER_TEMP/matplotlib-solver-evidence" \
+                --work-dir "$RUNNER_TEMP/pylint-gold-private"
+              ;;
+            *) printf 'Unsupported preparation probe stage\n' >&2; exit 2 ;;
+          esac
+
+      - name: Record job outcome even if checkout or tests failed
+        if: always()
+        env:
+          SOLVER_STEP_OUTCOME: ${{ steps.solver.outcome }}
+          PREPARATION_PROBE_STAGE: ${{ inputs.preparation_probe_stage || 'solve' }}
+        run: |
+          # The image supervisor owns this evidence directory as root; keep the
+          # outcome writer on the same side of that ownership boundary.
+          sudo --non-interactive --preserve-env=RUNNER_TEMP,SOLVER_STEP_OUTCOME,PREPARATION_PROBE_STAGE,GITHUB_SHA python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "matplotlib-solver-evidence"
+          evidence.mkdir(parents=True, exist_ok=True)
+          (evidence / "job-outcome.json").write_text(json.dumps({
+              "solver_step_outcome": os.environ["SOLVER_STEP_OUTCOME"],
+              "preparation_probe_stage": os.environ["PREPARATION_PROBE_STAGE"],
+              "github_sha": os.environ["GITHUB_SHA"],
+              "result_present": (evidence / "result.json").is_file(),
+          }, indent=2) + "\n")
+          PY
+
+      # Never upload the solver cache/prefix, let alone dataset or gold content.
+      - name: Retain bounded diagnostic evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: ${{ inputs.preparation_probe_stage == 'pylint-gold' && 'pylint-gold' || inputs.preparation_probe_stage == 'pylint-evaluator' && 'pylint-evaluator' || inputs.preparation_probe_stage == 'image' && 'matplotlib-image' || 'matplotlib-solver' }}-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/matplotlib-solver-evidence/${{ inputs.preparation_probe_stage == 'pylint-gold' && 'result.json' || '' }}
+            ${{ runner.temp }}/matplotlib-solver-evidence/job-outcome.json
+          if-no-files-found: error
+          retention-days: 7
+
   infra:
+    if: github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe
     name: Terraform infrastructure
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -58,6 +167,7 @@ jobs:
           terraform -chdir=infra validate
 
   test:
+    if: github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -91,9 +201,18 @@ jobs:
         run: >-
           python3 -m unittest -v
           scripts/test_benchmark_progress.py
+          scripts/test_benchmark_preparation_telemetry.py
+          scripts/test_benchmark_worker_diagnostics.py
+          scripts/test_render_swebench_worker_user_data.py
           scripts/test_swebench_benchmark.py
           scripts/test_swebench_live_runner.py
           scripts/test_swebench_smoke.py
+          scripts/test_swebench_preparation_compat.py
+          scripts/test_probe_matplotlib_solver.py
+          scripts/test_probe_matplotlib_preparation.py
+          scripts/test_probe_pylint_evaluator.py scripts/test_probe_pylint_gold.py
+          scripts/test_build_long_swebench_selection.py
+          scripts/test_merge_swebench_attempts.py
           scripts/test_swebench_harness_entrypoint.py
           scripts/test_prepared_swebench_image.py
           scripts/test_swebench_ec2_worker.py
@@ -101,6 +220,14 @@ jobs:
           scripts/test_presign_s3.py
           scripts/test_validate_pr_title.py
           scripts/test_wait_for_ec2_termination.py
+
+      - name: Verify preparation against pinned SWE-bench recipes
+        run: |
+          python3 -m venv "$RUNNER_TEMP/swebench-contract"
+          "$RUNNER_TEMP/swebench-contract/bin/python" -m pip install 'swebench==4.1.0'
+          "$RUNNER_TEMP/swebench-contract/bin/python" -m unittest -v \
+            scripts.test_swebench_preparation_compat scripts.test_swebench_smoke \
+            scripts.test_probe_matplotlib_preparation scripts.test_probe_pylint_evaluator scripts.test_probe_pylint_gold
 
       - name: Build one portable release binary
         run: |
