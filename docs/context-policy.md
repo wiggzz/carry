@@ -54,11 +54,21 @@ message with the same ID.
 
 ## Economic compaction
 
-Between rewrites, retained history grows by exact appends so the model provider
-can reuse a stable prompt-cache prefix. Without rollout sampling, the planner
-uses `--compaction-payoff-requests N` (or
-`CARRY_COMPACTION_PAYOFF_REQUESTS=N`) as its deterministic payoff period; `N`
-must be positive and defaults to `5`.
+Between rewrites, retained history grows by exact appends so the model provider can
+reuse a stable prompt-cache prefix. The planner compares a compact-now candidate
+with retaining the current history over the same projected cost model.
+
+`--compaction-min-payback-percent P` (or
+`CARRY_COMPACTION_MIN_PAYBACK_PERCENT=P`) makes that admission margin explicit:
+Carry compacts only when modeled savings exceed `P%` of the retain-path payoff cost.
+It accepts integer values from 0 through 100 and defaults to **25**. Carry previously
+used a hard-coded 10% gate; the new default more deliberately filters marginal
+rewrites. `0` means any strictly positive modeled saving; lower the value if
+you need to admit more speculative rewrites.
+
+Without rollout sampling, the planner uses
+`--compaction-payoff-requests N` (or `CARRY_COMPACTION_PAYOFF_REQUESTS=N`) as its
+deterministic payoff period; `N` must be positive and defaults to `5`.
 
 `--compaction-rollout-samples N` (or
 `CARRY_COMPACTION_ROLLOUT_SAMPLES=N`) is an opt-in deterministic V0 selection
@@ -76,16 +86,18 @@ priced). A stopped scenario contributes no further virtual item, cleanup, or
 request cost. Surviving turns choose a uniform count from 0 through 4 and
 uniformly drop that many non-human IDs from the post-compaction payload. The
 same seeded samples are applied to both branches. Carry selects the candidate
-with the largest expected horizon saving when that saving exceeds 10% of the
-simulated keep-path cost. Direct next-request savings are telemetry, not a
-gate: the rollout can approve an initial loss when its expected horizon value
+with the largest expected horizon saving when that saving exceeds the configured
+minimum-payback percentage of the simulated keep-path cost. Direct next-request
+savings are telemetry, not a gate: the rollout can approve an initial loss when its
+expected horizon value
 repays it. This is a structural sensitivity test, not a semantic prediction of
 model behavior; its inputs and branch costs are recorded in the compaction
 trace event.
 
-The deterministic fallback likewise requires projected savings to exceed 10% of
-the retained-path payoff cost. This deliberately avoids rewrites that only
-barely repay their cache invalidation. A compaction still begins a new cache
+The deterministic fallback likewise requires projected savings to exceed the
+configured minimum-payback percentage (25% by default) of retained-path payoff
+cost. This deliberately avoids rewrites that only barely repay their cache
+invalidation. A compaction still begins a new cache
 generation; the model-visible history is otherwise prefix-continuous.
 
 Neutral working-set hysteresis is configurable with

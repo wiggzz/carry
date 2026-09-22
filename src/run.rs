@@ -62,6 +62,8 @@ pub struct RunConfig {
     pub keep_lease_turns: Option<u64>,
     /// Number of future requests used to amortize a compaction rewrite; one is next-request economics.
     pub compaction_payoff_requests: u64,
+    /// Minimum projected saving (percent of retained-path payoff cost) required to compact.
+    pub compaction_min_payback_percent: u8,
     /// Zero disables deterministic flat-drop scenario rollouts before compaction.
     pub compaction_rollout_samples: u32,
     /// Per simulated future turn probability (percent) that the task ends.
@@ -387,17 +389,19 @@ impl CacheTracker {
 
     #[cfg(test)]
     fn policy(&self) -> CompactionPolicy {
-        self.policy_with_implicit_compatibility(true, 1)
+        self.policy_with_implicit_compatibility(true, 1, 10)
     }
 
     fn policy_for_history(
         &self,
         history: &[serde_json::Value],
         payoff_requests: u64,
+        min_payback_percent: u8,
     ) -> CompactionPolicy {
         self.policy_with_implicit_compatibility(
             history.starts_with(&self.implicit_prefix),
             payoff_requests,
+            min_payback_percent,
         )
     }
 
@@ -405,6 +409,7 @@ impl CacheTracker {
         &self,
         implicit_prefix_compatible: bool,
         payoff_requests: u64,
+        min_payback_percent: u8,
     ) -> CompactionPolicy {
         let now = Instant::now();
         let mut breakpoints = self
@@ -433,6 +438,7 @@ impl CacheTracker {
             },
             breakpoints,
             payoff_requests,
+            min_payback_percent,
         }
     }
 
@@ -609,6 +615,8 @@ async fn run_loop(
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
                 "compaction_policy": config.compaction_mode,
+                "compaction_payoff_requests": config.compaction_payoff_requests,
+                "compaction_min_payback_percent": config.compaction_min_payback_percent,
                 "source_session": config.resume_source,
             }),
             &format!(
@@ -629,6 +637,8 @@ async fn run_loop(
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
                 "compaction_policy": config.compaction_mode,
+                "compaction_payoff_requests": config.compaction_payoff_requests,
+                "compaction_min_payback_percent": config.compaction_min_payback_percent,
                 "compaction_decision": "next_request"
             }),
             &format!("carry · {} · {}", config.model, config.cwd.display()),
@@ -1015,7 +1025,11 @@ fn select_compaction_plan(
     cache: &CacheTracker,
     config: &RunConfig,
 ) -> Option<(CompactionPlan, Option<FlatRolloutEstimate>)> {
-    let policy = cache.policy_for_history(&state.input_items(), config.compaction_payoff_requests);
+    let policy = cache.policy_for_history(
+        &state.input_items(),
+        config.compaction_payoff_requests,
+        config.compaction_min_payback_percent,
+    );
     if config.compaction_rollout_samples > 0 {
         let rollout_config = FlatRolloutConfig {
             samples: config.compaction_rollout_samples,
@@ -1594,6 +1608,8 @@ async fn write_final_artifacts(
         "response_retries": metrics.response_retries,
         "compactions": metrics.compactions,
         "compaction_policy": config.compaction_mode,
+        "compaction_payoff_requests": config.compaction_payoff_requests,
+        "compaction_min_payback_percent": config.compaction_min_payback_percent,
         "elapsed_ms": elapsed_ms
     });
     tokio::fs::write(
@@ -1933,13 +1949,15 @@ mod tests {
         ];
         assert_eq!(
             cache
-                .policy_for_history(&extended, 1)
+                .policy_for_history(&extended, 1, 10)
                 .implicit_cached_tokens,
             2_400
         );
         let mutated = vec![json!({"role": "user", "content": "changed"})];
         assert_eq!(
-            cache.policy_for_history(&mutated, 1).implicit_cached_tokens,
+            cache
+                .policy_for_history(&mutated, 1, 10)
+                .implicit_cached_tokens,
             0
         );
     }
@@ -2199,6 +2217,7 @@ mod tests {
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: Some(1),
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
@@ -2280,6 +2299,7 @@ mod tests {
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
@@ -2346,6 +2366,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 5,
+                compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 4,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
@@ -2407,6 +2428,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
@@ -2494,6 +2516,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
@@ -2520,6 +2543,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
@@ -2589,6 +2613,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
@@ -2636,6 +2661,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
@@ -2698,6 +2724,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
@@ -2794,6 +2821,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,

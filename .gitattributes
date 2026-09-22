@@ -1,0 +1,2 @@
+# Preserve the checksum-bound upstream fixture's final blank line verbatim.
+scripts/fixtures/matplotlib-24627-environment.yml whitespace=-blank-at-eof
