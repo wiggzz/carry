@@ -23,6 +23,12 @@ def probe():
 
 
 class GoldTests(unittest.TestCase):
+    def setUp(self):
+        memory = mock.patch.object(probe().preparation.solver, "memory_snapshot", return_value={
+            "MemTotal_bytes": 16 * 1024**3, "MemAvailable_bytes": 12 * 1024**3})
+        memory.start()
+        self.addCleanup(memory.stop)
+
     def harness(self):
         try:
             from swebench.harness.test_spec.test_spec import make_test_spec
@@ -174,8 +180,9 @@ class GoldTests(unittest.TestCase):
             self.assertEqual(specs, [p.setup_specs()[1]])
             self.assertEqual(kwargs["max_workers"], 1)
             return specs, []
-        with tempfile.TemporaryDirectory() as directory, mock.patch.object(docker_build, "build_instance_images", side_effect=build), mock.patch.object(p.preparation, "install_build_limits"), mock.patch.object(p.smoke, "build_prepared_task_image", side_effect=prepare) as prepared, mock.patch.object(p, "verify_source", return_value="c"*64):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(docker_build, "build_instance_images", side_effect=build), mock.patch.object(p.preparation, "install_build_limits") as limits, mock.patch.object(p.smoke, "build_prepared_task_image", side_effect=prepare) as prepared, mock.patch.object(p, "verify_source", return_value="c"*64):
             result = p.build_pair(Path(directory), "fixture", client)
+            limits.assert_called_once_with(client, 8 * 1024**3)
             self.assertEqual(result["evaluator_image_id"], image)
             self.assertEqual(prepared.call_args.kwargs["task_image_id"], image)
             self.assertEqual(prepared.call_args.kwargs["cache_key"], result["cache_key"])
@@ -185,6 +192,30 @@ class GoldTests(unittest.TestCase):
             labels["org.carry.swebench.evaluator-image-id"] = "sha256:"+"c"*64
             with self.assertRaises(ValueError, msg="agent/evaluator pair drift must fail"):
                 p.build_pair(Path(directory), "fixture", client)
+
+
+    def test_supervisor_requires_measured_capacity_before_docker_or_worker(self):
+        p = probe()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls = []
+            def run(command, **kwargs):
+                calls.append(kwargs["label"])
+                return subprocess.CompletedProcess(command, 0, "", "")
+            with mock.patch.object(p.preparation.solver, "memory_snapshot", return_value={
+                    "MemTotal_bytes": 16 * 1024**3,
+                    "MemAvailable_bytes": 11 * 1024**3 - 1,
+                    "private": "NEVER-UPLOAD-GOLD"}), mock.patch.object(p.diagnostic, "preflight"):
+                self.assertEqual(p.run_probe(root / "evidence", root / "private", execute=run), 1)
+            report = json.loads((root / "evidence/result.json").read_text())
+            self.assertEqual(calls, [])
+            self.assertEqual(report["host_memory"], {
+                "MemTotal_bytes": 16 * 1024**3,
+                "MemAvailable_bytes": 11 * 1024**3 - 1})
+            self.assertEqual(report["limits"]["build_memory_bytes"], 8 * 1024**3)
+            self.assertEqual(report["limits"]["worker_address_space_bytes"], 3 * 1024**3)
+            self.assertEqual(report["limits"]["required_host_available_bytes"], 11 * 1024**3)
+            self.assertNotIn("NEVER-UPLOAD-GOLD", json.dumps(report))
 
 
 
@@ -465,6 +496,12 @@ def injected_worker_failure(work, run_id, stage, abrupt=False):
 
 
 class FailureEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        memory = mock.patch.object(probe().preparation.solver, "memory_snapshot", return_value={
+            "MemTotal_bytes": 16 * 1024**3, "MemAvailable_bytes": 12 * 1024**3})
+        memory.start()
+        self.addCleanup(memory.stop)
+
     def supervise(self, root, stage, abrupt=False):
         p = probe()
         def run(command, **kwargs):

@@ -19,6 +19,8 @@ from scripts import probe_pylint_evaluator as diagnostic
 TASK = diagnostic.TASK
 WALL_SECONDS = 1800
 EVALUATOR_SECONDS = 270
+BUILD_MEMORY_BYTES = 8 * 1024**3
+REQUIRED_HOST_AVAILABLE_BYTES = BUILD_MEMORY_BYTES + diagnostic.MEMORY_BYTES
 BUILD_OPERATIONS = {"setup", "official_images", "evaluator_identity", "prepared_image", "pair_identity"}
 WORKER_STAGES = {"build", "source", "dataset", "alias", "evaluate", "events", "grade", "complete"}
 WORKER_REASONS = {"in_progress", "worker_exception", "validated", "official_gold_unresolved",
@@ -202,7 +204,7 @@ def build_pair(work, run_id, client, checkpoint=lambda stage, **kwargs: None):
     for kind, attr in (("base", "BASE_IMAGE_BUILD_DIR"), ("env", "ENV_IMAGE_BUILD_DIR"), ("instances", "INSTANCE_IMAGE_BUILD_DIR")):
         setattr(docker_build, attr, work / "build-logs" / kind)
     checkpoint("build", build_operation="official_images")
-    preparation.install_build_limits(client, diagnostic.MEMORY_BYTES)
+    preparation.install_build_limits(client, BUILD_MEMORY_BYTES)
     _, failed = docker_build.build_instance_images(client, [spec], force_rebuild=False,
         max_workers=1, tag="latest", env_image_tag="latest")
     if failed:
@@ -350,7 +352,8 @@ def run_probe(evidence, work, *, execute=None):
         "model_execution": False, "registry_publication": False,
         "limits": {"wall_seconds": WALL_SECONDS, "build_seconds": 1200,
             "evaluator_seconds": EVALUATOR_SECONDS, "max_workers": 1,
-            "build_memory_bytes": diagnostic.MEMORY_BYTES, "worker_address_space_bytes": diagnostic.MEMORY_BYTES,
+            "build_memory_bytes": BUILD_MEMORY_BYTES, "worker_address_space_bytes": diagnostic.MEMORY_BYTES,
+            "required_host_available_bytes": REQUIRED_HOST_AVAILABLE_BYTES,
             "worker_cpu_seconds": 300, "log_bytes_per_stream": diagnostic.LOG_LIMIT,
             "disk_growth_budget_bytes": 12 * 1024**3, "disk_reserve_bytes": 8 * 1024**3,
             "disk_watchdog_interval_seconds": 0.1,
@@ -363,6 +366,13 @@ def run_probe(evidence, work, *, execute=None):
         work.mkdir(parents=True, mode=0o700, exist_ok=False)
         created = True
         run_work.mkdir(mode=0o700)
+        memory = preparation.solver.memory_snapshot()
+        report["host_memory"] = {key: memory[key]
+                                 for key in ("MemTotal_bytes", "MemAvailable_bytes")
+                                 if type(memory.get(key)) is int and memory[key] >= 0}
+        preparation.write_json(evidence / "result.json", report)
+        if report["host_memory"].get("MemAvailable_bytes", 0) < REQUIRED_HOST_AVAILABLE_BYTES:
+            raise ValueError("insufficient available host memory for 8 GiB diagnostic build cap")
         diagnostic.preflight(work)
         run = run or diagnostic.Transport(run_work / "private-transport", run_work, timeout=WALL_SECONDS)
         if run(["docker", "ps", "-aq"], label="initial").stdout.strip():
