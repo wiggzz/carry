@@ -14,11 +14,11 @@ on:
         required: false
         default: false
       preparation_probe_stage:
-        description: 'solve: Conda; image: Matplotlib readiness; pylint-evaluator: exact-image install differential'
+        description: 'solve: Conda; image: Matplotlib; pylint-evaluator: differential; pylint-gold: rebuilt official gold'
         type: choice
         required: false
         default: solve
-        options: [solve, image, pylint-evaluator]
+        options: [solve, image, pylint-evaluator, pylint-gold]
 
 permissions:
   contents: read
@@ -40,17 +40,17 @@ jobs:
         run: >-
           python3 -m unittest -v scripts/test_probe_matplotlib_solver.py
           scripts/test_probe_matplotlib_preparation.py scripts/test_swebench_preparation_compat.py
-          scripts/test_probe_pylint_evaluator.py
+          scripts/test_probe_pylint_evaluator.py scripts/test_probe_pylint_gold.py
 
       - name: Install pinned official harness for actual-image diagnostic
-        if: inputs.preparation_probe_stage == 'image' || inputs.preparation_probe_stage == 'pylint-evaluator'
+        if: inputs.preparation_probe_stage != 'solve'
         timeout-minutes: 5
         run: |
           python3 -m venv "$RUNNER_TEMP/swebench-image-probe"
           "$RUNNER_TEMP/swebench-image-probe/bin/python" -m pip install 'swebench==4.1.0'
           "$RUNNER_TEMP/swebench-image-probe/bin/python" -m unittest -v \
             scripts.test_probe_matplotlib_preparation scripts.test_swebench_preparation_compat \
-            scripts.test_probe_pylint_evaluator
+            scripts.test_probe_pylint_evaluator scripts.test_probe_pylint_gold
 
       - name: Run selected bounded preparation diagnostic
         id: solver
@@ -76,6 +76,13 @@ jobs:
                 "$RUNNER_TEMP/swebench-image-probe/bin/python" scripts/probe_pylint_evaluator.py \
                 --evidence-dir "$RUNNER_TEMP/matplotlib-solver-evidence" \
                 --work-dir "$RUNNER_TEMP/pylint-evaluator-work"
+              ;;
+            pylint-gold)
+              # Private evaluator payloads never enter the uploaded evidence dir.
+              sudo --non-interactive --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_SHA,GITHUB_RUN_ID \
+                "$RUNNER_TEMP/swebench-image-probe/bin/python" scripts/probe_pylint_gold.py \
+                --evidence-dir "$RUNNER_TEMP/matplotlib-solver-evidence" \
+                --work-dir "$RUNNER_TEMP/pylint-gold-private"
               ;;
             *) printf 'Unsupported preparation probe stage\n' >&2; exit 2 ;;
           esac
@@ -106,8 +113,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
-          name: ${{ inputs.preparation_probe_stage == 'pylint-evaluator' && 'pylint-evaluator' || inputs.preparation_probe_stage == 'image' && 'matplotlib-image' || 'matplotlib-solver' }}-probe-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/matplotlib-solver-evidence/
+          name: ${{ inputs.preparation_probe_stage == 'pylint-gold' && 'pylint-gold' || inputs.preparation_probe_stage == 'pylint-evaluator' && 'pylint-evaluator' || inputs.preparation_probe_stage == 'image' && 'matplotlib-image' || 'matplotlib-solver' }}-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/matplotlib-solver-evidence/${{ inputs.preparation_probe_stage == 'pylint-gold' && 'result.json' || '' }}
+            ${{ runner.temp }}/matplotlib-solver-evidence/job-outcome.json
           if-no-files-found: error
           retention-days: 7
 
@@ -201,7 +210,7 @@ jobs:
           scripts/test_swebench_preparation_compat.py
           scripts/test_probe_matplotlib_solver.py
           scripts/test_probe_matplotlib_preparation.py
-          scripts/test_probe_pylint_evaluator.py
+          scripts/test_probe_pylint_evaluator.py scripts/test_probe_pylint_gold.py
           scripts/test_build_long_swebench_selection.py
           scripts/test_merge_swebench_attempts.py
           scripts/test_swebench_harness_entrypoint.py
@@ -218,7 +227,7 @@ jobs:
           "$RUNNER_TEMP/swebench-contract/bin/python" -m pip install 'swebench==4.1.0'
           "$RUNNER_TEMP/swebench-contract/bin/python" -m unittest -v \
             scripts.test_swebench_preparation_compat scripts.test_swebench_smoke \
-            scripts.test_probe_matplotlib_preparation scripts.test_probe_pylint_evaluator
+            scripts.test_probe_matplotlib_preparation scripts.test_probe_pylint_evaluator scripts.test_probe_pylint_gold
 
       - name: Build one portable release binary
         run: |

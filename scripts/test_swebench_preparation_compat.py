@@ -4,7 +4,9 @@ import copy
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import venv
 from types import SimpleNamespace
 import unittest
 import hashlib
@@ -260,6 +262,68 @@ python() {
         with self.assertRaisesRegex(ValueError, "unexpected scikit-learn"):
             transform_test_specs(changed, swebench_version="4.1.0")
 
+    def test_pylint_7080_standalone_source_path_survives_editable_reinstall(self):
+        original = pylint_spec("7080")
+        before = copy.deepcopy(original)
+        changed, report = transform_test_specs([original], swebench_version="4.1.0")
+        start = original.repo_script_list.index("python -m pip install -e .")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # A real isolated interpreter/site-packages, without installing pip
+            # or dependencies. Only pip ownership is doubled below; the emitted
+            # path-writing command executes unchanged against real sysconfig.
+            venv.EnvBuilder(with_pip=False).create(root / "venv")
+            python = root / "venv/bin/python"
+            site = Path(subprocess.check_output(
+                [str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                text=True, timeout=15,
+            ).strip())
+            shell = '''set -eu
+python() {
+    case "$*" in
+        '-m pip install -e .')
+            printf 'FINDER_MARKER = 1\\n' > "$PURELIB/__editable___pylint_finder.py"
+            printf 'import __editable___pylint_finder\\n' > "$PURELIB/__editable__.pylint.pth"
+            printf 'editable\\n' >> "$INSTALL_LOG" ;;
+        '-m pip install --no-deps GitPython==3.1.43 gitdb==4.0.11 smmap==5.0.1'|'-m pip install --no-deps setuptools==67.4.0')
+            printf '%s\\n' "$*" >> "$INSTALL_LOG" ;;
+        '-') "$REAL_PYTHON" - ;;
+        *) return 99 ;;
+    esac
+}
+git() { :; }
+'''
+            environment = dict(os.environ, PURELIB=str(site), REAL_PYTHON=str(python),
+                               INSTALL_LOG=str(root / "installs"))
+            for repeat in range(2):
+                result = subprocess.run(
+                    ["bash", "-c", shell + "\n".join(changed[0].repo_script_list[start:])
+                     + "\npython -m pip install -e .\npython -m pip install -e ."],
+                    env=environment, cwd=root, capture_output=True, text=True, timeout=15,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                paths = sorted(site.glob("*.pth"))
+                self.assertEqual(len(paths), 2, "missing independent source-path .pth")
+                standalone = next(p for p in paths if not p.name.startswith("__editable__"))
+                self.assertEqual(standalone.name, "carry_pylint_7080_source.pth")
+                self.assertEqual(standalone.read_bytes(), b"/testbed\n")
+                self.assertEqual((site / "__editable__.pylint.pth").read_bytes(),
+                                 b"import __editable___pylint_finder\n")
+                self.assertEqual((site / "__editable___pylint_finder.py").read_bytes(),
+                                 b"FINDER_MARKER = 1\n")
+            self.assertEqual((root / "installs").read_text().splitlines(), [
+                "editable", "-m pip install --no-deps GitPython==3.1.43 gitdb==4.0.11 smmap==5.0.1",
+                "-m pip install --no-deps setuptools==67.4.0", "editable", "editable",
+            ] * 2)
+        self.assertEqual(original, before)
+        for field in ("env_script_list", "eval_script_list", "FAIL_TO_PASS", "PASS_TO_PASS"):
+            self.assertEqual(getattr(changed[0], field), getattr(original, field))
+        self.assertEqual(report["tasks"][original.instance_id]["repairs"], [
+            "pylint-testutils-gitpython-3.1.43", "pylint-setuptools-67.4.0",
+            "pylint-7080-standalone-source-path",
+        ])
+
     def test_pylint_installs_missing_testutils_dependency_closure_without_resolving_others(self):
         for task in PYLINT_TASKS:
             for failure in (False, True):
@@ -281,6 +345,8 @@ python() {
         '-m pip install --no-deps setuptools==67.4.0')
             [ "$TASK" = 7080 ] && [ "$available" = 1 ] || return 49
             setuptools_pinned=1 ;;
+        '-')
+            "$REAL_PYTHON" -c 'import sys, sysconfig, tempfile; d = tempfile.TemporaryDirectory(); sysconfig.get_path = lambda name: d.name; exec(sys.stdin.read())' ;;
         *) return 99 ;;
     esac
 }
@@ -290,7 +356,8 @@ git() {
 }
 '''
                     result = subprocess.run(["bash", "-c", shell + "\n".join(changed[0].repo_script_list[start:])],
-                        env=dict(os.environ, FAILURE=str(failure), TASK=task), capture_output=True, text=True, timeout=10)
+                        env=dict(os.environ, FAILURE=str(failure), TASK=task, REAL_PYTHON=sys.executable),
+                        capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 47 if failure else 0, result.stderr)
                     expected = copy.deepcopy(original)
                     expected.repo_script_list.insert(start + 1,
@@ -300,6 +367,10 @@ git() {
                         expected.repo_script_list.insert(start + 2,
                             "python -m pip install --no-deps setuptools==67.4.0")
                         expected_repairs.append("pylint-setuptools-67.4.0")
+                        # The separate source-path test executes and validates this
+                        # file-writing command; this seam checks dependency argv.
+                        expected.repo_script_list.insert(start + 3, changed[0].repo_script_list[start + 3])
+                        expected_repairs.append("pylint-7080-standalone-source-path")
                     expected.instance_image_tag = changed[0].instance_image_tag
                     self.assertEqual(changed[0], expected)
                     self.assertEqual(original, before)

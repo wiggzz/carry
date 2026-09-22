@@ -248,6 +248,18 @@ def transform_test_specs(
                 spec.repo_script_list.insert(index + 2,
                     "python -m pip install --no-deps setuptools==67.4.0")
                 repairs.append("pylint-setuptools-67.4.0")
+                # Historical Astroid discovers plugins via sys.path, not the PEP 660
+                # finder. Keep that finder intact; a standalone, non-pip-owned
+                # path file survives the evaluator's later editable reinstalls.
+                # Both preparation and the agent workspace use /testbed.
+                spec.repo_script_list.insert(index + 3,
+                    "python - <<'PY_PYLINT_SOURCE_PATH'\n"
+                    "from pathlib import Path\n"
+                    "import sysconfig\n"
+                    "(Path(sysconfig.get_path('purelib')) / 'carry_pylint_7080_source.pth')"
+                    ".write_text('/testbed\\n', encoding='utf-8')\n"
+                    "PY_PYLINT_SOURCE_PATH")
+                repairs.append("pylint-7080-standalone-source-path")
         if spec.instance_id in SPHINX_ROMAN_RECIPES:
             expected_version, expected_hash = SPHINX_ROMAN_RECIPES[spec.instance_id]
             if (spec.repo != "sphinx-doc/sphinx" or spec.version != expected_version
