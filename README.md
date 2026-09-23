@@ -148,6 +148,11 @@ not repeatedly while their arguments are being generated; the browser still show
 live shell-call previews. On Unix, run `cargo build && python3 tests/terminal_editor.py`
 for the editor’s pseudo-terminal smoke tests.
 
+Reedline is used only when stdin, stdout, and stderr are terminals. If either output
+stream is redirected, Carry uses the compatible line-oriented reader (`/paste`,
+`/end`, and `/cancel` remain available) so terminal protocol bytes never enter
+redirected stdout.
+
 Answers use lightweight terminal Markdown styling: colored headings, bold text,
 inline/fenced code, and muted block quotes. Lists, links, and tables remain readable
 Markdown source; code is colored as a block, not syntax-highlighted. Redirected
@@ -157,8 +162,9 @@ Your terminal's “scroll on output” setting controls whether new output scrol
 you back down.
 
 Model answer/commentary text is previewed as it streams, in both the browser
-and a terminal (on stderr when it is a TTY). Previews are provisional; completed
-answers are rendered as Markdown. A fully streamed terminal answer is not printed a second time at completion.
+and a terminal (on stderr when it is a TTY). Complete streamed lines receive the
+same lightweight Markdown styling as completed answers. Previews are provisional;
+a fully streamed terminal answer is not printed a second time at completion.
 If streaming was incomplete or stdout is redirected, the complete answer is still
 printed; redirected stdout remains suitable for piping. Tool arguments and context bookkeeping are not displayed
 as raw JSON. Private reasoning is not shown.

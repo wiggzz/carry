@@ -85,6 +85,54 @@ def check(pasted):
             os.close(master)
 
 
+def check_redirected_stdout():
+    with tempfile.TemporaryDirectory() as directory:
+        steps = os.path.join(directory, 'steps.jsonl')
+        context = {'protected': [], 'removable': [], 'remember': []}
+        with open(steps, 'w') as file:
+            file.write(json.dumps({
+                'action': {'kind': 'finish', 'answer': '# Answer'},
+                'context': context,
+            }) + '\n')
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 100, 0, 0))
+        session = os.path.join(directory, 'session')
+        process = subprocess.Popen(
+            ['target/debug/carry', '--interactive', '--scripted-steps', steps,
+             '--session-dir', session], stdin=slave, stdout=subprocess.PIPE, stderr=slave,
+            env=dict(os.environ, TERM='xterm-256color'))
+        os.close(slave)
+        terminal_output = bytearray()
+
+        def pump(seconds):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], .05)[0]:
+                    try:
+                        terminal_output.extend(os.read(master, 65536))
+                    except OSError:
+                        break
+
+        try:
+            pump(.3)
+            os.write(master, b'prompt\r')
+            pump(1)
+            os.write(master, b'/quit\r')
+            pump(.5)
+            assert process.poll() == 0, 'redirected interactive session failed to exit'
+            assert process.stdout is not None
+            stdout = process.stdout.read()
+            assert stdout == b'# Answer\n', stdout
+            assert b'\x1b[' not in stdout, stdout
+            assert b'terminal editor failed:' not in terminal_output, terminal_output
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            os.close(master)
+
+
 check(False)
 check(True)
-print('PTY checks passed: Alt+Enter, bracketed paste, draft preservation during output, exit.')
+check_redirected_stdout()
+print('PTY checks passed: Alt+Enter, bracketed paste, draft preservation, redirected stdout, exit.')
