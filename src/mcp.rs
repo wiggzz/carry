@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use rmcp::{
     ServiceExt,
-    model::{CallToolRequestParams, ClientInfo, JsonObject, Tool},
+    model::{CallToolRequestParams, ClientConfig, JsonObject, Tool},
     transport::{
         AuthClient, AuthError, AuthorizationManager, AuthorizationRequest, CredentialStore,
         StoredCredentials, StreamableHttpClientTransport, TokioChildProcess,
@@ -295,7 +295,7 @@ async fn server_tools(carry_home: &Path, name: &str, server: &Server) -> Result<
     match server {
         Server::Http { url } => {
             let transport = http_transport(carry_home, name, url).await?;
-            let client = ClientInfo::default()
+            let client = ClientConfig::default()
                 .serve(transport)
                 .await
                 .map_err(|error| {
@@ -323,7 +323,7 @@ async fn server_tools(carry_home: &Path, name: &str, server: &Server) -> Result<
             process.args(args);
             let transport = TokioChildProcess::new(process)
                 .with_context(|| format!("failed to start MCP server {name}"))?;
-            let client = ClientInfo::default()
+            let client = ClientConfig::default()
                 .serve(transport)
                 .await
                 .with_context(|| format!("failed to initialize MCP server {name}"))?;
@@ -350,7 +350,7 @@ async fn call_tool(
     match server {
         Server::Http { url } => {
             let transport = http_transport(carry_home, name, url).await?;
-            let client = ClientInfo::default()
+            let client = ClientConfig::default()
                 .serve(transport)
                 .await
                 .map_err(|error| {
@@ -378,7 +378,7 @@ async fn call_tool(
             process.args(args);
             let transport = TokioChildProcess::new(process)
                 .with_context(|| format!("failed to start MCP server {name}"))?;
-            let client = ClientInfo::default()
+            let client = ClientConfig::default()
                 .serve(transport)
                 .await
                 .with_context(|| format!("failed to initialize MCP server {name}"))?;
@@ -527,7 +527,7 @@ async fn authorize(carry_home: &Path, name: &str) -> Result<()> {
 async fn authorization_challenge(url: &str, name: &str) -> Result<String> {
     install_mcp_crypto_provider();
     let transport = StreamableHttpClientTransport::from_uri(url);
-    match ClientInfo::default().serve(transport).await {
+    match ClientConfig::default().serve(transport).await {
         Ok(client) => {
             client.cancel().await.ok();
             bail!("MCP server {name} does not require authorization");
