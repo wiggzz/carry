@@ -247,7 +247,10 @@ pub fn read_input(sender: tokio::sync::mpsc::UnboundedSender<crate::run::UserInp
             match input.line(&line) {
                 Entry::Message(message) => {
                     if sender
-                        .send(crate::run::UserInput::Message(message))
+                        .send(crate::run::UserInput::Message {
+                            message,
+                            submission_id: None,
+                        })
                         .is_err()
                     {
                         break;

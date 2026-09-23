@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
@@ -178,7 +178,10 @@ pub struct RunOutcome {
 
 #[derive(Debug)]
 pub enum UserInput {
-    Message(String),
+    Message {
+        message: String,
+        submission_id: Option<String>,
+    },
     Exit,
 }
 
@@ -557,7 +560,7 @@ impl Backend {
 }
 
 pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, None, None).await
+    run_loop(config, &mut backend, None, None, None).await
 }
 
 pub async fn run_interactive(
@@ -565,7 +568,7 @@ pub async fn run_interactive(
     mut backend: Backend,
     input: mpsc::UnboundedReceiver<UserInput>,
 ) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, Some(input), None).await
+    run_loop(config, &mut backend, Some(input), None, None).await
 }
 
 pub async fn run_interactive_with_events(
@@ -573,8 +576,16 @@ pub async fn run_interactive_with_events(
     mut backend: Backend,
     input: mpsc::UnboundedReceiver<UserInput>,
     events: broadcast::Sender<serde_json::Value>,
+    initial_submission_id: Option<String>,
 ) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, Some(input), Some(events)).await
+    run_loop(
+        config,
+        &mut backend,
+        Some(input),
+        Some(events),
+        initial_submission_id,
+    )
+    .await
 }
 
 async fn run_loop(
@@ -582,6 +593,7 @@ async fn run_loop(
     backend: &mut Backend,
     mut input: Option<mpsc::UnboundedReceiver<UserInput>>,
     events: Option<broadcast::Sender<serde_json::Value>>,
+    initial_submission_id: Option<String>,
 ) -> Result<RunOutcome> {
     let run_started = Instant::now();
     let prompt_cache_capabilities = backend.prompt_cache_capabilities();
@@ -655,13 +667,13 @@ async fn run_loop(
         let id = context_state.add_user(config.prompt.clone());
         logger.raw_event(
             "human_message",
-            json!({"context_id": id, "message": config.prompt}),
+            human_message_data(id, &config.prompt, initial_submission_id.as_deref()),
             &format!("  prompt [{id}] submitted"),
         )?;
     } else if !resumed {
         logger.raw_event(
             "human_message",
-            json!({"context_id": 1, "message": config.prompt}),
+            human_message_data(1, &config.prompt, initial_submission_id.as_deref()),
             "  prompt [1] submitted",
         )?;
     }
@@ -971,12 +983,16 @@ async fn run_loop(
                         drain_user_input(receiver, &mut context_state, &mut logger, &config)?;
                     if !should_exit && !had_messages {
                         match receiver.recv().await {
-                            Some(UserInput::Message(message)) => {
+                            Some(UserInput::Message {
+                                message,
+                                submission_id,
+                            }) => {
                                 append_user_message(
                                     &config,
                                     &mut context_state,
                                     &mut logger,
                                     message,
+                                    submission_id,
                                     false,
                                 )?;
                             }
@@ -1019,9 +1035,12 @@ fn drain_user_input(
     let mut had_messages = false;
     while let Ok(input) = receiver.try_recv() {
         match input {
-            UserInput::Message(message) => {
+            UserInput::Message {
+                message,
+                submission_id,
+            } => {
                 had_messages = true;
-                append_user_message(config, state, logger, message, true)?;
+                append_user_message(config, state, logger, message, submission_id, true)?;
             }
             UserInput::Exit => should_exit = true,
         }
@@ -1034,6 +1053,7 @@ fn append_user_message(
     state: &mut ContextState,
     logger: &mut RunLogger,
     message: String,
+    submission_id: Option<String>,
     steering: bool,
 ) -> Result<()> {
     let id = state.add_user(message.clone());
@@ -1044,10 +1064,18 @@ fn append_user_message(
     };
     logger.raw_event(
         "human_message",
-        json!({"context_id": id, "message": message}),
+        human_message_data(id, &message, submission_id.as_deref()),
         &terminal,
     )?;
     persist_context_checkpoint(config, state)
+}
+
+fn human_message_data(context_id: u64, message: &str, submission_id: Option<&str>) -> Value {
+    let mut data = json!({"context_id": context_id, "message": message});
+    if let Some(submission_id) = submission_id {
+        data["submission_id"] = json!(submission_id);
+    }
+    data
 }
 
 fn select_compaction_plan(
@@ -1655,6 +1683,22 @@ async fn write_final_artifacts(
 mod tests {
     use super::*;
     use crate::openai::PromptCacheCapabilities;
+
+    #[test]
+    fn human_message_event_preserves_submission_identity() {
+        assert_eq!(
+            human_message_data(7, "repeat", Some("submission-123")),
+            json!({
+                "context_id": 7,
+                "message": "repeat",
+                "submission_id": "submission-123"
+            })
+        );
+        assert_eq!(
+            human_message_data(7, "repeat", None),
+            json!({"context_id": 7, "message": "repeat"})
+        );
+    }
 
     fn openai_cache_capabilities() -> PromptCacheCapabilities {
         PromptCacheCapabilities {
@@ -2837,7 +2881,10 @@ mod tests {
         .unwrap();
         let (sender, receiver) = mpsc::unbounded_channel();
         sender
-            .send(UserInput::Message("do not change the JSON format".into()))
+            .send(UserInput::Message {
+                message: "do not change the JSON format".into(),
+                submission_id: None,
+            })
             .unwrap();
         drop(sender);
 
@@ -2891,7 +2938,10 @@ mod tests {
         .unwrap();
         let (sender, receiver) = mpsc::unbounded_channel();
         sender
-            .send(UserInput::Message("do not change the JSON format".into()))
+            .send(UserInput::Message {
+                message: "do not change the JSON format".into(),
+                submission_id: None,
+            })
             .unwrap();
         drop(sender);
 

@@ -334,7 +334,9 @@ async fn run_command(args: Cli) -> Result<()> {
             .recv()
             .await
         {
-            Some(UserInput::Message(prompt)) => prompt,
+            Some(UserInput::Message {
+                message: prompt, ..
+            }) => prompt,
             Some(UserInput::Exit) | None => return Ok(()),
         }
     };
