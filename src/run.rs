@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
@@ -171,13 +171,17 @@ pub enum Backend {
 #[derive(Debug)]
 pub struct RunOutcome {
     pub completed: bool,
+    pub answer_streamed: bool,
     pub answer: Option<String>,
     pub session_dir: PathBuf,
 }
 
 #[derive(Debug)]
 pub enum UserInput {
-    Message(String),
+    Message {
+        message: String,
+        submission_id: Option<String>,
+    },
     Exit,
 }
 
@@ -556,7 +560,7 @@ impl Backend {
 }
 
 pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, None, None).await
+    run_loop(config, &mut backend, None, None, None).await
 }
 
 pub async fn run_interactive(
@@ -564,7 +568,7 @@ pub async fn run_interactive(
     mut backend: Backend,
     input: mpsc::UnboundedReceiver<UserInput>,
 ) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, Some(input), None).await
+    run_loop(config, &mut backend, Some(input), None, None).await
 }
 
 pub async fn run_interactive_with_events(
@@ -572,8 +576,16 @@ pub async fn run_interactive_with_events(
     mut backend: Backend,
     input: mpsc::UnboundedReceiver<UserInput>,
     events: broadcast::Sender<serde_json::Value>,
+    initial_submission_id: Option<String>,
 ) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, Some(input), Some(events)).await
+    run_loop(
+        config,
+        &mut backend,
+        Some(input),
+        Some(events),
+        initial_submission_id,
+    )
+    .await
 }
 
 async fn run_loop(
@@ -581,6 +593,7 @@ async fn run_loop(
     backend: &mut Backend,
     mut input: Option<mpsc::UnboundedReceiver<UserInput>>,
     events: Option<broadcast::Sender<serde_json::Value>>,
+    initial_submission_id: Option<String>,
 ) -> Result<RunOutcome> {
     let run_started = Instant::now();
     let prompt_cache_capabilities = backend.prompt_cache_capabilities();
@@ -654,13 +667,13 @@ async fn run_loop(
         let id = context_state.add_user(config.prompt.clone());
         logger.raw_event(
             "human_message",
-            json!({"context_id": id, "message": config.prompt}),
+            human_message_data(id, &config.prompt, initial_submission_id.as_deref()),
             &format!("  prompt [{id}] submitted"),
         )?;
     } else if !resumed {
         logger.raw_event(
             "human_message",
-            json!({"context_id": 1, "message": config.prompt}),
+            human_message_data(1, &config.prompt, initial_submission_id.as_deref()),
             "  prompt [1] submitted",
         )?;
     }
@@ -696,6 +709,7 @@ async fn run_loop(
             persist_context_checkpoint(&config, &context_state)?;
             return Ok(RunOutcome {
                 completed: false,
+                answer_streamed: false,
                 answer: None,
                 session_dir: config.session_dir,
             });
@@ -740,6 +754,8 @@ async fn run_loop(
 
         let progress_events = events.clone();
         let mut last_progress = None;
+        let mut displayed_preview = String::new();
+        let mut stream_output = crate::terminal::StreamOutput::default();
         let reply = match backend
             .step_with_progress(&history, |progress| {
                 if last_progress
@@ -752,13 +768,26 @@ async fn run_loop(
                 {
                     return;
                 }
-                eprint!(
-                    "\r  model streaming · ~{} output tokens · {} events",
-                    progress.output_tokens, progress.output_events
-                );
+                let terminal_preview = progress
+                    .terminal_preview
+                    .as_ref()
+                    .unwrap_or(&progress.preview);
+                if !terminal_preview.is_empty() && *terminal_preview != displayed_preview {
+                    use std::io::IsTerminal;
+                    if std::io::stderr().is_terminal() {
+                        if let Some(delta) = terminal_preview.strip_prefix(&displayed_preview) {
+                            stream_output.push(delta);
+                        } else {
+                            stream_output
+                                .push(&format!("\n[stream restarted]\n{}", terminal_preview));
+                        }
+                        displayed_preview = terminal_preview.clone();
+                    }
+                }
                 if let Some(events) = &progress_events {
                     let _ = events.send(json!({"event":"model_progress", "data": {
                         "step": step_index,
+                        "preview": progress.preview,
                         "output_tokens": progress.output_tokens,
                         "reasoning_output_tokens": progress.reasoning_output_tokens,
                         "output_events": progress.output_events,
@@ -771,6 +800,9 @@ async fn run_loop(
         {
             Ok(reply) => reply,
             Err(error) => {
+                if !displayed_preview.is_empty() {
+                    stream_output.finish();
+                }
                 logger.raw_event(
                     "model_error",
                     json!({
@@ -787,8 +819,8 @@ async fn run_loop(
                 return Err(error);
             }
         };
-        if last_progress.is_some() {
-            eprintln!();
+        if !displayed_preview.is_empty() {
+            stream_output.finish();
         }
         metrics.record(&reply.usage, reply.latency_ms, reply.response_retries);
         sent_model_request = true;
@@ -800,6 +832,7 @@ async fn run_loop(
                 "response_id": reply.response_id,
                 "latency_ms": reply.latency_ms,
                 "response_retries": reply.response_retries,
+                "estimated_cost_usd": crate::openai::estimated_cost_usd(&config.model, &reply.usage),
                 "usage": reply.usage,
                 "parsed": &reply.step,
                 "raw": reply.raw
@@ -869,7 +902,7 @@ async fn run_loop(
                 persist_context_checkpoint(&config, &context_state)?;
 
                 if let Some(receiver) = input.as_mut()
-                    && drain_user_input(receiver, &mut context_state, &mut logger, &config)?
+                    && drain_user_input(receiver, &mut context_state, &mut logger, &config)?.0
                 {
                     write_final_artifacts(
                         &config,
@@ -883,6 +916,7 @@ async fn run_loop(
                     persist_context_checkpoint(&config, &context_state)?;
                     return Ok(RunOutcome {
                         completed: true,
+                        answer_streamed: false,
                         answer: None,
                         session_dir: config.session_dir,
                     });
@@ -935,20 +969,30 @@ async fn run_loop(
                     }),
                     &terminal_finished(step_index, &metrics.usage),
                 )?;
+                use std::io::IsTerminal;
+                let answer_streamed = !crate::terminal::should_print_answer(
+                    answer.as_deref().unwrap_or_default(),
+                    &displayed_preview,
+                    std::io::stdout().is_terminal(),
+                );
                 if let Some(receiver) = input.as_mut() {
-                    println!("{}", answer.as_deref().unwrap_or_default());
-                    let mut should_exit =
+                    if !answer_streamed {
+                        crate::terminal::print_answer(answer.as_deref().unwrap_or_default());
+                    }
+                    let (mut should_exit, had_messages) =
                         drain_user_input(receiver, &mut context_state, &mut logger, &config)?;
-                    if !should_exit {
-                        eprint!("carry> ");
-                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                    if !should_exit && !had_messages {
                         match receiver.recv().await {
-                            Some(UserInput::Message(message)) => {
+                            Some(UserInput::Message {
+                                message,
+                                submission_id,
+                            }) => {
                                 append_user_message(
                                     &config,
                                     &mut context_state,
                                     &mut logger,
                                     message,
+                                    submission_id,
                                     false,
                                 )?;
                             }
@@ -972,6 +1016,7 @@ async fn run_loop(
                 .await?;
                 return Ok(RunOutcome {
                     completed: true,
+                    answer_streamed,
                     answer,
                     session_dir: config.session_dir,
                 });
@@ -985,17 +1030,22 @@ fn drain_user_input(
     state: &mut ContextState,
     logger: &mut RunLogger,
     config: &RunConfig,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let mut should_exit = false;
+    let mut had_messages = false;
     while let Ok(input) = receiver.try_recv() {
         match input {
-            UserInput::Message(message) => {
-                append_user_message(config, state, logger, message, true)?;
+            UserInput::Message {
+                message,
+                submission_id,
+            } => {
+                had_messages = true;
+                append_user_message(config, state, logger, message, submission_id, true)?;
             }
             UserInput::Exit => should_exit = true,
         }
     }
-    Ok(should_exit)
+    Ok((should_exit, had_messages))
 }
 
 fn append_user_message(
@@ -1003,6 +1053,7 @@ fn append_user_message(
     state: &mut ContextState,
     logger: &mut RunLogger,
     message: String,
+    submission_id: Option<String>,
     steering: bool,
 ) -> Result<()> {
     let id = state.add_user(message.clone());
@@ -1013,10 +1064,18 @@ fn append_user_message(
     };
     logger.raw_event(
         "human_message",
-        json!({"context_id": id, "message": message}),
+        human_message_data(id, &message, submission_id.as_deref()),
         &terminal,
     )?;
     persist_context_checkpoint(config, state)
+}
+
+fn human_message_data(context_id: u64, message: &str, submission_id: Option<&str>) -> Value {
+    let mut data = json!({"context_id": context_id, "message": message});
+    if let Some(submission_id) = submission_id {
+        data["submission_id"] = json!(submission_id);
+    }
+    data
 }
 
 fn select_compaction_plan(
@@ -1624,6 +1683,22 @@ async fn write_final_artifacts(
 mod tests {
     use super::*;
     use crate::openai::PromptCacheCapabilities;
+
+    #[test]
+    fn human_message_event_preserves_submission_identity() {
+        assert_eq!(
+            human_message_data(7, "repeat", Some("submission-123")),
+            json!({
+                "context_id": 7,
+                "message": "repeat",
+                "submission_id": "submission-123"
+            })
+        );
+        assert_eq!(
+            human_message_data(7, "repeat", None),
+            json!({"context_id": 7, "message": "repeat"})
+        );
+    }
 
     fn openai_cache_capabilities() -> PromptCacheCapabilities {
         PromptCacheCapabilities {
@@ -2787,6 +2862,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_steering_at_finish_starts_another_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("session");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"finish","answer":"first"},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+                "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[2],"removable":[],"remember":[]}}"#,
+                "\n"
+            ),
+        )
+        .await
+        .unwrap();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        sender
+            .send(UserInput::Message {
+                message: "do not change the JSON format".into(),
+                submission_id: None,
+            })
+            .unwrap();
+        drop(sender);
+
+        let outcome = run_interactive(
+            RunConfig {
+                cwd: workspace,
+                prompt: "initial task".into(),
+                session_dir: session_dir.clone(),
+                model: "scripted".into(),
+                max_steps: None,
+                shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Economic,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 25,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
+                resume_context: None,
+                resume_source: None,
+                prompt_cache_key: None,
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+            receiver,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.completed);
+        assert_eq!(outcome.answer.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
     async fn interactive_steering_is_appended_after_the_completed_tool_result() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
@@ -2806,7 +2938,10 @@ mod tests {
         .unwrap();
         let (sender, receiver) = mpsc::unbounded_channel();
         sender
-            .send(UserInput::Message("do not change the JSON format".into()))
+            .send(UserInput::Message {
+                message: "do not change the JSON format".into(),
+                submission_id: None,
+            })
             .unwrap();
         drop(sender);
 

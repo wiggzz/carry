@@ -34,6 +34,7 @@ struct AppState {
 #[derive(Deserialize)]
 struct MessageRequest {
     message: String,
+    submission_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -41,7 +42,12 @@ struct Session {
     state: &'static str,
 }
 
-pub async fn serve(address: SocketAddr, config: RunConfig, backend: Backend) -> Result<()> {
+pub async fn serve(
+    address: SocketAddr,
+    config: RunConfig,
+    backend: Backend,
+    open_browser: bool,
+) -> Result<()> {
     let (input, receiver) = mpsc::unbounded_channel();
     let (events, _) = broadcast::channel(256);
     let shutdown = Arc::new(Notify::new());
@@ -62,7 +68,10 @@ pub async fn serve(address: SocketAddr, config: RunConfig, backend: Backend) -> 
                     eprintln!("Commands: /help, /quit, /exit");
                     continue;
                 } else {
-                    UserInput::Message(line.to_owned())
+                    UserInput::Message {
+                        message: line.to_owned(),
+                        submission_id: None,
+                    }
                 };
                 if console_input.send(command).is_err() {
                     break;
@@ -86,13 +95,19 @@ pub async fn serve(address: SocketAddr, config: RunConfig, backend: Backend) -> 
             shutdown_runner.notify_one();
             return;
         };
-        let UserInput::Message(prompt) = first_input else {
-            *runner_state.status.lock().await = "finished";
-            let _ = runner_state
-                .events
-                .send(json!({"event":"session_ended", "data":{"success":true}}));
-            shutdown_runner.notify_one();
-            return;
+        let (prompt, initial_submission_id) = match first_input {
+            UserInput::Message {
+                message,
+                submission_id,
+            } => (message, submission_id),
+            UserInput::Exit => {
+                *runner_state.status.lock().await = "finished";
+                let _ = runner_state
+                    .events
+                    .send(json!({"event":"session_ended", "data":{"success":true}}));
+                shutdown_runner.notify_one();
+                return;
+            }
         };
         *runner_state.status.lock().await = "running";
         let _ = runner_state
@@ -100,9 +115,14 @@ pub async fn serve(address: SocketAddr, config: RunConfig, backend: Backend) -> 
             .send(json!({"event":"session_started", "data":{"prompt":prompt}}));
         let mut config = config;
         config.prompt = prompt.clone();
-        let outcome =
-            run_interactive_with_events(config, backend, receiver, runner_state.events.clone())
-                .await;
+        let outcome = run_interactive_with_events(
+            config,
+            backend,
+            receiver,
+            runner_state.events.clone(),
+            initial_submission_id,
+        )
+        .await;
         let completed = outcome.as_ref().is_ok_and(|outcome| outcome.completed);
         *runner_state.status.lock().await = if completed { "finished" } else { "failed" };
         let _ = runner_state
@@ -118,6 +138,11 @@ pub async fn serve(address: SocketAddr, config: RunConfig, backend: Backend) -> 
         .route("/api/v1/events", get(sse_events))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(address).await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    eprintln!("carry web UI: {url}");
+    if open_browser {
+        crate::auth::open_browser(&url);
+    }
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.notified().await })
         .await?;
@@ -160,7 +185,10 @@ async fn message(
     }
     if state
         .input
-        .send(UserInput::Message(message.to_owned()))
+        .send(UserInput::Message {
+            message: message.to_owned(),
+            submission_id: request.submission_id,
+        })
         .is_err()
     {
         return (
@@ -267,15 +295,18 @@ mod tests {
             State(state),
             Json(MessageRequest {
                 message: "  steer right  ".to_owned(),
+                submission_id: Some("submission-123".to_owned()),
             }),
         )
         .await
         .into_response();
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        assert!(
-            matches!(receiver.recv().await, Some(UserInput::Message(message)) if message == "steer right")
-        );
+        assert!(matches!(
+            receiver.recv().await,
+            Some(UserInput::Message { message, submission_id })
+                if message == "steer right" && submission_id.as_deref() == Some("submission-123")
+        ));
     }
 
     #[test]

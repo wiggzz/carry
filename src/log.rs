@@ -119,7 +119,7 @@ impl RunLogger {
         if let Some(human) = human {
             writeln!(self.text, "{human}")?;
             self.text.flush()?;
-            eprintln!("{human}");
+            crate::terminal::output(human);
         }
         Ok(())
     }
