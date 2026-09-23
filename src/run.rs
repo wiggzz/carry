@@ -2838,6 +2838,7 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 25,
                 compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
