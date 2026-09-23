@@ -16,11 +16,13 @@ use tokio::{
 };
 
 use crate::{
+    auth,
     context::{
         CompactionPlan, CompactionPolicy, ContextState, FlatRolloutConfig, FlatRolloutEstimate,
         PricedBreakpoint, RenderedBreakpoint, meets_rollout_payback_threshold,
     },
     log::RunLogger,
+    mcp,
     openai::{
         ModelProgress, ModelReply, OpenAiClient, PromptCacheCapabilities, Usage,
         prompt_cache_capabilities,
@@ -34,6 +36,8 @@ Make task progress first: understand the request, investigate, implement, and ve
 
 Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
 
+MCP tools are available through the exact Carry executable in `$CARRY_SELF`. Discover tool names with `"$CARRY_SELF" mcp list` or scope discovery with `"$CARRY_SELF" mcp list --server SERVER`, inspect a tool's full description and schema with `"$CARRY_SELF" mcp describe SERVER/TOOL`, and invoke it with `"$CARRY_SELF" mcp call SERVER/TOOL '{"argument":"value"}'`. For complex arguments, pipe a JSON object to `"$CARRY_SELF" mcp call SERVER/TOOL --stdin`. MCP command output is JSON by default; `--json-pointer /path/to/value` selects part of call output and prints a selected string as raw text unless `--json` is passed. If a server requires authorization, ask the user to run `"$CARRY_SELF" mcp auth SERVER`.
+
 Large stdout and stderr results arrive in separate structured sections. Each text payload is unmodified; truncation, encoding, and artifact-path metadata are outside that payload. Read or slice the relevant stdout/stderr artifact when omitted details matter.
 
 History is a working set, not a complete transcript. Human-authored content is kept by default. All other context is eligible for removal when it no longer fits the working set. After the first removal, a history-status item states that earlier context has been removed.
@@ -41,6 +45,16 @@ History is a working set, not a complete transcript. Human-authored content is k
 As required secondary housekeeping, preserve task-critical working state from recently added visible context. This is required, not optional cleanup: protect exact facts, decisions, constraints, diagnoses, and verified results that will matter to later work. If you learned anything from an item that is not already preserved elsewhere, protect it. If only a concise learning must remain, remember it and leave its bulky source removable, or mark it removable if it was protected. Leave or mark an item removable only when it taught you nothing or everything learned from it is preserved elsewhere. Finishing an action or encountering a failure does not by itself preserve its learning.
 
 Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise. Preserve outcomes, not chain-of-thought."#;
+
+fn system_prompt(mcp_servers: &[String]) -> String {
+    if mcp_servers.is_empty() {
+        return SYSTEM_PROMPT.to_owned();
+    }
+    format!(
+        "{SYSTEM_PROMPT}\nConfigured MCP servers: {}.\n",
+        mcp_servers.join(", ")
+    )
+}
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -506,9 +520,13 @@ impl Backend {
         }
     }
 
-    fn request_body(&self, history: &[serde_json::Value]) -> Option<serde_json::Value> {
+    fn request_body(
+        &self,
+        system_prompt: &str,
+        history: &[serde_json::Value],
+    ) -> Option<serde_json::Value> {
         match self {
-            Self::OpenAi(client) => Some(client.request_body(SYSTEM_PROMPT, history)),
+            Self::OpenAi(client) => Some(client.request_body(system_prompt, history)),
             Self::Scripted { .. } => None,
         }
     }
@@ -525,6 +543,7 @@ impl Backend {
 
     async fn step_with_progress<F>(
         &mut self,
+        system_prompt: &str,
         history: &[serde_json::Value],
         progress: F,
     ) -> Result<ModelReply>
@@ -534,7 +553,7 @@ impl Backend {
         match self {
             Self::OpenAi(client) => {
                 client
-                    .step_with_progress(SYSTEM_PROMPT, history, progress)
+                    .step_with_progress(system_prompt, history, progress)
                     .await
             }
             Self::Scripted { steps, emitted } => {
@@ -596,6 +615,11 @@ async fn run_loop(
     initial_submission_id: Option<String>,
 ) -> Result<RunOutcome> {
     let run_started = Instant::now();
+    let mcp_servers = auth::carry_home()
+        .ok()
+        .and_then(|home| mcp::configured_server_names(&home).ok())
+        .unwrap_or_default();
+    let system_prompt = system_prompt(&mcp_servers);
     let prompt_cache_capabilities = backend.prompt_cache_capabilities();
     let implicit_cache_minimum_prefix_tokens =
         backend.implicit_cache_minimum_prefix_tokens(&config.model);
@@ -740,7 +764,7 @@ async fn run_loop(
             context_state.estimated_tokens(),
         );
         protected_until_request.clear();
-        let request = backend.request_body(&history);
+        let request = backend.request_body(&system_prompt, &history);
         let request_started = Instant::now();
         logger.raw_event_silent(
             "model_request",
@@ -757,7 +781,7 @@ async fn run_loop(
         let mut displayed_preview = String::new();
         let mut stream_output = crate::terminal::StreamOutput::default();
         let reply = match backend
-            .step_with_progress(&history, |progress| {
+            .step_with_progress(&system_prompt, &history, |progress| {
                 if last_progress
                     .as_ref()
                     .is_some_and(|previous: &ModelProgress| {
@@ -1279,6 +1303,13 @@ fn compact_bytes(value: usize) -> String {
     }
 }
 
+fn current_executable() -> Result<PathBuf> {
+    std::env::current_exe()
+        .context("failed to locate the running carry executable")?
+        .canonicalize()
+        .context("failed to canonicalize the running carry executable")
+}
+
 async fn execute_shell(
     cwd: &Path,
     run_dir: &Path,
@@ -1292,6 +1323,7 @@ async fn execute_shell(
         .arg("-lc")
         .arg(command)
         .current_dir(cwd)
+        .env("CARRY_SELF", current_executable()?)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1766,6 +1798,15 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_surfaces_configured_mcp_servers() {
+        let prompt = system_prompt(&["github".into(), "notion".into()]);
+        assert!(prompt.contains("Configured MCP servers: github, notion."));
+        assert!(prompt.contains("mcp list --server SERVER"));
+        assert!(prompt.contains("selected string as raw text"));
+        assert!(prompt.contains("--json"));
+    }
+
+    #[test]
     fn system_prompt_requires_reproduction_and_root_cause_investigation() {
         assert!(SYSTEM_PROMPT.contains("minimal failing reproduction"));
         assert!(SYSTEM_PROMPT.contains("affected tests"));
@@ -1773,6 +1814,10 @@ mod tests {
             "identify the root cause and make the smallest correct fix at the appropriate layer"
         ));
         assert!(SYSTEM_PROMPT.contains("use local history to investigate regressions"));
+        assert!(SYSTEM_PROMPT.contains("$CARRY_SELF"));
+        assert!(SYSTEM_PROMPT.contains("mcp describe SERVER/TOOL"));
+        assert!(SYSTEM_PROMPT.contains("--stdin"));
+        assert!(SYSTEM_PROMPT.contains("--json-pointer"));
         assert!(!SYSTEM_PROMPT.contains("later fixes"));
         assert!(!SYSTEM_PROMPT.contains("upstream fix"));
     }
