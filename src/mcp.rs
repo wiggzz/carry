@@ -139,23 +139,25 @@ fn add(carry_home: &Path, name: String, url: Option<String>, command: Vec<String
         }
     };
     let mut config = load(carry_home)?;
-    let changed = config.servers.get(&name).is_some_and(|old| old != &server);
-    config.servers.insert(name.clone(), server);
-    save(carry_home, &config)?;
-    if changed {
+    let credentials_must_be_cleared = config.servers.get(&name) != Some(&server);
+    if credentials_must_be_cleared {
         clear_credentials(carry_home, &name)?;
     }
+    config.servers.insert(name.clone(), server);
+    save(carry_home, &config)?;
     println!("added MCP server {name}");
     Ok(())
 }
 
 fn remove(carry_home: &Path, name: &str) -> Result<()> {
+    validate_name(name)?;
     let mut config = load(carry_home)?;
-    if config.servers.remove(name).is_none() {
+    if !config.servers.contains_key(name) {
         bail!("MCP server not found: {name}");
     }
-    save(carry_home, &config)?;
     clear_credentials(carry_home, name)?;
+    config.servers.remove(name);
+    save(carry_home, &config)?;
     println!("removed MCP server {name}");
     Ok(())
 }
@@ -426,14 +428,15 @@ impl CredentialStore for FileCredentialStore {
     }
 }
 
-fn credential_store(carry_home: &Path, name: &str) -> FileCredentialStore {
-    FileCredentialStore {
+fn credential_store(carry_home: &Path, name: &str) -> Result<FileCredentialStore> {
+    validate_name(name)?;
+    Ok(FileCredentialStore {
         path: carry_home.join(AUTH_DIR).join(format!("{name}.json")),
-    }
+    })
 }
 
 fn clear_credentials(carry_home: &Path, name: &str) -> Result<()> {
-    let path = credential_store(carry_home, name).path;
+    let path = credential_store(carry_home, name)?.path;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -450,7 +453,7 @@ async fn authorization_manager(
     let mut manager = AuthorizationManager::new(url)
         .await
         .context("failed to initialize MCP OAuth")?;
-    manager.set_credential_store(credential_store(carry_home, name));
+    manager.set_credential_store(credential_store(carry_home, name)?);
     manager
         .initialize_from_store()
         .await
@@ -613,8 +616,23 @@ fn save_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.contains('/') || name.chars().any(char::is_whitespace) {
-        bail!("MCP server name must be non-empty and contain no whitespace or `/`");
+    let portable = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    let windows_stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let windows_device = matches!(windows_stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((windows_stem.starts_with("COM") || windows_stem.starts_with("LPT"))
+            && windows_stem.len() == 4
+            && matches!(windows_stem.as_bytes()[3], b'1'..=b'9'));
+    if !portable || windows_device {
+        bail!(
+            "MCP server name must use only ASCII letters, digits, `.`, `-`, or `_` and must not be a Windows device name"
+        );
     }
     Ok(())
 }
@@ -626,8 +644,16 @@ pub(crate) fn configured_server_names(carry_home: &Path) -> Result<Vec<String>> 
 fn load(carry_home: &Path) -> Result<Config> {
     let path = carry_home.join(CONFIG_FILE);
     match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse MCP configuration: {}", path.display())),
+        Ok(bytes) => {
+            let config: Config = serde_json::from_slice(&bytes).with_context(|| {
+                format!("failed to parse MCP configuration: {}", path.display())
+            })?;
+            for name in config.servers.keys() {
+                validate_name(name)
+                    .with_context(|| format!("invalid MCP server name in configuration: {name}"))?;
+            }
+            Ok(config)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(error) => Err(error)
             .with_context(|| format!("failed to read MCP configuration: {}", path.display())),
@@ -635,6 +661,9 @@ fn load(carry_home: &Path) -> Result<Config> {
 }
 
 fn save(carry_home: &Path, config: &Config) -> Result<()> {
+    for name in config.servers.keys() {
+        validate_name(name).with_context(|| format!("invalid MCP server name: {name}"))?;
+    }
     std::fs::create_dir_all(carry_home)
         .with_context(|| format!("failed to create Carry home: {}", carry_home.display()))?;
     #[cfg(unix)]
@@ -713,7 +742,7 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let credentials = credential_store(home.path(), "remote").path;
+        let credentials = credential_store(home.path(), "remote").unwrap().path;
         save_private_json(
             &credentials,
             &StoredCredentials::new("client".into(), None, vec![], None),
@@ -724,6 +753,130 @@ mod tests {
 
         assert!(!load(home.path()).unwrap().servers.contains_key("remote"));
         assert!(!credentials.exists());
+    }
+
+    #[test]
+    fn failed_credential_clear_does_not_publish_replacement_server() {
+        let home = tempdir().unwrap();
+        add(
+            home.path(),
+            "remote".into(),
+            Some("https://one.example/mcp".into()),
+            vec![],
+        )
+        .unwrap();
+        let credentials = credential_store(home.path(), "remote").unwrap().path;
+        std::fs::create_dir_all(&credentials).unwrap();
+
+        let error = add(
+            home.path(),
+            "remote".into(),
+            Some("https://two.example/mcp".into()),
+            vec![],
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to clear MCP credentials")
+        );
+        assert!(matches!(
+            &load(home.path()).unwrap().servers["remote"],
+            Server::Http { url } if url == "https://one.example/mcp"
+        ));
+        assert!(credentials.is_dir());
+    }
+
+    #[test]
+    fn failed_credential_clear_does_not_remove_server() {
+        let home = tempdir().unwrap();
+        add(
+            home.path(),
+            "remote".into(),
+            Some("https://example.test/mcp".into()),
+            vec![],
+        )
+        .unwrap();
+        let credentials = credential_store(home.path(), "remote").unwrap().path;
+        std::fs::create_dir_all(&credentials).unwrap();
+
+        let error = remove(home.path(), "remote").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to clear MCP credentials")
+        );
+        assert!(load(home.path()).unwrap().servers.contains_key("remote"));
+        assert!(credentials.is_dir());
+    }
+
+    #[test]
+    fn first_add_clears_stale_credentials() {
+        let home = tempdir().unwrap();
+        let credentials = credential_store(home.path(), "remote").unwrap().path;
+        save_private_json(
+            &credentials,
+            &StoredCredentials::new("client".into(), None, vec![], None),
+        )
+        .unwrap();
+
+        add(
+            home.path(),
+            "remote".into(),
+            Some("https://example.test/mcp".into()),
+            vec![],
+        )
+        .unwrap();
+
+        assert!(!credentials.exists());
+    }
+
+    #[test]
+    fn rejects_non_portable_server_names() {
+        for name in [
+            "",
+            "../mcp",
+            "..\\mcp",
+            r"C:\mcp",
+            r"\\server\share",
+            "bad name",
+            "bad:name",
+            "CON",
+            "com1.json",
+            "LPT9",
+        ] {
+            assert!(validate_name(name).is_err(), "accepted unsafe name: {name}");
+        }
+        for name in ["github", "notion-prod_1", "example.com"] {
+            validate_name(name).unwrap();
+        }
+    }
+
+    #[test]
+    fn load_rejects_unsafe_server_names_from_existing_config() {
+        let home = tempdir().unwrap();
+        let config = Config {
+            servers: BTreeMap::from([(
+                "..\\mcp".into(),
+                Server::Http {
+                    url: "https://example.test/mcp".into(),
+                },
+            )]),
+        };
+        std::fs::write(
+            home.path().join(CONFIG_FILE),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+
+        let error = load(home.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid MCP server name in configuration")
+        );
     }
 
     #[tokio::test]
@@ -897,7 +1050,7 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let credentials = credential_store(home.path(), "remote").path;
+        let credentials = credential_store(home.path(), "remote").unwrap().path;
         save_private_json(
             &credentials,
             &StoredCredentials::new("client".into(), None, vec![], None),
