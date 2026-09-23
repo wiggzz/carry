@@ -25,6 +25,10 @@ const document = {
 const sandbox = {
   document,
   window: { addEventListener() {}, innerHeight: 0, scrollTo() {}, scrollY: 0, location: 'http://localhost/' },
+  crypto: {
+    ids: ['submission-a', 'submission-b', 'submission-c', 'submission-d', 'submission-e'],
+    randomUUID() { return this.ids.shift(); },
+  },
   setInterval() {},
   setTimeout() { return 0; },
   clearTimeout() {},
@@ -60,16 +64,60 @@ assert.equal(vm.runInContext('modelProgress', sandbox), null);
 assert.ok(![...elements.values()].flatMap(el => el.children).some(el => el.textContent === 'Model response received'), 'completion should not leave a redundant response-received item');
 
 (async () => {
-  sandbox.fetch = () => new Promise(() => {});
+  let request;
+  sandbox.fetch = (_url, options) => {
+    request = JSON.parse(options.body);
+    return new Promise(() => {});
+  };
   vm.runInContext("text.value='please add tests'; send();", sandbox);
   assert.equal(vm.runInContext('pendingMessages.length', sandbox), 1);
   assert.ok(elements.get('#queued')?.children.includes(vm.runInContext('pendingMessages[0].el', sandbox)), 'pending input must stay beside composer, outside timeline');
   assert.equal(vm.runInContext('pendingMessages[0].el.textContent', sandbox), 'You (sending): please add tests');
+  assert.equal(request.submission_id, 'submission-a', 'each submission must carry a client-generated identity');
   const draft=vm.runInContext('pendingMessages[0].el', sandbox);
-  vm.runInContext("event({event:'human_message',data:{message:'please add tests'}})", sandbox);
+  vm.runInContext("event({event:'human_message',data:{message:'please add tests',submission_id:'submission-a'}})", sandbox);
   assert.equal(draft.removed,true);
   assert.ok(elements.get('#activity').children.some(el=>el.textContent==='You: please add tests'));
   assert.equal(vm.runInContext('pendingMessages.length', sandbox), 0);
+
+  let rejectReplay;
+  sandbox.fetch = (_url, options) => {
+    request = JSON.parse(options.body);
+    return new Promise((_resolve, reject) => { rejectReplay = reject; });
+  };
+  vm.runInContext("replaying=true; text.value='repeat'; send();", sandbox);
+  const replayDraft=vm.runInContext('pendingMessages[0].el', sandbox);
+  assert.equal(request.submission_id, 'submission-b');
+  vm.runInContext("event({event:'human_message',data:{message:'repeat',submission_id:'historical-submission'}})", sandbox);
+  assert.equal(vm.runInContext('pendingMessages.length', sandbox), 1, 'replayed same-text history must not confirm a new submission');
+  assert.notEqual(replayDraft.removed, true);
+  rejectReplay(new Error('offline'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(vm.runInContext('pendingMessages.length', sandbox), 0);
+  assert.equal(vm.runInContext('text.value', sandbox), 'repeat', 'a failed POST must restore the unconfirmed draft');
+  assert.match(replayDraft.textContent, /^Not confirmed — check before resending:/);
+
+  sandbox.fetch = () => new Promise(() => {});
+  vm.runInContext("replaying=true; text.value='race'; send();", sandbox);
+  const replayedMatch=vm.runInContext('pendingMessages[0].el', sandbox);
+  vm.runInContext("event({event:'human_message',data:{message:'race',submission_id:'submission-c'}})", sandbox);
+  assert.equal(vm.runInContext('pendingMessages.length', sandbox), 0, 'an exact identity may confirm a submission captured by the replay snapshot');
+  assert.equal(replayedMatch.removed, true);
+
+  const duplicateRequests = [];
+  sandbox.fetch = (_url, options) => {
+    duplicateRequests.push(JSON.parse(options.body));
+    return new Promise(() => {});
+  };
+  vm.runInContext("replaying=false; text.value='same'; send(); text.value='same'; send();", sandbox);
+  assert.deepEqual(duplicateRequests.map(value => value.submission_id), ['submission-d', 'submission-e']);
+  const firstDuplicate=vm.runInContext('pendingMessages[0].el', sandbox);
+  const secondDuplicate=vm.runInContext('pendingMessages[1].el', sandbox);
+  vm.runInContext("event({event:'human_message',data:{message:'same',submission_id:'submission-e'}})", sandbox);
+  assert.equal(vm.runInContext('pendingMessages.length', sandbox), 1, 'an acknowledgement must remove only its matching submission');
+  assert.equal(vm.runInContext('pendingMessages[0].submissionId', sandbox), 'submission-d');
+  assert.notEqual(firstDuplicate.removed, true);
+  assert.equal(secondDuplicate.removed, true);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 vm.runInContext(`
 const usageEvent={run_id:'usage',seq:1,event:'model_response',data:{step:4,usage:{input_tokens:1200,cached_input_tokens:800,output_tokens:75,total_tokens:1275}}};

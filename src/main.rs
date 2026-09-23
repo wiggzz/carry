@@ -336,7 +336,9 @@ async fn run_command(args: Cli) -> Result<()> {
             .recv()
             .await
         {
-            Some(UserInput::Message(prompt)) => prompt,
+            Some(UserInput::Message {
+                message: prompt, ..
+            }) => prompt,
             Some(UserInput::Exit) | None => return Ok(()),
         }
     };
@@ -500,7 +502,13 @@ fn spawn_input_reader() -> mpsc::UnboundedReceiver<UserInput> {
             let Ok(line) = line else { break };
             match input.line(&line) {
                 terminal::Entry::Message(message) => {
-                    if sender.send(UserInput::Message(message)).is_err() {
+                    if sender
+                        .send(UserInput::Message {
+                            message,
+                            submission_id: None,
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                 }
