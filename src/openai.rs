@@ -369,10 +369,10 @@ impl OpenAiClient {
                     }
                     retries += 1;
                     retry_wait += delay;
-                    eprintln!(
+                    crate::terminal::output(&format!(
                         "Responses API transport error: {error}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
                         delay.as_millis(),
-                    );
+                    ));
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -408,10 +408,10 @@ impl OpenAiClient {
                         }
                         retries += 1;
                         retry_wait += delay;
-                        eprintln!(
+                        crate::terminal::output(&format!(
                             "Responses API stream read failed: {error}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
                             delay.as_millis(),
-                        );
+                        ));
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -433,10 +433,10 @@ impl OpenAiClient {
                     }
                     retries += 1;
                     retry_wait += delay;
-                    eprintln!(
+                    crate::terminal::output(&format!(
                         "Responses API response body read failed: {error}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
                         delay.as_millis(),
-                    );
+                    ));
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -475,15 +475,15 @@ impl OpenAiClient {
                         "server backoff of {}ms exceeds the remaining retry wait budget",
                         delay.as_millis()
                     );
-                    eprintln!("Responses API returned {status}; {reason}");
+                    crate::terminal::output(&format!("Responses API returned {status}; {reason}"));
                     retry_stopped_reason = Some(reason);
                 } else {
                     retries += 1;
                     retry_wait += delay;
-                    eprintln!(
+                    crate::terminal::output(&format!(
                         "Responses API returned {status}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
                         delay.as_millis(),
-                    );
+                    ));
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -833,11 +833,7 @@ where
                 current.preview = partial_string_field(&current.arguments, field);
                 if current.function_name == "shell" {
                     let command = partial_string_field(&current.arguments, "command");
-                    current.terminal_preview = Some(if command.is_empty() {
-                        String::new()
-                    } else {
-                        format!("$ {command}")
-                    });
+                    current.terminal_preview = Some(String::new());
                     if !command.is_empty() {
                         current
                             .preview
@@ -960,7 +956,7 @@ mod tests {
             );
             previous = text.clone();
         }
-        assert_eq!(previous, "$ echo hello");
+        assert_eq!(previous, "");
     }
 
     #[test]

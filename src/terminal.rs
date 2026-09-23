@@ -43,9 +43,49 @@ impl Input {
                 Entry::Notice("Multiline input: /end on its own line sends; /cancel discards.")
             }
             "/help" => Entry::Notice(
-                "Enter sends. /paste starts multiline input; /end sends; /cancel discards. /quit or /exit exits. EOF discards unfinished drafts.",
+                "Enter sends; Alt+Enter or Ctrl+J inserts a newline; paste inserts without sending. Ctrl+C clears the draft. /paste also starts multiline input; /end sends; /cancel discards. /quit or /exit exits. EOF discards unfinished drafts.",
             ),
             _ => Entry::Message(line.to_owned()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct MarkdownRenderer {
+    fence: Option<String>,
+}
+
+impl MarkdownRenderer {
+    fn render_line(&mut self, line: &str, color: bool) -> Option<String> {
+        if !color {
+            return Some(line.to_owned());
+        }
+        let trimmed = line.trim_start();
+        if let Some(marker) = self.fence.as_deref() {
+            if trimmed.starts_with(marker) {
+                self.fence = None;
+                None
+            } else {
+                Some(format!("\x1b[33m{line}\x1b[0m"))
+            }
+        } else if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            let marker = if trimmed.starts_with("```") {
+                "```"
+            } else {
+                "~~~"
+            };
+            self.fence = Some(marker.to_owned());
+            let language = trimmed[3..].trim();
+            (!language.is_empty()).then(|| format!("\x1b[2m{language}\x1b[0m"))
+        } else {
+            let heading = trimmed.bytes().take_while(|c| *c == b'#').count();
+            if (1..=6).contains(&heading) && trimmed[heading..].starts_with(' ') {
+                Some(format!("\x1b[1;36m{}\x1b[0m", &trimmed[heading + 1..]))
+            } else if trimmed.starts_with("> ") {
+                Some(format!("\x1b[2m{line}\x1b[0m"))
+            } else {
+                Some(inline(line))
+            }
         }
     }
 }
@@ -56,35 +96,11 @@ pub fn markdown(text: &str, color: bool) -> String {
     if !color {
         return text.to_owned();
     }
-    let mut fence: Option<&str> = None;
+    let mut renderer = MarkdownRenderer::default();
     let mut output = Vec::new();
     for line in text.lines() {
-        let trimmed = line.trim_start();
-        if let Some(marker) = fence {
-            if trimmed.starts_with(marker) {
-                fence = None;
-                continue;
-            }
-            output.push(format!("\x1b[33m{line}\x1b[0m"));
-        } else if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fence = Some(if trimmed.starts_with("```") {
-                "```"
-            } else {
-                "~~~"
-            });
-            let language = trimmed[3..].trim();
-            if !language.is_empty() {
-                output.push(format!("\x1b[2m{language}\x1b[0m"));
-            }
-        } else {
-            let heading = trimmed.bytes().take_while(|c| *c == b'#').count();
-            if (1..=6).contains(&heading) && trimmed[heading..].starts_with(' ') {
-                output.push(format!("\x1b[1;36m{}\x1b[0m", &trimmed[heading + 1..]));
-            } else if trimmed.starts_with("> ") {
-                output.push(format!("\x1b[2m{line}\x1b[0m"));
-            } else {
-                output.push(inline(line));
-            }
+        if let Some(line) = renderer.render_line(line, true) {
+            output.push(line);
         }
     }
     let mut rendered = output.join("\n");
@@ -117,16 +133,26 @@ fn inline(text: &str) -> String {
     result
 }
 
-pub fn print_answer(text: &str) {
-    let color = std::io::stdout().is_terminal()
+fn color_enabled(is_terminal: bool) -> bool {
+    is_terminal
         && std::env::var_os("NO_COLOR").is_none()
-        && std::env::var("TERM").as_deref() != Ok("dumb");
-    println!("{}", markdown(text, color));
+        && std::env::var("TERM").as_deref() != Ok("dumb")
+}
+
+pub fn print_answer(text: &str) {
+    let rendered = markdown(text, color_enabled(std::io::stdout().is_terminal()));
+    if std::io::stdout().is_terminal() && editor_active() {
+        output(&rendered);
+    } else {
+        println!("{rendered}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static STREAM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn multiline_preserves_indentation_blank_lines_and_literal_commands() {
@@ -160,5 +186,232 @@ mod tests {
     fn redirected_and_no_color_output_preserve_markdown() {
         let text = "# Heading\n**bold** and `code`\n";
         assert_eq!(markdown(text, false), text);
+    }
+
+    #[test]
+    fn streamed_markdown_preserves_blank_lines_and_fenced_code_styling() {
+        let _serial = STREAM_TEST_LOCK.lock().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        *PRINTER.lock().unwrap() = Some(Box::new(move |message| {
+            for line in message.lines() {
+                sink.lock().unwrap().push(line.to_owned());
+            }
+        }));
+
+        let mut output = StreamOutput::with_color(true);
+        output.push("# Heading\n\n```rust\n  let x = 1;\n```\n");
+        output.finish();
+        *PRINTER.lock().unwrap() = None;
+
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![
+                "\x1b[1;36mHeading\x1b[0m",
+                "",
+                "\x1b[2mrust\x1b[0m",
+                "\x1b[33m  let x = 1;\x1b[0m",
+            ]
+        );
+    }
+}
+
+/// Redirected stdout must always receive the complete answer, even when stderr
+/// was used for a live preview.
+pub fn should_print_answer(answer: &str, streamed: &str, stdout_is_terminal: bool) -> bool {
+    !stdout_is_terminal || streamed.is_empty() || answer != streamed
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    #[test]
+    fn completed_stream_is_not_printed_twice_but_redirects_and_partial_streams_are_complete() {
+        assert!(!should_print_answer("hello", "hello", true));
+        assert!(should_print_answer("hello", "hello", false));
+        assert!(should_print_answer("hello", "hel", true));
+        assert!(should_print_answer("hello", "", true));
+    }
+}
+
+type Printer = Box<dyn FnMut(String) + Send>;
+static PRINTER: std::sync::Mutex<Option<Printer>> = std::sync::Mutex::new(None);
+
+pub fn output(message: &str) {
+    let mut printer = PRINTER.lock().unwrap();
+    if let Some(print) = printer.as_mut() {
+        print(message.to_owned());
+    } else {
+        eprintln!("{message}");
+    }
+}
+
+pub fn editor_active() -> bool {
+    PRINTER.lock().unwrap().is_some()
+}
+
+pub fn read_input(sender: tokio::sync::mpsc::UnboundedSender<crate::run::UserInput>) {
+    let result = if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
+        read_reedline_input(&sender)
+    } else {
+        read_basic_input(&sender)
+    };
+    *PRINTER.lock().unwrap() = None;
+    if let Err(error) = result {
+        eprintln!("terminal editor failed: {error}");
+    }
+    let _ = sender.send(crate::run::UserInput::Exit);
+}
+
+fn read_basic_input(
+    sender: &tokio::sync::mpsc::UnboundedSender<crate::run::UserInput>,
+) -> std::io::Result<()> {
+    use std::io::{BufRead, Write};
+
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let mut input = Input::default();
+    loop {
+        eprint!("carry> ");
+        std::io::stderr().flush()?;
+        let Some(line) = lines.next() else { break };
+        match input.line(&line?) {
+            Entry::Message(message) => {
+                if sender
+                    .send(crate::run::UserInput::Message {
+                        message,
+                        submission_id: None,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Entry::Notice(message) => output(message),
+            Entry::Exit => break,
+            Entry::Pending => {}
+        }
+    }
+    Ok(())
+}
+
+fn read_reedline_input(
+    sender: &tokio::sync::mpsc::UnboundedSender<crate::run::UserInput>,
+) -> std::io::Result<()> {
+    use reedline::{
+        DefaultPrompt, DefaultPromptSegment, EditCommand, Emacs, ExternalPrinter, KeyCode,
+        KeyModifiers, Reedline, ReedlineEvent, Signal, default_emacs_keybindings,
+    };
+    let mut keys = default_emacs_keybindings();
+    for (modifiers, key) in [
+        (KeyModifiers::ALT, KeyCode::Enter),
+        (KeyModifiers::SHIFT, KeyCode::Enter),
+        (KeyModifiers::CONTROL, KeyCode::Char('j')),
+    ] {
+        keys.add_binding(
+            modifiers,
+            key,
+            ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
+        );
+    }
+    let printer = ExternalPrinter::default();
+    let mut editor = Reedline::create()
+        .with_edit_mode(Box::new(Emacs::new(keys)))
+        .use_bracketed_paste(true)
+        .with_external_printer(printer.clone())
+        .with_ansi_colors(std::env::var_os("NO_COLOR").is_none());
+    *PRINTER.lock().unwrap() = Some(Box::new(move |message| {
+        let _ = printer.print(message);
+    }));
+    let prompt = DefaultPrompt {
+        left_prompt: DefaultPromptSegment::Basic("carry".into()),
+        right_prompt: DefaultPromptSegment::Empty,
+    };
+    let mut input = Input::default();
+    loop {
+        let line = match editor.read_line(&prompt)? {
+            Signal::Success(line) => line,
+            Signal::CtrlC => {
+                input = Input::default();
+                continue;
+            }
+            Signal::CtrlD => break,
+        };
+        match input.line(&line) {
+            Entry::Message(message) => {
+                if sender
+                    .send(crate::run::UserInput::Message {
+                        message,
+                        submission_id: None,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Entry::Notice(message) => output(message),
+            Entry::Exit => break,
+            Entry::Pending => {}
+        }
+    }
+    Ok(())
+}
+
+/// External printers work in lines: buffer a partial line rather than repainting
+/// the input for every token or putting every fragment on its own line.
+pub struct StreamOutput {
+    pending: String,
+    renderer: MarkdownRenderer,
+    color: bool,
+}
+
+impl Default for StreamOutput {
+    fn default() -> Self {
+        Self::with_color(color_enabled(std::io::stderr().is_terminal()))
+    }
+}
+
+impl StreamOutput {
+    fn with_color(color: bool) -> Self {
+        Self {
+            pending: String::new(),
+            renderer: MarkdownRenderer::default(),
+            color,
+        }
+    }
+
+    fn output_complete_line(&mut self, line: &str) {
+        if let Some(mut rendered) = self.renderer.render_line(line, self.color) {
+            rendered.push('\n');
+            output(&rendered);
+        }
+    }
+
+    pub fn push(&mut self, delta: &str) {
+        use std::io::Write;
+        if editor_active() {
+            self.pending.push_str(delta);
+            while let Some(end) = self.pending.find('\n') {
+                let line: String = self.pending.drain(..=end).collect();
+                self.output_complete_line(line.trim_end_matches('\n'));
+            }
+        } else {
+            if !self.pending.is_empty() {
+                eprint!("{}", std::mem::take(&mut self.pending));
+            }
+            eprint!("{delta}");
+            let _ = std::io::stderr().flush();
+        }
+    }
+    pub fn finish(&mut self) {
+        if !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            if let Some(rendered) = self.renderer.render_line(&pending, self.color) {
+                output(&rendered);
+            }
+        } else if !editor_active() {
+            eprintln!();
+        }
     }
 }

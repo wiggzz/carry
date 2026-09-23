@@ -8,7 +8,7 @@ mod terminal;
 mod web;
 
 use std::{
-    io::{BufRead, IsTerminal, Read, Write},
+    io::{IsTerminal, Read},
     path::{Component, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -262,9 +262,9 @@ async fn main() -> Result<()> {
             argv.remove(1);
             LogoutCli::parse_from(argv);
             if auth::logout(&auth::carry_home()?).await? {
-                eprintln!("signed out of ChatGPT subscription");
+                terminal::output("signed out of ChatGPT subscription");
             } else {
-                eprintln!("no ChatGPT subscription credential was stored");
+                terminal::output("no ChatGPT subscription credential was stored");
             }
             return Ok(());
         }
@@ -327,8 +327,6 @@ async fn run_command(args: Cli) -> Result<()> {
             .context("failed to read prompt from stdin")?;
         prompt
     } else {
-        eprint!("carry (/help for multiline input)> ");
-        let _ = std::io::stderr().flush();
         input = Some(spawn_input_reader());
         match input
             .as_mut()
@@ -369,12 +367,12 @@ async fn run_command(args: Cli) -> Result<()> {
         create_private_session_dir(&session_dir)?;
     }
     if let Some(source) = &resume_source {
-        eprintln!("resuming session: {}", source.display());
+        terminal::output(&format!("resuming session: {}", source.display()));
         if source != &session_dir {
-            eprintln!("new session: {}", session_dir.display());
+            terminal::output(&format!("new session: {}", session_dir.display()));
         }
     } else {
-        eprintln!("session: {}", session_dir.display());
+        terminal::output(&format!("session: {}", session_dir.display()));
     }
 
     if args.request_timeout_secs == 0 || args.connect_timeout_secs == 0 {
@@ -448,7 +446,7 @@ async fn run_command(args: Cli) -> Result<()> {
         tokio::select! {
             result = web::serve(address, config, backend, !args.no_open) => result?,
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("session interrupted by Ctrl-C");
+                terminal::output("session interrupted by Ctrl-C");
                 print_resume_hint(&session_dir);
                 return Ok(());
             }
@@ -466,14 +464,14 @@ async fn run_command(args: Cli) -> Result<()> {
             }
         } => result?,
         _ = tokio::signal::ctrl_c() => {
-            eprintln!("session interrupted by Ctrl-C");
+            terminal::output("session interrupted by Ctrl-C");
             print_resume_hint(&session_dir);
             return Ok(());
         }
     };
     print_resume_hint(&outcome.session_dir);
     if outcome.completed {
-        if !interactive {
+        if !interactive && !outcome.answer_streamed {
             terminal::print_answer(&outcome.answer.unwrap_or_default());
         }
         Ok(())
@@ -486,39 +484,16 @@ async fn run_command(args: Cli) -> Result<()> {
 }
 
 fn print_resume_hint(session_dir: &std::path::Path) {
-    eprintln!(
+    terminal::output(&format!(
         "session: {}\nresume with: carry --resume {}",
         session_dir.display(),
         session_dir.display()
-    );
+    ));
 }
 
 fn spawn_input_reader() -> mpsc::UnboundedReceiver<UserInput> {
     let (sender, receiver) = mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let mut input = terminal::Input::default();
-        for line in stdin.lock().lines() {
-            let Ok(line) = line else { break };
-            match input.line(&line) {
-                terminal::Entry::Message(message) => {
-                    if sender
-                        .send(UserInput::Message {
-                            message,
-                            submission_id: None,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                terminal::Entry::Notice(message) => eprintln!("{message}"),
-                terminal::Entry::Exit => break,
-                terminal::Entry::Pending => {}
-            }
-        }
-        let _ = sender.send(UserInput::Exit);
-    });
+    std::thread::spawn(move || terminal::read_input(sender));
     receiver
 }
 

@@ -194,6 +194,11 @@ jobs:
       - name: Unit tests
         run: cargo test
 
+      - name: Terminal editor PTY tests
+        run: |
+          cargo build
+          python3 tests/terminal_editor.py
+
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
 

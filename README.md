@@ -133,13 +133,25 @@ printf 'explain the failing tests' | carry --print
 
 ### Terminal input and formatting
 
-In `--interactive` mode, Enter sends a single-line message. For multiline prompts
-or steering, enter `/paste`, then type or paste your text (including blank lines
-and indentation), and enter `/end` on its own line to send it. `/cancel` discards
-the draft. Other commands inside a draft are literal text; `/end` and `/cancel`
-are reserved. EOF discards an unfinished draft and exits. `/help` lists commands.
-This is line-based input, not a full-screen editor; earlier lines in a draft
-cannot be edited in place. Ordinary terminal line editing still works.
+In `--interactive` mode, Enter sends the draft. Alt+Enter or Ctrl+J inserts a
+newline; Shift+Enter also works when the terminal reports it distinctly. Pasted
+blocks are inserted without submitting (bracketed paste), preserving indentation
+and blank lines. Arrow keys edit the draft, including earlier lines. Ctrl+C clears
+the draft; Ctrl+D on empty input or `/quit` exits. `/help` lists commands. The old
+`/paste` and `/end` commands remain available for compatibility.
+
+The editor stays in the normal terminal screen. Status output is printed above
+the editable draft. While the editor is active, streamed answers are buffered to
+complete lines (the last partial line is flushed on completion) to avoid disruptive
+per-token redraws. Terminal shell commands are shown once when execution starts,
+not repeatedly while their arguments are being generated; the browser still shows
+live shell-call previews. On Unix, run `cargo build && python3 tests/terminal_editor.py`
+for the editor’s pseudo-terminal smoke tests.
+
+Reedline is used only when stdin, stdout, and stderr are terminals. If either output
+stream is redirected, Carry uses the compatible line-oriented reader (`/paste`,
+`/end`, and `/cancel` remain available) so terminal protocol bytes never enter
+redirected stdout.
 
 Answers use lightweight terminal Markdown styling: colored headings, bold text,
 inline/fenced code, and muted block quotes. Lists, links, and tables remain readable
@@ -147,13 +159,14 @@ Markdown source; code is colored as a block, not syntax-highlighted. Redirected
 stdout, `NO_COLOR`, and `TERM=dumb` preserve the original Markdown without styling.
 Output stays in native terminal scrollback, without a live token-counter redraw.
 Your terminal's “scroll on output” setting controls whether new output scrolls
-you back down. Tool/status lines can still interleave with typing; this is not yet
-an independent input pane.
+you back down.
 
 Model answer/commentary text is previewed as it streams, in both the browser
-and a terminal (on stderr when it is a TTY). Previews are provisional; completed
-answers are rendered as Markdown. Terminal previews remain in scrollback alongside
-the final styled answer. Tool arguments and context bookkeeping are not displayed
+and a terminal (on stderr when it is a TTY). Complete streamed lines receive the
+same lightweight Markdown styling as completed answers. Previews are provisional;
+a fully streamed terminal answer is not printed a second time at completion.
+If streaming was incomplete or stdout is redirected, the complete answer is still
+printed; redirected stdout remains suitable for piping. Tool arguments and context bookkeeping are not displayed
 as raw JSON. Private reasoning is not shown.
 
 Each model response in the browser includes its own input, cached-input, output,
