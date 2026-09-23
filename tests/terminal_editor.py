@@ -1,5 +1,6 @@
 """Unix PTY smoke test. Run after cargo build: python3 tests/terminal_editor.py."""
 import fcntl
+import http.server
 import json
 import os
 import pty
@@ -8,6 +9,7 @@ import struct
 import subprocess
 import tempfile
 import termios
+import threading
 import time
 
 
@@ -132,7 +134,114 @@ def check_redirected_stdout():
             os.close(master)
 
 
+def check_stream_exit_order():
+    prefix = 'STREAM_PREFIX_7a9'
+    suffix = '_STREAM_SUFFIX_8b2'
+    first_sent = threading.Event()
+    release = threading.Event()
+
+    class Responses(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            del format, args
+
+        def do_POST(self):
+            length = int(self.headers.get('Content-Length', '0'))
+            self.rfile.read(length)
+            arguments = json.dumps({
+                'answer': prefix + suffix,
+                'context': {'protected': [], 'removable': [], 'remember': []},
+            }, separators=(',', ':'))
+            initial = [
+                {'type': 'response.output_item.added',
+                 'item': {'type': 'function_call', 'name': 'finish'}},
+                {'type': 'response.function_call_arguments.delta',
+                 'delta': '{"answer":"' + prefix},
+            ]
+            final_item = {
+                'type': 'function_call', 'call_id': 'call-1',
+                'name': 'finish', 'arguments': arguments,
+            }
+            remaining = [
+                {'type': 'response.function_call_arguments.delta',
+                 'delta': suffix + '","context":{"protected":[],"removable":[],"remember":[]}}'},
+                {'type': 'response.output_item.done', 'item': final_item},
+                {'type': 'response.completed', 'response': {
+                    'id': 'response-1', 'output': [final_item], 'usage': {},
+                }},
+            ]
+
+            def frames(events):
+                return ''.join('data: ' + json.dumps(event, separators=(',', ':')) + '\n\n'
+                               for event in events).encode()
+
+            first = frames(initial)
+            rest = frames(remaining)
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Content-Length', str(len(first) + len(rest)))
+            self.end_headers()
+            self.wfile.write(first)
+            self.wfile.flush()
+            first_sent.set()
+            release.wait(3)
+            self.wfile.write(rest)
+            self.wfile.flush()
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Responses)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    with tempfile.TemporaryDirectory() as directory:
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 100, 0, 0))
+        process = subprocess.Popen(
+            ['target/debug/carry', '--interactive', '--api-base',
+             f'http://127.0.0.1:{server.server_port}', '--session-dir',
+             os.path.join(directory, 'session')], stdin=slave, stdout=slave, stderr=slave,
+            env=dict(os.environ, TERM='xterm-256color', OPENAI_API_KEY='test-key'))
+        os.close(slave)
+        output = bytearray()
+
+        def pump(seconds):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], .05)[0]:
+                    try:
+                        chunk = os.read(master, 65536)
+                    except OSError:
+                        break
+                    output.extend(chunk)
+                    for _ in range(chunk.count(b'\x1b[6n')):
+                        os.write(master, b'\x1b[1;1R')
+
+        try:
+            pump(.3)
+            os.write(master, b'prompt\r')
+            assert first_sent.wait(3), 'server did not emit the first stream fragment'
+            os.write(master, b'/quit\r')
+            pump(.3)
+            release.set()
+            deadline = time.monotonic() + 5
+            while process.poll() is None and time.monotonic() < deadline:
+                pump(.1)
+            pump(.2)
+            assert process.poll() == 0, output
+            prefix_index = output.find(prefix.encode())
+            suffix_index = output.find(suffix.encode())
+            assert prefix_index >= 0 and suffix_index >= 0, output
+            assert prefix_index < suffix_index, (prefix_index, suffix_index, output)
+        finally:
+            release.set()
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            os.close(master)
+            server.shutdown()
+            server.server_close()
+            server_thread.join()
+
+
 check(False)
 check(True)
 check_redirected_stdout()
-print('PTY checks passed: Alt+Enter, bracketed paste, draft preservation, redirected stdout, exit.')
+check_stream_exit_order()
+print('PTY checks passed: Alt+Enter, bracketed paste, draft preservation, redirected stdout, stream exit order.')

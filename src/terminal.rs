@@ -397,6 +397,9 @@ impl StreamOutput {
                 self.output_complete_line(line.trim_end_matches('\n'));
             }
         } else {
+            if !self.pending.is_empty() {
+                eprint!("{}", std::mem::take(&mut self.pending));
+            }
             eprint!("{delta}");
             let _ = std::io::stderr().flush();
         }
