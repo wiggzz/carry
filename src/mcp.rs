@@ -138,13 +138,15 @@ fn add(carry_home: &Path, name: String, url: Option<String>, command: Vec<String
             args: args.to_vec(),
         }
     };
-    let mut config = load(carry_home)?;
+    let config = load(carry_home)?;
     let credentials_must_be_cleared = config.servers.get(&name) != Some(&server);
+    let mut next_config = config;
+    next_config.servers.insert(name.clone(), server);
+    validate_config_server_names(&next_config)?;
     if credentials_must_be_cleared {
         clear_credentials(carry_home, &name)?;
     }
-    config.servers.insert(name.clone(), server);
-    save(carry_home, &config)?;
+    save(carry_home, &next_config)?;
     println!("added MCP server {name}");
     Ok(())
 }
@@ -637,6 +639,21 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_config_server_names(config: &Config) -> Result<()> {
+    let mut folded_names = BTreeMap::new();
+    for name in config.servers.keys() {
+        validate_name(name)
+            .with_context(|| format!("invalid MCP server name in configuration: {name}"))?;
+        let folded = name.to_ascii_lowercase();
+        if let Some(existing) = folded_names.insert(folded, name) {
+            bail!(
+                "MCP server names must be unique ignoring ASCII case: `{existing}` conflicts with `{name}`"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn configured_server_names(carry_home: &Path) -> Result<Vec<String>> {
     Ok(load(carry_home)?.servers.into_keys().collect())
 }
@@ -648,10 +665,7 @@ fn load(carry_home: &Path) -> Result<Config> {
             let config: Config = serde_json::from_slice(&bytes).with_context(|| {
                 format!("failed to parse MCP configuration: {}", path.display())
             })?;
-            for name in config.servers.keys() {
-                validate_name(name)
-                    .with_context(|| format!("invalid MCP server name in configuration: {name}"))?;
-            }
+            validate_config_server_names(&config)?;
             Ok(config)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
@@ -661,9 +675,7 @@ fn load(carry_home: &Path) -> Result<Config> {
 }
 
 fn save(carry_home: &Path, config: &Config) -> Result<()> {
-    for name in config.servers.keys() {
-        validate_name(name).with_context(|| format!("invalid MCP server name: {name}"))?;
-    }
+    validate_config_server_names(config)?;
     std::fs::create_dir_all(carry_home)
         .with_context(|| format!("failed to create Carry home: {}", carry_home.display()))?;
     #[cfg(unix)]
@@ -877,6 +889,70 @@ mod tests {
                 .to_string()
                 .contains("invalid MCP server name in configuration")
         );
+    }
+
+    #[test]
+    fn add_rejects_case_insensitive_duplicate_before_clearing_credentials() {
+        let home = tempdir().unwrap();
+        add(
+            home.path(),
+            "remote".into(),
+            Some("https://one.example/mcp".into()),
+            vec![],
+        )
+        .unwrap();
+        let credentials = credential_store(home.path(), "REMOTE").unwrap().path;
+        save_private_json(
+            &credentials,
+            &StoredCredentials::new("client".into(), None, vec![], None),
+        )
+        .unwrap();
+
+        let error = add(
+            home.path(),
+            "REMOTE".into(),
+            Some("https://two.example/mcp".into()),
+            vec![],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unique ignoring ASCII case"));
+        assert!(credentials.exists());
+        let config = load(home.path()).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert!(matches!(
+            &config.servers["remote"],
+            Server::Http { url } if url == "https://one.example/mcp"
+        ));
+    }
+
+    #[test]
+    fn load_rejects_case_insensitive_duplicate_server_names() {
+        let home = tempdir().unwrap();
+        let config = Config {
+            servers: BTreeMap::from([
+                (
+                    "remote".into(),
+                    Server::Http {
+                        url: "https://one.example/mcp".into(),
+                    },
+                ),
+                (
+                    "REMOTE".into(),
+                    Server::Http {
+                        url: "https://two.example/mcp".into(),
+                    },
+                ),
+            ]),
+        };
+        std::fs::write(
+            home.path().join(CONFIG_FILE),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+
+        let error = load(home.path()).unwrap_err();
+        assert!(error.to_string().contains("unique ignoring ASCII case"));
     }
 
     #[tokio::test]
