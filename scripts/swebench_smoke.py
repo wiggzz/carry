@@ -1689,7 +1689,8 @@ def run_official_evaluation(*, predictions: pathlib.Path, canonical_dataset: pat
         if key.startswith("OPENAI_"):
             del env[key]
     command = [
-        os.environ.get("PYTHON", "python3"), "-m", "swebench.harness.run_evaluation",
+        os.environ.get("PYTHON", "python3"),
+        str(pathlib.Path(__file__).with_name("swebench_evaluator_compat.py").resolve()),
         "--dataset_name", str(canonical_dataset),
         "--split", "test", "--predictions_path", str(predictions),
         "--run_id", run_id, "--report_dir", str(output),

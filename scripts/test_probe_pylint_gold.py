@@ -133,7 +133,10 @@ class GoldTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             def execute(command, **kwargs):
-                self.assertEqual(command[1:3], ["-m", "swebench.harness.run_evaluation"])
+                self.assertEqual(
+                    Path(command[1]),
+                    Path(__file__).with_name("swebench_evaluator_compat.py").resolve(),
+                )
                 self.assertEqual(command[command.index("--predictions_path")+1], "gold")
                 self.assertEqual(command[command.index("--timeout")+1], "270")
                 self.assertEqual(command[command.index("--max_workers")+1], "1")

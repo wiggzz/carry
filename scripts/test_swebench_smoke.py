@@ -1168,7 +1168,9 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertFalse(any(command[:2] == ["docker", "build"] for command in state.calls))
 
             def evaluator_process(command, **kwargs):
-                self.assertEqual(command[1:3], ["-m", "swebench.harness.run_evaluation"])
+                self.assertEqual(
+                    command[1], str(SCRIPT.with_name("swebench_evaluator_compat.py").resolve())
+                )
                 # run_evaluation regenerates unmodified recipes, with this namespace
                 # and tag. Its remote-image branch reuses images.get(key), no build.
                 namespace = command[command.index("--namespace") + 1]
@@ -1185,6 +1187,82 @@ class SmokeWorkerTests(unittest.TestCase):
                     instance_ids=[task], run_id="evaluator", output=state.root, environment={},
                 )
             process.assert_called_once()
+
+    def test_sympy_parser_keeps_duplicate_failure_after_later_pass(self):
+        from scripts import swebench_evaluator_compat as evaluator_compat
+
+        parsed = evaluator_compat.parse_log_sympy_fail_closed(
+            "test_MatrixElement_printing F\n"
+            "test_MatrixElement_printing ok\n",
+            None,
+        )
+
+        self.assertEqual(parsed["test_MatrixElement_printing"], "FAILED")
+
+    def test_sympy_parser_keeps_duplicate_error_after_later_pass(self):
+        from scripts import swebench_evaluator_compat as evaluator_compat
+
+        parsed = evaluator_compat.parse_log_sympy_fail_closed(
+            "test_MatrixElement_printing E\n"
+            "test_MatrixElement_printing ok\n",
+            None,
+        )
+
+        self.assertEqual(parsed["test_MatrixElement_printing"], "ERROR")
+
+    def test_sympy_compat_installs_fail_closed_parser(self):
+        from scripts import swebench_evaluator_compat as evaluator_compat
+
+        parsers = {"sympy/sympy": object()}
+        evaluator_compat.install_sympy_parser(parsers)
+
+        self.assertIs(parsers["sympy/sympy"], evaluator_compat.parse_log_sympy_fail_closed)
+
+    def test_sympy_compat_wrapper_installs_parser_before_official_module(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            package = root / "swebench" / "harness" / "log_parsers"
+            package.mkdir(parents=True)
+            metadata = root / "swebench-4.1.0.dist-info"
+            metadata.mkdir()
+            metadata.joinpath("METADATA").write_text(
+                "Metadata-Version: 2.1\nName: swebench\nVersion: 4.1.0\n",
+                encoding="utf-8",
+            )
+            (root / "swebench" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "swebench" / "harness" / "__init__.py").write_text(
+                "from . import run_evaluation\n", encoding="utf-8"
+            )
+            package.joinpath("__init__.py").write_text(
+                "def original(log, spec):\n"
+                "    return {'duplicate': 'PASSED'}\n"
+                "MAP_REPO_TO_PARSER = {'sympy/sympy': original}\n",
+                encoding="utf-8",
+            )
+            marker = root / "official-ran"
+            (root / "swebench" / "harness" / "run_evaluation.py").write_text(
+                "import os\n"
+                "from pathlib import Path\n"
+                "from swebench.harness.log_parsers import MAP_REPO_TO_PARSER\n"
+                "def main():\n"
+                "    parsed = MAP_REPO_TO_PARSER['sympy/sympy']('test_duplicate F\\nduplicate ok\\n', None)\n"
+                "    if parsed != {'test_duplicate': 'FAILED'}:\n"
+                "        raise SystemExit(9)\n"
+                "    Path(os.environ['WRAPPER_MARKER']).write_text('ok', encoding='utf-8')\n"
+                "if __name__ == '__main__':\n"
+                "    main()\n",
+                encoding="utf-8",
+            )
+            environment = dict(os.environ, PYTHONPATH=str(root), WRAPPER_MARKER=str(marker))
+
+            completed = subprocess.run(
+                [sys.executable, str(SCRIPT.with_name("swebench_evaluator_compat.py"))],
+                cwd=root, env=environment, check=False, capture_output=True, text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stderr, "")
+            self.assertEqual(marker.read_text(encoding="utf-8"), "ok")
 
     def test_publisher_preserves_independent_pairs_and_reuses_them_after_partial_build_failure(self):
         with self.preparation_fixture() as state:
@@ -2693,7 +2771,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             canonical.write_text("[]\n")
             captured = {}
             def fake_run(command, **kwargs):
-                if "swebench.harness.run_evaluation" in command:
+                if command[1] == str(SCRIPT.with_name("swebench_evaluator_compat.py").resolve()):
                     captured.update(command=command, kwargs=kwargs)
                 return mock.Mock(returncode=0, stdout="")
             with mock.patch.object(self.worker.subprocess, "run", side_effect=fake_run):
@@ -2703,7 +2781,9 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                     environment={"PATH": "/bin", "OPENAI_API_KEY": "secret", "OPENAI_MODEL": "model"},
                 )
             command = captured["command"]
-            self.assertIn("swebench.harness.run_evaluation", command)
+            self.assertEqual(
+                command[1], str(SCRIPT.with_name("swebench_evaluator_compat.py").resolve())
+            )
             self.assertIn(str(canonical), command)
             self.assertEqual(command[command.index("--max_workers") + 1], "5")
             self.assertEqual(command[command.index("--cache_level") + 1], "instance")
@@ -2732,7 +2812,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
 
             def fake_run(command, **kwargs):
                 calls.append((command, kwargs))
-                if "swebench.harness.run_evaluation" in command:
+                if command[1] == str(SCRIPT.with_name("swebench_evaluator_compat.py").resolve()):
                     raise subprocess.TimeoutExpired(command, kwargs["timeout"])
                 if command[:2] == ["docker", "ps"] and "name=" in command[-1]:
                     return mock.Mock(returncode=0, stdout=container_id + "\ninvalid\n")
@@ -2800,7 +2880,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             canonical.write_text("[]\n")
 
             def fake_run(command, **kwargs):
-                if "swebench.harness.run_evaluation" in command:
+                if command[1] == str(SCRIPT.with_name("swebench_evaluator_compat.py").resolve()):
                     raise subprocess.TimeoutExpired(command, kwargs["timeout"])
                 return mock.Mock(returncode=1, stdout="")
 
