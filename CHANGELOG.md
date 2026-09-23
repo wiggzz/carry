@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.0](https://github.com/wiggzz/carry/compare/v0.8.2...v0.9.0) (2026-09-15)
+
+
+### Features
+
+* **bench:** parameterize SWE-bench official-50 attempts ([#113](https://github.com/wiggzz/carry/issues/113)) ([a46e5e5](https://github.com/wiggzz/carry/commit/a46e5e5fe364d768d24ab44b8478a889ed30deb8))
+
+
+### Bug Fixes
+
+* preserve cache affinity across follow-ups ([#111](https://github.com/wiggzz/carry/issues/111)) ([539bce5](https://github.com/wiggzz/carry/commit/539bce5cbb0a3febf66feb7028adccd08c5fff14))
+
 ## [0.8.2](https://github.com/wiggzz/carry/compare/v0.8.1...v0.8.2) (2026-09-14)
 
 

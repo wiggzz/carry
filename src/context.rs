@@ -9,9 +9,11 @@ use crate::protocol::ContextManagement;
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 const CACHE_READ_RATE: f64 = 0.10;
 const CACHE_WRITE_RATE: f64 = 1.25;
-const COMPACTION_MIN_PAYBACK_RATIO: f64 = 0.10;
+pub(crate) const DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT: u8 = 25;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
+#[cfg(test)]
 const NEUTRAL_TARGET_NUMERATOR: usize = 3;
+#[cfg(test)]
 const NEUTRAL_TARGET_DENOMINATOR: usize = 4;
 const HISTORY_COMPACTED_STATUS: &str =
     "[history status: earlier context has been removed by compaction]";
@@ -243,10 +245,6 @@ impl ContextState {
         self.retention_turn = self.retention_turn.saturating_add(1);
     }
 
-    pub fn retention_turn(&self) -> u64 {
-        self.retention_turn
-    }
-
     pub fn arm_keep_leases(&mut self, ids: &[u64], turns: u64) {
         if turns == 0 {
             return;
@@ -260,24 +258,75 @@ impl ContextState {
         }
     }
 
-    /// At a sweep, attach one immutable review to the newest completed tool block.
-    /// The review is resolved only after the next model response has seen it.
-    pub fn attach_due_keep_lease_review(&mut self) -> KeepLeaseReview {
+    /// Return a metadata-only view in which every due, non-human lease is releasable.
+    /// The source state is unchanged; callers use this only to ask whether a release wave
+    /// could make the normal compaction planner worthwhile.
+    pub(crate) fn virtual_release_due_keep_leases(&self) -> Option<(Self, Vec<u64>)> {
+        let mut released = self.clone();
+        let mut released_ids = Vec::new();
+        for item in &mut released.items {
+            let due = item
+                .keep_lease_expires_at_turn
+                .is_some_and(|expires_at| expires_at <= released.retention_turn);
+            if item.kind != ContextItemKind::User && item.signal != RetentionSignal::Drop && due {
+                item.signal = RetentionSignal::Drop;
+                item.retention = Retention::Eligible;
+                released_ids.push(item.id);
+            }
+        }
+        (!released_ids.is_empty()).then_some((released, released_ids))
+    }
+
+    /// Attach one cache-safe review for the four largest due leases to the tool
+    /// result that was just returned. The host must be the latest item: the
+    /// review is rendered inside the host's output, so attaching it to an
+    /// older result would rewrite the cached prefix. The review is resolved
+    /// only after the next model response has seen it.
+    pub fn attach_due_keep_lease_review_to(&mut self, host_id: u64) -> KeepLeaseReview {
+        const MAX_REVIEWED_KEEP_LEASES: usize = 4;
+
         if !self.pending_keep_lease_review.is_empty() {
             return KeepLeaseReview {
                 item_ids: Vec::new(),
             };
         }
-        let item_ids = self
+        let Some(host_index) = self.items.iter().position(|item| item.id == host_id) else {
+            return KeepLeaseReview {
+                item_ids: Vec::new(),
+            };
+        };
+        let fresh_host = self.items[host_index].kind == ContextItemKind::Tool
+            && self.items[host_index + 1..].iter().all(|item| {
+                item.memory
+                    .as_ref()
+                    .is_some_and(|memory| memory.source_id == host_id)
+            });
+        if !fresh_host {
+            return KeepLeaseReview {
+                item_ids: Vec::new(),
+            };
+        }
+        let mut due = self
             .items
             .iter()
             .filter(|item| {
-                item.signal != RetentionSignal::Drop
+                item.kind != ContextItemKind::User
+                    && item.signal != RetentionSignal::Drop
                     && item
                         .keep_lease_expires_at_turn
                         .is_some_and(|expires_at| expires_at <= self.retention_turn)
             })
-            .map(|item| item.id)
+            .map(|item| (item.id, item.bytes))
+            .collect::<Vec<_>>();
+        due.sort_unstable_by(|(left_id, left_bytes), (right_id, right_bytes)| {
+            right_bytes
+                .cmp(left_bytes)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let item_ids = due
+            .into_iter()
+            .take(MAX_REVIEWED_KEEP_LEASES)
+            .map(|(id, _)| id)
             .collect::<Vec<_>>();
         if !item_ids.is_empty() {
             let ids = item_ids
@@ -286,14 +335,9 @@ impl ContextState {
                 .collect::<Vec<_>>()
                 .join(", ");
             let text = format!(
-                "Previously protected items {ids} may be removed soon. If their learnings need to be preserved exactly, protect them. If there are learnings that can be summarized, remember those."
+                "Review protected items: IDs {ids} are expiring. Re-protect only if their information is still needed for this task and either is not represented elsewhere or cannot be accurately captured with context.remember. Otherwise omit them to release them for normal compaction."
             );
-            if let Some(item) = self
-                .items
-                .iter_mut()
-                .rev()
-                .find(|item| item.kind == ContextItemKind::Tool)
-            {
+            if let Some(item) = self.items.iter_mut().find(|item| item.id == host_id) {
                 item.keep_lease_review = Some(text);
                 self.pending_keep_lease_review = item_ids.clone();
             }
@@ -518,12 +562,59 @@ impl ContextState {
         self.plan_compaction_with_neutral_budget(protected, policy, 0)
     }
 
+    #[cfg(test)]
     pub fn plan_compaction_with_neutral_budget(
         &self,
         protected: &[u64],
         policy: CompactionPolicy,
         neutral_budget_tokens: usize,
     ) -> Option<CompactionPlan> {
+        let neutral_target_tokens = neutral_budget_tokens.saturating_mul(NEUTRAL_TARGET_NUMERATOR)
+            / NEUTRAL_TARGET_DENOMINATOR;
+        self.plan_compaction_with_neutral_watermarks(
+            protected,
+            policy,
+            neutral_budget_tokens,
+            neutral_target_tokens,
+        )
+    }
+
+    pub fn plan_compaction_with_neutral_watermarks(
+        &self,
+        protected: &[u64],
+        policy: CompactionPolicy,
+        neutral_high_watermark_tokens: usize,
+        neutral_low_watermark_tokens: usize,
+    ) -> Option<CompactionPlan> {
+        self.compaction_candidates_with_neutral_watermarks(
+            protected,
+            policy,
+            neutral_high_watermark_tokens,
+            neutral_low_watermark_tokens,
+        )
+        .into_iter()
+        .filter(|plan| {
+            meets_payback_threshold(
+                plan.estimated_savings_input_units,
+                plan.minimum_payback_input_units,
+            )
+        })
+        .max_by(|left, right| {
+            left.estimated_savings_input_units
+                .total_cmp(&right.estimated_savings_input_units)
+        })
+    }
+
+    pub(crate) fn compaction_candidates_with_neutral_watermarks(
+        &self,
+        protected: &[u64],
+        policy: CompactionPolicy,
+        neutral_high_watermark_tokens: usize,
+        neutral_low_watermark_tokens: usize,
+    ) -> Vec<CompactionPlan> {
+        assert!(neutral_low_watermark_tokens <= neutral_high_watermark_tokens);
+        let neutral_budget_tokens = neutral_high_watermark_tokens;
+        let neutral_target_tokens = neutral_low_watermark_tokens;
         let protected = protected.iter().copied().collect::<HashSet<_>>();
         let newest_id = self.items.last().map_or(0, |item| item.id);
         // Explicit keep/drop signals remain authoritative. Neutral eligible items compete for
@@ -555,8 +646,6 @@ impl ContextState {
             .fold(0usize, usize::saturating_add);
         // Only cross the neutral high-water mark before collecting neutral items, then compact
         // toward a lower target so one new result does not trigger another compaction next turn.
-        let neutral_target_tokens = neutral_budget_tokens.saturating_mul(NEUTRAL_TARGET_NUMERATOR)
-            / NEUTRAL_TARGET_DENOMINATOR;
         let neutral_over_budget = neutral_total_tokens > neutral_budget_tokens;
         let mut neutral_retained = Vec::new();
         let mut neutral_retained_tokens = neutral
@@ -633,17 +722,103 @@ impl ContextState {
         }
 
         candidates
-            .into_iter()
-            .filter(|plan| {
-                meets_payback_threshold(
-                    plan.estimated_savings_input_units,
-                    plan.minimum_payback_input_units,
-                )
-            })
-            .max_by(|left, right| {
-                left.estimated_savings_input_units
-                    .total_cmp(&right.estimated_savings_input_units)
-            })
+    }
+
+    pub(crate) fn flat_rollout_estimate(
+        &self,
+        plan: &CompactionPlan,
+        _protected: &[u64],
+        policy: CompactionPolicy,
+        config: FlatRolloutConfig,
+    ) -> FlatRolloutEstimate {
+        debug_assert!(config.samples > 0);
+        debug_assert!(config.horizon > 0);
+        debug_assert!(config.stop_probability_percent <= 100);
+        let mut compacted = self.clone();
+        compacted.compact(plan.clone());
+        let retained_ids = compacted
+            .items
+            .iter()
+            .filter(|item| item.kind != ContextItemKind::User)
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let mean_virtual_item_tokens = compacted
+            .items
+            .iter()
+            .filter(|item| item.kind != ContextItemKind::User)
+            .map(|item| item.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN))
+            .sum::<usize>()
+            .checked_div(retained_ids.len())
+            .unwrap_or(1)
+            .max(1);
+        let initial_compact_cost = compact_request_cost(plan);
+        let direct_next_request_savings_input_units = direct_next_request_savings(
+            policy.implicit_cached_tokens,
+            self.estimated_tokens(),
+            initial_compact_cost,
+        );
+        let initial_keep_cost = keep_request_cost(self.estimated_tokens(), &policy);
+        let mut total_compact_cost = 0.0;
+        let mut total_keep_cost = 0.0;
+        let mut max_sampled_drops = 0usize;
+        let mut total_simulated_followup_turns = 0u64;
+        let mut stopped_samples = 0u32;
+
+        for sample in 0..config.samples {
+            let mut compact_branch = compacted.clone();
+            let mut keep_branch = self.clone();
+            let mut compact_cost = initial_compact_cost;
+            let mut keep_cost = initial_keep_cost;
+            let mut rng = FlatRolloutRng::new(config.seed ^ u64::from(sample));
+            for _ in 1..config.horizon {
+                if rng.stops_with_probability(config.stop_probability_percent) {
+                    stopped_samples += 1;
+                    break;
+                }
+                let count = rng.range_inclusive(retained_ids.len().min(4));
+                max_sampled_drops = max_sampled_drops.max(count);
+                let dropped_ids = sample_ids_without_replacement(&retained_ids, count, &mut rng);
+                compact_cost += simulate_rollout_turn(
+                    &mut compact_branch,
+                    &dropped_ids,
+                    mean_virtual_item_tokens,
+                    plan.neutral_budget_tokens,
+                    plan.neutral_target_tokens,
+                    &policy,
+                );
+                keep_cost += simulate_rollout_turn(
+                    &mut keep_branch,
+                    &dropped_ids,
+                    mean_virtual_item_tokens,
+                    plan.neutral_budget_tokens,
+                    plan.neutral_target_tokens,
+                    &policy,
+                );
+                total_simulated_followup_turns += 1;
+            }
+            total_compact_cost += compact_cost;
+            total_keep_cost += keep_cost;
+        }
+
+        let samples = f64::from(config.samples);
+        let expected_compact_cost = total_compact_cost / samples;
+        let expected_keep_cost = total_keep_cost / samples;
+        FlatRolloutEstimate {
+            samples: config.samples,
+            horizon: config.horizon,
+            seed: config.seed,
+            stop_probability_percent: config.stop_probability_percent,
+            mean_virtual_item_tokens,
+            max_sampled_drops,
+            average_simulated_followup_turns: total_simulated_followup_turns as f64 / samples,
+            stopped_samples,
+            expected_compact_cost,
+            expected_keep_cost,
+            minimum_payback_input_units: expected_keep_cost * f64::from(policy.min_payback_percent)
+                / 100.0,
+            direct_next_request_savings_input_units,
+            expected_savings_input_units: expected_keep_cost - expected_compact_cost,
+        }
     }
 
     fn compaction_candidate(
@@ -753,7 +928,9 @@ impl ContextState {
             invalidated_generations,
             invalidated_cache_tokens,
             estimated_savings_input_units: payoff_savings,
-            minimum_payback_input_units: keep_payoff_cost * COMPACTION_MIN_PAYBACK_RATIO,
+            min_payback_percent: policy.min_payback_percent,
+            minimum_payback_input_units: keep_payoff_cost * f64::from(policy.min_payback_percent)
+                / 100.0,
         }
     }
 
@@ -871,6 +1048,8 @@ impl ContextState {
             invalidated_generations: plan.invalidated_generations,
             invalidated_cache_tokens: plan.invalidated_cache_tokens,
             estimated_savings_input_units: plan.estimated_savings_input_units,
+            min_payback_percent: plan.min_payback_percent,
+            minimum_payback_input_units: plan.minimum_payback_input_units,
             generation: self.generation,
             protected_frontier: self.protected_frontier_id(),
             retained_bytes: self.retained_bytes(),
@@ -897,6 +1076,21 @@ fn meets_payback_threshold(savings: f64, minimum_payback: f64) -> bool {
     savings > minimum_payback
 }
 
+pub(crate) fn meets_rollout_payback_threshold(estimate: &FlatRolloutEstimate) -> bool {
+    meets_payback_threshold(
+        estimate.expected_savings_input_units,
+        estimate.minimum_payback_input_units,
+    )
+}
+
+fn direct_next_request_savings(
+    implicit_cached_tokens: usize,
+    current_tokens: usize,
+    compact_first_cost: f64,
+) -> f64 {
+    keep_request_cost_with_implicit(implicit_cached_tokens, current_tokens) - compact_first_cost
+}
+
 fn payoff_savings_input_units(
     implicit_cached_tokens: usize,
     current_tokens: usize,
@@ -904,13 +1098,170 @@ fn payoff_savings_input_units(
     compact_first_cost: f64,
     payoff_requests: u64,
 ) -> f64 {
-    let keep_first = implicit_cached_tokens as f64 * CACHE_READ_RATE
-        + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE;
+    let keep_first = keep_request_cost_with_implicit(implicit_cached_tokens, current_tokens);
     let compact_first = compact_first_cost;
     let later_requests = payoff_requests.saturating_sub(1) as f64;
     keep_first + later_requests * current_tokens as f64 * CACHE_READ_RATE
         - compact_first
         - later_requests * retained_tokens as f64 * CACHE_READ_RATE
+}
+
+fn keep_request_cost(current_tokens: usize, policy: &CompactionPolicy) -> f64 {
+    keep_request_cost_with_implicit(
+        policy.implicit_cached_tokens.min(current_tokens),
+        current_tokens,
+    )
+}
+
+fn keep_request_cost_with_implicit(implicit_cached_tokens: usize, current_tokens: usize) -> f64 {
+    implicit_cached_tokens as f64 * CACHE_READ_RATE
+        + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE
+}
+
+fn compact_request_cost(plan: &CompactionPlan) -> f64 {
+    plan.retained_tokens.saturating_sub(plan.rewrite_tokens) as f64 * CACHE_READ_RATE
+        + plan.rewrite_tokens as f64 * CACHE_WRITE_RATE
+}
+
+fn simulate_rollout_turn(
+    state: &mut ContextState,
+    dropped_ids: &[u64],
+    virtual_item_tokens: usize,
+    neutral_high_watermark_tokens: usize,
+    neutral_low_watermark_tokens: usize,
+    base_policy: &CompactionPolicy,
+) -> f64 {
+    let cached_before_virtual_item = state.estimated_tokens();
+    let virtual_id = state.add_simulated_tool_item(virtual_item_tokens);
+    for id in dropped_ids {
+        if let Some(item) = state.items.iter_mut().find(|item| item.id == *id) {
+            item.signal = RetentionSignal::Drop;
+        }
+    }
+    let policy = CompactionPolicy {
+        implicit_cached_tokens: cached_before_virtual_item,
+        breakpoints: state
+            .rendered_breakpoints()
+            .into_iter()
+            .map(|breakpoint| PricedBreakpoint {
+                generation: breakpoint.generation,
+                cached_tokens: breakpoint.prefix_tokens,
+            })
+            .collect(),
+        payoff_requests: base_policy.payoff_requests,
+        min_payback_percent: base_policy.min_payback_percent,
+    };
+    let keep_cost = keep_request_cost(state.estimated_tokens(), &policy);
+    let Some(plan) = state
+        .compaction_candidates_with_neutral_watermarks(
+            &[virtual_id],
+            policy.clone(),
+            neutral_high_watermark_tokens,
+            neutral_low_watermark_tokens,
+        )
+        .into_iter()
+        .min_by(|left, right| compact_request_cost(left).total_cmp(&compact_request_cost(right)))
+    else {
+        return keep_cost;
+    };
+    let cost = compact_request_cost(&plan);
+    if cost >= keep_cost {
+        return keep_cost;
+    }
+    state.compact(plan);
+    cost
+}
+
+impl ContextState {
+    fn add_simulated_tool_item(&mut self, estimated_tokens: usize) -> u64 {
+        let id = self.allocate_id();
+        let bytes = estimated_tokens.saturating_mul(ESTIMATED_BYTES_PER_TOKEN);
+        self.items.push(ContextItem::new(
+            id,
+            ContextItemKind::Tool,
+            Retention::Eligible,
+            vec![json!({
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "x".repeat(bytes)}]
+            })],
+        ));
+        id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FlatRolloutConfig {
+    pub samples: u32,
+    pub horizon: u64,
+    pub seed: u64,
+    /// Per simulated forward turn; the direct next request is always priced.
+    pub stop_probability_percent: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct FlatRolloutEstimate {
+    pub samples: u32,
+    pub horizon: u64,
+    pub seed: u64,
+    pub stop_probability_percent: u8,
+    pub mean_virtual_item_tokens: usize,
+    pub max_sampled_drops: usize,
+    pub average_simulated_followup_turns: f64,
+    pub stopped_samples: u32,
+    pub expected_compact_cost: f64,
+    pub expected_keep_cost: f64,
+    pub minimum_payback_input_units: f64,
+    pub direct_next_request_savings_input_units: f64,
+    pub expected_savings_input_units: f64,
+}
+
+#[derive(Clone, Copy)]
+struct FlatRolloutRng(u64);
+
+impl FlatRolloutRng {
+    fn new(seed: u64) -> Self {
+        Self(seed ^ 0x9e37_79b9_7f4a_7c15)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.0
+    }
+
+    fn range_inclusive(&mut self, upper: usize) -> usize {
+        if upper == 0 {
+            0
+        } else {
+            (self.next_u64() % (upper as u64 + 1)) as usize
+        }
+    }
+
+    fn range_exclusive(&mut self, upper: usize) -> usize {
+        debug_assert!(upper > 0);
+        (self.next_u64() % upper as u64) as usize
+    }
+
+    fn stops_with_probability(&mut self, probability_percent: u8) -> bool {
+        match probability_percent {
+            0 => false,
+            100.. => true,
+            probability => self.range_exclusive(100) < usize::from(probability),
+        }
+    }
+}
+
+fn sample_ids_without_replacement(
+    candidates: &[u64],
+    count: usize,
+    rng: &mut FlatRolloutRng,
+) -> Vec<u64> {
+    let mut ids = candidates.to_vec();
+    for index in 0..count {
+        let selected = index + rng.range_exclusive(ids.len() - index);
+        ids.swap(index, selected);
+    }
+    ids.truncate(count);
+    ids
 }
 
 fn unique_ids(ids: &[u64]) -> Vec<u64> {
@@ -939,6 +1290,8 @@ pub struct CompactionPolicy {
     pub breakpoints: Vec<PricedBreakpoint>,
     /// Fixed number of requests over which a rewrite is amortized; must be positive.
     pub payoff_requests: u64,
+    /// Minimum modeled saving, as a percent of the retained-path payoff cost.
+    pub min_payback_percent: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -967,6 +1320,7 @@ pub(crate) struct CompactionPlan {
     pub invalidated_generations: Vec<u64>,
     pub invalidated_cache_tokens: usize,
     pub estimated_savings_input_units: f64,
+    pub min_payback_percent: u8,
     pub minimum_payback_input_units: f64,
 }
 
@@ -1031,6 +1385,8 @@ pub(crate) struct ContextChange {
     pub invalidated_generations: Vec<u64>,
     pub invalidated_cache_tokens: usize,
     pub estimated_savings_input_units: f64,
+    pub min_payback_percent: u8,
+    pub minimum_payback_input_units: f64,
     pub generation: u64,
     pub protected_frontier: Option<u64>,
     pub retained_bytes: usize,
@@ -1099,6 +1455,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 0,
             )
@@ -1115,6 +1472,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 0,
             )
@@ -1144,6 +1502,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 0,
             )
@@ -1166,6 +1525,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 0,
             )
@@ -1175,15 +1535,168 @@ mod tests {
     }
 
     #[test]
+    fn flat_rollout_is_seeded_nonmutating_and_caps_random_drops_at_four() {
+        let mut state = ContextState::new("initial".into());
+        let oldest = add_tool_with_output(&mut state, &"old ".repeat(4_000));
+        let middle = add_tool_with_output(&mut state, &"middle ".repeat(1_000));
+        let newest = add_tool_with_output(&mut state, &"new ".repeat(1_000));
+        let budget = state.item_estimated_tokens(middle) + state.item_estimated_tokens(newest);
+        let policy = CompactionPolicy {
+            implicit_cached_tokens: 0,
+            breakpoints: Vec::new(),
+            payoff_requests: 5,
+            min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
+        };
+        let plan = state
+            .plan_compaction_with_neutral_budget(&[], policy.clone(), budget)
+            .expect("initial plan should remove the old tool result");
+        assert!(plan.dropped.contains(&oldest));
+        let before = state.encode().unwrap();
+
+        let config = FlatRolloutConfig {
+            samples: 16,
+            horizon: 5,
+            seed: 7,
+            stop_probability_percent: 0,
+        };
+        let first = state.flat_rollout_estimate(&plan, &[], policy.clone(), config);
+        let second = state.flat_rollout_estimate(&plan, &[], policy, config);
+
+        assert_eq!(first, second);
+        assert_eq!(first.samples, 16);
+        assert!(first.max_sampled_drops <= 4);
+        assert!(first.mean_virtual_item_tokens > 0);
+        assert_eq!(state.encode().unwrap(), before);
+    }
+
+    #[test]
+    fn flat_rollout_stops_forward_simulation_when_stop_probability_is_certain() {
+        let mut state = ContextState::new("initial".into());
+        let oldest = add_tool_with_output(&mut state, &"old ".repeat(4_000));
+        let middle = add_tool_with_output(&mut state, &"middle ".repeat(1_000));
+        let newest = add_tool_with_output(&mut state, &"new ".repeat(1_000));
+        let budget = state.item_estimated_tokens(middle) + state.item_estimated_tokens(newest);
+        let policy = CompactionPolicy {
+            implicit_cached_tokens: 0,
+            breakpoints: Vec::new(),
+            payoff_requests: 5,
+            min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
+        };
+        let plan = state
+            .plan_compaction_with_neutral_budget(&[], policy.clone(), budget)
+            .expect("initial plan should remove the old tool result");
+        assert!(plan.dropped.contains(&oldest));
+
+        let estimate = state.flat_rollout_estimate(
+            &plan,
+            &[],
+            policy.clone(),
+            FlatRolloutConfig {
+                samples: 4,
+                horizon: 5,
+                seed: 7,
+                stop_probability_percent: 100,
+            },
+        );
+
+        assert_eq!(estimate.stopped_samples, 4);
+        assert_eq!(estimate.average_simulated_followup_turns, 0.0);
+        assert_eq!(estimate.expected_compact_cost, compact_request_cost(&plan));
+        assert_eq!(
+            estimate.expected_keep_cost,
+            keep_request_cost(state.estimated_tokens(), &policy)
+        );
+    }
+
+    #[test]
+    fn rollout_virtual_item_is_priced_as_a_cache_write() {
+        let mut state = ContextState::new("initial".into());
+        add_tool_with_output(&mut state, &"x".repeat(4_000));
+        let previous_tokens = state.estimated_tokens();
+        let cost = simulate_rollout_turn(
+            &mut state,
+            &[],
+            1_000,
+            usize::MAX,
+            usize::MAX / 4 * 3,
+            &CompactionPolicy {
+                implicit_cached_tokens: 0,
+                breakpoints: Vec::new(),
+                payoff_requests: 5,
+                min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
+            },
+        );
+        let current_tokens = state.estimated_tokens();
+        let expected = previous_tokens as f64 * CACHE_READ_RATE
+            + current_tokens.saturating_sub(previous_tokens) as f64 * CACHE_WRITE_RATE;
+        assert_eq!(cost, expected);
+    }
+
+    #[test]
     fn five_request_payoff_accepts_a_rewrite_that_one_request_rejects() {
         let policy = CompactionPolicy {
             implicit_cached_tokens: 0,
             breakpoints: Vec::new(),
             payoff_requests: 5,
+            min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
         };
         assert_eq!(policy.payoff_requests, 5);
         assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 1) < 0.0);
         assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 5) > 0.0);
+        assert!(direct_next_request_savings(312_141, 313_063, 54_562.5) < 0.0);
+    }
+
+    #[test]
+    fn rollout_payback_can_repay_an_initial_loss() {
+        let estimate = FlatRolloutEstimate {
+            samples: 1,
+            horizon: 5,
+            seed: 0,
+            stop_probability_percent: 0,
+            mean_virtual_item_tokens: 1,
+            max_sampled_drops: 0,
+            average_simulated_followup_turns: 0.0,
+            stopped_samples: 0,
+            expected_compact_cost: 80.0,
+            expected_keep_cost: 100.0,
+            minimum_payback_input_units: 10.0,
+            direct_next_request_savings_input_units: -5.0,
+            expected_savings_input_units: 20.0,
+        };
+
+        assert!(meets_rollout_payback_threshold(&estimate));
+        let stricter = FlatRolloutEstimate {
+            minimum_payback_input_units: 25.0,
+            ..estimate
+        };
+        assert!(!meets_rollout_payback_threshold(&stricter));
+    }
+
+    #[test]
+    fn configurable_min_payback_margin_rejects_a_plan_that_zero_accepts() {
+        let mut state = ContextState::new("initial".into());
+        add_tool_with_output(&mut state, &"x".repeat(8_000));
+        let no_margin = CompactionPolicy {
+            implicit_cached_tokens: 0,
+            breakpoints: Vec::new(),
+            payoff_requests: 1,
+            min_payback_percent: 0,
+        };
+        let accepted = state
+            .plan_compaction(&[], no_margin.clone())
+            .expect("positive saving compacts");
+        assert_eq!(accepted.min_payback_percent, 0);
+        assert!(
+            state
+                .plan_compaction(
+                    &[],
+                    CompactionPolicy {
+                        min_payback_percent: 100,
+                        ..no_margin
+                    }
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -1209,6 +1722,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
                 budget,
             )
@@ -1223,6 +1737,36 @@ mod tests {
             vec![newest, middle]
         );
         assert!(plan.neutral_retained[0].score > plan.neutral_retained[1].score);
+    }
+
+    #[test]
+    fn zero_neutral_watermarks_drop_all_eligible_items() {
+        let mut state = ContextState::new("initial".into());
+        let first = add_tool_with_output(&mut state, &"first ".repeat(100));
+        let second = add_tool_with_output(&mut state, &"second ".repeat(100));
+
+        let plan = state
+            .plan_compaction_with_neutral_watermarks(
+                &[],
+                CompactionPolicy {
+                    implicit_cached_tokens: 0,
+                    breakpoints: Vec::new(),
+                    payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
+                },
+                0,
+                0,
+            )
+            .expect("zero watermarks should make every eligible item removable");
+
+        assert_eq!(plan.dropped, vec![first, second]);
+        assert!(plan.neutral_retained.is_empty());
+        state.compact(plan);
+        assert!(state.input_items().iter().any(|item| {
+            item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text == "initial")
+        }));
     }
 
     #[test]
@@ -1242,6 +1786,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
                 budget,
             )
@@ -1275,6 +1820,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
                 budget,
             )
@@ -1305,6 +1851,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 budget,
             )
@@ -1337,6 +1884,7 @@ mod tests {
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
                         payoff_requests: 1,
+                        min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                     },
                     budget,
                 )
@@ -1373,6 +1921,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 usize::MAX,
             )
@@ -1395,6 +1944,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -1434,6 +1984,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -1457,12 +2008,12 @@ mod tests {
         state.arm_keep_leases(&change.keep, 1);
 
         state.advance_retention_turn();
-        let review = state.attach_due_keep_lease_review();
+        let review = state.attach_due_keep_lease_review_to(source);
         assert_eq!(review.item_ids, vec![protected]);
         assert!(
             serde_json::to_string(&state.input_items())
                 .unwrap()
-                .contains("Previously protected items")
+                .contains("Review protected items")
         );
 
         let expired = state.resolve_keep_lease_review(&[]);
@@ -1480,6 +2031,74 @@ mod tests {
     }
 
     #[test]
+    fn virtual_due_lease_release_includes_all_due_items_without_mutating_source() {
+        let mut state = ContextState::new("initial".into());
+        let first = add_tool(&mut state);
+        let second = add_tool(&mut state);
+        let third = add_tool(&mut state);
+        let source = add_tool(&mut state);
+        let change = state.record_signals(&update(&[first, second, third], &[], &[]), source);
+        state.arm_keep_leases(&change.keep, 1);
+        state.advance_retention_turn();
+
+        let (virtual_release, released_ids) = state
+            .virtual_release_due_keep_leases()
+            .expect("all due leases should be released in the virtual planner state");
+
+        assert_eq!(released_ids, vec![first, second, third]);
+        for id in &released_ids {
+            assert_eq!(state.signal_for(*id), Some(RetentionSignal::Keep));
+            assert_eq!(virtual_release.signal_for(*id), Some(RetentionSignal::Drop));
+        }
+    }
+
+    #[test]
+    fn keep_lease_review_batches_four_largest_due_items_and_explains_release() {
+        let mut state = ContextState::new("initial".into());
+        let tiny = add_tool_with_output(&mut state, &"tiny ".repeat(10));
+        let small = add_tool_with_output(&mut state, &"small ".repeat(20));
+        let medium = add_tool_with_output(&mut state, &"medium ".repeat(30));
+        let large = add_tool_with_output(&mut state, &"large ".repeat(40));
+        let largest = add_tool_with_output(&mut state, &"largest ".repeat(50));
+        let source = add_tool(&mut state);
+        let change = state.record_signals(
+            &update(&[tiny, small, medium, large, largest], &[], &[]),
+            source,
+        );
+        state.arm_keep_leases(&change.keep, 1);
+        state.advance_retention_turn();
+
+        let review = state.attach_due_keep_lease_review_to(source);
+
+        assert_eq!(review.item_ids, vec![largest, large, medium, small]);
+        let rendered = serde_json::to_string(&state.input_items()).unwrap();
+        assert!(rendered.contains("Review protected items"));
+        assert!(rendered.contains("are expiring"));
+        assert!(rendered.contains("context.remember"));
+        assert!(rendered.contains("release them for normal compaction"));
+        assert!(!rendered.contains(&format!("ID {tiny}")));
+    }
+
+    #[test]
+    fn keep_lease_review_must_not_rewrite_an_already_rendered_tool_result() {
+        let mut state = ContextState::new("initial".into());
+        let protected = add_tool(&mut state);
+        let source = add_tool(&mut state);
+        let change = state.record_signals(&update(&[protected], &[], &[]), source);
+        state.arm_keep_leases(&change.keep, 1);
+
+        state.advance_retention_turn();
+        state.add_user("steer: focus on the deploy script".into());
+        let rendered_before = serde_json::to_string(&state.input_items()).unwrap();
+
+        let review = state.attach_due_keep_lease_review_to(source);
+        let rendered_after = serde_json::to_string(&state.input_items()).unwrap();
+
+        assert!(review.item_ids.is_empty());
+        assert_eq!(rendered_before, rendered_after);
+    }
+
+    #[test]
     fn compaction_audit_distinguishes_expired_leases_from_active_keeps() {
         let mut state = ContextState::new("initial".into());
         let expired = add_tool_with_output(&mut state, &"expired ".repeat(100));
@@ -1489,7 +2108,7 @@ mod tests {
         state.arm_keep_leases(&change.keep, 2);
         state.advance_retention_turn();
         state.advance_retention_turn();
-        state.attach_due_keep_lease_review();
+        state.attach_due_keep_lease_review_to(source);
         state.resolve_keep_lease_review(&[active]);
         state.arm_keep_leases(&[active], 2);
 
@@ -1500,6 +2119,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
                 0,
             )
@@ -1611,6 +2231,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -1651,6 +2272,7 @@ mod tests {
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
                         payoff_requests: 1,
+                        min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                     },
                 )
                 .is_none()
@@ -1673,6 +2295,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -1741,6 +2364,7 @@ mod tests {
                 implicit_cached_tokens: usize::MAX,
                 breakpoints: Vec::new(),
                 payoff_requests: 1,
+                min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
             },
         );
         assert!(short.is_none());
@@ -1753,6 +2377,7 @@ mod tests {
                         implicit_cached_tokens: usize::MAX,
                         breakpoints: Vec::new(),
                         payoff_requests: 1,
+                        min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                     },
                 )
                 .is_none()
@@ -1777,6 +2402,7 @@ mod tests {
                         cached_tokens: 1_200,
                     }],
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -1798,6 +2424,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -1812,6 +2439,7 @@ mod tests {
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
                         payoff_requests: 1,
+                        min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                     },
                 )
                 .is_none()
@@ -1832,6 +2460,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -1870,6 +2499,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
                 },
             )
             .unwrap();
@@ -1896,6 +2526,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
                 usize::MAX,
             )
@@ -1922,6 +2553,7 @@ mod tests {
                         cached_tokens: 1_200,
                     }],
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
                 usize::MAX,
             )
@@ -1971,6 +2603,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
             )
             .unwrap();
@@ -2003,6 +2636,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
             )
             .unwrap();
@@ -2017,6 +2651,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
+                    min_payback_percent: 0,
                 },
             )
             .unwrap();

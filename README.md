@@ -12,7 +12,12 @@ records its work, and saves the resulting patch, trace, and usage record.
 
 - **Model-directed context management.** Human-authored content is kept by
 default. The model can protect evidence, mark stale tool output removable, or
-save a concise learning from it.
+save a concise learning from it. Model-protected items now receive keep leases by
+default: after eight later model turns they become due for a batched review.
+The model can renew protection; unrenewed items become eligible for compaction,
+not immediately deleted. Configure the positive lease length with
+`--keep-lease-turns N` or `CARRY_KEEP_LEASE_TURNS`. Human content remains kept by
+default unless its retention is explicitly changed.
 - **Cost-optimized compaction planning.** The default `economic` policy estimates
 whether the next request becomes cheaper before rewriting context; otherwise it
 keeps the existing history and its prompt-cache reuse.
@@ -112,12 +117,68 @@ carry login --device-auth
 `OPENAI_BASE_URL`. Remove the stored subscription credential with `carry logout`.
 Use `-p` when the prompt begins with an option-like value.
 
-Run without a prompt for an interactive session, or add `--interactive` after an
-initial prompt. For the localhost-only UI, run:
+Run without a prompt to start the localhost-only HTML UI and open it in your
+default browser. Use `--no-open` on remote/headless machines or to open the printed
+URL yourself. Browser-launch failures do not stop the server.
+`--serve` remains an explicit alias. Use `--interactive` for terminal follow-ups
+and steering. Supplying a prompt still runs once in the terminal; use `--print`
+to explicitly select one-shot mode, including when piping a prompt from stdin:
 
 ```sh
-carry --serve --cwd ../project
+carry --cwd ../project
+carry --port 9000
+carry --interactive -p "investigate the flaky test"
+printf 'explain the failing tests' | carry --print
 ```
+
+### Terminal input and formatting
+
+In `--interactive` mode, Enter sends the draft. Alt+Enter or Ctrl+J inserts a
+newline; Shift+Enter also works when the terminal reports it distinctly. Pasted
+blocks are inserted without submitting (bracketed paste), preserving indentation
+and blank lines. Arrow keys edit the draft, including earlier lines. Ctrl+C clears
+the draft; Ctrl+D on empty input or `/quit` exits. `/help` lists commands. The old
+`/paste` and `/end` commands remain available for compatibility.
+
+The editor stays in the normal terminal screen. Status output is printed above
+the editable draft. While the editor is active, streamed answers are buffered to
+complete lines (the last partial line is flushed on completion) to avoid disruptive
+per-token redraws. Terminal shell commands are shown once when execution starts,
+not repeatedly while their arguments are being generated; the browser still shows
+live shell-call previews. On Unix, run `cargo build && python3 tests/terminal_editor.py`
+for the editor’s pseudo-terminal smoke tests.
+
+Reedline is used only when stdin, stdout, and stderr are terminals. If either output
+stream is redirected, Carry uses the compatible line-oriented reader (`/paste`,
+`/end`, and `/cancel` remain available) so terminal protocol bytes never enter
+redirected stdout.
+
+Answers use lightweight terminal Markdown styling: colored headings, bold text,
+inline/fenced code, and muted block quotes. Lists, links, and tables remain readable
+Markdown source; code is colored as a block, not syntax-highlighted. Redirected
+stdout, `NO_COLOR`, and `TERM=dumb` preserve the original Markdown without styling.
+Output stays in native terminal scrollback, without a live token-counter redraw.
+Your terminal's “scroll on output” setting controls whether new output scrolls
+you back down.
+
+Model answer/commentary text is previewed as it streams, in both the browser
+and a terminal (on stderr when it is a TTY). Complete streamed lines receive the
+same lightweight Markdown styling as completed answers. Previews are provisional;
+a fully streamed terminal answer is not printed a second time at completion.
+If streaming was incomplete or stdout is redirected, the complete answer is still
+printed; redirected stdout remains suitable for piping. Tool arguments and context bookkeeping are not displayed
+as raw JSON. Private reasoning is not shown.
+
+Each model response in the browser includes its own input, cached-input, output,
+and total token counts. The footer shows only estimated session cost in USD, using the repository’s
+benchmark rates (currently available for `gpt-5.6-luna`). This is not a billing
+quote. Missing pricing or older responses without cost metadata show compact token totals instead
+(e.g. `2.5m tokens (2.4m cached, 120k out)`), rather than an incomplete cost.
+
+In the browser, submitted messages stay beside the composer as “sending”, then
+“queued” once accepted. They move into the conversation when added to the model's
+context, rather than appearing among output before they have been consumed.
+Steering received during a finishing response starts another turn automatically.
 
 ## Inspect a run
 

@@ -149,23 +149,23 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "After selecting the highest-priority action, preserve task-critical working state from recently added visible context. This is required secondary housekeeping, not optional cleanup. Human-authored content is kept by default. Other context is eligible for removal under budget pressure. Mark a human item removable only if it is a large item whose information can be safely summarized, is available elsewhere, or provides no directional change or learning. Retention decisions persist until reversed or applied by compaction.",
+        "description": "After making task progress, preserve task-critical working state from recently added visible context. This is required secondary housekeeping, not optional cleanup. Human-authored content is kept by default. Other context is eligible for removal under budget pressure. Leave eligible items removable; mark an already protected item removable only if its information can be safely summarized, is available elsewhere, or provides no directional change or learning. Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise.",
         "properties": {
             "protected": {
                 "type": "array",
-                "description": "Protect up to four context IDs carrying exact facts, decisions, constraints, diagnoses, or verified results that will matter to later work. Also protect an ID when you learned anything from it that is not preserved elsewhere. When only a concise learning must remain, use remember and make its bulky source removable instead. Protecting an ID reverses a removable decision.",
+                "description": "Protect up to four context IDs carrying exact facts, decisions, constraints, diagnoses, or verified results that will matter to later work. Also protect an ID when you learned anything from it that is not preserved elsewhere. When only a concise learning must remain, use remember and leave its bulky source removable, or mark it removable if it was protected. Protecting an ID reverses a removable decision.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "removable": {
                 "type": "array",
-                "description": "Mark up to four context IDs removable only when you learned nothing from them, or when everything learned from them is preserved elsewhere. Finishing an action does not preserve its learning. Making an ID removable reverses protection.",
+                "description": "Use this to release up to four already protected context IDs when you learned nothing from them, or when everything learned from them is preserved elsewhere. Leave eligible items unlisted. Finishing an action does not preserve its learning. Marking an ID removable reverses protection.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "remember": {
                 "type": "array",
-                "description": "At most one concise learning that preserves what a bulky source taught you without retaining its exact details. Make the source removable rather than also protecting it. Preserve outcomes, not chain-of-thought.",
+                "description": "At most one concise learning that preserves what a bulky source taught you without retaining its exact details. When it safely replaces a bulky source, leave that source removable or mark it removable if it was protected. Preserve outcomes, not chain-of-thought.",
                 "items": { "type": "string" },
                 "maxItems": 1
             }
@@ -258,13 +258,22 @@ mod tests {
         );
         assert_eq!(
             description,
-            "After selecting the highest-priority action, preserve task-critical working state from recently added visible context. This is required secondary housekeeping, not optional cleanup. Human-authored content is kept by default. Other context is eligible for removal under budget pressure. Mark a human item removable only if it is a large item whose information can be safely summarized, is available elsewhere, or provides no directional change or learning. Retention decisions persist until reversed or applied by compaction."
+            "After making task progress, preserve task-critical working state from recently added visible context. This is required secondary housekeeping, not optional cleanup. Human-authored content is kept by default. Other context is eligible for removal under budget pressure. Leave eligible items removable; mark an already protected item removable only if its information can be safely summarized, is available elsewhere, or provides no directional change or learning. Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise."
         );
         assert!(
             protected
                 .contains("exact facts, decisions, constraints, diagnoses, or verified results")
         );
         assert!(protected.contains("learned anything"));
+        assert!(protected.contains("leave its bulky source removable"));
+        assert!(
+            removable.starts_with("Use this to release up to four already protected context IDs")
+        );
+        assert!(removable.contains("Leave eligible items unlisted"));
+        assert!(
+            removable.find("Use this to release up to four already protected context IDs")
+                < removable.find("Leave eligible items unlisted")
+        );
         assert!(removable.contains("learned nothing"));
         assert!(removable.contains("preserved elsewhere"));
         assert!(remember.contains("concise learning"));

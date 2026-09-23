@@ -43,7 +43,9 @@ pub(crate) fn prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabi
 
 fn exact_model_prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabilities> {
     match model {
-        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" => Some(OPENAI_GPT_56_PROMPT_CACHE),
+        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-astra" => {
+            Some(OPENAI_GPT_56_PROMPT_CACHE)
+        }
         _ => None,
     }
 }
@@ -74,6 +76,8 @@ pub struct OpenAiClient {
     prompt_cache_key: String,
     request_timeout: Duration,
     connect_timeout: Duration,
+    #[cfg(test)]
+    auth_token_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -92,8 +96,33 @@ pub struct Usage {
     pub total_tokens: u64,
 }
 
+/// Modeled USD rates from scripts/swebench_smoke.py, not a billing quote.
+pub(crate) fn estimated_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
+    if model != "gpt-5.6-luna" {
+        return None;
+    }
+    let cached = usage.cached_input_tokens.min(usage.input_tokens);
+    let written = usage
+        .cache_write_input_tokens
+        .min(usage.input_tokens - cached);
+    let ordinary = usage.input_tokens - cached - written;
+    Some(
+        (ordinary as f64 * 0.20
+            + cached as f64 * 0.02
+            + written as f64 * 0.25
+            + usage.output_tokens as f64 * 1.20)
+            / 1_000_000.0,
+    )
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ModelProgress {
+    pub preview: String,
+    pub terminal_preview: Option<String>,
+    #[serde(skip)]
+    function_name: String,
+    #[serde(skip)]
+    arguments: String,
     /// Estimated while streaming; replaced with the API total on completion.
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
@@ -192,7 +221,26 @@ impl OpenAiClient {
             prompt_cache_key,
             request_timeout,
             connect_timeout,
+            #[cfg(test)]
+            auth_token_url: None,
         })
+    }
+
+    #[cfg(test)]
+    fn with_auth_token_url(mut self, auth_token_url: String) -> Self {
+        self.auth_token_url = Some(auth_token_url);
+        self
+    }
+
+    async fn refresh_subscription_auth(
+        &self,
+        home: &std::path::Path,
+    ) -> Result<Option<crate::auth::CodexAuth>> {
+        #[cfg(test)]
+        if let Some(token_url) = &self.auth_token_url {
+            return crate::auth::refresh_auth_at(home, token_url).await;
+        }
+        crate::auth::refresh_auth(home).await
     }
 
     pub(crate) fn request_timeout(&self) -> Duration {
@@ -281,7 +329,9 @@ impl OpenAiClient {
     {
         let mut body = self.request_body(system, history);
         body["stream"] = json!(true);
-        let auth = self.auth_for_step().await?;
+        let mut auth = self.auth_for_step().await?;
+        let mut auth_refreshed = false;
+        let client_request_id = new_prompt_cache_key();
         let started = Instant::now();
         let mut retries = 0;
         let mut retry_wait = Duration::ZERO;
@@ -303,7 +353,7 @@ impl OpenAiClient {
                     .header("OpenAI-Beta", "responses=experimental")
                     .header("Accept", "text/event-stream")
                     .header("session-id", &self.prompt_cache_key)
-                    .header("x-client-request-id", &self.prompt_cache_key)
+                    .header("x-client-request-id", &client_request_id)
                     .header("originator", "carry")
                     .header("User-Agent", concat!("carry/", env!("CARGO_PKG_VERSION"))),
             };
@@ -319,10 +369,10 @@ impl OpenAiClient {
                     }
                     retries += 1;
                     retry_wait += delay;
-                    eprintln!(
+                    crate::terminal::output(&format!(
                         "Responses API transport error: {error}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
                         delay.as_millis(),
-                    );
+                    ));
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -358,10 +408,10 @@ impl OpenAiClient {
                         }
                         retries += 1;
                         retry_wait += delay;
-                        eprintln!(
+                        crate::terminal::output(&format!(
                             "Responses API stream read failed: {error}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
                             delay.as_millis(),
-                        );
+                        ));
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -383,10 +433,10 @@ impl OpenAiClient {
                     }
                     retries += 1;
                     retry_wait += delay;
-                    eprintln!(
+                    crate::terminal::output(&format!(
                         "Responses API response body read failed: {error}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
                         delay.as_millis(),
-                    );
+                    ));
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -399,6 +449,25 @@ impl OpenAiClient {
                 break serde_json::from_slice(&response_body)
                     .context("Responses API returned invalid JSON")?;
             }
+            if status == StatusCode::UNAUTHORIZED
+                && !auth_refreshed
+                && let RequestAuth::CodexSubscription {
+                    credential_home: Some(home),
+                    ..
+                } = &auth
+            {
+                let credential = self
+                    .refresh_subscription_auth(home)
+                    .await?
+                    .context("ChatGPT subscription credential was removed; run `carry login`")?;
+                auth = RequestAuth::CodexSubscription {
+                    access_token: credential.access_token,
+                    account_id: credential.account_id,
+                    credential_home: Some(home.clone()),
+                };
+                auth_refreshed = true;
+                continue;
+            }
             if retryable_rate_limit(status, &response_body) && retries < MAX_RESPONSE_RETRIES {
                 let delay = retry_delay(&headers, retries);
                 if delay > MAX_TOTAL_RETRY_WAIT.saturating_sub(retry_wait) {
@@ -406,15 +475,15 @@ impl OpenAiClient {
                         "server backoff of {}ms exceeds the remaining retry wait budget",
                         delay.as_millis()
                     );
-                    eprintln!("Responses API returned {status}; {reason}");
+                    crate::terminal::output(&format!("Responses API returned {status}; {reason}"));
                     retry_stopped_reason = Some(reason);
                 } else {
                     retries += 1;
                     retry_wait += delay;
-                    eprintln!(
+                    crate::terminal::output(&format!(
                         "Responses API returned {status}; retrying in {}ms ({retries}/{MAX_RESPONSE_RETRIES})",
                         delay.as_millis(),
-                    );
+                    ));
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -614,8 +683,98 @@ where
         output_tokens: usage.output_tokens,
         reasoning_output_tokens: usage.reasoning_tokens,
         output_events: current.output_events,
+        ..ModelProgress::default()
     });
     Ok(response)
+}
+
+// Scan only top-level string fields. Decode complete JSON string prefixes so split
+// escapes (including Unicode surrogate pairs) are never displayed as raw JSON.
+fn partial_string_field(json: &str, field: &str) -> String {
+    let bytes = json.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth -= 1,
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return String::new();
+                }
+                let key = &json[start..=i];
+                let mut next = i + 1;
+                while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                if depth == 1
+                    && bytes.get(next) == Some(&b':')
+                    && serde_json::from_str::<String>(key).ok().as_deref() == Some(field)
+                {
+                    next += 1;
+                    while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                        next += 1;
+                    }
+                    if bytes.get(next) != Some(&b'"') {
+                        return String::new();
+                    }
+                    let start = next;
+                    next += 1;
+                    let mut end = next;
+                    while next < bytes.len() {
+                        if bytes[next] == b'"' {
+                            break;
+                        }
+                        if bytes[next] == b'\\' {
+                            next += 1;
+                            if next >= bytes.len() {
+                                break;
+                            }
+                            if bytes[next] == b'u' {
+                                if next + 4 >= bytes.len() {
+                                    break;
+                                }
+                                next += 4;
+                            }
+                        }
+                        next += 1;
+                        end = next;
+                    }
+                    // At most one incomplete surrogate pair needs trimming.
+                    for _ in 0..7 {
+                        if let Ok(value) =
+                            serde_json::from_str::<String>(&format!("{}\"", &json[start..end]))
+                        {
+                            return value;
+                        }
+                        if end <= start + 1 {
+                            break;
+                        }
+                        end -= 1;
+                        while !json.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                    }
+                    return String::new();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    String::new()
 }
 
 fn sse_frame_end(pending: &[u8]) -> Option<(usize, usize)> {
@@ -653,7 +812,39 @@ where
     let event: Value =
         serde_json::from_str(&data).context("Responses API stream contained invalid JSON")?;
     let event_type = event["type"].as_str().unwrap_or_default();
+    if event_type == "response.output_item.added" {
+        current.function_name = event["item"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        current.terminal_preview = (current.function_name == "shell").then(String::new);
+        current.arguments.clear();
+        current.preview.clear();
+    }
     if let Some(delta) = event["delta"].as_str() {
+        if event_type == "response.function_call_arguments.delta" {
+            current.arguments.push_str(delta);
+            let field = match current.function_name.as_str() {
+                "finish" => Some("answer"),
+                "shell" => Some("message"),
+                _ => None,
+            };
+            if let Some(field) = field {
+                current.preview = partial_string_field(&current.arguments, field);
+                if current.function_name == "shell" {
+                    let command = partial_string_field(&current.arguments, "command");
+                    current.terminal_preview = Some(String::new());
+                    if !command.is_empty() {
+                        current
+                            .preview
+                            .push_str(&format!("\n\n```sh\n{command}\n```"));
+                    }
+                }
+            }
+        } else if event_type == "response.output_text.delta" {
+            current.preview.push_str(delta);
+        }
+
         // Private reasoning tokens are not exposed as token deltas. This is an explicit
         // approximate activity counter and is corrected by final usage on completion.
         current.output_tokens += (delta.len().max(1) as u64).div_ceil(4);
@@ -678,6 +869,121 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_preview_handles_split_escapes_and_ignores_nested_fields() {
+        assert_eq!(partial_string_field(r#"{"answer":"hi\""#, "answer"), "hi\"");
+        assert_eq!(partial_string_field(r#"{"answer":"hi\"#, "answer"), "hi");
+        assert_eq!(
+            partial_string_field(r#"{"answer":"hi\uD83D"#, "answer"),
+            "hi"
+        );
+        assert_eq!(
+            partial_string_field(r#"{"answer":"hi\uD83D\uDE00"#, "answer"),
+            "hi😀"
+        );
+        assert_eq!(
+            partial_string_field(r#"{"context":{"answer":"hidden"},"answer":"世界"#, "answer"),
+            "世界"
+        );
+    }
+
+    #[test]
+    fn function_arguments_stream_readable_answer_not_context_json() {
+        let mut current = ModelProgress::default();
+        let mut completed = None;
+        let mut items = Vec::new();
+        let mut updates = Vec::new();
+        for event in [
+            json!({"type":"response.output_item.added", "item":{"type":"function_call", "name":"finish"}}),
+            json!({"type":"response.function_call_arguments.delta", "delta":r#"{"context":{"remember":["secret"]},"answer":"Hello\nwo"#}),
+            json!({"type":"response.function_call_arguments.delta", "delta":r#"rld","context":{}}"#}),
+        ] {
+            process_sse_frame(
+                format!("data: {event}").as_bytes(),
+                &mut completed,
+                &mut items,
+                &mut current,
+                &mut |p| updates.push(p),
+            )
+            .unwrap();
+        }
+        assert_eq!(updates[0].preview, "Hello\nwo");
+        assert_eq!(updates[1].preview, "Hello\nworld");
+    }
+
+    #[test]
+    fn cost_estimate_matches_benchmark_rates_without_guessing_unknown_prices() {
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 400_000,
+            cache_write_input_tokens: 200_000,
+            output_tokens: 100_000,
+            ..Usage::default()
+        };
+        assert_eq!(estimated_cost_usd("gpt-5.6-luna", &usage), Some(0.258));
+        assert_eq!(estimated_cost_usd("custom-model", &usage), None);
+        assert_eq!(estimated_cost_usd("gpt-5.6-astra", &usage), None);
+    }
+
+    #[test]
+    fn shell_terminal_preview_only_appends_when_command_and_message_arrive() {
+        let mut current = ModelProgress::default();
+        let mut completed = None;
+        let mut items = Vec::new();
+        let mut previous = String::new();
+        for event in [
+            json!({"type":"response.output_item.added","item":{"name":"shell"}}),
+            json!({"type":"response.function_call_arguments.delta","delta":r#"{"command":"echo"#}),
+            json!({"type":"response.function_call_arguments.delta","delta":r#" hello","message":"Checking"#}),
+            json!({"type":"response.function_call_arguments.delta","delta":r#" output"}"#}),
+        ] {
+            process_sse_frame(
+                format!("data: {event}").as_bytes(),
+                &mut completed,
+                &mut items,
+                &mut current,
+                &mut |_| {},
+            )
+            .unwrap();
+            let text = current
+                .terminal_preview
+                .as_ref()
+                .unwrap_or(&current.preview);
+            assert!(
+                text.starts_with(&previous),
+                "preview rewrote previously printed text: {text:?}"
+            );
+            previous = text.clone();
+        }
+        assert_eq!(previous, "");
+    }
+
+    #[test]
+    fn shell_command_is_previewed_while_arguments_arrive() {
+        let mut current = ModelProgress::default();
+        let mut completed = None;
+        let mut items = Vec::new();
+        for event in [
+            json!({"type":"response.output_item.added","item":{"name":"shell"}}),
+            json!({"type":"response.function_call_arguments.delta","delta":r#"{"command":"echo hello"#}),
+        ] {
+            process_sse_frame(
+                format!("data: {event}").as_bytes(),
+                &mut completed,
+                &mut items,
+                &mut current,
+                &mut |_| {},
+            )
+            .unwrap();
+        }
+        assert!(current.preview.contains("echo hello"));
+    }
+
+    #[test]
+    fn astra_is_explicitly_recognized() {
+        assert!(exact_model_prompt_cache_capabilities("gpt-5.6-astra").is_some());
+    }
 
     #[test]
     fn known_openai_models_resolve_prompt_cache_capabilities() {
@@ -982,6 +1288,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscription_request_refreshes_and_retries_after_unauthorized() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let home = tempfile::tempdir().unwrap();
+        let stale_payload = URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"stale-account"}}"#);
+        tokio::fs::write(
+            home.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "access_token": format!("header.{stale_payload}.signature"),
+                "refresh_token": "stale-refresh-token",
+                "expires_at_ms": u64::MAX,
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let fresh_payload = URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fresh-account"}}"#);
+        let fresh_access_token = format!("header.{fresh_payload}.signature");
+        let (token_url, token_requests, token_server) = response_server(vec![http_response(
+            "200 OK",
+            "",
+            &json!({
+                "access_token": fresh_access_token,
+                "refresh_token": "fresh-refresh-token",
+                "expires_in": 3600,
+            }),
+        )]);
+
+        let response = json!({
+            "id": "response-after-refresh",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "finish",
+                "arguments": "{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
+            }],
+            "usage": {}
+        });
+        let (api_base, api_requests, api_server) = response_server(vec![
+            http_response(
+                "401 Unauthorized",
+                "",
+                &json!({"error": {"message": "Authentication token has been invalidated."}}),
+            ),
+            sse_response(&format!(
+                "data: {{\"type\":\"response.completed\",\"response\":{response}}}\n\n"
+            )),
+        ]);
+        let client = OpenAiClient::new_with_auth(
+            api_base,
+            RequestAuth::CodexSubscription {
+                access_token: "ignored-in-favor-of-disk".into(),
+                account_id: "ignored-account".into(),
+                credential_home: Some(home.path().to_path_buf()),
+            },
+            "model".into(),
+            "medium".into(),
+        )
+        .with_auth_token_url(token_url);
+
+        let reply = client.step("system", &[]).await.unwrap();
+
+        assert_eq!(reply.response_id, "response-after-refresh");
+        assert_eq!(
+            api_requests.recv_timeout(Duration::from_secs(2)).unwrap(),
+            api_requests.recv_timeout(Duration::from_secs(2)).unwrap()
+        );
+        let token_request =
+            String::from_utf8(token_requests.recv_timeout(Duration::from_secs(2)).unwrap())
+                .unwrap();
+        assert!(token_request.contains("grant_type=refresh_token"));
+        assert!(token_request.contains("refresh_token=stale-refresh-token"));
+        let stored: Value = serde_json::from_slice(
+            &tokio::fs::read(home.path().join("auth.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored["access_token"], fresh_access_token);
+        assert_eq!(stored["refresh_token"], "fresh-refresh-token");
+        token_server.join().unwrap();
+        api_server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn subscription_requests_send_codex_auth_headers() {
         let response = json!({
             "id": "response-1",
@@ -1018,8 +1413,15 @@ mod tests {
         assert!(headers.contains("originator: carry"));
         assert!(headers.contains("openai-beta: responses=experimental"));
         assert!(headers.contains("accept: text/event-stream"));
-        assert!(headers.contains("session-id:"));
-        assert!(headers.contains("x-client-request-id:"));
+        let header_value = |name: &str| {
+            headers.lines().find_map(|line| {
+                let (header, value) = line.split_once(':')?;
+                header.eq_ignore_ascii_case(name).then(|| value.trim())
+            })
+        };
+        let session_id = header_value("session-id").expect("session id header");
+        let request_id = header_value("x-client-request-id").expect("client request id header");
+        assert_ne!(session_id, request_id);
         server.join().unwrap();
     }
 

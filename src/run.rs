@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
@@ -17,7 +17,10 @@ use tokio::{
 
 use crate::{
     auth,
-    context::{CompactionPolicy, ContextState, PricedBreakpoint, RenderedBreakpoint},
+    context::{
+        CompactionPlan, CompactionPolicy, ContextState, FlatRolloutConfig, FlatRolloutEstimate,
+        PricedBreakpoint, RenderedBreakpoint, meets_rollout_payback_threshold,
+    },
     log::RunLogger,
     mcp,
     openai::{
@@ -27,28 +30,21 @@ use crate::{
     protocol::{ActionKind, Step},
 };
 
-// Initial policy hypothesis: keep a meaningful recent working set while leaving ample room in
-// the model context. Hysteresis compacts this 32 Ki-token high-water mark toward 24 Ki tokens.
-const ELIGIBLE_CONTEXT_BUDGET_TOKENS: usize = 32 * 1024;
-
 const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an assigned repository.
 
-At each step, select one action. Understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
+Make task progress first: understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. When practical, identify the root cause and make the smallest correct fix at the appropriate layer; use local history to investigate regressions when it is available. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
 
-History is a working set, not a complete transcript. Human-authored content is kept by default. All other context is eligible for removal when it no longer fits the working set. After the first removal, a history-status item states that earlier context has been removed.
-
-At each step:
-1. First, determine the next immediate step toward the goal and perform the highest-priority action.
-2. Then, as secondary housekeeping, preserve task-critical working state from recently added visible context. This is required, not optional cleanup: protect exact facts, decisions, constraints, diagnoses, and verified results that will matter to later work. If you learned anything from an item that is not already preserved elsewhere, protect it. If only a concise learning must remain, remember the learning and make its bulky source removable. Make an item removable only when it taught you nothing or everything learned from it is preserved elsewhere. Finishing an action or encountering a failure does not by itself preserve its learning.
-
-Retention decisions persist until reversed or applied by compaction. Preserve outcomes, not chain-of-thought.
+Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
 
 MCP tools are available through the exact Carry executable in `$CARRY_SELF`. Discover tool names with `"$CARRY_SELF" mcp list` or scope discovery with `"$CARRY_SELF" mcp list --server SERVER`, inspect a tool's full description and schema with `"$CARRY_SELF" mcp describe SERVER/TOOL`, and invoke it with `"$CARRY_SELF" mcp call SERVER/TOOL '{"argument":"value"}'`. For complex arguments, pipe a JSON object to `"$CARRY_SELF" mcp call SERVER/TOOL --stdin`. MCP command output is JSON by default; `--json-pointer /path/to/value` selects part of call output and prints a selected string as raw text unless `--json` is passed. If a server requires authorization, ask the user to run `"$CARRY_SELF" mcp auth SERVER`.
 
 Large stdout and stderr results arrive in separate structured sections. Each text payload is unmodified; truncation, encoding, and artifact-path metadata are outside that payload. Read or slice the relevant stdout/stderr artifact when omitted details matter.
 
-Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
-"#;
+History is a working set, not a complete transcript. Human-authored content is kept by default. All other context is eligible for removal when it no longer fits the working set. After the first removal, a history-status item states that earlier context has been removed.
+
+As required secondary housekeeping, preserve task-critical working state from recently added visible context. This is required, not optional cleanup: protect exact facts, decisions, constraints, diagnoses, and verified results that will matter to later work. If you learned anything from an item that is not already preserved elsewhere, protect it. If only a concise learning must remain, remember it and leave its bulky source removable, or mark it removable if it was protected. Leave or mark an item removable only when it taught you nothing or everything learned from it is preserved elsewhere. Finishing an action or encountering a failure does not by itself preserve its learning.
+
+Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise. Preserve outcomes, not chain-of-thought."#;
 
 fn system_prompt(mcp_servers: &[String]) -> String {
     if mcp_servers.is_empty() {
@@ -80,6 +76,16 @@ pub struct RunConfig {
     pub keep_lease_turns: Option<u64>,
     /// Number of future requests used to amortize a compaction rewrite; one is next-request economics.
     pub compaction_payoff_requests: u64,
+    /// Minimum projected saving (percent of retained-path payoff cost) required to compact.
+    pub compaction_min_payback_percent: u8,
+    /// Zero disables deterministic flat-drop scenario rollouts before compaction.
+    pub compaction_rollout_samples: u32,
+    /// Per simulated future turn probability (percent) that the task ends.
+    pub compaction_rollout_stop_probability_percent: u8,
+    /// Eligible neutral token high-water mark before automatic compaction.
+    pub compaction_neutral_high_watermark_tokens: usize,
+    /// Eligible neutral token target after automatic compaction.
+    pub compaction_neutral_low_watermark_tokens: usize,
     pub resume_context: Option<ContextState>,
     pub resume_source: Option<PathBuf>,
     /// Stable provider cache affinity, retained with the resumable state.
@@ -179,13 +185,17 @@ pub enum Backend {
 #[derive(Debug)]
 pub struct RunOutcome {
     pub completed: bool,
+    pub answer_streamed: bool,
     pub answer: Option<String>,
     pub session_dir: PathBuf,
 }
 
 #[derive(Debug)]
 pub enum UserInput {
-    Message(String),
+    Message {
+        message: String,
+        submission_id: Option<String>,
+    },
     Exit,
 }
 
@@ -397,17 +407,19 @@ impl CacheTracker {
 
     #[cfg(test)]
     fn policy(&self) -> CompactionPolicy {
-        self.policy_with_implicit_compatibility(true, 1)
+        self.policy_with_implicit_compatibility(true, 1, 10)
     }
 
     fn policy_for_history(
         &self,
         history: &[serde_json::Value],
         payoff_requests: u64,
+        min_payback_percent: u8,
     ) -> CompactionPolicy {
         self.policy_with_implicit_compatibility(
             history.starts_with(&self.implicit_prefix),
             payoff_requests,
+            min_payback_percent,
         )
     }
 
@@ -415,6 +427,7 @@ impl CacheTracker {
         &self,
         implicit_prefix_compatible: bool,
         payoff_requests: u64,
+        min_payback_percent: u8,
     ) -> CompactionPolicy {
         let now = Instant::now();
         let mut breakpoints = self
@@ -443,6 +456,7 @@ impl CacheTracker {
             },
             breakpoints,
             payoff_requests,
+            min_payback_percent,
         }
     }
 
@@ -565,7 +579,7 @@ impl Backend {
 }
 
 pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, None, None).await
+    run_loop(config, &mut backend, None, None, None).await
 }
 
 pub async fn run_interactive(
@@ -573,7 +587,7 @@ pub async fn run_interactive(
     mut backend: Backend,
     input: mpsc::UnboundedReceiver<UserInput>,
 ) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, Some(input), None).await
+    run_loop(config, &mut backend, Some(input), None, None).await
 }
 
 pub async fn run_interactive_with_events(
@@ -581,8 +595,16 @@ pub async fn run_interactive_with_events(
     mut backend: Backend,
     input: mpsc::UnboundedReceiver<UserInput>,
     events: broadcast::Sender<serde_json::Value>,
+    initial_submission_id: Option<String>,
 ) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, Some(input), Some(events)).await
+    run_loop(
+        config,
+        &mut backend,
+        Some(input),
+        Some(events),
+        initial_submission_id,
+    )
+    .await
 }
 
 async fn run_loop(
@@ -590,6 +612,7 @@ async fn run_loop(
     backend: &mut Backend,
     mut input: Option<mpsc::UnboundedReceiver<UserInput>>,
     events: Option<broadcast::Sender<serde_json::Value>>,
+    initial_submission_id: Option<String>,
 ) -> Result<RunOutcome> {
     let run_started = Instant::now();
     let mcp_servers = auth::carry_home()
@@ -629,6 +652,8 @@ async fn run_loop(
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
                 "compaction_policy": config.compaction_mode,
+                "compaction_payoff_requests": config.compaction_payoff_requests,
+                "compaction_min_payback_percent": config.compaction_min_payback_percent,
                 "source_session": config.resume_source,
             }),
             &format!(
@@ -649,6 +674,8 @@ async fn run_loop(
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
                 "compaction_policy": config.compaction_mode,
+                "compaction_payoff_requests": config.compaction_payoff_requests,
+                "compaction_min_payback_percent": config.compaction_min_payback_percent,
                 "compaction_decision": "next_request"
             }),
             &format!("carry · {} · {}", config.model, config.cwd.display()),
@@ -664,13 +691,13 @@ async fn run_loop(
         let id = context_state.add_user(config.prompt.clone());
         logger.raw_event(
             "human_message",
-            json!({"context_id": id, "message": config.prompt}),
+            human_message_data(id, &config.prompt, initial_submission_id.as_deref()),
             &format!("  prompt [{id}] submitted"),
         )?;
     } else if !resumed {
         logger.raw_event(
             "human_message",
-            json!({"context_id": 1, "message": config.prompt}),
+            human_message_data(1, &config.prompt, initial_submission_id.as_deref()),
             "  prompt [1] submitted",
         )?;
     }
@@ -706,6 +733,7 @@ async fn run_loop(
             persist_context_checkpoint(&config, &context_state)?;
             return Ok(RunOutcome {
                 completed: false,
+                answer_streamed: false,
                 answer: None,
                 session_dir: config.session_dir,
             });
@@ -750,6 +778,8 @@ async fn run_loop(
 
         let progress_events = events.clone();
         let mut last_progress = None;
+        let mut displayed_preview = String::new();
+        let mut stream_output = crate::terminal::StreamOutput::default();
         let reply = match backend
             .step_with_progress(&system_prompt, &history, |progress| {
                 if last_progress
@@ -762,13 +792,26 @@ async fn run_loop(
                 {
                     return;
                 }
-                eprint!(
-                    "\r  model streaming · ~{} output tokens · {} events",
-                    progress.output_tokens, progress.output_events
-                );
+                let terminal_preview = progress
+                    .terminal_preview
+                    .as_ref()
+                    .unwrap_or(&progress.preview);
+                if !terminal_preview.is_empty() && *terminal_preview != displayed_preview {
+                    use std::io::IsTerminal;
+                    if std::io::stderr().is_terminal() {
+                        if let Some(delta) = terminal_preview.strip_prefix(&displayed_preview) {
+                            stream_output.push(delta);
+                        } else {
+                            stream_output
+                                .push(&format!("\n[stream restarted]\n{}", terminal_preview));
+                        }
+                        displayed_preview = terminal_preview.clone();
+                    }
+                }
                 if let Some(events) = &progress_events {
                     let _ = events.send(json!({"event":"model_progress", "data": {
                         "step": step_index,
+                        "preview": progress.preview,
                         "output_tokens": progress.output_tokens,
                         "reasoning_output_tokens": progress.reasoning_output_tokens,
                         "output_events": progress.output_events,
@@ -781,6 +824,9 @@ async fn run_loop(
         {
             Ok(reply) => reply,
             Err(error) => {
+                if !displayed_preview.is_empty() {
+                    stream_output.finish();
+                }
                 logger.raw_event(
                     "model_error",
                     json!({
@@ -797,8 +843,8 @@ async fn run_loop(
                 return Err(error);
             }
         };
-        if last_progress.is_some() {
-            eprintln!();
+        if !displayed_preview.is_empty() {
+            stream_output.finish();
         }
         metrics.record(&reply.usage, reply.latency_ms, reply.response_retries);
         sent_model_request = true;
@@ -810,6 +856,7 @@ async fn run_loop(
                 "response_id": reply.response_id,
                 "latency_ms": reply.latency_ms,
                 "response_retries": reply.response_retries,
+                "estimated_cost_usd": crate::openai::estimated_cost_usd(&config.model, &reply.usage),
                 "usage": reply.usage,
                 "parsed": &reply.step,
                 "raw": reply.raw
@@ -862,20 +909,16 @@ async fn run_loop(
                 } else {
                     Vec::new()
                 };
-                if let Some(lease_turns) = config.keep_lease_turns
-                    && context_state.retention_turn().is_multiple_of(lease_turns)
-                {
-                    let review = context_state.attach_due_keep_lease_review();
-                    if !review.item_ids.is_empty() {
-                        protected_until_request.extend(review.item_ids.iter().copied());
-                        logger.raw_event_silent(
-                            "retention_revalidation_requested",
-                            json!({"item_ids": review.item_ids}),
-                        )?;
-                    }
-                }
                 protected_until_request.push(item_id);
                 protected_until_request.extend(signals.added.iter().copied());
+                maybe_attach_keep_lease_review(
+                    &mut context_state,
+                    &protected_until_request,
+                    &mut cache,
+                    &mut logger,
+                    &config,
+                    item_id,
+                )?;
                 logger.raw_event_silent(
                     "context_signals",
                     json!({"source_id": item_id, "signals": &signals, "expired_keep_leases": expired_keep_leases}),
@@ -883,7 +926,7 @@ async fn run_loop(
                 persist_context_checkpoint(&config, &context_state)?;
 
                 if let Some(receiver) = input.as_mut()
-                    && drain_user_input(receiver, &mut context_state, &mut logger, &config)?
+                    && drain_user_input(receiver, &mut context_state, &mut logger, &config)?.0
                 {
                     write_final_artifacts(
                         &config,
@@ -897,6 +940,7 @@ async fn run_loop(
                     persist_context_checkpoint(&config, &context_state)?;
                     return Ok(RunOutcome {
                         completed: true,
+                        answer_streamed: false,
                         answer: None,
                         session_dir: config.session_dir,
                     });
@@ -920,6 +964,16 @@ async fn run_loop(
                 };
                 protected_until_request.push(item_id);
                 protected_until_request.extend(signals.added.iter().copied());
+                if input.is_some() {
+                    maybe_attach_keep_lease_review(
+                        &mut context_state,
+                        &protected_until_request,
+                        &mut cache,
+                        &mut logger,
+                        &config,
+                        item_id,
+                    )?;
+                }
                 logger.raw_event_silent(
                     "context_signals",
                     json!({"source_id": item_id, "signals": &signals, "expired_keep_leases": expired_keep_leases}),
@@ -939,20 +993,30 @@ async fn run_loop(
                     }),
                     &terminal_finished(step_index, &metrics.usage),
                 )?;
+                use std::io::IsTerminal;
+                let answer_streamed = !crate::terminal::should_print_answer(
+                    answer.as_deref().unwrap_or_default(),
+                    &displayed_preview,
+                    std::io::stdout().is_terminal(),
+                );
                 if let Some(receiver) = input.as_mut() {
-                    println!("{}", answer.as_deref().unwrap_or_default());
-                    let mut should_exit =
+                    if !answer_streamed {
+                        crate::terminal::print_answer(answer.as_deref().unwrap_or_default());
+                    }
+                    let (mut should_exit, had_messages) =
                         drain_user_input(receiver, &mut context_state, &mut logger, &config)?;
-                    if !should_exit {
-                        eprint!("carry> ");
-                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                    if !should_exit && !had_messages {
                         match receiver.recv().await {
-                            Some(UserInput::Message(message)) => {
+                            Some(UserInput::Message {
+                                message,
+                                submission_id,
+                            }) => {
                                 append_user_message(
                                     &config,
                                     &mut context_state,
                                     &mut logger,
                                     message,
+                                    submission_id,
                                     false,
                                 )?;
                             }
@@ -976,6 +1040,7 @@ async fn run_loop(
                 .await?;
                 return Ok(RunOutcome {
                     completed: true,
+                    answer_streamed,
                     answer,
                     session_dir: config.session_dir,
                 });
@@ -989,17 +1054,22 @@ fn drain_user_input(
     state: &mut ContextState,
     logger: &mut RunLogger,
     config: &RunConfig,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let mut should_exit = false;
+    let mut had_messages = false;
     while let Ok(input) = receiver.try_recv() {
         match input {
-            UserInput::Message(message) => {
-                append_user_message(config, state, logger, message, true)?;
+            UserInput::Message {
+                message,
+                submission_id,
+            } => {
+                had_messages = true;
+                append_user_message(config, state, logger, message, submission_id, true)?;
             }
             UserInput::Exit => should_exit = true,
         }
     }
-    Ok(should_exit)
+    Ok((should_exit, had_messages))
 }
 
 fn append_user_message(
@@ -1007,6 +1077,7 @@ fn append_user_message(
     state: &mut ContextState,
     logger: &mut RunLogger,
     message: String,
+    submission_id: Option<String>,
     steering: bool,
 ) -> Result<()> {
     let id = state.add_user(message.clone());
@@ -1017,10 +1088,111 @@ fn append_user_message(
     };
     logger.raw_event(
         "human_message",
-        json!({"context_id": id, "message": message}),
+        human_message_data(id, &message, submission_id.as_deref()),
         &terminal,
     )?;
     persist_context_checkpoint(config, state)
+}
+
+fn human_message_data(context_id: u64, message: &str, submission_id: Option<&str>) -> Value {
+    let mut data = json!({"context_id": context_id, "message": message});
+    if let Some(submission_id) = submission_id {
+        data["submission_id"] = json!(submission_id);
+    }
+    data
+}
+
+fn select_compaction_plan(
+    state: &ContextState,
+    protected: &[u64],
+    cache: &CacheTracker,
+    config: &RunConfig,
+) -> Option<(CompactionPlan, Option<FlatRolloutEstimate>)> {
+    let policy = cache.policy_for_history(
+        &state.input_items(),
+        config.compaction_payoff_requests,
+        config.compaction_min_payback_percent,
+    );
+    if config.compaction_rollout_samples > 0 {
+        let rollout_config = FlatRolloutConfig {
+            samples: config.compaction_rollout_samples,
+            horizon: config.compaction_payoff_requests,
+            seed: 0,
+            stop_probability_percent: config.compaction_rollout_stop_probability_percent,
+        };
+        state
+            .compaction_candidates_with_neutral_watermarks(
+                protected,
+                policy.clone(),
+                config.compaction_neutral_high_watermark_tokens,
+                config.compaction_neutral_low_watermark_tokens,
+            )
+            .into_iter()
+            .map(|plan| {
+                let rollout =
+                    state.flat_rollout_estimate(&plan, protected, policy.clone(), rollout_config);
+                (plan, rollout)
+            })
+            .filter(|(_, rollout)| meets_rollout_payback_threshold(rollout))
+            .max_by(|(_, left), (_, right)| {
+                left.expected_savings_input_units
+                    .total_cmp(&right.expected_savings_input_units)
+            })
+            .map(|(plan, rollout)| (plan, Some(rollout)))
+    } else {
+        state
+            .plan_compaction_with_neutral_watermarks(
+                protected,
+                policy,
+                config.compaction_neutral_high_watermark_tokens,
+                config.compaction_neutral_low_watermark_tokens,
+            )
+            .map(|plan| (plan, None))
+    }
+}
+
+/// Attach a keep-lease review to the tool result that was just returned, while
+/// it is still fresh trailing content. Rewriting an older, already-rendered
+/// result instead would invalidate the cached prefix. This keeps the planner
+/// gate from `select_compaction_plan`: the review only fires when releasing
+/// the due leases would make a compaction worthwhile.
+fn maybe_attach_keep_lease_review(
+    state: &mut ContextState,
+    protected_until_request: &[u64],
+    cache: &mut CacheTracker,
+    logger: &mut RunLogger,
+    config: &RunConfig,
+    host_id: u64,
+) -> Result<()> {
+    if config.compaction_mode != CompactionMode::Economic || config.keep_lease_turns.is_none() {
+        return Ok(());
+    }
+    if select_compaction_plan(state, protected_until_request, cache, config).is_some() {
+        return Ok(());
+    }
+    let Some((virtual_release, virtually_released_ids)) = state.virtual_release_due_keep_leases()
+    else {
+        return Ok(());
+    };
+    let virtual_protected = protected_until_request
+        .iter()
+        .copied()
+        .filter(|id| !virtually_released_ids.contains(id))
+        .collect::<Vec<_>>();
+    if select_compaction_plan(&virtual_release, &virtual_protected, cache, config).is_none() {
+        return Ok(());
+    }
+    let review = state.attach_due_keep_lease_review_to(host_id);
+    if !review.item_ids.is_empty() {
+        logger.raw_event_silent(
+            "retention_revalidation_requested",
+            json!({
+                "item_ids": review.item_ids,
+                "selection_scope": "all_due_virtual_release"
+            }),
+        )?;
+    }
+    Ok(())
 }
 
 fn maybe_compact(
@@ -1032,12 +1204,7 @@ fn maybe_compact(
     config: &RunConfig,
     trigger: &str,
 ) -> Result<bool> {
-    let policy = cache.policy_for_history(&state.input_items(), config.compaction_payoff_requests);
-    let Some(plan) = state.plan_compaction_with_neutral_budget(
-        protected,
-        policy,
-        ELIGIBLE_CONTEXT_BUDGET_TOKENS,
-    ) else {
+    let Some((plan, rollout)) = select_compaction_plan(state, protected, cache, config) else {
         return Ok(false);
     };
     let change = state.compact(plan);
@@ -1045,7 +1212,12 @@ fn maybe_compact(
     metrics.record_compaction();
     logger.raw_event(
         "context_compacted",
-        json!({"trigger": trigger, "compaction": &change, "retained_context": state.snapshot()}),
+        json!({
+            "trigger": trigger,
+            "compaction": &change,
+            "retained_context": state.snapshot(),
+            "rollout": rollout,
+        }),
         &format!(
             "  compact · -{} items / ~{} tok · {} retained · {} rewritten · reuse {} · invalidate {} generations / {} cached tok · next request saves ~{} input-equivalent tok",
             change.dropped.len(),
@@ -1527,6 +1699,8 @@ async fn write_final_artifacts(
         "response_retries": metrics.response_retries,
         "compactions": metrics.compactions,
         "compaction_policy": config.compaction_mode,
+        "compaction_payoff_requests": config.compaction_payoff_requests,
+        "compaction_min_payback_percent": config.compaction_min_payback_percent,
         "elapsed_ms": elapsed_ms
     });
     tokio::fs::write(
@@ -1541,6 +1715,22 @@ async fn write_final_artifacts(
 mod tests {
     use super::*;
     use crate::openai::PromptCacheCapabilities;
+
+    #[test]
+    fn human_message_event_preserves_submission_identity() {
+        assert_eq!(
+            human_message_data(7, "repeat", Some("submission-123")),
+            json!({
+                "context_id": 7,
+                "message": "repeat",
+                "submission_id": "submission-123"
+            })
+        );
+        assert_eq!(
+            human_message_data(7, "repeat", None),
+            json!({"context_id": 7, "message": "repeat"})
+        );
+    }
 
     fn openai_cache_capabilities() -> PromptCacheCapabilities {
         PromptCacheCapabilities {
@@ -1617,9 +1807,13 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_requires_reproduction_without_soliciting_future_fixes() {
+    fn system_prompt_requires_reproduction_and_root_cause_investigation() {
         assert!(SYSTEM_PROMPT.contains("minimal failing reproduction"));
         assert!(SYSTEM_PROMPT.contains("affected tests"));
+        assert!(SYSTEM_PROMPT.contains(
+            "identify the root cause and make the smallest correct fix at the appropriate layer"
+        ));
+        assert!(SYSTEM_PROMPT.contains("use local history to investigate regressions"));
         assert!(SYSTEM_PROMPT.contains("$CARRY_SELF"));
         assert!(SYSTEM_PROMPT.contains("mcp describe SERVER/TOOL"));
         assert!(SYSTEM_PROMPT.contains("--stdin"));
@@ -1629,9 +1823,13 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_prioritizes_action_and_requires_critical_state_preservation() {
-        assert!(SYSTEM_PROMPT.contains("First, determine the next immediate step"));
-        assert!(SYSTEM_PROMPT.contains("Then, as secondary housekeeping"));
+    fn system_prompt_prioritizes_task_progress_and_requires_critical_state_preservation() {
+        assert!(SYSTEM_PROMPT.contains("Make task progress first"));
+        assert!(SYSTEM_PROMPT.contains("As required secondary housekeeping"));
+        assert!(
+            SYSTEM_PROMPT.find("Make task progress first")
+                < SYSTEM_PROMPT.find("As required secondary housekeeping")
+        );
         assert!(SYSTEM_PROMPT.contains("task-critical working state"));
         assert!(SYSTEM_PROMPT.contains("This is required, not optional cleanup"));
         assert!(
@@ -1640,10 +1838,17 @@ mod tests {
         );
         assert!(SYSTEM_PROMPT.contains("If you learned anything"));
         assert!(SYSTEM_PROMPT.contains("not already preserved elsewhere"));
-        assert!(SYSTEM_PROMPT.contains("remember the learning"));
+        assert!(SYSTEM_PROMPT.contains("remember it"));
         assert!(SYSTEM_PROMPT.contains("History is a working set"));
         assert!(SYSTEM_PROMPT.contains("Human-authored content is kept by default"));
         assert!(SYSTEM_PROMPT.contains("All other context is eligible for removal"));
+        assert!(!SYSTEM_PROMPT.contains("Select one action"));
+        assert!(!SYSTEM_PROMPT.contains("At each step:"));
+        assert!(SYSTEM_PROMPT.contains("leave its bulky source removable"));
+        assert!(SYSTEM_PROMPT.contains("or mark it removable if it was protected"));
+        assert!(SYSTEM_PROMPT.contains("Leave or mark an item removable only"));
+        assert!(SYSTEM_PROMPT.contains("or explicitly noted otherwise"));
+        assert!(!SYSTEM_PROMPT.contains("Make an item removable only"));
         assert!(!SYSTEM_PROMPT.contains("stable"));
         assert!(!SYSTEM_PROMPT.contains("volatile"));
     }
@@ -1864,13 +2069,15 @@ mod tests {
         ];
         assert_eq!(
             cache
-                .policy_for_history(&extended, 1)
+                .policy_for_history(&extended, 1, 10)
                 .implicit_cached_tokens,
             2_400
         );
         let mutated = vec![json!({"role": "user", "content": "changed"})];
         assert_eq!(
-            cache.policy_for_history(&mutated, 1).implicit_cached_tokens,
+            cache
+                .policy_for_history(&mutated, 1, 10)
+                .implicit_cached_tokens,
             0
         );
     }
@@ -2103,7 +2310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keep_lease_review_extends_cached_request_history_without_rewrite() {
+    async fn disabled_compaction_does_not_request_keep_lease_revalidation() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let session_dir = temp.path().join("run");
@@ -2113,7 +2320,7 @@ mod tests {
             &steps_file,
             concat!(
                 r#"{"action":{"kind":"shell","command":"printf first","answer":null},"context":{"protected":[2],"removable":[],"remember":[]}}"#, "\n",
-                r#"{"action":{"kind":"shell","command":"printf second","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+                r#"{"action":{"kind":"shell","command":"printf second","answer":null},"context":{"protected":[],"removable":[],"remember":["the second tool result is relevant"]}}"#, "\n",
                 r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
             ),
         )
@@ -2130,6 +2337,11 @@ mod tests {
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: Some(1),
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2150,20 +2362,12 @@ mod tests {
             .map(|event| event["data"]["history"].as_array().unwrap().clone())
             .collect::<Vec<_>>();
         assert_eq!(histories.len(), 3);
-        for pair in histories.windows(2) {
-            assert_eq!(pair[1][..pair[0].len()], pair[0]);
-        }
-        let third = &histories[2];
-        let review_in_tool_result = third.iter().any(|item| {
+        assert!(histories.iter().all(|history| !history.iter().any(|item| {
             item["type"] == "function_call_output"
-                && item["output"].as_str().is_some_and(|output| {
-                    output.contains("Previously protected items 2 may be removed soon")
-                })
-        });
-        assert!(review_in_tool_result);
-        assert!(!third.iter().any(|item| {
-            item["role"] == "developer" && item["content"].to_string().contains("Retention review")
-        }));
+                && item["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("Review protected items"))
+        })));
     }
 
     #[tokio::test]
@@ -2215,6 +2419,11 @@ mod tests {
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2230,6 +2439,87 @@ mod tests {
         assert!(
             patch.contains("+after"),
             "committed changes must remain in final.patch"
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_run_emits_flat_rollout_telemetry_before_a_compaction_decision() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("run");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"shell","command":"true","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+                "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        let mut context = ContextState::new("initial task".into());
+        for call in 0..3 {
+            context
+                .add_tool(
+                    vec![json!({
+                        "type": "function_call", "call_id": format!("call-{call}"),
+                        "name": "shell", "arguments": "{}"
+                    })],
+                    json!({
+                        "type": "function_call_output", "call_id": format!("call-{call}"),
+                        "output": "large output ".repeat(7_000)
+                    }),
+                )
+                .unwrap();
+        }
+
+        run(
+            RunConfig {
+                cwd: workspace,
+                prompt: "Finish the task.".into(),
+                session_dir: session_dir.clone(),
+                model: "scripted".into(),
+                max_steps: Some(2),
+                shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Economic,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 5,
+                compaction_min_payback_percent: 10,
+                compaction_rollout_samples: 4,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
+                resume_context: Some(context),
+                resume_source: None,
+                prompt_cache_key: Some("carry-test-cache-key".into()),
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let trace = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap();
+        let decision = trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| {
+                matches!(
+                    event["event"].as_str(),
+                    Some("context_compacted") | Some("compaction_rollout_rejected")
+                )
+            })
+            .expect("large resumed context should make a compaction decision");
+        assert_eq!(decision["data"]["rollout"]["samples"], 4);
+        assert_eq!(decision["data"]["rollout"]["horizon"], 5);
+        assert_eq!(decision["data"]["rollout"]["stop_probability_percent"], 10);
+        assert!(
+            decision["data"]["rollout"]["average_simulated_followup_turns"]
+                .as_f64()
+                .is_some()
         );
     }
 
@@ -2258,6 +2548,11 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
@@ -2341,6 +2636,11 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: Some("resumable-cache-affinity".into()),
@@ -2363,6 +2663,11 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: Some(resume.context),
                 resume_source: Some(first_session),
                 prompt_cache_key,
@@ -2428,6 +2733,11 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2471,6 +2781,11 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2529,6 +2844,11 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,
@@ -2587,6 +2907,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_steering_at_finish_starts_another_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("session");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"finish","answer":"first"},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+                "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[2],"removable":[],"remember":[]}}"#,
+                "\n"
+            ),
+        )
+        .await
+        .unwrap();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        sender
+            .send(UserInput::Message {
+                message: "do not change the JSON format".into(),
+                submission_id: None,
+            })
+            .unwrap();
+        drop(sender);
+
+        let outcome = run_interactive(
+            RunConfig {
+                cwd: workspace,
+                prompt: "initial task".into(),
+                session_dir: session_dir.clone(),
+                model: "scripted".into(),
+                max_steps: None,
+                shell_timeout_secs: 1,
+                compaction_mode: CompactionMode::Economic,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 25,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
+                resume_context: None,
+                resume_source: None,
+                prompt_cache_key: None,
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+            receiver,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.completed);
+        assert_eq!(outcome.answer.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
     async fn interactive_steering_is_appended_after_the_completed_tool_result() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
@@ -2606,7 +2983,10 @@ mod tests {
         .unwrap();
         let (sender, receiver) = mpsc::unbounded_channel();
         sender
-            .send(UserInput::Message("do not change the JSON format".into()))
+            .send(UserInput::Message {
+                message: "do not change the JSON format".into(),
+                submission_id: None,
+            })
             .unwrap();
         drop(sender);
 
@@ -2621,6 +3001,11 @@ mod tests {
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 32 * 1024,
+                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: None,
                 resume_source: None,
                 prompt_cache_key: None,

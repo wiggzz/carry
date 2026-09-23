@@ -84,6 +84,23 @@ pub(crate) fn codex_responses_url() -> &'static str {
 }
 
 pub(crate) async fn load_auth(home: &Path) -> Result<Option<CodexAuth>> {
+    load_auth_inner(home, false, TOKEN_URL).await
+}
+
+pub(crate) async fn refresh_auth(home: &Path) -> Result<Option<CodexAuth>> {
+    load_auth_inner(home, true, TOKEN_URL).await
+}
+
+#[cfg(test)]
+pub(crate) async fn refresh_auth_at(home: &Path, token_url: &str) -> Result<Option<CodexAuth>> {
+    load_auth_inner(home, true, token_url).await
+}
+
+async fn load_auth_inner(
+    home: &Path,
+    force_refresh: bool,
+    token_url: &str,
+) -> Result<Option<CodexAuth>> {
     let path = credential_path(home);
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
@@ -101,8 +118,10 @@ pub(crate) async fn load_auth(home: &Path) -> Result<Option<CodexAuth>> {
             path.display()
         );
     }
-    if credential.expires_at_ms <= now_ms().saturating_add(REFRESH_MARGIN.as_millis() as u64) {
-        credential = refresh(&credential).await?;
+    if force_refresh
+        || credential.expires_at_ms <= now_ms().saturating_add(REFRESH_MARGIN.as_millis() as u64)
+    {
+        credential = refresh(&credential, token_url).await?;
         save_credential(home, &credential).await?;
     }
     Ok(Some(CodexAuth {
@@ -339,18 +358,25 @@ async fn exchange_authorization_code(
     .await
 }
 
-async fn refresh(credential: &StoredCredential) -> Result<StoredCredential> {
-    token_request(&[
-        ("grant_type", "refresh_token"),
-        ("client_id", CLIENT_ID),
-        ("refresh_token", &credential.refresh_token),
-    ])
+async fn refresh(credential: &StoredCredential, token_url: &str) -> Result<StoredCredential> {
+    token_request_at(
+        token_url,
+        &[
+            ("grant_type", "refresh_token"),
+            ("client_id", CLIENT_ID),
+            ("refresh_token", &credential.refresh_token),
+        ],
+    )
     .await
 }
 
 async fn token_request(form: &[(&str, &str)]) -> Result<StoredCredential> {
+    token_request_at(TOKEN_URL, form).await
+}
+
+async fn token_request_at(token_url: &str, form: &[(&str, &str)]) -> Result<StoredCredential> {
     let response = Client::new()
-        .post(TOKEN_URL)
+        .post(token_url)
         .form(form)
         .send()
         .await
@@ -450,7 +476,7 @@ where
     }
 }
 
-fn open_browser(url: &str) {
+pub(crate) fn open_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let command = "open";
     #[cfg(target_os = "windows")]
@@ -464,8 +490,19 @@ fn open_browser(url: &str) {
         .spawn();
     #[cfg(not(target_os = "windows"))]
     let result = std::process::Command::new(command).arg(url).spawn();
-    if let Err(error) = result {
-        eprintln!("could not open a browser ({error}); paste the URL above into one");
+    match result {
+        Ok(mut child) => {
+            std::thread::spawn(move || match child.wait() {
+                Ok(status) if status.success() => {}
+                Ok(status) => eprintln!(
+                    "browser launcher exited with {status}; paste the URL above into a browser"
+                ),
+                Err(error) => eprintln!(
+                    "could not wait for browser launcher ({error}); paste the URL above into a browser"
+                ),
+            });
+        }
+        Err(error) => eprintln!("could not open a browser ({error}); paste the URL above into one"),
     }
 }
 
