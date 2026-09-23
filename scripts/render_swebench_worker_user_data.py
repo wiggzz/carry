@@ -2,6 +2,7 @@
 """Render bounded EC2 user data for the SWE-bench worker."""
 import argparse
 import base64
+import gzip
 from pathlib import Path
 
 
@@ -15,12 +16,16 @@ def render_user_data(worker_script: str, bootstrap_config_url: str) -> str:
     if not bootstrap_config_url.startswith("https://"):
         raise ValueError("bootstrap config URL must use HTTPS")
     config_url_b64 = base64.b64encode(bootstrap_config_url.encode("utf-8")).decode("ascii")
+    # Compress only the fixed audited implementation, not the capability URL.
+    # Decode in a separate strict-shell assignment: corrupt payloads must not run.
+    worker_b64 = base64.b64encode(gzip.compress(worker_script.encode("utf-8"), mtime=0)).decode("ascii")
     rendered = (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
-        f"BOOTSTRAP_CONFIG_URL_B64={config_url_b64}\n"
+        f"export BOOTSTRAP_CONFIG_URL_B64={config_url_b64}\n"
         "# BEGIN CARRY EC2 WORKER\n"
-        f"{worker_script}"
+        f"worker=$(printf '%s' '{worker_b64}' | base64 -d | gzip -dc)\n"
+        'exec bash -c "$worker"\n'
     )
     size = len(rendered.encode("utf-8"))
     if size > EC2_USER_DATA_MAX_BYTES:

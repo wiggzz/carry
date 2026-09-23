@@ -76,6 +76,8 @@ pub struct OpenAiClient {
     prompt_cache_key: String,
     request_timeout: Duration,
     connect_timeout: Duration,
+    #[cfg(test)]
+    auth_token_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -219,7 +221,26 @@ impl OpenAiClient {
             prompt_cache_key,
             request_timeout,
             connect_timeout,
+            #[cfg(test)]
+            auth_token_url: None,
         })
+    }
+
+    #[cfg(test)]
+    fn with_auth_token_url(mut self, auth_token_url: String) -> Self {
+        self.auth_token_url = Some(auth_token_url);
+        self
+    }
+
+    async fn refresh_subscription_auth(
+        &self,
+        home: &std::path::Path,
+    ) -> Result<Option<crate::auth::CodexAuth>> {
+        #[cfg(test)]
+        if let Some(token_url) = &self.auth_token_url {
+            return crate::auth::refresh_auth_at(home, token_url).await;
+        }
+        crate::auth::refresh_auth(home).await
     }
 
     pub(crate) fn request_timeout(&self) -> Duration {
@@ -308,7 +329,8 @@ impl OpenAiClient {
     {
         let mut body = self.request_body(system, history);
         body["stream"] = json!(true);
-        let auth = self.auth_for_step().await?;
+        let mut auth = self.auth_for_step().await?;
+        let mut auth_refreshed = false;
         let client_request_id = new_prompt_cache_key();
         let started = Instant::now();
         let mut retries = 0;
@@ -426,6 +448,25 @@ impl OpenAiClient {
             if status.is_success() {
                 break serde_json::from_slice(&response_body)
                     .context("Responses API returned invalid JSON")?;
+            }
+            if status == StatusCode::UNAUTHORIZED
+                && !auth_refreshed
+                && let RequestAuth::CodexSubscription {
+                    credential_home: Some(home),
+                    ..
+                } = &auth
+            {
+                let credential = self
+                    .refresh_subscription_auth(home)
+                    .await?
+                    .context("ChatGPT subscription credential was removed; run `carry login`")?;
+                auth = RequestAuth::CodexSubscription {
+                    access_token: credential.access_token,
+                    account_id: credential.account_id,
+                    credential_home: Some(home.clone()),
+                };
+                auth_refreshed = true;
+                continue;
             }
             if retryable_rate_limit(status, &response_body) && retries < MAX_RESPONSE_RETRIES {
                 let delay = retry_delay(&headers, retries);
@@ -1248,6 +1289,95 @@ mod tests {
             }
             RequestAuth::ApiKey(_) => panic!("expected subscription credentials"),
         }
+    }
+
+    #[tokio::test]
+    async fn subscription_request_refreshes_and_retries_after_unauthorized() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let home = tempfile::tempdir().unwrap();
+        let stale_payload = URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"stale-account"}}"#);
+        tokio::fs::write(
+            home.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "access_token": format!("header.{stale_payload}.signature"),
+                "refresh_token": "stale-refresh-token",
+                "expires_at_ms": u64::MAX,
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let fresh_payload = URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fresh-account"}}"#);
+        let fresh_access_token = format!("header.{fresh_payload}.signature");
+        let (token_url, token_requests, token_server) = response_server(vec![http_response(
+            "200 OK",
+            "",
+            &json!({
+                "access_token": fresh_access_token,
+                "refresh_token": "fresh-refresh-token",
+                "expires_in": 3600,
+            }),
+        )]);
+
+        let response = json!({
+            "id": "response-after-refresh",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "finish",
+                "arguments": "{\"answer\":\"done\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"
+            }],
+            "usage": {}
+        });
+        let (api_base, api_requests, api_server) = response_server(vec![
+            http_response(
+                "401 Unauthorized",
+                "",
+                &json!({"error": {"message": "Authentication token has been invalidated."}}),
+            ),
+            sse_response(&format!(
+                "data: {{\"type\":\"response.completed\",\"response\":{response}}}\n\n"
+            )),
+        ]);
+        let client = OpenAiClient::new_with_auth(
+            api_base,
+            RequestAuth::CodexSubscription {
+                access_token: "ignored-in-favor-of-disk".into(),
+                account_id: "ignored-account".into(),
+                credential_home: Some(home.path().to_path_buf()),
+            },
+            "model".into(),
+            "medium".into(),
+        )
+        .with_auth_token_url(token_url);
+
+        let reply = client.step("system", &[]).await.unwrap();
+
+        assert_eq!(reply.response_id, "response-after-refresh");
+        assert_eq!(
+            api_requests.recv_timeout(Duration::from_secs(2)).unwrap(),
+            api_requests.recv_timeout(Duration::from_secs(2)).unwrap()
+        );
+        let token_request =
+            String::from_utf8(token_requests.recv_timeout(Duration::from_secs(2)).unwrap())
+                .unwrap();
+        assert!(token_request.contains("grant_type=refresh_token"));
+        assert!(token_request.contains("refresh_token=stale-refresh-token"));
+        let stored: Value = serde_json::from_slice(
+            &tokio::fs::read(home.path().join("auth.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored["access_token"], fresh_access_token);
+        assert_eq!(stored["refresh_token"], "fresh-refresh-token");
+        token_server.join().unwrap();
+        api_server.join().unwrap();
     }
 
     #[tokio::test]

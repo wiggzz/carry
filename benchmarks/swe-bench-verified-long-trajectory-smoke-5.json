@@ -1,0 +1,11 @@
+{
+  "instance_ids": [
+    "sphinx-doc__sphinx-9229",
+    "pylint-dev__pylint-7080",
+    "sympy__sympy-14248",
+    "sympy__sympy-13878",
+    "sympy__sympy-13798"
+  ],
+  "parent_selection_sha256": "168ebe441da5481d0bf10b92ce69e34e10457a954900571cf366300de1e7d972",
+  "schema": "carry.swe-bench-long-trajectory-smoke.v1"
+}
