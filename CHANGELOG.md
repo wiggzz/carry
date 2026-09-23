@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.10.0](https://github.com/wiggzz/carry/compare/v0.9.0...v0.10.0) (2026-09-23)
+
+
+### Features
+
+* add MCP CLI support ([#95](https://github.com/wiggzz/carry/issues/95)) ([6f10962](https://github.com/wiggzz/carry/commit/6f10962db50b6b794db6ce6d3be2a097a6086629))
+* **compaction:** add paired rollout policy ([#114](https://github.com/wiggzz/carry/issues/114)) ([ebb4f0a](https://github.com/wiggzz/carry/commit/ebb4f0ad2b413bc16e582679df4be3f689bf3675))
+* **context:** add payoff margin and long-cohort validation ([#119](https://github.com/wiggzz/carry/issues/119)) ([0fe9a9f](https://github.com/wiggzz/carry/commit/0fe9a9f9753ef6f9828676c3640599816d1cefe5))
+* **context:** gate keep-lease review by planner ([#116](https://github.com/wiggzz/carry/issues/116)) ([3211310](https://github.com/wiggzz/carry/commit/32113105f11e49627acb7307b3b8e2111733066b))
+* improve web and terminal session experience ([#120](https://github.com/wiggzz/carry/issues/120)) ([655413c](https://github.com/wiggzz/carry/commit/655413c36913e8c9fa996ec38cb52dc4dd56078f))
+
+
+### Bug Fixes
+
+* **benchmark:** account timed-out Carry usage ([#117](https://github.com/wiggzz/carry/issues/117)) ([af6d913](https://github.com/wiggzz/carry/commit/af6d9136b74a42734b3490fa5c74fa5acf22d88b))
+* **context:** preserve cache prefix during keep-lease review ([#118](https://github.com/wiggzz/carry/issues/118)) ([419c741](https://github.com/wiggzz/carry/commit/419c741dfa3463a1ab026e4f5ec21e6b577d23ce))
+* refresh invalidated ChatGPT subscription tokens ([#122](https://github.com/wiggzz/carry/issues/122)) ([0ba814c](https://github.com/wiggzz/carry/commit/0ba814cef6ff8d91b6b9ca0ed51f029ec1b5c0b3))
+
 ## [0.9.0](https://github.com/wiggzz/carry/compare/v0.8.2...v0.9.0) (2026-09-15)
 
 
