@@ -202,10 +202,14 @@ class CompatibilityTests(unittest.TestCase):
                 self.assertEqual(compat._recipe_sha256(original), recipe_hash)
                 changed, report = transform_test_specs([original], swebench_version="4.1.0")
                 command = "python -m pip install --no-deps elementpath==2.5.3 xmlschema==1.11.3"
-                install = changed[0].repo_script_list.index("python -m pip install -e .")
+                install = original.repo_script_list.index("python -m pip install -e .")
+                self.assertEqual(changed[0].repo_script_list[install],
+                                 "python -m pip install -e '.[testing]'")
                 self.assertEqual(changed[0].repo_script_list[install + 1], command)
+                self.assertEqual(changed[0].repo_script_list[:install], original.repo_script_list[:install])
+                self.assertEqual(changed[0].repo_script_list[install + 2:], original.repo_script_list[install + 1:])
                 self.assertEqual(report["tasks"][original.instance_id]["repairs"],
-                                 ["pytest-xmlschema-1.11.3"])
+                                 ["pytest-testing-extra-xmlschema-1.11.3"])
                 self.assertEqual(changed[0].env_script_list, original.env_script_list)
                 self.assertEqual(changed[0].eval_script_list, original.eval_script_list)
                 self.assertNotEqual(changed[0].instance_image_key, original.instance_image_key)

@@ -281,9 +281,14 @@ def transform_test_specs(
                     or original_sha256 != expected_hash):
                 raise ValueError("unexpected pytest preparation recipe")
             index = _original_block_index(spec.repo_script_list, ["python -m pip install -e ."])
+            # The historical tox configuration installs the `testing` extra;
+            # upstream's image recipe omits it, leaving public collection imports
+            # (xmlschema, hypothesis, etc.) absent. Install that declared extra
+            # and retain the narrow parser-compatible XML pins.
+            spec.repo_script_list[index] = "python -m pip install -e '.[testing]'"
             spec.repo_script_list.insert(index + 1,
                 "python -m pip install --no-deps elementpath==2.5.3 xmlschema==1.11.3")
-            repairs.append("pytest-xmlschema-1.11.3")
+            repairs.append("pytest-testing-extra-xmlschema-1.11.3")
         if spec.instance_id in SPHINX_ROMAN_RECIPES:
             expected_version, expected_hash = SPHINX_ROMAN_RECIPES[spec.instance_id]
             if (spec.repo != "sphinx-doc/sphinx" or spec.version != expected_version
