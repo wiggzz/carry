@@ -146,7 +146,7 @@ if args.harness == "pi":
                     "name": "Benchmark model",
                     "reasoning": True,
                     "input": ["text", "image"],
-                    "contextWindow": 400000,
+                    "contextWindow": 1050000 if args.model == "gpt-6-luna" else 400000,
                     "maxTokens": 128000,
                     "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                 }],

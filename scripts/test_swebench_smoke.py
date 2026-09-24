@@ -100,6 +100,19 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(inputs["carry_compaction_neutral_low_watermark_tokens"]["default"], "0")
         self.assertEqual(inputs["carry_compaction_min_payback_percent"]["default"], "25")
 
+    def test_workflow_benchmark_model_input_controls_protected_worker(self):
+        workflow = pathlib.Path(__file__).parents[1] / ".github" / "workflows" / "run-swebench.yml"
+        contents = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        dispatched = contents[True]["workflow_dispatch"]["inputs"]["model"]
+        self.assertEqual(dispatched["default"], "gpt-6-luna")
+        self.assertTrue(dispatched["required"])
+        worker_model = contents["jobs"]["bootstrap-worker"]["env"]["MODEL"]
+        self.assertEqual(worker_model, "${{ inputs.model }}")
+        reasoning = contents[True]["workflow_dispatch"]["inputs"]["reasoning"]
+        self.assertEqual(reasoning["default"], "medium")
+        self.assertEqual(contents["jobs"]["bootstrap-worker"]["env"]["REASONING"],
+                         "${{ inputs.reasoning }}")
+
     def test_proxy_round_usage_records_maximum_and_non_monotonic_inputs(self):
         log = "noise\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 120}\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 90}\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 180}\n"
         execute = mock.Mock(return_value=types.SimpleNamespace(stdout=log))
@@ -1773,6 +1786,9 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                 "p = pathlib.Path(os.environ['HOME']) / '.pi/agent/models.json'\n"
                 "d = json.loads(p.read_text())\n"
                 "actual = d['providers']['openai-benchmark']['baseUrl']\n"
+                "model = d['providers']['openai-benchmark']['models'][0]\n"
+                "assert model['id'] == 'gpt-6-luna', model\n"
+                "assert model['contextWindow'] == 1050000, model\n"
                 "sys.exit(0 if actual == os.environ['OPENAI_BASE_URL'] else 7)\n"
             )
             env = {
@@ -1785,7 +1801,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                 "OPENAI_BASE_URL": "http://openai-proxy:8080/v1",
             }
             subprocess.run(
-                ["python3", str(entrypoint), "run", "--model", "gpt-test", "--reasoning", "medium",
+                ["python3", str(entrypoint), "run", "--model", "gpt-6-luna", "--reasoning", "medium",
                  "--prompt", str(prompt), "--output", str(output)],
                 check=True, env=env,
             )
@@ -1988,6 +2004,25 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                  "reasoning_tokens": 5, "total_tokens": 1_100_000}
         self.assertEqual(self.worker.estimate_cost_usd(usage, pricing), 0.258)
         self.assertIsNone(self.worker.pricing_for_model("unknown-model"))
+
+    def test_gpt6_luna_pricing_requires_round_size_and_rejects_long_context_estimate(self):
+        pricing = self.worker.pricing_for_model("gpt-6-luna")
+        self.assertIsNotNone(pricing)
+        usage = {"input_tokens": 1_000_000, "cached_input_tokens": 400_000,
+                 "cache_write_input_tokens": 200_000, "output_tokens": 100_000}
+        self.assertEqual(self.worker.estimate_cost_usd(
+            usage, pricing, max_round_input_tokens=272_000,
+            observed_round_input_tokens=1_000_000,
+        ), 0.119)
+        self.assertIsNone(self.worker.estimate_cost_usd(
+            usage, pricing, max_round_input_tokens=272_000,
+            observed_round_input_tokens=999_999,
+        ))
+        self.assertIsNone(self.worker.estimate_cost_usd(
+            usage, pricing, max_round_input_tokens=272_001,
+            observed_round_input_tokens=1_000_000,
+        ))
+        self.assertIsNone(self.worker.estimate_cost_usd(usage, pricing))
 
     def test_finalize_reports_per_agent_time_tokens_and_configured_cost(self):
         tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
