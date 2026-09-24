@@ -47,6 +47,13 @@ MODEL_PRICING_USD_PER_MILLION = {
         "cache_write_input": 0.25,
         "output": 1.20,
     },
+    "gpt-6-luna": {
+        "input": 0.10,
+        "cached_input": 0.01,
+        "cache_write_input": 0.125,
+        "output": 0.50,
+        "long_context_threshold": 272_000,
+    },
 }
 USAGE_KEYS = (
     "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
@@ -173,9 +180,20 @@ def pricing_for_model(model: str) -> dict[str, float] | None:
     return dict(pricing) if pricing is not None else None
 
 
-def estimate_cost_usd(usage: Mapping[str, int], pricing: Mapping[str, float] | None) -> float | None:
+def estimate_cost_usd(
+    usage: Mapping[str, int], pricing: Mapping[str, float] | None,
+    *, max_round_input_tokens: int = 0, observed_round_input_tokens: int = 0,
+) -> float | None:
     if pricing is None:
         return None
+    threshold = pricing.get("long_context_threshold")
+    if threshold is not None and usage["input_tokens"] > 0:
+        # Aggregate usage cannot identify which response incurred the provider's
+        # full-request long-context surcharge. Missing or incomplete per-round
+        # telemetry also cannot prove the cheap tier applies.
+        if (observed_round_input_tokens != usage["input_tokens"]
+                or max_round_input_tokens == 0 or max_round_input_tokens > threshold):
+            return None
     cached = min(usage["cached_input_tokens"], usage["input_tokens"])
     cache_write = min(
         usage["cache_write_input_tokens"], usage["input_tokens"] - cached,
@@ -1650,7 +1668,10 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
     record["round_input_tokens"] = load_proxy_round_input_tokens(proxy_container)
     record["max_round_input_tokens"] = max_observed_input_tokens(record["round_input_tokens"])
     record["usage"] = load_agent_usage(harness, output)
-    record["estimated_cost_usd"] = estimate_cost_usd(record["usage"], pricing)
+    record["estimated_cost_usd"] = estimate_cost_usd(
+        record["usage"], pricing, max_round_input_tokens=record["max_round_input_tokens"],
+        observed_round_input_tokens=sum(record["round_input_tokens"]),
+    )
     print("BENCHMARK_PROGRESS " + json.dumps({
         "elapsed_seconds": record["elapsed_seconds"], "instance_id": instance_id,
         "harness": harness, "state": "completed", "status": record["status"],
