@@ -157,6 +157,20 @@ PYLINT_GIT_RECIPES = {
     ),
 }
 
+# These exact bases import xmlschema during public test collection, but upstream
+# setup installs only pytest's runtime dependencies. --maxfail=1 otherwise aborts
+# collection before a single public test executes.
+PYTEST_XMLSCHEMA_RECIPES = {
+    "pytest-dev__pytest-7205": ("5.4", "0dbeee626c03a9017f9477ec682b4bda98210d8033f2f975abfb6fd2508d412a"),
+    "pytest-dev__pytest-7236": ("5.4", "7037f63968fcde659a042f0c1cdd5dd578f35a309592812d2c3524c5d2b545b3"),
+    "pytest-dev__pytest-7490": ("6.0", "407aaa00d4945f9136831de7221146d7e6dad20459429399fb4634ce9e4fc910"),
+    "pytest-dev__pytest-7521": ("6.0", "049de7de0ebbdb1a8036003d7524036a17cc83114a432f7bf9bf119bc271f4b5"),
+}
+
+# The exact 0.20 task pins pandas 1.5.3 after the Conda solve, but its historical
+# public tests import UndefinedVariableError from ops, which moved in 1.5.x.
+XARRAY_PANDAS_RECIPE = ("0.20", "aa3c2577487958d0e85f5f5f122df7da9262ff125bc1092e37b1f70eb3c225cf")
+
 
 # NumPy 1.25 introduced a warning in float(np.diff(...)) which these exact
 # historical bases promote to an error during collection. Preserve all other
@@ -260,6 +274,16 @@ def transform_test_specs(
                     ".write_text('/testbed\\n', encoding='utf-8')\n"
                     "PY_PYLINT_SOURCE_PATH")
                 repairs.append("pylint-7080-standalone-source-path")
+        if spec.instance_id in PYTEST_XMLSCHEMA_RECIPES:
+            expected_version, expected_hash = PYTEST_XMLSCHEMA_RECIPES[spec.instance_id]
+            if (spec.repo != "pytest-dev/pytest" or spec.version != expected_version
+                    or getattr(spec, "arch", None) != "x86_64"
+                    or original_sha256 != expected_hash):
+                raise ValueError("unexpected pytest preparation recipe")
+            index = _original_block_index(spec.repo_script_list, ["python -m pip install -e ."])
+            spec.repo_script_list.insert(index + 1,
+                "python -m pip install --no-deps elementpath==2.5.3 xmlschema==1.11.3")
+            repairs.append("pytest-xmlschema-1.11.3")
         if spec.instance_id in SPHINX_ROMAN_RECIPES:
             expected_version, expected_hash = SPHINX_ROMAN_RECIPES[spec.instance_id]
             if (spec.repo != "sphinx-doc/sphinx" or spec.version != expected_version
@@ -276,6 +300,17 @@ def transform_test_specs(
                 # 0.23 breaks public meta registration and text/docinfo output.
                 spec.repo_script_list.insert(index + 2, "python -m pip install --no-deps docutils==0.16")
                 repairs.append("sphinx-docutils-0.16")
+        if spec.instance_id == "pydata__xarray-6461":
+            expected_version, expected_hash = XARRAY_PANDAS_RECIPE
+            if (spec.repo != "pydata/xarray" or spec.version != expected_version
+                    or getattr(spec, "arch", None) != "x86_64"
+                    or original_sha256 != expected_hash
+                    or spec.env_script_list[-1].split().count("pandas==1.5.3") != 1):
+                raise ValueError("unexpected xarray preparation recipe")
+            spec.env_script_list[-1] = spec.env_script_list[-1].replace(
+                "pandas==1.5.3", "pandas==1.4.4", 1,
+            )
+            repairs.append("xarray-pandas-1.4.4")
         if spec.repo == "scikit-learn/scikit-learn" and spec.version in {"1.3", "1.4", "1.5", "1.6"}:
             if spec.env_script_list != SKLEARN_ENV or PIP_PIN in spec.repo_script_list:
                 raise ValueError("unexpected scikit-learn preparation environment")
