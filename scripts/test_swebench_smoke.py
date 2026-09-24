@@ -931,7 +931,8 @@ class SmokeWorkerTests(unittest.TestCase):
     def test_swebench_base_image_dependency_sources_are_https_only(self):
         templates = {"py": (
             "FROM --platform={platform} ubuntu:{ubuntu_version}\n"
-            "ENV TZ=Etc/UTC\nRUN apt update && apt install -y git\n"
+            "ENV TZ=Etc/UTC\nRUN apt update && apt install -y git "
+            "&& rm -rf /var/lib/apt/lists/*\n"
         )}
         ca_image = "node@sha256:" + "a" * 64
         first = self.worker.enforce_https_swebench_base_images(templates, ca_image)
@@ -941,6 +942,42 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertIn(ca_image, templates["py"])
         self.assertIn("COPY --from=trusted_certs /etc/ssl/certs", templates["py"])
         self.assertNotIn("\nRUN apt update", templates["py"])
+
+    def test_swebench_base_image_apt_retry_is_bounded_and_exercised(self):
+        templates = {"py": (
+            "FROM --platform={platform} ubuntu:{ubuntu_version}\n"
+            "ENV TZ=Etc/UTC\n"
+            "RUN apt update && apt install -y git && rm -rf /var/lib/apt/lists/*\n"
+        )}
+        self.worker.enforce_https_swebench_base_images(
+            templates, "node@sha256:" + "a" * 64,
+        )
+        run = next(line[4:] for line in templates["py"].splitlines()
+                   if line.startswith("RUN sed -i"))
+        for always_fail, expected_status, expected_installs in ((False, 0, 2), (True, 1, 4)):
+            with self.subTest(always_fail=always_fail), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                bin_dir = root / "bin"
+                bin_dir.mkdir()
+                apt = bin_dir / "apt"
+                apt.write_text("#!/bin/sh\n"
+                               "printf '%s\\n' \"$1\" >> \"$APT_LOG\"\n"
+                               "if [ \"$1\" = install ] && "
+                               "{ [ \"$ALWAYS_FAIL\" = 1 ] || [ ! -e \"$RETRIED\" ]; }; then\n"
+                               "  /usr/bin/touch \"$RETRIED\"\n  exit 100\nfi\n")
+                apt.chmod(0o755)
+                for name in ("sed", "rm", "sleep"):
+                    stub = bin_dir / name
+                    stub.write_text("#!/bin/sh\nexit 0\n")
+                    stub.chmod(0o755)
+                log = root / "apt.log"
+                env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}",
+                           APT_LOG=str(log), RETRIED=str(root / "retried"),
+                           ALWAYS_FAIL="1" if always_fail else "0")
+                result = subprocess.run(["/bin/sh", "-eu", "-c", run], env=env,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, expected_status, result.stderr)
+                self.assertEqual(log.read_text().splitlines().count("install"), expected_installs)
 
     @contextlib.contextmanager
     def preparation_fixture(self, count=3):

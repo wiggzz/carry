@@ -183,6 +183,72 @@ class CompatibilityTests(unittest.TestCase):
             "base_commit": commit, "test_patch": "", "FAIL_TO_PASS": [], "PASS_TO_PASS": [],
         })
 
+    def test_exact_pytest_readiness_recipes_install_xmlschema_without_changing_tests(self):
+        cases = (
+            ("7205", "5.4", "5e7f1ab4bf58e473e5d7f878eb2b499d7deabd29",
+             "0dbeee626c03a9017f9477ec682b4bda98210d8033f2f975abfb6fd2508d412a"),
+            ("7236", "5.4", "c98bc4cd3d687fe9b392d8eecd905627191d4f06",
+             "7037f63968fcde659a042f0c1cdd5dd578f35a309592812d2c3524c5d2b545b3"),
+            ("7490", "6.0", "7f7a36478abe7dd1fa993b115d22606aa0e35e88",
+             "407aaa00d4945f9136831de7221146d7e6dad20459429399fb4634ce9e4fc910"),
+            ("7521", "6.0", "41d211c24a6781843b174379d6d6538f5c17adb9",
+             "049de7de0ebbdb1a8036003d7524036a17cc83114a432f7bf9bf119bc271f4b5"),
+        )
+        for number, release, commit, recipe_hash in cases:
+            original = self.public_setup_spec(
+                "pytest-dev__pytest-" + number, "pytest-dev/pytest", release, commit,
+            )
+            with self.subTest(task=number):
+                self.assertEqual(compat._recipe_sha256(original), recipe_hash)
+                changed, report = transform_test_specs([original], swebench_version="4.1.0")
+                command = "python -m pip install --no-deps elementpath==2.5.3 xmlschema==1.11.3"
+                install = original.repo_script_list.index("python -m pip install -e .")
+                self.assertEqual(changed[0].repo_script_list[install],
+                                 "python -m pip install -e '.[testing]'")
+                self.assertEqual(changed[0].repo_script_list[install + 1], command)
+                self.assertEqual(changed[0].repo_script_list[:install], original.repo_script_list[:install])
+                self.assertEqual(changed[0].repo_script_list[install + 2:], original.repo_script_list[install + 1:])
+                self.assertEqual(report["tasks"][original.instance_id]["repairs"],
+                                 ["pytest-testing-extra-xmlschema-1.11.3"])
+                self.assertEqual(changed[0].env_script_list, original.env_script_list)
+                self.assertEqual(changed[0].eval_script_list, original.eval_script_list)
+                self.assertNotEqual(changed[0].instance_image_key, original.instance_image_key)
+                syntax = subprocess.run(["bash", "-n"], input=changed[0].install_repo_script,
+                                        text=True, capture_output=True, timeout=10)
+                self.assertEqual(syntax.returncode, 0, syntax.stderr)
+                drift = copy.deepcopy(original)
+                drift.repo_script_list[install] += " # changed upstream"
+                with self.assertRaisesRegex(ValueError, "unexpected pytest preparation recipe"):
+                    transform_test_specs([drift], swebench_version="4.1.0")
+
+    def test_exact_xarray_readiness_recipe_restores_pandas_legacy_import(self):
+        try:
+            from swebench.harness.test_spec import python as recipes
+            from swebench.harness.test_spec.test_spec import make_test_spec
+        except ImportError:
+            self.skipTest("optional pinned SWE-bench harness is not installed")
+        yaml = (Path(__file__).parent / "fixtures/xarray-6461-environment.yml").read_text()
+        with mock.patch.object(recipes, "get_environment_yml", return_value=yaml):
+            original = make_test_spec({
+                "instance_id": "pydata__xarray-6461", "repo": "pydata/xarray",
+                "version": "2022.03", "base_commit": "851dadeb0338403e5021c3fbe80cbc9127ee672d",
+                "test_patch": "", "FAIL_TO_PASS": [], "PASS_TO_PASS": [],
+            })
+        self.assertEqual(compat._recipe_sha256(original),
+                         "aa3c2577487958d0e85f5f5f122df7da9262ff125bc1092e37b1f70eb3c225cf")
+        changed, report = transform_test_specs([original], swebench_version="4.1.0")
+        self.assertEqual(changed[0].env_script_list[-1],
+                         original.env_script_list[-1].replace("pandas==1.5.3", "pandas==1.4.4"))
+        self.assertEqual(report["tasks"][original.instance_id]["repairs"], ["xarray-pandas-1.4.4"])
+        self.assertNotEqual(changed[0].env_image_key, original.env_image_key)
+        self.assertNotEqual(changed[0].instance_image_key, original.instance_image_key)
+        self.assertEqual(changed[0].repo_script_list, original.repo_script_list)
+        self.assertEqual(changed[0].eval_script_list, original.eval_script_list)
+        drift = copy.deepcopy(original)
+        drift.env_script_list[-1] += " # changed upstream"
+        with self.assertRaisesRegex(ValueError, "unexpected xarray preparation recipe"):
+            transform_test_specs([drift], swebench_version="4.1.0")
+
     def test_astropy_numpy_repair_executes_exact_pin_and_rejects_drift(self):
         # Release labels come from the pinned canonical dataset, not the source
         # package's development version (13398 is labeled 5.0, not 5.1).

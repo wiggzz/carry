@@ -976,12 +976,25 @@ def enforce_https_swebench_base_images(templates: dict[str, str],
         if template.count(env_marker) != 1:
             raise RuntimeError("unexpected SWE-bench Python base environment")
         template = template.replace(env_marker, f"{env_marker}\n{ca_copy}", 1)
-    marker = "RUN sed -i 's|http://|https://|g' /etc/apt/sources.list && apt update"
-    if marker not in template:
+    https_prefix = "RUN sed -i 's|http://|https://|g' /etc/apt/sources.list && "
+    if https_prefix not in template:
         needle = "RUN apt update"
         if template.count(needle) != 1:
             raise RuntimeError("unexpected SWE-bench Python base Dockerfile")
-        template = template.replace(needle, marker, 1)
+        template = template.replace(needle, f"{https_prefix}apt update", 1)
+    # Ubuntu security mirrors can briefly advertise a package before every
+    # backend serves it (404). Refresh the index and retry the *whole* install;
+    # never accept a partially installed base image after four attempts.
+    retry = "for attempt in 1 2 3 4; do apt update && apt install -y"
+    if retry not in template:
+        install = "apt update && apt install -y"
+        cleanup = "&& rm -rf /var/lib/apt/lists/*"
+        if template.count(install) != 1 or template.count(cleanup) != 1:
+            raise RuntimeError("unexpected SWE-bench Python base apt recipe")
+        template = template.replace(install, retry, 1)
+        template = template.replace(cleanup,
+            '&& break; [ "$attempt" -eq 4 ] && exit 1; sleep 4; done '
+            '&& rm -rf /var/lib/apt/lists/*', 1)
     templates["py"] = template
     return hashlib.sha256(template.encode()).hexdigest()
 
