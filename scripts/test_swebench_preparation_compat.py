@@ -227,7 +227,7 @@ class CompatibilityTests(unittest.TestCase):
         with mock.patch.object(recipes, "get_environment_yml", return_value=yaml):
             original = make_test_spec({
                 "instance_id": "pydata__xarray-6461", "repo": "pydata/xarray",
-                "version": "0.20", "base_commit": "851dadeb0338403e5021c3fbe80cbc9127ee672d",
+                "version": "2022.03", "base_commit": "851dadeb0338403e5021c3fbe80cbc9127ee672d",
                 "test_patch": "", "FAIL_TO_PASS": [], "PASS_TO_PASS": [],
             })
         self.assertEqual(compat._recipe_sha256(original),

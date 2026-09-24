@@ -167,9 +167,9 @@ PYTEST_XMLSCHEMA_RECIPES = {
     "pytest-dev__pytest-7521": ("6.0", "049de7de0ebbdb1a8036003d7524036a17cc83114a432f7bf9bf119bc271f4b5"),
 }
 
-# The exact 0.20 task pins pandas 1.5.3 after the Conda solve, but its historical
+# The exact 2022.03 task pins pandas 1.5.3 after the Conda solve, but its historical
 # public tests import UndefinedVariableError from ops, which moved in 1.5.x.
-XARRAY_PANDAS_RECIPE = ("0.20", "aa3c2577487958d0e85f5f5f122df7da9262ff125bc1092e37b1f70eb3c225cf")
+XARRAY_PANDAS_RECIPE = ("2022.03", "aa3c2577487958d0e85f5f5f122df7da9262ff125bc1092e37b1f70eb3c225cf")
 
 
 # NumPy 1.25 introduced a warning in float(np.diff(...)) which these exact
