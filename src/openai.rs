@@ -943,7 +943,8 @@ mod tests {
             input_tokens: 272_001,
             ..usage
         };
-        assert_eq!(estimated_cost_usd("gpt-6-luna", &long), Some(0.0464002));
+        let actual = estimated_cost_usd("gpt-6-luna", &long).unwrap();
+        assert!((actual - 0.0464002).abs() < 1e-12, "{actual}");
     }
 
     #[test]
