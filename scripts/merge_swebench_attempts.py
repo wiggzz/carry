@@ -17,7 +17,7 @@ MAX_ATTEMPTS = 10
 
 IMMUTABLE_PROVENANCE_FIELDS = (
     "dataset", "dataset_revision", "swebench_version", "source_commit", "model", "reasoning",
-    "carry_compaction_policy", "carry_keep_lease_turns", "carry_compaction_payoff_requests",
+    "carry_compaction_policy", "carry_keep_lease_turns", "carry_lease_review_policy", "carry_compaction_payoff_requests",
     "carry_compaction_min_payback_percent", "carry_compaction_rollout_samples", "carry_compaction_rollout_stop_probability_percent",
     "carry_compaction_neutral_high_watermark_tokens", "carry_compaction_neutral_low_watermark_tokens",
     "pricing_usd_per_million", "images", "harnesses",
@@ -28,6 +28,7 @@ IMMUTABLE_PROVENANCE_FIELDS = (
 # so historical default-policy studies remain mergeable; explicit non-default values
 # still differ from this identity and are rejected.
 LEGACY_COMPACTION_DEFAULTS = {
+    "carry_lease_review_policy": "baseline",
     "carry_compaction_neutral_high_watermark_tokens": "32768",
     "carry_compaction_neutral_low_watermark_tokens": "24576",
     "carry_compaction_min_payback_percent": "10",
