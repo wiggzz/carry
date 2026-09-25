@@ -1181,24 +1181,63 @@ fn maybe_attach_keep_lease_review(
     config: &RunConfig,
     host_id: u64,
 ) -> Result<()> {
-    if config.compaction_mode != CompactionMode::Economic || config.keep_lease_turns.is_none() {
+    // Ordinary runs without leases do not need decision events or a due-item scan.
+    if config.keep_lease_turns.is_none() {
+        return Ok(());
+    }
+    // This event is planner-boundary metadata only; never serialize item IDs or content.
+    let reviewed_ids = state.due_keep_lease_review_ids();
+    let (due_count, due_estimated_tokens, reviewable_estimated_tokens) =
+        state.due_keep_lease_review_metrics(&reviewed_ids);
+    let mut telemetry = json!({
+        "decision": "skip",
+        "reason": null,
+        "due_count": due_count,
+        "due_estimated_tokens": due_estimated_tokens,
+        "reviewable_count": reviewed_ids.len(),
+        "reviewable_estimated_tokens": reviewable_estimated_tokens,
+        "selected_wave_count": 0,
+        "ordinary_savings_input_units": null,
+        "expanded_savings_input_units": null,
+        "expanded_after_review_savings_input_units": null,
+        "advisory_write_input_units": null,
+    });
+    macro_rules! decision {
+        ($outcome:literal, $reason:literal) => {{
+            telemetry["decision"] = json!($outcome);
+            telemetry["reason"] = json!($reason);
+            logger.raw_event_silent("keep_lease_review_decision", telemetry)?;
+        }};
+    }
+    if config.compaction_mode != CompactionMode::Economic {
+        decision!("skip", "compaction_disabled");
         return Ok(());
     }
     if state.pending_keep_lease_review() {
+        decision!("skip", "review_pending");
         return Ok(());
     }
     let ordinary = select_compaction_plan(state, protected_until_request, cache, config);
+    if let Some((plan, _)) = &ordinary {
+        telemetry["ordinary_savings_input_units"] = json!(
+            plan.estimated_savings_input_units
+                .is_finite()
+                .then_some(plan.estimated_savings_input_units)
+        );
+    }
     if config.lease_review_policy == LeaseReviewPolicy::Baseline && ordinary.is_some() {
+        decision!("skip", "baseline_ordinary_plan");
         return Ok(());
     }
     if let Some((ordinary_plan, _)) = ordinary {
         // The rollout estimator does not yet model the mandatory one-request
         // review delay. Keep the ordinary rollout decision unchanged.
         if config.compaction_rollout_samples > 0 {
+            decision!("skip", "rollout_delay_unsupported");
             return Ok(());
         }
-        let reviewed_ids = state.due_keep_lease_review_ids();
         if reviewed_ids.is_empty() {
+            decision!("skip", "no_due_leases");
             return Ok(());
         }
         let virtual_release = state.virtual_omit_keep_lease_review(&reviewed_ids);
@@ -1210,8 +1249,15 @@ fn maybe_attach_keep_lease_review(
         let Some((expanded, _)) =
             select_compaction_plan(&virtual_release, &virtual_protected, cache, config)
         else {
+            decision!("skip", "expanded_plan_unavailable");
             return Ok(());
         };
+        telemetry["expanded_savings_input_units"] = json!(
+            expanded
+                .estimated_savings_input_units
+                .is_finite()
+                .then_some(expanded.estimated_savings_input_units)
+        );
         let implicit_cached_tokens = cache
             .policy_for_history(
                 &virtual_release.input_items(),
@@ -1225,13 +1271,20 @@ fn maybe_attach_keep_lease_review(
             config.compaction_payoff_requests,
         );
         let advisory_cost = state.review_advisory_write_input_units(host_id);
+        telemetry["expanded_after_review_savings_input_units"] =
+            json!(delayed_savings.is_finite().then_some(delayed_savings));
+        telemetry["advisory_write_input_units"] =
+            json!(advisory_cost.is_finite().then_some(advisory_cost));
         if !expanded.dropped.iter().any(|id| reviewed_ids.contains(id))
             || delayed_savings - advisory_cost <= ordinary_plan.estimated_savings_input_units
         {
+            decision!("skip", "incremental_benefit_insufficient");
             return Ok(());
         }
         let review = state.attach_due_keep_lease_review_to(host_id);
         if !review.item_ids.is_empty() {
+            telemetry["selected_wave_count"] = json!(review.item_ids.len());
+            decision!("request", "ordinary_review_payback");
             logger.raw_event_silent(
                 "retention_revalidation_requested",
                 json!({
@@ -1245,11 +1298,14 @@ fn maybe_attach_keep_lease_review(
                     "advisory_write_input_units": advisory_cost,
                 }),
             )?;
+        } else {
+            decision!("skip", "attachment_unavailable");
         }
         return Ok(());
     }
     let Some((virtual_release, virtually_released_ids)) = state.virtual_release_due_keep_leases()
     else {
+        decision!("skip", "no_due_leases");
         return Ok(());
     };
     let virtual_protected = protected_until_request
@@ -1257,11 +1313,22 @@ fn maybe_attach_keep_lease_review(
         .copied()
         .filter(|id| !virtually_released_ids.contains(id))
         .collect::<Vec<_>>();
-    if select_compaction_plan(&virtual_release, &virtual_protected, cache, config).is_none() {
+    let Some((expanded, _)) =
+        select_compaction_plan(&virtual_release, &virtual_protected, cache, config)
+    else {
+        decision!("skip", "all_due_plan_unavailable");
         return Ok(());
-    }
+    };
+    telemetry["expanded_savings_input_units"] = json!(
+        expanded
+            .estimated_savings_input_units
+            .is_finite()
+            .then_some(expanded.estimated_savings_input_units)
+    );
     let review = state.attach_due_keep_lease_review_to(host_id);
     if !review.item_ids.is_empty() {
+        telemetry["selected_wave_count"] = json!(review.item_ids.len());
+        decision!("request", "all_due_virtual_payback");
         logger.raw_event_silent(
             "retention_revalidation_requested",
             json!({
@@ -1269,6 +1336,8 @@ fn maybe_attach_keep_lease_review(
                 "selection_scope": "all_due_virtual_release"
             }),
         )?;
+    } else {
+        decision!("skip", "attachment_unavailable");
     }
     Ok(())
 }
@@ -2441,6 +2510,20 @@ mod tests {
             .map(|event| event["data"]["history"].as_array().unwrap().clone())
             .collect::<Vec<_>>();
         assert_eq!(histories.len(), 3);
+        let events = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap();
+        let decisions = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["event"] == "keep_lease_review_decision")
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions.iter().all(|event| {
+            event["data"]["reason"] == "compaction_disabled"
+                && event["data"]["due_count"].is_number()
+                && event["data"]["ordinary_savings_input_units"].is_null()
+        }));
         assert!(histories.iter().all(|history| !history.iter().any(|item| {
             item["type"] == "function_call_output"
                 && item["output"]
@@ -2532,6 +2615,18 @@ mod tests {
                 .iter()
                 .any(|e| e["event"] == "retention_revalidation_requested")
         );
+        let baseline_decision = baseline_events
+            .iter()
+            .find(|e| e["event"] == "keep_lease_review_decision")
+            .unwrap();
+        assert_eq!(
+            baseline_decision["data"]["reason"],
+            "baseline_ordinary_plan"
+        );
+        assert_eq!(baseline_decision["data"]["decision"], "skip");
+        assert_eq!(baseline_decision["data"]["due_count"], 1);
+        assert!(baseline_decision["data"]["ordinary_savings_input_units"].is_number());
+        assert!(baseline_decision["data"]["expanded_savings_input_units"].is_null());
         let baseline_compact = baseline_events
             .iter()
             .position(|e| e["event"] == "context_compacted")
@@ -2626,6 +2721,44 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(reviews.len(), 1, "one review should precede the rewrite");
         assert_eq!(reviews[0].1["data"]["item_ids"], json!([due]));
+        let decisions = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["event"] == "keep_lease_review_decision")
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 2, "one decision per eligible tool result");
+        let decision = &decisions[0].1["data"];
+        assert_eq!(decision["decision"], "request");
+        assert_eq!(decision["reason"], "ordinary_review_payback");
+        assert_eq!(decision["due_count"], 1);
+        assert_eq!(decision["reviewable_count"], 1);
+        assert_eq!(decision["selected_wave_count"], 1);
+        assert!(decision["due_estimated_tokens"].as_u64().unwrap() > 0);
+        for key in [
+            "ordinary_savings_input_units",
+            "expanded_savings_input_units",
+            "expanded_after_review_savings_input_units",
+            "advisory_write_input_units",
+        ] {
+            assert!(decision[key].as_f64().unwrap().is_finite(), "missing {key}");
+        }
+        assert!(
+            decision["expanded_after_review_savings_input_units"]
+                .as_f64()
+                .unwrap()
+                - decision["advisory_write_input_units"].as_f64().unwrap()
+                > decision["ordinary_savings_input_units"].as_f64().unwrap()
+        );
+        assert_eq!(decisions[1].1["data"]["decision"], "skip");
+        assert_eq!(decisions[1].1["data"]["reason"], "no_due_leases");
+        assert_eq!(decisions[1].1["data"]["due_count"], 0);
+        assert!(decision["reviewable_estimated_tokens"].as_u64().unwrap() > 0);
+        assert!(decisions[0].0 < reviews[0].0);
+        for (_, event) in &decisions {
+            let data = event["data"].to_string();
+            assert!(!data.contains("item_ids") && !data.contains("call_id"));
+            assert!(!data.contains("protected evidence") && !data.contains("printf"));
+        }
         let requests = events
             .iter()
             .enumerate()
@@ -2742,6 +2875,19 @@ mod tests {
                 .iter()
                 .any(|event| event["event"] == "retention_revalidation_requested")
         );
+        let decision = events
+            .iter()
+            .find(|e| e["event"] == "keep_lease_review_decision")
+            .unwrap();
+        assert_eq!(
+            decision["data"]["reason"],
+            "incremental_benefit_insufficient"
+        );
+        assert_eq!(decision["data"]["decision"], "skip");
+        assert_eq!(decision["data"]["selected_wave_count"], 0);
+        assert!(decision["data"]["expanded_savings_input_units"].is_number());
+        assert!(decision["data"]["expanded_after_review_savings_input_units"].is_number());
+        assert!(decision["data"]["advisory_write_input_units"].is_number());
         let compact = events
             .iter()
             .position(|event| event["event"] == "context_compacted")
@@ -2945,6 +3091,12 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .all(|event| event["event"] != "keep_lease_review_decision"),
+            "disabled leases must not add ordinary-run trace overhead"
+        );
         let requests = events
             .iter()
             .enumerate()
