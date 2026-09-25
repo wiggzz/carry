@@ -1168,6 +1168,38 @@ fn select_compaction_plan(
     }
 }
 
+/// Forecast the earliest rewrite after a lease review, with one projected new
+/// tool-turn item kept through that request. Both this and the ordinary planner
+/// use `select_compaction_plan` and the rollout's future-item size estimate.
+fn projected_after_review_plan(
+    state: &ContextState,
+    mut released: ContextState,
+    protected: &[u64],
+    cache: &CacheTracker,
+    config: &RunConfig,
+    next_turn_tokens: usize,
+) -> Option<(CompactionPlan, f64, usize)> {
+    if config.compaction_payoff_requests <= 1 || config.compaction_rollout_samples > 0 {
+        return None;
+    }
+    let next_id = released.add_simulated_tool_item(next_turn_tokens);
+    let mut future_protected = protected.to_vec();
+    future_protected.push(next_id);
+    let mut future_config = config.clone();
+    future_config.compaction_payoff_requests -= 1;
+    let (plan, _) = select_compaction_plan(&released, &future_protected, cache, &future_config)?;
+    let prior_cached_tokens = cache
+        .policy_for_history(
+            &state.input_items(),
+            config.compaction_payoff_requests,
+            config.compaction_min_payback_percent,
+        )
+        .implicit_cached_tokens;
+    let delayed_savings =
+        plan.savings_after_review_input_units(state.estimated_tokens(), prior_cached_tokens);
+    Some((plan, delayed_savings, prior_cached_tokens))
+}
+
 /// Attach a keep-lease review to the tool result that was just returned, while
 /// it is still fresh trailing content. Rewriting an older, already-rendered
 /// result instead would invalidate the cached prefix. This keeps the planner
@@ -1200,6 +1232,8 @@ fn maybe_attach_keep_lease_review(
         "ordinary_savings_input_units": null,
         "expanded_savings_input_units": null,
         "expanded_after_review_savings_input_units": null,
+        "expanded_after_review_retained_tokens": null,
+        "next_turn_estimated_tokens": null,
         "advisory_write_input_units": null,
     });
     macro_rules! decision {
@@ -1215,6 +1249,10 @@ fn maybe_attach_keep_lease_review(
     }
     if state.pending_keep_lease_review() {
         decision!("skip", "review_pending");
+        return Ok(());
+    }
+    if config.compaction_payoff_requests <= 1 {
+        decision!("skip", "review_delay_exceeds_horizon");
         return Ok(());
     }
     let ordinary = select_compaction_plan(state, protected_until_request, cache, config);
@@ -1258,24 +1296,31 @@ fn maybe_attach_keep_lease_review(
                 .is_finite()
                 .then_some(expanded.estimated_savings_input_units)
         );
-        let implicit_cached_tokens = cache
-            .policy_for_history(
-                &virtual_release.input_items(),
-                config.compaction_payoff_requests,
-                config.compaction_min_payback_percent,
+        let next_turn_tokens = state.estimated_next_tool_turn_tokens();
+        let Some((after_review, delayed_savings, implicit_cached_tokens)) =
+            projected_after_review_plan(
+                state,
+                virtual_release,
+                &virtual_protected,
+                cache,
+                config,
+                next_turn_tokens,
             )
-            .implicit_cached_tokens;
-        let delayed_savings = expanded.savings_after_review_input_units(
-            state.estimated_tokens(),
-            implicit_cached_tokens,
-            config.compaction_payoff_requests,
-        );
+        else {
+            decision!("skip", "forecast_plan_unavailable");
+            return Ok(());
+        };
         let advisory_cost = state.review_advisory_write_input_units(host_id);
+        telemetry["next_turn_estimated_tokens"] = json!(next_turn_tokens);
+        telemetry["expanded_after_review_retained_tokens"] = json!(after_review.retained_tokens);
         telemetry["expanded_after_review_savings_input_units"] =
             json!(delayed_savings.is_finite().then_some(delayed_savings));
         telemetry["advisory_write_input_units"] =
             json!(advisory_cost.is_finite().then_some(advisory_cost));
-        if !expanded.dropped.iter().any(|id| reviewed_ids.contains(id))
+        if !after_review
+            .dropped
+            .iter()
+            .any(|id| reviewed_ids.contains(id))
             || delayed_savings - advisory_cost <= ordinary_plan.estimated_savings_input_units
         {
             decision!("skip", "incremental_benefit_insufficient");
@@ -1293,6 +1338,8 @@ fn maybe_attach_keep_lease_review(
                     "ordinary_savings_input_units": ordinary_plan.estimated_savings_input_units,
                     "expanded_now_savings_input_units": expanded.estimated_savings_input_units,
                     "expanded_after_review_savings_input_units": delayed_savings,
+                    "expanded_after_review_retained_tokens": after_review.retained_tokens,
+                    "next_turn_estimated_tokens": next_turn_tokens,
                     "review_first_cached_tokens": implicit_cached_tokens,
                     "review_first_uncached_tokens": state.estimated_tokens().saturating_sub(implicit_cached_tokens),
                     "advisory_write_input_units": advisory_cost,
@@ -1325,6 +1372,34 @@ fn maybe_attach_keep_lease_review(
             .is_finite()
             .then_some(expanded.estimated_savings_input_units)
     );
+    let next_turn_tokens = state.estimated_next_tool_turn_tokens();
+    let Some((after_review, delayed_savings, _prior_cached_tokens)) = projected_after_review_plan(
+        state,
+        virtual_release,
+        &virtual_protected,
+        cache,
+        config,
+        next_turn_tokens,
+    ) else {
+        decision!("skip", "forecast_plan_unavailable");
+        return Ok(());
+    };
+    let advisory_cost = state.review_advisory_write_input_units(host_id);
+    telemetry["next_turn_estimated_tokens"] = json!(next_turn_tokens);
+    telemetry["expanded_after_review_retained_tokens"] = json!(after_review.retained_tokens);
+    telemetry["expanded_after_review_savings_input_units"] =
+        json!(delayed_savings.is_finite().then_some(delayed_savings));
+    telemetry["advisory_write_input_units"] =
+        json!(advisory_cost.is_finite().then_some(advisory_cost));
+    if !after_review
+        .dropped
+        .iter()
+        .any(|id| virtually_released_ids.contains(id))
+        || delayed_savings - advisory_cost <= after_review.minimum_payback_input_units
+    {
+        decision!("skip", "review_payback_insufficient");
+        return Ok(());
+    }
     let review = state.attach_due_keep_lease_review_to(host_id);
     if !review.item_ids.is_empty() {
         telemetry["selected_wave_count"] = json!(review.item_ids.len());
@@ -1333,7 +1408,12 @@ fn maybe_attach_keep_lease_review(
             "retention_revalidation_requested",
             json!({
                 "item_ids": review.item_ids,
-                "selection_scope": "all_due_virtual_release"
+                "selection_scope": "all_due_virtual_release",
+                "expanded_now_savings_input_units": expanded.estimated_savings_input_units,
+                "expanded_after_review_savings_input_units": delayed_savings,
+                "expanded_after_review_retained_tokens": after_review.retained_tokens,
+                "next_turn_estimated_tokens": next_turn_tokens,
+                "advisory_write_input_units": advisory_cost,
             }),
         )?;
     } else {
@@ -2753,6 +2833,14 @@ mod tests {
         assert_eq!(decisions[1].1["data"]["reason"], "no_due_leases");
         assert_eq!(decisions[1].1["data"]["due_count"], 0);
         assert!(decision["reviewable_estimated_tokens"].as_u64().unwrap() > 0);
+        assert!(decision["next_turn_estimated_tokens"].as_u64().unwrap() > 0);
+        assert!(
+            decision["expanded_after_review_retained_tokens"]
+                .as_u64()
+                .unwrap()
+                >= decision["next_turn_estimated_tokens"].as_u64().unwrap(),
+            "the projected follow-up item must be retained through its next request"
+        );
         assert!(decisions[0].0 < reviews[0].0);
         for (_, event) in &decisions {
             let data = event["data"].to_string();
@@ -3020,6 +3108,90 @@ mod tests {
         assert!(
             !cold_state.pending_keep_lease_review(),
             "a cold first keep request makes the delayed rewrite worse than ordinary compaction"
+        );
+    }
+
+    #[test]
+    fn all_due_review_forecasts_a_protected_next_tool_turn() {
+        use crate::protocol::ContextManagement;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = ContextState::new("Preserve the task".into());
+        let due = state.add_tool(
+            vec![json!({"type":"function_call", "call_id":"due", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"due", "output":"protected evidence ".repeat(5_000)}),
+        ).unwrap();
+        let host = state.add_tool(
+            vec![json!({"type":"function_call", "call_id":"host", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"host", "output":"fresh"}),
+        ).unwrap();
+        let signals = state.record_signals(
+            &ContextManagement {
+                keep: vec![due],
+                ..ContextManagement::default()
+            },
+            host,
+        );
+        state.arm_keep_leases(&signals.keep, 1);
+        state.advance_retention_turn();
+        let config = RunConfig {
+            cwd: temp.path().into(),
+            prompt: String::new(),
+            session_dir: temp.path().join("run"),
+            model: "scripted".into(),
+            max_steps: Some(2),
+            shell_timeout_secs: 1,
+            compaction_mode: CompactionMode::Economic,
+            keep_lease_turns: Some(1),
+            lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
+            compaction_payoff_requests: 20,
+            compaction_min_payback_percent: 0,
+            compaction_rollout_samples: 0,
+            compaction_rollout_stop_probability_percent: 10,
+            compaction_neutral_high_watermark_tokens: 0,
+            compaction_neutral_low_watermark_tokens: 0,
+            resume_context: None,
+            resume_source: None,
+            prompt_cache_key: None,
+        };
+        let mut cache = CacheTracker::new(None);
+        assert!(select_compaction_plan(&state, &[host], &cache, &config).is_none());
+        let (released, _) = state.virtual_release_due_keep_leases().unwrap();
+        let small =
+            projected_after_review_plan(&state, released.clone(), &[host], &cache, &config, 1)
+                .unwrap()
+                .0;
+        let large = projected_after_review_plan(&state, released, &[host], &cache, &config, 20_000)
+            .unwrap()
+            .0;
+        assert!(
+            large.retained_tokens > small.retained_tokens + 10_000,
+            "the follow-up size must enter the real post-review compaction plan"
+        );
+        let mut logger = RunLogger::create_with_events(&config.session_dir, None).unwrap();
+        maybe_attach_keep_lease_review(&mut state, &[host], &mut cache, &mut logger, &config, host)
+            .unwrap();
+        assert!(state.pending_keep_lease_review());
+        let events = std::fs::read_to_string(config.session_dir.join("trace.jsonl")).unwrap();
+        let decision = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "keep_lease_review_decision")
+            .unwrap();
+        assert_eq!(decision["data"]["reason"], "all_due_virtual_payback");
+        assert!(
+            decision["data"]["next_turn_estimated_tokens"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            decision["data"]["expanded_after_review_retained_tokens"]
+                .as_u64()
+                .unwrap()
+                >= decision["data"]["next_turn_estimated_tokens"]
+                    .as_u64()
+                    .unwrap()
         );
     }
 
