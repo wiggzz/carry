@@ -88,7 +88,7 @@ struct Cli {
     session_dir: Option<PathBuf>,
 
     /// OpenAI model name.
-    #[arg(long, env = "OPENAI_MODEL", default_value = "gpt-5.6-luna")]
+    #[arg(long, env = "OPENAI_MODEL", default_value = "gpt-6-sol")]
     model: String,
 
     /// OpenAI API base URL.
@@ -603,6 +603,15 @@ fn create_private_session_dir(path: &std::path::Path) -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn interactive_default_is_gpt6_sol_but_benchmark_model_can_be_explicit() {
+        let defaulted = Cli::try_parse_from(["carry", "-p", "fix it"]).unwrap();
+        assert_eq!(defaulted.model, "gpt-6-sol");
+        let benchmark =
+            Cli::try_parse_from(["carry", "--model", "gpt-6-luna", "-p", "fix it"]).unwrap();
+        assert_eq!(benchmark.model, "gpt-6-luna");
+    }
 
     #[test]
     fn default_web_port_does_not_require_serve_flag() {
