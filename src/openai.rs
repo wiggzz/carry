@@ -43,9 +43,8 @@ pub(crate) fn prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabi
 
 fn exact_model_prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabilities> {
     match model {
-        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-astra" => {
-            Some(OPENAI_GPT_56_PROMPT_CACHE)
-        }
+        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-astra" | "gpt-6-luna"
+        | "gpt-6-sol" => Some(OPENAI_GPT_56_PROMPT_CACHE),
         _ => None,
     }
 }
@@ -98,19 +97,24 @@ pub struct Usage {
 
 /// Modeled USD rates from scripts/swebench_smoke.py, not a billing quote.
 pub(crate) fn estimated_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
-    if model != "gpt-5.6-luna" {
-        return None;
-    }
+    let (input, cached_input, cache_write_input, output) = match model {
+        "gpt-5.6-luna" => (0.20, 0.02, 0.25, 1.20),
+        "gpt-6-luna" if usage.input_tokens > 272_000 => (0.20, 0.02, 0.25, 0.75),
+        "gpt-6-luna" => (0.10, 0.01, 0.125, 0.50),
+        "gpt-6-sol" if usage.input_tokens > 272_000 => (4.00, 0.40, 5.00, 15.00),
+        "gpt-6-sol" => (2.00, 0.20, 2.50, 10.00),
+        _ => return None,
+    };
     let cached = usage.cached_input_tokens.min(usage.input_tokens);
     let written = usage
         .cache_write_input_tokens
         .min(usage.input_tokens - cached);
     let ordinary = usage.input_tokens - cached - written;
     Some(
-        (ordinary as f64 * 0.20
-            + cached as f64 * 0.02
-            + written as f64 * 0.25
-            + usage.output_tokens as f64 * 1.20)
+        (ordinary as f64 * input
+            + cached as f64 * cached_input
+            + written as f64 * cache_write_input
+            + usage.output_tokens as f64 * output)
             / 1_000_000.0,
     )
 }
@@ -927,6 +931,42 @@ mod tests {
     }
 
     #[test]
+    fn gpt6_luna_cost_uses_per_request_long_context_threshold() {
+        let usage = Usage {
+            input_tokens: 272_000,
+            cached_input_tokens: 100_000,
+            cache_write_input_tokens: 50_000,
+            output_tokens: 10_000,
+            ..Usage::default()
+        };
+        assert_eq!(estimated_cost_usd("gpt-6-luna", &usage), Some(0.02445));
+        let long = Usage {
+            input_tokens: 272_001,
+            ..usage
+        };
+        let actual = estimated_cost_usd("gpt-6-luna", &long).unwrap();
+        assert!((actual - 0.0464002).abs() < 1e-12, "{actual}");
+    }
+
+    #[test]
+    fn gpt6_sol_cost_uses_its_own_rates_and_per_request_long_context_threshold() {
+        let usage = Usage {
+            input_tokens: 272_000,
+            cached_input_tokens: 100_000,
+            cache_write_input_tokens: 50_000,
+            output_tokens: 10_000,
+            ..Usage::default()
+        };
+        assert_eq!(estimated_cost_usd("gpt-6-sol", &usage), Some(0.489));
+        let long = Usage {
+            input_tokens: 272_001,
+            ..usage
+        };
+        let actual = estimated_cost_usd("gpt-6-sol", &long).unwrap();
+        assert!((actual - 0.928004).abs() < 1e-12, "{actual}");
+    }
+
+    #[test]
     fn shell_terminal_preview_only_appends_when_command_and_message_arrive() {
         let mut current = ModelProgress::default();
         let mut completed = None;
@@ -991,6 +1031,8 @@ mod tests {
         assert_eq!(capabilities.minimum_prefix_tokens, 1_024);
         assert_eq!(capabilities.max_read_breakpoints, 50);
         assert_eq!(capabilities.max_write_breakpoints, 4);
+        assert_eq!(prompt_cache_capabilities("gpt-6-luna"), Some(capabilities));
+        assert_eq!(prompt_cache_capabilities("gpt-6-sol"), Some(capabilities));
         assert!(capabilities.implicit_breakpoint_uses_write_slot);
         assert_eq!(
             prompt_cache_capabilities("gpt-5.6-future"),

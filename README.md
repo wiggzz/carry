@@ -197,9 +197,11 @@ Each session includes:
 - `result.json` — outcome, usage, cost estimate, retries, and compactions
 - `trace.jsonl` and shell-output files — chronological execution evidence
 
-The default model is `gpt-5.6-luna`; choose another with `--model` or
-`OPENAI_MODEL`. There is no default step limit; use `--max-steps N` only when a
-specific cap is required.
+The default model for ordinary Carry runs is `gpt-6-sol`; choose another with
+`--model` or `OPENAI_MODEL`. SWE-bench benchmark entry points separately default
+to `gpt-6-luna` and pass that choice explicitly to Carry, so changing Carry's
+interactive default does not change benchmark costs. There is no default step
+limit; use `--max-steps N` only when a specific cap is required.
 
 ## Development
 

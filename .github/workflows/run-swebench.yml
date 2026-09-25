@@ -26,6 +26,16 @@ on:
         default: carry
         type: choice
         options: [carry, codex, pi, all]
+      model:
+        description: Exact benchmark model ID; independent of the Hermes and native CLI defaults
+        required: true
+        default: gpt-6-luna
+        type: string
+      reasoning:
+        description: Benchmark reasoning effort; fixed across paired arms
+        required: true
+        default: medium
+        type: string
       carry_compaction_policy:
         description: Carry-only context policy; record it for paired ablations
         required: true
@@ -155,8 +165,8 @@ jobs:
       CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT: ${{ inputs.carry_compaction_rollout_stop_probability_percent }}
       CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS: ${{ inputs.carry_compaction_neutral_high_watermark_tokens }}
       CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS: ${{ inputs.carry_compaction_neutral_low_watermark_tokens }}
-      MODEL: ${{ vars.BENCHMARK_MODEL || 'gpt-5.6-luna' }}
-      REASONING: ${{ vars.BENCHMARK_REASONING || 'medium' }}
+      MODEL: ${{ inputs.model }}
+      REASONING: ${{ inputs.reasoning }}
     steps:
       - name: Bind candidate source to the reviewed workflow ref
         shell: bash
