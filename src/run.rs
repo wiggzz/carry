@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
@@ -63,6 +64,13 @@ pub enum CompactionMode {
     Disabled,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum LeaseReviewPolicy {
+    Baseline,
+    BatchOrdinary,
+}
+
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub cwd: PathBuf,
@@ -74,6 +82,8 @@ pub struct RunConfig {
     pub compaction_mode: CompactionMode,
     /// Experimental: revalidate model-requested protected context after this many model turns.
     pub keep_lease_turns: Option<u64>,
+    /// Opt-in experiment: review due leases before an already-qualified rewrite.
+    pub lease_review_policy: LeaseReviewPolicy,
     /// Number of future requests used to amortize a compaction rewrite; one is next-request economics.
     pub compaction_payoff_requests: u64,
     /// Minimum projected saving (percent of retained-path payoff cost) required to compact.
@@ -659,6 +669,7 @@ async fn run_loop(
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
                 "compaction_policy": config.compaction_mode,
+                "lease_review_policy": config.lease_review_policy,
                 "compaction_payoff_requests": config.compaction_payoff_requests,
                 "compaction_min_payback_percent": config.compaction_min_payback_percent,
                 "source_session": config.resume_source,
@@ -681,6 +692,7 @@ async fn run_loop(
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
                 "compaction_policy": config.compaction_mode,
+                "lease_review_policy": config.lease_review_policy,
                 "compaction_payoff_requests": config.compaction_payoff_requests,
                 "compaction_min_payback_percent": config.compaction_min_payback_percent,
                 "compaction_decision": "next_request"
@@ -1187,6 +1199,9 @@ fn maybe_attach_keep_lease_review(
         return Ok(());
     }
     let ordinary = select_compaction_plan(state, protected_until_request, cache, config);
+    if config.lease_review_policy == LeaseReviewPolicy::Baseline && ordinary.is_some() {
+        return Ok(());
+    }
     if let Some((ordinary_plan, _)) = ordinary {
         // The rollout estimator does not yet model the mandatory one-request
         // review delay. Keep the ordinary rollout decision unchanged.
@@ -2463,6 +2478,7 @@ mod tests {
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: Some(1),
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
@@ -2548,6 +2564,7 @@ mod tests {
             shell_timeout_secs: 1,
             compaction_mode: CompactionMode::Economic,
             keep_lease_turns: Some(1),
+            lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
             compaction_payoff_requests: 40,
             compaction_min_payback_percent: 0,
             compaction_rollout_samples: 0,
@@ -2558,6 +2575,41 @@ mod tests {
             resume_source: None,
             prompt_cache_key: Some("carry-test-cache-key".into()),
         };
+        let mut baseline_config = config.clone();
+        baseline_config.lease_review_policy = LeaseReviewPolicy::Baseline;
+        baseline_config.session_dir = temp.path().join("baseline");
+        run(
+            baseline_config.clone(),
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let baseline_events =
+            tokio::fs::read_to_string(baseline_config.session_dir.join("trace.jsonl"))
+                .await
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+        assert!(
+            !baseline_events
+                .iter()
+                .any(|e| e["event"] == "retention_revalidation_requested")
+        );
+        let baseline_compact = baseline_events
+            .iter()
+            .position(|e| e["event"] == "context_compacted")
+            .unwrap();
+        let baseline_requests = baseline_events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["event"] == "model_request")
+            .collect::<Vec<_>>();
+        assert!(
+            baseline_compact < baseline_requests[1].0,
+            "baseline must compact before review"
+        );
+
         let cache = CacheTracker::new(None);
         let ordinary = select_compaction_plan(&context, &[], &cache, &config)
             .expect("ordinary material alone justifies a rewrite")
@@ -2716,6 +2768,7 @@ mod tests {
             shell_timeout_secs: 1,
             compaction_mode: CompactionMode::Economic,
             keep_lease_turns: Some(1),
+            lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
             compaction_payoff_requests: 5,
             compaction_min_payback_percent: 0,
             compaction_rollout_samples: 0,
@@ -2809,6 +2862,7 @@ mod tests {
             shell_timeout_secs: 1,
             compaction_mode: CompactionMode::Economic,
             keep_lease_turns: Some(1),
+            lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
             compaction_payoff_requests: 5,
             compaction_min_payback_percent: 0,
             compaction_rollout_samples: 0,
@@ -2935,6 +2989,7 @@ mod tests {
             shell_timeout_secs: 1,
             compaction_mode: CompactionMode::Economic,
             keep_lease_turns: None,
+            lease_review_policy: LeaseReviewPolicy::Baseline,
             compaction_payoff_requests: 5,
             compaction_min_payback_percent: 0,
             compaction_rollout_samples: 0,
@@ -3033,6 +3088,7 @@ mod tests {
                 default_shell_timeout_secs: 5,
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
@@ -3100,6 +3156,7 @@ mod tests {
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 5,
                 compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 4,
@@ -3162,6 +3219,7 @@ mod tests {
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
@@ -3250,6 +3308,7 @@ mod tests {
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
@@ -3277,6 +3336,7 @@ mod tests {
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
@@ -3347,6 +3407,7 @@ mod tests {
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
@@ -3395,6 +3456,7 @@ mod tests {
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
@@ -3458,6 +3520,7 @@ mod tests {
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,
@@ -3558,6 +3621,7 @@ mod tests {
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 25,
                 compaction_rollout_samples: 0,
@@ -3615,6 +3679,7 @@ mod tests {
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 0,

@@ -127,8 +127,13 @@ and `trace.jsonl`.
 
 `--keep-lease-turns N` (or `CARRY_KEEP_LEASE_TURNS=N`) is disabled by default.
 When enabled, a model `protected` signal is a lease for `N` later model turns,
-not a permanent lock. Once one or more leases are due, Carry asks the ordinary
-planner whether compaction already qualifies. If it does, Carry simulates
+not a permanent lock. `--lease-review-policy baseline` is the default: an
+already-qualified ordinary compaction takes precedence over a due-lease review.
+Use `--lease-review-policy batch-ordinary` (or
+`CARRY_LEASE_REVIEW_POLICY=batch-ordinary`) to opt into the experimental
+comparison on the same binary and source commit. Once one or more leases are
+due, Carry asks the ordinary planner whether compaction already qualifies.
+Under the treatment, if it does, Carry simulates
 omitting the next four reviewed leases as **neutral** and compares the selected
 cache-aware plans. It delays the ordinary rewrite for a review only when that
 one wave would remove due material and its projected savings over the **same**
@@ -160,7 +165,8 @@ pre-rewrite item’s ID, estimated tokens, kept/removed outcome, and reason
 (active lease, expired lease, explicit removable, neutral policy, or stable
 baseline). A `retention_revalidation_requested` event records reviewed IDs and the
 selection scope (`reviewed_wave_virtual_omission` for a qualifying ordinary
-plan, or `all_due_virtual_release` when no ordinary plan qualifies). The wave
+plan under `batch-ordinary`, or `all_due_virtual_release` when no ordinary plan
+qualifies). The wave
 scope also records both projected savings, the one-request delay estimate, and
 annotation cost. Pending review suppresses compaction until the next model
 response has seen the annotation and provided renewal signals, even if a

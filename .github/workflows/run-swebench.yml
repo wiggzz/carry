@@ -42,6 +42,12 @@ on:
         default: economic
         type: choice
         options: [economic, disabled]
+      carry_lease_review_policy:
+        description: Carry-only due-lease review treatment; baseline preserves existing behavior
+        required: true
+        default: baseline
+        type: choice
+        options: [baseline, batch-ordinary]
       carry_keep_lease_turns:
         description: Optional Carry keep-lease revalidation horizon; blank disables it
         required: false
@@ -158,6 +164,7 @@ jobs:
       BENCHMARK_ATTEMPT: ${{ matrix.attempt }}
       BENCHMARK_ATTEMPTS: ${{ needs['plan-attempts'].outputs.total }}
       CARRY_COMPACTION_POLICY: ${{ inputs.carry_compaction_policy }}
+      CARRY_LEASE_REVIEW_POLICY: ${{ inputs.carry_lease_review_policy }}
       CARRY_KEEP_LEASE_TURNS: ${{ inputs.carry_keep_lease_turns }}
       CARRY_COMPACTION_PAYOFF_REQUESTS: ${{ inputs.carry_compaction_payoff_requests }}
       CARRY_COMPACTION_MIN_PAYBACK_PERCENT: ${{ inputs.carry_compaction_min_payback_percent }}
@@ -310,6 +317,10 @@ jobs:
               echo "carry compaction policy must be economic or disabled" >&2
               exit 1
             }
+            [[ "$CARRY_LEASE_REVIEW_POLICY" =~ ^(baseline|batch-ordinary)$ ]] || {
+              echo "carry lease review policy must be baseline or batch-ordinary" >&2
+              exit 1
+            }
             [[ "$CARRY_COMPACTION_PAYOFF_REQUESTS" =~ ^[1-9][0-9]*$ ]] || {
               echo "carry compaction payoff requests must be a positive integer" >&2
               exit 1
@@ -445,6 +456,7 @@ jobs:
           SOURCE_SHA256="$SOURCE_SHA256" SOURCE_COMMIT="$SOURCE_COMMIT" BENCHMARK_MODE="$BENCHMARK_MODE" \
           BENCHMARK_HARNESS="$BENCHMARK_HARNESS" BENCHMARK_ATTEMPT="$BENCHMARK_ATTEMPT" \
           BENCHMARK_ATTEMPTS="$BENCHMARK_ATTEMPTS" CARRY_COMPACTION_POLICY="$CARRY_COMPACTION_POLICY" \
+          CARRY_LEASE_REVIEW_POLICY="$CARRY_LEASE_REVIEW_POLICY" \
           CARRY_KEEP_LEASE_TURNS="$CARRY_KEEP_LEASE_TURNS" \
           CARRY_COMPACTION_PAYOFF_REQUESTS="$CARRY_COMPACTION_PAYOFF_REQUESTS" \
           CARRY_COMPACTION_MIN_PAYBACK_PERCENT="$CARRY_COMPACTION_MIN_PAYBACK_PERCENT" \
@@ -465,7 +477,7 @@ jobs:
               'RESULT_URL_B64': encoded['RESULT_URL'], 'CONTROL_URL_B64': encoded['CONTROL_URL'],
               **{key: os.environ[key] for key in (
                   'SOURCE_SHA256', 'SOURCE_COMMIT', 'BENCHMARK_MODE', 'BENCHMARK_HARNESS',
-                  'BENCHMARK_ATTEMPT', 'BENCHMARK_ATTEMPTS', 'CARRY_COMPACTION_POLICY', 'CARRY_KEEP_LEASE_TURNS',
+                  'BENCHMARK_ATTEMPT', 'BENCHMARK_ATTEMPTS', 'CARRY_COMPACTION_POLICY', 'CARRY_LEASE_REVIEW_POLICY', 'CARRY_KEEP_LEASE_TURNS',
                   'CARRY_COMPACTION_PAYOFF_REQUESTS', 'CARRY_COMPACTION_MIN_PAYBACK_PERCENT', 'CARRY_COMPACTION_ROLLOUT_SAMPLES', 'CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT',
                   'CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS', 'CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS', 'BOOTSTRAP_WAIT_SECONDS', 'RUN_ID',
                   'MODEL', 'REASONING', 'TASK_IMAGE_REPOSITORY', 'TASK_IMAGE_CATALOG')},
