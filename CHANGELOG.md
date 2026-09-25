@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.11.0](https://github.com/wiggzz/carry/compare/v0.10.0...v0.11.0) (2026-09-25)
+
+
+### Features
+
+* **defaults:** use Sol for Carry and Luna for SWE-bench ([#130](https://github.com/wiggzz/carry/issues/130)) ([97c2b49](https://github.com/wiggzz/carry/commit/97c2b49b988c605e609021e67332c3ab38508b1e))
+
+
+### Bug Fixes
+
+* **benchmark:** fail closed on duplicate SymPy tests ([#127](https://github.com/wiggzz/carry/issues/127)) ([64b8f00](https://github.com/wiggzz/carry/commit/64b8f0095ceb7a65f823bc7c6c8ad7fc788ce6c5))
+* **benchmark:** grade captured patches after task timeouts ([#131](https://github.com/wiggzz/carry/issues/131)) ([dccddf0](https://github.com/wiggzz/carry/commit/dccddf081e2975137adb7bae0a11a5aea789fa96))
+* **benchmark:** repair standard catalog readiness recipes ([#129](https://github.com/wiggzz/carry/issues/129)) ([4febda6](https://github.com/wiggzz/carry/commit/4febda680d0dbfc7d4245c882cd59dfb7e689197))
+
 ## [0.10.0](https://github.com/wiggzz/carry/compare/v0.9.0...v0.10.0) (2026-09-23)
 
 
