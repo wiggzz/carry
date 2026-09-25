@@ -297,6 +297,32 @@ impl ContextState {
         state
     }
 
+    /// Aggregate due lease sizes without exposing retained content or identifiers.
+    pub(crate) fn due_keep_lease_review_metrics(
+        &self,
+        reviewable_ids: &[u64],
+    ) -> (usize, usize, usize) {
+        let mut due_count = 0;
+        let mut due_tokens = 0;
+        let mut reviewable_tokens = 0;
+        for item in &self.items {
+            if item.kind != ContextItemKind::User
+                && item.signal != RetentionSignal::Drop
+                && item
+                    .keep_lease_expires_at_turn
+                    .is_some_and(|turn| turn <= self.retention_turn)
+            {
+                let tokens = item.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN);
+                due_count += 1;
+                due_tokens += tokens;
+                if reviewable_ids.contains(&item.id) {
+                    reviewable_tokens += tokens;
+                }
+            }
+        }
+        (due_count, due_tokens, reviewable_tokens)
+    }
+
     pub(crate) fn due_keep_lease_review_ids(&self) -> Vec<u64> {
         const MAX_REVIEWED_KEEP_LEASES: usize = 4;
         let mut due = self
@@ -2145,6 +2171,9 @@ mod tests {
 
         let wave = state.due_keep_lease_review_ids();
         assert_eq!(wave, due[1..].iter().rev().copied().collect::<Vec<_>>());
+        let (due_count, due_tokens, reviewable_tokens) = state.due_keep_lease_review_metrics(&wave);
+        assert_eq!(due_count, 5);
+        assert!(due_tokens > reviewable_tokens && reviewable_tokens > 0);
         let virtual_omission = state.virtual_omit_keep_lease_review(&wave);
         assert!(!state.pending_keep_lease_review());
         for id in &wave {
