@@ -127,11 +127,17 @@ and `trace.jsonl`.
 
 `--keep-lease-turns N` (or `CARRY_KEEP_LEASE_TURNS=N`) is disabled by default.
 When enabled, a model `protected` signal is a lease for `N` later model turns,
-not a permanent lock. Once one or more leases are due, Carry first asks the
-ordinary planner a metadata-only counterfactual: whether releasing **all** due,
-non-human leases could make a normal rewrite worthwhile. It emits no review
-unless that full release set qualifies, and it never emits a review when
-compaction is disabled.
+not a permanent lock. Once one or more leases are due, Carry asks the ordinary
+planner whether compaction already qualifies. If it does, Carry simulates
+omitting the next four reviewed leases as **neutral** and compares the selected
+cache-aware plans. It delays the ordinary rewrite for a review only when that
+one wave would remove due material and its projected savings over the **same**
+request horizon exceed the ordinary rewrite, after charging the review annotation,
+the request spent waiting, and any cold first-request cache write. Otherwise
+compaction proceeds immediately. If ordinary compaction does not yet qualify,
+the existing metadata-only all-due release counterfactual can request
+a review when that full release set makes a rewrite worthwhile. A review never
+occurs when compaction is disabled.
 
 A qualifying review names at most the four largest due blocks, matching the
 `protected` field's four-ID limit. The concise tool-result annotation directs
@@ -152,10 +158,15 @@ intentional compaction rewrite.
 Each `context_compacted` trace event includes `retention_audit`, with every
 pre-rewrite item’s ID, estimated tokens, kept/removed outcome, and reason
 (active lease, expired lease, explicit removable, neutral policy, or stable
-baseline). A `retention_revalidation_requested` event records the reviewed IDs
-and the `all_due_virtual_release` selection scope. The review is appended to
-persisted native context, so it extends the previous request history and
-preserves prompt-cache continuity until a normal rewrite.
+baseline). A `retention_revalidation_requested` event records reviewed IDs and the
+selection scope (`reviewed_wave_virtual_omission` for a qualifying ordinary
+plan, or `all_due_virtual_release` when no ordinary plan qualifies). The wave
+scope also records both projected savings, the one-request delay estimate, and
+annotation cost. Pending review suppresses compaction until the next model
+response has seen the annotation and provided renewal signals, even if a
+resumed run disables new leases; afterward normal compaction resumes. The
+review is appended to persisted native context, extending the previous request
+history and preserving prompt-cache continuity until a normal rewrite.
 
 ## Session-persistence benchmark mode
 
