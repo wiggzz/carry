@@ -277,14 +277,66 @@ impl ContextState {
         (!released_ids.is_empty()).then_some((released, released_ids))
     }
 
+    pub(crate) fn pending_keep_lease_review(&self) -> bool {
+        !self.pending_keep_lease_review.is_empty()
+    }
+
+    /// Simulate one review wave when the model omits every reviewed ID.
+    /// Omitted leases become neutral, not explicit drops; the normal planner
+    /// and cached prefix may still keep them.
+    pub(crate) fn virtual_omit_keep_lease_review(&self, ids: &[u64]) -> Self {
+        let mut state = self.clone();
+        for item in &mut state.items {
+            if ids.contains(&item.id) {
+                item.signal = RetentionSignal::Neutral;
+                item.retention = Retention::Eligible;
+                item.keep_lease_expires_at_turn = None;
+                item.keep_lease_expired = true;
+            }
+        }
+        state
+    }
+
+    pub(crate) fn due_keep_lease_review_ids(&self) -> Vec<u64> {
+        const MAX_REVIEWED_KEEP_LEASES: usize = 4;
+        let mut due = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.kind != ContextItemKind::User
+                    && item.signal != RetentionSignal::Drop
+                    && item
+                        .keep_lease_expires_at_turn
+                        .is_some_and(|expires_at| expires_at <= self.retention_turn)
+            })
+            .map(|item| (item.id, item.bytes))
+            .collect::<Vec<_>>();
+        due.sort_unstable_by(|(left_id, left_bytes), (right_id, right_bytes)| {
+            right_bytes
+                .cmp(left_bytes)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        due.into_iter()
+            .take(MAX_REVIEWED_KEEP_LEASES)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    pub(crate) fn review_advisory_write_input_units(&self, host_id: u64) -> f64 {
+        let mut annotated = self.clone();
+        annotated.attach_due_keep_lease_review_to(host_id);
+        annotated
+            .estimated_tokens()
+            .saturating_sub(self.estimated_tokens()) as f64
+            * CACHE_WRITE_RATE
+    }
+
     /// Attach one cache-safe review for the four largest due leases to the tool
     /// result that was just returned. The host must be the latest item: the
     /// review is rendered inside the host's output, so attaching it to an
     /// older result would rewrite the cached prefix. The review is resolved
     /// only after the next model response has seen it.
     pub fn attach_due_keep_lease_review_to(&mut self, host_id: u64) -> KeepLeaseReview {
-        const MAX_REVIEWED_KEEP_LEASES: usize = 4;
-
         if !self.pending_keep_lease_review.is_empty() {
             return KeepLeaseReview {
                 item_ids: Vec::new(),
@@ -306,28 +358,7 @@ impl ContextState {
                 item_ids: Vec::new(),
             };
         }
-        let mut due = self
-            .items
-            .iter()
-            .filter(|item| {
-                item.kind != ContextItemKind::User
-                    && item.signal != RetentionSignal::Drop
-                    && item
-                        .keep_lease_expires_at_turn
-                        .is_some_and(|expires_at| expires_at <= self.retention_turn)
-            })
-            .map(|item| (item.id, item.bytes))
-            .collect::<Vec<_>>();
-        due.sort_unstable_by(|(left_id, left_bytes), (right_id, right_bytes)| {
-            right_bytes
-                .cmp(left_bytes)
-                .then_with(|| left_id.cmp(right_id))
-        });
-        let item_ids = due
-            .into_iter()
-            .take(MAX_REVIEWED_KEEP_LEASES)
-            .map(|(id, _)| id)
-            .collect::<Vec<_>>();
+        let item_ids = self.due_keep_lease_review_ids();
         if !item_ids.is_empty() {
             let ids = item_ids
                 .iter()
@@ -1324,6 +1355,28 @@ pub(crate) struct CompactionPlan {
     pub minimum_payback_input_units: f64,
 }
 
+impl CompactionPlan {
+    /// Compare against a rewrite delayed until after one review request.
+    /// The first keep request can write an uncached prefix; that one-time
+    /// premium cannot be credited again when the rewrite occurs on request two.
+    pub(crate) fn savings_after_review_input_units(
+        &self,
+        current_tokens: usize,
+        implicit_cached_tokens: usize,
+        payoff_requests: u64,
+    ) -> f64 {
+        if payoff_requests <= 1 {
+            return 0.0;
+        }
+        let first_keep_write_premium =
+            current_tokens.saturating_sub(implicit_cached_tokens.min(current_tokens)) as f64
+                * (CACHE_WRITE_RATE - CACHE_READ_RATE);
+        self.estimated_savings_input_units
+            - current_tokens.saturating_sub(self.retained_tokens) as f64 * CACHE_READ_RATE
+            - first_keep_write_premium
+    }
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct NeutralRetentionDecision {
     pub id: u64,
@@ -2077,6 +2130,40 @@ mod tests {
         assert!(rendered.contains("context.remember"));
         assert!(rendered.contains("release them for normal compaction"));
         assert!(!rendered.contains(&format!("ID {tiny}")));
+    }
+
+    #[test]
+    fn virtual_review_omission_releases_only_four_reviewed_leases_as_neutral() {
+        let mut state = ContextState::new("initial".into());
+        let due = (0..5)
+            .map(|index| add_tool_with_output(&mut state, &"evidence ".repeat(100 + index)))
+            .collect::<Vec<_>>();
+        let host = add_tool(&mut state);
+        let signals = state.record_signals(&update(&due, &[], &[]), host);
+        state.arm_keep_leases(&signals.keep, 1);
+        state.advance_retention_turn();
+
+        let wave = state.due_keep_lease_review_ids();
+        assert_eq!(wave, due[1..].iter().rev().copied().collect::<Vec<_>>());
+        let virtual_omission = state.virtual_omit_keep_lease_review(&wave);
+        assert!(!state.pending_keep_lease_review());
+        for id in &wave {
+            assert_eq!(state.signal_for(*id), Some(RetentionSignal::Keep));
+            assert_eq!(
+                virtual_omission.signal_for(*id),
+                Some(RetentionSignal::Neutral)
+            );
+        }
+        assert_eq!(
+            virtual_omission.signal_for(due[0]),
+            Some(RetentionSignal::Keep)
+        );
+        assert_eq!(state.attach_due_keep_lease_review_to(host).item_ids, wave);
+        assert!(state.pending_keep_lease_review());
+        let omitted = state.resolve_keep_lease_review(&[]);
+        assert_eq!(omitted, wave);
+        assert_eq!(state.signal_for(due[0]), Some(RetentionSignal::Keep));
+        assert!(!state.pending_keep_lease_review());
     }
 
     #[test]
