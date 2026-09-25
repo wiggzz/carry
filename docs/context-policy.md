@@ -166,11 +166,17 @@ pre-rewrite item’s ID, estimated tokens, kept/removed outcome, and reason
 baseline). A `retention_revalidation_requested` event records reviewed IDs and the
 selection scope (`reviewed_wave_virtual_omission` for a qualifying ordinary
 plan under `batch-ordinary`, or `all_due_virtual_release` when no ordinary plan
-qualifies). The wave
-scope also records both projected savings, the one-request delay estimate, and
-annotation cost. Pending review suppresses compaction until the next model
-response has seen the annotation and provided renewal signals, even if a
-resumed run disables new leases; afterward normal compaction resumes. The
+qualifies). With leases enabled, each completed tool-result planner boundary also
+emits a content-free `keep_lease_review_decision` event: due/reviewable counts and
+estimated tokens, the selected wave size, request/skip and reason, and available
+ordinary, expanded, delayed and annotation-cost estimates. A skipped decision is
+not a review; count `retention_revalidation_requested` separately and join
+subsequent `context_signals` and `context_compacted` events for actual renewal
+and removal. The review wave event records projected savings, the one-request
+delay estimate, and annotation cost. Pending review suppresses compaction
+until the next model response has seen the annotation and provided renewal
+signals, even if a resumed run disables new leases; afterward normal
+compaction resumes. The
 review is appended to persisted native context, extending the previous request
 history and preserving prompt-cache continuity until a normal rewrite.
 
