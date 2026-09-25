@@ -17,7 +17,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use context::DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT;
-use run::{Backend, CompactionMode, RunConfig, UserInput};
+use run::{Backend, CompactionMode, LeaseReviewPolicy, RunConfig, UserInput};
 use tokio::sync::mpsc;
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
@@ -136,6 +136,15 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     keep_lease_turns: Option<u64>,
+
+    /// Experimental lease review policy; baseline preserves the existing gate.
+    #[arg(
+        long,
+        env = "CARRY_LEASE_REVIEW_POLICY",
+        value_enum,
+        default_value = "baseline"
+    )]
+    lease_review_policy: LeaseReviewPolicy,
 
     /// Number of future requests used to amortize a compaction rewrite; defaults to five.
     #[arg(
@@ -434,6 +443,7 @@ async fn run_command(args: Cli) -> Result<()> {
         shell_timeout_secs: args.shell_timeout_secs,
         compaction_mode: args.compaction_policy.into(),
         keep_lease_turns: args.keep_lease_turns,
+        lease_review_policy: args.lease_review_policy,
         compaction_payoff_requests: args.compaction_payoff_requests,
         compaction_min_payback_percent: args.compaction_min_payback_percent,
         compaction_rollout_samples: args.compaction_rollout_samples,
@@ -653,6 +663,33 @@ mod tests {
             Cli::try_parse_from(["carry", "--keep-lease-turns", "3", "continue"]).unwrap();
         assert_eq!(enabled.keep_lease_turns, Some(3));
         assert!(Cli::try_parse_from(["carry", "--keep-lease-turns", "0", "continue"]).is_err());
+    }
+
+    #[test]
+    fn lease_review_treatment_is_explicit_and_rejects_unknown_modes() {
+        assert!(Cli::try_parse_from(["carry", "continue"]).is_ok());
+        let selected = Cli::try_parse_from([
+            "carry",
+            "--lease-review-policy",
+            "batch-ordinary",
+            "-p",
+            "continue",
+        ])
+        .unwrap();
+        assert!(
+            selected.prompt_words.is_empty(),
+            "the policy flag must not be swallowed as task text"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "carry",
+                "--lease-review-policy",
+                "unexpected",
+                "-p",
+                "continue"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

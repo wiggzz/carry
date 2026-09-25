@@ -32,6 +32,7 @@ class AttemptMergeTests(unittest.TestCase):
                 "dataset": "SWE-bench/SWE-bench_Verified", "dataset_revision": "frozen",
                 "swebench_version": "4.1.0", "model": "test-model", "reasoning": "medium",
                 "carry_compaction_policy": "economic", "carry_keep_lease_turns": "0",
+                "carry_lease_review_policy": "baseline",
                 "carry_compaction_payoff_requests": "1", "carry_compaction_min_payback_percent": "10",
                 "carry_compaction_rollout_samples": "16",
                 "carry_compaction_rollout_stop_probability_percent": "10",
@@ -90,6 +91,7 @@ class AttemptMergeTests(unittest.TestCase):
             self.assertEqual(report["provenance"]["model"], "test-model")
             self.assertEqual(report["provenance"]["source_commit"], "a" * 40)
             self.assertEqual(report["provenance"]["carry_compaction_rollout_samples"], "16")
+            self.assertEqual(report["provenance"]["carry_lease_review_policy"], "baseline")
             self.assertEqual(report["provenance"]["carry_compaction_rollout_stop_probability_percent"], "10")
             self.assertEqual(report["provenance"]["carry_compaction_neutral_high_watermark_tokens"], "32768")
             self.assertEqual(report["provenance"]["carry_compaction_neutral_low_watermark_tokens"], "24576")
@@ -152,6 +154,16 @@ class AttemptMergeTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("identical immutable provenance", result.stderr)
+            payload["provenance"]["carry_compaction_neutral_high_watermark_tokens"] = "32768"
+            payload["provenance"]["carry_lease_review_policy"] = "batch-ordinary"
+            second_report.write_text(json.dumps(payload), encoding="utf-8")
+            result = subprocess.run(
+                ["python3", str(SCRIPT), "--artifacts", str(artifacts), "--manifest", str(manifest),
+                 "--harness", "all", "--attempts", "2", "--out", str(root / "out")],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("identical immutable provenance", result.stderr)
 
     def test_cli_merges_legacy_default_compaction_provenance(self):
         tasks = [f"task-{index:02d}" for index in range(50)]
@@ -166,6 +178,7 @@ class AttemptMergeTests(unittest.TestCase):
             payload["provenance"].pop("carry_compaction_neutral_high_watermark_tokens")
             payload["provenance"].pop("carry_compaction_neutral_low_watermark_tokens")
             payload["provenance"].pop("carry_compaction_min_payback_percent")
+            payload["provenance"].pop("carry_lease_review_policy")
             legacy_report.write_text(json.dumps(payload), encoding="utf-8")
             manifest = root / "tasks.json"
             manifest.write_text(json.dumps({"instance_ids": tasks}), encoding="utf-8")
@@ -180,6 +193,7 @@ class AttemptMergeTests(unittest.TestCase):
             self.assertEqual(provenance["carry_compaction_neutral_high_watermark_tokens"], "32768")
             self.assertEqual(provenance["carry_compaction_neutral_low_watermark_tokens"], "24576")
             self.assertEqual(provenance["carry_compaction_min_payback_percent"], "10")
+            self.assertEqual(provenance["carry_lease_review_policy"], "baseline")
 
     def test_cli_merges_legacy_payback_margin_without_changing_watermarks(self):
         tasks = [f"task-{index:02d}" for index in range(50)]
