@@ -1843,12 +1843,13 @@ def is_terminal_timeout_failure(record: Mapping[str, Any]) -> bool:
 def apply_official_outcomes(
     records: list[dict[str, Any]], outcomes: Mapping[str, set[str]]
 ) -> None:
-    """Apply grading while preserving ordinary task timeouts as terminal failures."""
+    """Grade captured patches independently of whether the agent timed out."""
     for record in records:
-        if is_terminal_timeout_failure(record):
+        terminal_timeout = is_terminal_timeout_failure(record)
+        if terminal_timeout and not record.get("patch"):
             record["resolved"] = False
             continue
-        if record.get("status") != "agent-completed":
+        if record.get("status") != "agent-completed" and not terminal_timeout:
             continue
         instance_id = record["instance_id"]
         record["resolved"] = instance_id in outcomes["resolved_ids"]
@@ -1860,7 +1861,7 @@ def official_evaluation_unknowns(records: list[dict[str, Any]]) -> list[dict[str
         (
             record for record in records
             if record.get("status") not in {"evaluated", "empty-patch", "task-timeout"}
-            and not is_terminal_timeout_failure(record)
+            and not (is_terminal_timeout_failure(record) and not record.get("patch"))
         ),
         key=lambda record: (record["instance_id"], record["harness"]),
     )

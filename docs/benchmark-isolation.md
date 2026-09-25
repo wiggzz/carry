@@ -66,13 +66,16 @@ harnesses × one declared attempt). Its record identity and evidence path includ
 or subsequent attempts cannot overwrite a patch, evaluator report, or metadata. When
 `attempts > 1`, an artifact-gated merge job accepts every declared complete worker
 artifact and requires the exact combined attempt-record count before publishing
-`report.json`, `records.json`, and `report.md`. A task agent timeout remains an
-`agent-failed` record with `timed_out: true` and `resolved: false`, so it remains in
-the declared denominator; it does not invalidate an otherwise complete attempt. If
-Carry did not write a usable usage object to `result.json`, the worker totals completed
-`model_response` usage from `trace.jsonl` before calculating the record's modeled cost.
-A timeout caused by clipping a slot to the overall agent-phase budget still fails the
-attempt.
+`report.json`, `records.json`, and `report.md`. An ordinary agent timeout
+retains `timed_out: true` and remains in the declared denominator. If its
+captured patch receives a complete official grade, the task is `evaluated` and
+`resolved` follows that grade—even if the agent never exited normally. With no
+captured patch it remains `agent-failed` and unresolved; a captured patch with
+an incomplete evaluator result fails the attempt rather than silently counting
+as a loss. If Carry did not write a usable usage object to `result.json`, the
+worker totals completed `model_response` usage from `trace.jsonl` before
+calculating the record's modeled cost. A timeout caused by clipping a slot to
+the overall agent-phase budget still fails the attempt.
 Worker, evaluator, identity, and coverage failures also fail closed.
 
 The combined report keeps both denominators explicit: `50 × attempts` executions per

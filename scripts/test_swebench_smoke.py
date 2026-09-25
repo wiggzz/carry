@@ -2180,10 +2180,10 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
 
         self.worker.require_complete_official_evaluations(records[:2])
 
-    def test_official_agent_timeout_is_a_terminal_agent_failure(self):
+    def test_official_agent_timeout_without_patch_is_terminal_failure(self):
         records = [{
             "instance_id": "timed-out", "harness": "carry", "status": "agent-failed",
-            "timed_out": True, "resolved": True, "phase_budget_limited": False,
+            "timed_out": True, "patch": "", "resolved": True, "phase_budget_limited": False,
         }]
         outcomes = {
             "resolved_ids": set(), "unresolved_ids": set(), "empty_patch_ids": set(),
@@ -2191,6 +2191,53 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         }
         self.worker.apply_official_outcomes(records, outcomes)
         self.assertEqual(records[0]["status"], "agent-failed")
+        self.assertFalse(records[0]["resolved"])
+        self.worker.require_complete_official_evaluations(records)
+
+    def test_official_evaluator_can_resolve_captured_patch_after_agent_timeout(self):
+        records = [{
+            "instance_id": "timed-out", "harness": "carry", "status": "agent-failed",
+            "timed_out": True, "phase_budget_limited": False,
+            "patch": "diff --git a/a.py b/a.py\n", "error": "agent timed out",
+            "resolved": False,
+        }]
+        outcomes = {
+            "resolved_ids": {"timed-out"}, "unresolved_ids": set(), "empty_patch_ids": set(),
+            "error_ids": set(), "incomplete_ids": set(), "completed_ids": {"timed-out"},
+        }
+        self.worker.apply_official_outcomes(records, outcomes)
+        self.assertEqual(records[0]["status"], "evaluated")
+        self.assertTrue(records[0]["resolved"])
+        self.assertTrue(records[0]["timed_out"])
+        self.assertEqual(records[0]["error"], "agent timed out")
+        self.worker.require_complete_official_evaluations(records)
+
+    def test_timeout_with_captured_patch_requires_official_grade(self):
+        records = [{
+            "instance_id": "timed-out", "harness": "carry", "status": "agent-failed",
+            "timed_out": True, "phase_budget_limited": False,
+            "patch": "diff --git a/a.py b/a.py\n", "resolved": False,
+        }]
+        outcomes = {
+            "resolved_ids": set(), "unresolved_ids": set(), "empty_patch_ids": set(),
+            "error_ids": {"timed-out"}, "incomplete_ids": set(), "completed_ids": set(),
+        }
+        self.worker.apply_official_outcomes(records, outcomes)
+        with self.assertRaisesRegex(RuntimeError, "official evaluation incomplete.*timed-out"):
+            self.worker.require_complete_official_evaluations(records)
+
+    def test_timeout_with_patch_obeys_official_empty_patch_verdict(self):
+        records = [{
+            "instance_id": "timed-out", "harness": "carry", "status": "agent-failed",
+            "timed_out": True, "phase_budget_limited": False,
+            "patch": "diff --git a/a.py b/a.py\n", "resolved": False,
+        }]
+        outcomes = {
+            "resolved_ids": set(), "unresolved_ids": set(), "empty_patch_ids": {"timed-out"},
+            "error_ids": set(), "incomplete_ids": set(), "completed_ids": set(),
+        }
+        self.worker.apply_official_outcomes(records, outcomes)
+        self.assertEqual(records[0]["status"], "empty-patch")
         self.assertFalse(records[0]["resolved"])
         self.worker.require_complete_official_evaluations(records)
 
