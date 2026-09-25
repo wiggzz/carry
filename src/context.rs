@@ -799,15 +799,7 @@ impl ContextState {
             .filter(|item| item.kind != ContextItemKind::User)
             .map(|item| item.id)
             .collect::<Vec<_>>();
-        let mean_virtual_item_tokens = compacted
-            .items
-            .iter()
-            .filter(|item| item.kind != ContextItemKind::User)
-            .map(|item| item.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN))
-            .sum::<usize>()
-            .checked_div(retained_ids.len())
-            .unwrap_or(1)
-            .max(1);
+        let mean_virtual_item_tokens = compacted.estimated_next_tool_turn_tokens();
         let initial_compact_cost = compact_request_cost(plan);
         let direct_next_request_savings_input_units = direct_next_request_savings(
             policy.implicit_cached_tokens,
@@ -1230,7 +1222,21 @@ fn simulate_rollout_turn(
 }
 
 impl ContextState {
-    fn add_simulated_tool_item(&mut self, estimated_tokens: usize) -> u64 {
+    /// Use the same content-free future-item size estimate in the rollout and
+    /// in the one-turn lease-review forecast. Existing item sizes are exact.
+    pub(crate) fn estimated_next_tool_turn_tokens(&self) -> usize {
+        let mut count = 0usize;
+        let mut tokens = 0usize;
+        for item in &self.items {
+            if item.kind != ContextItemKind::User {
+                count += 1;
+                tokens = tokens.saturating_add(item.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN));
+            }
+        }
+        tokens.checked_div(count).unwrap_or(1).max(1)
+    }
+
+    pub(crate) fn add_simulated_tool_item(&mut self, estimated_tokens: usize) -> u64 {
         let id = self.allocate_id();
         let bytes = estimated_tokens.saturating_mul(ESTIMATED_BYTES_PER_TOKEN);
         self.items.push(ContextItem::new(
@@ -1382,24 +1388,20 @@ pub(crate) struct CompactionPlan {
 }
 
 impl CompactionPlan {
-    /// Compare against a rewrite delayed until after one review request.
-    /// The first keep request can write an uncached prefix; that one-time
-    /// premium cannot be credited again when the rewrite occurs on request two.
+    /// The projected plan starts on request two, after a review request has
+    /// made previously uncached existing tokens readable at the cache-read rate.
+    /// Remove that first keep-request write premium from the forecast's saving;
+    /// the future tool item itself was not in the first request.
     pub(crate) fn savings_after_review_input_units(
         &self,
-        current_tokens: usize,
-        implicit_cached_tokens: usize,
-        payoff_requests: u64,
+        prior_request_tokens: usize,
+        prior_implicit_cached_tokens: usize,
     ) -> f64 {
-        if payoff_requests <= 1 {
-            return 0.0;
-        }
-        let first_keep_write_premium =
-            current_tokens.saturating_sub(implicit_cached_tokens.min(current_tokens)) as f64
-                * (CACHE_WRITE_RATE - CACHE_READ_RATE);
-        self.estimated_savings_input_units
-            - current_tokens.saturating_sub(self.retained_tokens) as f64 * CACHE_READ_RATE
-            - first_keep_write_premium
+        let first_keep_write_premium = prior_request_tokens
+            .saturating_sub(prior_implicit_cached_tokens.min(prior_request_tokens))
+            as f64
+            * (CACHE_WRITE_RATE - CACHE_READ_RATE);
+        self.estimated_savings_input_units - first_keep_write_premium
     }
 }
 

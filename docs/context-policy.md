@@ -135,14 +135,19 @@ comparison on the same binary and source commit. Once one or more leases are
 due, Carry asks the ordinary planner whether compaction already qualifies.
 Under the treatment, if it does, Carry simulates
 omitting the next four reviewed leases as **neutral** and compares the selected
-cache-aware plans. It delays the ordinary rewrite for a review only when that
+cache-aware plans. The delayed branch also projects a protected future tool-turn
+item, sized by the same mean non-human-item estimate used by the flat rollout,
+and replans with one fewer request in the payoff horizon. The forecast is a
+content-free size assumption, not a prediction of the model's next action.
+It delays the ordinary rewrite for a review only when that
 one wave would remove due material and its projected savings over the **same**
 request horizon exceed the ordinary rewrite, after charging the review annotation,
 the request spent waiting, and any cold first-request cache write. Otherwise
 compaction proceeds immediately. If ordinary compaction does not yet qualify,
 the existing metadata-only all-due release counterfactual can request
-a review when that full release set makes a rewrite worthwhile. A review never
-occurs when compaction is disabled.
+a review when that full release set makes a rewrite worthwhile **after** the
+projected follow-up turn and advisory charge. A review never occurs when
+compaction is disabled or the payoff horizon contains no post-review request.
 
 A qualifying review names at most the four largest due blocks, matching the
 `protected` field's four-ID limit. The concise tool-result annotation directs
