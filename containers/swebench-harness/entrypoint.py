@@ -36,6 +36,9 @@ if not os.environ.get("OPENAI_BASE_URL"):
 compaction_policy = os.environ.get("CARRY_COMPACTION_POLICY", "economic")
 if compaction_policy not in {"economic", "disabled"}:
     parser.error("CARRY_COMPACTION_POLICY must be economic or disabled")
+lease_review_policy = os.environ.get("CARRY_LEASE_REVIEW_POLICY", "baseline")
+if lease_review_policy not in {"baseline", "batch-ordinary"}:
+    parser.error("CARRY_LEASE_REVIEW_POLICY must be baseline or batch-ordinary")
 keep_lease_turns = os.environ.get("CARRY_KEEP_LEASE_TURNS", "")
 if keep_lease_turns and (not keep_lease_turns.isascii() or not keep_lease_turns.isdecimal()
                          or int(keep_lease_turns) < 1):
@@ -96,6 +99,7 @@ command = [part.format(**values) for part in shlex.split(template)]
 if args.harness == "carry" and keep_lease_turns:
     command.extend(["--keep-lease-turns", keep_lease_turns])
 if args.harness == "carry":
+    command.extend(["--lease-review-policy", lease_review_policy])
     command.extend(["--compaction-payoff-requests", payoff_requests])
     command.extend(["--compaction-min-payback-percent", min_payback_percent])
     command.extend(["--compaction-rollout-samples", rollout_samples])

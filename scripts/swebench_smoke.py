@@ -456,6 +456,7 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
     required = ("BASE_IMAGE", "CODEX_VERSION", "PI_VERSION", "MODEL", "REASONING")
     config = {key: values.get(key, "") for key in required}
     config["CARRY_COMPACTION_POLICY"] = values.get("CARRY_COMPACTION_POLICY", "economic")
+    config["CARRY_LEASE_REVIEW_POLICY"] = values.get("CARRY_LEASE_REVIEW_POLICY", "baseline")
     config["CARRY_KEEP_LEASE_TURNS"] = values.get("CARRY_KEEP_LEASE_TURNS", "")
     config["CARRY_COMPACTION_PAYOFF_REQUESTS"] = values.get(
         "CARRY_COMPACTION_PAYOFF_REQUESTS", "1"
@@ -477,6 +478,8 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
     )
     if config["CARRY_COMPACTION_POLICY"] not in {"economic", "disabled"}:
         raise ValueError("CARRY_COMPACTION_POLICY must be economic or disabled")
+    if config["CARRY_LEASE_REVIEW_POLICY"] not in {"baseline", "batch-ordinary"}:
+        raise ValueError("CARRY_LEASE_REVIEW_POLICY must be baseline or batch-ordinary")
     if config["CARRY_KEEP_LEASE_TURNS"] and (
             not config["CARRY_KEEP_LEASE_TURNS"].isascii()
             or not config["CARRY_KEEP_LEASE_TURNS"].isdecimal()
@@ -676,6 +679,7 @@ def agent_docker_command(*, image: str, harness: str, repo: pathlib.Path,
         "--env", f"OPENAI_BASE_URL={api_base}",
         "--env", f"AGENT_TIMEOUT_SECONDS={agent_timeout_seconds}",
         "--env", "CARRY_COMPACTION_POLICY",
+        "--env", "CARRY_LEASE_REVIEW_POLICY",
         "--env", "CARRY_COMPACTION_PAYOFF_REQUESTS",
         "--env", "CARRY_COMPACTION_MIN_PAYBACK_PERCENT",
         "--env", "CARRY_COMPACTION_ROLLOUT_SAMPLES",
@@ -2509,6 +2513,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "model": validated["MODEL"],
         "reasoning": validated["REASONING"],
         "carry_compaction_policy": validated["CARRY_COMPACTION_POLICY"],
+        "carry_lease_review_policy": validated["CARRY_LEASE_REVIEW_POLICY"],
         "carry_keep_lease_turns": validated["CARRY_KEEP_LEASE_TURNS"],
         "carry_compaction_payoff_requests": validated["CARRY_COMPACTION_PAYOFF_REQUESTS"],
         "carry_compaction_min_payback_percent": validated["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"],
