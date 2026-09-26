@@ -67,7 +67,6 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(self.worker.validate_config(dict(valid, CARRY_LEASE_REVIEW_POLICY="batch-ordinary"))["CARRY_LEASE_REVIEW_POLICY"], "batch-ordinary")
         self.assertEqual(config["CARRY_COMPACTION_PAYOFF_REQUESTS"], "1")
         self.assertEqual(config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"], "25")
-        self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "0")
         self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"], "10")
         self.assertEqual(config["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"], "0")
         self.assertEqual(config["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"], "0")
@@ -76,11 +75,9 @@ class SmokeWorkerTests(unittest.TestCase):
         )
         self.assertEqual(configured_budget["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"], "32768")
         self.assertEqual(configured_budget["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"], "24576")
-        rollout = self.worker.validate_config(
-            dict(valid, CARRY_COMPACTION_ROLLOUT_SAMPLES="16")
-        )
-        self.assertEqual(rollout["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "16")
-        self.assertEqual(rollout["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"], "10")
+        with self.assertRaises(ValueError):
+            self.worker.validate_config(dict(valid, CARRY_COMPACTION_ROLLOUT_SAMPLES="16"))
+        self.assertNotIn("CARRY_COMPACTION_ROLLOUT_SAMPLES", config)
         for key, value in (("BASE_IMAGE", "node:22"), ("CODEX_VERSION", "latest"),
                            ("CARRY_COMPACTION_POLICY", "adaptive"),
                            ("CARRY_LEASE_REVIEW_POLICY", "unexpected"),
@@ -104,6 +101,7 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(inputs["carry_compaction_min_payback_percent"]["default"], "25")
         self.assertEqual(inputs["carry_lease_review_policy"]["default"], "baseline")
         self.assertEqual(inputs["carry_lease_review_policy"]["options"], ["baseline", "batch-ordinary"])
+        self.assertNotIn("carry_compaction_rollout_samples", inputs)
         self.assertEqual(contents["jobs"]["bootstrap-worker"]["env"]["CARRY_LEASE_REVIEW_POLICY"],
                          "${{ inputs.carry_lease_review_policy }}")
 
@@ -133,7 +131,7 @@ class SmokeWorkerTests(unittest.TestCase):
             "SOURCE_SHA256", "SOURCE_COMMIT", "BENCHMARK_MODE", "BENCHMARK_HARNESS", "BENCHMARK_ATTEMPT",
             "BENCHMARK_ATTEMPTS", "CARRY_COMPACTION_POLICY", "CARRY_KEEP_LEASE_TURNS",
             "CARRY_COMPACTION_PAYOFF_REQUESTS", "CARRY_COMPACTION_MIN_PAYBACK_PERCENT",
-            "CARRY_COMPACTION_ROLLOUT_SAMPLES", "CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT",
+            "CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT",
             "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS", "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS",
             "BOOTSTRAP_WAIT_SECONDS", "RUN_ID", "MODEL", "REASONING", "TASK_IMAGE_REPOSITORY",
             "TASK_IMAGE_CATALOG",
