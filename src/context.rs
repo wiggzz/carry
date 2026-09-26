@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 use crate::protocol::ContextManagement;
 
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
-const CACHE_READ_RATE: f64 = 0.10;
-const CACHE_WRITE_RATE: f64 = 1.25;
+pub(crate) const CACHE_READ_RATE: f64 = 0.10;
+pub(crate) const CACHE_WRITE_RATE: f64 = 1.25;
 pub(crate) const DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT: u8 = 25;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
 #[cfg(test)]
