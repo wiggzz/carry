@@ -203,10 +203,10 @@ to `gpt-6-luna` and pass that choice explicitly to Carry, so changing Carry's
 interactive default does not change benchmark costs. There is no default step
 limit; use `--max-steps N` only when a specific cap is required. Shell commands
 default to a 60-second wall-clock timeout. Set the session fallback with
-`--default-shell-timeout-secs N`; the old `--shell-timeout-secs N` spelling remains
-an alias. The model can set `timeout_secs` on an individual `shell` call to
-1–300 seconds for work that needs a different limit; `null` uses the session
-default. A timed-out command and its process group are killed.
+`--default-shell-timeout-secs N`. The model can set `timeout_secs` on an
+individual `shell` call to 1–300 seconds for work that needs a different limit;
+`null` uses the session default. A timed-out command and its process group are
+killed.
 
 ## Development
 
