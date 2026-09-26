@@ -97,6 +97,35 @@ class AttemptMergeTests(unittest.TestCase):
             self.assertEqual(report["provenance"]["carry_compaction_neutral_low_watermark_tokens"], "24576")
             self.assertIn("official-50 attempts", (output / "report.md").read_text(encoding="utf-8"))
 
+    def test_new_reports_without_rollout_samples_remain_separate_from_sampled_history(self):
+        tasks = [f"task-{index:02d}" for index in range(50)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
+            for attempt in (1, 2):
+                self.write_attempt(artifacts, attempt, tasks, total=2)
+                path = artifacts / f"attempt-{attempt}" / "report.json"
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload["provenance"].pop("carry_compaction_rollout_samples")
+                path.write_text(json.dumps(payload), encoding="utf-8")
+            manifest = root / "tasks.json"
+            manifest.write_text(json.dumps({"instance_ids": tasks}), encoding="utf-8")
+            command = ["python3", str(SCRIPT), "--artifacts", str(artifacts),
+                       "--manifest", str(manifest), "--harness", "all", "--attempts", "2",
+                       "--out", str(root / "out")]
+            result = subprocess.run(command, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads((root / "out" / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["provenance"]["carry_compaction_rollout_samples"], "0")
+            path = artifacts / "attempt-2" / "report.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["provenance"]["carry_compaction_rollout_samples"] = "16"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            result = subprocess.run(command, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("identical immutable provenance", result.stderr)
+
     def test_cli_rejects_missing_or_duplicate_attempt_artifacts(self):
         tasks = [f"task-{index:02d}" for index in range(50)]
         with tempfile.TemporaryDirectory() as directory:

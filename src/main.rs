@@ -164,14 +164,9 @@ struct Cli {
     )]
     compaction_min_payback_percent: u8,
 
-    /// Deterministic flat-drop rollout samples used to gate economic compaction; zero disables it.
-    #[arg(
-        long,
-        env = "CARRY_COMPACTION_ROLLOUT_SAMPLES",
-        default_value_t = 0,
-        value_parser = clap::value_parser!(u32).range(0..=64)
-    )]
-    compaction_rollout_samples: u32,
+    /// Reject the retired sampled rollout setting before it becomes prompt text.
+    #[arg(long = "compaction-rollout-samples", hide = true)]
+    retired_rollout_samples: Option<String>,
 
     /// Per simulated future turn probability (percent) that the task ends; defaults to ten.
     #[arg(
@@ -287,6 +282,19 @@ async fn main() -> Result<()> {
 }
 
 fn validate_args(args: &Cli) -> Result<()> {
+    let retired_env = std::env::var_os("CARRY_COMPACTION_ROLLOUT_SAMPLES");
+    validate_args_with_retired_samples(args, retired_env.as_deref())
+}
+
+fn validate_args_with_retired_samples(
+    args: &Cli,
+    retired_env: Option<&std::ffi::OsStr>,
+) -> Result<()> {
+    if args.retired_rollout_samples.is_some() || retired_env.is_some() {
+        bail!(
+            "sampled compaction rollouts have been removed; use the deterministic payoff horizon and stop probability"
+        );
+    }
     if args.compaction_neutral_low_watermark_tokens > args.compaction_neutral_high_watermark_tokens
     {
         bail!("compaction neutral low watermark must not exceed the high watermark");
@@ -446,7 +454,6 @@ async fn run_command(args: Cli) -> Result<()> {
         lease_review_policy: args.lease_review_policy,
         compaction_payoff_requests: args.compaction_payoff_requests,
         compaction_min_payback_percent: args.compaction_min_payback_percent,
-        compaction_rollout_samples: args.compaction_rollout_samples,
         compaction_rollout_stop_probability_percent: args
             .compaction_rollout_stop_probability_percent,
         compaction_neutral_high_watermark_tokens: args.compaction_neutral_high_watermark_tokens,
@@ -730,17 +737,26 @@ mod tests {
     }
 
     #[test]
-    fn compaction_rollout_samples_are_opt_in_and_bounded() {
-        let disabled = Cli::try_parse_from(["carry", "continue"]).unwrap();
-        assert_eq!(disabled.compaction_rollout_samples, 0);
-        let enabled =
+    fn sampled_rollout_option_is_not_a_second_compaction_policy() {
+        let legacy =
             Cli::try_parse_from(["carry", "--compaction-rollout-samples", "16", "continue"])
                 .unwrap();
-        assert_eq!(enabled.compaction_rollout_samples, 16);
         assert!(
-            Cli::try_parse_from(["carry", "--compaction-rollout-samples", "65", "continue",])
-                .is_err()
+            validate_args(&legacy).is_err(),
+            "sampled rollouts must fail before a model call, not become prompt text"
         );
+    }
+
+    #[test]
+    fn sampled_rollout_env_is_rejected_before_a_model_call() {
+        let args = Cli::try_parse_from(["carry", "continue"]).unwrap();
+        assert!(
+            validate_args_with_retired_samples(&args, Some(std::ffi::OsStr::new("16"))).is_err()
+        );
+        assert!(
+            validate_args_with_retired_samples(&args, Some(std::ffi::OsStr::new("0"))).is_err()
+        );
+        assert!(validate_args_with_retired_samples(&args, None).is_ok());
     }
 
     #[test]

@@ -29,6 +29,9 @@ IMMUTABLE_PROVENANCE_FIELDS = (
 # still differ from this identity and are rejected.
 LEGACY_COMPACTION_DEFAULTS = {
     "carry_lease_review_policy": "baseline",
+    # Absent means no sampled rollout for both pre-rollout and unified-forecast reports;
+    # preserve explicit historical sample counts as an immutable treatment axis.
+    "carry_compaction_rollout_samples": "0",
     "carry_compaction_neutral_high_watermark_tokens": "32768",
     "carry_compaction_neutral_low_watermark_tokens": "24576",
     "carry_compaction_min_payback_percent": "10",
