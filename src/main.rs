@@ -107,8 +107,8 @@ struct Cli {
     #[arg(long)]
     max_steps: Option<usize>,
 
-    /// Timeout for each shell command.
-    #[arg(long, default_value_t = 300)]
+    /// Timeout for each shell command (default: 60 seconds).
+    #[arg(long, default_value_t = 60)]
     shell_timeout_secs: u64,
 
     /// Deadline for each OpenAI Responses API attempt.
@@ -611,6 +611,56 @@ mod tests {
         let benchmark =
             Cli::try_parse_from(["carry", "--model", "gpt-6-luna", "-p", "fix it"]).unwrap();
         assert_eq!(benchmark.model, "gpt-6-luna");
+    }
+
+    #[test]
+    fn shell_commands_default_to_60_second_timeout() {
+        let args = Cli::try_parse_from(["carry", "-p", "fix it"]).unwrap();
+        assert_eq!(args.shell_timeout_secs, 60);
+    }
+
+    #[tokio::test]
+    async fn shell_timeout_cli_override_terminates_slow_scripted_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("session");
+        let steps_file = temp.path().join("steps.jsonl");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"shell","command":"sleep 3","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+                "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+            ),
+        )
+        .unwrap();
+        let args = Cli::try_parse_from([
+            "carry",
+            "--shell-timeout-secs",
+            "1",
+            "--max-steps",
+            "2",
+            "--cwd",
+            workspace.to_str().unwrap(),
+            "--session-dir",
+            session_dir.to_str().unwrap(),
+            "--scripted-steps",
+            steps_file.to_str().unwrap(),
+            "-p",
+            "run the command",
+        ])
+        .unwrap();
+        assert_eq!(args.shell_timeout_secs, 1);
+
+        run_command(args).await.unwrap();
+        let trace = std::fs::read_to_string(session_dir.join("trace.jsonl")).unwrap();
+        let shell_finished = trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "shell_finished")
+            .unwrap();
+        assert_eq!(shell_finished["data"]["result"]["timed_out"], true);
     }
 
     #[test]
