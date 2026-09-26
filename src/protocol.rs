@@ -191,13 +191,13 @@ fn context_schema() -> Value {
     })
 }
 
-pub fn tool_definitions() -> Value {
+pub fn tool_definitions(default_shell_timeout_secs: u64) -> Value {
     let context = context_schema();
     json!([
         {
             "type": "function",
             "name": "shell",
-            "description": "Run one noninteractive shell command in the assigned repository. Use it to inspect files, edit files, and run tests. The command runs through /bin/sh -lc with no stdin; stdout and stderr are returned in one function result. Set timeout_secs for commands that need a shorter or longer deadline; null uses the session default. Commands must terminate on their own.",
+            "description": format!("Run one noninteractive shell command in the assigned repository. Use it to inspect files, edit files, and run tests. The command runs through /bin/sh -lc with no stdin; stdout and stderr are returned in one function result. Set timeout_secs for commands that need a shorter or longer deadline; null uses this session's default of {default_shell_timeout_secs} seconds. Commands must terminate on their own."),
             "strict": true,
             "parameters": {
                 "type": "object",
@@ -214,7 +214,7 @@ pub fn tool_definitions() -> Value {
                         "type": ["integer", "null"],
                         "minimum": 1,
                         "maximum": 300,
-                        "description": "Wall-clock timeout for this command in seconds (1-300). Use null for the session default (60 seconds unless overridden by --default-shell-timeout-secs); request a longer timeout when a build or test needs it."
+                        "description": format!("Wall-clock timeout for this command in seconds (1-300). Use null for this session's default of {default_shell_timeout_secs} seconds; request a longer timeout when a build or test needs it.")
                     },
                     "context": context.clone()
                 },
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn context_schema_keeps_human_content_by_default() {
-        let schema = tool_definitions();
+        let schema = tool_definitions(60);
         let context = &schema[0]["parameters"]["properties"]["context"];
         let description = context["description"].as_str().unwrap();
         let protected = context["properties"]["protected"]["description"]
@@ -306,8 +306,21 @@ mod tests {
     }
 
     #[test]
+    fn shell_description_reports_the_effective_session_timeout() {
+        let schema = tool_definitions(17);
+        let shell = &schema[0];
+        let tool_description = shell["description"].as_str().unwrap();
+        let timeout_description = shell["parameters"]["properties"]["timeout_secs"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(tool_description.contains("17 seconds"));
+        assert!(timeout_description.contains("17 seconds"));
+        assert!(!timeout_description.contains("60 seconds"));
+    }
+
+    #[test]
     fn shell_timeout_is_model_visible_and_survives_function_call_roundtrip() {
-        let schema = tool_definitions();
+        let schema = tool_definitions(60);
         let shell = &schema[0]["parameters"];
         assert_eq!(
             shell["properties"]["timeout_secs"]["type"],
@@ -371,7 +384,7 @@ mod tests {
             Some("Checking the focused tests first.")
         );
         assert_eq!(parsed.context.keep, vec![1]);
-        let schema = tool_definitions();
+        let schema = tool_definitions(60);
         assert_eq!(
             schema[0]["parameters"]["properties"]["context"]["properties"]["protected"]["items"]["type"],
             "integer"
