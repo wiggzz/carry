@@ -19,8 +19,9 @@ use tokio::{
 use crate::{
     auth,
     context::{
-        CompactionPlan, CompactionPolicy, ContextState, FlatRolloutConfig, FlatRolloutEstimate,
-        PricedBreakpoint, RenderedBreakpoint, meets_rollout_payback_threshold,
+        CACHE_READ_RATE, CACHE_WRITE_RATE, CompactionPlan, CompactionPolicy, ContextState,
+        FlatRolloutConfig, FlatRolloutEstimate, PricedBreakpoint, RenderedBreakpoint,
+        meets_rollout_payback_threshold,
     },
     log::RunLogger,
     mcp,
@@ -1157,14 +1158,27 @@ fn select_compaction_plan(
             })
             .map(|(plan, rollout)| (plan, Some(rollout)))
     } else {
-        state
-            .plan_compaction_with_neutral_watermarks(
-                protected,
-                policy,
-                config.compaction_neutral_high_watermark_tokens,
-                config.compaction_neutral_low_watermark_tokens,
-            )
-            .map(|plan| (plan, None))
+        let plan = state.plan_compaction_with_neutral_watermarks(
+            protected,
+            policy.clone(),
+            config.compaction_neutral_high_watermark_tokens,
+            config.compaction_neutral_low_watermark_tokens,
+        )?;
+        if config.keep_lease_turns.is_some()
+            && config.lease_review_policy == LeaseReviewPolicy::BatchOrdinary
+        {
+            let (keep, compact) = paired_keep_compact_costs(
+                state,
+                &plan,
+                policy.implicit_cached_tokens,
+                state.estimated_next_tool_turn_tokens(),
+                config,
+            );
+            if compact >= keep {
+                return None;
+            }
+        }
+        Some((plan, None))
     }
 }
 
@@ -1187,6 +1201,9 @@ fn projected_after_review_plan(
     future_protected.push(next_id);
     let mut future_config = config.clone();
     future_config.compaction_payoff_requests -= 1;
+    // The follow-up plan is a structural candidate. The same-horizon paired
+    // comparison below, not a second synthetic future, gates its expected cost.
+    future_config.lease_review_policy = LeaseReviewPolicy::Baseline;
     let (plan, _) = select_compaction_plan(&released, &future_protected, cache, &future_config)?;
     let prior_cached_tokens = cache
         .policy_for_history(
@@ -1198,6 +1215,124 @@ fn projected_after_review_plan(
     let delayed_savings =
         plan.savings_after_review_input_units(state.estimated_tokens(), prior_cached_tokens);
     Some((plan, delayed_savings, prior_cached_tokens))
+}
+
+/// Compare every choice on the same fixed future tool item and stop hazard.
+/// This is a bounded, frozen-plan sensitivity forecast, not a learned model of
+/// model renewals or subsequent planner actions. Review assumes the nominated
+/// IDs are omitted; actual renewal can only make its benefit smaller.
+#[derive(Debug, Serialize)]
+struct PairedReviewForecast {
+    horizon: u64,
+    stop_probability_percent: u8,
+    compact_now_future_item_tokens: usize,
+    review_first_future_item_tokens: usize,
+    keep_cost_input_units: f64,
+    compact_now_cost_input_units: Option<f64>,
+    review_first_cost_input_units: f64,
+}
+
+fn expected_horizon_cost(first: f64, second: f64, later: f64, config: &RunConfig) -> f64 {
+    let horizon = config.compaction_payoff_requests;
+    if horizon <= 1 {
+        return first;
+    }
+    let stop = f64::from(config.compaction_rollout_stop_probability_percent) / 100.0;
+    let survival = 1.0 - stop;
+    let later_weight = if stop == 0.0 {
+        horizon.saturating_sub(2) as f64
+    } else {
+        survival * survival * (1.0 - survival.powf(horizon.saturating_sub(2) as f64)) / stop
+    };
+    first + survival * second + later_weight * later
+}
+
+fn paired_keep_compact_costs(
+    state: &ContextState,
+    plan: &CompactionPlan,
+    cached_tokens: usize,
+    future_item_tokens: usize,
+    config: &RunConfig,
+) -> (f64, f64) {
+    let before = state.estimated_tokens();
+    let mut kept = state.clone();
+    kept.add_simulated_tool_item(future_item_tokens);
+    let kept_after_future = kept.estimated_tokens();
+    let keep_first = cached_tokens.min(before) as f64 * CACHE_READ_RATE
+        + before.saturating_sub(cached_tokens) as f64 * CACHE_WRITE_RATE;
+    let keep_second = before as f64 * CACHE_READ_RATE
+        + kept_after_future.saturating_sub(before) as f64 * CACHE_WRITE_RATE;
+    let keep = expected_horizon_cost(
+        keep_first,
+        keep_second,
+        kept_after_future as f64 * CACHE_READ_RATE,
+        config,
+    );
+    let mut compacted = state.clone();
+    compacted.compact(plan.clone());
+    let compacted_before_future = compacted.estimated_tokens();
+    compacted.add_simulated_tool_item(future_item_tokens);
+    let compacted_after_future = compacted.estimated_tokens();
+    let compact_first = plan.retained_tokens.saturating_sub(plan.rewrite_tokens) as f64
+        * CACHE_READ_RATE
+        + plan.rewrite_tokens as f64 * CACHE_WRITE_RATE;
+    let compact_second = compacted_before_future as f64 * CACHE_READ_RATE
+        + compacted_after_future.saturating_sub(compacted_before_future) as f64 * CACHE_WRITE_RATE;
+    let compact = expected_horizon_cost(
+        compact_first,
+        compact_second,
+        compacted_after_future as f64 * CACHE_READ_RATE,
+        config,
+    );
+    (keep, compact)
+}
+
+fn paired_review_forecast(
+    state: &ContextState,
+    ordinary: Option<&CompactionPlan>,
+    after_review: &CompactionPlan,
+    cached_tokens: usize,
+    advisory_write_input_units: f64,
+    future_item_tokens: usize,
+    config: &RunConfig,
+) -> PairedReviewForecast {
+    let before = state.estimated_tokens();
+    let mut kept = state.clone();
+    kept.add_simulated_tool_item(future_item_tokens);
+    let kept_after_future = kept.estimated_tokens();
+    let keep_first = cached_tokens.min(before) as f64 * CACHE_READ_RATE
+        + before.saturating_sub(cached_tokens) as f64 * CACHE_WRITE_RATE;
+    let keep_second = before as f64 * CACHE_READ_RATE
+        + kept_after_future.saturating_sub(before) as f64 * CACHE_WRITE_RATE;
+    let compact_now_cost_input_units = ordinary.map(|plan| {
+        paired_keep_compact_costs(state, plan, cached_tokens, future_item_tokens, config).1
+    });
+    let advisory_tokens = advisory_write_input_units / CACHE_WRITE_RATE;
+    let review_second = after_review
+        .retained_tokens
+        .saturating_sub(after_review.rewrite_tokens) as f64
+        * CACHE_READ_RATE
+        + after_review.rewrite_tokens as f64 * CACHE_WRITE_RATE
+        + advisory_write_input_units;
+    PairedReviewForecast {
+        horizon: config.compaction_payoff_requests,
+        stop_probability_percent: config.compaction_rollout_stop_probability_percent,
+        compact_now_future_item_tokens: future_item_tokens,
+        review_first_future_item_tokens: future_item_tokens,
+        keep_cost_input_units: expected_horizon_cost(
+            keep_first,
+            keep_second,
+            kept_after_future as f64 * CACHE_READ_RATE,
+            config,
+        ),
+        compact_now_cost_input_units,
+        review_first_cost_input_units: expected_horizon_cost(
+            keep_first + advisory_write_input_units,
+            review_second,
+            (after_review.retained_tokens as f64 + advisory_tokens) * CACHE_READ_RATE,
+            config,
+        ),
+    }
 }
 
 /// Attach a keep-lease review to the tool result that was just returned, while
@@ -1235,6 +1370,7 @@ fn maybe_attach_keep_lease_review(
         "expanded_after_review_retained_tokens": null,
         "next_turn_estimated_tokens": null,
         "advisory_write_input_units": null,
+        "paired_forecast": null,
     });
     macro_rules! decision {
         ($outcome:literal, $reason:literal) => {{
@@ -1317,11 +1453,25 @@ fn maybe_attach_keep_lease_review(
             json!(delayed_savings.is_finite().then_some(delayed_savings));
         telemetry["advisory_write_input_units"] =
             json!(advisory_cost.is_finite().then_some(advisory_cost));
+        let paired = paired_review_forecast(
+            state,
+            Some(&ordinary_plan),
+            &after_review,
+            implicit_cached_tokens,
+            advisory_cost,
+            next_turn_tokens,
+            config,
+        );
+        let review_beats_compact = paired
+            .compact_now_cost_input_units
+            .is_some_and(|cost| paired.review_first_cost_input_units < cost)
+            && paired.review_first_cost_input_units < paired.keep_cost_input_units;
+        telemetry["paired_forecast"] = json!(paired);
         if !after_review
             .dropped
             .iter()
             .any(|id| reviewed_ids.contains(id))
-            || delayed_savings - advisory_cost <= ordinary_plan.estimated_savings_input_units
+            || !review_beats_compact
         {
             decision!("skip", "incremental_benefit_insufficient");
             return Ok(());
@@ -1391,11 +1541,29 @@ fn maybe_attach_keep_lease_review(
         json!(delayed_savings.is_finite().then_some(delayed_savings));
     telemetry["advisory_write_input_units"] =
         json!(advisory_cost.is_finite().then_some(advisory_cost));
+    let prior_cached_tokens = cache
+        .policy_for_history(
+            &state.input_items(),
+            config.compaction_payoff_requests,
+            config.compaction_min_payback_percent,
+        )
+        .implicit_cached_tokens;
+    let paired = paired_review_forecast(
+        state,
+        None,
+        &after_review,
+        prior_cached_tokens,
+        advisory_cost,
+        next_turn_tokens,
+        config,
+    );
+    let review_beats_keep = paired.review_first_cost_input_units < paired.keep_cost_input_units;
+    telemetry["paired_forecast"] = json!(paired);
     if !after_review
         .dropped
         .iter()
         .any(|id| virtually_released_ids.contains(id))
-        || delayed_savings - advisory_cost <= after_review.minimum_payback_input_units
+        || !review_beats_keep
     {
         decision!("skip", "review_payback_insufficient");
         return Ok(());
@@ -1434,6 +1602,35 @@ fn maybe_compact(
     let Some((plan, rollout)) = select_compaction_plan(state, protected, cache, config) else {
         return Ok(false);
     };
+    let expected_value = if config.keep_lease_turns.is_some()
+        && config.lease_review_policy == LeaseReviewPolicy::BatchOrdinary
+        && config.compaction_rollout_samples == 0
+    {
+        let cached_tokens = cache
+            .policy_for_history(
+                &state.input_items(),
+                config.compaction_payoff_requests,
+                config.compaction_min_payback_percent,
+            )
+            .implicit_cached_tokens;
+        let next_turn_estimated_tokens = state.estimated_next_tool_turn_tokens();
+        let (keep_cost_input_units, compact_cost_input_units) = paired_keep_compact_costs(
+            state,
+            &plan,
+            cached_tokens,
+            next_turn_estimated_tokens,
+            config,
+        );
+        Some(json!({
+            "keep_cost_input_units": keep_cost_input_units,
+            "compact_cost_input_units": compact_cost_input_units,
+            "next_turn_estimated_tokens": next_turn_estimated_tokens,
+            "stop_probability_percent": config.compaction_rollout_stop_probability_percent,
+            "horizon": config.compaction_payoff_requests,
+        }))
+    } else {
+        None
+    };
     let change = state.compact(plan);
     cache.mark_compaction(&change.invalidated_generations);
     metrics.record_compaction();
@@ -1444,6 +1641,7 @@ fn maybe_compact(
             "compaction": &change,
             "retained_context": state.snapshot(),
             "rollout": rollout,
+            "expected_value": expected_value,
         }),
         &format!(
             "  compact · -{} items / ~{} tok · {} retained · {} rewritten · reuse {} · invalidate {} generations / {} cached tok · next request saves ~{} input-equivalent tok",
@@ -2667,7 +2865,7 @@ mod tests {
             compaction_payoff_requests: 40,
             compaction_min_payback_percent: 0,
             compaction_rollout_samples: 0,
-            compaction_rollout_stop_probability_percent: 10,
+            compaction_rollout_stop_probability_percent: 0,
             compaction_neutral_high_watermark_tokens: 0,
             compaction_neutral_low_watermark_tokens: 0,
             resume_context: Some(context.clone()),
@@ -2876,6 +3074,13 @@ mod tests {
             "batch the ordinary and newly released items once"
         );
         assert!(requests[1].0 < compactions[0].0 && compactions[0].0 < requests[2].0);
+        let expected = &compactions[0].1["data"]["expected_value"];
+        assert_eq!(expected["stop_probability_percent"], 0);
+        assert!(expected["next_turn_estimated_tokens"].as_u64().unwrap() > 0);
+        assert!(
+            expected["compact_cost_input_units"].as_f64().unwrap()
+                < expected["keep_cost_input_units"].as_f64().unwrap()
+        );
         let dropped = compactions[0].1["data"]["compaction"]["dropped"]
             .as_array()
             .unwrap();
@@ -2996,7 +3201,7 @@ mod tests {
     }
 
     #[test]
-    fn warm_cache_review_must_beat_ordinary_plan_over_the_same_request_horizon() {
+    fn warm_cache_review_compares_paired_expected_costs_on_the_same_future() {
         use crate::protocol::ContextManagement;
 
         let temp = tempfile::tempdir().unwrap();
@@ -3069,17 +3274,70 @@ mod tests {
             expanded.estimated_savings_input_units
         );
 
+        let mut certain_stop_state = state.clone();
+        let mut certain_stop_cache = CacheTracker::new(None);
+        certain_stop_cache.implicit_prefix = certain_stop_state.input_items();
+        certain_stop_cache.implicit_cached_tokens = certain_stop_state.estimated_tokens();
+        certain_stop_cache.implicit_activity = Some(Instant::now());
+        let mut certain_stop_config = config.clone();
+        certain_stop_config.compaction_rollout_stop_probability_percent = 100;
+        certain_stop_config.session_dir = temp.path().join("certain-stop");
+        assert!(
+            select_compaction_plan(
+                &certain_stop_state,
+                &[host],
+                &certain_stop_cache,
+                &certain_stop_config,
+            )
+            .is_none(),
+            "a one-request horizon should keep the warm cache instead of compacting"
+        );
+        let mut certain_stop_logger =
+            RunLogger::create_with_events(&certain_stop_config.session_dir, None).unwrap();
+        maybe_attach_keep_lease_review(
+            &mut certain_stop_state,
+            &[host],
+            &mut certain_stop_cache,
+            &mut certain_stop_logger,
+            &certain_stop_config,
+            host,
+        )
+        .unwrap();
+        assert!(
+            !certain_stop_state.pending_keep_lease_review(),
+            "when the task stops after this request, keep beats paying for a review"
+        );
+
+        let mut cold_state = state.clone();
         let mut logger = RunLogger::create_with_events(&config.session_dir, None).unwrap();
         maybe_attach_keep_lease_review(&mut state, &[host], &mut cache, &mut logger, &config, host)
             .unwrap();
-        assert!(
-            !state.pending_keep_lease_review(),
-            "do not delay a better ordinary rewrite"
+        let trace = std::fs::read_to_string(config.session_dir.join("trace.jsonl")).unwrap();
+        let decision = trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "keep_lease_review_decision")
+            .unwrap();
+        let paired = &decision["data"]["paired_forecast"];
+        assert_eq!(
+            paired["compact_now_future_item_tokens"],
+            decision["data"]["next_turn_estimated_tokens"]
         );
+        assert_eq!(
+            paired["review_first_future_item_tokens"],
+            decision["data"]["next_turn_estimated_tokens"]
+        );
+        assert!(paired["compact_now_cost_input_units"].as_f64().is_some());
+        assert!(paired["review_first_cost_input_units"].as_f64().is_some());
+        assert!(
+            paired["review_first_cost_input_units"].as_f64().unwrap()
+                < paired["compact_now_cost_input_units"].as_f64().unwrap()
+        );
+        assert_eq!(decision["data"]["reason"], "ordinary_review_payback");
+        assert!(state.pending_keep_lease_review());
 
         // The first keep request can itself be cold. Delaying the rewrite then
         // pays that full cache write before the same rewrite on request two.
-        let mut cold_state = state.clone();
         let mut cold_cache = CacheTracker::new(None);
         let ordinary_cold = select_compaction_plan(&cold_state, &[host], &cold_cache, &config)
             .unwrap()

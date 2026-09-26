@@ -133,21 +133,33 @@ Use `--lease-review-policy batch-ordinary` (or
 `CARRY_LEASE_REVIEW_POLICY=batch-ordinary`) to opt into the experimental
 comparison on the same binary and source commit. Once one or more leases are
 due, Carry asks the ordinary planner whether compaction already qualifies.
-Under the treatment, if it does, Carry simulates
-omitting the next four reviewed leases as **neutral** and compares the selected
-cache-aware plans. The delayed branch also projects a protected future tool-turn
-item, sized by the same mean non-human-item estimate used by the flat rollout,
-and replans with one fewer request in the payoff horizon. The forecast is a
-content-free size assumption, not a prediction of the model's next action.
-It delays the ordinary rewrite for a review only when that
-one wave would remove due material and its projected savings over the **same**
-request horizon exceed the ordinary rewrite, after charging the review annotation,
-the request spent waiting, and any cold first-request cache write. Otherwise
-compaction proceeds immediately. If ordinary compaction does not yet qualify,
-the existing metadata-only all-due release counterfactual can request
-a review when that full release set makes a rewrite worthwhile **after** the
-projected follow-up turn and advisory charge. A review never occurs when
-compaction is disabled or the payoff horizon contains no post-review request.
+Under the `batch-ordinary` treatment with rollout sampling disabled, Carry
+compares **keep**, **compact now**, and **review first** over the same bounded
+future. Each branch receives the same projected next tool-turn item. The first
+request pays its actual modeled cache read/write or rewrite cost; the review
+branch also pays the annotation and cannot remove reviewed material until its
+second request. The chance of reaching each subsequent request is
+`(1 - q)^(t - 1)`, where `q` is
+`--compaction-rollout-stop-probability-percent` (10% by default, including when
+rollout samples are zero for this treatment). `q=0` is an uninterrupted horizon;
+`q=100` prices only the immediate request. Both ordinary compaction and review
+must beat **keeping** on expected net input-equivalent cost, and review must
+also beat compacting now. There is no extra margin on this final three-way
+comparison; the configured payback margin still applies when the ordinary
+planner admits structural candidates, so use `--compaction-min-payback-percent 0`
+to test a margin-free treatment. The delayed candidate still projects a
+protected tool-turn item, sized by the same mean non-human-item estimate used
+by the flat rollout, and replans with one fewer request in the payoff horizon.
+This is an **experimental frozen-plan sensitivity forecast**: it assumes every
+reviewed ID is omitted, only one future item is projected, and no subsequent
+planner action or renewed lease is sampled. The stop probability is not yet
+calibrated; positive forecast savings are not observed cost savings. The
+content-free `keep_lease_review_decision.data.paired_forecast` and
+`context_compacted.data.expected_value` fields record the compared costs and
+settings. The separate sampled ordinary rollout remains unchanged; review-first
+planning with `--compaction-rollout-samples > 0` is not supported. A review
+never occurs when compaction is disabled or the payoff horizon contains no
+post-review request.
 
 A qualifying review names at most the four largest due blocks, matching the
 `protected` field's four-ID limit. The concise tool-result annotation directs
