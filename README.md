@@ -201,10 +201,11 @@ The default model for ordinary Carry runs is `gpt-6-sol`; choose another with
 `--model` or `OPENAI_MODEL`. SWE-bench benchmark entry points separately default
 to `gpt-6-luna` and pass that choice explicitly to Carry, so changing Carry's
 interactive default does not change benchmark costs. There is no default step
-limit; use `--max-steps N` only when a specific cap is required. Each shell
-command times out after 60 seconds by default; use `--shell-timeout-secs N` to
-allow longer commands (for example, builds). This is a CLI setting for the
-session, not a per-command model action parameter.
+limit; use `--max-steps N` only when a specific cap is required. Shell commands
+default to a 60-second wall-clock timeout (configurable per session with
+`--shell-timeout-secs N`). The model can set `timeout_secs` on an individual
+`shell` call to 1–300 seconds for work that needs a different limit; `null`
+uses the session default. A timed-out command and its process group are killed.
 
 ## Development
 

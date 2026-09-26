@@ -890,7 +890,11 @@ async fn run_loop(
                     &config.session_dir,
                     call_id,
                     command,
-                    config.shell_timeout_secs,
+                    reply
+                        .step
+                        .action
+                        .timeout_secs
+                        .unwrap_or(config.shell_timeout_secs),
                 )
                 .await?;
                 let output = function_call_output(&reply.function_call, &result)?;

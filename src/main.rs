@@ -107,7 +107,7 @@ struct Cli {
     #[arg(long)]
     max_steps: Option<usize>,
 
-    /// Timeout for each shell command (default: 60 seconds).
+    /// Default timeout for each shell command; the model may override per call (1-300 seconds).
     #[arg(long, default_value_t = 60)]
     shell_timeout_secs: u64,
 
@@ -661,6 +661,91 @@ mod tests {
             .find(|event| event["event"] == "shell_finished")
             .unwrap();
         assert_eq!(shell_finished["data"]["result"]["timed_out"], true);
+    }
+
+    #[tokio::test]
+    async fn model_shell_timeout_overrides_session_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("session");
+        let steps_file = temp.path().join("steps.jsonl");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"shell","command":"sleep 3","timeout_secs":1,"answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+                "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+            ),
+        )
+        .unwrap();
+        let args = Cli::try_parse_from([
+            "carry",
+            "--shell-timeout-secs",
+            "60",
+            "--max-steps",
+            "2",
+            "--cwd",
+            workspace.to_str().unwrap(),
+            "--session-dir",
+            session_dir.to_str().unwrap(),
+            "--scripted-steps",
+            steps_file.to_str().unwrap(),
+            "-p",
+            "run the command",
+        ])
+        .unwrap();
+        run_command(args).await.unwrap();
+        let trace = std::fs::read_to_string(session_dir.join("trace.jsonl")).unwrap();
+        let shell_finished = trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "shell_finished")
+            .unwrap();
+        assert_eq!(shell_finished["data"]["result"]["timed_out"], true);
+    }
+
+    #[tokio::test]
+    async fn model_can_extend_short_session_timeout_for_one_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("session");
+        let steps_file = temp.path().join("steps.jsonl");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"shell","command":"sleep 2 && printf done","timeout_secs":3,"answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+                "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+            ),
+        )
+        .unwrap();
+        let args = Cli::try_parse_from([
+            "carry",
+            "--shell-timeout-secs",
+            "1",
+            "--max-steps",
+            "2",
+            "--cwd",
+            workspace.to_str().unwrap(),
+            "--session-dir",
+            session_dir.to_str().unwrap(),
+            "--scripted-steps",
+            steps_file.to_str().unwrap(),
+            "-p",
+            "run the command",
+        ])
+        .unwrap();
+        run_command(args).await.unwrap();
+        let trace = std::fs::read_to_string(session_dir.join("trace.jsonl")).unwrap();
+        let shell_finished = trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "shell_finished")
+            .unwrap();
+        assert_eq!(shell_finished["data"]["result"]["timed_out"], false);
+        assert_eq!(shell_finished["data"]["result"]["exit_code"], 0);
     }
 
     #[test]
