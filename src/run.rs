@@ -1541,24 +1541,31 @@ fn maybe_attach_keep_lease_review(
         json!(delayed_savings.is_finite().then_some(delayed_savings));
     telemetry["advisory_write_input_units"] =
         json!(advisory_cost.is_finite().then_some(advisory_cost));
-    let prior_cached_tokens = cache
-        .policy_for_history(
-            &state.input_items(),
-            config.compaction_payoff_requests,
-            config.compaction_min_payback_percent,
-        )
-        .implicit_cached_tokens;
-    let paired = paired_review_forecast(
-        state,
-        None,
-        &after_review,
-        prior_cached_tokens,
-        advisory_cost,
-        next_turn_tokens,
-        config,
-    );
-    let review_beats_keep = paired.review_first_cost_input_units < paired.keep_cost_input_units;
-    telemetry["paired_forecast"] = json!(paired);
+    let review_beats_keep = if config.lease_review_policy == LeaseReviewPolicy::Baseline {
+        // Preserve the pre-experiment all-due gate for the control arm. Only
+        // batch-ordinary uses the paired stop-hazard sensitivity model.
+        delayed_savings - advisory_cost > after_review.minimum_payback_input_units
+    } else {
+        let prior_cached_tokens = cache
+            .policy_for_history(
+                &state.input_items(),
+                config.compaction_payoff_requests,
+                config.compaction_min_payback_percent,
+            )
+            .implicit_cached_tokens;
+        let paired = paired_review_forecast(
+            state,
+            None,
+            &after_review,
+            prior_cached_tokens,
+            advisory_cost,
+            next_turn_tokens,
+            config,
+        );
+        let cheaper = paired.review_first_cost_input_units < paired.keep_cost_input_units;
+        telemetry["paired_forecast"] = json!(paired);
+        cheaper
+    };
     if !after_review
         .dropped
         .iter()
@@ -3426,6 +3433,29 @@ mod tests {
             large.retained_tokens > small.retained_tokens + 10_000,
             "the follow-up size must enter the real post-review compaction plan"
         );
+        for stop in [0, 100] {
+            let mut baseline_state = state.clone();
+            let mut baseline_cache = CacheTracker::new(None);
+            let mut baseline_config = config.clone();
+            baseline_config.lease_review_policy = LeaseReviewPolicy::Baseline;
+            baseline_config.compaction_rollout_stop_probability_percent = stop;
+            baseline_config.session_dir = temp.path().join(format!("baseline-stop-{stop}"));
+            let mut baseline_logger =
+                RunLogger::create_with_events(&baseline_config.session_dir, None).unwrap();
+            maybe_attach_keep_lease_review(
+                &mut baseline_state,
+                &[host],
+                &mut baseline_cache,
+                &mut baseline_logger,
+                &baseline_config,
+                host,
+            )
+            .unwrap();
+            assert!(
+                baseline_state.pending_keep_lease_review(),
+                "the unchanged baseline all-due gate must ignore the experimental stop hazard {stop}"
+            );
+        }
         let mut logger = RunLogger::create_with_events(&config.session_dir, None).unwrap();
         maybe_attach_keep_lease_review(&mut state, &[host], &mut cache, &mut logger, &config, host)
             .unwrap();
