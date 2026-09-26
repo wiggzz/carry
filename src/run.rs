@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
@@ -18,8 +19,8 @@ use tokio::{
 use crate::{
     auth,
     context::{
-        CompactionPlan, CompactionPolicy, ContextState, FlatRolloutConfig, FlatRolloutEstimate,
-        PricedBreakpoint, RenderedBreakpoint, meets_rollout_payback_threshold,
+        CACHE_READ_RATE, CACHE_WRITE_RATE, CompactionPlan, CompactionPolicy, ContextState,
+        PricedBreakpoint, RenderedBreakpoint,
     },
     log::RunLogger,
     mcp,
@@ -63,6 +64,13 @@ pub enum CompactionMode {
     Disabled,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum LeaseReviewPolicy {
+    Baseline,
+    BatchOrdinary,
+}
+
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub cwd: PathBuf,
@@ -74,12 +82,12 @@ pub struct RunConfig {
     pub compaction_mode: CompactionMode,
     /// Experimental: revalidate model-requested protected context after this many model turns.
     pub keep_lease_turns: Option<u64>,
+    /// Opt-in experiment: review due leases before an already-qualified rewrite.
+    pub lease_review_policy: LeaseReviewPolicy,
     /// Number of future requests used to amortize a compaction rewrite; one is next-request economics.
     pub compaction_payoff_requests: u64,
     /// Minimum projected saving (percent of retained-path payoff cost) required to compact.
     pub compaction_min_payback_percent: u8,
-    /// Zero disables deterministic flat-drop scenario rollouts before compaction.
-    pub compaction_rollout_samples: u32,
     /// Per simulated future turn probability (percent) that the task ends.
     pub compaction_rollout_stop_probability_percent: u8,
     /// Eligible neutral token high-water mark before automatic compaction.
@@ -652,6 +660,7 @@ async fn run_loop(
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
                 "compaction_policy": config.compaction_mode,
+                "lease_review_policy": config.lease_review_policy,
                 "compaction_payoff_requests": config.compaction_payoff_requests,
                 "compaction_min_payback_percent": config.compaction_min_payback_percent,
                 "source_session": config.resume_source,
@@ -674,6 +683,7 @@ async fn run_loop(
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
                 "compaction_policy": config.compaction_mode,
+                "lease_review_policy": config.lease_review_policy,
                 "compaction_payoff_requests": config.compaction_payoff_requests,
                 "compaction_min_payback_percent": config.compaction_min_payback_percent,
                 "compaction_decision": "next_request"
@@ -743,7 +753,10 @@ async fn run_loop(
         } else {
             "economic"
         };
-        if config.compaction_mode == CompactionMode::Economic && (!resumed || sent_model_request) {
+        if config.compaction_mode == CompactionMode::Economic
+            && (!resumed || sent_model_request)
+            && !context_state.pending_keep_lease_review()
+        {
             maybe_compact(
                 &mut context_state,
                 &protected_until_request,
@@ -901,14 +914,15 @@ async fn run_loop(
                     &terminal_shell_result(&result),
                 )?;
                 let signals = context_state.record_signals(&reply.step.context, item_id);
-                let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
+                if config.keep_lease_turns.is_some() {
                     context_state.advance_retention_turn();
-                    let expired = context_state.resolve_keep_lease_review(&signals.keep);
+                }
+                // A pending advisory survives resume even if leases are now disabled.
+                // Consume it after the model sees it so compaction can proceed.
+                let expired_keep_leases = context_state.resolve_keep_lease_review(&signals.keep);
+                if let Some(lease_turns) = config.keep_lease_turns {
                     context_state.arm_keep_leases(&signals.keep, lease_turns);
-                    expired
-                } else {
-                    Vec::new()
-                };
+                }
                 protected_until_request.push(item_id);
                 protected_until_request.extend(signals.added.iter().copied());
                 maybe_attach_keep_lease_review(
@@ -954,14 +968,15 @@ async fn run_loop(
                 )?;
                 let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
                 let signals = context_state.record_signals(&reply.step.context, item_id);
-                let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
+                if config.keep_lease_turns.is_some() {
                     context_state.advance_retention_turn();
-                    let expired = context_state.resolve_keep_lease_review(&signals.keep);
+                }
+                // A pending advisory survives resume even if leases are now disabled.
+                // Consume it after the model sees it so compaction can proceed.
+                let expired_keep_leases = context_state.resolve_keep_lease_review(&signals.keep);
+                if let Some(lease_turns) = config.keep_lease_turns {
                     context_state.arm_keep_leases(&signals.keep, lease_turns);
-                    expired
-                } else {
-                    Vec::new()
-                };
+                }
                 protected_until_request.push(item_id);
                 protected_until_request.extend(signals.added.iter().copied());
                 if input.is_some() {
@@ -1107,20 +1122,17 @@ fn select_compaction_plan(
     protected: &[u64],
     cache: &CacheTracker,
     config: &RunConfig,
-) -> Option<(CompactionPlan, Option<FlatRolloutEstimate>)> {
+) -> Option<CompactionPlan> {
     let policy = cache.policy_for_history(
         &state.input_items(),
         config.compaction_payoff_requests,
         config.compaction_min_payback_percent,
     );
-    if config.compaction_rollout_samples > 0 {
-        let rollout_config = FlatRolloutConfig {
-            samples: config.compaction_rollout_samples,
-            horizon: config.compaction_payoff_requests,
-            seed: 0,
-            stop_probability_percent: config.compaction_rollout_stop_probability_percent,
-        };
-        state
+    if config.keep_lease_turns.is_some()
+        && config.lease_review_policy == LeaseReviewPolicy::BatchOrdinary
+    {
+        let future_item_tokens = state.estimated_next_tool_turn_tokens();
+        return state
             .compaction_candidates_with_neutral_watermarks(
                 protected,
                 policy.clone(),
@@ -1128,34 +1140,253 @@ fn select_compaction_plan(
                 config.compaction_neutral_low_watermark_tokens,
             )
             .into_iter()
-            .map(|plan| {
-                let rollout =
-                    state.flat_rollout_estimate(&plan, protected, policy.clone(), rollout_config);
-                (plan, rollout)
+            .filter_map(|mut plan| {
+                let (keep, compact) = paired_keep_compact_costs(
+                    state,
+                    &plan,
+                    policy.implicit_cached_tokens,
+                    future_item_tokens,
+                    config,
+                );
+                let savings = keep - compact;
+                let minimum = keep * f64::from(config.compaction_min_payback_percent) / 100.0;
+                if savings <= minimum {
+                    return None;
+                }
+                plan.estimated_savings_input_units = savings;
+                plan.minimum_payback_input_units = minimum;
+                Some(plan)
             })
-            .filter(|(_, rollout)| meets_rollout_payback_threshold(rollout))
-            .max_by(|(_, left), (_, right)| {
-                left.expected_savings_input_units
-                    .total_cmp(&right.expected_savings_input_units)
-            })
-            .map(|(plan, rollout)| (plan, Some(rollout)))
+            .max_by(|left, right| {
+                left.estimated_savings_input_units
+                    .total_cmp(&right.estimated_savings_input_units)
+            });
+    }
+    state.plan_compaction_with_neutral_watermarks(
+        protected,
+        policy,
+        config.compaction_neutral_high_watermark_tokens,
+        config.compaction_neutral_low_watermark_tokens,
+    )
+}
+
+/// Forecast a delayed review rewrite using the same weighted horizon as an
+/// ordinary rewrite. The projected tool result is protected through request two.
+fn projected_after_review_plan(
+    state: &ContextState,
+    mut released: ContextState,
+    protected: &[u64],
+    cache: &CacheTracker,
+    config: &RunConfig,
+    next_turn_tokens: usize,
+) -> Option<(CompactionPlan, f64, usize)> {
+    if config.compaction_payoff_requests <= 1 {
+        return None;
+    }
+    let next_id = released.add_simulated_tool_item(next_turn_tokens);
+    let mut future_protected = protected.to_vec();
+    future_protected.push(next_id);
+    let mut future_config = config.clone();
+    future_config.compaction_payoff_requests -= 1;
+    future_config.lease_review_policy = LeaseReviewPolicy::Baseline;
+    let prior_cached_tokens = cache
+        .policy_for_history(
+            &state.input_items(),
+            config.compaction_payoff_requests,
+            config.compaction_min_payback_percent,
+        )
+        .implicit_cached_tokens;
+    if config.lease_review_policy == LeaseReviewPolicy::Baseline {
+        let plan = select_compaction_plan(&released, &future_protected, cache, &future_config)?;
+        let delayed_savings =
+            plan.savings_after_review_input_units(state.estimated_tokens(), prior_cached_tokens);
+        return Some((plan, delayed_savings, prior_cached_tokens));
+    }
+    let policy = cache.policy_for_history(
+        &released.input_items(),
+        future_config.compaction_payoff_requests,
+        config.compaction_min_payback_percent,
+    );
+    released
+        .compaction_candidates_with_neutral_watermarks(
+            &future_protected,
+            policy,
+            config.compaction_neutral_high_watermark_tokens,
+            config.compaction_neutral_low_watermark_tokens,
+        )
+        .into_iter()
+        .filter_map(|mut plan| {
+            let forecast = paired_review_forecast(
+                state,
+                None,
+                &plan,
+                prior_cached_tokens,
+                0.0,
+                next_turn_tokens,
+                config,
+            );
+            let savings = forecast.keep_cost_input_units - forecast.review_first_cost_input_units;
+            let minimum = forecast.keep_cost_input_units
+                * f64::from(config.compaction_min_payback_percent)
+                / 100.0;
+            if savings <= minimum {
+                return None;
+            }
+            plan.estimated_savings_input_units = savings;
+            plan.minimum_payback_input_units = minimum;
+            Some((plan, savings, prior_cached_tokens))
+        })
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+}
+
+/// Compare ordinary and delayed-review choices against the same estimated
+/// future tool growth and stopping hazard. This is a bounded, frozen-plan
+/// sensitivity forecast, not a learned model of
+/// model renewals or subsequent planner actions. Review assumes the nominated
+/// IDs are omitted; actual renewal can only make its benefit smaller.
+#[derive(Debug, Serialize)]
+struct PairedReviewForecast {
+    horizon: u64,
+    stop_probability_percent: u8,
+    compact_now_future_item_tokens: usize,
+    review_first_future_item_tokens: usize,
+    keep_cost_input_units: f64,
+    compact_now_cost_input_units: Option<f64>,
+    review_first_cost_input_units: f64,
+}
+
+fn expected_horizon_cost(
+    first: f64,
+    second: f64,
+    later: f64,
+    future_growth_tokens: usize,
+    config: &RunConfig,
+) -> f64 {
+    let horizon = config.compaction_payoff_requests;
+    if horizon <= 1 {
+        return first;
+    }
+    let stop = f64::from(config.compaction_rollout_stop_probability_percent) / 100.0;
+    let survival = 1.0 - stop;
+    let later_count = horizon.saturating_sub(2) as f64;
+    let (later_weight, growth_weight) = if stop == 0.0 {
+        (later_count, later_count * (later_count - 1.0) / 2.0)
     } else {
-        state
-            .plan_compaction_with_neutral_watermarks(
-                protected,
-                policy,
-                config.compaction_neutral_high_watermark_tokens,
-                config.compaction_neutral_low_watermark_tokens,
-            )
-            .map(|plan| (plan, None))
+        let power = survival.powf(later_count);
+        (
+            survival * survival * (1.0 - power) / stop,
+            survival
+                * survival
+                * (survival - later_count * power + (later_count - 1.0) * power * survival)
+                / (stop * stop),
+        )
+    };
+    let growth = future_growth_tokens as f64;
+    first
+        + survival * second
+        + later_weight * (later + growth * CACHE_WRITE_RATE)
+        + growth_weight * growth * CACHE_READ_RATE
+}
+
+fn paired_keep_compact_costs(
+    state: &ContextState,
+    plan: &CompactionPlan,
+    cached_tokens: usize,
+    future_item_tokens: usize,
+    config: &RunConfig,
+) -> (f64, f64) {
+    let before = state.estimated_tokens();
+    let mut kept = state.clone();
+    kept.add_simulated_tool_item(future_item_tokens);
+    let kept_after_future = kept.estimated_tokens();
+    let future_growth = kept_after_future.saturating_sub(before);
+    let keep_first = cached_tokens.min(before) as f64 * CACHE_READ_RATE
+        + before.saturating_sub(cached_tokens) as f64 * CACHE_WRITE_RATE;
+    let keep_second = before as f64 * CACHE_READ_RATE
+        + kept_after_future.saturating_sub(before) as f64 * CACHE_WRITE_RATE;
+    let keep = expected_horizon_cost(
+        keep_first,
+        keep_second,
+        kept_after_future as f64 * CACHE_READ_RATE,
+        future_growth,
+        config,
+    );
+    let mut compacted = state.clone();
+    compacted.compact(plan.clone());
+    let compacted_before_future = compacted.estimated_tokens();
+    compacted.add_simulated_tool_item(future_item_tokens);
+    let compacted_after_future = compacted.estimated_tokens();
+    let compact_first = plan.retained_tokens.saturating_sub(plan.rewrite_tokens) as f64
+        * CACHE_READ_RATE
+        + plan.rewrite_tokens as f64 * CACHE_WRITE_RATE;
+    let compact_second = compacted_before_future as f64 * CACHE_READ_RATE
+        + compacted_after_future.saturating_sub(compacted_before_future) as f64 * CACHE_WRITE_RATE;
+    let compact = expected_horizon_cost(
+        compact_first,
+        compact_second,
+        compacted_after_future as f64 * CACHE_READ_RATE,
+        future_growth,
+        config,
+    );
+    (keep, compact)
+}
+
+fn paired_review_forecast(
+    state: &ContextState,
+    ordinary: Option<&CompactionPlan>,
+    after_review: &CompactionPlan,
+    cached_tokens: usize,
+    advisory_write_input_units: f64,
+    future_item_tokens: usize,
+    config: &RunConfig,
+) -> PairedReviewForecast {
+    let before = state.estimated_tokens();
+    let mut kept = state.clone();
+    kept.add_simulated_tool_item(future_item_tokens);
+    let kept_after_future = kept.estimated_tokens();
+    let future_growth = kept_after_future.saturating_sub(before);
+    let keep_first = cached_tokens.min(before) as f64 * CACHE_READ_RATE
+        + before.saturating_sub(cached_tokens) as f64 * CACHE_WRITE_RATE;
+    let keep_second = before as f64 * CACHE_READ_RATE
+        + kept_after_future.saturating_sub(before) as f64 * CACHE_WRITE_RATE;
+    let compact_now_cost_input_units = ordinary.map(|plan| {
+        paired_keep_compact_costs(state, plan, cached_tokens, future_item_tokens, config).1
+    });
+    let advisory_tokens = advisory_write_input_units / CACHE_WRITE_RATE;
+    let review_second = after_review
+        .retained_tokens
+        .saturating_sub(after_review.rewrite_tokens) as f64
+        * CACHE_READ_RATE
+        + after_review.rewrite_tokens as f64 * CACHE_WRITE_RATE
+        + advisory_write_input_units;
+    PairedReviewForecast {
+        horizon: config.compaction_payoff_requests,
+        stop_probability_percent: config.compaction_rollout_stop_probability_percent,
+        compact_now_future_item_tokens: future_item_tokens,
+        review_first_future_item_tokens: future_item_tokens,
+        keep_cost_input_units: expected_horizon_cost(
+            keep_first,
+            keep_second,
+            kept_after_future as f64 * CACHE_READ_RATE,
+            future_growth,
+            config,
+        ),
+        compact_now_cost_input_units,
+        review_first_cost_input_units: expected_horizon_cost(
+            keep_first + advisory_write_input_units,
+            review_second,
+            (after_review.retained_tokens as f64 + advisory_tokens) * CACHE_READ_RATE,
+            future_growth,
+            config,
+        ),
     }
 }
 
 /// Attach a keep-lease review to the tool result that was just returned, while
 /// it is still fresh trailing content. Rewriting an older, already-rendered
 /// result instead would invalidate the cached prefix. This keeps the planner
-/// gate from `select_compaction_plan`: the review only fires when releasing
-/// the due leases would make a compaction worthwhile.
+/// gate from `select_compaction_plan`: defer an ordinary rewrite only when
+/// reviewing a single wave could pay for its one-request delay.
 fn maybe_attach_keep_lease_review(
     state: &mut ContextState,
     protected_until_request: &[u64],
@@ -1164,14 +1395,155 @@ fn maybe_attach_keep_lease_review(
     config: &RunConfig,
     host_id: u64,
 ) -> Result<()> {
-    if config.compaction_mode != CompactionMode::Economic || config.keep_lease_turns.is_none() {
+    // Ordinary runs without leases do not need decision events or a due-item scan.
+    if config.keep_lease_turns.is_none() {
         return Ok(());
     }
-    if select_compaction_plan(state, protected_until_request, cache, config).is_some() {
+    // This event is planner-boundary metadata only; never serialize item IDs or content.
+    let reviewed_ids = state.due_keep_lease_review_ids();
+    let (due_count, due_estimated_tokens, reviewable_estimated_tokens) =
+        state.due_keep_lease_review_metrics(&reviewed_ids);
+    let mut telemetry = json!({
+        "decision": "skip",
+        "reason": null,
+        "due_count": due_count,
+        "due_estimated_tokens": due_estimated_tokens,
+        "reviewable_count": reviewed_ids.len(),
+        "reviewable_estimated_tokens": reviewable_estimated_tokens,
+        "selected_wave_count": 0,
+        "ordinary_savings_input_units": null,
+        "expanded_savings_input_units": null,
+        "expanded_after_review_savings_input_units": null,
+        "expanded_after_review_retained_tokens": null,
+        "next_turn_estimated_tokens": null,
+        "advisory_write_input_units": null,
+        "paired_forecast": null,
+    });
+    macro_rules! decision {
+        ($outcome:literal, $reason:literal) => {{
+            telemetry["decision"] = json!($outcome);
+            telemetry["reason"] = json!($reason);
+            logger.raw_event_silent("keep_lease_review_decision", telemetry)?;
+        }};
+    }
+    if config.compaction_mode != CompactionMode::Economic {
+        decision!("skip", "compaction_disabled");
+        return Ok(());
+    }
+    if state.pending_keep_lease_review() {
+        decision!("skip", "review_pending");
+        return Ok(());
+    }
+    if config.compaction_payoff_requests <= 1 {
+        decision!("skip", "review_delay_exceeds_horizon");
+        return Ok(());
+    }
+    let ordinary = select_compaction_plan(state, protected_until_request, cache, config);
+    if let Some(plan) = &ordinary {
+        telemetry["ordinary_savings_input_units"] = json!(
+            plan.estimated_savings_input_units
+                .is_finite()
+                .then_some(plan.estimated_savings_input_units)
+        );
+    }
+    if config.lease_review_policy == LeaseReviewPolicy::Baseline && ordinary.is_some() {
+        decision!("skip", "baseline_ordinary_plan");
+        return Ok(());
+    }
+    if let Some(ordinary_plan) = ordinary {
+        if reviewed_ids.is_empty() {
+            decision!("skip", "no_due_leases");
+            return Ok(());
+        }
+        let virtual_release = state.virtual_omit_keep_lease_review(&reviewed_ids);
+        let virtual_protected = protected_until_request
+            .iter()
+            .copied()
+            .filter(|id| !reviewed_ids.contains(id))
+            .collect::<Vec<_>>();
+        let Some(expanded) =
+            select_compaction_plan(&virtual_release, &virtual_protected, cache, config)
+        else {
+            decision!("skip", "expanded_plan_unavailable");
+            return Ok(());
+        };
+        telemetry["expanded_savings_input_units"] = json!(
+            expanded
+                .estimated_savings_input_units
+                .is_finite()
+                .then_some(expanded.estimated_savings_input_units)
+        );
+        let next_turn_tokens = state.estimated_next_tool_turn_tokens();
+        let Some((after_review, delayed_savings, implicit_cached_tokens)) =
+            projected_after_review_plan(
+                state,
+                virtual_release,
+                &virtual_protected,
+                cache,
+                config,
+                next_turn_tokens,
+            )
+        else {
+            decision!("skip", "forecast_plan_unavailable");
+            return Ok(());
+        };
+        let advisory_cost = state.review_advisory_write_input_units(host_id);
+        telemetry["next_turn_estimated_tokens"] = json!(next_turn_tokens);
+        telemetry["expanded_after_review_retained_tokens"] = json!(after_review.retained_tokens);
+        telemetry["expanded_after_review_savings_input_units"] =
+            json!(delayed_savings.is_finite().then_some(delayed_savings));
+        telemetry["advisory_write_input_units"] =
+            json!(advisory_cost.is_finite().then_some(advisory_cost));
+        let paired = paired_review_forecast(
+            state,
+            Some(&ordinary_plan),
+            &after_review,
+            implicit_cached_tokens,
+            advisory_cost,
+            next_turn_tokens,
+            config,
+        );
+        let review_beats_compact = paired
+            .compact_now_cost_input_units
+            .is_some_and(|cost| paired.review_first_cost_input_units < cost)
+            && paired.review_first_cost_input_units < paired.keep_cost_input_units;
+        telemetry["paired_forecast"] = json!(paired);
+        if !after_review
+            .dropped
+            .iter()
+            .any(|id| reviewed_ids.contains(id))
+            || !review_beats_compact
+        {
+            decision!("skip", "incremental_benefit_insufficient");
+            return Ok(());
+        }
+        let review = state.attach_due_keep_lease_review_to(host_id);
+        if !review.item_ids.is_empty() {
+            telemetry["selected_wave_count"] = json!(review.item_ids.len());
+            decision!("request", "ordinary_review_payback");
+            logger.raw_event_silent(
+                "retention_revalidation_requested",
+                json!({
+                    "item_ids": review.item_ids,
+                    "selection_scope": "reviewed_wave_virtual_omission",
+                    "ordinary_savings_input_units": ordinary_plan.estimated_savings_input_units,
+                    "expanded_now_savings_input_units": expanded.estimated_savings_input_units,
+                    "expanded_after_review_savings_input_units": delayed_savings,
+                    "expanded_after_review_retained_tokens": after_review.retained_tokens,
+                    "next_turn_estimated_tokens": next_turn_tokens,
+                    "review_first_cached_tokens": implicit_cached_tokens,
+                    "review_first_uncached_tokens": state.estimated_tokens().saturating_sub(implicit_cached_tokens),
+                    "advisory_write_input_units": advisory_cost,
+                }),
+            )?;
+        } else {
+            decision!("skip", "attachment_unavailable");
+        }
         return Ok(());
     }
     let Some((virtual_release, virtually_released_ids)) = state.virtual_release_due_keep_leases()
     else {
+        decision!("skip", "no_due_leases");
         return Ok(());
     };
     let virtual_protected = protected_until_request
@@ -1179,18 +1551,89 @@ fn maybe_attach_keep_lease_review(
         .copied()
         .filter(|id| !virtually_released_ids.contains(id))
         .collect::<Vec<_>>();
-    if select_compaction_plan(&virtual_release, &virtual_protected, cache, config).is_none() {
+    let Some(expanded) =
+        select_compaction_plan(&virtual_release, &virtual_protected, cache, config)
+    else {
+        decision!("skip", "all_due_plan_unavailable");
+        return Ok(());
+    };
+    telemetry["expanded_savings_input_units"] = json!(
+        expanded
+            .estimated_savings_input_units
+            .is_finite()
+            .then_some(expanded.estimated_savings_input_units)
+    );
+    let next_turn_tokens = state.estimated_next_tool_turn_tokens();
+    let Some((after_review, delayed_savings, _prior_cached_tokens)) = projected_after_review_plan(
+        state,
+        virtual_release,
+        &virtual_protected,
+        cache,
+        config,
+        next_turn_tokens,
+    ) else {
+        decision!("skip", "forecast_plan_unavailable");
+        return Ok(());
+    };
+    let advisory_cost = state.review_advisory_write_input_units(host_id);
+    telemetry["next_turn_estimated_tokens"] = json!(next_turn_tokens);
+    telemetry["expanded_after_review_retained_tokens"] = json!(after_review.retained_tokens);
+    telemetry["expanded_after_review_savings_input_units"] =
+        json!(delayed_savings.is_finite().then_some(delayed_savings));
+    telemetry["advisory_write_input_units"] =
+        json!(advisory_cost.is_finite().then_some(advisory_cost));
+    let review_beats_keep = if config.lease_review_policy == LeaseReviewPolicy::Baseline {
+        // Preserve the pre-experiment all-due gate for the control arm. Only
+        // batch-ordinary uses the paired stop-hazard sensitivity model.
+        delayed_savings - advisory_cost > after_review.minimum_payback_input_units
+    } else {
+        let prior_cached_tokens = cache
+            .policy_for_history(
+                &state.input_items(),
+                config.compaction_payoff_requests,
+                config.compaction_min_payback_percent,
+            )
+            .implicit_cached_tokens;
+        let paired = paired_review_forecast(
+            state,
+            None,
+            &after_review,
+            prior_cached_tokens,
+            advisory_cost,
+            next_turn_tokens,
+            config,
+        );
+        let cheaper = paired.review_first_cost_input_units < paired.keep_cost_input_units;
+        telemetry["paired_forecast"] = json!(paired);
+        cheaper
+    };
+    if !after_review
+        .dropped
+        .iter()
+        .any(|id| virtually_released_ids.contains(id))
+        || !review_beats_keep
+    {
+        decision!("skip", "review_payback_insufficient");
         return Ok(());
     }
     let review = state.attach_due_keep_lease_review_to(host_id);
     if !review.item_ids.is_empty() {
+        telemetry["selected_wave_count"] = json!(review.item_ids.len());
+        decision!("request", "all_due_virtual_payback");
         logger.raw_event_silent(
             "retention_revalidation_requested",
             json!({
                 "item_ids": review.item_ids,
-                "selection_scope": "all_due_virtual_release"
+                "selection_scope": "all_due_virtual_release",
+                "expanded_now_savings_input_units": expanded.estimated_savings_input_units,
+                "expanded_after_review_savings_input_units": delayed_savings,
+                "expanded_after_review_retained_tokens": after_review.retained_tokens,
+                "next_turn_estimated_tokens": next_turn_tokens,
+                "advisory_write_input_units": advisory_cost,
             }),
         )?;
+    } else {
+        decision!("skip", "attachment_unavailable");
     }
     Ok(())
 }
@@ -1204,8 +1647,36 @@ fn maybe_compact(
     config: &RunConfig,
     trigger: &str,
 ) -> Result<bool> {
-    let Some((plan, rollout)) = select_compaction_plan(state, protected, cache, config) else {
+    let Some(plan) = select_compaction_plan(state, protected, cache, config) else {
         return Ok(false);
+    };
+    let expected_value = if config.keep_lease_turns.is_some()
+        && config.lease_review_policy == LeaseReviewPolicy::BatchOrdinary
+    {
+        let cached_tokens = cache
+            .policy_for_history(
+                &state.input_items(),
+                config.compaction_payoff_requests,
+                config.compaction_min_payback_percent,
+            )
+            .implicit_cached_tokens;
+        let next_turn_estimated_tokens = state.estimated_next_tool_turn_tokens();
+        let (keep_cost_input_units, compact_cost_input_units) = paired_keep_compact_costs(
+            state,
+            &plan,
+            cached_tokens,
+            next_turn_estimated_tokens,
+            config,
+        );
+        Some(json!({
+            "keep_cost_input_units": keep_cost_input_units,
+            "compact_cost_input_units": compact_cost_input_units,
+            "next_turn_estimated_tokens": next_turn_estimated_tokens,
+            "stop_probability_percent": config.compaction_rollout_stop_probability_percent,
+            "horizon": config.compaction_payoff_requests,
+        }))
+    } else {
+        None
     };
     let change = state.compact(plan);
     cache.mark_compaction(&change.invalidated_generations);
@@ -1216,10 +1687,10 @@ fn maybe_compact(
             "trigger": trigger,
             "compaction": &change,
             "retained_context": state.snapshot(),
-            "rollout": rollout,
+            "expected_value": expected_value,
         }),
         &format!(
-            "  compact · -{} items / ~{} tok · {} retained · {} rewritten · reuse {} · invalidate {} generations / {} cached tok · next request saves ~{} input-equivalent tok",
+            "  compact · -{} items / ~{} tok · {} retained · {} rewritten · reuse {} · invalidate {} generations / {} cached tok · projected horizon saves ~{} input-equivalent tok",
             change.dropped.len(),
             compact_number(change.dropped_tokens as u64),
             compact_number(change.retained_tokens as u64),
@@ -2336,9 +2807,9 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: Some(1),
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -2362,12 +2833,939 @@ mod tests {
             .map(|event| event["data"]["history"].as_array().unwrap().clone())
             .collect::<Vec<_>>();
         assert_eq!(histories.len(), 3);
+        let events = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap();
+        let decisions = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["event"] == "keep_lease_review_decision")
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions.iter().all(|event| {
+            event["data"]["reason"] == "compaction_disabled"
+                && event["data"]["due_count"].is_number()
+                && event["data"]["ordinary_savings_input_units"].is_null()
+        }));
         assert!(histories.iter().all(|history| !history.iter().any(|item| {
             item["type"] == "function_call_output"
                 && item["output"]
                     .as_str()
                     .is_some_and(|output| output.contains("Review protected items"))
         })));
+    }
+
+    #[tokio::test]
+    async fn reviews_due_lease_before_ordinary_compaction_to_batch_safe_removal() {
+        use crate::protocol::ContextManagement;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("run");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"shell","command":"printf first","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+                r#"{"action":{"kind":"shell","command":"printf second","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+            ),
+        )
+        .await
+        .unwrap();
+        let mut context = ContextState::new("Keep the task safe".into());
+        let due = context
+            .add_tool(
+                vec![json!({"type":"function_call", "call_id":"due", "name":"shell", "arguments":"{}"})],
+                json!({"type":"function_call_output", "call_id":"due", "output":"protected evidence ".repeat(6_000)}),
+            )
+            .unwrap();
+        let eligible = context
+            .add_tool(
+                vec![json!({"type":"function_call", "call_id":"eligible", "name":"shell", "arguments":"{}"})],
+                json!({"type":"function_call_output", "call_id":"eligible", "output":"eligible evidence ".repeat(5_000)}),
+            )
+            .unwrap();
+        let signals = context.record_signals(
+            &ContextManagement {
+                keep: vec![due],
+                ..ContextManagement::default()
+            },
+            eligible,
+        );
+        context.arm_keep_leases(&signals.keep, 1);
+        context.advance_retention_turn();
+
+        let config = RunConfig {
+            cwd: workspace,
+            prompt: String::new(),
+            session_dir: session_dir.clone(),
+            model: "scripted".into(),
+            max_steps: Some(3),
+            shell_timeout_secs: 1,
+            compaction_mode: CompactionMode::Economic,
+            keep_lease_turns: Some(1),
+            lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
+            compaction_payoff_requests: 40,
+            compaction_min_payback_percent: 0,
+            compaction_rollout_stop_probability_percent: 0,
+            compaction_neutral_high_watermark_tokens: 0,
+            compaction_neutral_low_watermark_tokens: 0,
+            resume_context: Some(context.clone()),
+            resume_source: None,
+            prompt_cache_key: Some("carry-test-cache-key".into()),
+        };
+        let mut baseline_config = config.clone();
+        baseline_config.lease_review_policy = LeaseReviewPolicy::Baseline;
+        baseline_config.session_dir = temp.path().join("baseline");
+        run(
+            baseline_config.clone(),
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let baseline_events =
+            tokio::fs::read_to_string(baseline_config.session_dir.join("trace.jsonl"))
+                .await
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+        assert!(
+            !baseline_events
+                .iter()
+                .any(|e| e["event"] == "retention_revalidation_requested")
+        );
+        let baseline_decision = baseline_events
+            .iter()
+            .find(|e| e["event"] == "keep_lease_review_decision")
+            .unwrap();
+        assert_eq!(
+            baseline_decision["data"]["reason"],
+            "baseline_ordinary_plan"
+        );
+        assert_eq!(baseline_decision["data"]["decision"], "skip");
+        assert_eq!(baseline_decision["data"]["due_count"], 1);
+        assert!(baseline_decision["data"]["ordinary_savings_input_units"].is_number());
+        assert!(baseline_decision["data"]["expanded_savings_input_units"].is_null());
+        let baseline_compact = baseline_events
+            .iter()
+            .position(|e| e["event"] == "context_compacted")
+            .unwrap();
+        let baseline_requests = baseline_events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["event"] == "model_request")
+            .collect::<Vec<_>>();
+        assert!(
+            baseline_compact < baseline_requests[1].0,
+            "baseline must compact before review"
+        );
+
+        let cache = CacheTracker::new(None);
+        let ordinary = select_compaction_plan(&context, &[], &cache, &config)
+            .expect("ordinary material alone justifies a rewrite");
+        assert!(ordinary.dropped.contains(&eligible));
+        assert!(!ordinary.dropped.contains(&due));
+        let released = context.virtual_omit_keep_lease_review(&[due]);
+        let expanded = select_compaction_plan(&released, &[], &cache, &config)
+            .expect("releasing the due lease should also justify a rewrite");
+        assert!(expanded.dropped.contains(&due));
+        assert!(expanded.estimated_savings_input_units > ordinary.estimated_savings_input_units);
+
+        // A cold first request has to write the full history if the review
+        // delays the rewrite; count that cost over the same five requests.
+        let mut cold_five_state = context.clone();
+        let mut cold_five_cache = CacheTracker::new(None);
+        let mut cold_five_config = config.clone();
+        cold_five_config.compaction_payoff_requests = 5;
+        let mut cold_five_logger =
+            RunLogger::create_with_events(&session_dir.join("cold-five"), None).unwrap();
+        maybe_attach_keep_lease_review(
+            &mut cold_five_state,
+            &[],
+            &mut cold_five_cache,
+            &mut cold_five_logger,
+            &cold_five_config,
+            eligible,
+        )
+        .unwrap();
+        assert!(
+            !cold_five_state.pending_keep_lease_review(),
+            "one-review delay must beat a cold ordinary rewrite over five requests"
+        );
+
+        // A certain stop cannot recover a mandatory review delay.
+        let mut certain_stop_config = config.clone();
+        certain_stop_config.compaction_rollout_stop_probability_percent = 100;
+        let mut certain_stop_state = context.clone();
+        let mut certain_stop_cache = CacheTracker::new(None);
+        assert!(
+            select_compaction_plan(
+                &certain_stop_state,
+                &[],
+                &certain_stop_cache,
+                &certain_stop_config,
+            )
+            .is_some()
+        );
+        let mut certain_stop_logger =
+            RunLogger::create_with_events(&session_dir.join("certain-stop"), None).unwrap();
+        maybe_attach_keep_lease_review(
+            &mut certain_stop_state,
+            &[],
+            &mut certain_stop_cache,
+            &mut certain_stop_logger,
+            &certain_stop_config,
+            eligible,
+        )
+        .unwrap();
+        assert!(!certain_stop_state.pending_keep_lease_review());
+
+        run(config, Backend::scripted(&steps_file).await.unwrap())
+            .await
+            .unwrap();
+        let events = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let reviews = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["event"] == "retention_revalidation_requested")
+            .collect::<Vec<_>>();
+        assert_eq!(reviews.len(), 1, "one review should precede the rewrite");
+        assert_eq!(reviews[0].1["data"]["item_ids"], json!([due]));
+        let decisions = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["event"] == "keep_lease_review_decision")
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 2, "one decision per eligible tool result");
+        let decision = &decisions[0].1["data"];
+        assert_eq!(decision["decision"], "request");
+        assert_eq!(decision["reason"], "ordinary_review_payback");
+        assert_eq!(decision["due_count"], 1);
+        assert_eq!(decision["reviewable_count"], 1);
+        assert_eq!(decision["selected_wave_count"], 1);
+        assert!(decision["due_estimated_tokens"].as_u64().unwrap() > 0);
+        for key in [
+            "ordinary_savings_input_units",
+            "expanded_savings_input_units",
+            "expanded_after_review_savings_input_units",
+            "advisory_write_input_units",
+        ] {
+            assert!(decision[key].as_f64().unwrap().is_finite(), "missing {key}");
+        }
+        assert!(
+            decision["expanded_after_review_savings_input_units"]
+                .as_f64()
+                .unwrap()
+                - decision["advisory_write_input_units"].as_f64().unwrap()
+                > decision["ordinary_savings_input_units"].as_f64().unwrap()
+        );
+        assert_eq!(decisions[1].1["data"]["decision"], "skip");
+        assert_eq!(decisions[1].1["data"]["reason"], "no_due_leases");
+        assert_eq!(decisions[1].1["data"]["due_count"], 0);
+        assert!(decision["reviewable_estimated_tokens"].as_u64().unwrap() > 0);
+        assert!(decision["next_turn_estimated_tokens"].as_u64().unwrap() > 0);
+        assert!(
+            decision["expanded_after_review_retained_tokens"]
+                .as_u64()
+                .unwrap()
+                >= decision["next_turn_estimated_tokens"].as_u64().unwrap(),
+            "the projected follow-up item must be retained through its next request"
+        );
+        assert!(decisions[0].0 < reviews[0].0);
+        for (_, event) in &decisions {
+            let data = event["data"].to_string();
+            assert!(!data.contains("item_ids") && !data.contains("call_id"));
+            assert!(!data.contains("protected evidence") && !data.contains("printf"));
+        }
+        let requests = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["event"] == "model_request")
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[1].1["data"]["history"]
+                .as_array()
+                .unwrap()
+                .starts_with(requests[0].1["data"]["history"].as_array().unwrap())
+        );
+        assert!(
+            requests[1].1["data"]["history"]
+                .to_string()
+                .contains("Review protected items")
+        );
+        assert!(reviews[0].0 < requests[1].0);
+        let compactions = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["event"] == "context_compacted")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            compactions.len(),
+            1,
+            "batch the ordinary and newly released items once"
+        );
+        assert!(requests[1].0 < compactions[0].0 && compactions[0].0 < requests[2].0);
+        let expected = &compactions[0].1["data"]["expected_value"];
+        assert_eq!(expected["stop_probability_percent"], 0);
+        assert!(expected["next_turn_estimated_tokens"].as_u64().unwrap() > 0);
+        assert!(
+            expected["compact_cost_input_units"].as_f64().unwrap()
+                < expected["keep_cost_input_units"].as_f64().unwrap()
+        );
+        let dropped = compactions[0].1["data"]["compaction"]["dropped"]
+            .as_array()
+            .unwrap();
+        assert!(dropped.contains(&json!(eligible)) && dropped.contains(&json!(due)));
+    }
+
+    #[tokio::test]
+    async fn small_due_lease_does_not_delay_an_ordinary_compaction() {
+        use crate::protocol::ContextManagement;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("run");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(
+            &steps_file,
+            concat!(
+                r#"{"action":{"kind":"shell","command":"printf first","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+            ),
+        ).await.unwrap();
+        let mut context = ContextState::new("Keep the task safe".into());
+        let due = context.add_tool(
+            vec![json!({"type":"function_call", "call_id":"due", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"due", "output":"small evidence"}),
+        ).unwrap();
+        let eligible = context.add_tool(
+            vec![json!({"type":"function_call", "call_id":"eligible", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"eligible", "output":"eligible evidence ".repeat(7_000)}),
+        ).unwrap();
+        let signals = context.record_signals(
+            &ContextManagement {
+                keep: vec![due],
+                ..ContextManagement::default()
+            },
+            eligible,
+        );
+        context.arm_keep_leases(&signals.keep, 1);
+        context.advance_retention_turn();
+        let config = RunConfig {
+            cwd: workspace,
+            prompt: String::new(),
+            session_dir: session_dir.clone(),
+            model: "scripted".into(),
+            max_steps: Some(2),
+            shell_timeout_secs: 1,
+            compaction_mode: CompactionMode::Economic,
+            keep_lease_turns: Some(1),
+            lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
+            compaction_payoff_requests: 5,
+            compaction_min_payback_percent: 0,
+            compaction_rollout_stop_probability_percent: 10,
+            compaction_neutral_high_watermark_tokens: 0,
+            compaction_neutral_low_watermark_tokens: 0,
+            resume_context: Some(context.clone()),
+            resume_source: None,
+            prompt_cache_key: Some("carry-test-cache-key".into()),
+        };
+        let cache = CacheTracker::new(None);
+        let ordinary = select_compaction_plan(&context, &[], &cache, &config).unwrap();
+        assert!(ordinary.dropped.contains(&eligible));
+        assert!(!ordinary.dropped.contains(&due));
+        let virtual_release = context.virtual_omit_keep_lease_review(&[due]);
+        let expanded = select_compaction_plan(&virtual_release, &[], &cache, &config).unwrap();
+        assert!(expanded.dropped.contains(&due));
+        assert!(expanded.estimated_savings_input_units > ordinary.estimated_savings_input_units);
+
+        run(config, Backend::scripted(&steps_file).await.unwrap())
+            .await
+            .unwrap();
+        let events = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["event"] == "retention_revalidation_requested")
+        );
+        let decision = events
+            .iter()
+            .find(|e| e["event"] == "keep_lease_review_decision")
+            .unwrap();
+        assert_eq!(
+            decision["data"]["reason"],
+            "incremental_benefit_insufficient"
+        );
+        assert_eq!(decision["data"]["decision"], "skip");
+        assert_eq!(decision["data"]["selected_wave_count"], 0);
+        assert!(decision["data"]["expanded_savings_input_units"].is_number());
+        assert!(decision["data"]["expanded_after_review_savings_input_units"].is_number());
+        assert!(decision["data"]["advisory_write_input_units"].is_number());
+        let compact = events
+            .iter()
+            .position(|event| event["event"] == "context_compacted")
+            .unwrap();
+        let second = events
+            .iter()
+            .position(|event| event["event"] == "model_request" && event["data"]["step"] == 2)
+            .unwrap();
+        assert!(
+            compact < second,
+            "ordinary rewrite must not wait for a low-value review"
+        );
+        let dropped = events[compact]["data"]["compaction"]["dropped"]
+            .as_array()
+            .unwrap();
+        assert!(dropped.contains(&json!(eligible)));
+        assert!(!dropped.contains(&json!(due)));
+    }
+
+    #[test]
+    fn paired_forecast_prices_each_surviving_new_tool_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = ContextState::new("Keep this user direction".into());
+        state.add_tool(
+            vec![json!({"type":"function_call", "call_id":"old", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"old", "output":"old ".repeat(5_000)}),
+        ).unwrap();
+        let config = RunConfig {
+            cwd: temp.path().into(),
+            prompt: String::new(),
+            session_dir: temp.path().join("run"),
+            model: "scripted".into(),
+            max_steps: None,
+            shell_timeout_secs: 1,
+            compaction_mode: CompactionMode::Economic,
+            keep_lease_turns: Some(1),
+            lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
+            compaction_payoff_requests: 3,
+            compaction_min_payback_percent: 0,
+            compaction_rollout_stop_probability_percent: 0,
+            compaction_neutral_high_watermark_tokens: 0,
+            compaction_neutral_low_watermark_tokens: 0,
+            resume_context: None,
+            resume_source: None,
+            prompt_cache_key: None,
+        };
+        let cache = CacheTracker::new(None);
+        let policy = cache.policy_for_history(&state.input_items(), 3, 0);
+        let plan = state
+            .plan_compaction_with_neutral_watermarks(&[], policy, 0, 0)
+            .unwrap();
+        let before = state.estimated_tokens();
+        let mut with_tool = state.clone();
+        with_tool.add_simulated_tool_item(1_000);
+        let growth = with_tool.estimated_tokens() - before;
+        let (keep, _) = paired_keep_compact_costs(&state, &plan, 0, 1_000, &config);
+        let expected = before as f64 * CACHE_WRITE_RATE
+            + before as f64 * CACHE_READ_RATE
+            + growth as f64 * CACHE_WRITE_RATE
+            + (before + growth) as f64 * CACHE_READ_RATE
+            + growth as f64 * CACHE_WRITE_RATE;
+        assert_eq!(
+            keep, expected,
+            "request three must write its own future item"
+        );
+    }
+
+    #[test]
+    fn deterministic_planner_uses_weighted_keep_cost_for_margin() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = ContextState::new("Preserve this request".into());
+        state.add_tool(
+            vec![json!({"type":"function_call", "call_id":"old", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"old", "output":"old ".repeat(10_000)}),
+        ).unwrap();
+        let config = RunConfig {
+            cwd: temp.path().into(),
+            prompt: String::new(),
+            session_dir: temp.path().join("run"),
+            model: "scripted".into(),
+            max_steps: None,
+            shell_timeout_secs: 1,
+            compaction_mode: CompactionMode::Economic,
+            keep_lease_turns: Some(1),
+            lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
+            compaction_payoff_requests: 5,
+            compaction_min_payback_percent: 25,
+            compaction_rollout_stop_probability_percent: 0,
+            compaction_neutral_high_watermark_tokens: 0,
+            compaction_neutral_low_watermark_tokens: 0,
+            resume_context: None,
+            resume_source: None,
+            prompt_cache_key: None,
+        };
+        let cache = CacheTracker::new(None);
+        let policy = cache.policy_for_history(&state.input_items(), 5, 25);
+        let old_plan = state
+            .plan_compaction_with_neutral_watermarks(&[], policy, 0, 0)
+            .expect("fixed-size planner admits this candidate");
+        let (keep, compact) = paired_keep_compact_costs(
+            &state,
+            &old_plan,
+            0,
+            state.estimated_next_tool_turn_tokens(),
+            &config,
+        );
+        assert!(keep > compact);
+        assert!(
+            keep - compact <= keep * 0.25,
+            "fixture must distinguish margins"
+        );
+        assert!(
+            select_compaction_plan(&state, &[], &cache, &config).is_none(),
+            "one weighted forecast must admit the candidate, not a fixed-size prefilter"
+        );
+    }
+
+    #[test]
+    fn weighted_compaction_telemetry_does_not_claim_next_request_savings() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = ContextState::new("Preserve task".into());
+        state.add_tool(
+            vec![json!({"type":"function_call", "call_id":"old", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"old", "output":"old ".repeat(10_000)}),
+        ).unwrap();
+        let config = RunConfig {
+            cwd: temp.path().into(),
+            prompt: String::new(),
+            session_dir: temp.path().join("run"),
+            model: "scripted".into(),
+            max_steps: None,
+            shell_timeout_secs: 1,
+            compaction_mode: CompactionMode::Economic,
+            keep_lease_turns: Some(1),
+            lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
+            compaction_payoff_requests: 5,
+            compaction_min_payback_percent: 0,
+            compaction_rollout_stop_probability_percent: 10,
+            compaction_neutral_high_watermark_tokens: 0,
+            compaction_neutral_low_watermark_tokens: 0,
+            resume_context: None,
+            resume_source: None,
+            prompt_cache_key: None,
+        };
+        let mut cache = CacheTracker::new(None);
+        let mut metrics = RunMetrics::default();
+        let mut logger = RunLogger::create_with_events(&config.session_dir, None).unwrap();
+        assert!(
+            maybe_compact(
+                &mut state,
+                &[],
+                &mut cache,
+                &mut metrics,
+                &mut logger,
+                &config,
+                "test"
+            )
+            .unwrap()
+        );
+        drop(logger);
+        let log = std::fs::read_to_string(config.session_dir.join("trace.log")).unwrap();
+        assert!(log.contains("projected horizon saves"), "{log}");
+        assert!(!log.contains("next request saves"), "{log}");
+    }
+
+    #[test]
+    fn warm_cache_review_compares_paired_expected_costs_on_the_same_future() {
+        use crate::protocol::ContextManagement;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = ContextState::new("base ".repeat(2_400));
+        let due = state.add_tool(
+            vec![json!({"type":"function_call", "call_id":"due", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"due", "output":"due ".repeat(1_000)}),
+        ).unwrap();
+        let eligible = state.add_tool(
+            vec![json!({"type":"function_call", "call_id":"eligible", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"eligible", "output":"eligible ".repeat(7_000)}),
+        ).unwrap();
+        let host = state.add_tool(
+            vec![json!({"type":"function_call", "call_id":"host", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"host", "output":"fresh"}),
+        ).unwrap();
+        let signals = state.record_signals(
+            &ContextManagement {
+                keep: vec![due],
+                ..ContextManagement::default()
+            },
+            host,
+        );
+        state.arm_keep_leases(&signals.keep, 1);
+        state.advance_retention_turn();
+
+        let config = RunConfig {
+            cwd: temp.path().into(),
+            prompt: String::new(),
+            session_dir: temp.path().join("run"),
+            model: "scripted".into(),
+            max_steps: Some(2),
+            shell_timeout_secs: 1,
+            compaction_mode: CompactionMode::Economic,
+            keep_lease_turns: Some(1),
+            lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
+            compaction_payoff_requests: 5,
+            compaction_min_payback_percent: 0,
+            compaction_rollout_stop_probability_percent: 10,
+            compaction_neutral_high_watermark_tokens: 0,
+            compaction_neutral_low_watermark_tokens: 0,
+            resume_context: None,
+            resume_source: None,
+            prompt_cache_key: None,
+        };
+        let mut cache = CacheTracker::new(None);
+        cache.implicit_prefix = state.input_items();
+        cache.implicit_cached_tokens = state.estimated_tokens();
+        cache.implicit_activity = Some(Instant::now());
+        let ordinary = select_compaction_plan(&state, &[host], &cache, &config).unwrap();
+        assert!(ordinary.dropped.contains(&eligible));
+        let omitted = state.virtual_omit_keep_lease_review(&[due]);
+        let expanded = select_compaction_plan(&omitted, &[host], &cache, &config).unwrap();
+        assert!(expanded.dropped.contains(&due));
+        assert!(expanded.estimated_savings_input_units > ordinary.estimated_savings_input_units);
+        // A review consumes the immediate request; the rewrite can earn savings
+        // only over the remaining four requests, not the full five-request plan.
+        let delayed_savings = expanded.estimated_savings_input_units
+            - (state.estimated_tokens() - expanded.retained_tokens) as f64 * 0.10;
+        let delayed_net_savings = delayed_savings - state.review_advisory_write_input_units(host);
+        assert!(
+            delayed_net_savings <= ordinary.estimated_savings_input_units,
+            "fixture must make a full-horizon comparison misleading: ordinary={}, expanded={}, delayed_net={delayed_net_savings}",
+            ordinary.estimated_savings_input_units,
+            expanded.estimated_savings_input_units
+        );
+
+        let mut certain_stop_state = state.clone();
+        let mut certain_stop_cache = CacheTracker::new(None);
+        certain_stop_cache.implicit_prefix = certain_stop_state.input_items();
+        certain_stop_cache.implicit_cached_tokens = certain_stop_state.estimated_tokens();
+        certain_stop_cache.implicit_activity = Some(Instant::now());
+        let mut certain_stop_config = config.clone();
+        certain_stop_config.compaction_rollout_stop_probability_percent = 100;
+        certain_stop_config.session_dir = temp.path().join("certain-stop");
+        assert!(
+            select_compaction_plan(
+                &certain_stop_state,
+                &[host],
+                &certain_stop_cache,
+                &certain_stop_config,
+            )
+            .is_none(),
+            "a one-request horizon should keep the warm cache instead of compacting"
+        );
+        let mut certain_stop_logger =
+            RunLogger::create_with_events(&certain_stop_config.session_dir, None).unwrap();
+        maybe_attach_keep_lease_review(
+            &mut certain_stop_state,
+            &[host],
+            &mut certain_stop_cache,
+            &mut certain_stop_logger,
+            &certain_stop_config,
+            host,
+        )
+        .unwrap();
+        assert!(
+            !certain_stop_state.pending_keep_lease_review(),
+            "when the task stops after this request, keep beats paying for a review"
+        );
+
+        let mut cold_state = state.clone();
+        let mut logger = RunLogger::create_with_events(&config.session_dir, None).unwrap();
+        maybe_attach_keep_lease_review(&mut state, &[host], &mut cache, &mut logger, &config, host)
+            .unwrap();
+        let trace = std::fs::read_to_string(config.session_dir.join("trace.jsonl")).unwrap();
+        let decision = trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "keep_lease_review_decision")
+            .unwrap();
+        let paired = &decision["data"]["paired_forecast"];
+        assert_eq!(
+            paired["compact_now_future_item_tokens"],
+            decision["data"]["next_turn_estimated_tokens"]
+        );
+        assert_eq!(
+            paired["review_first_future_item_tokens"],
+            decision["data"]["next_turn_estimated_tokens"]
+        );
+        assert!(paired["compact_now_cost_input_units"].as_f64().is_some());
+        assert!(paired["review_first_cost_input_units"].as_f64().is_some());
+        assert!(
+            paired["review_first_cost_input_units"].as_f64().unwrap()
+                < paired["compact_now_cost_input_units"].as_f64().unwrap()
+        );
+        assert_eq!(decision["data"]["reason"], "ordinary_review_payback");
+        assert!(state.pending_keep_lease_review());
+
+        // The first keep request can itself be cold. Delaying the rewrite then
+        // pays that full cache write before the same rewrite on request two.
+        let mut cold_cache = CacheTracker::new(None);
+        let ordinary_cold =
+            select_compaction_plan(&cold_state, &[host], &cold_cache, &config).unwrap();
+        assert!(ordinary_cold.dropped.contains(&eligible));
+        let expanded_cold = select_compaction_plan(
+            &cold_state.virtual_omit_keep_lease_review(&[due]),
+            &[host],
+            &cold_cache,
+            &config,
+        )
+        .unwrap();
+        assert!(expanded_cold.dropped.contains(&due));
+        let cold_logger_dir = temp.path().join("cold-run");
+        let mut cold_logger = RunLogger::create_with_events(&cold_logger_dir, None).unwrap();
+        maybe_attach_keep_lease_review(
+            &mut cold_state,
+            &[host],
+            &mut cold_cache,
+            &mut cold_logger,
+            &config,
+            host,
+        )
+        .unwrap();
+        assert!(
+            !cold_state.pending_keep_lease_review(),
+            "a cold first keep request makes the delayed rewrite worse than ordinary compaction"
+        );
+    }
+
+    #[test]
+    fn all_due_review_forecasts_a_protected_next_tool_turn() {
+        use crate::protocol::ContextManagement;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = ContextState::new("Preserve the task".into());
+        let due = state.add_tool(
+            vec![json!({"type":"function_call", "call_id":"due", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"due", "output":"protected evidence ".repeat(5_000)}),
+        ).unwrap();
+        let host = state.add_tool(
+            vec![json!({"type":"function_call", "call_id":"host", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"host", "output":"fresh"}),
+        ).unwrap();
+        let signals = state.record_signals(
+            &ContextManagement {
+                keep: vec![due],
+                ..ContextManagement::default()
+            },
+            host,
+        );
+        state.arm_keep_leases(&signals.keep, 1);
+        state.advance_retention_turn();
+        let config = RunConfig {
+            cwd: temp.path().into(),
+            prompt: String::new(),
+            session_dir: temp.path().join("run"),
+            model: "scripted".into(),
+            max_steps: Some(2),
+            shell_timeout_secs: 1,
+            compaction_mode: CompactionMode::Economic,
+            keep_lease_turns: Some(1),
+            lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
+            compaction_payoff_requests: 20,
+            compaction_min_payback_percent: 0,
+            compaction_rollout_stop_probability_percent: 10,
+            compaction_neutral_high_watermark_tokens: 0,
+            compaction_neutral_low_watermark_tokens: 0,
+            resume_context: None,
+            resume_source: None,
+            prompt_cache_key: None,
+        };
+        let mut cache = CacheTracker::new(None);
+        assert!(select_compaction_plan(&state, &[host], &cache, &config).is_none());
+        let (released, _) = state.virtual_release_due_keep_leases().unwrap();
+        let small =
+            projected_after_review_plan(&state, released.clone(), &[host], &cache, &config, 1)
+                .unwrap()
+                .0;
+        let large = projected_after_review_plan(&state, released, &[host], &cache, &config, 20_000)
+            .unwrap()
+            .0;
+        assert!(
+            large.retained_tokens > small.retained_tokens + 10_000,
+            "the follow-up size must enter the real post-review compaction plan"
+        );
+        let mut certain_stop_treatment = config.clone();
+        certain_stop_treatment.compaction_rollout_stop_probability_percent = 100;
+        let (released_again, _) = state.virtual_release_due_keep_leases().unwrap();
+        assert!(
+            projected_after_review_plan(
+                &state,
+                released_again,
+                &[host],
+                &cache,
+                &certain_stop_treatment,
+                1,
+            )
+            .is_none(),
+            "a review-only plan cannot repay after a certain stop"
+        );
+        for stop in [0, 100] {
+            let mut baseline_state = state.clone();
+            let mut baseline_cache = CacheTracker::new(None);
+            let mut baseline_config = config.clone();
+            baseline_config.lease_review_policy = LeaseReviewPolicy::Baseline;
+            baseline_config.compaction_rollout_stop_probability_percent = stop;
+            baseline_config.session_dir = temp.path().join(format!("baseline-stop-{stop}"));
+            let mut baseline_logger =
+                RunLogger::create_with_events(&baseline_config.session_dir, None).unwrap();
+            maybe_attach_keep_lease_review(
+                &mut baseline_state,
+                &[host],
+                &mut baseline_cache,
+                &mut baseline_logger,
+                &baseline_config,
+                host,
+            )
+            .unwrap();
+            assert!(
+                baseline_state.pending_keep_lease_review(),
+                "the unchanged baseline all-due gate must ignore the experimental stop hazard {stop}"
+            );
+        }
+        let mut logger = RunLogger::create_with_events(&config.session_dir, None).unwrap();
+        maybe_attach_keep_lease_review(&mut state, &[host], &mut cache, &mut logger, &config, host)
+            .unwrap();
+        assert!(state.pending_keep_lease_review());
+        let events = std::fs::read_to_string(config.session_dir.join("trace.jsonl")).unwrap();
+        let decision = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "keep_lease_review_decision")
+            .unwrap();
+        assert_eq!(decision["data"]["reason"], "all_due_virtual_payback");
+        assert!(
+            decision["data"]["next_turn_estimated_tokens"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            decision["data"]["expanded_after_review_retained_tokens"]
+                .as_u64()
+                .unwrap()
+                >= decision["data"]["next_turn_estimated_tokens"]
+                    .as_u64()
+                    .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_leases_resolve_a_resumed_pending_review_after_it_is_seen() {
+        use crate::protocol::ContextManagement;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("run");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::write(&steps_file, concat!(
+            r#"{"action":{"kind":"shell","command":"printf first","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+            r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#, "\n",
+        )).await.unwrap();
+        let mut context = ContextState::new("Keep the task safe".into());
+        let due = context.add_tool(
+            vec![json!({"type":"function_call", "call_id":"due", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"due", "output":"protected evidence ".repeat(4_000)}),
+        ).unwrap();
+        let eligible = context.add_tool(
+            vec![json!({"type":"function_call", "call_id":"eligible", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"eligible", "output":"eligible evidence ".repeat(5_000)}),
+        ).unwrap();
+        let host = context.add_tool(
+            vec![json!({"type":"function_call", "call_id":"host", "name":"shell", "arguments":"{}"})],
+            json!({"type":"function_call_output", "call_id":"host", "output":"fresh"}),
+        ).unwrap();
+        let signals = context.record_signals(
+            &ContextManagement {
+                keep: vec![due],
+                ..ContextManagement::default()
+            },
+            host,
+        );
+        context.arm_keep_leases(&signals.keep, 1);
+        context.advance_retention_turn();
+        assert_eq!(
+            context.attach_due_keep_lease_review_to(host).item_ids,
+            vec![due]
+        );
+        let config = RunConfig {
+            cwd: workspace,
+            prompt: String::new(),
+            session_dir: session_dir.clone(),
+            model: "scripted".into(),
+            max_steps: Some(2),
+            shell_timeout_secs: 1,
+            compaction_mode: CompactionMode::Economic,
+            keep_lease_turns: None,
+            lease_review_policy: LeaseReviewPolicy::Baseline,
+            compaction_payoff_requests: 5,
+            compaction_min_payback_percent: 0,
+            compaction_rollout_stop_probability_percent: 10,
+            compaction_neutral_high_watermark_tokens: 0,
+            compaction_neutral_low_watermark_tokens: 0,
+            resume_context: Some(context),
+            resume_source: None,
+            prompt_cache_key: Some("carry-test-cache-key".into()),
+        };
+        run(config, Backend::scripted(&steps_file).await.unwrap())
+            .await
+            .unwrap();
+        let events = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .all(|event| event["event"] != "keep_lease_review_decision"),
+            "disabled leases must not add ordinary-run trace overhead"
+        );
+        let requests = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["event"] == "model_request")
+            .collect::<Vec<_>>();
+        assert!(
+            requests[0].1["data"]["history"]
+                .to_string()
+                .contains("Review protected items")
+        );
+        let compact = events
+            .iter()
+            .position(|event| event["event"] == "context_compacted")
+            .expect("pending review must not block compaction forever when leases are disabled");
+        assert!(requests[0].0 < compact && compact < requests[1].0);
+        let dropped = events[compact]["data"]["compaction"]["dropped"]
+            .as_array()
+            .unwrap();
+        assert!(dropped.contains(&json!(eligible)) && dropped.contains(&json!(due)));
+        let checkpoint: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(session_dir.join("context-state.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint["context"]["pending_keep_lease_review"],
+            json!([])
+        );
     }
 
     #[tokio::test]
@@ -2418,9 +3816,9 @@ mod tests {
                 shell_timeout_secs: 5,
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -2439,87 +3837,6 @@ mod tests {
         assert!(
             patch.contains("+after"),
             "committed changes must remain in final.patch"
-        );
-    }
-
-    #[tokio::test]
-    async fn scripted_run_emits_flat_rollout_telemetry_before_a_compaction_decision() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        let session_dir = temp.path().join("run");
-        let steps_file = temp.path().join("steps.jsonl");
-        tokio::fs::create_dir(&workspace).await.unwrap();
-        tokio::fs::write(
-            &steps_file,
-            concat!(
-                r#"{"action":{"kind":"shell","command":"true","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}"#,
-                "\n",
-                r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#,
-            ),
-        )
-        .await
-        .unwrap();
-        let mut context = ContextState::new("initial task".into());
-        for call in 0..3 {
-            context
-                .add_tool(
-                    vec![json!({
-                        "type": "function_call", "call_id": format!("call-{call}"),
-                        "name": "shell", "arguments": "{}"
-                    })],
-                    json!({
-                        "type": "function_call_output", "call_id": format!("call-{call}"),
-                        "output": "large output ".repeat(7_000)
-                    }),
-                )
-                .unwrap();
-        }
-
-        run(
-            RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                max_steps: Some(2),
-                shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 5,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 4,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: Some(context),
-                resume_source: None,
-                prompt_cache_key: Some("carry-test-cache-key".into()),
-            },
-            Backend::scripted(&steps_file).await.unwrap(),
-        )
-        .await
-        .unwrap();
-
-        let trace = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
-            .await
-            .unwrap();
-        let decision = trace
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|event| {
-                matches!(
-                    event["event"].as_str(),
-                    Some("context_compacted") | Some("compaction_rollout_rejected")
-                )
-            })
-            .expect("large resumed context should make a compaction decision");
-        assert_eq!(decision["data"]["rollout"]["samples"], 4);
-        assert_eq!(decision["data"]["rollout"]["horizon"], 5);
-        assert_eq!(decision["data"]["rollout"]["stop_probability_percent"], 10);
-        assert!(
-            decision["data"]["rollout"]["average_simulated_followup_turns"]
-                .as_f64()
-                .is_some()
         );
     }
 
@@ -2547,9 +3864,9 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -2635,9 +3952,9 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -2662,9 +3979,9 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -2732,9 +4049,9 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -2780,9 +4097,9 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -2843,9 +4160,9 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -2943,9 +4260,9 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 25,
-                compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -3000,9 +4317,9 @@ mod tests {
                 shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
+                lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,

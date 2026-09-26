@@ -63,9 +63,10 @@ class SmokeWorkerTests(unittest.TestCase):
         config = self.worker.validate_config(valid)
         self.assertEqual(config["PI_VERSION"], "0.84.2")
         self.assertEqual(config["CARRY_COMPACTION_POLICY"], "economic")
+        self.assertEqual(config["CARRY_LEASE_REVIEW_POLICY"], "baseline")
+        self.assertEqual(self.worker.validate_config(dict(valid, CARRY_LEASE_REVIEW_POLICY="batch-ordinary"))["CARRY_LEASE_REVIEW_POLICY"], "batch-ordinary")
         self.assertEqual(config["CARRY_COMPACTION_PAYOFF_REQUESTS"], "1")
         self.assertEqual(config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"], "25")
-        self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "0")
         self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"], "10")
         self.assertEqual(config["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"], "0")
         self.assertEqual(config["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"], "0")
@@ -74,13 +75,12 @@ class SmokeWorkerTests(unittest.TestCase):
         )
         self.assertEqual(configured_budget["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"], "32768")
         self.assertEqual(configured_budget["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"], "24576")
-        rollout = self.worker.validate_config(
-            dict(valid, CARRY_COMPACTION_ROLLOUT_SAMPLES="16")
-        )
-        self.assertEqual(rollout["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "16")
-        self.assertEqual(rollout["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"], "10")
+        with self.assertRaises(ValueError):
+            self.worker.validate_config(dict(valid, CARRY_COMPACTION_ROLLOUT_SAMPLES="16"))
+        self.assertNotIn("CARRY_COMPACTION_ROLLOUT_SAMPLES", config)
         for key, value in (("BASE_IMAGE", "node:22"), ("CODEX_VERSION", "latest"),
                            ("CARRY_COMPACTION_POLICY", "adaptive"),
+                           ("CARRY_LEASE_REVIEW_POLICY", "unexpected"),
                            ("CARRY_COMPACTION_MIN_PAYBACK_PERCENT", "101"),
                            ("CARRY_COMPACTION_ROLLOUT_SAMPLES", "65")):
             bad = dict(valid)
@@ -99,6 +99,11 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(inputs["carry_compaction_neutral_high_watermark_tokens"]["default"], "0")
         self.assertEqual(inputs["carry_compaction_neutral_low_watermark_tokens"]["default"], "0")
         self.assertEqual(inputs["carry_compaction_min_payback_percent"]["default"], "25")
+        self.assertEqual(inputs["carry_lease_review_policy"]["default"], "baseline")
+        self.assertEqual(inputs["carry_lease_review_policy"]["options"], ["baseline", "batch-ordinary"])
+        self.assertNotIn("carry_compaction_rollout_samples", inputs)
+        self.assertEqual(contents["jobs"]["bootstrap-worker"]["env"]["CARRY_LEASE_REVIEW_POLICY"],
+                         "${{ inputs.carry_lease_review_policy }}")
 
     def test_workflow_benchmark_model_input_controls_protected_worker(self):
         workflow = pathlib.Path(__file__).parents[1] / ".github" / "workflows" / "run-swebench.yml"
@@ -112,6 +117,39 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(reasoning["default"], "medium")
         self.assertEqual(contents["jobs"]["bootstrap-worker"]["env"]["REASONING"],
                          "${{ inputs.reasoning }}")
+
+    def test_workflow_stages_lease_review_treatment_for_the_worker(self):
+        workflow = pathlib.Path(__file__).parents[1] / ".github" / "workflows" / "run-swebench.yml"
+        contents = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        stage = next(step for step in contents["jobs"]["bootstrap-worker"]["steps"]
+                     if step.get("name") == "Stage run-scoped inputs and output capability")
+        script = stage["run"]
+        fragment = script[script.index('SOURCE_URL="$SOURCE_URL" KEY_URL='):]
+        fragment = fragment[:fragment.index("\nPY\n") + len("\nPY\n")]
+        inputs = (
+            "SOURCE_URL", "KEY_URL", "DOCKER_AUTH_URL", "REGISTRY_AUTH_URL", "RESULT_URL", "CONTROL_URL",
+            "SOURCE_SHA256", "SOURCE_COMMIT", "BENCHMARK_MODE", "BENCHMARK_HARNESS", "BENCHMARK_ATTEMPT",
+            "BENCHMARK_ATTEMPTS", "CARRY_COMPACTION_POLICY", "CARRY_KEEP_LEASE_TURNS",
+            "CARRY_COMPACTION_PAYOFF_REQUESTS", "CARRY_COMPACTION_MIN_PAYBACK_PERCENT",
+            "CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT",
+            "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS", "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS",
+            "BOOTSTRAP_WAIT_SECONDS", "RUN_ID", "MODEL", "REASONING", "TASK_IMAGE_REPOSITORY",
+            "TASK_IMAGE_CATALOG",
+        )
+        env = dict(os.environ, **dict.fromkeys(inputs, "fixture"))
+        env.pop("CARRY_LEASE_REVIEW_POLICY", None)
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "worker-bootstrap.env"
+            env["BOOTSTRAP_CONFIG_FILE"] = str(path)
+            result = subprocess.run(["bash", "-euo", "pipefail", "-c",
+                                     "CARRY_LEASE_REVIEW_POLICY=batch-ordinary\n" + fragment],
+                                    env=env, text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            sourced = subprocess.run(["bash", "-euo", "pipefail", "-c",
+                                      'source "$1"; printf "%s" "$CARRY_LEASE_REVIEW_POLICY"', "_", str(path)],
+                                     text=True, capture_output=True, check=False)
+            self.assertEqual(sourced.returncode, 0, sourced.stderr)
+            self.assertEqual(sourced.stdout, "batch-ordinary")
 
     def test_proxy_round_usage_records_maximum_and_non_monotonic_inputs(self):
         log = "noise\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 120}\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 90}\nBENCHMARK_PROXY_USAGE {\"input_tokens\": 180}\n"
@@ -234,6 +272,7 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertIn("HOME=/agent-home", rendered)
             self.assertIn("AGENT_TIMEOUT_SECONDS=315", rendered)
             self.assertIn("--env\nCARRY_COMPACTION_POLICY", rendered)
+            self.assertIn("--env\nCARRY_LEASE_REVIEW_POLICY", rendered)
             self.assertIn("carry-agent-codex-test", rendered)
             self.assertIn("/agent-home:rw", rendered)
             self.assertIn("/tmp:rw", rendered)
@@ -2499,6 +2538,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
 
         config = {
             "BENCHMARK_MODE": "session-smoke-5", "BENCHMARK_HARNESS": "carry", "RUN_ID": "session-test",
+            "CARRY_LEASE_REVIEW_POLICY": "batch-ordinary",
             "BASE_IMAGE": "node@sha256:" + "a" * 64,
             "CARRY_BASE_IMAGE": "rust@sha256:" + "b" * 64,
             "CODEX_VERSION": "1.2.3", "PI_VERSION": "0.84.2",
@@ -2543,6 +2583,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             )
             report = json.loads((output / "report.json").read_text())
             self.assertEqual(report["denominator"], 5)
+            self.assertEqual(report["provenance"]["carry_lease_review_policy"], "batch-ordinary")
             limits = report["provenance"]["images"]["execution_limits"]
             self.assertEqual((limits["agent_concurrency"], limits["agent_shard_size"]), (1, 5))
 

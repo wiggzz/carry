@@ -42,8 +42,14 @@ on:
         default: economic
         type: choice
         options: [economic, disabled]
+      carry_lease_review_policy:
+        description: Carry-only due-lease review treatment; baseline preserves existing behavior
+        required: true
+        default: baseline
+        type: choice
+        options: [baseline, batch-ordinary]
       carry_keep_lease_turns:
-        description: Optional Carry keep-lease revalidation horizon; blank disables it
+        description: Optional Carry keep-lease horizon; blank inherits the native default of 8 (not disabled)
         required: false
         default: ""
         type: string
@@ -56,11 +62,6 @@ on:
         description: Carry minimum projected payoff saving as a percentage of the retained-path cost (0-100)
         required: true
         default: "25"
-        type: string
-      carry_compaction_rollout_samples:
-        description: Carry-only deterministic flat-drop rollout samples; zero disables the treatment
-        required: true
-        default: "0"
         type: string
       carry_compaction_rollout_stop_probability_percent:
         description: Carry-only per-forward-turn task-stop probability (0-100); 10 is the default
@@ -158,10 +159,10 @@ jobs:
       BENCHMARK_ATTEMPT: ${{ matrix.attempt }}
       BENCHMARK_ATTEMPTS: ${{ needs['plan-attempts'].outputs.total }}
       CARRY_COMPACTION_POLICY: ${{ inputs.carry_compaction_policy }}
+      CARRY_LEASE_REVIEW_POLICY: ${{ inputs.carry_lease_review_policy }}
       CARRY_KEEP_LEASE_TURNS: ${{ inputs.carry_keep_lease_turns }}
       CARRY_COMPACTION_PAYOFF_REQUESTS: ${{ inputs.carry_compaction_payoff_requests }}
       CARRY_COMPACTION_MIN_PAYBACK_PERCENT: ${{ inputs.carry_compaction_min_payback_percent }}
-      CARRY_COMPACTION_ROLLOUT_SAMPLES: ${{ inputs.carry_compaction_rollout_samples }}
       CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT: ${{ inputs.carry_compaction_rollout_stop_probability_percent }}
       CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS: ${{ inputs.carry_compaction_neutral_high_watermark_tokens }}
       CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS: ${{ inputs.carry_compaction_neutral_low_watermark_tokens }}
@@ -310,6 +311,10 @@ jobs:
               echo "carry compaction policy must be economic or disabled" >&2
               exit 1
             }
+            [[ "$CARRY_LEASE_REVIEW_POLICY" =~ ^(baseline|batch-ordinary)$ ]] || {
+              echo "carry lease review policy must be baseline or batch-ordinary" >&2
+              exit 1
+            }
             [[ "$CARRY_COMPACTION_PAYOFF_REQUESTS" =~ ^[1-9][0-9]*$ ]] || {
               echo "carry compaction payoff requests must be a positive integer" >&2
               exit 1
@@ -318,10 +323,6 @@ jobs:
             echo "carry compaction minimum payoff percent must be an integer from 0 through 100" >&2
             exit 1
           }
-          [[ "$CARRY_COMPACTION_ROLLOUT_SAMPLES" =~ ^[0-9]+$ ]] && (( CARRY_COMPACTION_ROLLOUT_SAMPLES <= 64 )) || {
-              echo "carry compaction rollout samples must be an integer from 0 through 64" >&2
-              exit 1
-            }
             [[ "$CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT" =~ ^[0-9]+$ ]] && (( CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT <= 100 )) || {
               echo "carry compaction rollout stop probability must be an integer from 0 through 100" >&2
               exit 1
@@ -445,10 +446,10 @@ jobs:
           SOURCE_SHA256="$SOURCE_SHA256" SOURCE_COMMIT="$SOURCE_COMMIT" BENCHMARK_MODE="$BENCHMARK_MODE" \
           BENCHMARK_HARNESS="$BENCHMARK_HARNESS" BENCHMARK_ATTEMPT="$BENCHMARK_ATTEMPT" \
           BENCHMARK_ATTEMPTS="$BENCHMARK_ATTEMPTS" CARRY_COMPACTION_POLICY="$CARRY_COMPACTION_POLICY" \
+          CARRY_LEASE_REVIEW_POLICY="$CARRY_LEASE_REVIEW_POLICY" \
           CARRY_KEEP_LEASE_TURNS="$CARRY_KEEP_LEASE_TURNS" \
           CARRY_COMPACTION_PAYOFF_REQUESTS="$CARRY_COMPACTION_PAYOFF_REQUESTS" \
           CARRY_COMPACTION_MIN_PAYBACK_PERCENT="$CARRY_COMPACTION_MIN_PAYBACK_PERCENT" \
-          CARRY_COMPACTION_ROLLOUT_SAMPLES="$CARRY_COMPACTION_ROLLOUT_SAMPLES" \
           CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT="$CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT" \
           CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS="$CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS" \
           CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS="$CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS" \
@@ -465,8 +466,8 @@ jobs:
               'RESULT_URL_B64': encoded['RESULT_URL'], 'CONTROL_URL_B64': encoded['CONTROL_URL'],
               **{key: os.environ[key] for key in (
                   'SOURCE_SHA256', 'SOURCE_COMMIT', 'BENCHMARK_MODE', 'BENCHMARK_HARNESS',
-                  'BENCHMARK_ATTEMPT', 'BENCHMARK_ATTEMPTS', 'CARRY_COMPACTION_POLICY', 'CARRY_KEEP_LEASE_TURNS',
-                  'CARRY_COMPACTION_PAYOFF_REQUESTS', 'CARRY_COMPACTION_MIN_PAYBACK_PERCENT', 'CARRY_COMPACTION_ROLLOUT_SAMPLES', 'CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT',
+                  'BENCHMARK_ATTEMPT', 'BENCHMARK_ATTEMPTS', 'CARRY_COMPACTION_POLICY', 'CARRY_LEASE_REVIEW_POLICY', 'CARRY_KEEP_LEASE_TURNS',
+                  'CARRY_COMPACTION_PAYOFF_REQUESTS', 'CARRY_COMPACTION_MIN_PAYBACK_PERCENT', 'CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT',
                   'CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS', 'CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS', 'BOOTSTRAP_WAIT_SECONDS', 'RUN_ID',
                   'MODEL', 'REASONING', 'TASK_IMAGE_REPOSITORY', 'TASK_IMAGE_CATALOG')},
           }

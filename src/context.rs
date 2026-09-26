@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 use crate::protocol::ContextManagement;
 
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
-const CACHE_READ_RATE: f64 = 0.10;
-const CACHE_WRITE_RATE: f64 = 1.25;
+pub(crate) const CACHE_READ_RATE: f64 = 0.10;
+pub(crate) const CACHE_WRITE_RATE: f64 = 1.25;
 pub(crate) const DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT: u8 = 25;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
 #[cfg(test)]
@@ -277,14 +277,92 @@ impl ContextState {
         (!released_ids.is_empty()).then_some((released, released_ids))
     }
 
+    pub(crate) fn pending_keep_lease_review(&self) -> bool {
+        !self.pending_keep_lease_review.is_empty()
+    }
+
+    /// Simulate one review wave when the model omits every reviewed ID.
+    /// Omitted leases become neutral, not explicit drops; the normal planner
+    /// and cached prefix may still keep them.
+    pub(crate) fn virtual_omit_keep_lease_review(&self, ids: &[u64]) -> Self {
+        let mut state = self.clone();
+        for item in &mut state.items {
+            if ids.contains(&item.id) {
+                item.signal = RetentionSignal::Neutral;
+                item.retention = Retention::Eligible;
+                item.keep_lease_expires_at_turn = None;
+                item.keep_lease_expired = true;
+            }
+        }
+        state
+    }
+
+    /// Aggregate due lease sizes without exposing retained content or identifiers.
+    pub(crate) fn due_keep_lease_review_metrics(
+        &self,
+        reviewable_ids: &[u64],
+    ) -> (usize, usize, usize) {
+        let mut due_count = 0;
+        let mut due_tokens = 0;
+        let mut reviewable_tokens = 0;
+        for item in &self.items {
+            if item.kind != ContextItemKind::User
+                && item.signal != RetentionSignal::Drop
+                && item
+                    .keep_lease_expires_at_turn
+                    .is_some_and(|turn| turn <= self.retention_turn)
+            {
+                let tokens = item.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN);
+                due_count += 1;
+                due_tokens += tokens;
+                if reviewable_ids.contains(&item.id) {
+                    reviewable_tokens += tokens;
+                }
+            }
+        }
+        (due_count, due_tokens, reviewable_tokens)
+    }
+
+    pub(crate) fn due_keep_lease_review_ids(&self) -> Vec<u64> {
+        const MAX_REVIEWED_KEEP_LEASES: usize = 4;
+        let mut due = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.kind != ContextItemKind::User
+                    && item.signal != RetentionSignal::Drop
+                    && item
+                        .keep_lease_expires_at_turn
+                        .is_some_and(|expires_at| expires_at <= self.retention_turn)
+            })
+            .map(|item| (item.id, item.bytes))
+            .collect::<Vec<_>>();
+        due.sort_unstable_by(|(left_id, left_bytes), (right_id, right_bytes)| {
+            right_bytes
+                .cmp(left_bytes)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        due.into_iter()
+            .take(MAX_REVIEWED_KEEP_LEASES)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    pub(crate) fn review_advisory_write_input_units(&self, host_id: u64) -> f64 {
+        let mut annotated = self.clone();
+        annotated.attach_due_keep_lease_review_to(host_id);
+        annotated
+            .estimated_tokens()
+            .saturating_sub(self.estimated_tokens()) as f64
+            * CACHE_WRITE_RATE
+    }
+
     /// Attach one cache-safe review for the four largest due leases to the tool
     /// result that was just returned. The host must be the latest item: the
     /// review is rendered inside the host's output, so attaching it to an
     /// older result would rewrite the cached prefix. The review is resolved
     /// only after the next model response has seen it.
     pub fn attach_due_keep_lease_review_to(&mut self, host_id: u64) -> KeepLeaseReview {
-        const MAX_REVIEWED_KEEP_LEASES: usize = 4;
-
         if !self.pending_keep_lease_review.is_empty() {
             return KeepLeaseReview {
                 item_ids: Vec::new(),
@@ -306,28 +384,7 @@ impl ContextState {
                 item_ids: Vec::new(),
             };
         }
-        let mut due = self
-            .items
-            .iter()
-            .filter(|item| {
-                item.kind != ContextItemKind::User
-                    && item.signal != RetentionSignal::Drop
-                    && item
-                        .keep_lease_expires_at_turn
-                        .is_some_and(|expires_at| expires_at <= self.retention_turn)
-            })
-            .map(|item| (item.id, item.bytes))
-            .collect::<Vec<_>>();
-        due.sort_unstable_by(|(left_id, left_bytes), (right_id, right_bytes)| {
-            right_bytes
-                .cmp(left_bytes)
-                .then_with(|| left_id.cmp(right_id))
-        });
-        let item_ids = due
-            .into_iter()
-            .take(MAX_REVIEWED_KEEP_LEASES)
-            .map(|(id, _)| id)
-            .collect::<Vec<_>>();
+        let item_ids = self.due_keep_lease_review_ids();
         if !item_ids.is_empty() {
             let ids = item_ids
                 .iter()
@@ -724,103 +781,6 @@ impl ContextState {
         candidates
     }
 
-    pub(crate) fn flat_rollout_estimate(
-        &self,
-        plan: &CompactionPlan,
-        _protected: &[u64],
-        policy: CompactionPolicy,
-        config: FlatRolloutConfig,
-    ) -> FlatRolloutEstimate {
-        debug_assert!(config.samples > 0);
-        debug_assert!(config.horizon > 0);
-        debug_assert!(config.stop_probability_percent <= 100);
-        let mut compacted = self.clone();
-        compacted.compact(plan.clone());
-        let retained_ids = compacted
-            .items
-            .iter()
-            .filter(|item| item.kind != ContextItemKind::User)
-            .map(|item| item.id)
-            .collect::<Vec<_>>();
-        let mean_virtual_item_tokens = compacted
-            .items
-            .iter()
-            .filter(|item| item.kind != ContextItemKind::User)
-            .map(|item| item.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN))
-            .sum::<usize>()
-            .checked_div(retained_ids.len())
-            .unwrap_or(1)
-            .max(1);
-        let initial_compact_cost = compact_request_cost(plan);
-        let direct_next_request_savings_input_units = direct_next_request_savings(
-            policy.implicit_cached_tokens,
-            self.estimated_tokens(),
-            initial_compact_cost,
-        );
-        let initial_keep_cost = keep_request_cost(self.estimated_tokens(), &policy);
-        let mut total_compact_cost = 0.0;
-        let mut total_keep_cost = 0.0;
-        let mut max_sampled_drops = 0usize;
-        let mut total_simulated_followup_turns = 0u64;
-        let mut stopped_samples = 0u32;
-
-        for sample in 0..config.samples {
-            let mut compact_branch = compacted.clone();
-            let mut keep_branch = self.clone();
-            let mut compact_cost = initial_compact_cost;
-            let mut keep_cost = initial_keep_cost;
-            let mut rng = FlatRolloutRng::new(config.seed ^ u64::from(sample));
-            for _ in 1..config.horizon {
-                if rng.stops_with_probability(config.stop_probability_percent) {
-                    stopped_samples += 1;
-                    break;
-                }
-                let count = rng.range_inclusive(retained_ids.len().min(4));
-                max_sampled_drops = max_sampled_drops.max(count);
-                let dropped_ids = sample_ids_without_replacement(&retained_ids, count, &mut rng);
-                compact_cost += simulate_rollout_turn(
-                    &mut compact_branch,
-                    &dropped_ids,
-                    mean_virtual_item_tokens,
-                    plan.neutral_budget_tokens,
-                    plan.neutral_target_tokens,
-                    &policy,
-                );
-                keep_cost += simulate_rollout_turn(
-                    &mut keep_branch,
-                    &dropped_ids,
-                    mean_virtual_item_tokens,
-                    plan.neutral_budget_tokens,
-                    plan.neutral_target_tokens,
-                    &policy,
-                );
-                total_simulated_followup_turns += 1;
-            }
-            total_compact_cost += compact_cost;
-            total_keep_cost += keep_cost;
-        }
-
-        let samples = f64::from(config.samples);
-        let expected_compact_cost = total_compact_cost / samples;
-        let expected_keep_cost = total_keep_cost / samples;
-        FlatRolloutEstimate {
-            samples: config.samples,
-            horizon: config.horizon,
-            seed: config.seed,
-            stop_probability_percent: config.stop_probability_percent,
-            mean_virtual_item_tokens,
-            max_sampled_drops,
-            average_simulated_followup_turns: total_simulated_followup_turns as f64 / samples,
-            stopped_samples,
-            expected_compact_cost,
-            expected_keep_cost,
-            minimum_payback_input_units: expected_keep_cost * f64::from(policy.min_payback_percent)
-                / 100.0,
-            direct_next_request_savings_input_units,
-            expected_savings_input_units: expected_keep_cost - expected_compact_cost,
-        }
-    }
-
     fn compaction_candidate(
         &self,
         dropped: Vec<u64>,
@@ -1076,21 +1036,6 @@ fn meets_payback_threshold(savings: f64, minimum_payback: f64) -> bool {
     savings > minimum_payback
 }
 
-pub(crate) fn meets_rollout_payback_threshold(estimate: &FlatRolloutEstimate) -> bool {
-    meets_payback_threshold(
-        estimate.expected_savings_input_units,
-        estimate.minimum_payback_input_units,
-    )
-}
-
-fn direct_next_request_savings(
-    implicit_cached_tokens: usize,
-    current_tokens: usize,
-    compact_first_cost: f64,
-) -> f64 {
-    keep_request_cost_with_implicit(implicit_cached_tokens, current_tokens) - compact_first_cost
-}
-
 fn payoff_savings_input_units(
     implicit_cached_tokens: usize,
     current_tokens: usize,
@@ -1106,74 +1051,27 @@ fn payoff_savings_input_units(
         - later_requests * retained_tokens as f64 * CACHE_READ_RATE
 }
 
-fn keep_request_cost(current_tokens: usize, policy: &CompactionPolicy) -> f64 {
-    keep_request_cost_with_implicit(
-        policy.implicit_cached_tokens.min(current_tokens),
-        current_tokens,
-    )
-}
-
 fn keep_request_cost_with_implicit(implicit_cached_tokens: usize, current_tokens: usize) -> f64 {
     implicit_cached_tokens as f64 * CACHE_READ_RATE
         + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE
 }
 
-fn compact_request_cost(plan: &CompactionPlan) -> f64 {
-    plan.retained_tokens.saturating_sub(plan.rewrite_tokens) as f64 * CACHE_READ_RATE
-        + plan.rewrite_tokens as f64 * CACHE_WRITE_RATE
-}
-
-fn simulate_rollout_turn(
-    state: &mut ContextState,
-    dropped_ids: &[u64],
-    virtual_item_tokens: usize,
-    neutral_high_watermark_tokens: usize,
-    neutral_low_watermark_tokens: usize,
-    base_policy: &CompactionPolicy,
-) -> f64 {
-    let cached_before_virtual_item = state.estimated_tokens();
-    let virtual_id = state.add_simulated_tool_item(virtual_item_tokens);
-    for id in dropped_ids {
-        if let Some(item) = state.items.iter_mut().find(|item| item.id == *id) {
-            item.signal = RetentionSignal::Drop;
-        }
-    }
-    let policy = CompactionPolicy {
-        implicit_cached_tokens: cached_before_virtual_item,
-        breakpoints: state
-            .rendered_breakpoints()
-            .into_iter()
-            .map(|breakpoint| PricedBreakpoint {
-                generation: breakpoint.generation,
-                cached_tokens: breakpoint.prefix_tokens,
-            })
-            .collect(),
-        payoff_requests: base_policy.payoff_requests,
-        min_payback_percent: base_policy.min_payback_percent,
-    };
-    let keep_cost = keep_request_cost(state.estimated_tokens(), &policy);
-    let Some(plan) = state
-        .compaction_candidates_with_neutral_watermarks(
-            &[virtual_id],
-            policy.clone(),
-            neutral_high_watermark_tokens,
-            neutral_low_watermark_tokens,
-        )
-        .into_iter()
-        .min_by(|left, right| compact_request_cost(left).total_cmp(&compact_request_cost(right)))
-    else {
-        return keep_cost;
-    };
-    let cost = compact_request_cost(&plan);
-    if cost >= keep_cost {
-        return keep_cost;
-    }
-    state.compact(plan);
-    cost
-}
-
 impl ContextState {
-    fn add_simulated_tool_item(&mut self, estimated_tokens: usize) -> u64 {
+    /// Use one content-free future-item size estimate for the ordinary and
+    /// delayed-review forecasts. Existing item sizes are exact.
+    pub(crate) fn estimated_next_tool_turn_tokens(&self) -> usize {
+        let mut count = 0usize;
+        let mut tokens = 0usize;
+        for item in &self.items {
+            if item.kind != ContextItemKind::User {
+                count += 1;
+                tokens = tokens.saturating_add(item.bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN));
+            }
+        }
+        tokens.checked_div(count).unwrap_or(1).max(1)
+    }
+
+    pub(crate) fn add_simulated_tool_item(&mut self, estimated_tokens: usize) -> u64 {
         let id = self.allocate_id();
         let bytes = estimated_tokens.saturating_mul(ESTIMATED_BYTES_PER_TOKEN);
         self.items.push(ContextItem::new(
@@ -1187,81 +1085,6 @@ impl ContextState {
         ));
         id
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FlatRolloutConfig {
-    pub samples: u32,
-    pub horizon: u64,
-    pub seed: u64,
-    /// Per simulated forward turn; the direct next request is always priced.
-    pub stop_probability_percent: u8,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct FlatRolloutEstimate {
-    pub samples: u32,
-    pub horizon: u64,
-    pub seed: u64,
-    pub stop_probability_percent: u8,
-    pub mean_virtual_item_tokens: usize,
-    pub max_sampled_drops: usize,
-    pub average_simulated_followup_turns: f64,
-    pub stopped_samples: u32,
-    pub expected_compact_cost: f64,
-    pub expected_keep_cost: f64,
-    pub minimum_payback_input_units: f64,
-    pub direct_next_request_savings_input_units: f64,
-    pub expected_savings_input_units: f64,
-}
-
-#[derive(Clone, Copy)]
-struct FlatRolloutRng(u64);
-
-impl FlatRolloutRng {
-    fn new(seed: u64) -> Self {
-        Self(seed ^ 0x9e37_79b9_7f4a_7c15)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
-        self.0
-    }
-
-    fn range_inclusive(&mut self, upper: usize) -> usize {
-        if upper == 0 {
-            0
-        } else {
-            (self.next_u64() % (upper as u64 + 1)) as usize
-        }
-    }
-
-    fn range_exclusive(&mut self, upper: usize) -> usize {
-        debug_assert!(upper > 0);
-        (self.next_u64() % upper as u64) as usize
-    }
-
-    fn stops_with_probability(&mut self, probability_percent: u8) -> bool {
-        match probability_percent {
-            0 => false,
-            100.. => true,
-            probability => self.range_exclusive(100) < usize::from(probability),
-        }
-    }
-}
-
-fn sample_ids_without_replacement(
-    candidates: &[u64],
-    count: usize,
-    rng: &mut FlatRolloutRng,
-) -> Vec<u64> {
-    let mut ids = candidates.to_vec();
-    for index in 0..count {
-        let selected = index + rng.range_exclusive(ids.len() - index);
-        ids.swap(index, selected);
-    }
-    ids.truncate(count);
-    ids
 }
 
 fn unique_ids(ids: &[u64]) -> Vec<u64> {
@@ -1322,6 +1145,24 @@ pub(crate) struct CompactionPlan {
     pub estimated_savings_input_units: f64,
     pub min_payback_percent: u8,
     pub minimum_payback_input_units: f64,
+}
+
+impl CompactionPlan {
+    /// The projected plan starts on request two, after a review request has
+    /// made previously uncached existing tokens readable at the cache-read rate.
+    /// Remove that first keep-request write premium from the forecast's saving;
+    /// the future tool item itself was not in the first request.
+    pub(crate) fn savings_after_review_input_units(
+        &self,
+        prior_request_tokens: usize,
+        prior_implicit_cached_tokens: usize,
+    ) -> f64 {
+        let first_keep_write_premium = prior_request_tokens
+            .saturating_sub(prior_implicit_cached_tokens.min(prior_request_tokens))
+            as f64
+            * (CACHE_WRITE_RATE - CACHE_READ_RATE);
+        self.estimated_savings_input_units - first_keep_write_premium
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1535,104 +1376,6 @@ mod tests {
     }
 
     #[test]
-    fn flat_rollout_is_seeded_nonmutating_and_caps_random_drops_at_four() {
-        let mut state = ContextState::new("initial".into());
-        let oldest = add_tool_with_output(&mut state, &"old ".repeat(4_000));
-        let middle = add_tool_with_output(&mut state, &"middle ".repeat(1_000));
-        let newest = add_tool_with_output(&mut state, &"new ".repeat(1_000));
-        let budget = state.item_estimated_tokens(middle) + state.item_estimated_tokens(newest);
-        let policy = CompactionPolicy {
-            implicit_cached_tokens: 0,
-            breakpoints: Vec::new(),
-            payoff_requests: 5,
-            min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
-        };
-        let plan = state
-            .plan_compaction_with_neutral_budget(&[], policy.clone(), budget)
-            .expect("initial plan should remove the old tool result");
-        assert!(plan.dropped.contains(&oldest));
-        let before = state.encode().unwrap();
-
-        let config = FlatRolloutConfig {
-            samples: 16,
-            horizon: 5,
-            seed: 7,
-            stop_probability_percent: 0,
-        };
-        let first = state.flat_rollout_estimate(&plan, &[], policy.clone(), config);
-        let second = state.flat_rollout_estimate(&plan, &[], policy, config);
-
-        assert_eq!(first, second);
-        assert_eq!(first.samples, 16);
-        assert!(first.max_sampled_drops <= 4);
-        assert!(first.mean_virtual_item_tokens > 0);
-        assert_eq!(state.encode().unwrap(), before);
-    }
-
-    #[test]
-    fn flat_rollout_stops_forward_simulation_when_stop_probability_is_certain() {
-        let mut state = ContextState::new("initial".into());
-        let oldest = add_tool_with_output(&mut state, &"old ".repeat(4_000));
-        let middle = add_tool_with_output(&mut state, &"middle ".repeat(1_000));
-        let newest = add_tool_with_output(&mut state, &"new ".repeat(1_000));
-        let budget = state.item_estimated_tokens(middle) + state.item_estimated_tokens(newest);
-        let policy = CompactionPolicy {
-            implicit_cached_tokens: 0,
-            breakpoints: Vec::new(),
-            payoff_requests: 5,
-            min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
-        };
-        let plan = state
-            .plan_compaction_with_neutral_budget(&[], policy.clone(), budget)
-            .expect("initial plan should remove the old tool result");
-        assert!(plan.dropped.contains(&oldest));
-
-        let estimate = state.flat_rollout_estimate(
-            &plan,
-            &[],
-            policy.clone(),
-            FlatRolloutConfig {
-                samples: 4,
-                horizon: 5,
-                seed: 7,
-                stop_probability_percent: 100,
-            },
-        );
-
-        assert_eq!(estimate.stopped_samples, 4);
-        assert_eq!(estimate.average_simulated_followup_turns, 0.0);
-        assert_eq!(estimate.expected_compact_cost, compact_request_cost(&plan));
-        assert_eq!(
-            estimate.expected_keep_cost,
-            keep_request_cost(state.estimated_tokens(), &policy)
-        );
-    }
-
-    #[test]
-    fn rollout_virtual_item_is_priced_as_a_cache_write() {
-        let mut state = ContextState::new("initial".into());
-        add_tool_with_output(&mut state, &"x".repeat(4_000));
-        let previous_tokens = state.estimated_tokens();
-        let cost = simulate_rollout_turn(
-            &mut state,
-            &[],
-            1_000,
-            usize::MAX,
-            usize::MAX / 4 * 3,
-            &CompactionPolicy {
-                implicit_cached_tokens: 0,
-                breakpoints: Vec::new(),
-                payoff_requests: 5,
-                min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
-            },
-        );
-        let current_tokens = state.estimated_tokens();
-        let expected = previous_tokens as f64 * CACHE_READ_RATE
-            + current_tokens.saturating_sub(previous_tokens) as f64 * CACHE_WRITE_RATE;
-        assert_eq!(cost, expected);
-    }
-
-    #[test]
     fn five_request_payoff_accepts_a_rewrite_that_one_request_rejects() {
         let policy = CompactionPolicy {
             implicit_cached_tokens: 0,
@@ -1643,33 +1386,6 @@ mod tests {
         assert_eq!(policy.payoff_requests, 5);
         assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 1) < 0.0);
         assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 5) > 0.0);
-        assert!(direct_next_request_savings(312_141, 313_063, 54_562.5) < 0.0);
-    }
-
-    #[test]
-    fn rollout_payback_can_repay_an_initial_loss() {
-        let estimate = FlatRolloutEstimate {
-            samples: 1,
-            horizon: 5,
-            seed: 0,
-            stop_probability_percent: 0,
-            mean_virtual_item_tokens: 1,
-            max_sampled_drops: 0,
-            average_simulated_followup_turns: 0.0,
-            stopped_samples: 0,
-            expected_compact_cost: 80.0,
-            expected_keep_cost: 100.0,
-            minimum_payback_input_units: 10.0,
-            direct_next_request_savings_input_units: -5.0,
-            expected_savings_input_units: 20.0,
-        };
-
-        assert!(meets_rollout_payback_threshold(&estimate));
-        let stricter = FlatRolloutEstimate {
-            minimum_payback_input_units: 25.0,
-            ..estimate
-        };
-        assert!(!meets_rollout_payback_threshold(&stricter));
     }
 
     #[test]
@@ -2077,6 +1793,43 @@ mod tests {
         assert!(rendered.contains("context.remember"));
         assert!(rendered.contains("release them for normal compaction"));
         assert!(!rendered.contains(&format!("ID {tiny}")));
+    }
+
+    #[test]
+    fn virtual_review_omission_releases_only_four_reviewed_leases_as_neutral() {
+        let mut state = ContextState::new("initial".into());
+        let due = (0..5)
+            .map(|index| add_tool_with_output(&mut state, &"evidence ".repeat(100 + index)))
+            .collect::<Vec<_>>();
+        let host = add_tool(&mut state);
+        let signals = state.record_signals(&update(&due, &[], &[]), host);
+        state.arm_keep_leases(&signals.keep, 1);
+        state.advance_retention_turn();
+
+        let wave = state.due_keep_lease_review_ids();
+        assert_eq!(wave, due[1..].iter().rev().copied().collect::<Vec<_>>());
+        let (due_count, due_tokens, reviewable_tokens) = state.due_keep_lease_review_metrics(&wave);
+        assert_eq!(due_count, 5);
+        assert!(due_tokens > reviewable_tokens && reviewable_tokens > 0);
+        let virtual_omission = state.virtual_omit_keep_lease_review(&wave);
+        assert!(!state.pending_keep_lease_review());
+        for id in &wave {
+            assert_eq!(state.signal_for(*id), Some(RetentionSignal::Keep));
+            assert_eq!(
+                virtual_omission.signal_for(*id),
+                Some(RetentionSignal::Neutral)
+            );
+        }
+        assert_eq!(
+            virtual_omission.signal_for(due[0]),
+            Some(RetentionSignal::Keep)
+        );
+        assert_eq!(state.attach_due_keep_lease_review_to(host).item_ids, wave);
+        assert!(state.pending_keep_lease_review());
+        let omitted = state.resolve_keep_lease_review(&[]);
+        assert_eq!(omitted, wave);
+        assert_eq!(state.signal_for(due[0]), Some(RetentionSignal::Keep));
+        assert!(!state.pending_keep_lease_review());
     }
 
     #[test]

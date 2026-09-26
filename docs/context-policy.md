@@ -66,39 +66,27 @@ used a hard-coded 10% gate; the new default more deliberately filters marginal
 rewrites. `0` means any strictly positive modeled saving; lower the value if
 you need to admit more speculative rewrites.
 
-Without rollout sampling, the planner uses
-`--compaction-payoff-requests N` (or `CARRY_COMPACTION_PAYOFF_REQUESTS=N`) as its
-deterministic payoff period; `N` must be positive and defaults to `5`.
+`--compaction-payoff-requests N` (or `CARRY_COMPACTION_PAYOFF_REQUESTS=N`)
+sets the maximum deterministic forecast horizon; `N` must be positive and
+defaults to `5`. The immediate request is always priced. Each subsequent
+request has probability `(1-q)^(t-1)` of occurring, where
+`q=--compaction-rollout-stop-probability-percent` (or
+`CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT`), an integer from 0 to
+100 defaulting to 10. Each surviving request grows by one estimated tool-turn
+item on **all** compared paths. The planner sums request costs weighted by
+these survival probabilities; it does not sample rollouts. `q=0` prices the
+full horizon and `q=100` prices only the first request. The old
+`--compaction-rollout-samples` mode is retired and rejected.
 
-`--compaction-rollout-samples N` (or
-`CARRY_COMPACTION_ROLLOUT_SAMPLES=N`) is an opt-in deterministic V0 selection
-policy with `0` disabling it and `1`–`64` samples allowed. Its per-future-turn
-stop probability is `--compaction-rollout-stop-probability-percent N` (or
-`CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT=N`), bounded 0–100 and
-defaulting to 10. In rollout mode,
-`compaction-payoff-requests` is only the bounded simulation horizon, not a
-separate economic admission check. Carry compares every structurally valid
-“compact now” candidate with “keep” across `N` flat scenarios: it preserves
-exact known item sizes, appends one virtual compactible item sized to the
-current post-compaction mean, and, before each simulated *future* turn, samples
-a per-turn task-stop event (default 10%; the immediate next request is always
-priced). A stopped scenario contributes no further virtual item, cleanup, or
-request cost. Surviving turns choose a uniform count from 0 through 4 and
-uniformly drop that many non-human IDs from the post-compaction payload. The
-same seeded samples are applied to both branches. Carry selects the candidate
-with the largest expected horizon saving when that saving exceeds the configured
-minimum-payback percentage of the simulated keep-path cost. Direct next-request
-savings are telemetry, not a gate: the rollout can approve an initial loss when its
-expected horizon value
-repays it. This is a structural sensitivity test, not a semantic prediction of
-model behavior; its inputs and branch costs are recorded in the compaction
-trace event.
-
-The deterministic fallback likewise requires projected savings to exceed the
-configured minimum-payback percentage (25% by default) of retained-path payoff
-cost. This deliberately avoids rewrites that only barely repay their cache
-invalidation. A compaction still begins a new cache
-generation; the model-visible history is otherwise prefix-continuous.
+Under the experimental `batch-ordinary` lease policy, every structurally
+valid compact-now candidate is priced against keeping the same projected
+future. The candidate with the largest positive expected saving is admitted
+only if it exceeds `P%` of the expected keep-path cost. That percentage gate
+can change when genuinely common future work increases both path costs, even
+if their absolute difference stays the same. An admitted rewrite still begins
+a new cache generation; otherwise model-visible history is prefix-continuous.
+The baseline lease policy keeps its original next-request admission gate as an
+unchanged control.
 
 Neutral working-set hysteresis is configurable with
 `--compaction-neutral-high-watermark-tokens N` / `CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS=N`
@@ -125,13 +113,38 @@ and `trace.jsonl`.
 
 ## Experimental keep leases
 
-`--keep-lease-turns N` (or `CARRY_KEEP_LEASE_TURNS=N`) is disabled by default.
-When enabled, a model `protected` signal is a lease for `N` later model turns,
-not a permanent lock. Once one or more leases are due, Carry first asks the
-ordinary planner a metadata-only counterfactual: whether releasing **all** due,
-non-human leases could make a normal rewrite worthwhile. It emits no review
-unless that full release set qualifies, and it never emits a review when
-compaction is disabled.
+`--keep-lease-turns N` (or `CARRY_KEEP_LEASE_TURNS=N`) defaults to **8**
+in the native CLI. A blank benchmark input omits the flag but inherits that
+native default; it does **not** disable leases. The current CLI has no
+lease-only disable switch. A model `protected` signal is a lease for `N`
+later model turns, not a permanent lock. `--lease-review-policy baseline`
+is the default: an already-qualified ordinary compaction takes precedence over
+a due-lease review.
+Use `--lease-review-policy batch-ordinary` (or
+`CARRY_LEASE_REVIEW_POLICY=batch-ordinary`) to opt into the experimental
+comparison on the same binary and source commit. Once one or more leases are
+due, Carry asks the ordinary planner whether compaction already qualifies.
+Under the `batch-ordinary` treatment, Carry compares **keep**, **compact
+now**, and **review first** over the same probability-weighted future. Each
+branch receives the same projected future tool-turn items, including one on
+each surviving later request. The first request pays its actual modeled cache
+read/write or rewrite cost; review also pays the annotation and cannot remove
+reviewed material until the second request. The chance of reaching request
+`t` is `(1 - q)^(t - 1)`, where `q` is the configured stop probability.
+Both ordinary compaction and review must beat **keeping** on expected net
+input-equivalent cost, and review must also beat compacting now. There is no
+extra margin on this final three-way comparison; the configured payback
+margin still applies when the ordinary planner admits candidates, so use `--compaction-min-payback-percent 0`
+to test a margin-free treatment. The delayed candidate projects a protected
+tool-turn item through the second request and is compared against the same
+future growth and stopping distribution as keep and compact-now.
+This is an **experimental forecast**, not a calibrated prediction: it assumes
+reviewed IDs are omitted and a delayed rewrite occurs, without forecasting
+renewal or further planner actions. Positive forecast savings are not observed
+cost savings. The content-free `keep_lease_review_decision.data.paired_forecast`
+and `context_compacted.data.expected_value` fields record the compared costs
+and settings. No sampled rollout policy remains. A review never occurs when
+compaction is disabled or the horizon contains no post-review request.
 
 A qualifying review names at most the four largest due blocks, matching the
 `protected` field's four-ID limit. The concise tool-result annotation directs
@@ -152,10 +165,22 @@ intentional compaction rewrite.
 Each `context_compacted` trace event includes `retention_audit`, with every
 pre-rewrite item’s ID, estimated tokens, kept/removed outcome, and reason
 (active lease, expired lease, explicit removable, neutral policy, or stable
-baseline). A `retention_revalidation_requested` event records the reviewed IDs
-and the `all_due_virtual_release` selection scope. The review is appended to
-persisted native context, so it extends the previous request history and
-preserves prompt-cache continuity until a normal rewrite.
+baseline). A `retention_revalidation_requested` event records reviewed IDs and the
+selection scope (`reviewed_wave_virtual_omission` for a qualifying ordinary
+plan under `batch-ordinary`, or `all_due_virtual_release` when no ordinary plan
+qualifies). With leases enabled, each completed tool-result planner boundary also
+emits a content-free `keep_lease_review_decision` event: due/reviewable counts and
+estimated tokens, the selected wave size, request/skip and reason, and available
+ordinary, expanded, delayed and annotation-cost estimates. A skipped decision is
+not a review; count `retention_revalidation_requested` separately and join
+subsequent `context_signals` and `context_compacted` events for actual renewal
+and removal. The review wave event records projected savings, the one-request
+delay estimate, and annotation cost. Pending review suppresses compaction
+until the next model response has seen the annotation and provided renewal
+signals, even if a resumed run disables new leases; afterward normal
+compaction resumes. The
+review is appended to persisted native context, extending the previous request
+history and preserving prompt-cache continuity until a normal rewrite.
 
 ## Session-persistence benchmark mode
 
