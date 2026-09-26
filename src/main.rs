@@ -108,8 +108,8 @@ struct Cli {
     max_steps: Option<usize>,
 
     /// Default timeout for each shell command; the model may override per call (1-300 seconds).
-    #[arg(long, default_value_t = 60)]
-    shell_timeout_secs: u64,
+    #[arg(long, alias = "shell-timeout-secs", default_value_t = 60)]
+    default_shell_timeout_secs: u64,
 
     /// Deadline for each OpenAI Responses API attempt.
     #[arg(long, env = "OPENAI_REQUEST_TIMEOUT_SECS", default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS)]
@@ -431,7 +431,7 @@ async fn run_command(args: Cli) -> Result<()> {
         session_dir: session_dir.clone(),
         model,
         max_steps: args.max_steps,
-        shell_timeout_secs: args.shell_timeout_secs,
+        default_shell_timeout_secs: args.default_shell_timeout_secs,
         compaction_mode: args.compaction_policy.into(),
         keep_lease_turns: args.keep_lease_turns,
         compaction_payoff_requests: args.compaction_payoff_requests,
@@ -614,9 +614,24 @@ mod tests {
     }
 
     #[test]
-    fn shell_commands_default_to_60_second_timeout() {
+    fn default_shell_timeout_flag_is_primary_and_legacy_name_still_works() {
         let args = Cli::try_parse_from(["carry", "-p", "fix it"]).unwrap();
-        assert_eq!(args.shell_timeout_secs, 60);
+        assert_eq!(args.default_shell_timeout_secs, 60);
+        let explicit = Cli::try_parse_from([
+            "carry",
+            "--default-shell-timeout-secs",
+            "17",
+            "-p",
+            "fix it",
+        ])
+        .unwrap();
+        assert_eq!(explicit.default_shell_timeout_secs, 17);
+        let legacy =
+            Cli::try_parse_from(["carry", "--shell-timeout-secs", "19", "-p", "fix it"]).unwrap();
+        assert_eq!(legacy.default_shell_timeout_secs, 19);
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--default-shell-timeout-secs"));
+        assert!(!help.contains("--shell-timeout-secs"));
     }
 
     #[tokio::test]
@@ -637,7 +652,7 @@ mod tests {
         .unwrap();
         let args = Cli::try_parse_from([
             "carry",
-            "--shell-timeout-secs",
+            "--default-shell-timeout-secs",
             "1",
             "--max-steps",
             "2",
@@ -651,7 +666,7 @@ mod tests {
             "run the command",
         ])
         .unwrap();
-        assert_eq!(args.shell_timeout_secs, 1);
+        assert_eq!(args.default_shell_timeout_secs, 1);
 
         run_command(args).await.unwrap();
         let trace = std::fs::read_to_string(session_dir.join("trace.jsonl")).unwrap();
@@ -681,7 +696,7 @@ mod tests {
         .unwrap();
         let args = Cli::try_parse_from([
             "carry",
-            "--shell-timeout-secs",
+            "--default-shell-timeout-secs",
             "60",
             "--max-steps",
             "2",
@@ -723,7 +738,7 @@ mod tests {
         .unwrap();
         let args = Cli::try_parse_from([
             "carry",
-            "--shell-timeout-secs",
+            "--default-shell-timeout-secs",
             "1",
             "--max-steps",
             "2",

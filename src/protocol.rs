@@ -214,7 +214,7 @@ pub fn tool_definitions() -> Value {
                         "type": ["integer", "null"],
                         "minimum": 1,
                         "maximum": 300,
-                        "description": "Wall-clock timeout for this command in seconds (1-300). Use null for the session default (60 seconds unless overridden by --shell-timeout-secs); request a longer timeout when a build or test needs it."
+                        "description": "Wall-clock timeout for this command in seconds (1-300). Use null for the session default (60 seconds unless overridden by --default-shell-timeout-secs); request a longer timeout when a build or test needs it."
                     },
                     "context": context.clone()
                 },
