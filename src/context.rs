@@ -1036,14 +1036,6 @@ fn meets_payback_threshold(savings: f64, minimum_payback: f64) -> bool {
     savings > minimum_payback
 }
 
-fn direct_next_request_savings(
-    implicit_cached_tokens: usize,
-    current_tokens: usize,
-    compact_first_cost: f64,
-) -> f64 {
-    keep_request_cost_with_implicit(implicit_cached_tokens, current_tokens) - compact_first_cost
-}
-
 fn payoff_savings_input_units(
     implicit_cached_tokens: usize,
     current_tokens: usize,
@@ -1394,7 +1386,6 @@ mod tests {
         assert_eq!(policy.payoff_requests, 5);
         assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 1) < 0.0);
         assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 5) > 0.0);
-        assert!(direct_next_request_savings(312_141, 313_063, 54_562.5) < 0.0);
     }
 
     #[test]
