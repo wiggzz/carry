@@ -70,7 +70,7 @@ pub struct RunConfig {
     pub session_dir: PathBuf,
     pub model: String,
     pub max_steps: Option<usize>,
-    pub shell_timeout_secs: u64,
+    pub default_shell_timeout_secs: u64,
     pub compaction_mode: CompactionMode,
     /// Experimental: revalidate model-requested protected context after this many model turns.
     pub keep_lease_turns: Option<u64>,
@@ -484,6 +484,12 @@ impl Backend {
         Self::OpenAi(client)
     }
 
+    fn configure_shell_timeout(&mut self, seconds: u64) {
+        if let Self::OpenAi(client) = self {
+            client.set_default_shell_timeout_secs(seconds);
+        }
+    }
+
     pub async fn scripted(path: &Path) -> Result<Self> {
         let contents = tokio::fs::read_to_string(path)
             .await
@@ -615,6 +621,7 @@ async fn run_loop(
     initial_submission_id: Option<String>,
 ) -> Result<RunOutcome> {
     let run_started = Instant::now();
+    backend.configure_shell_timeout(config.default_shell_timeout_secs);
     let mcp_servers = auth::carry_home()
         .ok()
         .and_then(|home| mcp::configured_server_names(&home).ok())
@@ -890,7 +897,11 @@ async fn run_loop(
                     &config.session_dir,
                     call_id,
                     command,
-                    config.shell_timeout_secs,
+                    reply
+                        .step
+                        .action
+                        .timeout_secs
+                        .unwrap_or(config.default_shell_timeout_secs),
                 )
                 .await?;
                 let output = function_call_output(&reply.function_call, &result)?;
@@ -1716,6 +1727,59 @@ mod tests {
     use super::*;
     use crate::openai::PromptCacheCapabilities;
 
+    #[tokio::test]
+    async fn run_configures_the_openai_request_with_its_shell_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let client = OpenAiClient::with_timeouts_and_prompt_cache_key(
+            "https://example.invalid/v1".into(),
+            crate::openai::RequestAuth::ApiKey("unused".into()),
+            "gpt-6-sol".into(),
+            "medium".into(),
+            "test-cache".into(),
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let mut backend = Backend::openai(client);
+        let outcome = run_loop(
+            RunConfig {
+                cwd: workspace,
+                prompt: "fix it".into(),
+                session_dir: temp.path().join("session"),
+                model: "gpt-6-sol".into(),
+                max_steps: Some(0),
+                default_shell_timeout_secs: 7,
+                compaction_mode: CompactionMode::Disabled,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 0,
+                compaction_neutral_low_watermark_tokens: 0,
+                resume_context: None,
+                resume_source: None,
+                prompt_cache_key: None,
+            },
+            &mut backend,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.completed);
+        let body = backend.request_body("system", &[]).unwrap();
+        let description =
+            body["tools"][0]["parameters"]["properties"]["timeout_secs"]["description"]
+                .as_str()
+                .unwrap();
+        assert!(description.contains("7 seconds"));
+        assert!(!description.contains("60 seconds"));
+    }
+
     #[test]
     fn human_message_event_preserves_submission_identity() {
         assert_eq!(
@@ -2333,7 +2397,7 @@ mod tests {
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
                 max_steps: Some(3),
-                shell_timeout_secs: 1,
+                default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: Some(1),
                 compaction_payoff_requests: 1,
@@ -2415,7 +2479,7 @@ mod tests {
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
                 max_steps: Some(2),
-                shell_timeout_secs: 5,
+                default_shell_timeout_secs: 5,
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2482,7 +2546,7 @@ mod tests {
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
                 max_steps: Some(2),
-                shell_timeout_secs: 1,
+                default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 5,
@@ -2544,7 +2608,7 @@ mod tests {
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
                 max_steps: Some(1),
-                shell_timeout_secs: 1,
+                default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2632,7 +2696,7 @@ mod tests {
                 session_dir: first_session.clone(),
                 model: "scripted".into(),
                 max_steps: Some(1),
-                shell_timeout_secs: 1,
+                default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2659,7 +2723,7 @@ mod tests {
                 session_dir: second_session.clone(),
                 model: resume.model,
                 max_steps: Some(1),
-                shell_timeout_secs: 1,
+                default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2729,7 +2793,7 @@ mod tests {
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
                 max_steps: None,
-                shell_timeout_secs: 1,
+                default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2777,7 +2841,7 @@ mod tests {
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
                 max_steps: None,
-                shell_timeout_secs: 1,
+                default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2840,7 +2904,7 @@ mod tests {
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
                 max_steps: Some(1),
-                shell_timeout_secs: 1,
+                default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2940,7 +3004,7 @@ mod tests {
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
                 max_steps: None,
-                shell_timeout_secs: 1,
+                default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2997,7 +3061,7 @@ mod tests {
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
                 max_steps: None,
-                shell_timeout_secs: 1,
+                default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,

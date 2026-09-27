@@ -73,6 +73,7 @@ pub struct OpenAiClient {
     model: String,
     reasoning_effort: String,
     prompt_cache_key: String,
+    default_shell_timeout_secs: u64,
     request_timeout: Duration,
     connect_timeout: Duration,
     #[cfg(test)]
@@ -223,6 +224,7 @@ impl OpenAiClient {
             model,
             reasoning_effort,
             prompt_cache_key,
+            default_shell_timeout_secs: 60,
             request_timeout,
             connect_timeout,
             #[cfg(test)]
@@ -255,6 +257,10 @@ impl OpenAiClient {
         self.connect_timeout
     }
 
+    pub(crate) fn set_default_shell_timeout_secs(&mut self, seconds: u64) {
+        self.default_shell_timeout_secs = seconds;
+    }
+
     pub(crate) fn prompt_cache_capabilities(&self) -> Option<PromptCacheCapabilities> {
         match self.auth {
             RequestAuth::ApiKey(_) => prompt_cache_capabilities(&self.model),
@@ -275,7 +281,7 @@ impl OpenAiClient {
                 "effort": self.reasoning_effort,
                 "context": "current_turn"
             },
-            "tools": tool_definitions(),
+            "tools": tool_definitions(self.default_shell_timeout_secs),
             "tool_choice": "required",
             "parallel_tool_calls": false
         });

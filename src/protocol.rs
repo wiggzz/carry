@@ -14,6 +14,8 @@ pub struct Action {
     pub command: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     pub answer: Option<String>,
 }
 
@@ -40,11 +42,18 @@ impl Action {
                 if self.command.as_deref().is_none_or(str::is_empty) || self.answer.is_some() {
                     bail!("shell action requires command and no answer");
                 }
+                if self
+                    .timeout_secs
+                    .is_some_and(|secs| !(1..=300).contains(&secs))
+                {
+                    bail!("shell timeout_secs must be between 1 and 300 seconds");
+                }
             }
             ActionKind::Finish => {
                 if self.answer.as_deref().is_none_or(str::is_empty)
                     || self.command.is_some()
                     || self.message.is_some()
+                    || self.timeout_secs.is_some()
                 {
                     bail!("finish action requires answer and no command or message");
                 }
@@ -59,6 +68,8 @@ struct ShellArguments {
     command: String,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
     context: ContextManagement,
 }
 
@@ -81,13 +92,16 @@ impl Step {
                 if args.command.is_empty() {
                     bail!("shell command must not be empty");
                 }
+                let action = Action {
+                    kind: ActionKind::Shell,
+                    command: Some(args.command),
+                    message: args.message.filter(|message| !message.trim().is_empty()),
+                    timeout_secs: args.timeout_secs,
+                    answer: None,
+                };
+                action.validate()?;
                 Ok(Self {
-                    action: Action {
-                        kind: ActionKind::Shell,
-                        command: Some(args.command),
-                        message: args.message.filter(|message| !message.trim().is_empty()),
-                        answer: None,
-                    },
+                    action,
                     context: args.context,
                 })
             }
@@ -102,6 +116,7 @@ impl Step {
                         kind: ActionKind::Finish,
                         command: None,
                         message: None,
+                        timeout_secs: None,
                         answer: Some(args.answer),
                     },
                     context: args.context,
@@ -122,6 +137,7 @@ impl Step {
                         .clone()
                         .context("shell command missing")?,
                     message: self.action.message.clone(),
+                    timeout_secs: self.action.timeout_secs,
                     context: self.context.clone(),
                 })?,
             ),
@@ -175,13 +191,13 @@ fn context_schema() -> Value {
     })
 }
 
-pub fn tool_definitions() -> Value {
+pub fn tool_definitions(default_shell_timeout_secs: u64) -> Value {
     let context = context_schema();
     json!([
         {
             "type": "function",
             "name": "shell",
-            "description": "Run one noninteractive shell command in the assigned repository. Use it to inspect files, edit files, and run tests. The command runs through /bin/sh -lc with no stdin; stdout and stderr are returned in one function result. Commands must terminate on their own.",
+            "description": format!("Run one noninteractive shell command in the assigned repository. Use it to inspect files, edit files, and run tests. The command runs through /bin/sh -lc with no stdin; stdout and stderr are returned in one function result. Set timeout_secs for commands that need a shorter or longer deadline; null uses this session's default of {default_shell_timeout_secs} seconds. Commands must terminate on their own."),
             "strict": true,
             "parameters": {
                 "type": "object",
@@ -194,9 +210,15 @@ pub fn tool_definitions() -> Value {
                         "type": ["string", "null"],
                         "description": "Optional concise commentary shown before the command, explaining what is being done and why."
                     },
+                    "timeout_secs": {
+                        "type": ["integer", "null"],
+                        "minimum": 1,
+                        "maximum": 300,
+                        "description": format!("Wall-clock timeout for this command in seconds (1-300). Use null for this session's default of {default_shell_timeout_secs} seconds; request a longer timeout when a build or test needs it.")
+                    },
                     "context": context.clone()
                 },
-                "required": ["command", "message", "context"],
+                "required": ["command", "message", "timeout_secs", "context"],
                 "additionalProperties": false
             }
         },
@@ -227,7 +249,7 @@ mod tests {
 
     #[test]
     fn context_schema_keeps_human_content_by_default() {
-        let schema = tool_definitions();
+        let schema = tool_definitions(60);
         let context = &schema[0]["parameters"]["properties"]["context"];
         let description = context["description"].as_str().unwrap();
         let protected = context["properties"]["protected"]["description"]
@@ -284,6 +306,69 @@ mod tests {
     }
 
     #[test]
+    fn shell_description_reports_the_effective_session_timeout() {
+        let schema = tool_definitions(17);
+        let shell = &schema[0];
+        let tool_description = shell["description"].as_str().unwrap();
+        let timeout_description = shell["parameters"]["properties"]["timeout_secs"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(tool_description.contains("17 seconds"));
+        assert!(timeout_description.contains("17 seconds"));
+        assert!(!timeout_description.contains("60 seconds"));
+    }
+
+    #[test]
+    fn shell_timeout_is_model_visible_and_survives_function_call_roundtrip() {
+        let schema = tool_definitions(60);
+        let shell = &schema[0]["parameters"];
+        assert_eq!(
+            shell["properties"]["timeout_secs"]["type"],
+            json!(["integer", "null"])
+        );
+        assert_eq!(shell["properties"]["timeout_secs"]["minimum"], 1);
+        assert_eq!(shell["properties"]["timeout_secs"]["maximum"], 300);
+        assert!(
+            shell["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("timeout_secs"))
+        );
+
+        let call = json!({
+            "type": "function_call", "name": "shell", "call_id": "call_1",
+            "arguments": r#"{"command":"sleep 3","timeout_secs":1,"message":null,"context":{"protected":[],"removable":[],"remember":[]}}"#
+        });
+        let step = Step::from_function_call(&call).unwrap();
+        assert_eq!(
+            serde_json::to_value(&step).unwrap()["action"]["timeout_secs"],
+            1
+        );
+        let echoed = step.synthetic_function_call("call_2").unwrap();
+        let echoed_args: Value =
+            serde_json::from_str(echoed["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(echoed_args["timeout_secs"], 1);
+    }
+
+    #[test]
+    fn shell_timeout_rejects_out_of_range_model_values_and_accepts_legacy_calls() {
+        for seconds in [0, 301] {
+            let call = json!({
+                "name": "shell", "arguments": json!({
+                    "command": "true", "timeout_secs": seconds,
+                    "context": {"protected": [], "removable": [], "remember": []}
+                }).to_string()
+            });
+            assert!(Step::from_function_call(&call).is_err());
+        }
+        let legacy = json!({
+            "name": "shell", "arguments": r#"{"command":"true","context":{"protected":[],"removable":[],"remember":[]}}"#
+        });
+        let step = Step::from_function_call(&legacy).unwrap();
+        assert!(serde_json::to_value(step).unwrap()["action"]["timeout_secs"].is_null());
+    }
+
+    #[test]
     fn parses_shell_and_finish_function_calls() {
         let shell = json!({
             "type": "function_call",
@@ -299,7 +384,7 @@ mod tests {
             Some("Checking the focused tests first.")
         );
         assert_eq!(parsed.context.keep, vec![1]);
-        let schema = tool_definitions();
+        let schema = tool_definitions(60);
         assert_eq!(
             schema[0]["parameters"]["properties"]["context"]["properties"]["protected"]["items"]["type"],
             "integer"
