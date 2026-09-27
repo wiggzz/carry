@@ -188,16 +188,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
 
+      - name: Identify installed Rust version
+        id: rust-version
+        run: |
+          version=$(rustc --version)
+          version=${version#rustc }
+          version=${version%% *}
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      # PR caches are scoped to their merge ref; protected release jobs never
+      # restore this cache. Cache only public dependencies and CI build output.
+      - name: Restore Rust dependencies and build output
+        id: rust-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            target
+          key: rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-version.outputs.version }}-musl-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}-${{ github.sha }}
+          restore-keys: |
+            rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-version.outputs.version }}-musl-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}-
+
       - name: Format
         run: cargo fmt -- --check
 
+      - name: Build terminal editor binary
+        run: cargo build --locked
+
       - name: Unit tests
-        run: cargo test
+        run: cargo test --locked
 
       - name: Terminal editor PTY tests
-        run: |
-          cargo build
-          python3 tests/terminal_editor.py
+        run: python3 tests/terminal_editor.py
 
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
