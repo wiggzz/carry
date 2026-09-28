@@ -82,7 +82,12 @@ impl ContextItem {
     }
 
     fn memory(id: u64, source_id: u64, content: String) -> Self {
-        let mut item = Self::new(id, ContextItemKind::Memory, Retention::Eligible, Vec::new());
+        let mut item = Self::new(
+            id,
+            ContextItemKind::Memory,
+            Retention::Protected,
+            Vec::new(),
+        );
         item.bytes = content.len();
         item.memory = Some(MemoryData {
             content,
@@ -216,7 +221,13 @@ impl ContextState {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let state: Self = serde_json::from_slice(bytes)?;
+        let mut state: Self = serde_json::from_slice(bytes)?;
+        // Upgrade memories written before they were protected by default.
+        for item in &mut state.items {
+            if item.kind == ContextItemKind::Memory && item.signal != RetentionSignal::Drop {
+                item.retention = Retention::Protected;
+            }
+        }
         let max_id = state.items.iter().map(|item| item.id).max().unwrap_or(0);
         if state.next_id < max_id {
             bail!("persisted context next_id is behind its item IDs");
@@ -511,7 +522,7 @@ impl ContextState {
         let mut drop = Vec::new();
         let mut ignored = Vec::new();
 
-        // Human-authored items begin protected; every other kind begins eligible.
+        // Human-authored items and memories begin protected; other kinds begin eligible.
         // Explicit removable/protected signals override those defaults.
         for id in unique_ids(&update.drop) {
             match self.items.iter_mut().find(|item| item.id == id) {
@@ -1508,8 +1519,13 @@ mod tests {
             )
             .unwrap();
         assert!(first_plan.dropped.contains(&source));
-        assert!(first_plan.dropped.contains(&memory));
+        assert!(!first_plan.dropped.contains(&memory));
         state.compact(first_plan);
+        assert!(
+            serde_json::to_string(&state.input_items())
+                .unwrap()
+                .contains(summary.trim())
+        );
 
         let status = state
             .snapshot()
@@ -2183,7 +2199,72 @@ mod tests {
     }
 
     #[test]
-    fn memory_is_an_inline_eligible_handle_without_duplicating_its_content() {
+    fn resumed_eligible_memories_become_protected_unless_explicitly_dropped() {
+        let mut state = ContextState::new("initial".into());
+        let tool = add_tool(&mut state);
+        let ids = state
+            .record_signals(&update(&[], &[], &["remember", "forget"]), tool)
+            .added;
+        state
+            .items
+            .iter_mut()
+            .filter(|item| ids.contains(&item.id))
+            .for_each(|item| item.retention = Retention::Eligible);
+        state.record_signals(&update(&[], &[ids[1]], &[]), tool);
+        let resumed = ContextState::decode(&state.encode().unwrap()).unwrap();
+        assert_eq!(
+            resumed
+                .items
+                .iter()
+                .find(|item| item.id == ids[0])
+                .unwrap()
+                .retention,
+            Retention::Protected
+        );
+        assert_eq!(
+            resumed
+                .items
+                .iter()
+                .find(|item| item.id == ids[1])
+                .unwrap()
+                .signal,
+            RetentionSignal::Drop
+        );
+    }
+
+    #[test]
+    fn memory_survives_budget_compaction_until_explicitly_dropped() {
+        let mut state = ContextState::new("initial".into());
+        let tool = add_tool_with_output(&mut state, &"temporary output ".repeat(1_000));
+        let memory = state
+            .record_signals(&update(&[], &[], &["keep this fact"]), tool)
+            .added[0];
+        let policy = CompactionPolicy {
+            implicit_cached_tokens: 0,
+            breakpoints: Vec::new(),
+            payoff_requests: 1,
+            min_payback_percent: 0,
+        };
+        let plan = state
+            .plan_compaction_with_neutral_budget(&[], policy.clone(), 0)
+            .unwrap();
+        assert!(!plan.dropped.contains(&memory));
+        state.compact(plan);
+        assert!(
+            serde_json::to_string(&state.input_items())
+                .unwrap()
+                .contains("keep this fact")
+        );
+
+        state.record_signals(&update(&[], &[memory], &[]), tool);
+        let plan = state
+            .plan_compaction_with_neutral_budget(&[], policy, 0)
+            .unwrap();
+        assert!(plan.dropped.contains(&memory));
+    }
+
+    #[test]
+    fn memory_is_an_inline_protected_handle_without_duplicating_its_content() {
         let mut state = ContextState::new("initial".into());
         let tool = add_tool(&mut state);
         let change = state.record_signals(&update(&[], &[], &["durable outcome"]), tool);
@@ -2193,7 +2274,7 @@ mod tests {
             state.items.iter().map(|item| item.id).collect::<Vec<_>>(),
             vec![1, tool, memory]
         );
-        assert_eq!(state.items[2].retention, Retention::Eligible);
+        assert_eq!(state.items[2].retention, Retention::Protected);
         assert_eq!(state.protected_frontier_len(), 1);
 
         let rendered = state.input_items();
@@ -2537,8 +2618,9 @@ mod tests {
                 .iter()
                 .map(|item| item.id)
                 .collect::<Vec<_>>(),
-            vec![memory, eligible_tail]
+            vec![eligible_tail]
         );
+        assert!(!first_plan.dropped.contains(&memory));
         let first_change = state.compact(first_plan);
         assert_eq!(first_change.protected_frontier, Some(1));
 

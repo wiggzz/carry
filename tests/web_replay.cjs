@@ -65,6 +65,11 @@ assert.equal(activity.children.find(el => el.className.includes('memory'))?.text
 vm.runInContext("event({event:'context_signals',data:{signals:{added:[]},memories:['   ']}})",sandbox);
 assert.equal(activity.children.filter(el => el.className.includes('memory')).length, 1, 'empty memories should not produce notes');
 
+vm.runInContext("event({event:'context_compacted',data:{compaction:{dropped:[9]}}})",sandbox);
+const note = activity.children.find(el => el.className.includes('memory'));
+assert.equal(note.children.find(el => el.className.includes('removed'))?.textContent, 'removed from agent context', 'removed memory should show its actual retention state');
+
+
 vm.runInContext(`
 const replayed = {run_id:'test', seq:1, event:'model_response', data:{usage:{total_tokens:10}}};
 event(replayed); event({event:'history_complete'});
