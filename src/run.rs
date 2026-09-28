@@ -932,7 +932,7 @@ async fn run_loop(
                 )?;
                 logger.raw_event_silent(
                     "context_signals",
-                    json!({"source_id": item_id, "signals": &signals, "expired_keep_leases": expired_keep_leases}),
+                    json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
                 )?;
                 persist_context_checkpoint(&config, &context_state)?;
 
@@ -987,7 +987,7 @@ async fn run_loop(
                 }
                 logger.raw_event_silent(
                     "context_signals",
-                    json!({"source_id": item_id, "signals": &signals, "expired_keep_leases": expired_keep_leases}),
+                    json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
                 )?;
                 persist_context_checkpoint(&config, &context_state)?;
                 logger.raw_event(

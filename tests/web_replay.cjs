@@ -56,6 +56,15 @@ vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], sandbox);
   assert.equal(elements.get('#stat-model').textContent, 'gpt-6-sol');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
+// Memory notes appear once for accepted memories, including on history replay.
+const activity = elements.get('#activity');
+const memoryEvent = {run_id:'memory',seq:1,event:'context_signals',data:{signals:{keep:[],drop:[],added:[9]},memories:['  Remember the user prefers short replies  ']}};
+vm.runInContext('event('+JSON.stringify(memoryEvent)+');event('+JSON.stringify(memoryEvent)+')',sandbox);
+assert.equal(activity.children.filter(el => el.className.includes('memory')).length, 1, 'remembered facts should produce one small note, even after reconnect');
+assert.equal(activity.children.find(el => el.className.includes('memory'))?.textContent, 'Remembered · Remember the user prefers short replies');
+vm.runInContext("event({event:'context_signals',data:{signals:{added:[]},memories:['   ']}})",sandbox);
+assert.equal(activity.children.filter(el => el.className.includes('memory')).length, 1, 'empty memories should not produce notes');
+
 vm.runInContext(`
 const replayed = {run_id:'test', seq:1, event:'model_response', data:{usage:{total_tokens:10}}};
 event(replayed); event({event:'history_complete'});
