@@ -165,23 +165,23 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "After making task progress, preserve task-critical working state from recently added visible context. This is required secondary housekeeping, not optional cleanup. Preserve guidance-check outcomes (including scope and absence of guidance) and learnings from failed tool calls. Keep a failed call until its lesson is remembered or represented by a protected successful call; release it only when nothing unique remains. Human-authored content is kept by default. Other context is eligible for removal under budget pressure. Leave eligible items removable; mark an already protected item removable only if its information can be safely summarized, is available elsewhere, or provides no directional change or learning. Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise.",
+        "description": "Leave context.protected, context.removable, and context.remember empty unless there is a reason to use them. Preserve new, important facts that may otherwise be lost, including guidance-check scope and lessons from failures, but do not repeat what is already kept. Human-authored content is kept by default; other items are eligible for removal under budget pressure. Retention decisions persist until reversed or applied by compaction.",
         "properties": {
             "protected": {
                 "type": "array",
-                "description": "Protect up to four context IDs carrying exact facts, decisions, constraints, diagnoses, or verified results that will matter to later work. Also protect an ID when you learned anything from it that is not preserved elsewhere. When only a concise learning must remain, use remember and leave its bulky source removable, or mark it removable if it was protected. Protecting an ID reverses a removable decision.",
+                "description": "Protect up to four IDs with exact facts needed later and not already preserved. Leave eligible items alone. Protecting an ID reverses a removable decision.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "removable": {
                 "type": "array",
-                "description": "Use this to release up to four already protected context IDs when you learned nothing from them, or when everything learned from them is preserved elsewhere. Leave eligible items unlisted. Finishing an action does not preserve its learning. Marking an ID removable reverses protection.",
+                "description": "Release up to four protected IDs when their information is no longer needed or is kept elsewhere. Leave eligible items unlisted. Marking an ID removable reverses protection.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "remember": {
                 "type": "array",
-                "description": "At most one concise learning that preserves what a bulky source taught you without retaining its exact details. Examples include tool limitations and the outcome and scope of repo guidance checks. When it safely replaces a bulky source, leave that source removable or mark it removable if it was protected. Preserve outcomes, not chain-of-thought.",
+                "description": "At most one short, new fact worth keeping, not a recap of every tool call. Keep guidance-check scope and failure lessons once, not repeatedly. When this replaces a bulky source, leave it removable or mark it removable if protected.",
                 "items": { "type": "string" },
                 "maxItems": 1
             }
