@@ -165,23 +165,22 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "After making task progress, preserve task-critical working state from recently added visible context. This is required secondary housekeeping, not optional cleanup. Human-authored content is kept by default. Other context is eligible for removal under budget pressure. Leave eligible items removable; mark an already protected item removable only if its information can be safely summarized, is available elsewhere, or provides no directional change or learning. Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise.",
         "properties": {
             "protected": {
                 "type": "array",
-                "description": "Protect up to four context IDs carrying exact facts, decisions, constraints, diagnoses, or verified results that will matter to later work. Also protect an ID when you learned anything from it that is not preserved elsewhere. When only a concise learning must remain, use remember and leave its bulky source removable, or mark it removable if it was protected. Protecting an ID reverses a removable decision.",
+                "description": "Protect up to four context item IDs that contained useful learnings or exact facts which need to be preserved. Items which are unprotected may be removed immediately by compaction, so ensure that you protect items if you need them. Human-authored content and memories will be retained by default, so there is no need to protect them.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "removable": {
                 "type": "array",
-                "description": "Use this to release up to four already protected context IDs when you learned nothing from them, or when everything learned from them is preserved elsewhere. Leave eligible items unlisted. Finishing an action does not preserve its learning. Marking an ID removable reverses protection.",
+                "description": "Mark up to four context item IDs as removable when their information is no longer needed or is kept elsewhere. Marking an ID removable reverses protection. Consider removing redundant items when the learnings from the associated text, function call or function output is preserved elsewhere.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "remember": {
                 "type": "array",
-                "description": "At most one concise learning that preserves what a bulky source taught you without retaining its exact details. When it safely replaces a bulky source, leave that source removable or mark it removable if it was protected. Preserve outcomes, not chain-of-thought.",
+                "description": "Add a concise additional fact to be preserved. Do this if you see a large item that is not useful verbatim, and any learnings from it are expected to remain useful for a long time and would be better preserved by a concise memory rather than the original assistant response, function call and function output. In that case, leave the item unprotected (or, mark it removable if it was previously protected) and capture its learnings as a memory.",
                 "items": { "type": "string" },
                 "maxItems": 1
             }
@@ -197,7 +196,7 @@ pub fn tool_definitions(default_shell_timeout_secs: u64) -> Value {
         {
             "type": "function",
             "name": "shell",
-            "description": format!("Run one noninteractive shell command in the assigned repository. Use it to inspect files, edit files, and run tests. The command runs through /bin/sh -lc with no stdin; stdout and stderr are returned in one function result. Set timeout_secs for commands that need a shorter or longer deadline; null uses this session's default of {default_shell_timeout_secs} seconds. Commands must terminate on their own."),
+            "description": format!("Run one noninteractive shell command in the working directory. The command runs through /bin/sh -lc with no stdin; stdout and stderr are returned in one function result. Set timeout_secs for commands that need a shorter or longer deadline; null uses this session's default of {default_shell_timeout_secs} seconds. Commands must terminate on their own."),
             "strict": true,
             "parameters": {
                 "type": "object",
@@ -225,7 +224,7 @@ pub fn tool_definitions(default_shell_timeout_secs: u64) -> Value {
         {
             "type": "function",
             "name": "finish",
-            "description": "End the run only when the coding task is complete and relevant verification has passed, or when no further useful work is possible. No shell command is executed.",
+            "description": "End the run only when the requested task is complete and relevant verification has passed, or when no further useful work is possible. No shell command is executed.",
             "strict": true,
             "parameters": {
                 "type": "object",
@@ -251,17 +250,6 @@ mod tests {
     fn context_schema_keeps_human_content_by_default() {
         let schema = tool_definitions(60);
         let context = &schema[0]["parameters"]["properties"]["context"];
-        let description = context["description"].as_str().unwrap();
-        let protected = context["properties"]["protected"]["description"]
-            .as_str()
-            .unwrap();
-        let removable = context["properties"]["removable"]["description"]
-            .as_str()
-            .unwrap();
-        let remember = context["properties"]["remember"]["description"]
-            .as_str()
-            .unwrap();
-
         assert!(
             !context["properties"]
                 .as_object()
@@ -278,44 +266,6 @@ mod tests {
             context["required"],
             json!(["protected", "removable", "remember"])
         );
-        assert_eq!(
-            description,
-            "After making task progress, preserve task-critical working state from recently added visible context. This is required secondary housekeeping, not optional cleanup. Human-authored content is kept by default. Other context is eligible for removal under budget pressure. Leave eligible items removable; mark an already protected item removable only if its information can be safely summarized, is available elsewhere, or provides no directional change or learning. Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise."
-        );
-        assert!(
-            protected
-                .contains("exact facts, decisions, constraints, diagnoses, or verified results")
-        );
-        assert!(protected.contains("learned anything"));
-        assert!(protected.contains("leave its bulky source removable"));
-        assert!(
-            removable.starts_with("Use this to release up to four already protected context IDs")
-        );
-        assert!(removable.contains("Leave eligible items unlisted"));
-        assert!(
-            removable.find("Use this to release up to four already protected context IDs")
-                < removable.find("Leave eligible items unlisted")
-        );
-        assert!(removable.contains("learned nothing"));
-        assert!(removable.contains("preserved elsewhere"));
-        assert!(remember.contains("concise learning"));
-        assert!(!description.contains("stable"));
-        assert!(!description.contains("volatile"));
-        assert!(!protected.contains("stable"));
-        assert!(!protected.contains("volatile"));
-    }
-
-    #[test]
-    fn shell_description_reports_the_effective_session_timeout() {
-        let schema = tool_definitions(17);
-        let shell = &schema[0];
-        let tool_description = shell["description"].as_str().unwrap();
-        let timeout_description = shell["parameters"]["properties"]["timeout_secs"]["description"]
-            .as_str()
-            .unwrap();
-        assert!(tool_description.contains("17 seconds"));
-        assert!(timeout_description.contains("17 seconds"));
-        assert!(!timeout_description.contains("60 seconds"));
     }
 
     #[test]

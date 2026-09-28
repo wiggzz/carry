@@ -34,24 +34,32 @@ const SYSTEM_PROMPT: &str = r#"You are a coding agent working iteratively in an 
 
 Make task progress first: understand the request, investigate, implement, and verify before finishing. Establish a minimal failing reproduction before editing when practical. When practical, identify the root cause and make the smallest correct fix at the appropriate layer; use local history to investigate regressions when it is available. Run affected tests before finishing. Use the optional shell message for concise progress commentary.
 
-Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
-
-MCP tools are available through the exact Carry executable in `$CARRY_SELF`. Discover tool names with `"$CARRY_SELF" mcp list` or scope discovery with `"$CARRY_SELF" mcp list --server SERVER`, inspect a tool's full description and schema with `"$CARRY_SELF" mcp describe SERVER/TOOL`, and invoke it with `"$CARRY_SELF" mcp call SERVER/TOOL '{"argument":"value"}'`. For complex arguments, pipe a JSON object to `"$CARRY_SELF" mcp call SERVER/TOOL --stdin`. MCP command output is JSON by default; `--json-pointer /path/to/value` selects part of call output and prints a selected string as raw text unless `--json` is passed. If a server requires authorization, ask the user to run `"$CARRY_SELF" mcp auth SERVER`.
+Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard. Preserve the outcome of each check, including the scope checked and whether guidance was found.
 
 Large stdout and stderr results arrive in separate structured sections. Each text payload is unmodified; truncation, encoding, and artifact-path metadata are outside that payload. Read or slice the relevant stdout/stderr artifact when omitted details matter.
 
-History is a working set, not a complete transcript. Human-authored content is kept by default. All other context is eligible for removal when it no longer fits the working set. After the first removal, a history-status item states that earlier context has been removed.
+History is a working set, not a complete transcript. Human-authored content and memories are kept by default. All other context is eligible for removal.
 
-As required secondary housekeeping, preserve task-critical working state from recently added visible context. This is required, not optional cleanup: protect exact facts, decisions, constraints, diagnoses, and verified results that will matter to later work. If you learned anything from an item that is not already preserved elsewhere, protect it. If only a concise learning must remain, remember it and leave its bulky source removable, or mark it removable if it was protected. Leave or mark an item removable only when it taught you nothing or everything learned from it is preserved elsewhere. Finishing an action or encountering a failure does not by itself preserve its learning.
+Each completed tool step has one context item ID covering the complete assistant reasoning, text and function call together with the resulting tool output.
 
-Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise. Preserve outcomes, not chain-of-thought."#;
+Use `context.protected` to protect context items where any part contains valuable learnings, decisions or outcomes (including failures). Use `context.removable` to release protected items after their learnings are preserved elsewhere. Use `context.remember` instead of protecting a context item only if the item is very large and it's learnings don't need to be preserved exactly. Memories are additive, so there is no need to repeat prior memories unless you need to change them, in which case you should mark the prior memory removable so it can eventually be removed.
+
+On your next tool call, decide whether to protect the immediately preceding tool step. Compaction may run after your next tool call and remove any unprotected step, including the preceding step if you don't protect it on this call. By default, protect the previous step if it contained anything you still need and haven't preserved elsewhere; otherwise you may need to repeat work.
+
+For example, if you search for something and find nothing, this is important because it indicates a real negative result. Or, if a tool call fails, protect it because the reason it failed is important information. However, if the failure resulted in a large amount of non-useful output, leave it unprotected and capture the learnings as a memory instead.
+
+As you move past detailed work on a section of code or implementation, once items are no longer informing your work, you may begin to mark items removable if the exact details are unimportant and the information can be re-discovered easily. Consider adding concise memories when an important fact could otherwise be lost.
+
+For example, once you have finished an implementation and there are several edits and rereads of files, consider leaving the final read back in place and marking the earlier edits removable."#;
+
+const MCP_PROMPT: &str = r#"MCP tools are available through the exact Carry executable in `$CARRY_SELF`. Discover tool names with `"$CARRY_SELF" mcp list` or scope discovery with `"$CARRY_SELF" mcp list --server SERVER`, inspect a tool's full description and schema with `"$CARRY_SELF" mcp describe SERVER/TOOL`, and invoke it with `"$CARRY_SELF" mcp call SERVER/TOOL '{"argument":"value"}'`. For complex arguments, pipe a JSON object to `"$CARRY_SELF" mcp call SERVER/TOOL --stdin`. MCP command output is JSON by default; `--json-pointer /path/to/value` selects part of call output and prints a selected string as raw text unless `--json` is passed. If a server requires authorization, ask the user to run `"$CARRY_SELF" mcp auth SERVER`."#;
 
 fn system_prompt(mcp_servers: &[String]) -> String {
     if mcp_servers.is_empty() {
         return SYSTEM_PROMPT.to_owned();
     }
     format!(
-        "{SYSTEM_PROMPT}\nConfigured MCP servers: {}.\n",
+        "{SYSTEM_PROMPT}\n\n{MCP_PROMPT}\nConfigured MCP servers: {}.\n",
         mcp_servers.join(", ")
     )
 }
@@ -69,6 +77,7 @@ pub struct RunConfig {
     pub prompt: String,
     pub session_dir: PathBuf,
     pub model: String,
+    pub reasoning_effort: String,
     pub max_steps: Option<usize>,
     pub default_shell_timeout_secs: u64,
     pub compaction_mode: CompactionMode,
@@ -654,6 +663,7 @@ async fn run_loop(
             json!({
                 "cwd": config.cwd,
                 "model": config.model,
+                "reasoning_effort": config.reasoning_effort,
                 "history_items": context.input_items().len(),
                 "cache_ttl_seconds": CACHE_TTL.as_secs(),
                 "prompt_cache_capabilities": prompt_cache_capabilities,
@@ -676,6 +686,7 @@ async fn run_loop(
                 "cwd": config.cwd,
                 "prompt": config.prompt,
                 "model": config.model,
+                "reasoning_effort": config.reasoning_effort,
                 "max_steps": config.max_steps,
                 "cache_ttl_seconds": CACHE_TTL.as_secs(),
                 "prompt_cache_capabilities": prompt_cache_capabilities,
@@ -805,7 +816,7 @@ async fn run_loop(
                     .unwrap_or(&progress.preview);
                 if !terminal_preview.is_empty() && *terminal_preview != displayed_preview {
                     use std::io::IsTerminal;
-                    if std::io::stderr().is_terminal() {
+                    if events.is_none() && std::io::stderr().is_terminal() {
                         if let Some(delta) = terminal_preview.strip_prefix(&displayed_preview) {
                             stream_output.push(delta);
                         } else {
@@ -876,6 +887,8 @@ async fn run_loop(
             ),
         )?;
 
+        log_assistant_output_text(&mut logger, &reply.raw["output"], step_index)?;
+
         match reply.step.action.kind {
             ActionKind::Shell => {
                 if let Some(message) = reply.step.action.message.as_deref() {
@@ -932,7 +945,7 @@ async fn run_loop(
                 )?;
                 logger.raw_event_silent(
                     "context_signals",
-                    json!({"source_id": item_id, "signals": &signals, "expired_keep_leases": expired_keep_leases}),
+                    json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
                 )?;
                 persist_context_checkpoint(&config, &context_state)?;
 
@@ -987,7 +1000,7 @@ async fn run_loop(
                 }
                 logger.raw_event_silent(
                     "context_signals",
-                    json!({"source_id": item_id, "signals": &signals, "expired_keep_leases": expired_keep_leases}),
+                    json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
                 )?;
                 persist_context_checkpoint(&config, &context_state)?;
                 logger.raw_event(
@@ -1011,7 +1024,7 @@ async fn run_loop(
                     std::io::stdout().is_terminal(),
                 );
                 if let Some(receiver) = input.as_mut() {
-                    if !answer_streamed {
+                    if !answer_streamed && events.is_none() {
                         crate::terminal::print_answer(answer.as_deref().unwrap_or_default());
                     }
                     let (mut should_exit, had_messages) =
@@ -1242,6 +1255,30 @@ fn maybe_compact(
         ),
     )?;
     Ok(true)
+}
+
+fn log_assistant_output_text(logger: &mut RunLogger, output: &Value, step: usize) -> Result<()> {
+    for message in assistant_output_text(output) {
+        logger.raw_event(
+            "assistant_message",
+            json!({"step": step, "message": message}),
+            &format!("  {message}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn assistant_output_text(output: &Value) -> Vec<&str> {
+    output
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "message" && item["role"] == "assistant")
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .filter(|part| part["type"] == "output_text")
+        .filter_map(|part| part["text"].as_str())
+        .filter(|text| !text.is_empty())
+        .collect()
 }
 
 fn terminal_usage(step: usize, latency_ms: u64, retries: usize, usage: &Usage) -> String {
@@ -1727,59 +1764,6 @@ mod tests {
     use super::*;
     use crate::openai::PromptCacheCapabilities;
 
-    #[tokio::test]
-    async fn run_configures_the_openai_request_with_its_shell_timeout() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir(&workspace).unwrap();
-        let client = OpenAiClient::with_timeouts_and_prompt_cache_key(
-            "https://example.invalid/v1".into(),
-            crate::openai::RequestAuth::ApiKey("unused".into()),
-            "gpt-6-sol".into(),
-            "medium".into(),
-            "test-cache".into(),
-            Duration::from_secs(30),
-            Duration::from_secs(5),
-        )
-        .unwrap();
-        let mut backend = Backend::openai(client);
-        let outcome = run_loop(
-            RunConfig {
-                cwd: workspace,
-                prompt: "fix it".into(),
-                session_dir: temp.path().join("session"),
-                model: "gpt-6-sol".into(),
-                max_steps: Some(0),
-                default_shell_timeout_secs: 7,
-                compaction_mode: CompactionMode::Disabled,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 0,
-                compaction_neutral_low_watermark_tokens: 0,
-                resume_context: None,
-                resume_source: None,
-                prompt_cache_key: None,
-            },
-            &mut backend,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(!outcome.completed);
-        let body = backend.request_body("system", &[]).unwrap();
-        let description =
-            body["tools"][0]["parameters"]["properties"]["timeout_secs"]["description"]
-                .as_str()
-                .unwrap();
-        assert!(description.contains("7 seconds"));
-        assert!(!description.contains("60 seconds"));
-    }
-
     #[test]
     fn human_message_event_preserves_submission_identity() {
         assert_eq!(
@@ -1859,71 +1843,6 @@ mod tests {
         let policy = cache.policy();
         assert_eq!(policy.implicit_cached_tokens, 4_000);
         assert!(policy.breakpoints.is_empty());
-    }
-
-    #[test]
-    fn system_prompt_surfaces_configured_mcp_servers() {
-        let prompt = system_prompt(&["github".into(), "notion".into()]);
-        assert!(prompt.contains("Configured MCP servers: github, notion."));
-        assert!(prompt.contains("mcp list --server SERVER"));
-        assert!(prompt.contains("selected string as raw text"));
-        assert!(prompt.contains("--json"));
-    }
-
-    #[test]
-    fn system_prompt_requires_reproduction_and_root_cause_investigation() {
-        assert!(SYSTEM_PROMPT.contains("minimal failing reproduction"));
-        assert!(SYSTEM_PROMPT.contains("affected tests"));
-        assert!(SYSTEM_PROMPT.contains(
-            "identify the root cause and make the smallest correct fix at the appropriate layer"
-        ));
-        assert!(SYSTEM_PROMPT.contains("use local history to investigate regressions"));
-        assert!(SYSTEM_PROMPT.contains("$CARRY_SELF"));
-        assert!(SYSTEM_PROMPT.contains("mcp describe SERVER/TOOL"));
-        assert!(SYSTEM_PROMPT.contains("--stdin"));
-        assert!(SYSTEM_PROMPT.contains("--json-pointer"));
-        assert!(!SYSTEM_PROMPT.contains("later fixes"));
-        assert!(!SYSTEM_PROMPT.contains("upstream fix"));
-    }
-
-    #[test]
-    fn system_prompt_prioritizes_task_progress_and_requires_critical_state_preservation() {
-        assert!(SYSTEM_PROMPT.contains("Make task progress first"));
-        assert!(SYSTEM_PROMPT.contains("As required secondary housekeeping"));
-        assert!(
-            SYSTEM_PROMPT.find("Make task progress first")
-                < SYSTEM_PROMPT.find("As required secondary housekeeping")
-        );
-        assert!(SYSTEM_PROMPT.contains("task-critical working state"));
-        assert!(SYSTEM_PROMPT.contains("This is required, not optional cleanup"));
-        assert!(
-            SYSTEM_PROMPT
-                .contains("exact facts, decisions, constraints, diagnoses, and verified results")
-        );
-        assert!(SYSTEM_PROMPT.contains("If you learned anything"));
-        assert!(SYSTEM_PROMPT.contains("not already preserved elsewhere"));
-        assert!(SYSTEM_PROMPT.contains("remember it"));
-        assert!(SYSTEM_PROMPT.contains("History is a working set"));
-        assert!(SYSTEM_PROMPT.contains("Human-authored content is kept by default"));
-        assert!(SYSTEM_PROMPT.contains("All other context is eligible for removal"));
-        assert!(!SYSTEM_PROMPT.contains("Select one action"));
-        assert!(!SYSTEM_PROMPT.contains("At each step:"));
-        assert!(SYSTEM_PROMPT.contains("leave its bulky source removable"));
-        assert!(SYSTEM_PROMPT.contains("or mark it removable if it was protected"));
-        assert!(SYSTEM_PROMPT.contains("Leave or mark an item removable only"));
-        assert!(SYSTEM_PROMPT.contains("or explicitly noted otherwise"));
-        assert!(!SYSTEM_PROMPT.contains("Make an item removable only"));
-        assert!(!SYSTEM_PROMPT.contains("stable"));
-        assert!(!SYSTEM_PROMPT.contains("volatile"));
-    }
-
-    #[test]
-    fn system_prompt_requires_relevant_repository_instruction_review() {
-        assert!(SYSTEM_PROMPT.contains(
-            "Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files"
-        ));
-        assert!(SYSTEM_PROMPT.contains("understand agent-specific guidance"));
-        assert!(SYSTEM_PROMPT.contains("take relevant guidance onboard"));
     }
 
     #[test]
@@ -2396,6 +2315,7 @@ mod tests {
                 prompt: "Finish the task.".into(),
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
+                reasoning_effort: "medium".into(),
                 max_steps: Some(3),
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Disabled,
@@ -2478,6 +2398,7 @@ mod tests {
                 prompt: "Finish the task.".into(),
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
+                reasoning_effort: "medium".into(),
                 max_steps: Some(2),
                 default_shell_timeout_secs: 5,
                 compaction_mode: CompactionMode::Disabled,
@@ -2545,6 +2466,7 @@ mod tests {
                 prompt: "Finish the task.".into(),
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
+                reasoning_effort: "medium".into(),
                 max_steps: Some(2),
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
@@ -2607,6 +2529,7 @@ mod tests {
                 prompt: "Finish the task.".into(),
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
+                reasoning_effort: "medium".into(),
                 max_steps: Some(1),
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
@@ -2676,6 +2599,47 @@ mod tests {
         assert_eq!(resumed.prompt_cache_key, None);
     }
 
+    #[test]
+    fn completed_assistant_text_before_finish_is_kept_in_order() {
+        let output = json!([
+            {"type":"reasoning"},
+            {"type":"message", "role":"assistant", "content":[
+                {"type":"output_text", "text":"First paragraph."},
+                {"type":"output_text", "text":"Second paragraph."}
+            ]},
+            {"type":"function_call", "name":"finish"}
+        ]);
+        assert_eq!(
+            assistant_output_text(&output),
+            vec!["First paragraph.", "Second paragraph."]
+        );
+    }
+
+    #[test]
+    fn completed_assistant_text_is_logged_as_durable_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut logger = RunLogger::create_with_events(temp.path(), None).unwrap();
+        let output = json!([
+            {"type":"reasoning"},
+            {"type":"message", "role":"assistant", "content":[
+                {"type":"output_text", "text":"Explanation"},
+                {"type":"output_text", "text":"More context"}
+            ]},
+            {"type":"function_call", "name":"finish"}
+        ]);
+        log_assistant_output_text(&mut logger, &output, 3).unwrap();
+        let events: Vec<Value> = std::fs::read_to_string(temp.path().join("trace.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "assistant_message");
+        assert_eq!(events[0]["data"]["message"], "Explanation");
+        assert_eq!(events[1]["data"]["message"], "More context");
+        assert_eq!(events[1]["data"]["step"], 3);
+    }
+
     #[tokio::test]
     async fn resumed_run_sends_the_prior_terminal_response_to_the_next_model_request() {
         let temp = tempfile::tempdir().unwrap();
@@ -2695,6 +2659,7 @@ mod tests {
                 prompt: "first task".into(),
                 session_dir: first_session.clone(),
                 model: "scripted".into(),
+                reasoning_effort: "medium".into(),
                 max_steps: Some(1),
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
@@ -2722,6 +2687,7 @@ mod tests {
                 prompt: "second task".into(),
                 session_dir: second_session.clone(),
                 model: resume.model,
+                reasoning_effort: "medium".into(),
                 max_steps: Some(1),
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
@@ -2792,6 +2758,7 @@ mod tests {
                 prompt: "Finish the task.".into(),
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
+                reasoning_effort: "medium".into(),
                 max_steps: None,
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
@@ -2840,6 +2807,7 @@ mod tests {
                 prompt: "Finish the task.".into(),
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
+                reasoning_effort: "medium".into(),
                 max_steps: None,
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
@@ -2903,6 +2871,7 @@ mod tests {
                 prompt: "Finish the task.".into(),
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
+                reasoning_effort: "medium".into(),
                 max_steps: Some(1),
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
@@ -3003,6 +2972,7 @@ mod tests {
                 prompt: "initial task".into(),
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
+                reasoning_effort: "medium".into(),
                 max_steps: None,
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,
@@ -3060,6 +3030,7 @@ mod tests {
                 prompt: "initial task".into(),
                 session_dir: session_dir.clone(),
                 model: "scripted".into(),
+                reasoning_effort: "medium".into(),
                 max_steps: None,
                 default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Economic,

@@ -430,6 +430,7 @@ async fn run_command(args: Cli) -> Result<()> {
         prompt,
         session_dir: session_dir.clone(),
         model,
+        reasoning_effort: args.reasoning_effort.as_str().to_owned(),
         max_steps: args.max_steps,
         default_shell_timeout_secs: args.default_shell_timeout_secs,
         compaction_mode: args.compaction_policy.into(),
@@ -984,7 +985,7 @@ mod tests {
 
         assert_eq!(
             resolve_resume_session(std::path::Path::new("run-42"), Some(temp.path())).unwrap(),
-            expected
+            expected.canonicalize().unwrap()
         );
     }
 
