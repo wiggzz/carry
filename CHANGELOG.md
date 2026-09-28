@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.11.0](https://github.com/wiggzz/carry/compare/v0.10.0...v0.11.0) (2026-09-28)
+
+
+### Features
+
+* **defaults:** use Sol for Carry and Luna for SWE-bench ([#130](https://github.com/wiggzz/carry/issues/130)) ([97c2b49](https://github.com/wiggzz/carry/commit/97c2b49b988c605e609021e67332c3ab38508b1e))
+* improve context retention and session visibility ([#136](https://github.com/wiggzz/carry/issues/136)) ([05a3f4c](https://github.com/wiggzz/carry/commit/05a3f4cf8df39543c48a83db2bf373633342486e))
+* **shell:** let model set command timeouts ([#133](https://github.com/wiggzz/carry/issues/133)) ([3649cf4](https://github.com/wiggzz/carry/commit/3649cf4c019ae9d0ad7287708eb14367d251daaa))
+* **web:** show reasoning and token usage in footer ([4de7c59](https://github.com/wiggzz/carry/commit/4de7c5911814b109360ae75cf2f78e0eba285d1b))
+* **web:** show remembered notes in activity ([a3a9f16](https://github.com/wiggzz/carry/commit/a3a9f16505f9f3b7b772168f065c956da5cb1356))
+* **web:** show selected model in footer ([003a129](https://github.com/wiggzz/carry/commit/003a129b1b71160ffdcea7e204100bb65b316adf))
+
+
+### Bug Fixes
+
+* **benchmark:** fail closed on duplicate SymPy tests ([#127](https://github.com/wiggzz/carry/issues/127)) ([64b8f00](https://github.com/wiggzz/carry/commit/64b8f0095ceb7a65f823bc7c6c8ad7fc788ce6c5))
+* **benchmark:** grade captured patches after task timeouts ([#131](https://github.com/wiggzz/carry/issues/131)) ([dccddf0](https://github.com/wiggzz/carry/commit/dccddf081e2975137adb7bae0a11a5aea789fa96))
+* **benchmark:** repair standard catalog readiness recipes ([#129](https://github.com/wiggzz/carry/issues/129)) ([4febda6](https://github.com/wiggzz/carry/commit/4febda680d0dbfc7d4245c882cd59dfb7e689197))
+* **context:** preserve guidance checks and tool failure learnings ([a3808c1](https://github.com/wiggzz/carry/commit/a3808c146bc6e9b4f111b7a5703042cd3baf7ed5))
+* **context:** protect remembered facts by default ([71d135e](https://github.com/wiggzz/carry/commit/71d135e1d57c5620473e7e72dea69e733ab82230))
+* focus web input and keep web logs off terminal ([7fed255](https://github.com/wiggzz/carry/commit/7fed2558fbe8d0e79aaa8c48abab5be020196dc3))
+* **prompt:** omit MCP instructions without configured servers ([e57d47b](https://github.com/wiggzz/carry/commit/e57d47b962073a4895b4e97c790063ef3ff994d4))
+* retain assistant text preceding tool calls ([91e73d2](https://github.com/wiggzz/carry/commit/91e73d23863fb96015b3630c430053b3f6cfc270))
+* **test:** avoid redundant closure in web session test ([be5b289](https://github.com/wiggzz/carry/commit/be5b289b565988d55bf324b86239194cbf954249))
+
 ## [0.10.0](https://github.com/wiggzz/carry/compare/v0.9.0...v0.10.0) (2026-09-23)
 
 
