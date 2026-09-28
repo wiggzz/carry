@@ -26,7 +26,7 @@ const sessionRequests = [];
 const sandbox = {
   fetch(url) {
     sessionRequests.push(url);
-    return Promise.resolve({ ok: true, json: async () => ({ state: 'waiting', model: 'gpt-6-sol' }) });
+    return Promise.resolve({ ok: true, json: async () => ({ state: 'waiting', model: 'gpt-6-sol', reasoning_effort: 'medium' }) });
   },
   document,
   window: { addEventListener() {}, innerHeight: 0, scrollTo() {}, scrollY: 0, location: 'http://localhost/' },
@@ -50,10 +50,13 @@ vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], sandbox);
   assert.deepEqual(sessionRequests, ['/api/v1/session']);
   assert.ok(html.includes('id="stat-model"'), 'footer must contain a model field');
   assert.equal(elements.get('#stat-model').textContent, 'gpt-6-sol', 'model should be visible before first message');
-  vm.runInContext("event({event:'run_started',data:{cwd:'/tmp',model:'gpt-6-luna'}})", sandbox);
+  assert.equal(elements.get('#stat-reasoning').textContent, 'medium', 'reasoning should be visible before first message');
+  vm.runInContext("event({event:'run_started',data:{cwd:'/tmp',model:'gpt-6-luna',reasoning_effort:'high'}})", sandbox);
   assert.equal(elements.get('#stat-model').textContent, 'gpt-6-luna');
-  vm.runInContext("event({event:'session_resumed',data:{model:'gpt-6-sol'}})", sandbox);
+  assert.equal(elements.get('#stat-reasoning').textContent, 'high');
+  vm.runInContext("event({event:'session_resumed',data:{model:'gpt-6-sol',reasoning_effort:'low'}})", sandbox);
   assert.equal(elements.get('#stat-model').textContent, 'gpt-6-sol');
+  assert.equal(elements.get('#stat-reasoning').textContent, 'low');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
 // Memory notes appear once for accepted memories, including on history replay.
@@ -155,13 +158,15 @@ event(usageEvent);event(usageEvent);
 `, sandbox);
 const usageLines = [...elements.values()].flatMap(el => el.children).filter(el => el.className === 'entry response-usage muted');
 assert.equal(usageLines.filter(el => el.textContent === 'Response 4 · 1200 input (800 cached) · 75 output · 1275 total tokens').length, 1, 'per-response usage must be visible and deduplicated on replay');
-assert.ok(!html.includes('id="stat-time"') && !html.includes('id="stat-tokens"'), 'footer should not contain timer or cumulative tokens');
+assert.ok(html.includes('id="stat-usage"'), 'footer should show cumulative usage');
 vm.runInContext(`
 totals.cost=0;totals.costUnknown=false;
 const costEvent={run_id:'cost',seq:1,event:'model_response',data:{usage:{},estimated_cost_usd:0.258}};
 event(costEvent);event(costEvent);
 `, sandbox);
 assert.equal(elements.get('#stat-cost').textContent, '$0.2580');
+assert.equal(elements.get('#stat-usage').textContent, '1.2k input (800 cached) 75 output tokens');
 vm.runInContext(`event({event:'model_response',data:{usage:{},estimated_cost_usd:null}});`, sandbox);
-vm.runInContext('totals.total=2520000;totals.cached=2400000;totals.output=120000;renderStats()', sandbox);
-assert.equal(elements.get('#stat-cost').textContent, '2.5m tokens (2.4m cached, 120k out)');
+vm.runInContext('totals.input=2520000;totals.total=2520000;totals.cached=2400000;totals.output=120000;renderStats()', sandbox);
+assert.equal(elements.get('#stat-usage').textContent, '2.5m input (2.4m cached) 120k output tokens');
+assert.equal(elements.get('#stat-cost').textContent, 'pricing unavailable');

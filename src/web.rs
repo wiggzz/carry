@@ -30,6 +30,7 @@ struct AppState {
     session_dir: Arc<std::path::PathBuf>,
     status: Arc<Mutex<&'static str>>,
     model: String,
+    reasoning_effort: String,
 }
 
 #[derive(Deserialize)]
@@ -42,6 +43,7 @@ struct MessageRequest {
 struct Session {
     state: &'static str,
     model: String,
+    reasoning_effort: String,
 }
 
 pub async fn serve(
@@ -90,6 +92,7 @@ pub async fn serve(
         session_dir: Arc::new(config.session_dir.clone()),
         status: Arc::new(Mutex::new("waiting")),
         model: config.model.clone(),
+        reasoning_effort: config.reasoning_effort.clone(),
     };
     let runner_state = state.clone();
     tokio::spawn(async move {
@@ -162,6 +165,7 @@ async fn session(State(state): State<AppState>) -> Json<Session> {
     Json(Session {
         state: *state.status.lock().await,
         model: state.model.clone(),
+        reasoning_effort: state.reasoning_effort.clone(),
     })
 }
 async fn message(
@@ -294,10 +298,12 @@ mod tests {
             session_dir: Arc::new(std::path::PathBuf::from("unused")),
             status: Arc::new(Mutex::new("waiting")),
             model: "gpt-6-luna".to_owned(),
+            reasoning_effort: "high".to_owned(),
         };
         let Json(session) = session(State(state)).await;
         assert_eq!(session.state, "waiting");
         assert_eq!(session.model, "gpt-6-luna");
+        assert_eq!(session.reasoning_effort, "high");
     }
 
     #[tokio::test]
@@ -310,6 +316,7 @@ mod tests {
             session_dir: Arc::new(std::path::PathBuf::from("unused")),
             status: Arc::new(Mutex::new("waiting")),
             model: "scripted".to_owned(),
+            reasoning_effort: "medium".to_owned(),
         };
 
         let response = message(
