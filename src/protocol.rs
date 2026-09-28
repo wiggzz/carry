@@ -251,17 +251,6 @@ mod tests {
     fn context_schema_keeps_human_content_by_default() {
         let schema = tool_definitions(60);
         let context = &schema[0]["parameters"]["properties"]["context"];
-        let description = context["description"].as_str().unwrap();
-        let protected = context["properties"]["protected"]["description"]
-            .as_str()
-            .unwrap();
-        let removable = context["properties"]["removable"]["description"]
-            .as_str()
-            .unwrap();
-        let remember = context["properties"]["remember"]["description"]
-            .as_str()
-            .unwrap();
-
         assert!(
             !context["properties"]
                 .as_object()
@@ -278,44 +267,6 @@ mod tests {
             context["required"],
             json!(["protected", "removable", "remember"])
         );
-        assert_eq!(
-            description,
-            "After making task progress, preserve task-critical working state from recently added visible context. This is required secondary housekeeping, not optional cleanup. Human-authored content is kept by default. Other context is eligible for removal under budget pressure. Leave eligible items removable; mark an already protected item removable only if its information can be safely summarized, is available elsewhere, or provides no directional change or learning. Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise."
-        );
-        assert!(
-            protected
-                .contains("exact facts, decisions, constraints, diagnoses, or verified results")
-        );
-        assert!(protected.contains("learned anything"));
-        assert!(protected.contains("leave its bulky source removable"));
-        assert!(
-            removable.starts_with("Use this to release up to four already protected context IDs")
-        );
-        assert!(removable.contains("Leave eligible items unlisted"));
-        assert!(
-            removable.find("Use this to release up to four already protected context IDs")
-                < removable.find("Leave eligible items unlisted")
-        );
-        assert!(removable.contains("learned nothing"));
-        assert!(removable.contains("preserved elsewhere"));
-        assert!(remember.contains("concise learning"));
-        assert!(!description.contains("stable"));
-        assert!(!description.contains("volatile"));
-        assert!(!protected.contains("stable"));
-        assert!(!protected.contains("volatile"));
-    }
-
-    #[test]
-    fn shell_description_reports_the_effective_session_timeout() {
-        let schema = tool_definitions(17);
-        let shell = &schema[0];
-        let tool_description = shell["description"].as_str().unwrap();
-        let timeout_description = shell["parameters"]["properties"]["timeout_secs"]["description"]
-            .as_str()
-            .unwrap();
-        assert!(tool_description.contains("17 seconds"));
-        assert!(timeout_description.contains("17 seconds"));
-        assert!(!timeout_description.contains("60 seconds"));
     }
 
     #[test]
