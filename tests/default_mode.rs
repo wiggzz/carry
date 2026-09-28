@@ -120,7 +120,7 @@ fn web_session_keeps_log_out_of_terminal() {
         .stderr(stderr)
         .spawn()
         .unwrap();
-    let result = (|| {
+    {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let url = loop {
             let output = std::fs::read_to_string(&stderr_path).unwrap();
@@ -160,8 +160,7 @@ fn web_session_keeps_log_out_of_terminal() {
             !terminal.contains("done") && !terminal.contains("Session started"),
             "web log leaked to terminal: {terminal}"
         );
-    })();
+    }
     let _ = child.kill();
     child.wait().unwrap();
-    result
 }
