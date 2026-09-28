@@ -22,7 +22,12 @@ const document = {
   createTextNode(value) { return { textContent: value }; },
   documentElement: { scrollHeight: 0 },
 };
+const sessionRequests = [];
 const sandbox = {
+  fetch(url) {
+    sessionRequests.push(url);
+    return Promise.resolve({ ok: true, json: async () => ({ state: 'waiting', model: 'gpt-6-sol' }) });
+  },
   document,
   window: { addEventListener() {}, innerHeight: 0, scrollTo() {}, scrollY: 0, location: 'http://localhost/' },
   crypto: {
@@ -40,6 +45,17 @@ const sandbox = {
 vm.createContext(sandbox);
 const html = fs.readFileSync(path.join(process.cwd(), 'src/web/index.html'), 'utf8');
 vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], sandbox);
+(async () => {
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(sessionRequests, ['/api/v1/session']);
+  assert.ok(html.includes('id="stat-model"'), 'footer must contain a model field');
+  assert.equal(elements.get('#stat-model').textContent, 'gpt-6-sol', 'model should be visible before first message');
+  vm.runInContext("event({event:'run_started',data:{cwd:'/tmp',model:'gpt-6-luna'}})", sandbox);
+  assert.equal(elements.get('#stat-model').textContent, 'gpt-6-luna');
+  vm.runInContext("event({event:'session_resumed',data:{model:'gpt-6-sol'}})", sandbox);
+  assert.equal(elements.get('#stat-model').textContent, 'gpt-6-sol');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+
 vm.runInContext(`
 const replayed = {run_id:'test', seq:1, event:'model_response', data:{usage:{total_tokens:10}}};
 event(replayed); event({event:'history_complete'});
