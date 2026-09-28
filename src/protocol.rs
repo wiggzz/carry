@@ -165,23 +165,22 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Leave context.protected, context.removable, and context.remember empty unless there is a reason to use them. Preserve new, important facts that may otherwise be lost, including guidance-check scope and lessons from failures, but do not repeat what is already kept. Human-authored content is kept by default; other items are eligible for removal under budget pressure. Retention decisions persist until reversed or applied by compaction.",
         "properties": {
             "protected": {
                 "type": "array",
-                "description": "Protect up to four IDs with exact facts needed later and not already preserved. Leave eligible items alone. Protecting an ID reverses a removable decision.",
+                "description": "Protect up to four context item IDs that contained useful learnings or exact facts which need to be preserved. Items which are unprotected may be removed immediately by compaction, so ensure that you protect items if you need them. Human-authored content and memories will be retained by default, so there is no need to protect them.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "removable": {
                 "type": "array",
-                "description": "Release up to four protected IDs when their information is no longer needed or is kept elsewhere. Leave eligible items unlisted. Marking an ID removable reverses protection.",
+                "description": "Mark up to four context item IDs as removable when their information is no longer needed or is kept elsewhere. Marking an ID removable reverses protection. Consider removing redundant items when the learnings from the associated text, function call or function output is preserved elsewhere.",
                 "items": { "type": "integer", "minimum": 1 },
                 "maxItems": 4
             },
             "remember": {
                 "type": "array",
-                "description": "At most one short, new fact worth keeping, not a recap of every tool call. Keep guidance-check scope and failure lessons once, not repeatedly. When this replaces a bulky source, leave it removable or mark it removable if protected.",
+                "description": "Add a concise additional fact to be preserved. Do this if you see a large item that is not useful verbatim, and any learnings from it are expected to remain useful for a long time and would be better preserved by a concise memory rather than the original assistant response, function call and function output. In that case, leave the item unprotected (or, mark it removable if it was previously protected) and capture its learnings as a memory.",
                 "items": { "type": "string" },
                 "maxItems": 1
             }
@@ -197,7 +196,7 @@ pub fn tool_definitions(default_shell_timeout_secs: u64) -> Value {
         {
             "type": "function",
             "name": "shell",
-            "description": format!("Run one noninteractive shell command in the assigned repository. Use it to inspect files, edit files, and run tests. The command runs through /bin/sh -lc with no stdin; stdout and stderr are returned in one function result. Set timeout_secs for commands that need a shorter or longer deadline; null uses this session's default of {default_shell_timeout_secs} seconds. Commands must terminate on their own."),
+            "description": format!("Run one noninteractive shell command in the working directory. The command runs through /bin/sh -lc with no stdin; stdout and stderr are returned in one function result. Set timeout_secs for commands that need a shorter or longer deadline; null uses this session's default of {default_shell_timeout_secs} seconds. Commands must terminate on their own."),
             "strict": true,
             "parameters": {
                 "type": "object",
@@ -225,7 +224,7 @@ pub fn tool_definitions(default_shell_timeout_secs: u64) -> Value {
         {
             "type": "function",
             "name": "finish",
-            "description": "End the run only when the coding task is complete and relevant verification has passed, or when no further useful work is possible. No shell command is executed.",
+            "description": "End the run only when the requested task is complete and relevant verification has passed, or when no further useful work is possible. No shell command is executed.",
             "strict": true,
             "parameters": {
                 "type": "object",

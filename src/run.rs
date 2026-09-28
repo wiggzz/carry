@@ -38,11 +38,19 @@ Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files
 
 Large stdout and stderr results arrive in separate structured sections. Each text payload is unmodified; truncation, encoding, and artifact-path metadata are outside that payload. Read or slice the relevant stdout/stderr artifact when omitted details matter.
 
-History is a working set, not a complete transcript. Human-authored content is kept by default. All other context is eligible for removal when it no longer fits the working set. After the first removal, a history-status item states that earlier context has been removed.
+History is a working set, not a complete transcript. Human-authored content and memories are kept by default. All other context is eligible for removal.
 
-Leave `context.protected`, `context.removable`, and `context.remember` empty unless there is a reason to use them. Use `context.remember` for a short, new fact worth keeping, not a recap of every tool call. Preserve guidance checks (including their scope) and lessons from failures once; do not repeat failed approaches. Use `context.removable` to release protected items when they are no longer needed.
+Each completed tool step has one context item ID covering the complete assistant reasoning, text and function call together with the resulting tool output.
 
-Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise. Preserve outcomes, not chain-of-thought."#;
+Use `context.protected` to protect context items where any part contains valuable learnings, decisions or outcomes (including failures). Use `context.removable` to release protected items after their learnings are preserved elsewhere. Use `context.remember` instead of protecting a context item only if the item is very large and it's learnings don't need to be preserved exactly. Memories are additive, so there is no need to repeat prior memories unless you need to change them, in which case you should mark the prior memory removable so it can eventually be removed.
+
+On your next tool call, decide whether to protect the immediately preceding tool step. Compaction may run after your next tool call and remove any unprotected step, including the preceding step if you don't protect it on this call. By default, protect the previous step if it contained anything you still need and haven't preserved elsewhere; otherwise you may need to repeat work.
+
+For example, if you search for something and find nothing, this is important because it indicates a real negative result. Or, if a tool call fails, protect it because the reason it failed is important information. However, if the failure resulted in a large amount of non-useful output, leave it unprotected and capture the learnings as a memory instead.
+
+As you move past detailed work on a section of code or implementation, once items are no longer informing your work, you may begin to mark items removable if the exact details are unimportant and the information can be re-discovered easily. Consider adding concise memories when an important fact could otherwise be lost.
+
+For example, once you have finished an implementation and there are several edits and rereads of files, consider leaving the final read back in place and marking the earlier edits removable."#;
 
 const MCP_PROMPT: &str = r#"MCP tools are available through the exact Carry executable in `$CARRY_SELF`. Discover tool names with `"$CARRY_SELF" mcp list` or scope discovery with `"$CARRY_SELF" mcp list --server SERVER`, inspect a tool's full description and schema with `"$CARRY_SELF" mcp describe SERVER/TOOL`, and invoke it with `"$CARRY_SELF" mcp call SERVER/TOOL '{"argument":"value"}'`. For complex arguments, pipe a JSON object to `"$CARRY_SELF" mcp call SERVER/TOOL --stdin`. MCP command output is JSON by default; `--json-pointer /path/to/value` selects part of call output and prints a selected string as raw text unless `--json` is passed. If a server requires authorization, ask the user to run `"$CARRY_SELF" mcp auth SERVER`."#;
 
