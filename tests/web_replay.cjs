@@ -10,6 +10,7 @@ const element = () => ({
   append(...items) { this.children.push(...items); },
   remove() { this.removed = true; },
   addEventListener() {},
+  focus() { this.focused = true; },
   querySelector() { return null; },
 });
 const elements = new Map();
@@ -45,6 +46,7 @@ const sandbox = {
 vm.createContext(sandbox);
 const html = fs.readFileSync(path.join(process.cwd(), 'src/web/index.html'), 'utf8');
 vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], sandbox);
+assert.equal(elements.get('#text').focused, true, 'composer should be focused at startup');
 (async () => {
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(sessionRequests, ['/api/v1/session']);

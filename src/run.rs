@@ -808,7 +808,7 @@ async fn run_loop(
                     .unwrap_or(&progress.preview);
                 if !terminal_preview.is_empty() && *terminal_preview != displayed_preview {
                     use std::io::IsTerminal;
-                    if std::io::stderr().is_terminal() {
+                    if events.is_none() && std::io::stderr().is_terminal() {
                         if let Some(delta) = terminal_preview.strip_prefix(&displayed_preview) {
                             stream_output.push(delta);
                         } else {
@@ -1014,7 +1014,7 @@ async fn run_loop(
                     std::io::stdout().is_terminal(),
                 );
                 if let Some(receiver) = input.as_mut() {
-                    if !answer_streamed {
+                    if !answer_streamed && events.is_none() {
                         crate::terminal::print_answer(answer.as_deref().unwrap_or_default());
                     }
                     let (mut should_exit, had_messages) =

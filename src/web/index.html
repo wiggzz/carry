@@ -20,6 +20,7 @@ body{max-width:900px;margin:auto;padding:1rem}header{display:flex;justify-conten
 </section></form>
 <script>
 const activity=document.querySelector('#activity'),status=document.querySelector('#status'),text=document.querySelector('#text');
+text.focus();
 const queued=document.querySelector('#queued');
 const stat={model:document.querySelector('#stat-model'),reasoning:document.querySelector('#stat-reasoning'),usage:document.querySelector('#stat-usage'),cost:document.querySelector('#stat-cost')};
 fetch('/api/v1/session').then(response=>response.json()).then(session=>{if(!stat.model.textContent||stat.model.textContent==='—')stat.model.textContent=session.model;if((!stat.reasoning.textContent||stat.reasoning.textContent==='—')&&session.reasoning_effort)stat.reasoning.textContent=session.reasoning_effort}).catch(()=>{});

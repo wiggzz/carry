@@ -100,3 +100,68 @@ fn web_startup_opens_browser_at_bound_address() {
         "browser URL must use the actual listening port: {url}"
     );
 }
+
+#[test]
+fn web_session_keeps_log_out_of_terminal() {
+    use std::io::{Read, Write};
+    let temp = tempfile::tempdir().unwrap();
+    let steps = temp.path().join("steps.jsonl");
+    std::fs::write(&steps, r#"{"action":{"kind":"finish","answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#).unwrap();
+    let stderr_path = temp.path().join("stderr");
+    let stderr = std::fs::File::create(&stderr_path).unwrap();
+    let session = temp.path().join("session");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_carry"))
+        .args(["--no-open", "--port", "0", "--scripted-steps"])
+        .arg(&steps)
+        .arg("--session-dir")
+        .arg(&session)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    let result = (|| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let url = loop {
+            let output = std::fs::read_to_string(&stderr_path).unwrap();
+            if let Some(url) = output
+                .lines()
+                .find_map(|line| line.strip_prefix("carry web UI: "))
+            {
+                break url.to_owned();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server did not start: {output}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let addr = url.strip_prefix("http://").unwrap();
+        let mut socket = std::net::TcpStream::connect(addr).unwrap();
+        let body = r#"{"message":"hello"}"#;
+        write!(socket, "POST /api/v1/messages HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+        let trace_path = session.join("trace.log");
+        loop {
+            let trace = std::fs::read_to_string(&trace_path).unwrap_or_default();
+            if trace.contains("done") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session did not finish: {trace}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let terminal = std::fs::read_to_string(&stderr_path).unwrap();
+        assert!(
+            !terminal.contains("done") && !terminal.contains("Session started"),
+            "web log leaked to terminal: {terminal}"
+        );
+    })();
+    let _ = child.kill();
+    child.wait().unwrap();
+    result
+}
