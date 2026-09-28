@@ -984,7 +984,7 @@ mod tests {
 
         assert_eq!(
             resolve_resume_session(std::path::Path::new("run-42"), Some(temp.path())).unwrap(),
-            expected
+            expected.canonicalize().unwrap()
         );
     }
 
