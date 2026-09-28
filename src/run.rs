@@ -36,8 +36,6 @@ Make task progress first: understand the request, investigate, implement, and ve
 
 Before working in a folder, search for relevant `AGENTS.md` or `CLAUDE.md` files and read them to understand agent-specific guidance; take relevant guidance onboard.
 
-MCP tools are available through the exact Carry executable in `$CARRY_SELF`. Discover tool names with `"$CARRY_SELF" mcp list` or scope discovery with `"$CARRY_SELF" mcp list --server SERVER`, inspect a tool's full description and schema with `"$CARRY_SELF" mcp describe SERVER/TOOL`, and invoke it with `"$CARRY_SELF" mcp call SERVER/TOOL '{"argument":"value"}'`. For complex arguments, pipe a JSON object to `"$CARRY_SELF" mcp call SERVER/TOOL --stdin`. MCP command output is JSON by default; `--json-pointer /path/to/value` selects part of call output and prints a selected string as raw text unless `--json` is passed. If a server requires authorization, ask the user to run `"$CARRY_SELF" mcp auth SERVER`.
-
 Large stdout and stderr results arrive in separate structured sections. Each text payload is unmodified; truncation, encoding, and artifact-path metadata are outside that payload. Read or slice the relevant stdout/stderr artifact when omitted details matter.
 
 History is a working set, not a complete transcript. Human-authored content is kept by default. All other context is eligible for removal when it no longer fits the working set. After the first removal, a history-status item states that earlier context has been removed.
@@ -46,12 +44,14 @@ As required secondary housekeeping, preserve task-critical working state from re
 
 Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise. Preserve outcomes, not chain-of-thought."#;
 
+const MCP_PROMPT: &str = r#"MCP tools are available through the exact Carry executable in `$CARRY_SELF`. Discover tool names with `"$CARRY_SELF" mcp list` or scope discovery with `"$CARRY_SELF" mcp list --server SERVER`, inspect a tool's full description and schema with `"$CARRY_SELF" mcp describe SERVER/TOOL`, and invoke it with `"$CARRY_SELF" mcp call SERVER/TOOL '{"argument":"value"}'`. For complex arguments, pipe a JSON object to `"$CARRY_SELF" mcp call SERVER/TOOL --stdin`. MCP command output is JSON by default; `--json-pointer /path/to/value` selects part of call output and prints a selected string as raw text unless `--json` is passed. If a server requires authorization, ask the user to run `"$CARRY_SELF" mcp auth SERVER`."#;
+
 fn system_prompt(mcp_servers: &[String]) -> String {
     if mcp_servers.is_empty() {
         return SYSTEM_PROMPT.to_owned();
     }
     format!(
-        "{SYSTEM_PROMPT}\nConfigured MCP servers: {}.\n",
+        "{SYSTEM_PROMPT}\n\n{MCP_PROMPT}\nConfigured MCP servers: {}.\n",
         mcp_servers.join(", ")
     )
 }
@@ -1862,6 +1862,15 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_without_mcp_servers_omits_mcp_instructions() {
+        let prompt = system_prompt(&[]);
+        assert!(!prompt.contains("MCP tools are available"));
+        assert!(!prompt.contains("mcp describe SERVER/TOOL"));
+        assert!(!prompt.contains("Configured MCP servers:"));
+        assert!(prompt.contains("Make task progress first"));
+    }
+
+    #[test]
     fn system_prompt_surfaces_configured_mcp_servers() {
         let prompt = system_prompt(&["github".into(), "notion".into()]);
         assert!(prompt.contains("Configured MCP servers: github, notion."));
@@ -1878,10 +1887,10 @@ mod tests {
             "identify the root cause and make the smallest correct fix at the appropriate layer"
         ));
         assert!(SYSTEM_PROMPT.contains("use local history to investigate regressions"));
-        assert!(SYSTEM_PROMPT.contains("$CARRY_SELF"));
-        assert!(SYSTEM_PROMPT.contains("mcp describe SERVER/TOOL"));
-        assert!(SYSTEM_PROMPT.contains("--stdin"));
-        assert!(SYSTEM_PROMPT.contains("--json-pointer"));
+        assert!(MCP_PROMPT.contains("$CARRY_SELF"));
+        assert!(MCP_PROMPT.contains("mcp describe SERVER/TOOL"));
+        assert!(MCP_PROMPT.contains("--stdin"));
+        assert!(MCP_PROMPT.contains("--json-pointer"));
         assert!(!SYSTEM_PROMPT.contains("later fixes"));
         assert!(!SYSTEM_PROMPT.contains("upstream fix"));
     }
