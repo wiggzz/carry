@@ -879,6 +879,8 @@ async fn run_loop(
             ),
         )?;
 
+        log_assistant_output_text(&mut logger, &reply.raw["output"], step_index)?;
+
         match reply.step.action.kind {
             ActionKind::Shell => {
                 if let Some(message) = reply.step.action.message.as_deref() {
@@ -1245,6 +1247,30 @@ fn maybe_compact(
         ),
     )?;
     Ok(true)
+}
+
+fn log_assistant_output_text(logger: &mut RunLogger, output: &Value, step: usize) -> Result<()> {
+    for message in assistant_output_text(output) {
+        logger.raw_event(
+            "assistant_message",
+            json!({"step": step, "message": message}),
+            &format!("  {message}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn assistant_output_text(output: &Value) -> Vec<&str> {
+    output
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "message" && item["role"] == "assistant")
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .filter(|part| part["type"] == "output_text")
+        .filter_map(|part| part["text"].as_str())
+        .filter(|text| !text.is_empty())
+        .collect()
 }
 
 fn terminal_usage(step: usize, latency_ms: u64, retries: usize, usage: &Usage) -> String {
@@ -2563,6 +2589,47 @@ mod tests {
         let resumed = load_resume_state(temp.path()).unwrap();
         assert_eq!(resumed.model, "gpt-5.6-luna");
         assert_eq!(resumed.prompt_cache_key, None);
+    }
+
+    #[test]
+    fn completed_assistant_text_before_finish_is_kept_in_order() {
+        let output = json!([
+            {"type":"reasoning"},
+            {"type":"message", "role":"assistant", "content":[
+                {"type":"output_text", "text":"First paragraph."},
+                {"type":"output_text", "text":"Second paragraph."}
+            ]},
+            {"type":"function_call", "name":"finish"}
+        ]);
+        assert_eq!(
+            assistant_output_text(&output),
+            vec!["First paragraph.", "Second paragraph."]
+        );
+    }
+
+    #[test]
+    fn completed_assistant_text_is_logged_as_durable_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut logger = RunLogger::create_with_events(temp.path(), None).unwrap();
+        let output = json!([
+            {"type":"reasoning"},
+            {"type":"message", "role":"assistant", "content":[
+                {"type":"output_text", "text":"Explanation"},
+                {"type":"output_text", "text":"More context"}
+            ]},
+            {"type":"function_call", "name":"finish"}
+        ]);
+        log_assistant_output_text(&mut logger, &output, 3).unwrap();
+        let events: Vec<Value> = std::fs::read_to_string(temp.path().join("trace.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "assistant_message");
+        assert_eq!(events[0]["data"]["message"], "Explanation");
+        assert_eq!(events[1]["data"]["message"], "More context");
+        assert_eq!(events[1]["data"]["step"], 3);
     }
 
     #[tokio::test]

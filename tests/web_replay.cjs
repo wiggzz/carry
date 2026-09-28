@@ -97,6 +97,11 @@ assert.equal(vm.runInContext('modelProgress.children[0]?.className', sandbox), '
 vm.runInContext(`event({event:'model_response', data:{usage:{}}});`, sandbox);
 assert.equal(vm.runInContext('modelProgress', sandbox), null);
 assert.ok(![...elements.values()].flatMap(el => el.children).some(el => el.textContent === 'Model response received'), 'completion should not leave a redundant response-received item');
+// A response can contain both a free-form assistant message and a finish call.
+vm.runInContext("event({event:'assistant_message', data:{message:'Detailed explanation before the call'}});event({event:'turn_finished', data:{answer:'Final answer referring to the explanation'}})", sandbox);
+const durableText = elements.get('#activity').children.filter(el => el.className === 'entry carry');
+assert.equal(durableText.at(-2).children[0].children[0].children[0].textContent, 'Detailed explanation before the call');
+assert.equal(durableText.at(-1).children[0].children[0].children[0].textContent, 'Final answer referring to the explanation');
 
 (async () => {
   let request;
