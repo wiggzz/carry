@@ -165,7 +165,7 @@ impl Step {
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "description": "After making task progress, preserve task-critical working state from recently added visible context. This is required secondary housekeeping, not optional cleanup. Human-authored content is kept by default. Other context is eligible for removal under budget pressure. Leave eligible items removable; mark an already protected item removable only if its information can be safely summarized, is available elsewhere, or provides no directional change or learning. Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise.",
+        "description": "After making task progress, preserve task-critical working state from recently added visible context. This is required secondary housekeeping, not optional cleanup. Preserve guidance-check outcomes (including scope and absence of guidance) and learnings from failed tool calls. Keep a failed call until its lesson is remembered or represented by a protected successful call; release it only when nothing unique remains. Human-authored content is kept by default. Other context is eligible for removal under budget pressure. Leave eligible items removable; mark an already protected item removable only if its information can be safely summarized, is available elsewhere, or provides no directional change or learning. Retention decisions persist until reversed, applied by compaction, or explicitly noted otherwise.",
         "properties": {
             "protected": {
                 "type": "array",
@@ -181,7 +181,7 @@ fn context_schema() -> Value {
             },
             "remember": {
                 "type": "array",
-                "description": "At most one concise learning that preserves what a bulky source taught you without retaining its exact details. When it safely replaces a bulky source, leave that source removable or mark it removable if it was protected. Preserve outcomes, not chain-of-thought.",
+                "description": "At most one concise learning that preserves what a bulky source taught you without retaining its exact details. Examples include tool limitations and the outcome and scope of repo guidance checks. When it safely replaces a bulky source, leave that source removable or mark it removable if it was protected. Preserve outcomes, not chain-of-thought.",
                 "items": { "type": "string" },
                 "maxItems": 1
             }
