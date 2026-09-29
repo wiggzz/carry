@@ -80,6 +80,30 @@ struct FinishArguments {
 }
 
 impl Step {
+    pub fn from_function_call_for_mode(item: &Value, enabled: bool) -> Result<Self> {
+        if enabled {
+            return Self::from_function_call(item);
+        }
+        let mut call = item.clone();
+        let mut args: Value = serde_json::from_str(
+            item["arguments"]
+                .as_str()
+                .context("function call has no string arguments")?,
+        )?;
+        let object = args
+            .as_object_mut()
+            .context("function arguments must be an object")?;
+        if object.contains_key("context") {
+            bail!("context field is not available with model context management disabled");
+        }
+        object.insert(
+            "context".into(),
+            serde_json::to_value(ContextManagement::default())?,
+        );
+        call["arguments"] = json!(args.to_string());
+        Self::from_function_call(&call)
+    }
+
     pub fn from_function_call(item: &Value) -> Result<Self> {
         let name = item["name"].as_str().context("function call has no name")?;
         let arguments = item["arguments"]
@@ -159,6 +183,16 @@ impl Step {
             "name": name,
             "arguments": arguments
         }))
+    }
+
+    pub fn synthetic_function_call_for_mode(&self, call_id: &str, enabled: bool) -> Result<Value> {
+        let mut call = self.synthetic_function_call(call_id)?;
+        if !enabled {
+            let mut args: Value = serde_json::from_str(call["arguments"].as_str().unwrap())?;
+            args.as_object_mut().unwrap().remove("context");
+            call["arguments"] = json!(args.to_string());
+        }
+        Ok(call)
     }
 }
 
@@ -242,9 +276,70 @@ pub fn tool_definitions(default_shell_timeout_secs: u64) -> Value {
     ])
 }
 
+pub fn tool_definitions_for_mode(default_shell_timeout_secs: u64, enabled: bool) -> Value {
+    let mut tools = tool_definitions(default_shell_timeout_secs);
+    if !enabled {
+        for tool in tools.as_array_mut().unwrap() {
+            let params = &mut tool["parameters"];
+            params["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("context");
+            params["required"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|field| field != "context");
+        }
+    }
+    tools
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_free_wire_contract_has_only_action_fields() {
+        let tools = tool_definitions_for_mode(60, false);
+        for tool in tools.as_array().unwrap() {
+            let params = &tool["parameters"];
+            assert!(params["properties"].get("context").is_none());
+            assert!(
+                !params["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("context"))
+            );
+            assert_eq!(params["additionalProperties"], false);
+        }
+        assert!(
+            tool_definitions_for_mode(60, true)[0]["parameters"]["properties"]
+                .get("context")
+                .is_some()
+        );
+        for (name, arguments) in [
+            (
+                "shell",
+                json!({"command":"true", "message":null, "timeout_secs":null}),
+            ),
+            ("finish", json!({"answer":"done"})),
+        ] {
+            let call = json!({"name":name, "arguments":arguments.to_string()});
+            let step = Step::from_function_call_for_mode(&call, false).unwrap();
+            assert_eq!(step.context, ContextManagement::default());
+            let echo = step
+                .synthetic_function_call_for_mode("call-2", false)
+                .unwrap();
+            let echoed: Value = serde_json::from_str(echo["arguments"].as_str().unwrap()).unwrap();
+            assert!(echoed.get("context").is_none());
+            assert_eq!(echoed, arguments);
+            let mut invalid = arguments;
+            invalid["context"] = json!({"protected":[],"removable":[],"remember":[]});
+            let invalid_call = json!({"name":name, "arguments":invalid.to_string()});
+            assert!(Step::from_function_call_for_mode(&invalid_call, false).is_err());
+            assert!(Step::from_function_call_for_mode(&call, true).is_err());
+        }
+    }
 
     #[test]
     fn context_schema_keeps_human_content_by_default() {

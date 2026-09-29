@@ -7,12 +7,14 @@ import hashlib
 import importlib.util
 import itertools
 import json
+import io
 import os
 import pathlib
 import shutil
 import shlex
 import subprocess
 import sys
+import tarfile
 import tempfile
 import types
 import unittest
@@ -63,6 +65,8 @@ class SmokeWorkerTests(unittest.TestCase):
         config = self.worker.validate_config(valid)
         self.assertEqual(config["PI_VERSION"], "0.84.2")
         self.assertEqual(config["CARRY_COMPACTION_POLICY"], "economic")
+        self.assertEqual(config["CARRY_MODEL_CONTEXT_MANAGEMENT"], "enabled")
+        self.assertEqual(self.worker.validate_config(dict(valid, CARRY_MODEL_CONTEXT_MANAGEMENT="disabled"))["CARRY_MODEL_CONTEXT_MANAGEMENT"], "disabled")
         self.assertEqual(config["CARRY_COMPACTION_PAYOFF_REQUESTS"], "1")
         self.assertEqual(config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"], "25")
         self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "0")
@@ -81,6 +85,8 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(rollout["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"], "10")
         for key, value in (("BASE_IMAGE", "node:22"), ("CODEX_VERSION", "latest"),
                            ("CARRY_COMPACTION_POLICY", "adaptive"),
+                           ("CARRY_MODEL_CONTEXT_MANAGEMENT", ""),
+                           ("CARRY_MODEL_CONTEXT_MANAGEMENT", "off"),
                            ("CARRY_COMPACTION_MIN_PAYBACK_PERCENT", "101"),
                            ("CARRY_COMPACTION_ROLLOUT_SAMPLES", "65")):
             bad = dict(valid)
@@ -99,6 +105,50 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(inputs["carry_compaction_neutral_high_watermark_tokens"]["default"], "0")
         self.assertEqual(inputs["carry_compaction_neutral_low_watermark_tokens"]["default"], "0")
         self.assertEqual(inputs["carry_compaction_min_payback_percent"]["default"], "25")
+        self.assertEqual(inputs["carry_model_context_management"]["default"], "enabled")
+        self.assertEqual(inputs["carry_model_context_management"]["options"], ["enabled", "disabled"])
+        self.assertEqual(contents["jobs"]["bootstrap-worker"]["env"]["CARRY_MODEL_CONTEXT_MANAGEMENT"], "${{ inputs.carry_model_context_management }}")
+
+    def test_workflow_rejects_report_with_wrong_model_context_mode(self):
+        workflow = pathlib.Path(__file__).parents[1] / ".github" / "workflows" / "run-swebench.yml"
+        contents = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        steps = contents["jobs"]["bootstrap-worker"]["steps"]
+        command = next(step["run"] for step in steps if step.get("name") == "Validate fixed-denominator results")
+        root = workflow.parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory)
+            manifests = target / "benchmarks"
+            manifests.mkdir()
+            for name in ("swe-bench-verified-50.json", "swe-bench-verified-smoke-5.json"):
+                shutil.copyfile(root / "benchmarks" / name, manifests / name)
+            selected = json.loads((manifests / "swe-bench-verified-smoke-5.json").read_text())["instance_ids"]
+            artifact = target / "benchmark-artifact"
+            artifact.mkdir()
+            (artifact / "worker-exit-status").write_text("0\n")
+            records = [{"instance_id": task, "harness": "carry", "attempt": 1, "status": "evaluated"}
+                       for task in selected]
+
+            def gate(reported, requested):
+                report = {"denominator": len(selected), "attempt_numbers": [1],
+                          "provenance": {"phase": "complete"}}
+                if reported is not None:
+                    report["provenance"]["carry_model_context_management"] = reported
+                with tarfile.open(artifact / "results.tar.gz", "w:gz") as archive:
+                    for name, data in (("records.json", records), ("report.json", report)):
+                        payload = json.dumps(data).encode()
+                        info = tarfile.TarInfo(name)
+                        info.size = len(payload)
+                        archive.addfile(info, io.BytesIO(payload))
+                return subprocess.run(["bash", "-c", command], cwd=target,
+                                      env=dict(os.environ, BENCHMARK_MODE="smoke-5", BENCHMARK_HARNESS="carry",
+                                               BENCHMARK_ATTEMPT="1", BENCHMARK_ATTEMPTS="1",
+                                               CARRY_MODEL_CONTEXT_MANAGEMENT=requested),
+                                      capture_output=True, text=True)
+
+            self.assertEqual(gate("disabled", "disabled").returncode, 0)
+            self.assertNotEqual(gate("enabled", "disabled").returncode, 0)
+            self.assertNotEqual(gate(None, "disabled").returncode, 0)
+            self.assertEqual(gate("enabled", "enabled").returncode, 0)
 
     def test_workflow_benchmark_model_input_controls_protected_worker(self):
         workflow = pathlib.Path(__file__).parents[1] / ".github" / "workflows" / "run-swebench.yml"
@@ -234,6 +284,7 @@ class SmokeWorkerTests(unittest.TestCase):
             self.assertIn("HOME=/agent-home", rendered)
             self.assertIn("AGENT_TIMEOUT_SECONDS=315", rendered)
             self.assertIn("--env\nCARRY_COMPACTION_POLICY", rendered)
+            self.assertIn("--env\nCARRY_MODEL_CONTEXT_MANAGEMENT", rendered)
             self.assertIn("carry-agent-codex-test", rendered)
             self.assertIn("/agent-home:rw", rendered)
             self.assertIn("/tmp:rw", rendered)

@@ -36,6 +36,9 @@ if not os.environ.get("OPENAI_BASE_URL"):
 compaction_policy = os.environ.get("CARRY_COMPACTION_POLICY", "economic")
 if compaction_policy not in {"economic", "disabled"}:
     parser.error("CARRY_COMPACTION_POLICY must be economic or disabled")
+model_context_management = os.environ.get("CARRY_MODEL_CONTEXT_MANAGEMENT", "enabled")
+if model_context_management not in {"enabled", "disabled"}:
+    parser.error("CARRY_MODEL_CONTEXT_MANAGEMENT must be enabled or disabled")
 keep_lease_turns = os.environ.get("CARRY_KEEP_LEASE_TURNS", "")
 if keep_lease_turns and (not keep_lease_turns.isascii() or not keep_lease_turns.isdecimal()
                          or int(keep_lease_turns) < 1):
@@ -96,6 +99,8 @@ command = [part.format(**values) for part in shlex.split(template)]
 if args.harness == "carry" and keep_lease_turns:
     command.extend(["--keep-lease-turns", keep_lease_turns])
 if args.harness == "carry":
+    if model_context_management == "disabled":
+        command.append("--no-model-context-management")
     command.extend(["--compaction-payoff-requests", payoff_requests])
     command.extend(["--compaction-min-payback-percent", min_payback_percent])
     command.extend(["--compaction-rollout-samples", rollout_samples])

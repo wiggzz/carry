@@ -76,6 +76,7 @@ class HarnessEntrypointTests(unittest.TestCase):
                 "assert sys.argv[high + 1] == '0', sys.argv\n"
                 "low=sys.argv.index('--compaction-neutral-low-watermark-tokens')\n"
                 "assert sys.argv[low + 1] == '0', sys.argv\n"
+                "assert '--no-model-context-management' in sys.argv, sys.argv\n"
                 "pathlib.Path('file.txt').write_text('after\\n')\n"
             )
             binary.chmod(0o755)
@@ -83,6 +84,7 @@ class HarnessEntrypointTests(unittest.TestCase):
                        OPENAI_BASE_URL="http://openai-proxy:8080/v1",
                        PREPARED_HARNESS_ROOT=str(root), AGENT_TIMEOUT_SECONDS="30",
                        BENCHMARK_WORKSPACE=str(repo), CARRY_COMPACTION_POLICY="disabled",
+                       CARRY_MODEL_CONTEXT_MANAGEMENT="disabled",
                        CARRY_KEEP_LEASE_TURNS="8", CARRY_COMPACTION_PAYOFF_REQUESTS="5",
                        CARRY_COMPACTION_MIN_PAYBACK_PERCENT="25", CARRY_COMPACTION_ROLLOUT_SAMPLES="16",
                        CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT="10")

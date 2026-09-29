@@ -384,6 +384,15 @@ impl ContextState {
         self.render_with_compatible_breakpoints(&self.items)
     }
 
+    /// Unmodified provider history for sessions with model context management disabled.
+    /// No item IDs, cache-frontier markers, review advice, or synthetic memories.
+    pub fn plain_input_items(&self) -> Vec<Value> {
+        self.items
+            .iter()
+            .flat_map(|item| item.input_items.iter().cloned())
+            .collect()
+    }
+
     fn render_items(items: &[ContextItem], breakpoint_frontiers: &[u64]) -> Vec<Value> {
         Self::render_items_through(items, breakpoint_frontiers, None)
     }

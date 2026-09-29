@@ -54,12 +54,20 @@ For example, once you have finished an implementation and there are several edit
 
 const MCP_PROMPT: &str = r#"MCP tools are available through the exact Carry executable in `$CARRY_SELF`. Discover tool names with `"$CARRY_SELF" mcp list` or scope discovery with `"$CARRY_SELF" mcp list --server SERVER`, inspect a tool's full description and schema with `"$CARRY_SELF" mcp describe SERVER/TOOL`, and invoke it with `"$CARRY_SELF" mcp call SERVER/TOOL '{"argument":"value"}'`. For complex arguments, pipe a JSON object to `"$CARRY_SELF" mcp call SERVER/TOOL --stdin`. MCP command output is JSON by default; `--json-pointer /path/to/value` selects part of call output and prints a selected string as raw text unless `--json` is passed. If a server requires authorization, ask the user to run `"$CARRY_SELF" mcp auth SERVER`."#;
 
-fn system_prompt(mcp_servers: &[String]) -> String {
+fn system_prompt(mcp_servers: &[String], model_context_management_enabled: bool) -> String {
+    let base = if model_context_management_enabled {
+        SYSTEM_PROMPT
+    } else {
+        SYSTEM_PROMPT
+            .split_once("\nHistory is a working set")
+            .expect("system prompt has a distinct context-management section")
+            .0
+    };
     if mcp_servers.is_empty() {
-        return SYSTEM_PROMPT.to_owned();
+        return base.to_owned();
     }
     format!(
-        "{SYSTEM_PROMPT}\n\n{MCP_PROMPT}\nConfigured MCP servers: {}.\n",
+        "{base}\n\n{MCP_PROMPT}\nConfigured MCP servers: {}.\n",
         mcp_servers.join(", ")
     )
 }
@@ -80,6 +88,7 @@ pub struct RunConfig {
     pub reasoning_effort: String,
     pub max_steps: Option<usize>,
     pub default_shell_timeout_secs: u64,
+    pub model_context_management_enabled: bool,
     pub compaction_mode: CompactionMode,
     /// Experimental: revalidate model-requested protected context after this many model turns.
     pub keep_lease_turns: Option<u64>,
@@ -111,6 +120,11 @@ pub struct ResumeState {
     pub context: ContextState,
     pub model: String,
     pub prompt_cache_key: Option<String>,
+    pub model_context_management_enabled: bool,
+}
+
+fn default_model_context_management_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -118,6 +132,8 @@ struct ContextCheckpoint {
     version: u32,
     model: String,
     context: ContextState,
+    #[serde(default = "default_model_context_management_enabled")]
+    model_context_management_enabled: bool,
     /// Missing from pre-cache-affinity checkpoints; such sessions resume normally.
     #[serde(default)]
     prompt_cache_key: Option<String>,
@@ -141,6 +157,7 @@ pub fn load_resume_state(session_dir: &Path) -> Result<ResumeState> {
         context: checkpoint.context,
         model: checkpoint.model,
         prompt_cache_key: checkpoint.prompt_cache_key,
+        model_context_management_enabled: checkpoint.model_context_management_enabled,
     })
 }
 
@@ -156,6 +173,7 @@ fn persist_context_checkpoint(config: &RunConfig, state: &ContextState) -> Resul
         version: CONTEXT_CHECKPOINT_VERSION,
         model: config.model.clone(),
         context: state.clone(),
+        model_context_management_enabled: config.model_context_management_enabled,
         prompt_cache_key: config.prompt_cache_key.clone(),
     };
     let bytes = serde_json::to_vec(&checkpoint)?;
@@ -184,7 +202,7 @@ fn persist_context_checkpoint(config: &RunConfig, state: &ContextState) -> Resul
 }
 
 pub enum Backend {
-    OpenAi(OpenAiClient),
+    OpenAi(Box<OpenAiClient>),
     Scripted {
         steps: VecDeque<Step>,
         emitted: usize,
@@ -490,7 +508,7 @@ fn cache_alive(activity: Option<Instant>, now: Instant) -> bool {
 
 impl Backend {
     pub fn openai(client: OpenAiClient) -> Self {
-        Self::OpenAi(client)
+        Self::OpenAi(Box::new(client))
     }
 
     fn configure_shell_timeout(&mut self, seconds: u64) {
@@ -556,10 +574,17 @@ impl Backend {
         }
     }
 
+    fn configure_model_context_management(&mut self, enabled: bool) {
+        if let Self::OpenAi(client) = self {
+            client.set_model_context_management_enabled(enabled);
+        }
+    }
+
     async fn step_with_progress<F>(
         &mut self,
         system_prompt: &str,
         history: &[serde_json::Value],
+        model_context_management_enabled: bool,
         progress: F,
     ) -> Result<ModelReply>
     where
@@ -576,8 +601,10 @@ impl Backend {
                     .pop_front()
                     .context("scripted backend ran out of Step objects")?;
                 *emitted += 1;
-                let function_call =
-                    step.synthetic_function_call(&format!("scripted-call-{emitted:04}"))?;
+                let function_call = step.synthetic_function_call_for_mode(
+                    &format!("scripted-call-{emitted:04}"),
+                    model_context_management_enabled,
+                )?;
                 Ok(ModelReply {
                     response_id: format!("scripted-{emitted:04}"),
                     raw: serde_json::to_value(&step)?,
@@ -631,11 +658,12 @@ async fn run_loop(
 ) -> Result<RunOutcome> {
     let run_started = Instant::now();
     backend.configure_shell_timeout(config.default_shell_timeout_secs);
+    backend.configure_model_context_management(config.model_context_management_enabled);
     let mcp_servers = auth::carry_home()
         .ok()
         .and_then(|home| mcp::configured_server_names(&home).ok())
         .unwrap_or_default();
-    let system_prompt = system_prompt(&mcp_servers);
+    let system_prompt = system_prompt(&mcp_servers, config.model_context_management_enabled);
     let prompt_cache_capabilities = backend.prompt_cache_capabilities();
     let implicit_cache_minimum_prefix_tokens =
         backend.implicit_cache_minimum_prefix_tokens(&config.model);
@@ -664,11 +692,12 @@ async fn run_loop(
                 "cwd": config.cwd,
                 "model": config.model,
                 "reasoning_effort": config.reasoning_effort,
-                "history_items": context.input_items().len(),
+                "history_items": if config.model_context_management_enabled { context.input_items().len() } else { context.plain_input_items().len() },
                 "cache_ttl_seconds": CACHE_TTL.as_secs(),
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
-                "compaction_policy": config.compaction_mode,
+                "compaction_policy": if config.model_context_management_enabled { config.compaction_mode } else { CompactionMode::Disabled },
+                "model_context_management_enabled": config.model_context_management_enabled,
                 "compaction_payoff_requests": config.compaction_payoff_requests,
                 "compaction_min_payback_percent": config.compaction_min_payback_percent,
                 "source_session": config.resume_source,
@@ -676,7 +705,7 @@ async fn run_loop(
             &format!(
                 "resumed · {} · {} history items",
                 config.model,
-                context.input_items().len()
+                if config.model_context_management_enabled { context.input_items().len() } else { context.plain_input_items().len() }
             ),
         )?;
     } else {
@@ -691,7 +720,8 @@ async fn run_loop(
                 "cache_ttl_seconds": CACHE_TTL.as_secs(),
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
-                "compaction_policy": config.compaction_mode,
+                "compaction_policy": if config.model_context_management_enabled { config.compaction_mode } else { CompactionMode::Disabled },
+                "model_context_management_enabled": config.model_context_management_enabled,
                 "compaction_payoff_requests": config.compaction_payoff_requests,
                 "compaction_min_payback_percent": config.compaction_min_payback_percent,
                 "compaction_decision": "next_request"
@@ -761,7 +791,10 @@ async fn run_loop(
         } else {
             "economic"
         };
-        if config.compaction_mode == CompactionMode::Economic && (!resumed || sent_model_request) {
+        if config.model_context_management_enabled
+            && config.compaction_mode == CompactionMode::Economic
+            && (!resumed || sent_model_request)
+        {
             maybe_compact(
                 &mut context_state,
                 &protected_until_request,
@@ -775,9 +808,17 @@ async fn run_loop(
         }
         step_index += 1;
         turn_step += 1;
-        let history = context_state.input_items();
+        let history = if config.model_context_management_enabled {
+            context_state.input_items()
+        } else {
+            context_state.plain_input_items()
+        };
         cache.begin_request_with_history(
-            context_state.rendered_breakpoints(),
+            if config.model_context_management_enabled {
+                context_state.rendered_breakpoints()
+            } else {
+                Vec::new()
+            },
             &history,
             context_state.estimated_tokens(),
         );
@@ -799,45 +840,51 @@ async fn run_loop(
         let mut displayed_preview = String::new();
         let mut stream_output = crate::terminal::StreamOutput::default();
         let reply = match backend
-            .step_with_progress(&system_prompt, &history, |progress| {
-                if last_progress
-                    .as_ref()
-                    .is_some_and(|previous: &ModelProgress| {
-                        previous.output_tokens == progress.output_tokens
-                            && previous.reasoning_output_tokens == progress.reasoning_output_tokens
-                            && previous.output_events == progress.output_events
-                    })
-                {
-                    return;
-                }
-                let terminal_preview = progress
-                    .terminal_preview
-                    .as_ref()
-                    .unwrap_or(&progress.preview);
-                if !terminal_preview.is_empty() && *terminal_preview != displayed_preview {
-                    use std::io::IsTerminal;
-                    if events.is_none() && std::io::stderr().is_terminal() {
-                        if let Some(delta) = terminal_preview.strip_prefix(&displayed_preview) {
-                            stream_output.push(delta);
-                        } else {
-                            stream_output
-                                .push(&format!("\n[stream restarted]\n{}", terminal_preview));
-                        }
-                        displayed_preview = terminal_preview.clone();
+            .step_with_progress(
+                &system_prompt,
+                &history,
+                config.model_context_management_enabled,
+                |progress| {
+                    if last_progress
+                        .as_ref()
+                        .is_some_and(|previous: &ModelProgress| {
+                            previous.output_tokens == progress.output_tokens
+                                && previous.reasoning_output_tokens
+                                    == progress.reasoning_output_tokens
+                                && previous.output_events == progress.output_events
+                        })
+                    {
+                        return;
                     }
-                }
-                if let Some(events) = &progress_events {
-                    let _ = events.send(json!({"event":"model_progress", "data": {
-                        "step": step_index,
-                        "preview": progress.preview,
-                        "output_tokens": progress.output_tokens,
-                        "reasoning_output_tokens": progress.reasoning_output_tokens,
-                        "output_events": progress.output_events,
-                        "estimated": true,
-                    }}));
-                }
-                last_progress = Some(progress);
-            })
+                    let terminal_preview = progress
+                        .terminal_preview
+                        .as_ref()
+                        .unwrap_or(&progress.preview);
+                    if !terminal_preview.is_empty() && *terminal_preview != displayed_preview {
+                        use std::io::IsTerminal;
+                        if events.is_none() && std::io::stderr().is_terminal() {
+                            if let Some(delta) = terminal_preview.strip_prefix(&displayed_preview) {
+                                stream_output.push(delta);
+                            } else {
+                                stream_output
+                                    .push(&format!("\n[stream restarted]\n{}", terminal_preview));
+                            }
+                            displayed_preview = terminal_preview.clone();
+                        }
+                    }
+                    if let Some(events) = &progress_events {
+                        let _ = events.send(json!({"event":"model_progress", "data": {
+                            "step": step_index,
+                            "preview": progress.preview,
+                            "output_tokens": progress.output_tokens,
+                            "reasoning_output_tokens": progress.reasoning_output_tokens,
+                            "output_events": progress.output_events,
+                            "estimated": true,
+                        }}));
+                    }
+                    last_progress = Some(progress);
+                },
+            )
             .await
         {
             Ok(reply) => reply,
@@ -924,29 +971,31 @@ async fn run_loop(
                     json!({"result": &result, "context_id": item_id}),
                     &terminal_shell_result(&result),
                 )?;
-                let signals = context_state.record_signals(&reply.step.context, item_id);
-                let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
-                    context_state.advance_retention_turn();
-                    let expired = context_state.resolve_keep_lease_review(&signals.keep);
-                    context_state.arm_keep_leases(&signals.keep, lease_turns);
-                    expired
-                } else {
-                    Vec::new()
-                };
-                protected_until_request.push(item_id);
-                protected_until_request.extend(signals.added.iter().copied());
-                maybe_attach_keep_lease_review(
-                    &mut context_state,
-                    &protected_until_request,
-                    &mut cache,
-                    &mut logger,
-                    &config,
-                    item_id,
-                )?;
-                logger.raw_event_silent(
+                if config.model_context_management_enabled {
+                    let signals = context_state.record_signals(&reply.step.context, item_id);
+                    let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
+                        context_state.advance_retention_turn();
+                        let expired = context_state.resolve_keep_lease_review(&signals.keep);
+                        context_state.arm_keep_leases(&signals.keep, lease_turns);
+                        expired
+                    } else {
+                        Vec::new()
+                    };
+                    protected_until_request.push(item_id);
+                    protected_until_request.extend(signals.added.iter().copied());
+                    maybe_attach_keep_lease_review(
+                        &mut context_state,
+                        &protected_until_request,
+                        &mut cache,
+                        &mut logger,
+                        &config,
+                        item_id,
+                    )?;
+                    logger.raw_event_silent(
                     "context_signals",
                     json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
                 )?;
+                }
                 persist_context_checkpoint(&config, &context_state)?;
 
                 if let Some(receiver) = input.as_mut()
@@ -977,31 +1026,33 @@ async fn run_loop(
                     "The answer was delivered to the human; the session may continue.",
                 )?;
                 let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
-                let signals = context_state.record_signals(&reply.step.context, item_id);
-                let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
-                    context_state.advance_retention_turn();
-                    let expired = context_state.resolve_keep_lease_review(&signals.keep);
-                    context_state.arm_keep_leases(&signals.keep, lease_turns);
-                    expired
-                } else {
-                    Vec::new()
-                };
-                protected_until_request.push(item_id);
-                protected_until_request.extend(signals.added.iter().copied());
-                if input.is_some() {
-                    maybe_attach_keep_lease_review(
-                        &mut context_state,
-                        &protected_until_request,
-                        &mut cache,
-                        &mut logger,
-                        &config,
-                        item_id,
-                    )?;
-                }
-                logger.raw_event_silent(
+                if config.model_context_management_enabled {
+                    let signals = context_state.record_signals(&reply.step.context, item_id);
+                    let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
+                        context_state.advance_retention_turn();
+                        let expired = context_state.resolve_keep_lease_review(&signals.keep);
+                        context_state.arm_keep_leases(&signals.keep, lease_turns);
+                        expired
+                    } else {
+                        Vec::new()
+                    };
+                    protected_until_request.push(item_id);
+                    protected_until_request.extend(signals.added.iter().copied());
+                    if input.is_some() {
+                        maybe_attach_keep_lease_review(
+                            &mut context_state,
+                            &protected_until_request,
+                            &mut cache,
+                            &mut logger,
+                            &config,
+                            item_id,
+                        )?;
+                    }
+                    logger.raw_event_silent(
                     "context_signals",
                     json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
                 )?;
+                }
                 persist_context_checkpoint(&config, &context_state)?;
                 logger.raw_event(
                     if input.is_some() {
@@ -1746,7 +1797,8 @@ async fn write_final_artifacts(
         "model_latency_ms": metrics.model_latency_ms,
         "response_retries": metrics.response_retries,
         "compactions": metrics.compactions,
-        "compaction_policy": config.compaction_mode,
+        "compaction_policy": if config.model_context_management_enabled { config.compaction_mode } else { CompactionMode::Disabled },
+                "model_context_management_enabled": config.model_context_management_enabled,
         "compaction_payoff_requests": config.compaction_payoff_requests,
         "compaction_min_payback_percent": config.compaction_min_payback_percent,
         "elapsed_ms": elapsed_ms
@@ -1763,6 +1815,131 @@ async fn write_final_artifacts(
 mod tests {
     use super::*;
     use crate::openai::PromptCacheCapabilities;
+
+    #[tokio::test]
+    async fn context_free_run_keeps_plain_history_without_signals_or_compactions() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("session");
+        let steps_file = temp.path().join("steps.jsonl");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        let steps = [
+            json!({"action":{"kind":"shell","command":"printf first","answer":null},"context":{"protected":[1],"removable":[],"remember":["model memory should be ignored"]}}),
+            json!({"action":{"kind":"shell","command":"printf second","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}),
+            json!({"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}),
+        ];
+        tokio::fs::write(&steps_file, steps.map(|s| s.to_string()).join("\n"))
+            .await
+            .unwrap();
+        let config = RunConfig {
+            cwd: workspace,
+            prompt: "Do work.".into(),
+            session_dir: session_dir.clone(),
+            model: "scripted".into(),
+            reasoning_effort: "medium".into(),
+            max_steps: Some(3),
+            default_shell_timeout_secs: 1,
+            model_context_management_enabled: false,
+            compaction_mode: CompactionMode::Economic,
+            keep_lease_turns: Some(1),
+            compaction_payoff_requests: 5,
+            compaction_min_payback_percent: 0,
+            compaction_rollout_samples: 0,
+            compaction_rollout_stop_probability_percent: 10,
+            compaction_neutral_high_watermark_tokens: 1,
+            compaction_neutral_low_watermark_tokens: 0,
+            resume_context: None,
+            resume_source: None,
+            prompt_cache_key: Some("test-cache-key".into()),
+        };
+        let outcome = run(
+            config.clone(),
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.completed);
+        let events = std::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let requests = events
+            .iter()
+            .filter(|event| event["event"] == "model_request")
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event["event"] == "run_started")
+                .unwrap()["data"]["compaction_policy"],
+            "disabled"
+        );
+        for event in &events {
+            assert!(!matches!(
+                event["event"].as_str(),
+                Some("context_compacted" | "context_signals" | "keep_lease_review")
+            ));
+        }
+        for request in requests {
+            let history = request["data"]["history"].as_array().unwrap();
+            assert!(history.iter().all(|item| item["role"] != "developer"));
+            for item in history {
+                if item["type"] == "function_call" {
+                    let args: Value =
+                        serde_json::from_str(item["arguments"].as_str().unwrap()).unwrap();
+                    assert!(args.get("context").is_none());
+                }
+            }
+            let rendered = serde_json::to_string(history).unwrap();
+            assert!(!rendered.contains("[context "));
+            assert!(!rendered.contains("model memory should be ignored"));
+        }
+        let checkpoint = load_resume_state(&session_dir).unwrap();
+        assert!(!checkpoint.model_context_management_enabled);
+        assert!(
+            checkpoint
+                .context
+                .snapshot()
+                .iter()
+                .all(|item| item.kind != crate::context::ContextItemKind::Memory)
+        );
+        tokio::fs::write(&steps_file,
+            r#"{"action":{"kind":"finish","command":null,"answer":"again"},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+        ).await.unwrap();
+        let resumed_dir = temp.path().join("resumed");
+        let resumed = run(
+            RunConfig {
+                session_dir: resumed_dir.clone(),
+                prompt: "continue".into(),
+                max_steps: Some(1),
+                resume_context: Some(checkpoint.context),
+                resume_source: Some(session_dir),
+                ..config
+            },
+            Backend::scripted(&steps_file).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(resumed.completed);
+        let requests = std::fs::read_to_string(resumed_dir.join("trace.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["event"] == "model_request")
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        let history = requests[0]["data"]["history"].as_array().unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|item| item["type"] == "function_call")
+                .count(),
+            3
+        );
+        assert!(history.iter().all(|item| item["role"] != "developer"));
+    }
 
     #[test]
     fn human_message_event_preserves_submission_identity() {
@@ -2318,6 +2495,7 @@ mod tests {
                 reasoning_effort: "medium".into(),
                 max_steps: Some(3),
                 default_shell_timeout_secs: 1,
+                model_context_management_enabled: true,
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: Some(1),
                 compaction_payoff_requests: 1,
@@ -2401,6 +2579,7 @@ mod tests {
                 reasoning_effort: "medium".into(),
                 max_steps: Some(2),
                 default_shell_timeout_secs: 5,
+                model_context_management_enabled: true,
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2469,6 +2648,7 @@ mod tests {
                 reasoning_effort: "medium".into(),
                 max_steps: Some(2),
                 default_shell_timeout_secs: 1,
+                model_context_management_enabled: true,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 5,
@@ -2532,6 +2712,7 @@ mod tests {
                 reasoning_effort: "medium".into(),
                 max_steps: Some(1),
                 default_shell_timeout_secs: 1,
+                model_context_management_enabled: true,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2584,10 +2765,15 @@ mod tests {
             version: CONTEXT_CHECKPOINT_VERSION,
             model: "gpt-5.6-luna".into(),
             context: ContextState::new("first task".into()),
+            model_context_management_enabled: true,
             prompt_cache_key: Some("newer-checkpoint-key".into()),
         };
         let mut legacy = serde_json::to_value(checkpoint).unwrap();
         legacy.as_object_mut().unwrap().remove("prompt_cache_key");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("model_context_management_enabled");
         std::fs::write(
             temp.path().join(CONTEXT_CHECKPOINT_FILE),
             serde_json::to_vec(&legacy).unwrap(),
@@ -2597,6 +2783,7 @@ mod tests {
         let resumed = load_resume_state(temp.path()).unwrap();
         assert_eq!(resumed.model, "gpt-5.6-luna");
         assert_eq!(resumed.prompt_cache_key, None);
+        assert!(resumed.model_context_management_enabled);
     }
 
     #[test]
@@ -2662,6 +2849,7 @@ mod tests {
                 reasoning_effort: "medium".into(),
                 max_steps: Some(1),
                 default_shell_timeout_secs: 1,
+                model_context_management_enabled: true,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2690,6 +2878,7 @@ mod tests {
                 reasoning_effort: "medium".into(),
                 max_steps: Some(1),
                 default_shell_timeout_secs: 1,
+                model_context_management_enabled: true,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2761,6 +2950,7 @@ mod tests {
                 reasoning_effort: "medium".into(),
                 max_steps: None,
                 default_shell_timeout_secs: 1,
+                model_context_management_enabled: true,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2810,6 +3000,7 @@ mod tests {
                 reasoning_effort: "medium".into(),
                 max_steps: None,
                 default_shell_timeout_secs: 1,
+                model_context_management_enabled: true,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2874,6 +3065,7 @@ mod tests {
                 reasoning_effort: "medium".into(),
                 max_steps: Some(1),
                 default_shell_timeout_secs: 1,
+                model_context_management_enabled: true,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -2975,6 +3167,7 @@ mod tests {
                 reasoning_effort: "medium".into(),
                 max_steps: None,
                 default_shell_timeout_secs: 1,
+                model_context_management_enabled: true,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,
@@ -3033,6 +3226,7 @@ mod tests {
                 reasoning_effort: "medium".into(),
                 max_steps: None,
                 default_shell_timeout_secs: 1,
+                model_context_management_enabled: true,
                 compaction_mode: CompactionMode::Economic,
                 keep_lease_turns: None,
                 compaction_payoff_requests: 1,

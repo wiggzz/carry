@@ -11,7 +11,7 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::protocol::{Step, tool_definitions};
+use crate::protocol::{Step, tool_definitions_for_mode};
 
 const MAX_RESPONSE_RETRIES: usize = 5;
 const MAX_TOTAL_RETRY_WAIT: Duration = Duration::from_secs(60);
@@ -74,6 +74,7 @@ pub struct OpenAiClient {
     reasoning_effort: String,
     prompt_cache_key: String,
     default_shell_timeout_secs: u64,
+    model_context_management_enabled: bool,
     request_timeout: Duration,
     connect_timeout: Duration,
     #[cfg(test)]
@@ -225,6 +226,7 @@ impl OpenAiClient {
             reasoning_effort,
             prompt_cache_key,
             default_shell_timeout_secs: 60,
+            model_context_management_enabled: true,
             request_timeout,
             connect_timeout,
             #[cfg(test)]
@@ -261,6 +263,10 @@ impl OpenAiClient {
         self.default_shell_timeout_secs = seconds;
     }
 
+    pub(crate) fn set_model_context_management_enabled(&mut self, enabled: bool) {
+        self.model_context_management_enabled = enabled;
+    }
+
     pub(crate) fn prompt_cache_capabilities(&self) -> Option<PromptCacheCapabilities> {
         match self.auth {
             RequestAuth::ApiKey(_) => prompt_cache_capabilities(&self.model),
@@ -281,7 +287,7 @@ impl OpenAiClient {
                 "effort": self.reasoning_effort,
                 "context": "current_turn"
             },
-            "tools": tool_definitions(self.default_shell_timeout_secs),
+            "tools": tool_definitions_for_mode(self.default_shell_timeout_secs, self.model_context_management_enabled),
             "tool_choice": "required",
             "parallel_tool_calls": false
         });
@@ -534,7 +540,10 @@ impl OpenAiClient {
         }
 
         let function_call = calls[0].clone();
-        let step = Step::from_function_call(&function_call)?;
+        let step = Step::from_function_call_for_mode(
+            &function_call,
+            self.model_context_management_enabled,
+        )?;
         let output_items = raw["output"]
             .as_array()
             .context("Responses API response has no output array")?
@@ -879,6 +888,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outbound_request_in_context_free_mode_has_action_only_tools() {
+        let mut client = OpenAiClient::new(
+            "https://example.invalid/v1".into(),
+            "test".into(),
+            "gpt-6-luna".into(),
+            "medium".into(),
+        );
+        client.set_model_context_management_enabled(false);
+        let body = client.request_body("coding agent", &[json!({"role":"user","content":"hello"})]);
+        assert_eq!(body["input"].as_array().unwrap().len(), 2);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        for tool in body["tools"].as_array().unwrap() {
+            assert!(tool["parameters"]["properties"].get("context").is_none());
+        }
+    }
 
     #[test]
     fn partial_preview_handles_split_escapes_and_ignores_nested_fields() {

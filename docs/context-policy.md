@@ -3,6 +3,25 @@
 Carry keeps one chronological context ledger. It is designed to make a context
 rewrite an explicit, inspectable decision instead of a periodic summary.
 
+## Context-free ablation (experimental)
+
+Pass `--no-model-context-management` to remove the context-management section
+of the system prompt, the `context` property of both model tools, rendered
+context IDs and review advice, memory/signal processing, and **all automatic
+compaction**. The task prompt, shell and finish tools, and complete raw provider
+history remain. By default this switch is off and existing behavior is unchanged;
+`--compaction-policy disabled` alone only stops compaction, not the model-facing
+contract. Sessions cannot resume with the opposite setting. Without compaction,
+a long run can exceed the provider's context window and fail instead of rewriting.
+
+For SWE-bench, choose `carry_model_context_management: disabled` on the candidate
+branch; `enabled` is the default. The workflow records this as immutable attempt
+provenance. Compare enabled and disabled on the **same branch commit**, with the
+same tasks, model, reasoning, payoff settings, images, and harness. In particular,
+keep `carry_compaction_policy: economic` in both arms if the aim is to ablate the
+whole model-context subsystem; the context-free switch overrides its effective
+compaction behavior. A smoke verifies activation, not a quality/cost effect.
+
 ## Item lifecycle
 
 - Human messages and saved memories enter stable retention.

@@ -128,6 +128,10 @@ struct Cli {
     )]
     compaction_policy: CompactionPolicyArg,
 
+    /// Remove model-facing context instructions, signals, IDs, and compaction for this run.
+    #[arg(long)]
+    no_model_context_management: bool,
+
     /// Revalidate model-protected context after this many later model turns (batched reviews).
     #[arg(
         long,
@@ -296,6 +300,11 @@ async fn run_command(args: Cli) -> Result<()> {
         .as_deref()
         .map(run::load_resume_state)
         .transpose()?;
+    if resume.as_ref().is_some_and(|state| {
+        state.model_context_management_enabled == args.no_model_context_management
+    }) {
+        bail!("cannot resume with a different model context management mode");
+    }
     let model = resume
         .as_ref()
         .map_or_else(|| args.model.clone(), |resume| resume.model.clone());
@@ -433,6 +442,7 @@ async fn run_command(args: Cli) -> Result<()> {
         reasoning_effort: args.reasoning_effort.as_str().to_owned(),
         max_steps: args.max_steps,
         default_shell_timeout_secs: args.default_shell_timeout_secs,
+        model_context_management_enabled: !args.no_model_context_management,
         compaction_mode: args.compaction_policy.into(),
         keep_lease_turns: args.keep_lease_turns,
         compaction_payoff_requests: args.compaction_payoff_requests,
@@ -912,6 +922,59 @@ mod tests {
                 "continue",
             ])
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_switching_model_context_mode_before_loading_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = temp.path().join("session");
+        let steps = temp.path().join("steps.jsonl");
+        tokio::fs::write(&steps,
+            r#"{"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}"#,
+        ).await.unwrap();
+        let first = Cli::try_parse_from([
+            "carry",
+            "--cwd",
+            temp.path().to_str().unwrap(),
+            "--session-dir",
+            session.to_str().unwrap(),
+            "--scripted-steps",
+            steps.to_str().unwrap(),
+            "-p",
+            "first task",
+        ])
+        .unwrap();
+        run_command(first).await.unwrap();
+        let mismatched = Cli::try_parse_from([
+            "carry",
+            "--resume",
+            session.to_str().unwrap(),
+            "--no-model-context-management",
+            "--scripted-steps",
+            "/nonexistent/scripted-steps",
+            "-p",
+            "continue",
+        ])
+        .unwrap();
+        let error = run_command(mismatched).await.unwrap_err().to_string();
+        assert!(
+            error.contains("different model context management mode"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn no_model_context_management_flag_is_opt_in() {
+        assert!(
+            !Cli::try_parse_from(["carry", "do work"])
+                .unwrap()
+                .no_model_context_management
+        );
+        assert!(
+            Cli::try_parse_from(["carry", "--no-model-context-management", "do work"])
+                .unwrap()
+                .no_model_context_management
         );
     }
 

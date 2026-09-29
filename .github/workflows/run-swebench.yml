@@ -36,6 +36,12 @@ on:
         required: true
         default: medium
         type: string
+      carry_model_context_management:
+        description: Carry-only ablation; disabled removes model-facing context management and all compaction
+        required: true
+        default: enabled
+        type: choice
+        options: [enabled, disabled]
       carry_compaction_policy:
         description: Carry-only context policy; record it for paired ablations
         required: true
@@ -158,6 +164,7 @@ jobs:
       BENCHMARK_ATTEMPT: ${{ matrix.attempt }}
       BENCHMARK_ATTEMPTS: ${{ needs['plan-attempts'].outputs.total }}
       CARRY_COMPACTION_POLICY: ${{ inputs.carry_compaction_policy }}
+      CARRY_MODEL_CONTEXT_MANAGEMENT: ${{ inputs.carry_model_context_management }}
       CARRY_KEEP_LEASE_TURNS: ${{ inputs.carry_keep_lease_turns }}
       CARRY_COMPACTION_PAYOFF_REQUESTS: ${{ inputs.carry_compaction_payoff_requests }}
       CARRY_COMPACTION_MIN_PAYBACK_PERCENT: ${{ inputs.carry_compaction_min_payback_percent }}
@@ -310,6 +317,10 @@ jobs:
               echo "carry compaction policy must be economic or disabled" >&2
               exit 1
             }
+            [[ "$CARRY_MODEL_CONTEXT_MANAGEMENT" =~ ^(enabled|disabled)$ ]] || {
+              echo "carry model context management must be enabled or disabled" >&2
+              exit 1
+            }
             [[ "$CARRY_COMPACTION_PAYOFF_REQUESTS" =~ ^[1-9][0-9]*$ ]] || {
               echo "carry compaction payoff requests must be a positive integer" >&2
               exit 1
@@ -445,7 +456,7 @@ jobs:
           SOURCE_SHA256="$SOURCE_SHA256" SOURCE_COMMIT="$SOURCE_COMMIT" BENCHMARK_MODE="$BENCHMARK_MODE" \
           BENCHMARK_HARNESS="$BENCHMARK_HARNESS" BENCHMARK_ATTEMPT="$BENCHMARK_ATTEMPT" \
           BENCHMARK_ATTEMPTS="$BENCHMARK_ATTEMPTS" CARRY_COMPACTION_POLICY="$CARRY_COMPACTION_POLICY" \
-          CARRY_KEEP_LEASE_TURNS="$CARRY_KEEP_LEASE_TURNS" \
+          CARRY_MODEL_CONTEXT_MANAGEMENT="$CARRY_MODEL_CONTEXT_MANAGEMENT" CARRY_KEEP_LEASE_TURNS="$CARRY_KEEP_LEASE_TURNS" \
           CARRY_COMPACTION_PAYOFF_REQUESTS="$CARRY_COMPACTION_PAYOFF_REQUESTS" \
           CARRY_COMPACTION_MIN_PAYBACK_PERCENT="$CARRY_COMPACTION_MIN_PAYBACK_PERCENT" \
           CARRY_COMPACTION_ROLLOUT_SAMPLES="$CARRY_COMPACTION_ROLLOUT_SAMPLES" \
@@ -465,7 +476,7 @@ jobs:
               'RESULT_URL_B64': encoded['RESULT_URL'], 'CONTROL_URL_B64': encoded['CONTROL_URL'],
               **{key: os.environ[key] for key in (
                   'SOURCE_SHA256', 'SOURCE_COMMIT', 'BENCHMARK_MODE', 'BENCHMARK_HARNESS',
-                  'BENCHMARK_ATTEMPT', 'BENCHMARK_ATTEMPTS', 'CARRY_COMPACTION_POLICY', 'CARRY_KEEP_LEASE_TURNS',
+                  'BENCHMARK_ATTEMPT', 'BENCHMARK_ATTEMPTS', 'CARRY_COMPACTION_POLICY', 'CARRY_MODEL_CONTEXT_MANAGEMENT', 'CARRY_KEEP_LEASE_TURNS',
                   'CARRY_COMPACTION_PAYOFF_REQUESTS', 'CARRY_COMPACTION_MIN_PAYBACK_PERCENT', 'CARRY_COMPACTION_ROLLOUT_SAMPLES', 'CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT',
                   'CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS', 'CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS', 'BOOTSTRAP_WAIT_SECONDS', 'RUN_ID',
                   'MODEL', 'REASONING', 'TASK_IMAGE_REPOSITORY', 'TASK_IMAGE_CATALOG')},
@@ -667,6 +678,7 @@ jobs:
           report=json.load(open('benchmark-artifact/report.json', encoding='utf-8'))
           assert report['denominator']==len(expected), 'canonical report denominator does not match records'
           assert report['attempt_numbers']==[attempt], 'canonical report does not identify the worker attempt'
+          assert report['provenance'].get('carry_model_context_management') == os.environ['CARRY_MODEL_CONTEXT_MANAGEMENT'], 'reported model context mode does not match dispatch'
           if mode == 'official-50':
               assert 1 <= attempts <= 10 and 1 <= attempt <= attempts, 'invalid official attempt identity'
               assert report['provenance']['attempt'] == {

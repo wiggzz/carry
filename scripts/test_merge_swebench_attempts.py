@@ -32,6 +32,7 @@ class AttemptMergeTests(unittest.TestCase):
                 "dataset": "SWE-bench/SWE-bench_Verified", "dataset_revision": "frozen",
                 "swebench_version": "4.1.0", "model": "test-model", "reasoning": "medium",
                 "carry_compaction_policy": "economic", "carry_keep_lease_turns": "0",
+                "carry_model_context_management": "enabled",
                 "carry_compaction_payoff_requests": "1", "carry_compaction_min_payback_percent": "10",
                 "carry_compaction_rollout_samples": "16",
                 "carry_compaction_rollout_stop_probability_percent": "10",
@@ -205,6 +206,33 @@ class AttemptMergeTests(unittest.TestCase):
             self.assertEqual(provenance["carry_compaction_min_payback_percent"], "10")
             self.assertEqual(provenance["carry_compaction_neutral_high_watermark_tokens"], "32768")
             self.assertEqual(provenance["carry_compaction_neutral_low_watermark_tokens"], "24576")
+
+
+    def test_cli_rejects_mixed_model_context_modes_and_accepts_absent_legacy_default(self):
+        tasks = [f"task-{index:02d}" for index in range(50)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            artifacts = root / "artifacts"; artifacts.mkdir()
+            for attempt in (1, 2):
+                self.write_attempt(artifacts, attempt, tasks, total=2)
+            first = artifacts / "attempt-1" / "report.json"
+            payload = json.loads(first.read_text(encoding="utf-8"))
+            payload["provenance"].pop("carry_model_context_management")
+            first.write_text(json.dumps(payload), encoding="utf-8")
+            manifest = root / "tasks.json"
+            manifest.write_text(json.dumps({"instance_ids": tasks}), encoding="utf-8")
+            command = ["python3", str(SCRIPT), "--artifacts", str(artifacts), "--manifest", str(manifest),
+                       "--harness", "all", "--attempts", "2", "--out", str(root / "out")]
+            merged = subprocess.run(command, text=True, capture_output=True)
+            self.assertEqual(merged.returncode, 0, merged.stderr)
+            self.assertEqual(json.loads((root / "out" / "report.json").read_text())["provenance"]["carry_model_context_management"], "enabled")
+            second = artifacts / "attempt-2" / "report.json"
+            payload = json.loads(second.read_text(encoding="utf-8"))
+            payload["provenance"]["carry_model_context_management"] = "disabled"
+            second.write_text(json.dumps(payload), encoding="utf-8")
+            rejected = subprocess.run(command, text=True, capture_output=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("identical immutable provenance", rejected.stderr)
 
 
 if __name__ == "__main__":
