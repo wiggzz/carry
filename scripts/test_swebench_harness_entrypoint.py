@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Behavior tests for the run-scoped harness image adapter."""
+import json
 import os
 import pathlib
 import subprocess
@@ -11,6 +12,81 @@ ENTRYPOINT = pathlib.Path(__file__).parents[1] / "containers" / "swebench-harnes
 
 
 class HarnessEntrypointTests(unittest.TestCase):
+    def test_carry_deadline_drains_in_flight_response_before_capturing_patch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo, prompt_dir, output = root / "repo", root / "input", root / "output"
+            binary = root / "bin" / "carry"
+            repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); binary.parent.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "file.txt").write_text("before\n")
+            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            (prompt_dir / "task.md").write_text("fix")
+            binary.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,pathlib,signal,sys,time\n"
+                "output=pathlib.Path(sys.argv[sys.argv.index('--session-dir')+1])\n"
+                "pathlib.Path('file.txt').write_text('after\\n')\n"
+                "def drain(*_args):\n"
+                "    time.sleep(0.15)  # simulate an in-flight response finishing\n"
+                "    (output/'result.json').write_text(json.dumps({'usage': {'input_tokens': 123, 'output_tokens': 4}}))\n"
+                "    sys.exit(124)\n"
+                "signal.signal(signal.SIGUSR1, drain)\n"
+                "while True: time.sleep(0.05)\n"
+            )
+            binary.chmod(0o755)
+            env = dict(os.environ, OPENAI_API_KEY="unit-test-secret", OPENAI_BASE_URL="http://openai-proxy:8080/v1",
+                       PREPARED_HARNESS_ROOT=str(root), AGENT_TIMEOUT_SECONDS="1", AGENT_SHUTDOWN_GRACE_SECONDS="2",
+                       BENCHMARK_WORKSPACE=str(repo))
+            result = subprocess.run(
+                ["python3", str(ENTRYPOINT), "run", "--harness", "carry", "--model", "model",
+                 "--reasoning", "medium", "--prompt", str(prompt_dir / "task.md"),
+                 "--output", str(output)], cwd=repo, env=env, text=True, capture_output=True,
+                timeout=8,
+            )
+            self.assertEqual(result.returncode, 124, result.stderr)
+            self.assertEqual(json.loads((output / "result.json").read_text())["usage"]["input_tokens"], 123)
+            self.assertIn("+after", (output / "final.patch").read_text())
+
+    def test_carry_deadline_kills_unresponsive_child_after_bounded_grace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo, prompt_dir, output = root / "repo", root / "input", root / "output"
+            binary = root / "bin" / "carry"
+            repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); binary.parent.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "file.txt").write_text("before\n")
+            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            (prompt_dir / "task.md").write_text("fix")
+            binary.write_text(
+                "#!/usr/bin/env python3\nimport pathlib,signal,sys,time\n"
+                "pathlib.Path('file.txt').write_text('after\\n')\n"
+                "signal.signal(signal.SIGUSR1, lambda *_: None)\n"
+                "pathlib.Path(sys.argv[sys.argv.index('--session-dir')+1], 'pid').write_text(str(__import__('os').getpid()))\n"
+                "while True: time.sleep(0.05)\n"
+            )
+            binary.chmod(0o755)
+            env = dict(os.environ, OPENAI_API_KEY="unit-test-secret", OPENAI_BASE_URL="http://openai-proxy:8080/v1",
+                       PREPARED_HARNESS_ROOT=str(root), AGENT_TIMEOUT_SECONDS="1", AGENT_SHUTDOWN_GRACE_SECONDS="1",
+                       BENCHMARK_WORKSPACE=str(repo))
+            result = subprocess.run(
+                ["python3", str(ENTRYPOINT), "run", "--harness", "carry", "--model", "model",
+                 "--reasoning", "medium", "--prompt", str(prompt_dir / "task.md"),
+                 "--output", str(output)], cwd=repo, env=env, text=True, capture_output=True,
+                timeout=7,
+            )
+            self.assertEqual(result.returncode, 124, result.stderr)
+            self.assertIn("+after", (output / "final.patch").read_text())
+            pid = int((output / "pid").read_text())
+            with self.assertRaises(ProcessLookupError):
+                __import__('os').kill(pid, 0)
+
     def test_carry_resume_session_is_forwarded_only_to_the_carry_command(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

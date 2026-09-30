@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import shlex
+import signal
 import subprocess
 import sys
 
@@ -199,17 +200,36 @@ with trace_path.open("w", encoding="utf-8") as trace:
             trace.write("\ncodex login timed out\n")
             returncode = 124
     if returncode == 0:
+        agent_timeout = int(os.environ.get("AGENT_TIMEOUT_SECONDS", "1200"))
         try:
-            result = subprocess.run(
-                command,
-                cwd=workspace,
-                env=agent_env,
-                stdout=trace,
-                stderr=subprocess.STDOUT,
-                check=False,
-                timeout=int(os.environ.get("AGENT_TIMEOUT_SECONDS", "1200")),
-            )
-            returncode = result.returncode
+            if args.harness == "carry":
+                grace = int(os.environ.get("AGENT_SHUTDOWN_GRACE_SECONDS", "25"))
+                if not 1 <= grace <= 30:
+                    raise ValueError("Carry shutdown grace must be between 1 and 30 seconds")
+                with subprocess.Popen(
+                    command, cwd=workspace, env=agent_env,
+                    stdout=trace, stderr=subprocess.STDOUT, text=True,
+                ) as process:
+                    try:
+                        returncode = process.wait(timeout=agent_timeout)
+                    except subprocess.TimeoutExpired:
+                        # The native agent stops issuing new requests after SIGUSR1;
+                        # allow the active response to finish and write its usage.
+                        process.send_signal(signal.SIGUSR1)
+                        try:
+                            process.wait(timeout=grace)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
+                        trace.write("\nagent timed out after graceful shutdown window\n")
+                        returncode = 124
+            else:
+                result = subprocess.run(
+                    command, cwd=workspace, env=agent_env,
+                    stdout=trace, stderr=subprocess.STDOUT,
+                    check=False, timeout=agent_timeout,
+                )
+                returncode = result.returncode
         except subprocess.TimeoutExpired:
             trace.write("\nagent timed out\n")
             returncode = 124
