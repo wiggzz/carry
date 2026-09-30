@@ -175,6 +175,45 @@ def load_agent_usage(harness: str, output: pathlib.Path) -> dict[str, int]:
     return usage
 
 
+def carry_timed_out_cost_complete(output: pathlib.Path, usage: Mapping[str, int]) -> bool:
+    """Only price a timed-out Carry slot when each started request yielded native usage."""
+    trace = output / "trace.jsonl"
+    if not trace.is_file():
+        return False
+    pending: list[int] = []
+    responses = 0
+    observed = empty_usage()
+    try:
+        with trace.open(encoding="utf-8") as events:
+            for line in events:
+                event = json.loads(line)
+                if not isinstance(event, dict) or event.get("event") not in {"model_request", "model_response"}:
+                    continue
+                data = event.get("data")
+                if not isinstance(data, dict):
+                    return False
+                step = data.get("step")
+                if isinstance(step, bool) or not isinstance(step, int) or step < 1:
+                    return False
+                if event["event"] == "model_request":
+                    pending.append(step)
+                    continue
+                if not pending or pending.pop(0) != step:
+                    return False
+                raw = data.get("usage")
+                if not isinstance(raw, dict) or any(
+                    isinstance(raw.get(key), bool) or not isinstance(raw.get(key), int) or raw[key] < 0
+                    for key in USAGE_KEYS
+                ):
+                    return False
+                for key in USAGE_KEYS:
+                    observed[key] += raw[key]
+                responses += 1
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+    return responses > 0 and not pending and observed == dict(usage)
+
+
 def pricing_for_model(model: str) -> dict[str, float] | None:
     pricing = MODEL_PRICING_USD_PER_MILLION.get(model)
     return dict(pricing) if pricing is not None else None
@@ -1685,6 +1724,10 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
         record["usage"], pricing, max_round_input_tokens=record["max_round_input_tokens"],
         observed_round_input_tokens=sum(record["round_input_tokens"]),
     )
+    if harness == "carry" and record.get("timed_out") and not carry_timed_out_cost_complete(output, record["usage"]):
+        # Completed-response usage is only a lower bound when an in-flight request
+        # was interrupted; its unknown provider charge must not become a total.
+        record["estimated_cost_usd"] = None
     print("BENCHMARK_PROGRESS " + json.dumps({
         "elapsed_seconds": record["elapsed_seconds"], "instance_id": instance_id,
         "harness": harness, "state": "completed", "status": record["status"],
@@ -2225,7 +2268,9 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
                 later < earlier for item in harness_records
                 for earlier, later in zip(item["round_input_tokens"], item["round_input_tokens"][1:])
             ),
-            "estimated_cost_usd": round(sum(costs), 6) if costs else None,
+            "estimated_cost_usd": round(sum(costs), 6) if len(costs) == len(harness_records) else None,
+            "costed_slot_subtotal_usd": round(sum(costs), 6) if costs else None,
+            "cost_complete": len(costs) == len(harness_records),
             "costed_slots": len(costs),
             "statuses": dict(sorted(Counter(item["status"] for item in harness_records).items())),
         }
@@ -2253,7 +2298,9 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
             task_harness_reports[f"{task['instance_id']}/{harness}"] = {
                 "attempts": attempt_count,
                 "completed": sum(item["status"] == "evaluated" for item in task_records),
-                "estimated_cost_usd": round(sum(costs), 6) if costs else None,
+                "estimated_cost_usd": round(sum(costs), 6) if len(costs) == len(task_records) else None,
+                "costed_slot_subtotal_usd": round(sum(costs), 6) if costs else None,
+                "cost_complete": len(costs) == len(task_records),
                 "resolved": resolved_count,
                 "resolve_rate": resolved_count / attempt_count,
                 "solved_at_least_once": bool(resolved_count),
@@ -2271,8 +2318,11 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
 
     def harness_cost_text(values: dict[str, Any]) -> str:
         rendered = cost_text(values["estimated_cost_usd"])
-        if values["estimated_cost_usd"] is not None and values["costed_slots"] < values["denominator"]:
-            rendered += f" ({values['costed_slots']}/{values['denominator']} slots)"
+        if not values["cost_complete"]:
+            rendered += f" ({values['costed_slots']}/{values['denominator']} priced slots"
+            if values["costed_slot_subtotal_usd"] is not None:
+                rendered += f"; priced subtotal {cost_text(values['costed_slot_subtotal_usd'])}"
+            rendered += ")"
         return rendered
 
     harness_lines = "\n".join(

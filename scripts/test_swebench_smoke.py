@@ -1831,6 +1831,26 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertEqual(set(report["harnesses"]), {"carry"})
             self.assertEqual(len(json.loads((output / "records.json").read_text())), 5)
 
+    def test_finalize_marks_full_cost_unknown_when_one_timed_out_slot_is_uncosted(self):
+        tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
+        records = [
+            {"instance_id": task["instance_id"], "harness": "carry", "status": "evaluated",
+             "patch": "", "estimated_cost_usd": None if index == 4 else 0.1}
+            for index, task in enumerate(tasks)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            self.worker.finalize(
+                tasks=tasks, records=records, output=output, provenance={}, harnesses=("carry",),
+            )
+            report = json.loads((output / "report.json").read_text())
+            summary = report["harnesses"]["carry"]
+            self.assertIsNone(summary["estimated_cost_usd"])
+            self.assertFalse(summary["cost_complete"])
+            self.assertEqual(summary["costed_slots"], 4)
+            self.assertEqual(summary["costed_slot_subtotal_usd"], 0.4)
+            self.assertIn("unavailable", (output / "report.md").read_text())
+
     def test_finalize_preserves_three_independent_attempts_per_task_and_harness(self):
         tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
         records = [
@@ -2761,7 +2781,9 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                 return mock.Mock(returncode=0, stdout="")
 
             (root / "output" / "trace.jsonl").write_text(json.dumps({
-                "event": "model_response", "data": {"usage": {
+                "event": "model_request", "data": {"step": 1},
+            }) + "\n" + json.dumps({
+                "event": "model_response", "data": {"step": 1, "usage": {
                     "input_tokens": 100, "cached_input_tokens": 40,
                     "cache_write_input_tokens": 10, "output_tokens": 20,
                     "reasoning_tokens": 5, "total_tokens": 120,
@@ -2780,6 +2802,40 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertTrue(record["timed_out"])
             self.assertEqual(record["usage"]["total_tokens"], 120)
             self.assertEqual(record["estimated_cost_usd"], 0.000037)
+
+    def test_timed_out_carry_with_unanswered_final_request_has_unknown_total_cost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for name in ("repo", "input", "output"):
+                (root / name).mkdir()
+            def fake_run(command, **_kwargs):
+                if command[:2] == ["docker", "run"]:
+                    raise subprocess.CalledProcessError(124, command)
+                return mock.Mock(returncode=0, stdout="")
+            output = root / "output"
+            (output / "result.json").write_text(json.dumps({"usage": {
+                "input_tokens": 100, "cached_input_tokens": 40,
+                "cache_write_input_tokens": 10, "output_tokens": 20,
+                "reasoning_tokens": 5, "total_tokens": 120,
+            }}))
+            (output / "trace.jsonl").write_text("\n".join(json.dumps(event) for event in (
+                {"event": "model_request", "data": {"step": 1}},
+                {"event": "model_response", "data": {"step": 1, "usage": {
+                    "input_tokens": 100, "output_tokens": 20}}},
+                {"event": "model_request", "data": {"step": 2}},
+            )) + "\n")
+            with mock.patch.object(self.worker.subprocess, "run", side_effect=fake_run):
+                record = self.worker.run_agent(
+                    instance_id="task-1", harness="carry", image="carry:run",
+                    repo=root / "repo", harness_bundle=root / "repo",
+                    task_input=root / "input", output=output,
+                    model="gpt-5.6-luna", reasoning="medium",
+                    pricing=self.worker.pricing_for_model("gpt-5.6-luna"),
+                    network="internal", proxy_ip="172.28.0.2", api_base="http://openai-proxy:8080/v1",
+                )
+            self.assertTrue(record["timed_out"])
+            self.assertEqual(record["usage"]["input_tokens"], 100)
+            self.assertIsNone(record["estimated_cost_usd"])
 
     def test_run_agent_surfaces_carry_response_retries(self):
         with tempfile.TemporaryDirectory() as directory:

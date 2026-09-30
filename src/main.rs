@@ -461,12 +461,27 @@ async fn run_command(args: Cli) -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(unix)]
+    let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(false);
+    #[cfg(unix)]
+    {
+        let mut deadline_signal =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+        tokio::spawn(async move {
+            if deadline_signal.recv().await.is_some() {
+                let _ = deadline_tx.send(true);
+            }
+        });
+    }
     let outcome = tokio::select! {
         result = async {
             if interactive {
                 run::run_interactive(config, backend, input.expect("interactive input exists")).await
             } else {
-                run::run(config, backend).await
+                #[cfg(unix)]
+                { run::run_with_shutdown(config, backend, deadline_rx).await }
+                #[cfg(not(unix))]
+                { run::run(config, backend).await }
             }
         } => result?,
         _ = tokio::signal::ctrl_c() => {

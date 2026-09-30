@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, watch},
     time::Duration,
 };
 
@@ -593,8 +593,18 @@ impl Backend {
     }
 }
 
-pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, None, None, None).await
+#[cfg(any(test, not(unix)))]
+pub async fn run(config: RunConfig, backend: Backend) -> Result<RunOutcome> {
+    run_with_shutdown(config, backend, tokio::sync::watch::channel(false).1).await
+}
+
+/// Finish the current model response, persist its usage, and stop before another action.
+pub async fn run_with_shutdown(
+    config: RunConfig,
+    mut backend: Backend,
+    shutdown: watch::Receiver<bool>,
+) -> Result<RunOutcome> {
+    run_loop(config, &mut backend, None, None, None, Some(shutdown)).await
 }
 
 pub async fn run_interactive(
@@ -602,7 +612,7 @@ pub async fn run_interactive(
     mut backend: Backend,
     input: mpsc::UnboundedReceiver<UserInput>,
 ) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, Some(input), None, None).await
+    run_loop(config, &mut backend, Some(input), None, None, None).await
 }
 
 pub async fn run_interactive_with_events(
@@ -618,6 +628,7 @@ pub async fn run_interactive_with_events(
         Some(input),
         Some(events),
         initial_submission_id,
+        None,
     )
     .await
 }
@@ -628,6 +639,7 @@ async fn run_loop(
     mut input: Option<mpsc::UnboundedReceiver<UserInput>>,
     events: Option<broadcast::Sender<serde_json::Value>>,
     initial_submission_id: Option<String>,
+    shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<RunOutcome> {
     let run_started = Instant::now();
     backend.configure_shell_timeout(config.default_shell_timeout_secs);
@@ -731,6 +743,17 @@ async fn run_loop(
     let mut turn_step = 0;
     let mut protected_until_request = Vec::new();
     loop {
+        if shutdown.as_ref().is_some_and(|signal| *signal.borrow()) {
+            return finish_shutdown(
+                &config,
+                patch_baseline.as_deref(),
+                &context_state,
+                &metrics,
+                &mut logger,
+                run_started,
+            )
+            .await;
+        }
         if let Some(max_steps) = config.max_steps
             && turn_step >= max_steps
         {
@@ -887,6 +910,17 @@ async fn run_loop(
             ),
         )?;
 
+        if shutdown.as_ref().is_some_and(|signal| *signal.borrow()) {
+            return finish_shutdown(
+                &config,
+                patch_baseline.as_deref(),
+                &context_state,
+                &metrics,
+                &mut logger,
+                run_started,
+            )
+            .await;
+        }
         log_assistant_output_text(&mut logger, &reply.raw["output"], step_index)?;
 
         match reply.step.action.kind {
@@ -1071,6 +1105,37 @@ async fn run_loop(
             }
         }
     }
+}
+
+async fn finish_shutdown(
+    config: &RunConfig,
+    patch_baseline: Option<&str>,
+    state: &ContextState,
+    metrics: &RunMetrics,
+    logger: &mut RunLogger,
+    started: Instant,
+) -> Result<RunOutcome> {
+    logger.raw_event(
+        "run_failed",
+        json!({"reason": "deadline_shutdown", "usage_recorded": metrics.usage}),
+        "  deadline reached; stopped after the in-flight model response",
+    )?;
+    write_final_artifacts(
+        config,
+        patch_baseline,
+        false,
+        None,
+        metrics,
+        started.elapsed().as_millis() as u64,
+    )
+    .await?;
+    persist_context_checkpoint(config, state)?;
+    Ok(RunOutcome {
+        completed: false,
+        answer_streamed: false,
+        answer: None,
+        session_dir: config.session_dir.clone(),
+    })
 }
 
 fn drain_user_input(
@@ -2290,6 +2355,136 @@ mod tests {
         assert_eq!(metrics.usage.total_tokens, 25);
         assert_eq!(metrics.model_latency_ms, 40);
         assert_eq!(metrics.response_retries, 5);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_one_in_flight_response_and_persists_usage_without_running_its_tool() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let session_dir = temp.path().join("run");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let size = stream.read(&mut chunk).await.unwrap();
+                assert!(size > 0);
+                request.extend_from_slice(&chunk[..size]);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let size = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + size {
+                        break;
+                    }
+                }
+            }
+            assert!(request.starts_with(b"POST /v1/responses"));
+            shutdown_tx.send(true).unwrap();
+            let body = serde_json::json!({
+                "id": "response-drained",
+                "output": [{"type": "function_call", "call_id": "call-1", "name": "shell",
+                    "arguments": "{\"command\":\"touch should-not-run\",\"context\":{\"protected\":[],\"removable\":[],\"remember\":[]}}"}],
+                "usage": {"input_tokens": 123, "output_tokens": 4}
+            }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            // A drain must never initiate a second request.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let client = OpenAiClient::with_timeouts(
+            format!("http://{address}/v1"),
+            "test-key".into(),
+            "gpt-6-luna".into(),
+            "medium".into(),
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        let outcome = run_with_shutdown(
+            RunConfig {
+                cwd: workspace.clone(),
+                prompt: "Finish the task.".into(),
+                session_dir: session_dir.clone(),
+                model: "gpt-6-luna".into(),
+                reasoning_effort: "medium".into(),
+                max_steps: None,
+                default_shell_timeout_secs: 5,
+                compaction_mode: CompactionMode::Disabled,
+                keep_lease_turns: None,
+                compaction_payoff_requests: 1,
+                compaction_min_payback_percent: 10,
+                compaction_rollout_samples: 0,
+                compaction_rollout_stop_probability_percent: 10,
+                compaction_neutral_high_watermark_tokens: 0,
+                compaction_neutral_low_watermark_tokens: 0,
+                resume_context: None,
+                resume_source: None,
+                prompt_cache_key: Some("test-key".into()),
+            },
+            Backend::openai(client),
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(!outcome.completed);
+        assert!(!workspace.join("should-not-run").exists());
+        let result: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(session_dir.join("result.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["usage"]["input_tokens"], 123);
+        let trace = tokio::fs::read_to_string(session_dir.join("trace.jsonl"))
+            .await
+            .unwrap();
+        let events = trace
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["event"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "model_request")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "model_response")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events.iter().filter(|event| *event == "run_failed").count(),
+            1
+        );
     }
 
     #[tokio::test]
