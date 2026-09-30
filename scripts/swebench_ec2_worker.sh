@@ -195,8 +195,8 @@ fi
   echo "CARRY_COMPACTION_PAYOFF_REQUESTS must be a positive integer" >&2
   exit 2
 }
-[[ "$CARRY_COMPACTION_MIN_PAYBACK_PERCENT" =~ ^(0+|0*(100|[1-9][0-9]?))$ ]] || {
-  echo "CARRY_COMPACTION_MIN_PAYBACK_PERCENT must be an integer from 0 through 100" >&2
+[[ "$CARRY_COMPACTION_MIN_PAYBACK_PERCENT" =~ ^(0|[1-9][0-9]?)(\.[0-9])?$|^100(\.0)?$ ]] || {
+  echo "CARRY_COMPACTION_MIN_PAYBACK_PERCENT must be 0 through 100 with at most one decimal place" >&2
   exit 2
 }
 [[ "$CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT" =~ ^[0-9]+$ ]] && (( CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT <= 100 )) || {

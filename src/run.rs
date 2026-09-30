@@ -96,7 +96,7 @@ pub struct RunConfig {
     /// Number of future requests used to amortize a compaction rewrite; one is next-request economics.
     pub compaction_payoff_requests: u64,
     /// Minimum projected saving (percent of retained-path payoff cost) required to compact.
-    pub compaction_min_payback_percent: u8,
+    pub compaction_min_payback_percent: f64,
     /// Per simulated future turn probability (percent) that the task ends.
     pub compaction_rollout_stop_probability_percent: u8,
     /// Eligible neutral token high-water mark before automatic compaction.
@@ -424,14 +424,14 @@ impl CacheTracker {
 
     #[cfg(test)]
     fn policy(&self) -> CompactionPolicy {
-        self.policy_with_implicit_compatibility(true, 1, 10)
+        self.policy_with_implicit_compatibility(true, 1, 10.0)
     }
 
     fn policy_for_history(
         &self,
         history: &[serde_json::Value],
         payoff_requests: u64,
-        min_payback_percent: u8,
+        min_payback_percent: f64,
     ) -> CompactionPolicy {
         self.policy_with_implicit_compatibility(
             history.starts_with(&self.implicit_prefix),
@@ -444,7 +444,7 @@ impl CacheTracker {
         &self,
         implicit_prefix_compatible: bool,
         payoff_requests: u64,
-        min_payback_percent: u8,
+        min_payback_percent: f64,
     ) -> CompactionPolicy {
         let now = Instant::now();
         let mut breakpoints = self
@@ -1173,7 +1173,7 @@ fn select_compaction_plan(
                     config,
                 );
                 let savings = keep - compact;
-                let minimum = keep * f64::from(config.compaction_min_payback_percent) / 100.0;
+                let minimum = keep * config.compaction_min_payback_percent / 100.0;
                 if savings <= minimum {
                     return None;
                 }
@@ -1250,9 +1250,8 @@ fn projected_after_review_plan(
                 config,
             );
             let savings = forecast.keep_cost_input_units - forecast.review_first_cost_input_units;
-            let minimum = forecast.keep_cost_input_units
-                * f64::from(config.compaction_min_payback_percent)
-                / 100.0;
+            let minimum =
+                forecast.keep_cost_input_units * config.compaction_min_payback_percent / 100.0;
             if savings <= minimum {
                 return None;
             }
@@ -2523,14 +2522,14 @@ mod tests {
         ];
         assert_eq!(
             cache
-                .policy_for_history(&extended, 1, 10)
+                .policy_for_history(&extended, 1, 10.0)
                 .implicit_cached_tokens,
             2_400
         );
         let mutated = vec![json!({"role": "user", "content": "changed"})];
         assert_eq!(
             cache
-                .policy_for_history(&mutated, 1, 10)
+                .policy_for_history(&mutated, 1, 10.0)
                 .implicit_cached_tokens,
             0
         );
@@ -2793,7 +2792,7 @@ mod tests {
                 keep_lease_turns: Some(1),
                 lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
+                compaction_min_payback_percent: 10.0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -2893,7 +2892,7 @@ mod tests {
             keep_lease_turns: Some(1),
             lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
             compaction_payoff_requests: 40,
-            compaction_min_payback_percent: 0,
+            compaction_min_payback_percent: 0.0,
             compaction_rollout_stop_probability_percent: 0,
             compaction_neutral_high_watermark_tokens: 0,
             compaction_neutral_low_watermark_tokens: 0,
@@ -3158,7 +3157,7 @@ mod tests {
             keep_lease_turns: Some(1),
             lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
             compaction_payoff_requests: 5,
-            compaction_min_payback_percent: 0,
+            compaction_min_payback_percent: 0.0,
             compaction_rollout_stop_probability_percent: 10,
             compaction_neutral_high_watermark_tokens: 0,
             compaction_neutral_low_watermark_tokens: 0,
@@ -3241,7 +3240,7 @@ mod tests {
             keep_lease_turns: Some(1),
             lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
             compaction_payoff_requests: 3,
-            compaction_min_payback_percent: 0,
+            compaction_min_payback_percent: 0.0,
             compaction_rollout_stop_probability_percent: 0,
             compaction_neutral_high_watermark_tokens: 0,
             compaction_neutral_low_watermark_tokens: 0,
@@ -3250,7 +3249,7 @@ mod tests {
             prompt_cache_key: None,
         };
         let cache = CacheTracker::new(None);
-        let policy = cache.policy_for_history(&state.input_items(), 3, 0);
+        let policy = cache.policy_for_history(&state.input_items(), 3, 0.0);
         let plan = state
             .plan_compaction_with_neutral_watermarks(&[], policy, 0, 0)
             .unwrap();
@@ -3290,7 +3289,7 @@ mod tests {
             keep_lease_turns: Some(1),
             lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
             compaction_payoff_requests: 5,
-            compaction_min_payback_percent: 25,
+            compaction_min_payback_percent: 25.0,
             compaction_rollout_stop_probability_percent: 0,
             compaction_neutral_high_watermark_tokens: 0,
             compaction_neutral_low_watermark_tokens: 0,
@@ -3299,7 +3298,7 @@ mod tests {
             prompt_cache_key: None,
         };
         let cache = CacheTracker::new(None);
-        let policy = cache.policy_for_history(&state.input_items(), 5, 25);
+        let policy = cache.policy_for_history(&state.input_items(), 5, 25.0);
         let old_plan = state
             .plan_compaction_with_neutral_watermarks(&[], policy, 0, 0)
             .expect("fixed-size planner admits this candidate");
@@ -3341,7 +3340,7 @@ mod tests {
             keep_lease_turns: Some(1),
             lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
             compaction_payoff_requests: 5,
-            compaction_min_payback_percent: 0,
+            compaction_min_payback_percent: 0.0,
             compaction_rollout_stop_probability_percent: 10,
             compaction_neutral_high_watermark_tokens: 0,
             compaction_neutral_low_watermark_tokens: 0,
@@ -3410,7 +3409,7 @@ mod tests {
             keep_lease_turns: Some(1),
             lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
             compaction_payoff_requests: 5,
-            compaction_min_payback_percent: 0,
+            compaction_min_payback_percent: 0.0,
             compaction_rollout_stop_probability_percent: 10,
             compaction_neutral_high_watermark_tokens: 0,
             compaction_neutral_low_watermark_tokens: 0,
@@ -3568,7 +3567,7 @@ mod tests {
             keep_lease_turns: Some(1),
             lease_review_policy: LeaseReviewPolicy::BatchOrdinary,
             compaction_payoff_requests: 20,
-            compaction_min_payback_percent: 0,
+            compaction_min_payback_percent: 0.0,
             compaction_rollout_stop_probability_percent: 10,
             compaction_neutral_high_watermark_tokens: 0,
             compaction_neutral_low_watermark_tokens: 0,
@@ -3706,7 +3705,7 @@ mod tests {
             keep_lease_turns: None,
             lease_review_policy: LeaseReviewPolicy::Baseline,
             compaction_payoff_requests: 5,
-            compaction_min_payback_percent: 0,
+            compaction_min_payback_percent: 0.0,
             compaction_rollout_stop_probability_percent: 10,
             compaction_neutral_high_watermark_tokens: 0,
             compaction_neutral_low_watermark_tokens: 0,
@@ -3811,7 +3810,7 @@ mod tests {
                 keep_lease_turns: None,
                 lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
+                compaction_min_payback_percent: 10.0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -3860,7 +3859,7 @@ mod tests {
                 keep_lease_turns: None,
                 lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
+                compaction_min_payback_percent: 10.0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -3990,7 +3989,7 @@ mod tests {
                 keep_lease_turns: None,
                 lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
+                compaction_min_payback_percent: 10.0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -4018,7 +4017,7 @@ mod tests {
                 keep_lease_turns: None,
                 lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
+                compaction_min_payback_percent: 10.0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -4089,7 +4088,7 @@ mod tests {
                 keep_lease_turns: None,
                 lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
+                compaction_min_payback_percent: 10.0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -4138,7 +4137,7 @@ mod tests {
                 keep_lease_turns: None,
                 lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
+                compaction_min_payback_percent: 10.0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -4202,7 +4201,7 @@ mod tests {
                 keep_lease_turns: None,
                 lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
+                compaction_min_payback_percent: 10.0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -4303,7 +4302,7 @@ mod tests {
                 keep_lease_turns: None,
                 lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 25,
+                compaction_min_payback_percent: 25.0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,
@@ -4361,7 +4360,7 @@ mod tests {
                 keep_lease_turns: None,
                 lease_review_policy: LeaseReviewPolicy::Baseline,
                 compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
+                compaction_min_payback_percent: 10.0,
                 compaction_rollout_stop_probability_percent: 10,
                 compaction_neutral_high_watermark_tokens: 32 * 1024,
                 compaction_neutral_low_watermark_tokens: 24 * 1024,

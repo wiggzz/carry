@@ -71,7 +71,7 @@ class HarnessEntrypointTests(unittest.TestCase):
                 "payoff=sys.argv.index('--compaction-payoff-requests')\n"
                 "assert sys.argv[payoff + 1] == '5', sys.argv\n"
                 "margin=sys.argv.index('--compaction-min-payback-percent')\n"
-                "assert sys.argv[margin + 1] == '25', sys.argv\n"
+                "assert sys.argv[margin + 1] == '2.5', sys.argv\n"
                 "assert '--compaction-rollout-samples' not in sys.argv, sys.argv\n"
                 "stop=sys.argv.index('--compaction-rollout-stop-probability-percent')\n"
                 "assert sys.argv[stop + 1] == '10', sys.argv\n"
@@ -88,7 +88,7 @@ class HarnessEntrypointTests(unittest.TestCase):
                        BENCHMARK_WORKSPACE=str(repo), CARRY_COMPACTION_POLICY="disabled",
                        CARRY_LEASE_REVIEW_POLICY="batch-ordinary",
                        CARRY_KEEP_LEASE_TURNS="8", CARRY_COMPACTION_PAYOFF_REQUESTS="5",
-                       CARRY_COMPACTION_MIN_PAYBACK_PERCENT="25",
+                       CARRY_COMPACTION_MIN_PAYBACK_PERCENT="2.5",
                        CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT="10")
             run = subprocess.run(
                 ["python3", str(ENTRYPOINT), "run", "--harness", "carry",

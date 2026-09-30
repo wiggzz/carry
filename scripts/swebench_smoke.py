@@ -488,10 +488,10 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
             or not config["CARRY_COMPACTION_PAYOFF_REQUESTS"].isdecimal()
             or int(config["CARRY_COMPACTION_PAYOFF_REQUESTS"]) < 1):
         raise ValueError("CARRY_COMPACTION_PAYOFF_REQUESTS must be a positive ASCII decimal integer")
-    if (not config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"].isascii()
-            or not config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"].isdecimal()
-            or int(config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"]) > 100):
-        raise ValueError("CARRY_COMPACTION_MIN_PAYBACK_PERCENT must be an ASCII decimal integer from 0 through 100")
+    margin = config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"]
+    if (not re.fullmatch(r"(?:0|[1-9][0-9]?|100)(?:\.[0-9])?", margin)
+            or float(margin) > 100):
+        raise ValueError("CARRY_COMPACTION_MIN_PAYBACK_PERCENT must be 0 through 100 with at most one decimal place")
     if (not config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"].isascii()
             or not config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"].isdecimal()
             or int(config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"]) > 100):

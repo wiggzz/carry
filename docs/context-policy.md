@@ -61,10 +61,10 @@ with retaining the current history over the same projected cost model.
 `--compaction-min-payback-percent P` (or
 `CARRY_COMPACTION_MIN_PAYBACK_PERCENT=P`) makes that admission margin explicit:
 Carry compacts only when modeled savings exceed `P%` of the retain-path payoff cost.
-It accepts integer values from 0 through 100 and defaults to **25**. Carry previously
-used a hard-coded 10% gate; the new default more deliberately filters marginal
-rewrites. `0` means any strictly positive modeled saving; lower the value if
-you need to admit more speculative rewrites.
+It accepts values from 0 through 100 with at most one decimal place (for example,
+`2.5`) and defaults to **25**. Carry previously used a hard-coded 10% gate;
+the default filters marginal rewrites. `0` means any strictly positive modeled
+saving; lower the value if you need to admit more speculative rewrites.
 
 `--compaction-payoff-requests N` (or `CARRY_COMPACTION_PAYOFF_REQUESTS=N`)
 sets the maximum deterministic forecast horizon; `N` must be positive and

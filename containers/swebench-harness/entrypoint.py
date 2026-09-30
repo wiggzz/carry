@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import shlex
 import subprocess
 import sys
@@ -48,9 +49,9 @@ if (not payoff_requests.isascii() or not payoff_requests.isdecimal()
         or int(payoff_requests) < 1):
     parser.error("CARRY_COMPACTION_PAYOFF_REQUESTS must be a positive ASCII decimal integer")
 min_payback_percent = os.environ.get("CARRY_COMPACTION_MIN_PAYBACK_PERCENT", "25")
-if (not min_payback_percent.isascii() or not min_payback_percent.isdecimal()
-        or int(min_payback_percent) > 100):
-    parser.error("CARRY_COMPACTION_MIN_PAYBACK_PERCENT must be an ASCII decimal integer from 0 through 100")
+if (not re.fullmatch(r"(?:0|[1-9][0-9]?|100)(?:\.[0-9])?", min_payback_percent)
+        or float(min_payback_percent) > 100):
+    parser.error("CARRY_COMPACTION_MIN_PAYBACK_PERCENT must be 0 through 100 with at most one decimal place")
 if "CARRY_COMPACTION_ROLLOUT_SAMPLES" in os.environ:
     parser.error("CARRY_COMPACTION_ROLLOUT_SAMPLES is retired; use deterministic forecast")
 rollout_stop_probability_percent = os.environ.get("CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT", "10")

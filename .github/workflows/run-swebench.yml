@@ -319,8 +319,8 @@ jobs:
               echo "carry compaction payoff requests must be a positive integer" >&2
               exit 1
             }
-            [[ "$CARRY_COMPACTION_MIN_PAYBACK_PERCENT" =~ ^(0+|0*(100|[1-9][0-9]?))$ ]] || {
-            echo "carry compaction minimum payoff percent must be an integer from 0 through 100" >&2
+            [[ "$CARRY_COMPACTION_MIN_PAYBACK_PERCENT" =~ ^(0|[1-9][0-9]?)(\.[0-9])?$|^100(\.0)?$ ]] || {
+            echo "carry compaction minimum payoff percent must be 0 through 100 with at most one decimal place" >&2
             exit 1
           }
             [[ "$CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT" =~ ^[0-9]+$ ]] && (( CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT <= 100 )) || {

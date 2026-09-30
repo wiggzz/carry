@@ -9,7 +9,7 @@ use crate::protocol::ContextManagement;
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 pub(crate) const CACHE_READ_RATE: f64 = 0.10;
 pub(crate) const CACHE_WRITE_RATE: f64 = 1.25;
-pub(crate) const DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT: u8 = 25;
+pub(crate) const DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT: f64 = 25.0;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
 #[cfg(test)]
 const NEUTRAL_TARGET_NUMERATOR: usize = 3;
@@ -900,8 +900,7 @@ impl ContextState {
             invalidated_cache_tokens,
             estimated_savings_input_units: payoff_savings,
             min_payback_percent: policy.min_payback_percent,
-            minimum_payback_input_units: keep_payoff_cost * f64::from(policy.min_payback_percent)
-                / 100.0,
+            minimum_payback_input_units: keep_payoff_cost * policy.min_payback_percent / 100.0,
         }
     }
 
@@ -1125,7 +1124,7 @@ pub struct CompactionPolicy {
     /// Fixed number of requests over which a rewrite is amortized; must be positive.
     pub payoff_requests: u64,
     /// Minimum modeled saving, as a percent of the retained-path payoff cost.
-    pub min_payback_percent: u8,
+    pub min_payback_percent: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1154,7 +1153,7 @@ pub(crate) struct CompactionPlan {
     pub invalidated_generations: Vec<u64>,
     pub invalidated_cache_tokens: usize,
     pub estimated_savings_input_units: f64,
-    pub min_payback_percent: u8,
+    pub min_payback_percent: f64,
     pub minimum_payback_input_units: f64,
 }
 
@@ -1237,7 +1236,7 @@ pub(crate) struct ContextChange {
     pub invalidated_generations: Vec<u64>,
     pub invalidated_cache_tokens: usize,
     pub estimated_savings_input_units: f64,
-    pub min_payback_percent: u8,
+    pub min_payback_percent: f64,
     pub minimum_payback_input_units: f64,
     pub generation: u64,
     pub protected_frontier: Option<u64>,
@@ -1412,18 +1411,30 @@ mod tests {
             implicit_cached_tokens: 0,
             breakpoints: Vec::new(),
             payoff_requests: 1,
-            min_payback_percent: 0,
+            min_payback_percent: 0.0,
         };
         let accepted = state
             .plan_compaction(&[], no_margin.clone())
             .expect("positive saving compacts");
-        assert_eq!(accepted.min_payback_percent, 0);
+        assert_eq!(accepted.min_payback_percent, 0.0);
+        let fractional = state
+            .plan_compaction(
+                &[],
+                CompactionPolicy {
+                    min_payback_percent: 2.5,
+                    ..no_margin.clone()
+                },
+            )
+            .expect("this saving exceeds the 2.5% threshold");
+        assert_eq!(fractional.min_payback_percent, 2.5);
+        assert!(fractional.minimum_payback_input_units > 0.0);
+        assert!(fractional.estimated_savings_input_units > fractional.minimum_payback_input_units);
         assert!(
             state
                 .plan_compaction(
                     &[],
                     CompactionPolicy {
-                        min_payback_percent: 100,
+                        min_payback_percent: 100.0,
                         ..no_margin
                     }
                 )
@@ -1454,7 +1465,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
-                    min_payback_percent: 0,
+                    min_payback_percent: 0.0,
                 },
                 budget,
             )
@@ -1518,7 +1529,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
-                    min_payback_percent: 0,
+                    min_payback_percent: 0.0,
                 },
                 budget,
             )
@@ -1552,7 +1563,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
-                    min_payback_percent: 0,
+                    min_payback_percent: 0.0,
                 },
                 budget,
             )
@@ -1996,7 +2007,7 @@ mod tests {
             implicit_cached_tokens: 0,
             breakpoints: Vec::new(),
             payoff_requests: 1,
-            min_payback_percent: 0,
+            min_payback_percent: 0.0,
         };
         let plan = state
             .plan_compaction_with_neutral_budget(&[], policy.clone(), 0)
@@ -2360,7 +2371,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
-                    min_payback_percent: 0,
+                    min_payback_percent: 0.0,
                 },
                 usize::MAX,
             )
@@ -2388,7 +2399,7 @@ mod tests {
                         cached_tokens: 1_200,
                     }],
                     payoff_requests: 1,
-                    min_payback_percent: 0,
+                    min_payback_percent: 0.0,
                 },
                 usize::MAX,
             )
@@ -2438,7 +2449,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
-                    min_payback_percent: 0,
+                    min_payback_percent: 0.0,
                 },
             )
             .unwrap();
@@ -2471,7 +2482,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
-                    min_payback_percent: 0,
+                    min_payback_percent: 0.0,
                 },
             )
             .unwrap();
@@ -2486,7 +2497,7 @@ mod tests {
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
-                    min_payback_percent: 0,
+                    min_payback_percent: 0.0,
                 },
             )
             .unwrap();

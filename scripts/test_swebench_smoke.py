@@ -67,6 +67,11 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(self.worker.validate_config(dict(valid, CARRY_LEASE_REVIEW_POLICY="batch-ordinary"))["CARRY_LEASE_REVIEW_POLICY"], "batch-ordinary")
         self.assertEqual(config["CARRY_COMPACTION_PAYOFF_REQUESTS"], "1")
         self.assertEqual(config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"], "25")
+        fractional = self.worker.validate_config(dict(valid, CARRY_COMPACTION_MIN_PAYBACK_PERCENT="2.5"))
+        self.assertEqual(fractional["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"], "2.5")
+        for invalid in ("2.55", "100.5", "NaN", "-1", "1e1", "", "001.0"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.worker.validate_config(dict(valid, CARRY_COMPACTION_MIN_PAYBACK_PERCENT=invalid))
         self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"], "10")
         self.assertEqual(config["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"], "0")
         self.assertEqual(config["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"], "0")
@@ -104,6 +109,31 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertNotIn("carry_compaction_rollout_samples", inputs)
         self.assertEqual(contents["jobs"]["bootstrap-worker"]["env"]["CARRY_LEASE_REVIEW_POLICY"],
                          "${{ inputs.carry_lease_review_policy }}")
+
+    def test_long_smoke_workflow_accepts_fractional_margin_before_credentials(self):
+        workflow = pathlib.Path(__file__).parents[1] / ".github" / "workflows" / "run-swebench.yml"
+        contents = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        stage = next(step for step in contents["jobs"]["bootstrap-worker"]["steps"]
+                     if step.get("name") == "Stage run-scoped inputs and output capability")
+        validation = stage["run"].split('RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"', 1)[0]
+        env = dict(os.environ, AWS_REGION="us-west-2", ARTIFACT_BUCKET="fixture",
+                   ARTIFACT_SESSION_ROLE_ARN="fixture", WORKER_LAUNCH_TEMPLATES="[]",
+                   SOURCE_COMMIT="a" * 40, BOOTSTRAP_WAIT_SECONDS="30", BENCHMARK_MODE="long-smoke-5",
+                   BENCHMARK_HARNESS="carry", OPENAI_API_KEY="fixture", DOCKERHUB_USERNAME="fixture",
+                   DOCKERHUB_TOKEN="fixture", MODEL="gpt-6-luna", REASONING="medium",
+                   TASK_IMAGE_REPOSITORY="registry.example/tasks",
+                   TASK_IMAGE_CATALOG="registry.example/tasks@sha256:" + "a" * 64,
+                   CARRY_COMPACTION_POLICY="economic", CARRY_LEASE_REVIEW_POLICY="baseline",
+                   CARRY_COMPACTION_PAYOFF_REQUESTS="5", CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT="10",
+                   CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS="0",
+                   CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS="0",
+                   CARRY_KEEP_LEASE_TURNS="5", BENCHMARK_ATTEMPTS="1", BENCHMARK_ATTEMPT="1")
+        for value, accepted in (("2.5", True), ("100.0", True), ("2.55", False),
+                                ("100.5", False), ("001.0", False), ("NaN", False)):
+            with self.subTest(value=value):
+                run = subprocess.run(["bash", "-c", validation], env=dict(env, CARRY_COMPACTION_MIN_PAYBACK_PERCENT=value),
+                                     text=True, capture_output=True)
+                self.assertEqual(run.returncode == 0, accepted, run.stderr)
 
     def test_workflow_benchmark_model_input_controls_protected_worker(self):
         workflow = pathlib.Path(__file__).parents[1] / ".github" / "workflows" / "run-swebench.yml"

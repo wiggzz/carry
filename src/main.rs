@@ -160,9 +160,9 @@ struct Cli {
         long,
         env = "CARRY_COMPACTION_MIN_PAYBACK_PERCENT",
         default_value_t = DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
-        value_parser = clap::value_parser!(u8).range(0..=100)
+        value_parser = parse_payback_percent
     )]
-    compaction_min_payback_percent: u8,
+    compaction_min_payback_percent: f64,
 
     /// Reject the retired sampled rollout setting before it becomes prompt text.
     #[arg(long = "compaction-rollout-samples", hide = true)]
@@ -212,6 +212,27 @@ struct LoginCli {
     about = "Remove the stored ChatGPT subscription credential"
 )]
 struct LogoutCli {}
+
+fn parse_payback_percent(raw: &str) -> std::result::Result<f64, String> {
+    let (whole, fraction) = match raw.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (raw, None),
+    };
+    let canonical_whole = whole == "0"
+        || (!whole.starts_with('0')
+            && whole.len() <= 3
+            && whole.bytes().all(|b| b.is_ascii_digit()));
+    let valid_fraction =
+        fraction.is_none_or(|f| f.len() == 1 && f.bytes().all(|b| b.is_ascii_digit()));
+    if !canonical_whole || !valid_fraction {
+        return Err("payback percent must be 0 through 100 with at most one decimal place".into());
+    }
+    let percent = raw.parse::<f64>().map_err(|_| "invalid payback percent")?;
+    if percent > 100.0 {
+        return Err("payback percent must be at most 100".into());
+    }
+    Ok(percent)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum CompactionPolicyArg {
@@ -868,7 +889,7 @@ mod tests {
     #[test]
     fn compaction_min_payback_percent_defaults_to_twenty_five_and_is_bounded() {
         let defaulted = Cli::try_parse_from(["carry", "continue"]).unwrap();
-        assert_eq!(defaulted.compaction_min_payback_percent, 25);
+        assert_eq!(defaulted.compaction_min_payback_percent, 25.0);
         let configured = Cli::try_parse_from([
             "carry",
             "--compaction-min-payback-percent",
@@ -876,7 +897,27 @@ mod tests {
             "continue",
         ])
         .unwrap();
-        assert_eq!(configured.compaction_min_payback_percent, 25);
+        assert_eq!(configured.compaction_min_payback_percent, 25.0);
+        let fractional = Cli::try_parse_from([
+            "carry",
+            "--compaction-min-payback-percent",
+            "2.5",
+            "continue",
+        ])
+        .expect("one decimal place must be accepted");
+        assert_eq!(fractional.compaction_min_payback_percent, 2.5);
+        for invalid in ["100.5", "NaN", "2.55", "1e1", "-1", ""] {
+            assert!(
+                Cli::try_parse_from([
+                    "carry",
+                    "--compaction-min-payback-percent",
+                    invalid,
+                    "continue",
+                ])
+                .is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
         assert!(
             Cli::try_parse_from([
                 "carry",
