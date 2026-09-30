@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import shlex
 import subprocess
 import sys
@@ -36,6 +37,9 @@ if not os.environ.get("OPENAI_BASE_URL"):
 compaction_policy = os.environ.get("CARRY_COMPACTION_POLICY", "economic")
 if compaction_policy not in {"economic", "disabled"}:
     parser.error("CARRY_COMPACTION_POLICY must be economic or disabled")
+lease_review_policy = os.environ.get("CARRY_LEASE_REVIEW_POLICY", "baseline")
+if lease_review_policy not in {"baseline", "batch-ordinary"}:
+    parser.error("CARRY_LEASE_REVIEW_POLICY must be baseline or batch-ordinary")
 keep_lease_turns = os.environ.get("CARRY_KEEP_LEASE_TURNS", "")
 if keep_lease_turns and (not keep_lease_turns.isascii() or not keep_lease_turns.isdecimal()
                          or int(keep_lease_turns) < 1):
@@ -45,13 +49,11 @@ if (not payoff_requests.isascii() or not payoff_requests.isdecimal()
         or int(payoff_requests) < 1):
     parser.error("CARRY_COMPACTION_PAYOFF_REQUESTS must be a positive ASCII decimal integer")
 min_payback_percent = os.environ.get("CARRY_COMPACTION_MIN_PAYBACK_PERCENT", "25")
-if (not min_payback_percent.isascii() or not min_payback_percent.isdecimal()
-        or int(min_payback_percent) > 100):
-    parser.error("CARRY_COMPACTION_MIN_PAYBACK_PERCENT must be an ASCII decimal integer from 0 through 100")
-rollout_samples = os.environ.get("CARRY_COMPACTION_ROLLOUT_SAMPLES", "0")
-if (not rollout_samples.isascii() or not rollout_samples.isdecimal()
-        or int(rollout_samples) > 64):
-    parser.error("CARRY_COMPACTION_ROLLOUT_SAMPLES must be an ASCII decimal integer from 0 through 64")
+if (not re.fullmatch(r"(?:0|[1-9][0-9]?|100)(?:\.[0-9])?", min_payback_percent)
+        or float(min_payback_percent) > 100):
+    parser.error("CARRY_COMPACTION_MIN_PAYBACK_PERCENT must be 0 through 100 with at most one decimal place")
+if "CARRY_COMPACTION_ROLLOUT_SAMPLES" in os.environ:
+    parser.error("CARRY_COMPACTION_ROLLOUT_SAMPLES is retired; use deterministic forecast")
 rollout_stop_probability_percent = os.environ.get("CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT", "10")
 if (not rollout_stop_probability_percent.isascii() or not rollout_stop_probability_percent.isdecimal()
         or int(rollout_stop_probability_percent) > 100):
@@ -96,9 +98,9 @@ command = [part.format(**values) for part in shlex.split(template)]
 if args.harness == "carry" and keep_lease_turns:
     command.extend(["--keep-lease-turns", keep_lease_turns])
 if args.harness == "carry":
+    command.extend(["--lease-review-policy", lease_review_policy])
     command.extend(["--compaction-payoff-requests", payoff_requests])
     command.extend(["--compaction-min-payback-percent", min_payback_percent])
-    command.extend(["--compaction-rollout-samples", rollout_samples])
     command.extend(["--compaction-rollout-stop-probability-percent", rollout_stop_probability_percent])
     command.extend(["--compaction-neutral-high-watermark-tokens", neutral_high_watermark_tokens])
     command.extend(["--compaction-neutral-low-watermark-tokens", neutral_low_watermark_tokens])

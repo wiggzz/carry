@@ -17,7 +17,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use context::DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT;
-use run::{Backend, CompactionMode, RunConfig, UserInput};
+use run::{Backend, CompactionMode, LeaseReviewPolicy, RunConfig, UserInput};
 use tokio::sync::mpsc;
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
@@ -137,6 +137,15 @@ struct Cli {
     )]
     keep_lease_turns: Option<u64>,
 
+    /// Experimental lease review policy; baseline preserves the existing gate.
+    #[arg(
+        long,
+        env = "CARRY_LEASE_REVIEW_POLICY",
+        value_enum,
+        default_value = "baseline"
+    )]
+    lease_review_policy: LeaseReviewPolicy,
+
     /// Number of future requests used to amortize a compaction rewrite; defaults to five.
     #[arg(
         long,
@@ -151,18 +160,13 @@ struct Cli {
         long,
         env = "CARRY_COMPACTION_MIN_PAYBACK_PERCENT",
         default_value_t = DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
-        value_parser = clap::value_parser!(u8).range(0..=100)
+        value_parser = parse_payback_percent
     )]
-    compaction_min_payback_percent: u8,
+    compaction_min_payback_percent: f64,
 
-    /// Deterministic flat-drop rollout samples used to gate economic compaction; zero disables it.
-    #[arg(
-        long,
-        env = "CARRY_COMPACTION_ROLLOUT_SAMPLES",
-        default_value_t = 0,
-        value_parser = clap::value_parser!(u32).range(0..=64)
-    )]
-    compaction_rollout_samples: u32,
+    /// Reject the retired sampled rollout setting before it becomes prompt text.
+    #[arg(long = "compaction-rollout-samples", hide = true)]
+    retired_rollout_samples: Option<String>,
 
     /// Per simulated future turn probability (percent) that the task ends; defaults to ten.
     #[arg(
@@ -208,6 +212,27 @@ struct LoginCli {
     about = "Remove the stored ChatGPT subscription credential"
 )]
 struct LogoutCli {}
+
+fn parse_payback_percent(raw: &str) -> std::result::Result<f64, String> {
+    let (whole, fraction) = match raw.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (raw, None),
+    };
+    let canonical_whole = whole == "0"
+        || (!whole.starts_with('0')
+            && whole.len() <= 3
+            && whole.bytes().all(|b| b.is_ascii_digit()));
+    let valid_fraction =
+        fraction.is_none_or(|f| f.len() == 1 && f.bytes().all(|b| b.is_ascii_digit()));
+    if !canonical_whole || !valid_fraction {
+        return Err("payback percent must be 0 through 100 with at most one decimal place".into());
+    }
+    let percent = raw.parse::<f64>().map_err(|_| "invalid payback percent")?;
+    if percent > 100.0 {
+        return Err("payback percent must be at most 100".into());
+    }
+    Ok(percent)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum CompactionPolicyArg {
@@ -278,6 +303,19 @@ async fn main() -> Result<()> {
 }
 
 fn validate_args(args: &Cli) -> Result<()> {
+    let retired_env = std::env::var_os("CARRY_COMPACTION_ROLLOUT_SAMPLES");
+    validate_args_with_retired_samples(args, retired_env.as_deref())
+}
+
+fn validate_args_with_retired_samples(
+    args: &Cli,
+    retired_env: Option<&std::ffi::OsStr>,
+) -> Result<()> {
+    if args.retired_rollout_samples.is_some() || retired_env.is_some() {
+        bail!(
+            "sampled compaction rollouts have been removed; use the deterministic payoff horizon and stop probability"
+        );
+    }
     if args.compaction_neutral_low_watermark_tokens > args.compaction_neutral_high_watermark_tokens
     {
         bail!("compaction neutral low watermark must not exceed the high watermark");
@@ -435,9 +473,9 @@ async fn run_command(args: Cli) -> Result<()> {
         default_shell_timeout_secs: args.default_shell_timeout_secs,
         compaction_mode: args.compaction_policy.into(),
         keep_lease_turns: args.keep_lease_turns,
+        lease_review_policy: args.lease_review_policy,
         compaction_payoff_requests: args.compaction_payoff_requests,
         compaction_min_payback_percent: args.compaction_min_payback_percent,
-        compaction_rollout_samples: args.compaction_rollout_samples,
         compaction_rollout_stop_probability_percent: args
             .compaction_rollout_stop_probability_percent,
         compaction_neutral_high_watermark_tokens: args.compaction_neutral_high_watermark_tokens,
@@ -808,6 +846,33 @@ mod tests {
     }
 
     #[test]
+    fn lease_review_treatment_is_explicit_and_rejects_unknown_modes() {
+        assert!(Cli::try_parse_from(["carry", "continue"]).is_ok());
+        let selected = Cli::try_parse_from([
+            "carry",
+            "--lease-review-policy",
+            "batch-ordinary",
+            "-p",
+            "continue",
+        ])
+        .unwrap();
+        assert!(
+            selected.prompt_words.is_empty(),
+            "the policy flag must not be swallowed as task text"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "carry",
+                "--lease-review-policy",
+                "unexpected",
+                "-p",
+                "continue"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn compaction_payoff_requests_defaults_to_five_and_requires_positive_value() {
         let defaulted = Cli::try_parse_from(["carry", "continue"]).unwrap();
         assert_eq!(defaulted.compaction_payoff_requests, 5);
@@ -824,7 +889,7 @@ mod tests {
     #[test]
     fn compaction_min_payback_percent_defaults_to_twenty_five_and_is_bounded() {
         let defaulted = Cli::try_parse_from(["carry", "continue"]).unwrap();
-        assert_eq!(defaulted.compaction_min_payback_percent, 25);
+        assert_eq!(defaulted.compaction_min_payback_percent, 25.0);
         let configured = Cli::try_parse_from([
             "carry",
             "--compaction-min-payback-percent",
@@ -832,7 +897,27 @@ mod tests {
             "continue",
         ])
         .unwrap();
-        assert_eq!(configured.compaction_min_payback_percent, 25);
+        assert_eq!(configured.compaction_min_payback_percent, 25.0);
+        let fractional = Cli::try_parse_from([
+            "carry",
+            "--compaction-min-payback-percent",
+            "2.5",
+            "continue",
+        ])
+        .expect("one decimal place must be accepted");
+        assert_eq!(fractional.compaction_min_payback_percent, 2.5);
+        for invalid in ["100.5", "NaN", "2.55", "1e1", "-1", ""] {
+            assert!(
+                Cli::try_parse_from([
+                    "carry",
+                    "--compaction-min-payback-percent",
+                    invalid,
+                    "continue",
+                ])
+                .is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
         assert!(
             Cli::try_parse_from([
                 "carry",
@@ -845,17 +930,26 @@ mod tests {
     }
 
     #[test]
-    fn compaction_rollout_samples_are_opt_in_and_bounded() {
-        let disabled = Cli::try_parse_from(["carry", "continue"]).unwrap();
-        assert_eq!(disabled.compaction_rollout_samples, 0);
-        let enabled =
+    fn sampled_rollout_option_is_not_a_second_compaction_policy() {
+        let legacy =
             Cli::try_parse_from(["carry", "--compaction-rollout-samples", "16", "continue"])
                 .unwrap();
-        assert_eq!(enabled.compaction_rollout_samples, 16);
         assert!(
-            Cli::try_parse_from(["carry", "--compaction-rollout-samples", "65", "continue",])
-                .is_err()
+            validate_args(&legacy).is_err(),
+            "sampled rollouts must fail before a model call, not become prompt text"
         );
+    }
+
+    #[test]
+    fn sampled_rollout_env_is_rejected_before_a_model_call() {
+        let args = Cli::try_parse_from(["carry", "continue"]).unwrap();
+        assert!(
+            validate_args_with_retired_samples(&args, Some(std::ffi::OsStr::new("16"))).is_err()
+        );
+        assert!(
+            validate_args_with_retired_samples(&args, Some(std::ffi::OsStr::new("0"))).is_err()
+        );
+        assert!(validate_args_with_retired_samples(&args, None).is_ok());
     }
 
     #[test]
