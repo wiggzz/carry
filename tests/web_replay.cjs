@@ -59,6 +59,8 @@ assert.equal(elements.get('#text').focused, true, 'composer should be focused at
   vm.runInContext("event({event:'session_resumed',data:{model:'gpt-6-sol',reasoning_effort:'low'}})", sandbox);
   assert.equal(elements.get('#stat-model').textContent, 'gpt-6-sol');
   assert.equal(elements.get('#stat-reasoning').textContent, 'low');
+  vm.runInContext("event({run_id:'savings',seq:1,event:'model_response',data:{usage:{input_tokens:10,output_tokens:1},estimated_savings_usd:4.2331}})",sandbox);
+  assert.equal(elements.get('#stat-savings').textContent, 'estimated savings $4.2331');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
 // Memory notes appear once for accepted memories, including on history replay.

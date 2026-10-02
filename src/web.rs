@@ -19,7 +19,9 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 
+use crate::openai::Usage;
 use crate::run::{Backend, RunConfig, UserInput, run_interactive_with_events};
+use crate::savings::{Request, estimate};
 
 const INDEX: &str = include_str!("web/index.html");
 
@@ -234,9 +236,47 @@ async fn sse_events(
         Ok(value) if should_emit_live_event(&value, highest_replayed_sequence) => Some(Ok(value)),
         Ok(_) | Err(_) => None,
     });
-    let stream = history.chain(live).map(|event: Result<Value, Infallible>| {
-        event.map(|value| Event::default().json_data(value).expect("event is JSON"))
-    });
+    let mut requests = Vec::new();
+    let mut model = state.model.clone();
+    let mut dropped = 0;
+    let stream = history
+        .chain(live)
+        .map(move |event: Result<Value, Infallible>| {
+            event.map(|mut value| {
+                match value["event"].as_str() {
+                    Some("run_started" | "session_resumed") => {
+                        if let Some(name) = value["data"]["model"].as_str() {
+                            model = name.to_owned();
+                        }
+                    }
+                    Some("context_compacted") => {
+                        dropped += value["data"]["compaction"]["dropped_tokens"]
+                            .as_u64()
+                            .unwrap_or(0);
+                    }
+                    Some("model_response") => {
+                        if let Ok(usage) =
+                            serde_json::from_value::<Usage>(value["data"]["usage"].clone())
+                        {
+                            requests.push(Request {
+                                model: model.clone(),
+                                usage,
+                                actual_cost: value["data"]["estimated_cost_usd"].as_f64(),
+                                dropped_before: std::mem::take(&mut dropped),
+                            });
+                            let estimate = estimate(&requests, 272_000);
+                            if estimate.priced {
+                                value["data"]["estimated_savings_usd"] = json!(estimate.savings);
+                                value["data"]["estimated_pi_compactions"] =
+                                    json!(estimate.pi_compactions);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                Event::default().json_data(value).expect("event is JSON")
+            })
+        });
     Ok(Sse::new(stream))
 }
 

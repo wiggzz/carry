@@ -5,6 +5,7 @@ mod mcp;
 mod openai;
 mod protocol;
 mod run;
+mod savings;
 mod terminal;
 mod web;
 
