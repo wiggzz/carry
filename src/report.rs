@@ -85,8 +85,8 @@ fn render(sessions: &Path) -> Result<String> {
     }
     Ok(format!(
         r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Carry cost report</title>
-<style>body{{font:15px system-ui;background:#101214;color:#e7e9eb;max-width:1100px;margin:2rem auto;padding:1rem}}table{{border-collapse:collapse;width:100%}}td,th{{padding:.5rem;border-bottom:1px solid #444;text-align:left}}td:nth-child(n+3){{text-align:right}}</style>
-<h1>Carry cost report</h1><p>{count} sessions with completed responses · Priced actual ${actual_total:.4} · Estimated savings ${savings_total:.4}</p>
+<style>body{{font:15px system-ui;background:#101214;color:#e7e9eb;max-width:1100px;margin:2rem auto;padding:1rem}}table{{border-collapse:collapse;width:100%}}td,th{{padding:.5rem;border-bottom:1px solid #444;text-align:left}}td:nth-child(n+3){{text-align:right}}.summary-cards{{display:flex;flex-wrap:wrap;gap:1rem;margin:1.5rem 0}}.summary-card{{display:flex;flex-direction:column;gap:.3rem;padding:1rem 1.3rem;border:1px solid #444;border-radius:12px;background:#1b1f23;min-width:180px}}.summary-card strong{{font-size:1.6rem}}.summary-card span{{color:#aeb6bf}}</style>
+<h1>Carry cost report</h1><div class="summary-cards"><div class="summary-card"><strong>${actual_total:.4}</strong><span>Actual cost</span></div><div class="summary-card"><strong>${savings_total:.4}</strong><span>Estimated savings</span></div></div><p>{count} sessions with completed responses</p>
 <table><thead><tr><th>Session</th><th>Last model</th><th>Responses</th><th>Actual</th><th>Estimated Pi compactions</th><th>Estimated savings</th></tr></thead><tbody>{rows}</tbody></table>
 <p>Estimated savings = Pi-style counterfactual minus observed Carry cost. Shares the web UI estimator: 272K window, 16,384-token reserve, 20K recent tokens retained, 1K-token summary charged as uncached input plus output, rewritten prompt after each simulated compaction. Cache reuse is modeled from request sizes, not Carry cache classifications. Same outputs and tool behavior assumed; not billed savings. Unpriced sessions are excluded from totals.</p></html>"#
     ))
@@ -115,6 +115,9 @@ mod tests {
             "{\"event\":\"run_started\",\"data\":{\"model\":\"gpt-6-sol\"}}\n",
             "{\"event\":\"model_response\",\"data\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":5}}}\n"
         )).unwrap();
+        let session_two = dir.path().join("two");
+        fs::create_dir(&session_two).unwrap();
+        fs::copy(session.join("trace.jsonl"), session_two.join("trace.jsonl")).unwrap();
         let output = dir.path().join("cost.html");
         run(ReportCli {
             command: ReportCommand::Cost {
@@ -127,5 +130,9 @@ mod tests {
         assert!(html.contains("one"));
         assert!(html.contains("$0.0000"));
         assert!(html.contains("<td>0</td><td>$0.0000"));
+        assert!(html.contains("class=\"summary-cards\""));
+        assert!(html.contains("<strong>$0.0041</strong><span>Actual cost</span>"));
+        assert!(html.contains("<strong>$0.0000</strong><span>Estimated savings</span>"));
+        assert!(html.contains("2 sessions with completed responses"));
     }
 }
