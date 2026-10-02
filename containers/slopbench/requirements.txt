@@ -1,0 +1,17 @@
+attrs==26.1.0
+deepdiff==8.6.1
+iniconfig==2.3.0
+jsonschema==4.17.3
+orderly-set==5.5.0
+packaging==26.3
+pluggy==1.6.0
+Pygments==2.21.0
+pyrsistent==0.20.0
+pytest==8.4.2
+pytest-json-ctrf==0.3.5
+pytest-json-report==1.5.0
+pytest-metadata==3.1.1
+pytest-timeout==2.4.0
+PyYAML==6.0.2
+ruamel.yaml==0.18.13
+ruamel.yaml.clib==0.2.14; python_version < '3.14'

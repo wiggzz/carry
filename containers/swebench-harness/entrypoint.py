@@ -16,6 +16,7 @@ parser.add_argument("--model", required=True)
 parser.add_argument("--reasoning", required=True)
 parser.add_argument("--prompt", required=True)
 parser.add_argument("--output", required=True)
+parser.add_argument("--snapshot-only", action="store_true", help="Continuous workspace: no Git baseline or patch capture")
 parser.add_argument("--resume-session", type=pathlib.Path)
 parser.add_argument("--codex-session", type=pathlib.Path)
 parser.add_argument("--codex-thread")
@@ -124,13 +125,14 @@ if args.harness == "pi":
     else:
         command.append("--no-session")
 workspace = os.environ.get("BENCHMARK_WORKSPACE", "/workspace")
-subprocess.run(
-    ["git", "config", "--global", "--add", "safe.directory", workspace],
-    check=True,
-)
-baseline = subprocess.check_output(
-    ["git", "rev-parse", "HEAD"], cwd=workspace, text=True
-).strip()
+if not args.snapshot_only:
+    subprocess.run(
+        ["git", "config", "--global", "--add", "safe.directory", workspace],
+        check=True,
+    )
+    baseline = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=workspace, text=True
+    ).strip()
 
 if args.harness == "pi":
     config = pathlib.Path(os.environ["HOME"]) / ".pi" / "agent"
@@ -220,14 +222,15 @@ if args.codex_session:
     (args.codex_session / "auth.json").unlink(missing_ok=True)
 
 patch_path = output / "final.patch"
-subprocess.run(["git", "add", "-N", "--", "."], cwd=workspace, check=True)
-with patch_path.open("wb") as patch:
-    subprocess.run(
-        ["git", "diff", "--binary", "--no-ext-diff", baseline],
-        cwd=workspace,
-        stdout=patch,
-        check=True,
-    )
+if not args.snapshot_only:
+    subprocess.run(["git", "add", "-N", "--", "."], cwd=workspace, check=True)
+    with patch_path.open("wb") as patch:
+        subprocess.run(
+            ["git", "diff", "--binary", "--no-ext-diff", baseline],
+            cwd=workspace, stdout=patch, check=True,
+        )
+else:
+    patch_path.write_bytes(b"")
 
 secret = os.environ["OPENAI_API_KEY"].encode()
 trace_path.write_bytes(trace_path.read_bytes().replace(secret, b"[REDACTED]"))
