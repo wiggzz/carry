@@ -4,6 +4,7 @@ mod log;
 mod mcp;
 mod openai;
 mod protocol;
+mod report;
 mod run;
 mod savings;
 mod terminal;
@@ -259,6 +260,10 @@ async fn main() -> Result<()> {
                 auth::LoginMethod::Browser
             };
             return auth::login(&auth::carry_home()?, method).await;
+        }
+        Some("report") => {
+            argv.remove(1);
+            return report::run(report::ReportCli::parse_from(argv));
         }
         Some("mcp") => {
             argv.remove(1);

@@ -70,6 +70,14 @@ Read [benchmark evidence](docs/benchmark-results.md) for immutable run links,
 configuration, accounting, recovery provenance, and limitations. One run is
 useful evidence, not a general quality ranking.
 
+## Local cost report
+
+Run `carry report cost` to generate `carry-cost-report.html` from local session
+traces. Use `--sessions DIR` to select a different session home and `--output FILE`
+to change the destination. The HTML and web UI share the same Pi-style
+counterfactual estimator; its dollar figures are estimates, not billed charges.
+The report contains local session IDs: review it before sharing.
+
 ## Install and try it
 
 ### Install a release

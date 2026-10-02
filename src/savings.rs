@@ -21,6 +21,52 @@ pub struct Estimate {
     pub priced: bool,
 }
 
+/// Incrementally reconstruct request metadata for both web replay and offline reports.
+#[derive(Default)]
+pub struct Trajectory {
+    pub requests: Vec<Request>,
+    model: String,
+    dropped: u64,
+}
+
+impl Trajectory {
+    pub fn with_model(model: String) -> Self {
+        Self {
+            model,
+            ..Self::default()
+        }
+    }
+
+    pub fn record(&mut self, value: &serde_json::Value) -> Option<Estimate> {
+        match value["event"].as_str()? {
+            "run_started" | "session_resumed" => {
+                if let Some(name) = value["data"]["model"].as_str() {
+                    self.model = name.to_owned();
+                }
+            }
+            "context_compacted" => {
+                self.dropped = self.dropped.saturating_add(
+                    value["data"]["compaction"]["dropped_tokens"]
+                        .as_u64()
+                        .unwrap_or(0),
+                );
+            }
+            "model_response" => {
+                let usage = serde_json::from_value::<Usage>(value["data"]["usage"].clone()).ok()?;
+                self.requests.push(Request {
+                    model: self.model.clone(),
+                    usage,
+                    actual_cost: value["data"]["estimated_cost_usd"].as_f64(),
+                    dropped_before: std::mem::take(&mut self.dropped),
+                });
+                return Some(estimate(&self.requests, 272_000));
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
 /// Re-simulates cache reuse and Pi compactions; never imports Carry's cache classifications
 /// into the alternative trajectory. No extrapolation of model outputs or tool activity.
 pub fn estimate(requests: &[Request], context_window: u64) -> Estimate {
