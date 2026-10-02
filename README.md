@@ -72,10 +72,12 @@ useful evidence, not a general quality ranking.
 
 ## Local cost report
 
-Run `carry report cost` to generate `carry-cost-report.html` from local session
-traces. Use `--sessions DIR` to select a different session home and `--output FILE`
-to change the destination. The HTML and web UI share the same Pi-style
-counterfactual estimator; its dollar figures are estimates, not billed charges.
+Run `carry report cost` to generate an HTML report in the system temp directory
+from local session traces and open it in your browser. Use `--sessions DIR` to
+select a different session home and `--output FILE` to save it elsewhere.
+Browser-launch failures do not prevent report generation; open the printed URL
+manually. The HTML and web UI share the same Pi-style counterfactual estimator;
+its dollar figures are estimates, not billed charges.
 The report contains local session IDs: review it before sharing.
 
 ## Install and try it

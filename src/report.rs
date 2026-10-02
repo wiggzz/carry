@@ -21,7 +21,7 @@ enum ReportCommand {
         /// Directory containing Carry session directories (defaults to ~/.carry/sessions).
         #[arg(long)]
         sessions: Option<PathBuf>,
-        /// Destination HTML file (defaults to ./carry-cost-report.html).
+        /// Destination HTML file (defaults to a persistent file in the system temp directory).
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -93,19 +93,85 @@ fn render(sessions: &Path) -> Result<String> {
 }
 
 pub fn run(args: ReportCli) -> Result<()> {
+    run_with_open(args, crate::auth::open_browser)
+}
+
+fn run_with_open(args: ReportCli, open: impl FnOnce(&str)) -> Result<()> {
     let ReportCommand::Cost { sessions, output } = args.command;
     let sessions = sessions.unwrap_or(crate::auth::carry_home()?.join("sessions"));
-    let output = output.unwrap_or_else(|| PathBuf::from("carry-cost-report.html"));
     let html =
         render(&sessions).with_context(|| format!("reading sessions in {}", sessions.display()))?;
+    let output = match output {
+        Some(path) => path,
+        None => {
+            tempfile::Builder::new()
+                .prefix("carry-cost-report-")
+                .suffix(".html")
+                .tempfile()
+                .context("creating temporary report")?
+                .keep()
+                .context("persisting temporary report")?
+                .1
+        }
+    };
     fs::write(&output, html).with_context(|| format!("writing {}", output.display()))?;
     println!("Cost report: {}", output.display());
+    let url = url::Url::from_file_path(&output.canonicalize()?)
+        .map_err(|_| anyhow::anyhow!("could not construct file URL for {}", output.display()))?;
+    println!("Open in browser: {url}");
+    open(url.as_str());
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_report_is_persisted_in_system_temp_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .collect::<std::collections::HashSet<_>>();
+        let mut opened = None;
+        run_with_open(
+            ReportCli {
+                command: ReportCommand::Cost {
+                    sessions: Some(dir.path().into()),
+                    output: None,
+                },
+            },
+            |url| opened = Some(url.to_owned()),
+        )
+        .unwrap();
+        let new_reports = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|path| {
+                !before.contains(path)
+                    && path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("carry-cost-report-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(new_reports.len(), 1);
+        let url = url::Url::parse(opened.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            url.to_file_path().unwrap(),
+            new_reports[0].canonicalize().unwrap()
+        );
+        assert!(
+            fs::read_to_string(&new_reports[0])
+                .unwrap()
+                .contains("Carry cost report")
+        );
+        fs::remove_file(&new_reports[0]).unwrap();
+    }
+
     #[test]
     fn cost_report_uses_shared_estimator() {
         let dir = tempfile::tempdir().unwrap();
@@ -118,14 +184,25 @@ mod tests {
         let session_two = dir.path().join("two");
         fs::create_dir(&session_two).unwrap();
         fs::copy(session.join("trace.jsonl"), session_two.join("trace.jsonl")).unwrap();
-        let output = dir.path().join("cost.html");
-        run(ReportCli {
-            command: ReportCommand::Cost {
-                sessions: Some(dir.path().into()),
-                output: Some(output.clone()),
+        let output = dir.path().join("cost report.html");
+        let mut opened = None;
+        run_with_open(
+            ReportCli {
+                command: ReportCommand::Cost {
+                    sessions: Some(dir.path().into()),
+                    output: Some(output.clone()),
+                },
             },
-        })
+            |url| opened = Some(url.to_owned()),
+        )
         .unwrap();
+        assert_eq!(
+            url::Url::parse(opened.as_deref().unwrap())
+                .unwrap()
+                .to_file_path()
+                .unwrap(),
+            output.canonicalize().unwrap()
+        );
         let html = fs::read_to_string(output).unwrap();
         assert!(html.contains("one"));
         assert!(html.contains("$0.0000"));
