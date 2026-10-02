@@ -38,7 +38,7 @@ function cleanHeaders(headers) {
   return result;
 }
 
-function usageRecords(body) {
+function usageRecords(body, includeIdentity = false) {
   const values = [];
   const visit = value => {
     if (!value || typeof value !== 'object') return;
@@ -46,6 +46,7 @@ function usageRecords(body) {
       const usage = value.usage;
       if (Number.isInteger(usage.input_tokens) && usage.input_tokens >= 0) {
         values.push({
+          ...(includeIdentity ? {response_id: typeof value.id === 'string' ? value.id : null} : {}),
           input_tokens: usage.input_tokens,
           cached_input_tokens: Number.isInteger(usage.input_tokens_details?.cached_tokens)
             ? usage.input_tokens_details.cached_tokens : 0,
@@ -107,6 +108,9 @@ function serve() {
             // only aggregate provider accounting, never prompts or responses.
             console.log(`BENCHMARK_PROXY_USAGE ${JSON.stringify(usage)}`);
           }
+        }
+        for (const usage of usageRecords(Buffer.concat(chunks).toString('utf8'), true)) {
+          console.log(`BENCHMARK_PROXY_RESPONSE ${JSON.stringify(usage)}`);
         }
         response.end();
       });

@@ -165,7 +165,7 @@ curl --proto '=https' --tlsv1.2 --fail --silent --location --retry 3 \
 printf '%s  %s\n' "$SOURCE_SHA256" "$CARRY_ROOT/source.tar.gz" | sha256sum -c -
 tar -xzf "$CARRY_ROOT/source.tar.gz" -C "$CARRY_ROOT/source"
 worker_event source_ready
-if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 ]]; then
+if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == prepare-slop-2 ]]; then
   "$PYTHON_BIN" "$CARRY_ROOT/source/scripts/benchmark_preparation_telemetry.py" \
     --root "$CARRY_ROOT/results" --work "$CARRY_ROOT/work" --interval 60 2>/dev/null &
   preparation_telemetry_pid=$!
@@ -176,7 +176,7 @@ if [[ "$BENCHMARK_MODE" == bootstrap ]]; then
   exit 0
 fi
 case "$BENCHMARK_MODE" in
-  smoke-5|long-smoke-5|session-smoke-5|session-20|official-50|long-official-50|prepare-50|prepare-long-50) ;;
+  smoke-5|long-smoke-5|session-smoke-5|session-20|official-50|long-official-50|prepare-50|prepare-long-50|slop-2|prepare-slop-2) ;;
   *) echo "unknown benchmark mode" >&2; exit 2 ;;
 esac
 if [[ "$BENCHMARK_MODE" =~ ^session-(smoke-5|20)$ && "$BENCHMARK_HARNESS" != carry && "$BENCHMARK_HARNESS" != codex && "$BENCHMARK_HARNESS" != pi ]]; then
@@ -204,6 +204,16 @@ fi
   exit 2
 }
 
+if [[ "$BENCHMARK_MODE" == slop-2 || "$BENCHMARK_MODE" == prepare-slop-2 ]]; then
+  [[ "$BENCHMARK_HARNESS" == carry && "$MODEL" == gpt-6-luna && "$REASONING" == medium && "$CARRY_COMPACTION_POLICY" == disabled ]] || {
+    echo "Slop requires Carry, gpt-6-luna, medium, disabled compaction" >&2; exit 2;
+  }
+  [[ "${BENCHMARK_ATTEMPTS:-1}" =~ ^[1-3]$ && "${BENCHMARK_ATTEMPT:-1}" =~ ^[1-3]$ ]] \
+    && (( ${BENCHMARK_ATTEMPT:-1} <= ${BENCHMARK_ATTEMPTS:-1} )) || {
+    echo "Slop attempts must be 1-3" >&2; exit 2;
+  }
+  [[ "$BENCHMARK_MODE" != prepare-slop-2 || "${BENCHMARK_ATTEMPTS:-1}" == 1 ]] || exit 2
+fi
 worker_event credentials
 docker_auth_url=$(printf '%s' "$DOCKER_AUTH_URL_B64" | base64 -d)
 [[ -n "$docker_auth_url" ]] || { echo "missing Docker Hub authentication capability" >&2; exit 2; }
@@ -214,7 +224,7 @@ export DOCKER_CONFIG
 "$PYTHON_BIN" "$CARRY_ROOT/source/scripts/docker_registry_login.py" \
   "$DOCKER_AUTH_FILE" "$DOCKER_CONFIG"
 
-if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 ]]; then
+if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == prepare-slop-2 ]]; then
   registry_auth_url=$(printf '%s' "$REGISTRY_AUTH_URL_B64" | base64 -d)
   [[ -n "$registry_auth_url" && -n "${TASK_IMAGE_REPOSITORY:-}" ]] || {
     echo "missing task-registry publication configuration" >&2
@@ -236,7 +246,20 @@ if [[ -n "$control_url" ]]; then
   capability_refresh_pid=$!
 fi
 
-if [[ "$BENCHMARK_MODE" != prepare-50 && "$BENCHMARK_MODE" != prepare-long-50 ]]; then
+if [[ "$BENCHMARK_MODE" == prepare-slop-2 ]]; then
+  worker_event preparation
+  timeout --signal=TERM --kill-after=30s 18000 "$PYTHON_BIN" "$CARRY_ROOT/source/scripts/slopbench.py" \
+    prepare-images --source "$CARRY_ROOT/source" --work "$CARRY_ROOT/work" --output "$CARRY_ROOT/results"
+  exit 0
+elif [[ "$BENCHMARK_MODE" == slop-2 ]]; then
+  worker_event slop_preflight
+  # No model key has been fetched. Reuse certified dependencies/reference gates;
+  # only the current-source native Carry bundle is built on this remote worker.
+  timeout --signal=TERM --kill-after=30s 3000 "$PYTHON_BIN" "$CARRY_ROOT/source/scripts/slopbench.py" \
+    preflight --source "$CARRY_ROOT/source" --work "$CARRY_ROOT/work" --output "$CARRY_ROOT/results"
+fi
+
+if [[ "$BENCHMARK_MODE" != prepare-50 && "$BENCHMARK_MODE" != prepare-long-50 && "$BENCHMARK_MODE" != prepare-slop-2 ]]; then
   key_url=$(printf '%s' "$KEY_URL_B64" | base64 -d)
   [[ -n "$key_url" ]] || { echo "missing model credential capability" >&2; exit 2; }
   curl --proto '=https' --tlsv1.2 --fail --silent --location \
@@ -245,6 +268,17 @@ if [[ "$BENCHMARK_MODE" != prepare-50 && "$BENCHMARK_MODE" != prepare-long-50 ]]
   export OPENAI_API_KEY
   OPENAI_API_KEY=$(cat "$SECRET_FILE")
   export OPENAI_SECRET_FILE="$SECRET_FILE"
+fi
+
+if [[ "$BENCHMARK_MODE" == slop-2 ]]; then
+  worker_event benchmark
+  worker_elapsed_seconds=$(( $(date +%s) - worker_started_at ))
+  OVERALL_TIMEOUT_SECONDS=$(( 18000 - worker_elapsed_seconds ))
+  (( OVERALL_TIMEOUT_SECONDS > 0 )) || exit 124
+  timeout --signal=TERM --kill-after=30s "$OVERALL_TIMEOUT_SECONDS" "$PYTHON_BIN" "$CARRY_ROOT/source/scripts/slopbench.py" \
+    run --source "$CARRY_ROOT/source" --work "$CARRY_ROOT/work" --output "$CARRY_ROOT/results" \
+    --attempt "${BENCHMARK_ATTEMPT:-1}" --attempts "${BENCHMARK_ATTEMPTS:-1}"
+  exit 0
 fi
 
 worker_event python_setup
@@ -279,7 +313,7 @@ if [[ "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 
     echo "official worker budget exhausted during setup" >&2
     exit 124
   }
-elif [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 ]]; then
+elif [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == prepare-slop-2 ]]; then
   export EVALUATOR_CONCURRENCY=5
   OVERALL_TIMEOUT_SECONDS=18000
 elif [[ "$BENCHMARK_MODE" == session-smoke-5 ]]; then
@@ -295,7 +329,7 @@ else
   OVERALL_TIMEOUT_SECONDS=3000
 fi
 runner_mode=--run
-if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 ]]; then
+if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == prepare-slop-2 ]]; then
   runner_mode=--prepare-images
   worker_event preparation
 else

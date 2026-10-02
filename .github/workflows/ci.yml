@@ -258,6 +258,18 @@ jobs:
             scripts.test_swebench_preparation_compat scripts.test_swebench_smoke \
             scripts.test_probe_matplotlib_preparation scripts.test_probe_pylint_evaluator scripts.test_probe_pylint_gold
 
+      - name: Slop continuous pilot contracts and canonical reference preflight
+        run: |
+          python3 -m venv "$RUNNER_TEMP/slop-contract"
+          "$RUNNER_TEMP/slop-contract/bin/pip" install -r containers/slopbench/requirements.txt
+          "$RUNNER_TEMP/slop-contract/bin/python" -m unittest -v \
+            scripts.test_slopbench scripts.test_slop_workflow
+          docker build --tag carry-slop:ci --file containers/slopbench/Dockerfile \
+            --build-arg BASE_IMAGE='node@sha256:afff6d8c97964a438d2e6a9c96509367e45d8bf93f790ad561a1eaea926303d9' \
+            containers/slopbench
+          "$RUNNER_TEMP/slop-contract/bin/python" scripts/slopbench.py reference-check \
+            --work "$RUNNER_TEMP/slop-preflight" --output "$RUNNER_TEMP/slop-reference" --image carry-slop:ci
+
       - name: Build one portable release binary
         run: |
           cargo build --release --locked --target x86_64-unknown-linux-musl
@@ -276,6 +288,8 @@ jobs:
           docker run --rm --network none \
             --mount "type=bind,src=$RUNNER_TEMP/carry-portable,dst=/carry,readonly" \
             --entrypoint /carry alpine:3.20 --help >/dev/null
+          CARRY_NATIVE_TEST_BINARY="$RUNNER_TEMP/carry-portable" \
+            "$RUNNER_TEMP/slop-contract/bin/python" -m unittest -v scripts.test_slop_native
 
       - name: Scripted fixture
         run: |

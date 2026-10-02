@@ -14,9 +14,9 @@ on:
         required: true
         default: bootstrap
         type: choice
-        options: [bootstrap, prepare-50, prepare-long-50, smoke-5, long-smoke-5, session-smoke-5, session-20, official-50, long-official-50, cleanup]
+        options: [bootstrap, prepare-slop-2, slop-2, prepare-50, prepare-long-50, smoke-5, long-smoke-5, session-smoke-5, session-20, official-50, long-official-50, cleanup]
       attempts:
-        description: Independent official-50 attempts per task/harness (1-10); other modes require 1
+        description: Independent attempts (Slop 1-3, official-50 1-10); others require 1
         required: true
         default: "1"
         type: string
@@ -78,7 +78,7 @@ on:
         default: "0"
         type: string
       catalog_digest:
-        description: Immutable prepare-50 catalog digest (sha256:... or 64 lowercase hex); required for model-bearing modes
+        description: Immutable matching preparation catalog digest (sha256:... or 64 lowercase hex); required for model-bearing modes
         required: false
         default: ""
         type: string
@@ -118,12 +118,14 @@ jobs:
           if not value.isdecimal():
               raise SystemExit("attempts must be a decimal integer")
           attempts = int(value)
-          if mode in {"official-50", "long-official-50"}:
+          if mode == "slop-2":
+              valid = 1 <= attempts <= 3
+          elif mode in {"official-50", "long-official-50"}:
               valid = 1 <= attempts <= 10
           else:
               valid = attempts == 1
           if not valid:
-              raise SystemExit("attempts must be 1-10 for official-50 and exactly 1 for other modes")
+              raise SystemExit("attempts must be 1-3 for slop-2, 1-10 for official-50, exactly 1 otherwise")
           print("matrix=" + json.dumps({"attempt": list(range(1, attempts + 1))}, separators=(",", ":")))
           print(f"total={attempts}")
           PY
@@ -267,7 +269,7 @@ jobs:
           echo "sanitized exact run prefix $TARGET_RUN_ID"
 
       - name: Install pinned pre-signing client
-        if: (inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50')
+        if: (inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50' || inputs.mode == 'prepare-slop-2') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50' || inputs.mode == 'slop-2')
         shell: bash
         run: |
           set -euo pipefail
@@ -282,9 +284,9 @@ jobs:
         env:
           SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
           SOURCE_SHA256: ${{ steps.source.outputs.source_sha256 }}
-          OPENAI_API_KEY: ${{ ((inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50')) && secrets.OPENAI_API_KEY || '' }}
-          DOCKERHUB_USERNAME: ${{ ((inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50')) && secrets.DOCKERHUB_USERNAME || '' }}
-          DOCKERHUB_TOKEN: ${{ ((inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50')) && secrets.DOCKERHUB_TOKEN || '' }}
+          OPENAI_API_KEY: ${{ ((inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50' || inputs.mode == 'slop-2')) && secrets.OPENAI_API_KEY || '' }}
+          DOCKERHUB_USERNAME: ${{ ((inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50' || inputs.mode == 'prepare-slop-2') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50' || inputs.mode == 'slop-2')) && secrets.DOCKERHUB_USERNAME || '' }}
+          DOCKERHUB_TOKEN: ${{ ((inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50' || inputs.mode == 'prepare-slop-2') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50' || inputs.mode == 'slop-2')) && secrets.DOCKERHUB_TOKEN || '' }}
         run: |
           set -euo pipefail
           for required in AWS_REGION ARTIFACT_BUCKET ARTIFACT_SESSION_ROLE_ARN WORKER_LAUNCH_TEMPLATES SOURCE_COMMIT; do
@@ -298,7 +300,7 @@ jobs:
             echo "retained-session modes require one BENCHMARK_HARNESS=carry, codex, or pi" >&2
             exit 1
           fi
-          if [[ "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == long-smoke-5 || "$BENCHMARK_MODE" == session-smoke-5 || "$BENCHMARK_MODE" == session-20 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 ]]; then
+          if [[ "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == long-smoke-5 || "$BENCHMARK_MODE" == session-smoke-5 || "$BENCHMARK_MODE" == session-20 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 || "$BENCHMARK_MODE" == slop-2 ]]; then
             for required in OPENAI_API_KEY DOCKERHUB_USERNAME DOCKERHUB_TOKEN MODEL REASONING TASK_IMAGE_REPOSITORY TASK_IMAGE_CATALOG; do
               [[ -n "${!required}" ]] || { echo "missing benchmark configuration: $required" >&2; exit 1; }
             done
@@ -339,12 +341,12 @@ jobs:
               echo "catalog_digest must be an immutable sha256 digest" >&2
               exit 1
             }
-          elif [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 ]]; then
+          elif [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == prepare-slop-2 ]]; then
             for required in DOCKERHUB_USERNAME DOCKERHUB_TOKEN TASK_IMAGE_REPOSITORY TASK_IMAGE_PUBLISHER_ROLE_ARN; do
               [[ -n "${!required}" ]] || { echo "missing preparation configuration: $required" >&2; exit 1; }
             done
           fi
-          if [[ "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 ]]; then
+          if [[ "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 || "$BENCHMARK_MODE" == slop-2 ]]; then
             [[ "$BENCHMARK_ATTEMPTS" =~ ^[1-9][0-9]*$ && "$BENCHMARK_ATTEMPT" =~ ^[1-9][0-9]*$ ]] \
               && (( BENCHMARK_ATTEMPTS <= 10 && BENCHMARK_ATTEMPT <= BENCHMARK_ATTEMPTS )) || {
               echo "official-50 attempts must be 1-10 and include this worker attempt" >&2; exit 1;
@@ -353,6 +355,12 @@ jobs:
             [[ "$BENCHMARK_ATTEMPTS" == 1 && "$BENCHMARK_ATTEMPT" == 1 ]] || {
               echo "non-official modes must use benchmark attempt 1 of 1" >&2; exit 1;
             }
+          fi
+          if [[ "$BENCHMARK_MODE" == slop-2 || "$BENCHMARK_MODE" == prepare-slop-2 ]]; then
+            [[ "$BENCHMARK_HARNESS" == carry && "$MODEL" == gpt-6-luna && "$REASONING" == medium && "$CARRY_COMPACTION_POLICY" == disabled ]] || {
+              echo "Slop requires Carry, gpt-6-luna, medium, disabled compaction" >&2; exit 1;
+            }
+            (( BENCHMARK_ATTEMPTS <= 3 )) || { echo "Slop attempts must be 1-3" >&2; exit 1; }
           fi
           RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           if (( BENCHMARK_ATTEMPTS > 1 )); then RUN_ID+="-attempt-${BENCHMARK_ATTEMPT}"; fi
@@ -374,7 +382,7 @@ jobs:
           set -a; source "$RUNNER_TEMP/artifact-session.env"; set +a
           PREFIX="runs/$RUN_ID"
           aws s3 cp carry-source.tar.gz "s3://$ARTIFACT_BUCKET/$PREFIX/carry-source.tar.gz" --sse AES256 --only-show-errors
-          if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == long-smoke-5 || "$BENCHMARK_MODE" == session-smoke-5 || "$BENCHMARK_MODE" == session-20 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 ]]; then
+          if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == prepare-slop-2 || "$BENCHMARK_MODE" == smoke-5 || "$BENCHMARK_MODE" == long-smoke-5 || "$BENCHMARK_MODE" == session-smoke-5 || "$BENCHMARK_MODE" == session-20 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 || "$BENCHMARK_MODE" == slop-2 ]]; then
             DOCKER_AUTH_FILE="$RUNNER_TEMP/dockerhub-auth.json"
             python3 - "$DOCKER_AUTH_FILE" <<'PY'
           import json, os, sys
@@ -385,7 +393,7 @@ jobs:
             aws s3 cp "$DOCKER_AUTH_FILE" "s3://$ARTIFACT_BUCKET/$PREFIX/dockerhub-auth.json" --sse AES256 --only-show-errors
             rm -f "$DOCKER_AUTH_FILE"
             DOCKER_AUTH_URL=$(aws s3 presign "s3://$ARTIFACT_BUCKET/$PREFIX/dockerhub-auth.json" --expires-in 3600)
-            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 ]]; then
+            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == prepare-slop-2 ]]; then
               export AWS_ACCESS_KEY_ID=$BASE_AWS_ACCESS_KEY_ID
               export AWS_SECRET_ACCESS_KEY=$BASE_AWS_SECRET_ACCESS_KEY
               export AWS_SESSION_TOKEN=$BASE_AWS_SESSION_TOKEN
@@ -422,7 +430,7 @@ jobs:
             fi
             RESULT_URL=$(python3 scripts/presign_s3.py put "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 3600)
             RESULT_GET_URL=$(python3 scripts/presign_s3.py get "$ARTIFACT_BUCKET" "$PREFIX/results.tar.gz" --expires 3600)
-            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 ]]; then
+            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == prepare-slop-2 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 || "$BENCHMARK_MODE" == slop-2 ]]; then
               CONTROL_URL=$(python3 scripts/presign_s3.py get "$ARTIFACT_BUCKET" "$PREFIX/control.json" --expires 3600)
               CONTROL_URL="$CONTROL_URL" RESULT_URL="$RESULT_URL" python3 - "$RUNNER_TEMP/control.json" <<'PY'
           import json, os, sys
@@ -508,7 +516,7 @@ jobs:
           echo "WORKER_INSTANCE_ID=$WORKER_INSTANCE_ID" >> "$GITHUB_ENV"
 
       - name: Wait for protected benchmark result
-        if: (inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50')
+        if: (inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50' || inputs.mode == 'prepare-slop-2') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50' || inputs.mode == 'slop-2')
         shell: bash
         env:
           RESULT_GET_URL: ${{ steps.stage.outputs.result_get_url }}
@@ -517,7 +525,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p benchmark-artifact
-          if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 ]]; then
+          if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == prepare-slop-2 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 || "$BENCHMARK_MODE" == slop-2 ]]; then
             # Allow twenty minutes for EC2 launch/boot around the worker's
             # five-and-a-quarter-hour wall clock; preserve twenty-five minutes
             # of the six-hour job for result validation and exact cleanup.
@@ -607,7 +615,7 @@ jobs:
               fi
               exit 1
             fi
-            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 || "$BENCHMARK_MODE" == session-20 ]] && (( SECONDS >= next_rotation )); then
+            if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 || "$BENCHMARK_MODE" == prepare-slop-2 || "$BENCHMARK_MODE" == official-50 || "$BENCHMARK_MODE" == long-official-50 || "$BENCHMARK_MODE" == slop-2 || "$BENCHMARK_MODE" == session-20 ]] && (( SECONDS >= next_rotation )); then
               if rotate_capabilities; then
                 next_rotation=$((SECONDS + 1500))
               else
@@ -622,7 +630,7 @@ jobs:
           exit 1
 
       - name: Refresh protected AWS dispatch identity after benchmark
-        if: always() && ((inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50'))
+        if: always() && ((inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50' || inputs.mode == 'prepare-slop-2') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50' || inputs.mode == 'slop-2'))
         uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8
         with:
           role-to-assume: ${{ env.DISPATCH_ROLE_ARN }}
@@ -638,7 +646,9 @@ jobs:
         run: scripts/wait_for_ec2_termination.sh "$WORKER_INSTANCE_ID"
 
       - name: Validate fixed-denominator results
-        if: always() && ((inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50'))
+        if: always() && ((inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50' || inputs.mode == 'slop-2'))
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
         shell: bash
         run: |
           set -euo pipefail
@@ -648,6 +658,11 @@ jobs:
             echo "benchmark worker exited unsuccessfully" >&2
             exit 1
           }
+          if [[ "$BENCHMARK_MODE" == slop-2 ]]; then
+            python3 scripts/slopbench.py validate-report --output benchmark-artifact \
+              --attempt "$BENCHMARK_ATTEMPT" --attempts "$BENCHMARK_ATTEMPTS"
+            exit 0
+          fi
           python3 - <<'PY'
           import json, os
           records=json.load(open('benchmark-artifact/records.json', encoding='utf-8'))
@@ -680,7 +695,7 @@ jobs:
           PY
 
       - name: Validate immutable task-image catalog
-        if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50')
+        if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50' || inputs.mode == 'prepare-slop-2')
         shell: bash
         run: |
           set -euo pipefail
@@ -690,6 +705,10 @@ jobs:
             echo "task-image publisher exited unsuccessfully" >&2
             exit 1
           }
+          if [[ "$BENCHMARK_MODE" == prepare-slop-2 ]]; then
+            python3 scripts/slopbench.py validate-preparation --output benchmark-artifact
+            exit 0
+          fi
           python3 - <<'PY'
           import json, os, re
           report=json.load(open('benchmark-artifact/preparation-report.json', encoding='utf-8'))
@@ -706,7 +725,7 @@ jobs:
           PY
 
       - name: Publish task-image catalog summary
-        if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50')
+        if: always() && (inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50' || inputs.mode == 'prepare-slop-2')
         shell: bash
         run: |
           if [[ -f benchmark-artifact/preparation-report.json ]]; then
@@ -716,12 +735,15 @@ jobs:
           print('# SWE-bench task-image catalog')
           print(f"\n- Catalog: `{report['catalog_reference']}`")
           print(f"- Tasks: {report['denominator']}")
-          print(f"- Statuses: `{report['status_counts']}`")
+          print(f"- Status: `{report.get('status_counts', report.get('phase'))}`")
+          if 'protocol_task_sha256' in report:
+              print(f"- Protocol/task digest: `{report['protocol_task_sha256']}`")
+              print(f"- Prepared recipe digest: `{report['prepared_recipe_sha256']}`")
           PY
           fi
 
       - name: Publish benchmark performance summary
-        if: always() && ((inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50'))
+        if: always() && ((inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50' || inputs.mode == 'slop-2'))
         shell: bash
         run: |
           if [[ -f benchmark-artifact/report.md ]]; then
@@ -731,7 +753,7 @@ jobs:
           fi
 
       - name: Retain final worker diagnostics
-        if: always() && ((inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50'))
+        if: always() && ((inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50' || inputs.mode == 'prepare-slop-2') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50' || inputs.mode == 'slop-2'))
         shell: bash
         run: |
           set -euo pipefail
@@ -743,7 +765,7 @@ jobs:
           test -s benchmark-artifact/worker-diagnostics.json
 
       - name: Upload results and diagnostics
-        if: always() && ((inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50'))
+        if: always() && ((inputs.mode == 'prepare-50' || inputs.mode == 'prepare-long-50' || inputs.mode == 'prepare-slop-2') || (inputs.mode == 'smoke-5' || inputs.mode == 'long-smoke-5') || inputs.mode == 'session-smoke-5' || inputs.mode == 'session-20' || (inputs.mode == 'official-50' || inputs.mode == 'long-official-50' || inputs.mode == 'slop-2'))
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
           name: swebench-${{ inputs.mode }}-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}-attempt-${{ matrix.attempt }}
