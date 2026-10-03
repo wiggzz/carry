@@ -70,6 +70,37 @@ Read [benchmark evidence](docs/benchmark-results.md) for immutable run links,
 configuration, accounting, recovery provenance, and limitations. One run is
 useful evidence, not a general quality ranking.
 
+## Local session cost report
+
+Run `carry report cost` to generate an HTML report from local session traces and
+open it in your browser. Use `--sessions DIR` to select a different session home
+and `--output FILE` to save it elsewhere. Browser-launch failures do not prevent
+report generation; open the printed URL manually.
+
+The report and web UI separate **observed modeled usage cost** from an
+**experimental savings scenario**. The scenario asks how carrying stale context
+until a traditional summary boundary might compare with incremental pruning;
+it is not a measured Pi run or a bill-saving guarantee. Missing usage and
+unpriced responses remain visible rather than being assigned zero cost.
+
+### Potential savings in iterative work
+
+A private local-session audit covers **30 sessions with 1,370 completed model
+responses and 142 recorded Carry compactions**. On the **25 fully covered
+sessions (1,122 responses)** eligible for the default proxy scenario, incremental
+pruning modeled **39.2% lower cost** than retaining removed context until a
+Pi-style summary boundary. This is a conditional byte-proxy comparison—not
+measured provider or invoice savings. Evidence can become stale while a project
+continues, well before a conventional full-context summary is needed.
+
+See the [local-session case study](docs/local-session-cost-report.md) for the
+aggregate report, scenario assumptions and limitations. Potential savings
+depend on the workload, retained evidence, cache behavior and comparator—not
+conversation length alone. These traces are not a quality benchmark, and their
+prompts, tool output and session identities are not published.
+
+The generated HTML contains local session IDs: review it before sharing.
+
 ## Install and try it
 
 ### Install a release

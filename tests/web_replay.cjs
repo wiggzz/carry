@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const html = fs.readFileSync(path.join(process.cwd(), 'src/web/index.html'), 'utf8');
 
 const element = () => ({
   children: [],
@@ -13,11 +14,10 @@ const element = () => ({
   focus() { this.focused = true; },
   querySelector() { return null; },
 });
-const elements = new Map();
+const elements = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map(match => ['#'+match[1], element()]));
 const document = {
   querySelector(key) {
-    if (!elements.has(key)) elements.set(key, element());
-    return elements.get(key);
+    return elements.get(key) || null;
   },
   createElement: element,
   createTextNode(value) { return { textContent: value }; },
@@ -44,13 +44,11 @@ const sandbox = {
   URL,
 };
 vm.createContext(sandbox);
-const html = fs.readFileSync(path.join(process.cwd(), 'src/web/index.html'), 'utf8');
 vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], sandbox);
 assert.equal(elements.get('#text').focused, true, 'composer should be focused at startup');
 (async () => {
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(sessionRequests, ['/api/v1/session']);
-  assert.ok(html.includes('id="stat-model"'), 'footer must contain a model field');
   assert.equal(elements.get('#stat-model').textContent, 'gpt-6-sol', 'model should be visible before first message');
   assert.equal(elements.get('#stat-reasoning').textContent, 'medium', 'reasoning should be visible before first message');
   vm.runInContext("event({event:'run_started',data:{cwd:'/tmp',model:'gpt-6-luna',reasoning_effort:'high'}})", sandbox);
@@ -59,6 +57,16 @@ assert.equal(elements.get('#text').focused, true, 'composer should be focused at
   vm.runInContext("event({event:'session_resumed',data:{model:'gpt-6-sol',reasoning_effort:'low'}})", sandbox);
   assert.equal(elements.get('#stat-model').textContent, 'gpt-6-sol');
   assert.equal(elements.get('#stat-reasoning').textContent, 'low');
+  vm.runInContext("event({run_id:'savings',seq:1,event:'model_response',data:{usage:{input_tokens:10,output_tokens:1},estimated_cost_usd:1,estimated_savings_usd:4.2331,estimated_savings_percent:80.9}})",sandbox);
+  assert.equal(elements.get('#stat-savings').textContent, 'conditional scenario savings $4.2331 (80.9%)');
+  vm.runInContext("event({run_id:'savings',seq:2,event:'model_response',data:{usage:{},estimated_cost_usd:null,estimated_savings_usd:null}})",sandbox);
+  assert.equal(elements.get('#stat-savings').textContent, '', 'unsupported pricing must clear the old savings number');
+  assert.equal(elements.get('#savings-stat').hidden, true);
+  vm.runInContext("event({run_id:'savings',seq:3,event:'run_finished',data:{estimated_savings_usd:2,estimated_savings_percent:50}})",sandbox);
+  assert.equal(elements.get('#stat-savings').textContent, 'conditional scenario savings $2.0000 (50.0%)', 'terminal summary accounting must refresh savings without another response');
+  vm.runInContext("event({event:'model_request',data:{observed_modeled_cost_usd:1,observed_cost_complete:false,cost_coverage:{responses:2,requests:3,unmatched_requests:1,missing_usage:0,retries:0},estimated_savings_usd:null}})",sandbox);
+  assert.equal(elements.get('#stat-cost').textContent, '$1.0000 (partial)', 'an unanswered request must label the observed ledger partial before another response');
+  assert.equal(elements.get('#stat-coverage').textContent, '2/3 responses · 1 unmatched · 0 missing usage · 0 retries');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
 // Memory notes appear once for accepted memories, including on history replay.
@@ -165,7 +173,6 @@ event(usageEvent);event(usageEvent);
 `, sandbox);
 const usageLines = [...elements.values()].flatMap(el => el.children).filter(el => el.className === 'entry response-usage muted');
 assert.equal(usageLines.filter(el => el.textContent === 'Response 4 · 1200 input (800 cached) · 75 output · 1275 total tokens').length, 1, 'per-response usage must be visible and deduplicated on replay');
-assert.ok(html.includes('id="stat-usage"'), 'footer should show cumulative usage');
 vm.runInContext(`
 totals.cost=0;totals.costUnknown=false;
 const costEvent={run_id:'cost',seq:1,event:'model_response',data:{usage:{},estimated_cost_usd:0.258}};
