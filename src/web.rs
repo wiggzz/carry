@@ -240,18 +240,30 @@ async fn sse_events(
         .chain(live)
         .map(move |event: Result<Value, Infallible>| {
             event.map(|mut value| {
-                if let Some(estimate) = trajectory.record(&value) {
-                    if estimate.priced {
-                        value["data"]["estimated_savings_usd"] = json!(estimate.savings);
-                        value["data"]["estimated_savings_percent"] =
-                            json!(savings_percent(estimate.savings, estimate.actual_cost));
-                        value["data"]["estimated_pi_compactions"] = json!(estimate.pi_compactions);
-                    }
-                }
+                augment_event(&mut trajectory, &mut value);
                 Event::default().json_data(value).expect("event is JSON")
             })
         });
     Ok(Sse::new(stream))
+}
+
+fn augment_event(trajectory: &mut Trajectory, value: &mut Value) {
+    if let Some(estimate) = trajectory.record(value) {
+        if !value["data"].is_object() {
+            value["data"] = json!({});
+        }
+        value["data"]["estimated_savings_usd"] = json!(estimate.priced.then_some(estimate.savings));
+        value["data"]["estimated_savings_percent"] = json!(if estimate.priced {
+            savings_percent(estimate.savings, estimate.carry_cost)
+        } else {
+            None
+        });
+        value["data"]["estimated_pi_compactions"] = json!(estimate.pi_compactions);
+        value["data"]["observed_modeled_cost_usd"] = json!(estimate.observed_cost);
+        value["data"]["observed_cost_complete"] = json!(estimate.observed_priced);
+        value["data"]["cost_coverage"] = json!(estimate.coverage);
+        value["data"]["scenario_assumptions"] = json!(trajectory.scenario);
+    }
 }
 
 fn should_emit_live_event(event: &Value, highest_replayed_sequence: u64) -> bool {
@@ -273,6 +285,31 @@ fn load_trace(session_dir: &Path) -> Result<Vec<Value>> {
         .map(serde_json::from_str)
         .collect::<serde_json::Result<Vec<_>>>()
         .with_context(|| format!("invalid JSON in session trace: {}", path.display()))
+}
+
+#[cfg(test)]
+mod savings_tests {
+    use super::*;
+    #[test]
+    fn augmentation_clears_unknown_pricing_and_updates_terminal_summary() {
+        let mut t = Trajectory::with_model("gpt-6-sol".into());
+        let mut request =
+            json!({"event":"model_request","data":{"request":{"input":["x".repeat(960000)]}}});
+        augment_event(&mut t, &mut request);
+        let mut response = json!({"event":"model_response","data":{"usage":{"input_tokens":240000,"output_tokens":20000},"raw":{"output":"x".repeat(80000)}}});
+        augment_event(&mut t, &mut response);
+        assert!(response["data"]["estimated_savings_usd"].is_number());
+        let mut finished = json!({"event":"run_finished","data":{}});
+        augment_event(&mut t, &mut finished);
+        assert_eq!(finished["data"]["estimated_pi_compactions"], 1);
+        assert!(finished["data"]["estimated_savings_usd"].as_f64().unwrap() > 0.0);
+        let mut unknown = json!({"event":"session_resumed","data":{"model":"unsupported"}});
+        augment_event(&mut t, &mut unknown);
+        assert_eq!(
+            unknown["data"].get("estimated_savings_usd"),
+            Some(&Value::Null)
+        );
+    }
 }
 
 #[cfg(test)]
