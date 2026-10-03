@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 
 use crate::run::{Backend, RunConfig, UserInput, run_interactive_with_events};
-use crate::savings::Trajectory;
+use crate::savings::{Trajectory, savings_percent};
 
 const INDEX: &str = include_str!("web/index.html");
 
@@ -243,6 +243,8 @@ async fn sse_events(
                 if let Some(estimate) = trajectory.record(&value) {
                     if estimate.priced {
                         value["data"]["estimated_savings_usd"] = json!(estimate.savings);
+                        value["data"]["estimated_savings_percent"] =
+                            json!(savings_percent(estimate.savings, estimate.actual_cost));
                         value["data"]["estimated_pi_compactions"] = json!(estimate.pi_compactions);
                     }
                 }

@@ -16,6 +16,7 @@ pub struct Request {
 #[derive(Default, Debug)]
 pub struct Estimate {
     pub savings: f64,
+    pub actual_cost: f64,
     pub pi_compactions: usize,
     pub summary_cost: f64,
     pub priced: bool,
@@ -67,6 +68,12 @@ impl Trajectory {
     }
 }
 
+/// Savings as a percentage of the estimated alternative cost (not Carry's cost).
+pub fn savings_percent(savings: f64, actual_cost: f64) -> Option<f64> {
+    let alternative = actual_cost + savings;
+    (alternative.is_finite() && alternative > 0.0).then_some(100.0 * savings / alternative)
+}
+
 /// Re-simulates cache reuse and Pi compactions; never imports Carry's cache classifications
 /// into the alternative trajectory. No extrapolation of model outputs or tool activity.
 pub fn estimate(requests: &[Request], context_window: u64) -> Estimate {
@@ -88,6 +95,7 @@ pub fn estimate(requests: &[Request], context_window: u64) -> Estimate {
             result.priced = false;
             break;
         };
+        result.actual_cost += actual;
         carry_removed = carry_removed.saturating_add(request.dropped_before);
         let raw = request.usage.input_tokens.saturating_add(carry_removed);
         let mut input = raw.saturating_sub(pi_removed).saturating_add(pi_summary);
@@ -193,6 +201,12 @@ mod tests {
             .abs()
                 < 1e-9
         );
+    }
+    #[test]
+    fn percentage_uses_alternative_cost_and_handles_zero() {
+        assert_eq!(savings_percent(4.0, 1.0), Some(80.0));
+        assert_eq!(savings_percent(0.0, 0.0), None);
+        assert_eq!(savings_percent(-1.0, 1.0), None);
     }
     #[test]
     fn unchanged_trajectory_has_zero_savings() {

@@ -1,5 +1,8 @@
 //! Offline session cost report; shares the exact trajectory estimator with the web UI.
-use crate::{openai::estimated_cost_usd, savings::Trajectory};
+use crate::{
+    openai::estimated_cost_usd,
+    savings::{Trajectory, savings_percent},
+};
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::{
@@ -83,12 +86,14 @@ fn render(sessions: &Path) -> Result<String> {
         rows.push_str(&format!("<tr><td>{id}</td><td>{}</td><td>{}</td><td>{actual}</td><td>{}</td><td>{savings}</td></tr>",
             model, trajectory.requests.len(), estimate.pi_compactions));
     }
+    let rate = savings_percent(savings_total, actual_total)
+        .map_or_else(|| "—".to_owned(), |rate| format!("{rate:.1}%"));
     Ok(format!(
         r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Carry cost report</title>
 <style>body{{font:15px system-ui;background:#101214;color:#e7e9eb;max-width:1100px;margin:2rem auto;padding:1rem}}table{{border-collapse:collapse;width:100%}}td,th{{padding:.5rem;border-bottom:1px solid #444;text-align:left}}td:nth-child(n+3){{text-align:right}}.summary-cards{{display:flex;flex-wrap:wrap;gap:1rem;margin:1.5rem 0}}.summary-card{{display:flex;flex-direction:column;gap:.3rem;padding:1rem 1.3rem;border:1px solid #444;border-radius:12px;background:#1b1f23;min-width:180px}}.summary-card strong{{font-size:1.6rem}}.summary-card span{{color:#aeb6bf}}</style>
-<h1>Carry cost report</h1><div class="summary-cards"><div class="summary-card"><strong>${actual_total:.4}</strong><span>Actual cost</span></div><div class="summary-card"><strong>${savings_total:.4}</strong><span>Estimated savings</span></div></div><p>{count} sessions with completed responses</p>
+<h1>Carry cost report</h1><div class="summary-cards"><div class="summary-card"><strong>${actual_total:.4}</strong><span>Actual cost</span></div><div class="summary-card"><strong>${savings_total:.4}</strong><span>Estimated savings</span></div><div class="summary-card"><strong>{rate}</strong><span>Estimated savings rate</span></div></div><p>{count} sessions with completed responses</p>
 <table><thead><tr><th>Session</th><th>Last model</th><th>Responses</th><th>Actual</th><th>Estimated Pi compactions</th><th>Estimated savings</th></tr></thead><tbody>{rows}</tbody></table>
-<p>Estimated savings = Pi-style counterfactual minus observed Carry cost. Shares the web UI estimator: 272K window, 16,384-token reserve, 20K recent tokens retained, 1K-token summary charged as uncached input plus output, rewritten prompt after each simulated compaction. Cache reuse is modeled from request sizes, not Carry cache classifications. Same outputs and tool behavior assumed; not billed savings. Unpriced sessions are excluded from totals.</p></html>"#
+<p>Estimated savings = Pi-style counterfactual minus observed Carry cost. Savings rate = estimated savings divided by estimated Pi cost; unavailable when the alternative cost is zero. Shares the web UI estimator: 272K window, 16,384-token reserve, 20K recent tokens retained, 1K-token summary charged as uncached input plus output, rewritten prompt after each simulated compaction. Cache reuse is modeled from request sizes, not Carry cache classifications. Same outputs and tool behavior assumed; not billed savings. Unpriced sessions are excluded from totals.</p></html>"#
     ))
 }
 
@@ -173,6 +178,13 @@ mod tests {
     }
 
     #[test]
+    fn no_priced_sessions_have_no_savings_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let html = render(dir.path()).unwrap();
+        assert!(html.contains("<strong>—</strong><span>Estimated savings rate</span>"));
+    }
+
+    #[test]
     fn cost_report_uses_shared_estimator() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("one");
@@ -211,5 +223,6 @@ mod tests {
         assert!(html.contains("<strong>$0.0041</strong><span>Actual cost</span>"));
         assert!(html.contains("<strong>$0.0000</strong><span>Estimated savings</span>"));
         assert!(html.contains("2 sessions with completed responses"));
+        assert!(html.contains("<strong>0.0%</strong><span>Estimated savings rate</span>"));
     }
 }
