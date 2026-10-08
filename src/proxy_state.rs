@@ -614,6 +614,57 @@ mod tests {
     }
 
     #[test]
+    fn explicit_rebase_retires_populated_selection_memories_shadow_and_cache_but_keeps_usage() {
+        let mut state = Session::default();
+        let input = vec![
+            json!({"role": "user", "content": "old requirement"}),
+            json!({"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "a", "output": "old evidence"}),
+            json!({"role": "user", "content": "old latest goal"}),
+        ];
+        state.ingest(&input).unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        let groups = state.groups();
+        state.observe_groups(&groups);
+        state.apply_advice(&groups, &json!({"protected": ["g1"], "removable": ["g2"], "memories": [{"source_ids": ["g2"], "text": "old derived memory"}]})).unwrap();
+        state.remove(&[2], &groups);
+        let evidence = CacheEvidence {
+            base: json!({"model": "gpt-6-luna"}),
+            input,
+            at: 1,
+            native_cached_fraction: 1.0,
+        };
+        state.primary_cache.push(evidence.clone());
+        state.shadow_cache.push(evidence);
+        state.primary.calls = 3;
+        state.shadow.calls = 2;
+        let prior_id = state.next_id;
+        let replacement = vec![json!({"role": "user", "content": "caller checkpoint summary"})];
+        assert!(
+            state.ingest(&replacement).is_err(),
+            "strict mode must not guess summary ancestry"
+        );
+        assert!(!state.active_shadow.is_empty());
+        state.ingest_with_rebase(&replacement, true).unwrap();
+        assert_eq!(state.render_primary(), replacement);
+        assert!(
+            state.active_shadow.is_empty()
+                && state.opinions.is_empty()
+                && state.observed.is_empty()
+        );
+        assert!(
+            state.memories.is_empty()
+                && state.primary_cache.is_empty()
+                && state.shadow_cache.is_empty()
+        );
+        assert!(state.next_id > prior_id && !state.history[0].exposed);
+        assert_eq!(state.history_rebases, 1);
+        assert_eq!((state.primary.calls, state.shadow.calls), (3, 2));
+    }
+
+    #[test]
     fn mixed_batch_projection_removes_only_main_source_and_keeps_shared_memory() {
         let mut state = Session::default();
         let input = vec![
