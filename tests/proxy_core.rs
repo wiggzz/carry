@@ -126,3 +126,14 @@ fn missing_or_invalid_cache_partition_never_makes_a_cost_claim() {
     assert_eq!(ledger.cost_usd, 0.0);
     assert_eq!(input_cost(100.0, 50.0, 2.0, 0.1), 105.0);
 }
+
+#[test]
+fn unsupported_billed_input_categories_make_native_cost_unavailable() {
+    let mut ledger = UsageLedger::default();
+    ledger.observe("gpt-6-luna", &json!({
+        "input_tokens": 100, "output_tokens": 2,
+        "input_tokens_details": {"cached_tokens": 0, "audio_tokens": 5}
+    }), true);
+    assert_eq!(ledger.unavailable_cost_calls, 1);
+    assert_eq!(ledger.cost_usd, 0.0);
+}
