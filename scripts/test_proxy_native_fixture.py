@@ -72,6 +72,29 @@ class NativeProviderFixtureTests(unittest.TestCase):
             self.assertEqual(final['output'][0]['content'][0]['text'],'FIXTURE_COMPLETE')
             self.assertFalse(fixture.errors)
 
+    def test_native_compaction_routes_return_real_checkpoint_items(self):
+        from scripts.proxy_native_fixture import Fixture
+        for case in ('v1','v2'):
+            with self.subTest(case=case), Fixture('codex',case) as fixture:
+                body={'model':'gpt-6-luna','prompt_cache_key':'fixture-conversation',
+                      'input':[{'role':'user','content':'fixture'}],'tools':[{'name':'exec_command'}]}
+                def call(path):
+                    req=urllib.request.Request(fixture.url+path,data=json.dumps(body).encode(),
+                        headers={'content-type':'application/json'})
+                    with urllib.request.urlopen(req,timeout=3) as response:
+                        raw=response.read().decode()
+                    if case=='v1' and path.endswith('/compact'): return json.loads(raw)
+                    return [json.loads(line[6:]) for line in raw.splitlines() if line.startswith('data: ')][-1]['response']
+                first=call('/v1/responses')
+                self.assertGreater(first['usage']['total_tokens'],20000)
+                body['input'].append({'type':'compaction_trigger'}) if case=='v2' else None
+                compact=call('/v1/responses/compact' if case=='v1' else '/v1/responses')
+                self.assertEqual(compact['output'][0]['type'],'compaction')
+                body['input']=[{'role':'user','content':'continue'}]+compact['output']
+                final=call('/v1/responses')
+                self.assertEqual(final['output'][0]['content'][0]['text'],'FIXTURE_COMPLETE')
+                self.assertFalse(fixture.errors)
+
     def test_provider_rejects_missing_or_changed_native_cache_namespace(self):
         from scripts.proxy_native_fixture import Fixture
         import urllib.error
