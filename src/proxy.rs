@@ -4,7 +4,10 @@ use std::{
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Weak, atomic::{AtomicU64, Ordering}},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -502,7 +505,12 @@ async fn forward(
             request = request.header(name, value);
         }
     }
-    let attempt = Attempt::start("primary", outbound["model"].as_str().unwrap_or(""), native, standard(&outbound));
+    let attempt = Attempt::start(
+        "primary",
+        outbound["model"].as_str().unwrap_or(""),
+        native,
+        standard(&outbound),
+    );
     match request.send().await {
         Ok(upstream) => Ok(relay(upstream, commit, Some(attempt)).await),
         Err(_) => {
@@ -825,7 +833,12 @@ struct Attempt {
 impl Attempt {
     fn start(actor: &'static str, model: &str, native: bool, standard: bool) -> Self {
         let attempt = Self {
-            id: format!("{}-{}-{}", std::process::id(), now(), NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)),
+            id: format!(
+                "{}-{}-{}",
+                std::process::id(),
+                now(),
+                NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)
+            ),
             actor,
             model: model.to_owned(),
             native,
@@ -841,13 +854,19 @@ impl Attempt {
             "actor": self.actor, "event": event, "request_id": self.id,
             "model": self.model, "native_compaction": self.native
         });
-        value.as_object_mut().unwrap().extend(details.as_object().unwrap().clone());
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(details.as_object().unwrap().clone());
         println!("BENCHMARK_CONTEXT_EVENT {value}");
     }
 
     fn finish(&self, response: Option<&Value>, reason: &str) {
         let Some(response) = response else {
-            self.emit("failed", json!({"reason": reason, "latency_ms": self.started.elapsed().as_millis() as u64}));
+            self.emit(
+                "failed",
+                json!({"reason": reason, "latency_ms": self.started.elapsed().as_millis() as u64}),
+            );
             return;
         };
         let usage = &response["usage"];
@@ -857,20 +876,47 @@ impl Attempt {
         }
         // Export only numeric native usage partitions. Never print response text,
         // headers, source contents, classifier advice or resolved credentials.
-        let mut safe_usage = json!({"input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]});
+        let mut safe_usage =
+            json!({"input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]});
         for (field, names) in [
-            ("input_tokens_details", &["cached_tokens", "cache_write_tokens", "cache_creation_tokens", "audio_tokens", "image_tokens", "text_tokens"][..]),
-            ("output_tokens_details", &["reasoning_tokens", "audio_tokens", "text_tokens"][..]),
+            (
+                "input_tokens_details",
+                &[
+                    "cached_tokens",
+                    "cache_write_tokens",
+                    "cache_creation_tokens",
+                    "audio_tokens",
+                    "image_tokens",
+                    "text_tokens",
+                ][..],
+            ),
+            (
+                "output_tokens_details",
+                &["reasoning_tokens", "audio_tokens", "text_tokens"][..],
+            ),
         ] {
             let mut details = serde_json::Map::new();
             for name in names {
-                if let Some(number) = usage[field][*name].as_u64() { details.insert((*name).to_owned(), json!(number)); }
+                if let Some(number) = usage[field][*name].as_u64() {
+                    details.insert((*name).to_owned(), json!(number));
+                }
             }
-            if !details.is_empty() { safe_usage[field] = Value::Object(details); }
+            if !details.is_empty() {
+                safe_usage[field] = Value::Object(details);
+            }
         }
         let mut priced = carry::core::UsageLedger::default();
-        priced.observe(&self.model, usage, self.standard && response.get("service_tier").is_none_or(|v| v == "default"));
-        let tools = response["output"].as_array().into_iter().flatten().filter(|item| item["type"] == "function_call").count();
+        priced.observe(
+            &self.model,
+            usage,
+            self.standard && response.get("service_tier").is_none_or(|v| v == "default"),
+        );
+        let tools = response["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["type"] == "function_call")
+            .count();
         self.emit("completed", json!({
             "usage": safe_usage, "latency_ms": self.started.elapsed().as_millis() as u64,
             "tool_calls": tools, "service_tier": response.get("service_tier").cloned().unwrap_or(json!("default")),
@@ -923,7 +969,14 @@ async fn relay(
             serde_json::from_slice::<Value>(&json_bytes).ok()
         };
         if let Some(attempt) = attempt {
-            attempt.finish(observed.as_ref(), if complete_transport { "observed" } else { "cancelled_or_stream_failure" });
+            attempt.finish(
+                observed.as_ref(),
+                if complete_transport {
+                    "observed"
+                } else {
+                    "cancelled_or_stream_failure"
+                },
+            );
         }
         if let Some(mut commit) = commit {
             let complete_transport = complete_transport && (!is_sse || sse_completed);
