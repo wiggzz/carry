@@ -1127,5 +1127,13 @@ mod tests {
         );
         assert_eq!(report["current_review_cost_is_sunk"], true);
         assert_eq!(report["future_reviews"], 4);
+        let mut expensive_future_reviews = config;
+        expensive_future_reviews.min_payback_percent = 25;
+        expensive_future_reviews.classifier_max_output_tokens = 16_384;
+        let (candidate, _) = plan(&expensive_future_reviews, &session, &main);
+        assert!(
+            candidate.is_none(),
+            "future review output cap belongs to both payoff costs and the minimum joint payback margin"
+        );
     }
 }
