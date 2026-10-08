@@ -375,6 +375,185 @@ async fn start_proxy_options(
 }
 
 #[tokio::test]
+async fn classifier_cache_affinity_is_bounded_stable_and_identity_isolated() {
+    use axum::{Router, routing::post};
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let primary = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let shadow = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let captured = primary.clone();
+    let reviewed = shadow.clone();
+    let router = Router::new()
+        .route("/v1/responses", post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().await.push(body);
+                axum::Json(json!({"status": "completed", "output": [],
+                    "usage": {"input_tokens": 100, "output_tokens": 1, "input_tokens_details": {"cached_tokens": 0}}}))
+            }
+        }))
+        .route("/review", post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let reviewed = reviewed.clone();
+            async move {
+                reviewed.lock().await.push(body);
+                axum::Json(json!({"status": "completed", "output": [{"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "{\"protected\":[],\"removable\":[],\"memories\":[]}"}]}],
+                    "usage": {"input_tokens": 100, "output_tokens": 1, "input_tokens_details": {"cached_tokens": 0}}}))
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let state = tempfile::tempdir().unwrap();
+    let owner = "a".repeat(64);
+    let other_owner = format!("{}b", "a".repeat(63));
+    let mut keys = std::collections::HashSet::new();
+    for (tenant, session, branch) in [
+        ("tenant-a", owner.as_str(), "left"),
+        ("tenant-b", owner.as_str(), "left"),
+        ("tenant-a", owner.as_str(), "right"),
+        ("tenant-a", other_owner.as_str(), "left"),
+    ] {
+        let id = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(tenant, session, branch)).unwrap())
+        );
+        let request = json!({"model": "gpt-6-luna", "prompt_cache_key": id, "input": [
+            {"role": "user", "content": "goal"},
+            {"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "a", "output": "tool result"},
+            {"role": "user", "content": "finish"}
+        ]});
+        // Restart between each generation: affinity must survive checkpoint reload.
+        for turn in 0..3 {
+            let (_proxy, url) = start_proxy(state.path(), address, "compact").await;
+            let response = reqwest::Client::new()
+                .post(format!("{url}/v1/responses"))
+                .header("x-carry-tenant", tenant)
+                .header("x-carry-session", session)
+                .header("x-carry-branch", branch)
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let _ = response.bytes().await.unwrap();
+            assert_eq!(
+                primary.lock().await.last().unwrap(),
+                &request,
+                "primary bytes/settings must not change"
+            );
+            if turn == 0 {
+                continue;
+            }
+            let reviews = shadow.lock().await;
+            let review = reviews.last().unwrap();
+            let key = review["prompt_cache_key"].as_str().unwrap();
+            assert!(
+                key.len() <= 64,
+                "classifier cache key exceeds provider's 64-character bound: {}",
+                key.len()
+            );
+            assert_ne!(key, id, "review/main cache domains must remain separate");
+            assert!(
+                !review["input"].to_string().contains(session),
+                "raw session owner is not model prompt data"
+            );
+            if turn == 1 {
+                assert!(
+                    keys.insert(key.to_owned()),
+                    "tenant/branch/fresh-owner cache collision"
+                );
+            } else {
+                assert_eq!(
+                    key,
+                    reviews[reviews.len() - 2]["prompt_cache_key"]
+                        .as_str()
+                        .unwrap()
+                );
+            }
+        }
+    }
+    assert_eq!(keys.len(), 4);
+    assert_eq!(shadow.lock().await.len(), 8);
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_classifier_records_only_bounded_content_free_provider_fields() {
+    use axum::{Router, routing::post};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    let failures = Arc::new(Mutex::new(std::collections::VecDeque::from([
+        json!({"error": {"type": "invalid_request_error", "code": "string_above_max_length", "param": "prompt_cache_key",
+            "message": "PRIVATE_PROVIDER_MESSAGE fixture-shadow", "request": "PRIVATE_REQUEST_EXCERPT"}, "credentials": "PRIVATE_CREDENTIAL"}),
+        json!({"error": {"type": "PRIVATE TYPE WITH SPACES", "code": "x".repeat(65), "param": "PRIVATE\nPARAM",
+            "message": "PRIVATE_PROVIDER_MESSAGE"}}),
+        json!({"error": {"type": 42, "code": null, "param": []}}),
+    ])));
+    let router = Router::new()
+        .route("/v1/responses", post(|| async { axum::Json(json!({"status": "completed", "output": [],
+            "usage": {"input_tokens": 100, "output_tokens": 1, "input_tokens_details": {"cached_tokens": 0}}})) }))
+        .route("/review", post(move || {
+            let failures = failures.clone();
+            async move { (axum::http::StatusCode::BAD_REQUEST, axum::Json(failures.lock().await.pop_front().unwrap())) }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let state = tempfile::tempdir().unwrap();
+    let (_proxy, url) = start_proxy(state.path(), address, "compact").await;
+    let request = json!({"model": "gpt-6-luna", "input": [
+        {"role": "user", "content": "goal"},
+        {"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "a", "output": "exact retained source"},
+        {"role": "user", "content": "finish"}
+    ]});
+    for _ in 0..4 {
+        let response = send(&url, &request, "a", "main").await;
+        assert!(response.status().is_success());
+        let _ = response.bytes().await.unwrap();
+    }
+    let saved = checkpoint_states(state.path()).remove(0);
+    assert_eq!(saved["invalid_reviews"], 3);
+    assert_eq!(saved["shadow"]["unavailable_cost_calls"], 3);
+    assert_eq!(saved["compactions"], 0);
+    let trace_file = std::fs::read_dir(state.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .unwrap();
+    let trace = std::fs::read_to_string(trace_file.path()).unwrap();
+    assert!(!trace.contains("PRIVATE_"));
+    assert!(!trace.contains("fixture-shadow"));
+    let failed = trace
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|e| e["event"] == "shadow_failed")
+        .map(|e| e["data"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failed.len(),
+        3,
+        "each HTTP rejection needs content-free diagnostics without a paid replay"
+    );
+    assert_eq!(
+        failed[0],
+        json!({"reason": "review_transport_or_protocol_failure", "http_status": 400,
+        "error_type": "invalid_request_error", "error_code": "string_above_max_length", "error_param": "prompt_cache_key"})
+    );
+    for failure in &failed[1..] {
+        assert_eq!(
+            failure,
+            &json!({"reason": "review_transport_or_protocol_failure", "http_status": 400})
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     use axum::{Router, routing::post};
     use std::sync::Arc;

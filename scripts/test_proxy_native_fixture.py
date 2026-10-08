@@ -5,6 +5,38 @@ import urllib.request
 
 
 class NativeProviderFixtureTests(unittest.TestCase):
+    def test_classifier_rejects_present_cache_keys_above_provider_character_limit(self):
+        from scripts.proxy_native_fixture import Fixture
+        import urllib.error
+        for key in ('x' * 65, 'carry-review-' + 'a' * 64, None, 42, True, []):
+            with self.subTest(key=key), Fixture('codex', 'compact') as fixture:
+                req = urllib.request.Request(fixture.url + '/classifier',
+                    data=json.dumps({'input': [], 'prompt_cache_key': key}).encode(),
+                    headers={'content-type': 'application/json'})
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    with urllib.request.urlopen(req, timeout=3) as response:
+                        response.read()
+                self.assertEqual(error.exception.code, 400)
+                value = json.loads(error.exception.read())
+                error.exception.close()
+                self.assertEqual(value['error']['param'], 'prompt_cache_key')
+                self.assertEqual(value['error']['code'],
+                    'string_above_max_length' if isinstance(key, str) else 'invalid_type')
+                self.assertEqual(len(fixture.reviews), 1)
+
+    def test_classifier_accepts_optional_cache_key_and_64_character_boundary(self):
+        from scripts.proxy_native_fixture import Fixture
+        for fields in ({}, {'prompt_cache_key': ''}, {'prompt_cache_key': 'x' * 64},
+                       {'prompt_cache_key': 'é' * 64}):
+            with self.subTest(fields=fields), Fixture('pi', 'compact') as fixture:
+                req = urllib.request.Request(fixture.url + '/classifier',
+                    data=json.dumps({'input': [], **fields}).encode(),
+                    headers={'content-type': 'application/json'})
+                with urllib.request.urlopen(req, timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(json.load(response)['status'], 'completed')
+                self.assertFalse(fixture.errors)
+
     def test_provider_emits_realistic_tool_and_final_sse_for_both_clients(self):
         from scripts.proxy_native_fixture import Fixture
         for client, name in [('codex','exec_command'),('pi','bash')]:

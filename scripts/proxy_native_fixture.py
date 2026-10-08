@@ -5,6 +5,7 @@ This is credential-free protocol evidence, never live model/quality/usage eviden
 Only CI installs the clients; this script never installs anything.
 """
 import argparse
+import hashlib
 import http.server
 import json
 import os
@@ -36,6 +37,17 @@ class Fixture:
                     body = json.loads(self.rfile.read(int(self.headers['content-length'])))
                     if self.path == '/classifier':
                         outer.reviews.append(body)
+                        cache_key = body.get('prompt_cache_key')
+                        if 'prompt_cache_key' in body and (not isinstance(cache_key, str) or len(cache_key) > 64):
+                            code = 'string_above_max_length' if isinstance(cache_key, str) else 'invalid_type'
+                            outer.errors.append(code)
+                            raw = json.dumps({'error': {'type': 'invalid_request_error',
+                                'code': code, 'param': 'prompt_cache_key',
+                                'message': 'prompt_cache_key must be a string with at most 64 characters'}}).encode()
+                            self.send_response(400); self.send_header('content-type', 'application/json')
+                            self.send_header('content-length', str(len(raw))); self.end_headers()
+                            self.wfile.write(raw)
+                            return
                         targets=set()
                         for record in body.get('input', []):
                             try: data=json.loads(record.get('content', ''))
@@ -187,6 +199,9 @@ def compact_evidence(trial, fixture):
     assert len(members(submitted[1]))==4, 'cohort must receive completed exposure before removal'
     assert not members(submitted[2]) and not members(submitted[3]), 'atomic cohort must stay removed'
     assert len(fixture.reviews)>=2, 'later shadow request required, not a source-only check'
+    cache_keys=[r.get('prompt_cache_key') for r in fixture.reviews]
+    assert all(isinstance(k,str) and 0 < len(k) <= 64 for k in cache_keys), 'classifier cache key exceeds provider limit'
+    assert len(set(cache_keys))==1, 'classifier cache affinity must stay stable within a session'
     assert 'DROP_COHORT_PAYLOAD' in json.dumps(fixture.reviews[0])
     assert 'DROP_COHORT_PAYLOAD' not in json.dumps(fixture.reviews[-1]), 'later shadow must mechanically prune'
     removed=[i for i in state['history'] if i['removed'] and i['value'].get('call_id') in cohort]
@@ -201,6 +216,9 @@ def compact_evidence(trial, fixture):
         for item in after['input']:
             if item.get('type')=='function_call_output': assert item==originals[item['call_id']]
     return {'compact_verified':True,'removed_atomic_members':len(removed),
+            'classifier_cache_key_characters':len(cache_keys[0]),
+            'classifier_cache_namespace_sha256':hashlib.sha256(cache_keys[0].encode()).hexdigest(),
+            'classifier_cache_affinity_verified':True,
             'classifier_calls':len(fixture.reviews),'invalid_reviews':state['invalid_reviews'],
             'coupled_later_shadow_pruning_verified':True,'tool_output_bytes_preserved':True,
             'proxy_compactions':state['compactions']}
@@ -241,7 +259,6 @@ def main():
             run=subprocess.run(command,env=env,text=True,capture_output=True,timeout=85)
             trace=(trial / 'client-events.jsonl').read_text() if (trial / 'client-events.jsonl').exists() else ''
             marker=workspace / 'proxy-fixture.txt'
-            import hashlib
             cache_key=fixture.calls[0].get('prompt_cache_key') if fixture.calls else None
             result={'client':client,'case':case,'fixture_only':True,'exit_code':run.returncode,
                 'native_cache_namespace_sha256':hashlib.sha256(cache_key.encode()).hexdigest() if cache_key else None,
@@ -286,6 +303,9 @@ def main():
                 raise RuntimeError(f'{client} integrated fixture failed; inspect isolated fixture artifacts')
     if len({r['native_cache_namespace_sha256'] for r in results}) != len(results):
         raise RuntimeError('fresh native clients reused a cache namespace')
+    compact=[r for r in results if r['case']=='compact']
+    if len({r['classifier_cache_namespace_sha256'] for r in compact}) != len(compact):
+        raise RuntimeError('fresh native clients reused a classifier cache namespace')
     print(json.dumps(results,indent=2))
 
 
