@@ -132,8 +132,7 @@ impl UsageLedger {
             output,
             cached,
             input.and_then(|i| Rates::for_model(model, i as f64)),
-        )
-            && standard
+        ) && standard
             && cached.checked_add(written).is_some_and(|v| v <= input)
         {
             self.cost_usd += (input - cached - written) as f64 * rates.input

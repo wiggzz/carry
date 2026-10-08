@@ -687,11 +687,8 @@ impl ContextState {
             })
             .map(|item| item.id)
             .collect::<HashSet<_>>();
-        let removable = select_removals(
-            self.items.iter().map(|item| item.id),
-            &eligible,
-            &protected,
-        );
+        let removable =
+            select_removals(self.items.iter().map(|item| item.id), &eligible, &protected);
 
         let mut candidates = Vec::new();
         if !removable.is_empty() {
@@ -1114,8 +1111,17 @@ fn payoff_savings_input_units(
 ) -> f64 {
     let keep_first = keep_request_cost_with_implicit(implicit_cached_tokens, current_tokens);
     let compact_first = compact_first_cost;
-    horizon_cost(keep_first, current_tokens as f64, CACHE_READ_RATE, payoff_requests)
-        - horizon_cost(compact_first, retained_tokens as f64, CACHE_READ_RATE, payoff_requests)
+    horizon_cost(
+        keep_first,
+        current_tokens as f64,
+        CACHE_READ_RATE,
+        payoff_requests,
+    ) - horizon_cost(
+        compact_first,
+        retained_tokens as f64,
+        CACHE_READ_RATE,
+        payoff_requests,
+    )
 }
 
 fn keep_request_cost(current_tokens: usize, policy: &CompactionPolicy) -> f64 {

@@ -75,7 +75,10 @@ pub(super) struct Session {
 
 fn identity(value: &Value) -> Value {
     let mut v = value.clone();
-    if matches!(v["type"].as_str(), Some("message" | "function_call" | "reasoning")) {
+    if matches!(
+        v["type"].as_str(),
+        Some("message" | "function_call" | "reasoning")
+    ) {
         if let Some(object) = v.as_object_mut() {
             object.retain(|key, value| {
                 !(value.is_null() || key == "id" || (key == "status" && value == "completed"))
@@ -106,7 +109,11 @@ impl Session {
         if input.len() > 16_384 || self.history.len() > 16_384 {
             bail!("lineage item limit exceeded; use native compaction or a new explicit session");
         }
-        let previous = self.history.iter().map(|i| identity(&i.value)).collect::<Vec<_>>();
+        let previous = self
+            .history
+            .iter()
+            .map(|i| identity(&i.value))
+            .collect::<Vec<_>>();
         let incoming = input.iter().map(identity).collect::<Vec<_>>();
         if !prefix_compatible(&incoming, &previous) {
             // Native opaque compaction is an explicit ancestry discontinuity,
@@ -122,7 +129,12 @@ impl Session {
         let suffix = &input[old_len..];
         let pending_echoed = suffix.len() >= pending.len()
             && !pending.is_empty()
-            && suffix.iter().take(pending.len()).map(identity).collect::<Vec<_>>() == pending;
+            && suffix
+                .iter()
+                .take(pending.len())
+                .map(identity)
+                .collect::<Vec<_>>()
+                == pending;
         let mut assistant_cohort = None;
         for (offset, value) in suffix.iter().enumerate() {
             self.next_id += 1;
@@ -164,7 +176,11 @@ impl Session {
     }
 
     pub fn groups(&self) -> Vec<Group> {
-        let live = self.history.iter().filter(|i| !i.removed).collect::<Vec<_>>();
+        let live = self
+            .history
+            .iter()
+            .filter(|i| !i.removed)
+            .collect::<Vec<_>>();
         let mut parent = (0..live.len()).collect::<Vec<_>>();
         fn root(parent: &[usize], mut index: usize) -> usize {
             while parent[index] != index {
@@ -190,7 +206,9 @@ impl Session {
             if let Some(call_id) = item.value["call_id"].as_str() {
                 match ty {
                     "function_call" => calls.entry(call_id.into()).or_default().push(index),
-                    "function_call_output" => results.entry(call_id.into()).or_default().push(index),
+                    "function_call_output" => {
+                        results.entry(call_id.into()).or_default().push(index)
+                    }
                     _ => {}
                 }
             }
@@ -204,56 +222,96 @@ impl Session {
                 }
             }
         }
-        let newest_user = live.iter().rev().find(|i| i.value["role"] == "user").map(|i| i.id);
+        let newest_user = live
+            .iter()
+            .rev()
+            .find(|i| i.value["role"] == "user")
+            .map(|i| i.id);
         let mut groups = BTreeMap::<usize, Vec<usize>>::new();
         for index in 0..live.len() {
             groups.entry(root(&parent, index)).or_default().push(index);
         }
-        groups.into_values().map(|indices| {
-            let mut group = Group {
-                id: live[indices[0]].id,
-                members: Vec::new(),
-                pinned: false,
-                exposed: true,
-                human: false,
-            };
-            let mut reasoning = false;
-            let mut call = false;
-            for index in indices {
-                let item = live[index];
-                let v = &item.value;
-                group.members.push(item.id);
-                group.exposed &= item.exposed;
-                group.pinned |= Some(item.id) == newest_user;
-                group.human |= matches!(v["role"].as_str(), Some("user" | "developer" | "system"));
-                match v["type"].as_str().unwrap_or("message") {
-                    "message" => {
-                        group.pinned |= !matches!(v["role"].as_str(), Some("user" | "assistant" | "developer" | "system"));
-                        group.pinned |= v["content"].as_array().is_some_and(|blocks| blocks.iter().any(|b| !matches!(b["type"].as_str(), Some("input_text" | "output_text"))));
+        groups
+            .into_values()
+            .map(|indices| {
+                let mut group = Group {
+                    id: live[indices[0]].id,
+                    members: Vec::new(),
+                    pinned: false,
+                    exposed: true,
+                    human: false,
+                };
+                let mut reasoning = false;
+                let mut call = false;
+                for index in indices {
+                    let item = live[index];
+                    let v = &item.value;
+                    group.members.push(item.id);
+                    group.exposed &= item.exposed;
+                    group.pinned |= Some(item.id) == newest_user;
+                    group.human |=
+                        matches!(v["role"].as_str(), Some("user" | "developer" | "system"));
+                    match v["type"].as_str().unwrap_or("message") {
+                        "message" => {
+                            group.pinned |= !matches!(
+                                v["role"].as_str(),
+                                Some("user" | "assistant" | "developer" | "system")
+                            );
+                            group.pinned |= v["content"].as_array().is_some_and(|blocks| {
+                                blocks.iter().any(|b| {
+                                    !matches!(
+                                        b["type"].as_str(),
+                                        Some("input_text" | "output_text")
+                                    )
+                                })
+                            });
+                        }
+                        "function_call" | "function_call_output" => {
+                            call = true;
+                            let id = v["call_id"].as_str().unwrap_or("");
+                            group.pinned |= id.is_empty()
+                                || calls.get(id).map(Vec::len) != Some(1)
+                                || results.get(id).map(Vec::len) != Some(1);
+                            group.pinned |= v.get("status").is_some_and(|s| s != "completed");
+                            group.pinned |= v["output"].as_array().is_some_and(|blocks| {
+                                blocks.iter().any(|b| {
+                                    !matches!(
+                                        b["type"].as_str(),
+                                        Some("input_text" | "output_text")
+                                    )
+                                })
+                            });
+                        }
+                        "reasoning" => {
+                            reasoning = true;
+                            group.pinned |= v.get("status").is_some_and(|s| s != "completed");
+                        }
+                        _ => group.pinned = true,
                     }
-                    "function_call" | "function_call_output" => {
-                        call = true;
-                        let id = v["call_id"].as_str().unwrap_or("");
-                        group.pinned |= id.is_empty() || calls.get(id).map(Vec::len) != Some(1) || results.get(id).map(Vec::len) != Some(1);
-                        group.pinned |= v.get("status").is_some_and(|s| s != "completed");
-                        group.pinned |= v["output"].as_array().is_some_and(|blocks| blocks.iter().any(|b| !matches!(b["type"].as_str(), Some("input_text" | "output_text"))));
-                    }
-                    "reasoning" => {
-                        reasoning = true;
-                        group.pinned |= v.get("status").is_some_and(|s| s != "completed");
-                    }
-                    _ => group.pinned = true,
                 }
-            }
-            group.pinned |= reasoning && !call;
-            group
-        }).collect()
+                group.pinned |= reasoning && !call;
+                group
+            })
+            .collect()
     }
 
     pub fn render_primary(&self) -> Vec<Value> {
-        let mut input = self.history.iter().filter(|i| !i.removed).map(|i| i.value.clone()).collect::<Vec<_>>();
-        let removed = self.history.iter().filter(|i| i.removed).map(|i| i.id).collect::<HashSet<_>>();
-        let mut at = input.iter().take_while(|v| matches!(v["role"].as_str(), Some("system" | "developer"))).count();
+        let mut input = self
+            .history
+            .iter()
+            .filter(|i| !i.removed)
+            .map(|i| i.value.clone())
+            .collect::<Vec<_>>();
+        let removed = self
+            .history
+            .iter()
+            .filter(|i| i.removed)
+            .map(|i| i.id)
+            .collect::<HashSet<_>>();
+        let mut at = input
+            .iter()
+            .take_while(|v| matches!(v["role"].as_str(), Some("system" | "developer")))
+            .count();
         for memory in &self.memories {
             if memory.source_ids.iter().all(|id| removed.contains(id)) {
                 let data = json!({"memory_id": format!("m{}", memory.id), "text": memory.text});
@@ -276,7 +334,12 @@ impl Session {
                     record.source_id = group.id;
                 }
             }
-            let values = self.history.iter().filter(|i| group.members.contains(&i.id)).map(|i| i.value.clone()).collect::<Vec<_>>();
+            let values = self
+                .history
+                .iter()
+                .filter(|i| group.members.contains(&i.id))
+                .map(|i| i.value.clone())
+                .collect::<Vec<_>>();
             let data = json!({"group_id": format!("g{}", group.id), "items": values, "human": group.human, "eligible": group.exposed && !group.pinned});
             let identity = data.to_string();
             if self.observed.get(&group.id) != Some(&identity) {
@@ -290,27 +353,52 @@ impl Session {
     }
 
     pub fn apply_advice(&mut self, groups: &[Group], value: &Value) -> Result<()> {
-        let object = value.as_object().filter(|o| o.len() == 3).ok_or_else(|| anyhow::anyhow!("advice object invalid"))?;
+        let object = value
+            .as_object()
+            .filter(|o| o.len() == 3)
+            .ok_or_else(|| anyhow::anyhow!("advice object invalid"))?;
         let _ = object;
-        let known = groups.iter().filter(|g| g.exposed && !g.pinned).map(|g| g.id).collect::<HashSet<_>>();
+        let known = groups
+            .iter()
+            .filter(|g| g.exposed && !g.pinned)
+            .map(|g| g.id)
+            .collect::<HashSet<_>>();
         let all = groups.iter().map(|g| g.id).collect::<HashSet<_>>();
         let mut updates = BTreeMap::new();
         for (field, opinion) in [("protected", "keep"), ("removable", "drop")] {
-            let ids = value[field].as_array().filter(|a| a.len() <= 256).ok_or_else(|| anyhow::anyhow!("advice IDs invalid"))?;
+            let ids = value[field]
+                .as_array()
+                .filter(|a| a.len() <= 256)
+                .ok_or_else(|| anyhow::anyhow!("advice IDs invalid"))?;
             for id in ids {
                 let id = parse_group(id)?;
-                if !(known.contains(&id) || (opinion == "keep" && all.contains(&id))) || updates.insert(id, opinion).is_some() {
+                if !(known.contains(&id) || (opinion == "keep" && all.contains(&id)))
+                    || updates.insert(id, opinion).is_some()
+                {
                     bail!("advice ID unknown, pinned, unexposed or contradictory");
                 }
             }
         }
         let mut memories = Vec::new();
-        for memory in value["memories"].as_array().filter(|a| a.len() <= 64).ok_or_else(|| anyhow::anyhow!("memories invalid"))? {
+        for memory in value["memories"]
+            .as_array()
+            .filter(|a| a.len() <= 64)
+            .ok_or_else(|| anyhow::anyhow!("memories invalid"))?
+        {
             if memory.as_object().is_none_or(|o| o.len() != 2) {
                 bail!("memory shape invalid");
             }
-            let text = memory["text"].as_str().filter(|s| !s.trim().is_empty() && s.len() <= 4096).ok_or_else(|| anyhow::anyhow!("memory text invalid"))?;
-            let sources = memory["source_ids"].as_array().filter(|a| !a.is_empty() && a.len() <= 32).ok_or_else(|| anyhow::anyhow!("memory sources invalid"))?.iter().map(parse_group).collect::<Result<Vec<_>>>()?;
+            let text = memory["text"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty() && s.len() <= 4096)
+                .ok_or_else(|| anyhow::anyhow!("memory text invalid"))?;
+            let sources = memory["source_ids"]
+                .as_array()
+                .filter(|a| !a.is_empty() && a.len() <= 32)
+                .ok_or_else(|| anyhow::anyhow!("memory sources invalid"))?
+                .iter()
+                .map(parse_group)
+                .collect::<Result<Vec<_>>>()?;
             if sources.iter().any(|id| !known.contains(id)) {
                 bail!("memory source not eligible");
             }
@@ -330,11 +418,19 @@ impl Session {
             });
         }
         for (sources, text) in memories {
-            if self.memories.iter().any(|m| m.source_ids == sources && m.text == text) {
+            if self
+                .memories
+                .iter()
+                .any(|m| m.source_ids == sources && m.text == text)
+            {
                 continue;
             }
             let id = self.memories.len() as u64 + 1;
-            self.memories.push(Memory { id, source_ids: sources, text: text.clone() });
+            self.memories.push(Memory {
+                id,
+                source_ids: sources,
+                text: text.clone(),
+            });
             self.active_shadow.push(ShadowRecord {
                 source_id: 0,
                 value: json!({"role": "user", "content": json!({"memory_id": format!("m{id}"), "text": text}).to_string()}),
@@ -344,18 +440,28 @@ impl Session {
     }
 
     pub fn remove(&mut self, ids: &[u64], groups: &[Group]) {
-        let members = groups.iter().filter(|g| ids.contains(&g.id)).flat_map(|g| g.members.iter().copied()).collect::<HashSet<_>>();
+        let members = groups
+            .iter()
+            .filter(|g| ids.contains(&g.id))
+            .flat_map(|g| g.members.iter().copied())
+            .collect::<HashSet<_>>();
         for item in &mut self.history {
             item.removed |= members.contains(&item.id);
         }
-        self.active_shadow.retain(|record| !ids.contains(&record.source_id));
+        self.active_shadow
+            .retain(|record| !ids.contains(&record.source_id));
         self.observed.retain(|id, _| !ids.contains(id));
         self.opinions.retain(|id, _| !ids.contains(id));
     }
 }
 
 fn parse_group(value: &Value) -> Result<u64> {
-    let s = value.as_str().ok_or_else(|| anyhow::anyhow!("group ID is not a string"))?;
-    let digits = s.strip_prefix('g').filter(|s| !s.is_empty() && !s.starts_with('0') && s.chars().all(|c| c.is_ascii_digit())).ok_or_else(|| anyhow::anyhow!("invalid group ID"))?;
+    let s = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("group ID is not a string"))?;
+    let digits = s
+        .strip_prefix('g')
+        .filter(|s| !s.is_empty() && !s.starts_with('0') && s.chars().all(|c| c.is_ascii_digit()))
+        .ok_or_else(|| anyhow::anyhow!("invalid group ID"))?;
     Ok(digits.parse()?)
 }
