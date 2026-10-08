@@ -4,8 +4,8 @@ use std::{
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Weak, atomic::{AtomicU64, Ordering}},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Result, bail};
@@ -322,7 +322,7 @@ async fn models(
         .send()
         .await
         .map_err(|_| failure(StatusCode::BAD_GATEWAY, "upstream transport failed"))?;
-    Ok(relay(upstream, None).await)
+    Ok(relay(upstream, None, None).await)
 }
 
 async fn metrics(
@@ -502,11 +502,14 @@ async fn forward(
             request = request.header(name, value);
         }
     }
+    let attempt = Attempt::start("primary", outbound["model"].as_str().unwrap_or(""), native, standard(&outbound));
     match request.send().await {
-        Ok(upstream) => Ok(relay(upstream, commit).await),
+        Ok(upstream) => Ok(relay(upstream, commit, Some(attempt)).await),
         Err(_) => {
             if let Some(mut commit) = commit {
                 commit.reviewed.failed_primaries += 1;
+                commit.reviewed.primary.calls += 1;
+                commit.reviewed.primary.unavailable_cost_calls += 1;
                 let _ = save(&service, &commit.id, &commit.reviewed);
                 let _ = trace(
                     &service,
@@ -515,6 +518,7 @@ async fn forward(
                     &json!({"reason": "transport"}),
                 );
             }
+            attempt.finish(None, "transport_or_timeout");
             Err(failure(
                 StatusCode::BAD_GATEWAY,
                 "upstream transport failed",
@@ -574,6 +578,7 @@ async fn review(service: &Service, id: &str, session: &mut Session, main: &Value
     }
     let _ = trace(service, id, "shadow_submitted", &body);
     session.last_review_request = session.completed_requests;
+    let attempt = Attempt::start("shadow", &service.config.classifier_model, false, true);
     let response = request.send().await;
     let mut valid = false;
     if let Ok(response) = response
@@ -581,6 +586,7 @@ async fn review(service: &Service, id: &str, session: &mut Session, main: &Value
         && let Ok(bytes) = bounded(response, 4 * 1024 * 1024).await
         && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
     {
+        attempt.finish(Some(&value), "observed");
         session.shadow.observe(
             &service.config.classifier_model,
             &value["usage"],
@@ -603,6 +609,7 @@ async fn review(service: &Service, id: &str, session: &mut Session, main: &Value
             }
         }
     } else {
+        attempt.finish(None, "review_transport_or_protocol_failure");
         session.shadow.calls += 1;
         session.shadow.unavailable_cost_calls += 1;
     }
@@ -804,7 +811,80 @@ fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Option<Session>,
     (best.map(|(session, _)| session), report)
 }
 
-async fn relay(mut upstream: reqwest::Response, commit: Option<Commit>) -> Response {
+static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+
+struct Attempt {
+    id: String,
+    actor: &'static str,
+    model: String,
+    native: bool,
+    started: Instant,
+    standard: bool,
+}
+
+impl Attempt {
+    fn start(actor: &'static str, model: &str, native: bool, standard: bool) -> Self {
+        let attempt = Self {
+            id: format!("{}-{}-{}", std::process::id(), now(), NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)),
+            actor,
+            model: model.to_owned(),
+            native,
+            started: Instant::now(),
+            standard,
+        };
+        attempt.emit("started", json!({}));
+        attempt
+    }
+
+    fn emit(&self, event: &str, details: Value) {
+        let mut value = json!({
+            "actor": self.actor, "event": event, "request_id": self.id,
+            "model": self.model, "native_compaction": self.native
+        });
+        value.as_object_mut().unwrap().extend(details.as_object().unwrap().clone());
+        println!("BENCHMARK_CONTEXT_EVENT {value}");
+    }
+
+    fn finish(&self, response: Option<&Value>, reason: &str) {
+        let Some(response) = response else {
+            self.emit("failed", json!({"reason": reason, "latency_ms": self.started.elapsed().as_millis() as u64}));
+            return;
+        };
+        let usage = &response["usage"];
+        if usage["input_tokens"].as_u64().is_none() || usage["output_tokens"].as_u64().is_none() {
+            self.emit("failed", json!({"reason": "usage_unavailable", "latency_ms": self.started.elapsed().as_millis() as u64}));
+            return;
+        }
+        // Export only numeric native usage partitions. Never print response text,
+        // headers, source contents, classifier advice or resolved credentials.
+        let mut safe_usage = json!({"input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]});
+        for (field, names) in [
+            ("input_tokens_details", &["cached_tokens", "cache_write_tokens", "cache_creation_tokens", "audio_tokens", "image_tokens", "text_tokens"][..]),
+            ("output_tokens_details", &["reasoning_tokens", "audio_tokens", "text_tokens"][..]),
+        ] {
+            let mut details = serde_json::Map::new();
+            for name in names {
+                if let Some(number) = usage[field][*name].as_u64() { details.insert((*name).to_owned(), json!(number)); }
+            }
+            if !details.is_empty() { safe_usage[field] = Value::Object(details); }
+        }
+        let mut priced = carry::core::UsageLedger::default();
+        priced.observe(&self.model, usage, self.standard && response.get("service_tier").is_none_or(|v| v == "default"));
+        let tools = response["output"].as_array().into_iter().flatten().filter(|item| item["type"] == "function_call").count();
+        self.emit("completed", json!({
+            "usage": safe_usage, "latency_ms": self.started.elapsed().as_millis() as u64,
+            "tool_calls": tools, "service_tier": response.get("service_tier").cloned().unwrap_or(json!("default")),
+            "response_status": response.get("status").cloned().unwrap_or(Value::Null),
+            "cost_available": priced.unavailable_cost_calls == 0
+        }));
+    }
+}
+
+async fn relay(
+    mut upstream: reqwest::Response,
+    commit: Option<Commit>,
+    attempt: Option<Attempt>,
+) -> Response {
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let is_sse = headers
@@ -836,13 +916,16 @@ async fn relay(mut upstream: reqwest::Response, commit: Option<Commit>) -> Respo
                 }
             }
         }
+        let sse_completed = observer.completed.is_some();
+        let observed = if is_sse {
+            observer.observed
+        } else {
+            serde_json::from_slice::<Value>(&json_bytes).ok()
+        };
+        if let Some(attempt) = attempt {
+            attempt.finish(observed.as_ref(), if complete_transport { "observed" } else { "cancelled_or_stream_failure" });
+        }
         if let Some(mut commit) = commit {
-            let sse_completed = observer.completed.is_some();
-            let observed = if is_sse {
-                observer.observed
-            } else {
-                serde_json::from_slice::<Value>(&json_bytes).ok()
-            };
             let complete_transport = complete_transport && (!is_sse || sse_completed);
             let completed = observed.as_ref().is_some_and(|v| {
                 v["status"] == "completed"
