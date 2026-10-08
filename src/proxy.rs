@@ -808,8 +808,10 @@ fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Option<Session>,
         // A future completed review also pays for bounded output. The current
         // completed review is sunk; future output is equal work, NOT zero cost.
         // Long-context output rates can differ between the two actual views.
-        let keep_rates = Rates::for_model(&config.classifier_model, estimate(&keep_shadow)).unwrap();
-        let compact_rates = Rates::for_model(&config.classifier_model, estimate(&compact_shadow)).unwrap();
+        let keep_rates =
+            Rates::for_model(&config.classifier_model, estimate(&keep_shadow)).unwrap();
+        let compact_rates =
+            Rates::for_model(&config.classifier_model, estimate(&compact_shadow)).unwrap();
         let future_output = future_reviews as f64 * config.classifier_max_output_tokens as f64;
         shadow.keep += future_output * keep_rates.output;
         shadow.compact += future_output * compact_rates.output;
