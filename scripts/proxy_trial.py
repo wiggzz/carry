@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import secrets
 import signal
+import queue
+import threading
 import subprocess
 import time
 import urllib.error
@@ -14,15 +16,23 @@ import urllib.request
 import uuid
 
 
-def client_configuration(root, *, client, base_url, model, session_id):
+def client_configuration(root, *, client, base_url, model, session_id,
+                         history_policy="strict", native_compaction="disabled"):
     """Write credential-free native HTTP Responses provider configuration."""
     headers = {'x-carry-session': session_id, 'x-carry-tenant':'local-trial', 'x-carry-branch':'main'}
+    if history_policy != 'strict': headers['x-carry-history-policy']=history_policy
     if client == 'codex':
         home = root / 'codex'; home.mkdir()
-        text = '\n'.join([
-            'model_provider = "carry-trial"', '[model_providers.carry-trial]',
-            'name = "Carry local trial"', f'base_url = {json.dumps(base_url)}',
+        controls=[]
+        if native_compaction != 'disabled':
+            controls=['model_context_window = 500000', 'model_auto_compact_token_limit = 20000',
+                'model_auto_compact_token_limit_scope = \"total\"', '[features]',
+                'token_budget = false', 'remote_compaction_v2 = '+str(native_compaction=='v2').lower()]
+        text = '\n'.join(['model_provider = "carry-trial"'] + controls + [
+            '[model_providers.carry-trial]',
+            'name = '+json.dumps('OpenAI' if native_compaction!='disabled' else 'Carry local trial'), f'base_url = {json.dumps(base_url)}',
             'wire_api = "responses"', 'env_key = "CARRY_TRIAL_GATEWAY_TOKEN"',
+            'requires_openai_auth = false', 'request_max_retries = 0', 'stream_max_retries = 0',
             'supports_websockets = false',
             'http_headers = {' + ', '.join(f'{json.dumps(k)} = {json.dumps(v)}' for k,v in headers.items()) + '}', '',
         ])
@@ -37,6 +47,42 @@ def client_configuration(root, *, client, base_url, model, session_id):
     return {'PI_CODING_AGENT_DIR':str(home), 'PI_OFFLINE':'1', 'PI_TELEMETRY':'0'}
 
 
+def run_rpc_checkpoint(command, *, cwd, env, output, prompt, timeout):
+    """Scripted fixture only: settled prompt -> manual compact -> settled continuation."""
+    process=subprocess.Popen(command,cwd=cwd,env=env,stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,start_new_session=True)
+    events=queue.Queue()
+    def read():
+        for line in process.stdout:
+            output.write(line); output.flush()
+            try: events.put(json.loads(line))
+            except ValueError: pass
+        events.put(None)
+    reader=threading.Thread(target=read,daemon=True); reader.start()
+    deadline=time.monotonic()+timeout
+    def send(value):
+        process.stdin.write(json.dumps(value)+'\n'); process.stdin.flush()
+    def wait(predicate):
+        while True:
+            remaining=deadline-time.monotonic()
+            if remaining<=0: raise TimeoutError('RPC fixture deadline')
+            value=events.get(timeout=remaining)
+            if value is None: raise RuntimeError('RPC fixture early EOF')
+            if predicate(value): return value
+    try:
+        send({'id':'p1','type':'prompt','message':prompt})
+        wait(lambda e:e.get('type')=='agent_settled')
+        send({'id':'c1','type':'compact'})
+        compact=wait(lambda e:e.get('type')=='response' and e.get('id')=='c1')
+        if compact.get('success') is not True: return 1
+        send({'id':'p2','type':'prompt','message':'Continue from the installed checkpoint; finish.'})
+        wait(lambda e:e.get('type')=='agent_settled')
+        return 0
+    finally:
+        stop_process_group(process)
+        reader.join(timeout=3)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--client', choices=['codex','pi'], required=True)
@@ -45,6 +91,14 @@ def main():
     parser.add_argument('--workspace', type=Path, required=True)
     parser.add_argument('--trial-dir', type=Path, required=True)
     parser.add_argument('--mode', choices=['off','audit','compact'], default='off')
+    parser.add_argument('--pi-checkpoint-fixture',action='store_true',
+        help='Credential-free scripted RPC manual-compaction/continuation fixture')
+    parser.add_argument('--history-policy',choices=['strict','reset-on-divergence'],default='strict',
+        help='Explicitly retire both active projections on caller replacement; never infer ancestry')
+    parser.add_argument('--codex-sandbox',choices=['workspace-write','danger-full-access'],default='workspace-write',
+        help='Unsandboxed mode is only for disposable contained fixtures; normal trials default workspace-write')
+    parser.add_argument('--codex-native-compaction',choices=['disabled','v1','v2'],default='disabled',
+        help='Fixture-only forced 20000-token native compaction threshold')
     parser.add_argument('--listen', default='127.0.0.1:8787')
     parser.add_argument('--upstream-url', default='https://api.openai.com/v1/responses')
     parser.add_argument('--classifier-url', default='https://api.openai.com/v1/responses')
@@ -106,10 +160,11 @@ def main():
             client_env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'),
                               CARRY_TRIAL_GATEWAY_TOKEN=token)
             client_env.update(client_configuration(root, client=args.client,
-                base_url=f'http://{args.listen}/v1', model=args.model, session_id=session))
+                base_url=f'http://{args.listen}/v1', model=args.model, session_id=session,
+                history_policy=args.history_policy,native_compaction=args.codex_native_compaction))
             binary = args.client_binary or args.client
             if args.client == 'codex':
-                client_command = [binary,'exec','--cd',str(workspace),'--sandbox','workspace-write',
+                client_command = [binary,'exec','--cd',str(workspace),'--sandbox',args.codex_sandbox,
                     '--model',args.model,'--config',f'model_reasoning_effort={args.reasoning}',
                     '--config','approval_policy="never"','--json',args.prompt]
             else:
@@ -117,11 +172,22 @@ def main():
                     '--thinking',args.reasoning,'--no-approve','--no-extensions','--no-skills',
                     '--no-prompt-templates','--no-context-files',
                     '--session-dir',str(root / 'pi-sessions'),args.prompt]
+            if args.pi_checkpoint_fixture:
+                if args.client != 'pi': raise ValueError('RPC fixture requires Pi')
+                client_command[client_command.index('json')]='rpc'
+                client_command.pop()
+                (root/'pi/settings.json').write_text(json.dumps({'compaction':{
+                    'enabled':False,'reserveTokens':1024,'keepRecentTokens':1024}}))
             (root / 'trial.json').write_text(json.dumps({'client':args.client,'mode':args.mode,
                 'session_id':session,'model':args.model,'reasoning':args.reasoning,
+                'history_policy':args.history_policy,'codex_sandbox':args.codex_sandbox,
+                'codex_native_compaction':args.codex_native_compaction,
                 'classifier_model':args.classifier_model,'classifier_effort':args.classifier_effort,
                 'payoff_requests':args.payoff_requests,'min_payback_percent':args.min_payback_percent}, indent=2)+'\n')
             with (root / 'client-events.jsonl').open('w') as output:
+                if args.pi_checkpoint_fixture:
+                    return run_rpc_checkpoint(client_command,cwd=workspace,env=client_env,output=output,
+                        prompt=args.prompt,timeout=args.timeout)
                 client = subprocess.Popen(client_command, cwd=workspace, env=client_env,
                     stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
                 try:

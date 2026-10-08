@@ -95,6 +95,19 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 self.assertEqual(final['output'][0]['content'][0]['text'],'FIXTURE_COMPLETE')
                 self.assertFalse(fixture.errors)
 
+    def test_pi_summary_is_cache_isolated_and_returns_native_text_checkpoint(self):
+        from scripts.proxy_native_fixture import Fixture
+        with Fixture('pi','pi-checkpoint') as fixture:
+            body={'model':'gpt-6-luna','input':[{'role':'user','content':'summarize controlled history'}]}
+            req=urllib.request.Request(fixture.url+'/v1/responses',data=json.dumps(body).encode(),
+                headers={'content-type':'application/json'})
+            try:
+                with urllib.request.urlopen(req,timeout=3) as response: raw=response.read().decode()
+            except urllib.error.HTTPError as error:
+                error.close(); self.fail('Pi native summary must be accepted without a coding cache namespace')
+            value=[json.loads(line[6:]) for line in raw.splitlines() if line.startswith('data: ')][-1]['response']
+            self.assertEqual(value['output'][0]['content'][0]['text'],'FIXTURE_PI_CHECKPOINT')
+
     def test_provider_rejects_missing_or_changed_native_cache_namespace(self):
         from scripts.proxy_native_fixture import Fixture
         import urllib.error
