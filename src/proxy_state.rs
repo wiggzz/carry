@@ -52,6 +52,8 @@ pub(super) struct Session {
     pub next_id: u64,
     pub history: Vec<Item>,
     pub pending_output: Vec<Value>,
+    #[serde(default)]
+    pub native_checkpoint: Vec<Value>,
     pub opinions: BTreeMap<u64, String>,
     pub memories: Vec<Memory>,
     /// Active reviewer view only. Audit source may persist in history, but is
@@ -106,6 +108,12 @@ impl Session {
             bail!("unsupported proxy checkpoint version");
         }
         self.version = 1;
+        if !self.native_checkpoint.is_empty() {
+            if !self.native_checkpoint.iter().all(|checkpoint| input.contains(checkpoint)) {
+                bail!("next epoch must echo the native opaque checkpoint, not pre-compaction source");
+            }
+            self.native_checkpoint.clear();
+        }
         if input.len() > 16_384 || self.history.len() > 16_384 {
             bail!("lineage item limit exceeded; use native compaction or a new explicit session");
         }
@@ -174,6 +182,7 @@ impl Session {
     pub fn reset_active(&mut self) {
         self.history.clear();
         self.pending_output.clear();
+        self.native_checkpoint.clear();
         self.opinions.clear();
         self.memories.clear();
         self.active_shadow.clear();
