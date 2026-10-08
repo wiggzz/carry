@@ -49,6 +49,17 @@ class WorkflowProxyTests(unittest.TestCase):
             self.assertEqual(values.get('CARRY_PROXY_HISTORY_POLICY'), 'reset-on-divergence')
 
 
+    def test_parsed_mode_choices_reach_actual_configuration_validator(self):
+        import yaml
+        from scripts.proxy_benchmark import validate_config
+        workflow=yaml.safe_load((ROOT/'.github/workflows/run-swebench.yml').read_text())
+        inputs=workflow.get('on',workflow.get(True))['workflow_dispatch']['inputs']
+        choices=inputs['proxy_mode']['options']
+        self.assertEqual(choices,['disabled','off','audit','compact'])
+        for mode in choices:
+            resolved=validate_config({'BENCHMARK_HARNESS':'pi','CARRY_PROXY_MODE':mode})
+            self.assertEqual(resolved['CARRY_PROXY_MODE'],mode)
+
     def test_parsed_workflow_policy_choice_reaches_real_validator(self):
         import yaml
         from scripts.proxy_benchmark import validate_config

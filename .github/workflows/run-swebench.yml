@@ -82,7 +82,7 @@ on:
         required: true
         default: disabled
         type: choice
-        options: [disabled, off, audit, compact]
+        options: [disabled, "off", audit, compact]
       proxy_history_policy:
         description: Trusted checkpoint policy; reset retires both active projections on non-prefix native history
         required: true
