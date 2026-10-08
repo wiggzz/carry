@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::protocol::ContextManagement;
+use carry::core::{horizon_cost, input_cost, prefix_compatible, select_removals};
 
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 const CACHE_READ_RATE: f64 = 0.10;
@@ -678,16 +679,19 @@ impl ContextState {
             }
         }
 
-        let removable = self
+        let eligible = self
             .items
             .iter()
             .filter(|item| {
-                !protected.contains(&item.id)
-                    && (item.signal == RetentionSignal::Drop
-                        || neutral_removable.contains(&item.id))
+                item.signal == RetentionSignal::Drop || neutral_removable.contains(&item.id)
             })
             .map(|item| item.id)
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
+        let removable = select_removals(
+            self.items.iter().map(|item| item.id),
+            &eligible,
+            &protected,
+        );
 
         let mut candidates = Vec::new();
         if !removable.is_empty() {
@@ -872,8 +876,7 @@ impl ContextState {
                 .breakpoints
                 .iter()
                 .find(|breakpoint| breakpoint.generation == priced.generation)?;
-            retained_rendered
-                .starts_with(&stored.rendered_prefix)
+            prefix_compatible(&retained_rendered, &stored.rendered_prefix)
                 .then_some(priced.generation)
         });
         let reused_tokens = reused
@@ -1111,10 +1114,8 @@ fn payoff_savings_input_units(
 ) -> f64 {
     let keep_first = keep_request_cost_with_implicit(implicit_cached_tokens, current_tokens);
     let compact_first = compact_first_cost;
-    let later_requests = payoff_requests.saturating_sub(1) as f64;
-    keep_first + later_requests * current_tokens as f64 * CACHE_READ_RATE
-        - compact_first
-        - later_requests * retained_tokens as f64 * CACHE_READ_RATE
+    horizon_cost(keep_first, current_tokens as f64, CACHE_READ_RATE, payoff_requests)
+        - horizon_cost(compact_first, retained_tokens as f64, CACHE_READ_RATE, payoff_requests)
 }
 
 fn keep_request_cost(current_tokens: usize, policy: &CompactionPolicy) -> f64 {
@@ -1125,8 +1126,12 @@ fn keep_request_cost(current_tokens: usize, policy: &CompactionPolicy) -> f64 {
 }
 
 fn keep_request_cost_with_implicit(implicit_cached_tokens: usize, current_tokens: usize) -> f64 {
-    implicit_cached_tokens as f64 * CACHE_READ_RATE
-        + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE
+    input_cost(
+        current_tokens as f64,
+        implicit_cached_tokens as f64,
+        CACHE_WRITE_RATE,
+        CACHE_READ_RATE,
+    )
 }
 
 fn compact_request_cost(plan: &CompactionPlan) -> f64 {
