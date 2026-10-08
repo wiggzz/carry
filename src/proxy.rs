@@ -571,7 +571,7 @@ fn review_body(config: &ProxyCli, session: &Session) -> Value {
         "model": config.classifier_model,
         "instructions": REVIEW_INSTRUCTIONS,
         // JSON mode requires the instruction in input text, not only top-level instructions.
-        "input": [json!({"role": "user", "content": "Return JSON."}), json!({"role": "user", "content": json!({"current_request": session.review_context}).to_string()})].into_iter().chain(session.shadow_input()).collect::<Vec<_>>(),
+        "input": std::iter::once(json!({"role": "user", "content": "Return JSON."})).chain(std::iter::once(json!({"role": "user", "content": json!({"current_request": session.review_context}).to_string()}))).chain(session.shadow_input()).collect::<Vec<_>>(),
         "store": false, "stream": false,
         "prompt_cache_key": session.review_cache_key,
         "reasoning": {"effort": config.classifier_reasoning_effort},
