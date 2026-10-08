@@ -641,12 +641,25 @@ async fn unsupported_stateful_review_and_retrieval_fail_explicitly() {
 async fn primary_timeout_and_client_cancellation_are_censored_without_exposure() {
     let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
     let state = tempfile::tempdir().unwrap();
-    let (_proxy, url) = start_proxy_options(state.path(), fixture.address, "off", &["--request-timeout-secs", "1"], "").await;
+    let (_proxy, url) = start_proxy_options(
+        state.path(),
+        fixture.address,
+        "off",
+        &["--request-timeout-secs", "1"],
+        "",
+    )
+    .await;
     let request = json!({"model": "gpt-6-luna", "input": [{"role": "user", "content": "goal"}], "metadata": {"scenario": "delayed"}});
-    assert_eq!(send(&url, &request, "a", "main").await.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        send(&url, &request, "a", "main").await.status(),
+        reqwest::StatusCode::BAD_GATEWAY
+    );
     let saved = checkpoint_states(state.path()).remove(0);
     assert_eq!(saved["history"][0]["exposed"], false);
-    assert_eq!(saved["primary"]["calls"], 1, "a timed-out attempt remains in the fixed denominator");
+    assert_eq!(
+        saved["primary"]["calls"], 1,
+        "a timed-out attempt remains in the fixed denominator"
+    );
     assert_eq!(saved["primary"]["unavailable_cost_calls"], 1);
     let mut cancelled = request;
     cancelled["metadata"]["scenario"] = json!("cancellable_sse");
@@ -655,7 +668,9 @@ async fn primary_timeout_and_client_cancellation_are_censored_without_exposure()
     drop(response);
     let mut saved = checkpoint_states(state.path()).remove(0);
     for _ in 0..100 {
-        if saved["failed_primaries"] == 2 { break; }
+        if saved["failed_primaries"] == 2 {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
         saved = checkpoint_states(state.path()).remove(0);
     }
@@ -669,11 +684,20 @@ async fn primary_timeout_and_client_cancellation_are_censored_without_exposure()
 async fn gateway_token_is_separate_and_not_an_upstream_credential() {
     let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
     let state = tempfile::tempdir().unwrap();
-    let (_proxy, url) = start_proxy_options(state.path(), fixture.address, "off", &[], "fixture-gateway").await;
+    let (_proxy, url) =
+        start_proxy_options(state.path(), fixture.address, "off", &[], "fixture-gateway").await;
     let request = json!({"model": "gpt-6-luna", "input": [{"role": "user", "content": "goal"}]});
-    assert_eq!(send(&url, &request, "a", "main").await.status(), reqwest::StatusCode::UNAUTHORIZED);
-    let response = reqwest::Client::new().post(format!("{url}/v1/responses"))
-        .bearer_auth("fixture-gateway").json(&request).send().await.unwrap();
+    assert_eq!(
+        send(&url, &request, "a", "main").await.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let response = reqwest::Client::new()
+        .post(format!("{url}/v1/responses"))
+        .bearer_auth("fixture-gateway")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
     assert!(response.status().is_success());
     let _ = response.bytes().await.unwrap();
     assert_eq!(fixture.requests.lock().await.len(), 1);
@@ -690,9 +714,16 @@ async fn valid_completed_shadow_and_shared_memory_survive_a_failed_primary() {
         {"type": "function_call_output", "call_id": "a", "output": "large".repeat(10000)},
         {"role": "user", "content": "finish"}
     ], "store": false});
-    let first: serde_json::Value = send(&url, &request, "a", "main").await.json().await.unwrap();
+    let first: serde_json::Value = send(&url, &request, "a", "main")
+        .await
+        .json()
+        .await
+        .unwrap();
     let mut next = request;
-    next["input"].as_array_mut().unwrap().extend(first["output"].as_array().unwrap().iter().cloned());
+    next["input"]
+        .as_array_mut()
+        .unwrap()
+        .extend(first["output"].as_array().unwrap().iter().cloned());
     next["metadata"] = json!({"scenario": "http_error"});
     let _ = send(&url, &next, "a", "main").await.bytes().await.unwrap();
     let saved = checkpoint_states(state.path()).remove(0);
@@ -700,7 +731,10 @@ async fn valid_completed_shadow_and_shared_memory_survive_a_failed_primary() {
     assert_eq!(saved["shadow"]["calls"], 1);
     assert_eq!(saved["memories"][0]["text"], "remember tested outcome");
     assert_eq!(saved["opinions"]["2"], "drop");
-    assert_eq!(saved["compactions"], 0, "failed primary does not commit a speculative removal");
+    assert_eq!(
+        saved["compactions"], 0,
+        "failed primary does not commit a speculative removal"
+    );
     assert_eq!(saved["history"][1]["removed"], false);
     assert_eq!(saved["history"][4]["exposed"], false);
 }
@@ -709,20 +743,36 @@ async fn valid_completed_shadow_and_shared_memory_survive_a_failed_primary() {
 async fn reviewer_timeout_fails_closed_while_primary_can_complete() {
     let fixture = fixture(json!({"fixture_delay": true})).await;
     let state = tempfile::tempdir().unwrap();
-    let (_proxy, url) = start_proxy_options(state.path(), fixture.address, "compact", &["--classifier-timeout-secs", "1"], "").await;
+    let (_proxy, url) = start_proxy_options(
+        state.path(),
+        fixture.address,
+        "compact",
+        &["--classifier-timeout-secs", "1"],
+        "",
+    )
+    .await;
     let request = json!({"model": "gpt-6-luna", "input": [
         {"role": "user", "content": "goal"},
         {"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"},
         {"type": "function_call_output", "call_id": "a", "output": "preserve exact source"},
         {"role": "user", "content": "finish"}
     ], "store": false});
-    let first: serde_json::Value = send(&url, &request, "a", "main").await.json().await.unwrap();
+    let first: serde_json::Value = send(&url, &request, "a", "main")
+        .await
+        .json()
+        .await
+        .unwrap();
     let mut next = request;
-    next["input"].as_array_mut().unwrap().extend(first["output"].as_array().unwrap().iter().cloned());
+    next["input"]
+        .as_array_mut()
+        .unwrap()
+        .extend(first["output"].as_array().unwrap().iter().cloned());
     assert!(send(&url, &next, "a", "main").await.status().is_success());
     let mut saved = checkpoint_states(state.path()).remove(0);
     for _ in 0..50 {
-        if saved["completed_requests"] == 2 { break; }
+        if saved["completed_requests"] == 2 {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
         saved = checkpoint_states(state.path()).remove(0);
     }
@@ -746,23 +796,41 @@ async fn native_codex_and_pi_echo_shapes_preserve_settings_and_unknown_model_pas
             "text": {"verbosity": "low"}, "include": ["reasoning.encrypted_content"], "store": false,
             "prompt_cache_key": format!("native-affinity-{branch}")
         });
-        let first: serde_json::Value = send(&url, &request, "a", branch).await.json().await.unwrap();
+        let first: serde_json::Value = send(&url, &request, "a", branch)
+            .await
+            .json()
+            .await
+            .unwrap();
         let mut next = request.clone();
         let mut output = first["output"][0].clone();
         if branch == "pi" {
             let object = output.as_object_mut().unwrap();
-            object.remove("id"); object.remove("status"); object.remove("type");
-            output["content"][0].as_object_mut().unwrap().remove("annotations");
-            output["content"][0].as_object_mut().unwrap().remove("logprobs");
+            object.remove("id");
+            object.remove("status");
+            object.remove("type");
+            output["content"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("annotations");
+            output["content"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("logprobs");
         }
         next["input"].as_array_mut().unwrap().push(output);
-        next["input"].as_array_mut().unwrap().push(json!({"role": "user", "content": [{"type": "input_text", "text": "continue"}]}));
+        next["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role": "user", "content": [{"type": "input_text", "text": "continue"}]}));
         let _ = send(&url, &next, "a", branch).await.bytes().await.unwrap();
         let captures = fixture.requests.lock().await;
-        assert_eq!(captures[captures.len()-2], request);
-        assert_eq!(captures[captures.len()-1], next);
+        assert_eq!(captures[captures.len() - 2], request);
+        assert_eq!(captures[captures.len() - 1], next);
     }
-    let pi_state = checkpoint_states(state.path()).into_iter().find(|s| s["review_context"]["model"] == "unknown-provider-model").unwrap();
+    let pi_state = checkpoint_states(state.path())
+        .into_iter()
+        .find(|s| s["review_context"]["model"] == "unknown-provider-model")
+        .unwrap();
     assert_eq!(pi_state["last_plan"]["reason"], "unsupported_model_or_tier");
     assert_eq!(pi_state["primary"]["unavailable_cost_calls"], 2);
 }
