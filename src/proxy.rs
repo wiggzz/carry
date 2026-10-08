@@ -912,3 +912,45 @@ async fn relay(mut upstream: reqwest::Response, commit: Option<Commit>) -> Respo
     }
     response
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actual_paired_rendering_and_separate_cache_evidence_can_veto_main_savings() {
+        let config = ProxyCli::try_parse_from([
+            "carry proxy", "--mode", "compact", "--classifier-model", "gpt-6-sol", "--min-payback-percent", "0",
+        ]).unwrap();
+        let mut session = Session::default();
+        let input = vec![
+            json!({"role": "user", "content": "durable".repeat(1600)}),
+            json!({"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "a", "output": "disposable".repeat(1600)}),
+            json!({"role": "user", "content": "finish"}),
+        ];
+        session.ingest(&input).unwrap();
+        for item in &mut session.history { item.exposed = true; }
+        let groups = session.groups();
+        session.observe_groups(&groups);
+        session.apply_advice(&groups, &json!({"protected": ["g1"], "removable": ["g2"], "memories": []})).unwrap();
+        session.review_cache_key = "test-affinity".into();
+        let main = json!({"model": "gpt-6-luna", "input": input, "store": false});
+        session.review_context = cache_base(&main);
+        let shadow = review_body(&config, &session);
+        session.shadow_cache.push(CacheEvidence {
+            base: cache_base(&shadow), input: shadow["input"].as_array().unwrap().clone(),
+            at: now(), native_cached_fraction: 1.0,
+        });
+        let (candidate, report) = plan(&config, &session, &main);
+        let joint = &report["candidates"][0]["joint"];
+        assert!(joint["primary_keep"].as_f64().unwrap() > joint["primary_compact"].as_f64().unwrap());
+        assert!(joint["future_shadow_compact"].as_f64().unwrap() > joint["future_shadow_keep"].as_f64().unwrap());
+        assert!(candidate.is_none(), "joint economics must veto a primary-only positive plan");
+        session.shadow_cache.clear();
+        let (candidate, report) = plan(&config, &session, &main);
+        assert!(candidate.is_some(), "cold actual reviewer view repays the same coupled rewrite");
+        assert_eq!(report["current_review_cost_is_sunk"], true);
+        assert_eq!(report["future_reviews"], 4);
+    }
+}
