@@ -236,17 +236,33 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         .post(format!("{url}/v1/responses"))
         .header("x-carry-session", "fixture-session")
         .json(&request)
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(primary.lock().await[0], request);
-    assert!(shadow.lock().await.is_empty(), "unexposed groups cannot be reviewed");
+    assert!(
+        shadow.lock().await.is_empty(),
+        "unexposed groups cannot be reviewed"
+    );
     let mut second = request.clone();
-    second["input"].as_array_mut().unwrap().extend(first["output"].as_array().unwrap().iter().cloned());
-    second["input"].as_array_mut().unwrap().push(json!({"role": "user", "content": "continue"}));
+    second["input"]
+        .as_array_mut()
+        .unwrap()
+        .extend(first["output"].as_array().unwrap().iter().cloned());
+    second["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role": "user", "content": "continue"}));
     let result = client
         .post(format!("{url}/v1/responses"))
         .header("x-carry-session", "fixture-session")
         .json(&second)
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(result.status().is_success());
     let _ = result.bytes().await.unwrap();
     assert_eq!(shadow.lock().await.len(), 1);
@@ -256,16 +272,23 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     assert!(sent.to_string().contains("both tools succeeded"));
     assert!(sent.to_string().contains("preserve requirement"));
     assert_eq!(sent["input"].as_array().unwrap().len(), 5);
-    let states = std::fs::read_dir(temp.path()).unwrap()
+    let states = std::fs::read_dir(temp.path())
+        .unwrap()
         .filter_map(Result::ok)
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-        .map(|entry| serde_json::from_slice::<serde_json::Value>(&std::fs::read(entry.path()).unwrap()).unwrap())
+        .map(|entry| {
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(entry.path()).unwrap())
+                .unwrap()
+        })
         .collect::<Vec<_>>();
     assert_eq!(states.len(), 1);
     let active = states[0]["active_shadow"].to_string();
     assert!(!active.contains("DISCARD_SOURCE_PAYLOAD_"));
     assert!(!active.contains("opaque-reasoning"));
-    assert!(!active.contains("g2"), "mixed review records must be projected, not kept whole");
+    assert!(
+        !active.contains("g2"),
+        "mixed review records must be projected, not kept whole"
+    );
     assert!(active.contains("preserve requirement"));
     assert!(active.contains("both tools succeeded"));
     server.abort();
