@@ -842,22 +842,49 @@ async fn numeric_benchmark_events_match_attempts_usage_and_censored_failures() {
     let state = tempfile::tempdir().unwrap();
     let (mut proxy, url) = start_proxy(state.path(), fixture.address, "off").await;
     let request = json!({"model": "gpt-6-luna", "input": [{"role": "user", "content": "PRIVATE_SOURCE_NOT_PUBLIC_TELEMETRY"}]});
-    let _ = send(&url, &request, "a", "main").await.bytes().await.unwrap();
+    let _ = send(&url, &request, "a", "main")
+        .await
+        .bytes()
+        .await
+        .unwrap();
     let mut failed = request;
     failed["metadata"] = json!({"scenario": "http_error"});
-    let _ = send(&url, &failed, "a", "main").await.bytes().await.unwrap();
+    let _ = send(&url, &failed, "a", "main")
+        .await
+        .bytes()
+        .await
+        .unwrap();
     proxy.0.kill().unwrap();
     proxy.0.wait().unwrap();
     let mut output = String::new();
-    proxy.0.stdout.take().unwrap().read_to_string(&mut output).unwrap();
+    proxy
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
     assert!(!output.contains("PRIVATE_SOURCE_NOT_PUBLIC_TELEMETRY"));
     assert!(!output.contains("fixture-primary"));
-    let events = output.lines().filter_map(|line| line.strip_prefix("BENCHMARK_CONTEXT_EVENT "))
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
-    let starts = events.iter().filter(|e| e["actor"] == "primary" && e["event"] == "started").collect::<Vec<_>>();
-    assert_eq!(starts.len(), 2, "each real attempt has numeric telemetry before network I/O");
+    let events = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("BENCHMARK_CONTEXT_EVENT "))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let starts = events
+        .iter()
+        .filter(|e| e["actor"] == "primary" && e["event"] == "started")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        starts.len(),
+        2,
+        "each real attempt has numeric telemetry before network I/O"
+    );
     assert_ne!(starts[0]["request_id"], starts[1]["request_id"]);
-    let completed = events.iter().filter(|e| e["actor"] == "primary" && e["event"] == "completed").collect::<Vec<_>>();
+    let completed = events
+        .iter()
+        .filter(|e| e["actor"] == "primary" && e["event"] == "completed")
+        .collect::<Vec<_>>();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0]["usage"]["input_tokens"], 11);
     assert_eq!(completed[0]["usage"]["output_tokens"], 2);
