@@ -188,12 +188,13 @@ def compact_evidence(trial, fixture):
     assert not members(submitted[2]) and not members(submitted[3]), 'atomic cohort must stay removed'
     assert len(fixture.reviews)>=2, 'later shadow request required, not a source-only check'
     assert 'DROP_COHORT_PAYLOAD' in json.dumps(fixture.reviews[0])
-    assert 'DROP_COHORT_PAYLOAD' not in json.dumps(fixture.reviews[1]), 'later shadow must mechanically prune'
+    assert 'DROP_COHORT_PAYLOAD' not in json.dumps(fixture.reviews[-1]), 'later shadow must mechanically prune'
     removed=[i for i in state['history'] if i['removed'] and i['value'].get('call_id') in cohort]
     assert len(removed)==4 and len({i['cohort'] for i in removed if i['value']['type']=='function_call'})==1
     removed_ids={i['id'] for i in removed}
     assert not any(r['source_id'] in removed_ids for r in state['active_shadow'])
     assert state['invalid_reviews']==0 and state['compactions']>=1
+    assert (trial.parent/(trial.name.removesuffix('-trial')+'-workspace')/'proxy-fixture-b.txt').read_text()=='FIXTURE_TOOL_OK_B'
     # Forwarded surviving tool outputs must be the caller's unmodified bytes.
     for before,after in zip(received,submitted):
         originals={i['call_id']:i for i in before['input'] if i.get('type')=='function_call_output'}

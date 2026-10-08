@@ -128,7 +128,8 @@ async fn v2_trigger_is_a_native_checkpoint_not_an_ordinary_generation() {
         let checkpoint = returned.clone();
         async move {
             assert_eq!(body["input"].as_array().unwrap().last().unwrap()["type"], "compaction_trigger");
-            axum::Json(json!({"status": "completed", "output": [checkpoint], "usage": {"input_tokens": 100, "output_tokens": 10, "input_tokens_details": {"cached_tokens": 0}}}))
+            let output = if body["metadata"]["invalid"] == true { json!([]) } else { json!([checkpoint]) };
+            axum::Json(json!({"status": "completed", "output": output, "usage": {"input_tokens": 100, "output_tokens": 10, "input_tokens_details": {"cached_tokens": 0}}}))
         }
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -166,6 +167,36 @@ async fn v2_trigger_is_a_native_checkpoint_not_an_ordinary_generation() {
         metrics["completed_requests"], 0,
         "a checkpoint is not completed main exposure"
     );
+    let invalid = json!({"model": "gpt-6-luna", "input": [checkpoint, {"type": "compaction_trigger"}], "metadata": {"invalid": true}});
+    let response: serde_json::Value = client
+        .post(format!("{url}/v1/responses"))
+        .header("x-carry-session", "v2")
+        .json(&invalid)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        response["output"],
+        json!([]),
+        "do not fabricate an upstream checkpoint"
+    );
+    let metrics: serde_json::Value = client
+        .get(format!("{url}/carry/metrics"))
+        .header("x-carry-session", "v2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        metrics["native_compactions"], 1,
+        "completed without exactly one opaque anchor is not native checkpoint success"
+    );
+    assert_eq!(metrics["failed_primaries"], 1);
     server.abort();
 }
 
@@ -250,6 +281,46 @@ async fn off_forwards_non_prefix_and_stateful_delta_bytes_without_ancestry_rejec
         );
     }
     server.abort();
+}
+
+#[tokio::test]
+async fn ephemeral_proxy_listen_announces_its_actual_bound_port() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let state = tempfile::tempdir().unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_carry"))
+        .args([
+            "proxy",
+            "--listen",
+            "127.0.0.1:0",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+        ])
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CARRY_PROXY_AUTH_TOKEN")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let banner = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+        .await
+        .expect("proxy must announce kernel-assigned port, not a racy reserved port")
+        .unwrap()
+        .unwrap();
+    let address = banner
+        .strip_prefix("CARRY_PROXY_LISTEN ")
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_ne!(address.port(), 0);
+    assert!(
+        reqwest::get(format!("http://{address}/health"))
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
 }
 
 async fn start_proxy(
@@ -649,7 +720,7 @@ async fn fragmented_sse_preserves_bytes_and_exposes_only_completed_primary_input
 async fn branch_tenant_and_restart_are_explicit_and_credentials_are_not_persisted() {
     let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
     let state = tempfile::tempdir().unwrap();
-    let (proxy, url) = start_proxy(state.path(), fixture.address, "off").await;
+    let (proxy, url) = start_proxy(state.path(), fixture.address, "compact").await;
     let request = json!({"model": "gpt-6-luna", "input": [{"role": "user", "content": "initial"}], "store": false});
     let _ = send(&url, &request, "a", "left")
         .await
@@ -657,7 +728,7 @@ async fn branch_tenant_and_restart_are_explicit_and_credentials_are_not_persiste
         .await
         .unwrap();
     drop(proxy);
-    let (_proxy, url) = start_proxy(state.path(), fixture.address, "off").await;
+    let (_proxy, url) = start_proxy(state.path(), fixture.address, "compact").await;
     let metrics: serde_json::Value = reqwest::Client::new()
         .get(format!("{url}/carry/metrics"))
         .header("x-carry-session", "session")
