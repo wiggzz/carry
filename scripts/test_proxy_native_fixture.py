@@ -17,11 +17,11 @@ class ShadowContractProvider:
     def __init__(self):
         self.primary = []
         self.shadow = []
-        self.advice = lambda body: {'protected': [], 'removable': [], 'memories': []}
+        self.advice = lambda review: {'protected': [], 'removable': [], 'memories': []}
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *args):
+            def log_message(self, format, *args):
                 pass
 
             def do_POST(self):
@@ -57,8 +57,8 @@ class ShadowContractProvider:
 
 
 @contextmanager
-def contract_proxy(test, provider, state_dir, mode='audit'):
-    binary = Path(os.environ.get('CARRY_TEST_BINARY', 'target/debug/carry')).resolve()
+def contract_proxy(test, provider, state_dir, mode='audit', binary=None):
+    binary = Path(binary or os.environ.get('CARRY_TEST_BINARY', 'target/debug/carry')).resolve()
     if not binary.is_file():
         test.skipTest('requires an existing Carry binary; never builds locally')
     env = {k: v for k, v in os.environ.items()
@@ -70,6 +70,7 @@ def contract_proxy(test, provider, state_dir, mode='audit'):
                '--state-dir', state_dir]
     process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, text=True)
+    assert process.stdout is not None
     try:
         test.assertTrue(select.select([process.stdout], [], [], 5)[0], 'proxy startup timed out')
         banner = process.stdout.readline().strip()
@@ -152,6 +153,156 @@ class NativeProviderFixtureTests(unittest.TestCase):
                                  ['g1'] if index == 0 else ['g1', 'g3'])
             self.assertEqual(contract_state(directory)['invalid_reviews'], 0)
 
+
+    def test_proxy_memory_facts_ground_new_advice_in_original_live_sources_not_memory_handles(self):
+        with ShadowContractProvider() as provider, tempfile.TemporaryDirectory() as directory:
+            body = {'model': 'gpt-6-luna', 'input': [
+                {'role': 'user', 'content': 'RETIRE_HUMAN_SOURCE ' * 3000},
+                {'role': 'user', 'content': 'current task'}]}
+            fact = 'the original requirement is JADE42'
+            provider.advice = lambda review: {'protected': [], 'removable': [],
+                'memories': [{'source_ids': ['g1'], 'text': fact}]}
+            with contract_proxy(self, provider, directory, mode='compact') as url:
+                contract_send(url, body)
+                contract_send(url, body)
+                self.assertEqual(contract_state(directory)['invalid_reviews'], 0)
+                # A reviewer derives another fact from the shown prior fact's provenance.
+                grounding = []
+                def grounded(review):
+                    facts = [r for r in wire_data(review) if r.get('text') == fact]
+                    grounding.append(facts)
+                    return {'protected': [], 'removable': [], 'memories': [
+                        {'source_ids': facts[0].get('source_ids', ['m1']),
+                         'text': 'JADE42 remains the required outcome'}]}
+                provider.advice = grounded
+                contract_send(url, body)
+                state = contract_state(directory)
+                if os.environ.get('CARRY_MEMORY_EVIDENCE'):
+                    Path(os.environ['CARRY_MEMORY_EVIDENCE']).write_text(json.dumps({
+                        'fixture_only': True, 'shown_fact_fields': sorted(grounding[0][0]),
+                        'shown_source_ids': grounding[0][0].get('source_ids'),
+                        'invalid_reviews': state['invalid_reviews'],
+                        'accepted_memory_count': len(state['memories'])
+                    }, indent=2) + '\n')
+                self.assertEqual(state['invalid_reviews'], 0,
+                                 'reviewer must receive the original source IDs for valid grounding')
+                self.assertEqual(grounding[0][0]['source_ids'], ['g1'])
+                self.assertNotIn('memory_id', grounding[0][0],
+                                 'internal memory handle must not masquerade as an actionable source')
+                self.assertEqual(len(state['memories']), 2)
+                # Keep validation strict: m1 is not a main source; whole mixed batch rejects.
+                provider.advice = lambda review: {'protected': [], 'removable': ['g1'],
+                    'memories': [{'source_ids': ['m1'], 'text': 'invalid source'}]}
+                contract_send(url, body)
+                state = contract_state(directory)
+                self.assertEqual(state['invalid_reviews'], 1)
+                self.assertEqual(len(state['memories']), 2)
+                self.assertEqual(state['compactions'], 0)
+                # Retire original human source only with an accepted original-ID review.
+                provider.advice = lambda review: {'protected': [], 'removable': ['g1'], 'memories': []}
+                contract_send(url, body)
+                self.assertNotIn('RETIRE_HUMAN_SOURCE', json.dumps(provider.primary[-1]))
+                state = contract_state(directory)
+                self.assertTrue(state['history'][0]['removed'])
+                self.assertEqual(state['compactions'], 1)
+                # Provenance remains visible, but does not re-admit retired IDs for advice.
+                provider.advice = lambda review: {'protected': [], 'removable': [],
+                    'memories': [{'source_ids': ['g1'], 'text': 'retired source is not newly eligible'}]}
+                body['input'].append({'role': 'user', 'content': 'next task'})
+                contract_send(url, body)
+                later = provider.shadow[-1]
+                self.assertNotIn('RETIRE_HUMAN_SOURCE', json.dumps(later))
+                self.assertEqual([r for r in wire_data(later) if r.get('text') == fact][0]['source_ids'], ['g1'])
+                self.assertNotIn('g1', wire_data(later)[-1]['eligible_group_ids'])
+                self.assertEqual(contract_state(directory)['invalid_reviews'], 2)
+                self.assertEqual(len(contract_state(directory)['memories']), 2)
+
+    def test_proxy_parallel_cohort_extension_observes_only_new_members_and_current_opinion(self):
+        with ShadowContractProvider() as provider, tempfile.TemporaryDirectory() as directory:
+            body = {'model': 'gpt-6-luna', 'input': [
+                {'role': 'user', 'content': 'old requirement'},
+                {'role': 'user', 'content': 'current task'}]}
+            provider.advice = lambda review: {'protected': ['g1'], 'removable': [], 'memories': []}
+            with contract_proxy(self, provider, directory) as url:
+                contract_send(url, body)
+                body['input'] += [
+                    {'type': 'function_call', 'call_id': 'a', 'name': 'native', 'arguments': 'CALL_A'},
+                    {'type': 'function_call', 'call_id': 'b', 'name': 'native', 'arguments': 'CALL_B'},
+                    {'type': 'function_call_output', 'call_id': 'a', 'output': 'RESULT_A ' * 500}]
+                contract_send(url, body)
+                provider.advice = lambda review: {'protected': [], 'removable': ['g1'], 'memories': []}
+                body['input'].append({'type': 'function_call_output', 'call_id': 'b',
+                                      'output': 'RESULT_B ' * 500})
+                contract_send(url, body)
+                provider.advice = lambda review: {'protected': [], 'removable': [], 'memories': []}
+                contract_send(url, body)
+            self.assertEqual(len(provider.shadow), 3)
+            self.assertEqual([json.dumps(r).count('RESULT_A') for r in provider.shadow], [500] * 3,
+                             'partial cohort extension must not re-copy earlier member payloads')
+            self.assertEqual([json.dumps(r).count('RESULT_B') for r in provider.shadow], [0, 500, 500])
+            for index, review in enumerate(provider.shadow):
+                records = wire_data(review)
+                blocks = [r for r in records if 'items' in r and r['group_id'] == 'g3']
+                self.assertEqual([r['member_ids'] for r in blocks],
+                                 [[3, 4, 5]] if index == 0 else [[3, 4, 5], [6]])
+                tail = records[-1]
+                self.assertEqual(tail['eligible_group_ids'], ['g1'] if index < 2 else ['g1', 'g3'])
+                self.assertEqual(tail['current_groups'][0]['opinion'], [None, 'keep', 'drop'][index])
+                self.assertFalse(any('opinion' in r for r in records[:-1]),
+                                 'superseded opinions must not live in immutable observation history')
+            state = contract_state(directory)
+            self.assertEqual(state['invalid_reviews'], 0)
+            self.assertEqual(len(state['observed']), 6)
+            self.assertEqual(provider.primary[-1], body)
+
+    def test_proxy_upgrades_real_legacy_checkpoint_without_duplicate_source_or_memory_aliases(self):
+        legacy = os.environ.get('CARRY_LEGACY_BINARY')
+        if not legacy:
+            self.skipTest('optional old binary needed for real checkpoint upgrade replay')
+        with ShadowContractProvider() as provider, tempfile.TemporaryDirectory() as directory:
+            body = {'model': 'gpt-6-luna', 'input': [
+                {'role': 'user', 'content': 'old requirement'},
+                {'role': 'user', 'content': 'current task'}]}
+            provider.advice = lambda review: {'protected': ['g1'], 'removable': [],
+                'memories': [{'source_ids': ['g1'], 'text': 'legacy derived fact'}]}
+            with contract_proxy(self, provider, directory, binary=legacy) as url:
+                contract_send(url, body)
+                body['input'] += [
+                    {'type': 'function_call', 'call_id': 'a', 'name': 'native', 'arguments': '{}'},
+                    {'type': 'function_call_output', 'call_id': 'a', 'output': 'LEGACY_BULK ' * 500}]
+                contract_send(url, body)
+                contract_send(url, body)
+            self.assertEqual(json.dumps(provider.shadow[-1]).count('LEGACY_BULK'), 1000,
+                             'old binary must actually produce the historical duplicated checkpoint')
+            with contract_proxy(self, provider, directory) as url:
+                contract_send(url, body)
+                contract_send(url, body)
+            for review in provider.shadow[-2:]:
+                self.assertEqual(json.dumps(review).count('LEGACY_BULK'), 500)
+                data = wire_data(review)
+                self.assertEqual([r for r in data if r.get('text') == 'legacy derived fact'][0]['source_ids'], ['g1'])
+                self.assertTrue(all('memory_id' not in r and 'eligible' not in r and 'opinion' not in r
+                                    for r in data[:-1]))
+            self.assertEqual(provider.primary[-1], body)
+            self.assertEqual(contract_state(directory)['invalid_reviews'], 0)
+
+    def test_classifier_uses_tail_eligibility_for_immutable_payload_blocks(self):
+        from scripts.proxy_native_fixture import Fixture
+        for eligible, stale in [(True, False), (False, True)]:
+            with self.subTest(eligible=eligible), Fixture('pi', 'compact') as fixture:
+                block = {'group_id': 'g7', 'member_ids': [7],
+                         'items': [{'type': 'function_call_output', 'call_id': 'a',
+                                    'output': 'DROP_COHORT_PAYLOAD'}]}
+                if stale:
+                    block['eligible'] = True
+                body = {'input': [{'role': 'user', 'content': json.dumps(block)},
+                    {'role': 'user', 'content': json.dumps({'eligible_group_ids': ['g7'] if eligible else []})}]}
+                request = urllib.request.Request(fixture.url + '/classifier', data=json.dumps(body).encode(),
+                    headers={'content-type': 'application/json'})
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    advice = json.load(response)
+                self.assertEqual(json.loads(advice['output'][0]['content'][0]['text'])['removable'],
+                                 ['g7'] if eligible else [])
 
     def test_json_mode_requires_json_in_actual_input_message_text(self):
         from scripts.proxy_native_fixture import Fixture
@@ -348,8 +499,9 @@ class NativeProviderFixtureTests(unittest.TestCase):
             self.assertEqual((Path(directory)/'proxy-fixture.txt').read_text(),'FIXTURE_TOOL_OK')
             second=call('/v1/responses',body)
             advice=call('/classifier',{'input':[{'role':'user','content':json.dumps({
-                'group_id':'g7','eligible':True,'items':first['output']+[
-                    {'type':'function_call_output','call_id':'call_fixture_1_a','output':'DROP_COHORT_PAYLOAD'}]})}]})
+                'group_id':'g7','member_ids':[7,8,9],'items':first['output']+[
+                    {'type':'function_call_output','call_id':'call_fixture_1_a','output':'DROP_COHORT_PAYLOAD'}]})},
+                {'role':'user','content':json.dumps({'eligible_group_ids':['g7']})}]})
             self.assertEqual(json.loads(advice['output'][0]['content'][0]['text']),
                 {'protected':[],'removable':['g7'],'memories':[]})
             self.assertEqual(second['output'][0]['type'],'function_call')

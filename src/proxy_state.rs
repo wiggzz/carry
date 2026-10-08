@@ -59,6 +59,8 @@ pub(super) struct Session {
     /// Active reviewer view only. Audit source may persist in history, but is
     /// NEVER used to render the reviewer after paired selection removes it.
     pub active_shadow: Vec<ShadowRecord>,
+    /// One immutable observation per main item ID; value is its coupled group ID.
+    /// Strings retain checkpoint compatibility with the former payload map.
     pub observed: BTreeMap<u64, String>,
     pub primary_cache: Vec<CacheEvidence>,
     pub shadow_cache: Vec<CacheEvidence>,
@@ -354,31 +356,94 @@ impl Session {
     }
 
     pub fn shadow_input(&self) -> Vec<Value> {
-        self.active_shadow.iter().map(|r| r.value.clone()).collect()
+        let mut input = self
+            .active_shadow
+            .iter()
+            .map(|r| r.value.clone())
+            .collect::<Vec<_>>();
+        let groups = self.groups();
+        let eligible = groups
+            .iter()
+            .filter(|g| g.exposed && !g.pinned)
+            .map(|g| format!("g{}", g.id))
+            .collect::<Vec<_>>();
+        let ledger = groups
+            .iter()
+            .map(|g| {
+                json!({"group_id": format!("g{}", g.id), "member_ids": g.members,
+                    "opinion": self.opinions.get(&g.id)})
+            })
+            .collect::<Vec<_>>();
+        input.push(json!({"role": "user", "content": json!({
+            "eligible_group_ids": eligible, "current_groups": ledger
+        }).to_string()}));
+        input
     }
 
     pub fn observe_groups(&mut self, groups: &[Group]) {
+        // v1 checkpoints formerly stored mutable group snapshots. Rebuild only
+        // this derived projection once, without changing canonical main history.
+        if self.observed.values().any(|value| value.starts_with('{')) {
+            self.observed.clear();
+            self.active_shadow.retain(|record| record.source_id == 0);
+        }
+        for record in &mut self.active_shadow {
+            if record.source_id != 0 {
+                continue;
+            }
+            let Some(data) = record.value["content"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            else {
+                continue;
+            };
+            let Some(memory) = self.memories.iter().find(|memory| {
+                data["memory_id"].as_str() == Some(format!("m{}", memory.id).as_str())
+            }) else {
+                continue;
+            };
+            let sources = memory
+                .source_ids
+                .iter()
+                .map(|id| format!("g{id}"))
+                .collect::<Vec<_>>();
+            record.value["content"] =
+                json!(json!({"source_ids": sources, "text": memory.text}).to_string());
+        }
         for group in groups {
-            // A growing parallel cohort keeps its original stable atomic ID.
+            // A growing parallel cohort keeps one coupled selection map. Source
+            // observations remain immutable; current membership lives in the tail.
             for record in &mut self.active_shadow {
                 if group.members.contains(&record.source_id) {
                     record.source_id = group.id;
                 }
             }
-            let values = self
+            for id in &group.members {
+                if let Some(owner) = self.observed.get_mut(id) {
+                    *owner = group.id.to_string();
+                }
+            }
+            let new_items = self
                 .history
                 .iter()
-                .filter(|i| group.members.contains(&i.id))
+                .filter(|i| group.members.contains(&i.id) && !self.observed.contains_key(&i.id))
+                .collect::<Vec<_>>();
+            if new_items.is_empty() {
+                continue;
+            }
+            let member_ids = new_items.iter().map(|i| i.id).collect::<Vec<_>>();
+            let values = new_items
+                .iter()
                 .map(|i| i.value.clone())
                 .collect::<Vec<_>>();
-            let data = json!({"group_id": format!("g{}", group.id), "items": values, "human": group.human, "eligible": group.exposed && !group.pinned});
-            let identity = data.to_string();
-            if self.observed.get(&group.id) != Some(&identity) {
-                self.active_shadow.push(ShadowRecord {
-                    source_id: group.id,
-                    value: json!({"role": "user", "content": identity}),
-                });
-                self.observed.insert(group.id, identity);
+            let data = json!({"group_id": format!("g{}", group.id), "member_ids": member_ids,
+                "items": values, "human": group.human});
+            self.active_shadow.push(ShadowRecord {
+                source_id: group.id,
+                value: json!({"role": "user", "content": data.to_string()}),
+            });
+            for id in member_ids {
+                self.observed.insert(id, group.id.to_string());
             }
         }
     }
@@ -443,10 +508,6 @@ impl Session {
         // hidden reservoir of removed source/opinion records in the active view.
         for (id, opinion) in updates {
             self.opinions.insert(id, opinion.into());
-            self.active_shadow.push(ShadowRecord {
-                source_id: id,
-                value: json!({"role": "assistant", "content": json!({"group_id": format!("g{id}"), "opinion": opinion}).to_string()}),
-            });
         }
         for (sources, text) in memories {
             if self
@@ -457,6 +518,10 @@ impl Session {
                 continue;
             }
             let id = self.memories.len() as u64 + 1;
+            let provenance = sources
+                .iter()
+                .map(|id| format!("g{id}"))
+                .collect::<Vec<_>>();
             self.memories.push(Memory {
                 id,
                 source_ids: sources,
@@ -464,7 +529,7 @@ impl Session {
             });
             self.active_shadow.push(ShadowRecord {
                 source_id: 0,
-                value: json!({"role": "user", "content": json!({"memory_id": format!("m{id}"), "text": text}).to_string()}),
+                value: json!({"role": "user", "content": json!({"source_ids": provenance, "text": text}).to_string()}),
             });
         }
         Ok(())
@@ -481,7 +546,7 @@ impl Session {
         }
         self.active_shadow
             .retain(|record| !ids.contains(&record.source_id));
-        self.observed.retain(|id, _| !ids.contains(id));
+        self.observed.retain(|id, _| !members.contains(id));
         self.opinions.retain(|id, _| !ids.contains(id));
     }
 }
@@ -665,6 +730,74 @@ mod tests {
     }
 
     #[test]
+    fn legacy_checkpoint_projection_migrates_once_without_changing_native_history() {
+        let input = vec![
+            json!({"role": "user", "content": "old requirement"}),
+            json!({"role": "user", "content": "latest task"}),
+            json!({"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "a", "output": "legacy evidence"}),
+        ];
+        let mut state = Session::default();
+        state.ingest(&input).unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        let groups = state.groups();
+        state.memories.push(Memory {
+            id: 1,
+            source_ids: vec![1],
+            text: "grounded fact".into(),
+        });
+        for group in &groups {
+            let values = state
+                .history
+                .iter()
+                .filter(|i| group.members.contains(&i.id))
+                .map(|i| i.value.clone())
+                .collect::<Vec<_>>();
+            for eligible in [false, true] {
+                let content = json!({"group_id": format!("g{}", group.id), "eligible": eligible, "human": group.human, "items": values}).to_string();
+                state.observed.insert(group.id, content.clone());
+                state.active_shadow.push(ShadowRecord {
+                    source_id: group.id,
+                    value: json!({"role": "user", "content": content}),
+                });
+            }
+        }
+        state.active_shadow.push(ShadowRecord { source_id: 0, value: json!({"role": "user", "content": json!({"memory_id": "m1", "text": "grounded fact"}).to_string()}) });
+        let checkpoint = serde_json::to_vec(&state).unwrap();
+        let mut resumed: Session = serde_json::from_slice(&checkpoint).unwrap();
+        resumed.observe_groups(&resumed.groups());
+        let first = resumed.shadow_input();
+        resumed.observe_groups(&resumed.groups());
+        assert_eq!(resumed.shadow_input(), first);
+        assert_eq!(resumed.render_primary(), input);
+        let data = first
+            .iter()
+            .map(|r| serde_json::from_str::<Value>(r["content"].as_str().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        let ids = data
+            .iter()
+            .filter_map(|r| r["member_ids"].as_array())
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![json!(1), json!(2), json!(3), json!(4)]);
+        assert_eq!(
+            data[0],
+            json!({"source_ids": ["g1"], "text": "grounded fact"})
+        );
+        assert_eq!(
+            data.last().unwrap()["eligible_group_ids"],
+            json!(["g1", "g3"])
+        );
+        assert!(
+            data.iter()
+                .all(|r| r.get("eligible").is_none() && r.get("memory_id").is_none())
+        );
+    }
+
+    #[test]
     fn mixed_batch_projection_removes_only_main_source_and_keeps_shared_memory() {
         let mut state = Session::default();
         let input = vec![
@@ -683,7 +816,20 @@ mod tests {
         state.remove(&[2], &groups);
         let shadow = serde_json::to_string(&state.shadow_input()).unwrap();
         assert!(!shadow.contains("REMOVED_EXACT_SOURCE"));
-        assert!(!shadow.contains("g2"));
+        assert!(state.active_shadow.iter().all(|record| {
+            let data: Value =
+                serde_json::from_str(record.value["content"].as_str().unwrap()).unwrap();
+            data["group_id"] != "g2"
+        }));
+        let facts = state
+            .active_shadow
+            .iter()
+            .filter_map(|record| {
+                let data: Value = serde_json::from_str(record.value["content"].as_str()?).ok()?;
+                (data["text"] == "durable learning").then_some(data)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(facts[0]["source_ids"], json!(["g2"]));
         assert!(shadow.contains("retained requirement"));
         assert!(shadow.contains("durable learning"));
         let main = serde_json::to_string(&state.render_primary()).unwrap();

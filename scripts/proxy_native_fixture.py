@@ -69,10 +69,16 @@ class Fixture:
                             self.wfile.write(raw)
                             return
                         targets=set()
+                        records=[]
+                        eligible=set()
                         for record in body.get('input', []):
                             try: data=json.loads(record.get('content', ''))
                             except (ValueError, TypeError): continue
-                            if data.get('eligible') and 'DROP_COHORT_PAYLOAD' in json.dumps(data.get('items', [])):
+                            records.append(data)
+                            if 'eligible_group_ids' in data:
+                                eligible=set(data['eligible_group_ids'])
+                        for data in records:
+                            if data.get('group_id') in eligible and 'DROP_COHORT_PAYLOAD' in json.dumps(data.get('items', [])):
                                 targets.add(data['group_id'])
                         value = {'id':'shadow-fixture','status':'completed','model':'gpt-6-luna',
                             'output':[{'type':'message','role':'assistant','content':[{'type':'output_text',
@@ -224,6 +230,27 @@ def compact_evidence(trial, fixture):
     assert len(set(cache_keys))==1, 'classifier cache affinity must stay stable within a session'
     assert 'DROP_COHORT_PAYLOAD' in json.dumps(fixture.reviews[0])
     assert 'DROP_COHORT_PAYLOAD' not in json.dumps(fixture.reviews[-1]), 'later shadow must mechanically prune'
+    observation_counts=[]
+    tail_eligible=[]
+    cohort_group=None
+    for review in fixture.reviews:
+        records=[]
+        for record in review['input']:
+            try: records.append(json.loads(record.get('content','')))
+            except (ValueError,TypeError): continue
+        blocks=[r for r in records if 'items' in r]
+        ids=[member for block in blocks for member in block['member_ids']]
+        assert len(ids)==len(set(ids)), 'every immutable main member must occur only once per shadow request'
+        assert all('eligible' not in b for b in blocks), 'eligibility must not be frozen inside immutable observations'
+        observation_counts.append(len(ids))
+        tail_eligible.append(records[-1]['eligible_group_ids'])
+        for block in blocks:
+            if any(i.get('call_id') in cohort for i in block['items']):
+                cohort_group=block['group_id']
+    assert cohort_group is not None
+    assert cohort_group not in tail_eligible[0] and cohort_group in tail_eligible[1], 'tail must reflect newly completed cohort exposure'
+    bulk_mentions=[json.dumps(r).count('DROP_COHORT_PAYLOAD') for r in fixture.reviews]
+    assert bulk_mentions[0]==bulk_mentions[1] and bulk_mentions[-1]==0, 'eligibility transition must not double source payload'
     removed=[i for i in state['history'] if i['removed'] and i['value'].get('call_id') in cohort]
     assert len(removed)==4 and len({i['cohort'] for i in removed if i['value']['type']=='function_call'})==1
     removed_ids={i['id'] for i in removed}
@@ -241,6 +268,9 @@ def compact_evidence(trial, fixture):
             'classifier_cache_affinity_verified':True,
             'classifier_calls':len(fixture.reviews),'invalid_reviews':state['invalid_reviews'],
             'coupled_later_shadow_pruning_verified':True,'tool_output_bytes_preserved':True,
+            'immutable_member_observation_verified':True,'current_tail_eligibility_verified':True,
+            'bulk_mentions_per_review':bulk_mentions,'observed_members_per_review':observation_counts,
+            'shadow_input_bytes_per_review':[len(json.dumps(r['input']).encode()) for r in fixture.reviews],
             'proxy_compactions':state['compactions']}
 
 

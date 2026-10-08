@@ -686,8 +686,16 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     assert!(!active.contains("DISCARD_SOURCE_PAYLOAD_"));
     assert!(!active.contains("opaque-reasoning"));
     assert!(
-        !active.contains("g2"),
-        "mixed review records must be projected, not kept whole"
+        states[0]["active_shadow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| {
+                let data: serde_json::Value =
+                    serde_json::from_str(record["value"]["content"].as_str().unwrap()).unwrap();
+                data["group_id"] != "g2"
+            }),
+        "removed observation/opinion must not survive as actionable group data"
     );
     assert!(active.contains("preserve requirement"));
     assert!(active.contains("both tools succeeded"));
