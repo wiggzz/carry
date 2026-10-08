@@ -85,7 +85,10 @@ pub async fn serve(config: ProxyCli) -> Result<()> {
     });
     let listener = tokio::net::TcpListener::bind(service.config.listen).await?;
     let router = Router::new()
-        .route("/health", get(|| async { axum::Json(json!({"status": "ok"})) }))
+        .route(
+            "/health",
+            get(|| async { axum::Json(json!({"status": "ok"})) }),
+        )
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
         .route("/carry/metrics", get(metrics))
@@ -100,7 +103,10 @@ fn authorize(service: &Service, headers: &HeaderMap) -> Result<(), Failure> {
         && headers.get("authorization").and_then(|h| h.to_str().ok())
             != Some(format!("Bearer {token}").as_str())
     {
-        return Err(failure(StatusCode::UNAUTHORIZED, "gateway authentication required"));
+        return Err(failure(
+            StatusCode::UNAUTHORIZED,
+            "gateway authentication required",
+        ));
     }
     Ok(())
 }
@@ -114,14 +120,22 @@ async fn models(
         .config
         .upstream_url
         .strip_suffix("/responses")
-        .ok_or_else(|| failure(StatusCode::BAD_GATEWAY, "upstream models endpoint unavailable"))?;
+        .ok_or_else(|| {
+            failure(
+                StatusCode::BAD_GATEWAY,
+                "upstream models endpoint unavailable",
+            )
+        })?;
     let mut request = service.client.get(format!("{endpoint}/models"));
     if let Some(key) = &service.upstream_key {
         request = request.bearer_auth(key);
     }
-    relay(request.send().await.map_err(|_| {
-        failure(StatusCode::BAD_GATEWAY, "upstream transport failed")
-    })?)
+    relay(
+        request
+            .send()
+            .await
+            .map_err(|_| failure(StatusCode::BAD_GATEWAY, "upstream transport failed"))?,
+    )
     .await
 }
 
@@ -152,9 +166,12 @@ async fn responses(
             request = request.header(name, value);
         }
     }
-    relay(request.send().await.map_err(|_| {
-        failure(StatusCode::BAD_GATEWAY, "upstream transport failed")
-    })?)
+    relay(
+        request
+            .send()
+            .await
+            .map_err(|_| failure(StatusCode::BAD_GATEWAY, "upstream transport failed"))?,
+    )
     .await
 }
 
@@ -172,7 +189,9 @@ async fn relay(mut upstream: reqwest::Response) -> Result<Response, Failure> {
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    let _ = sender.send(Err(std::io::Error::other("upstream stream failed"))).await;
+                    let _ = sender
+                        .send(Err(std::io::Error::other("upstream stream failed")))
+                        .await;
                     break;
                 }
             }
