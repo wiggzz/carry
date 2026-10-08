@@ -20,7 +20,7 @@ IMMUTABLE_PROVENANCE_FIELDS = (
     "carry_compaction_policy", "carry_keep_lease_turns", "carry_compaction_payoff_requests",
     "carry_compaction_min_payback_percent", "carry_compaction_rollout_samples", "carry_compaction_rollout_stop_probability_percent",
     "carry_compaction_neutral_high_watermark_tokens", "carry_compaction_neutral_low_watermark_tokens",
-    "pricing_usd_per_million", "images", "harnesses",
+    "pricing_usd_per_million", "images", "harnesses", "proxy",
 )
 
 # Reports produced before configurable neutral watermarks and payoff margin existed
@@ -65,6 +65,11 @@ def immutable_images(images: Any) -> dict[str, Any]:
 
 def normalize_legacy_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(provenance)
+    try:
+        from proxy_benchmark import provenance as proxy_provenance
+    except ModuleNotFoundError:
+        from scripts.proxy_benchmark import provenance as proxy_provenance
+    normalized.setdefault("proxy", proxy_provenance({}))
     for key, value in LEGACY_COMPACTION_DEFAULTS.items():
         normalized.setdefault(key, value)
     return normalized
