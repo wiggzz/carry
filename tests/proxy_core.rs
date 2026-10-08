@@ -1,15 +1,21 @@
 use std::collections::HashSet;
 
 use carry::core::{
-    Rates, UsageLedger, ViewCosts, horizon_cost, input_cost, joint_decision,
-    prefix_compatible, select_removals,
+    Rates, UsageLedger, ViewCosts, horizon_cost, input_cost, joint_decision, prefix_compatible,
+    select_removals,
 };
 use serde_json::json;
 
 #[test]
 fn joint_cost_vetoes_a_primary_only_positive_rewrite() {
-    let primary = ViewCosts { keep: 100.0, compact: 90.0 };
-    let shadow = ViewCosts { keep: 1.0, compact: 20.0 };
+    let primary = ViewCosts {
+        keep: 100.0,
+        compact: 90.0,
+    };
+    let shadow = ViewCosts {
+        keep: 1.0,
+        compact: 20.0,
+    };
     assert!(primary.keep > primary.compact);
     let decision = joint_decision(primary, shadow, 0);
     assert!(!decision.accepted);
@@ -18,8 +24,14 @@ fn joint_cost_vetoes_a_primary_only_positive_rewrite() {
 
 #[test]
 fn joint_cost_admits_a_rewrite_repaid_by_future_shadow_savings() {
-    let primary = ViewCosts { keep: 100.0, compact: 105.0 };
-    let shadow = ViewCosts { keep: 40.0, compact: 10.0 };
+    let primary = ViewCosts {
+        keep: 100.0,
+        compact: 105.0,
+    };
+    let shadow = ViewCosts {
+        keep: 40.0,
+        compact: 10.0,
+    };
     let decision = joint_decision(primary, shadow, 0);
     assert!(decision.accepted);
     assert_eq!(decision.savings, 25.0);
@@ -30,8 +42,14 @@ fn joint_cost_admits_a_rewrite_repaid_by_future_shadow_savings() {
 fn no_future_review_means_zero_shadow_cost_not_current_sunk_review() {
     assert_eq!(horizon_cost(1000.0, 50.0, 1.0, 0), 0.0);
     let decision = joint_decision(
-        ViewCosts { keep: 10.0, compact: 8.0 },
-        ViewCosts { keep: 0.0, compact: 0.0 },
+        ViewCosts {
+            keep: 10.0,
+            compact: 8.0,
+        },
+        ViewCosts {
+            keep: 0.0,
+            compact: 0.0,
+        },
         0,
     );
     assert!(decision.accepted);
@@ -73,24 +91,36 @@ fn exact_model_rates_and_full_request_long_context_threshold() {
 #[test]
 fn native_usage_keeps_partitions_and_reasoning_is_not_extra_output() {
     let mut ledger = UsageLedger::default();
-    ledger.observe("gpt-6-luna", &json!({
-        "input_tokens": 1000000, "output_tokens": 1000000,
-        "input_tokens_details": {"cached_tokens": 100000, "cache_write_tokens": 100000},
-        "output_tokens_details": {"reasoning_tokens": 900000}
-    }), true);
+    ledger.observe(
+        "gpt-6-luna",
+        &json!({
+            "input_tokens": 1000000, "output_tokens": 1000000,
+            "input_tokens_details": {"cached_tokens": 100000, "cache_write_tokens": 100000},
+            "output_tokens_details": {"reasoning_tokens": 900000}
+        }),
+        true,
+    );
     assert_eq!(ledger.input_tokens, 1000000);
     assert_eq!(ledger.output_tokens, 1000000);
     assert_eq!(ledger.cached_tokens, 100000);
     assert_eq!(ledger.cache_write_tokens, 100000);
     assert!((ledger.cost_usd - 0.937).abs() < 0.000001);
-    ledger.observe("unknown", &json!({"input_tokens": 1, "output_tokens": 1}), true);
+    ledger.observe(
+        "unknown",
+        &json!({"input_tokens": 1, "output_tokens": 1}),
+        true,
+    );
     assert_eq!(ledger.unavailable_cost_calls, 1);
 }
 
 #[test]
 fn missing_or_invalid_cache_partition_never_makes_a_cost_claim() {
     let mut ledger = UsageLedger::default();
-    ledger.observe("gpt-6-luna", &json!({"input_tokens": 100, "output_tokens": 1}), true);
+    ledger.observe(
+        "gpt-6-luna",
+        &json!({"input_tokens": 100, "output_tokens": 1}),
+        true,
+    );
     ledger.observe("gpt-6-luna", &json!({"input_tokens": 10, "output_tokens": 1, "input_tokens_details": {"cached_tokens": 11}}), true);
     assert_eq!(ledger.unavailable_cost_calls, 2);
     assert_eq!(ledger.cost_usd, 0.0);

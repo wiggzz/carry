@@ -315,9 +315,14 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         .json()
         .await
         .unwrap();
-    assert_eq!(checkpoint["output"][0]["encrypted_content"], "NATIVE_CHECKPOINT");
+    assert_eq!(
+        checkpoint["output"][0]["encrypted_content"],
+        "NATIVE_CHECKPOINT"
+    );
     assert!(
-        !primary.lock().await[2].to_string().contains("DISCARD_SOURCE_PAYLOAD_"),
+        !primary.lock().await[2]
+            .to_string()
+            .contains("DISCARD_SOURCE_PAYLOAD_"),
         "native compaction must operate on the same retained main view, not resurrect removed echo source"
     );
     let resumed = json!({"model": "gpt-6-luna", "input": [checkpoint["output"][0].clone(), json!({"role": "user", "content": "next goal"})], "store": false});
@@ -350,7 +355,12 @@ const COMPLETED_SSE: &str = "event: response.output_text.delta\r\ndata: {\"type\
 const FAILED_SSE: &str = "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"usage\":{\"input_tokens\":22,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0}}}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
 
 async fn fixture(advice: serde_json::Value) -> Fixture {
-    use axum::{Router, body::{Body, Bytes}, response::IntoResponse, routing::{get, post}};
+    use axum::{
+        Router,
+        body::{Body, Bytes},
+        response::IntoResponse,
+        routing::{get, post},
+    };
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -391,20 +401,37 @@ async fn fixture(advice: serde_json::Value) -> Fixture {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    Fixture { address, requests, task }
+    Fixture {
+        address,
+        requests,
+        task,
+    }
 }
 
 fn checkpoint_states(path: &std::path::Path) -> Vec<serde_json::Value> {
-    std::fs::read_dir(path).unwrap().filter_map(Result::ok)
+    std::fs::read_dir(path)
+        .unwrap()
+        .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
         .map(|e| serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap())
         .collect()
 }
 
-async fn send(url: &str, request: &serde_json::Value, tenant: &str, branch: &str) -> reqwest::Response {
-    reqwest::Client::new().post(format!("{url}/v1/responses"))
-        .header("x-carry-tenant", tenant).header("x-carry-session", "session").header("x-carry-branch", branch)
-        .json(request).send().await.unwrap()
+async fn send(
+    url: &str,
+    request: &serde_json::Value,
+    tenant: &str,
+    branch: &str,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{url}/v1/responses"))
+        .header("x-carry-tenant", tenant)
+        .header("x-carry-session", "session")
+        .header("x-carry-branch", branch)
+        .json(request)
+        .send()
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -415,7 +442,10 @@ async fn fragmented_sse_preserves_bytes_and_exposes_only_completed_primary_input
     let request = json!({"model": "gpt-6-luna", "input": [{"role": "user", "content": "call native"}], "stream": true, "metadata": {"scenario": "completed_sse"}});
     let response = send(&url, &request, "a", "main").await;
     assert_eq!(response.headers()["x-fixture-native"], "unchanged");
-    assert_eq!(response.bytes().await.unwrap().as_ref(), COMPLETED_SSE.as_bytes());
+    assert_eq!(
+        response.bytes().await.unwrap().as_ref(),
+        COMPLETED_SSE.as_bytes()
+    );
     let saved = checkpoint_states(state.path()).remove(0);
     assert_eq!(saved["history"].as_array().unwrap().len(), 1);
     assert_eq!(saved["history"][0]["exposed"], true);
@@ -425,13 +455,24 @@ async fn fragmented_sse_preserves_bytes_and_exposes_only_completed_primary_input
         {"type": "function_call", "call_id": "sse_call", "name": "native", "arguments": "{}"},
         {"type": "function_call_output", "call_id": "sse_call", "output": "fresh native result"}
     ], "stream": true, "metadata": {"scenario": "failed_sse"}});
-    assert_eq!(send(&url, &failed, "a", "main").await.bytes().await.unwrap().as_ref(), FAILED_SSE.as_bytes());
+    assert_eq!(
+        send(&url, &failed, "a", "main")
+            .await
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        FAILED_SSE.as_bytes()
+    );
     let saved = checkpoint_states(state.path()).remove(0);
     assert_eq!(saved["history"][1]["exposed"], false);
     assert_eq!(saved["history"][2]["exposed"], false);
     assert_eq!(saved["completed_requests"], 1);
     assert_eq!(saved["failed_primaries"], 1);
-    assert_eq!(saved["primary"]["input_tokens"], 33, "failed native usage remains billable even though it grants no exposure");
+    assert_eq!(
+        saved["primary"]["input_tokens"], 33,
+        "failed native usage remains billable even though it grants no exposure"
+    );
 }
 
 #[tokio::test]
@@ -440,21 +481,52 @@ async fn branch_tenant_and_restart_are_explicit_and_credentials_are_not_persiste
     let state = tempfile::tempdir().unwrap();
     let (proxy, url) = start_proxy(state.path(), fixture.address, "off").await;
     let request = json!({"model": "gpt-6-luna", "input": [{"role": "user", "content": "initial"}], "store": false});
-    let _ = send(&url, &request, "a", "left").await.bytes().await.unwrap();
+    let _ = send(&url, &request, "a", "left")
+        .await
+        .bytes()
+        .await
+        .unwrap();
     drop(proxy);
     let (_proxy, url) = start_proxy(state.path(), fixture.address, "off").await;
-    let metrics: serde_json::Value = reqwest::Client::new().get(format!("{url}/carry/metrics"))
-        .header("x-carry-session", "session").header("x-carry-tenant", "a").header("x-carry-branch", "left")
-        .send().await.unwrap().json().await.unwrap();
+    let metrics: serde_json::Value = reqwest::Client::new()
+        .get(format!("{url}/carry/metrics"))
+        .header("x-carry-session", "session")
+        .header("x-carry-tenant", "a")
+        .header("x-carry-branch", "left")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(metrics["completed_requests"], 1);
-    let _ = send(&url, &request, "a", "right").await.bytes().await.unwrap();
-    let _ = send(&url, &request, "b", "left").await.bytes().await.unwrap();
+    let _ = send(&url, &request, "a", "right")
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let _ = send(&url, &request, "b", "left")
+        .await
+        .bytes()
+        .await
+        .unwrap();
     assert_eq!(checkpoint_states(state.path()).len(), 3);
     let diverged = json!({"model": "gpt-6-luna", "input": [{"role": "user", "content": "different ancestry"}]});
-    assert_eq!(send(&url, &diverged, "a", "left").await.status(), reqwest::StatusCode::CONFLICT);
-    let models: serde_json::Value = reqwest::get(format!("{url}/v1/models")).await.unwrap().json().await.unwrap();
+    assert_eq!(
+        send(&url, &diverged, "a", "left").await.status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let models: serde_json::Value = reqwest::get(format!("{url}/v1/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(models["data"][0]["id"], "gpt-6-luna");
-    for entry in std::fs::read_dir(state.path()).unwrap().filter_map(Result::ok) {
+    for entry in std::fs::read_dir(state.path())
+        .unwrap()
+        .filter_map(Result::ok)
+    {
         let data = std::fs::read(entry.path()).unwrap();
         let text = String::from_utf8_lossy(&data);
         assert!(!text.contains("fixture-primary"));
@@ -478,9 +550,16 @@ async fn invalid_mixed_advice_is_atomic_and_failed_primary_keeps_completed_shado
         {"type": "function_call_output", "call_id": "a", "output": "UNIQUE_TOOL_SOURCE".repeat(2000)},
         {"role": "user", "content": "finish"}
     ], "store": false});
-    let first: serde_json::Value = send(&url, &request, "a", "main").await.json().await.unwrap();
+    let first: serde_json::Value = send(&url, &request, "a", "main")
+        .await
+        .json()
+        .await
+        .unwrap();
     let mut next = request.clone();
-    next["input"].as_array_mut().unwrap().extend(first["output"].as_array().unwrap().iter().cloned());
+    next["input"]
+        .as_array_mut()
+        .unwrap()
+        .extend(first["output"].as_array().unwrap().iter().cloned());
     next["metadata"] = json!({"scenario": "http_error"});
     let response = send(&url, &next, "a", "main").await;
     assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
@@ -491,7 +570,11 @@ async fn invalid_mixed_advice_is_atomic_and_failed_primary_keeps_completed_shado
     assert_eq!(saved["memories"], json!([]));
     assert_eq!(saved["opinions"], json!({}));
     assert_eq!(saved["compactions"], 0);
-    assert!(fixture.requests.lock().await[1].to_string().contains("UNIQUE_TOOL_SOURCE"));
+    assert!(
+        fixture.requests.lock().await[1]
+            .to_string()
+            .contains("UNIQUE_TOOL_SOURCE")
+    );
     assert_eq!(saved["history"][4]["exposed"], false);
 }
 
@@ -501,13 +584,31 @@ async fn unsupported_stateful_review_and_retrieval_fail_explicitly() {
     let state = tempfile::tempdir().unwrap();
     let (_proxy, url) = start_proxy(state.path(), fixture.address, "audit").await;
     let plain = json!({"model": "gpt-6-luna", "input": []});
-    let missing = reqwest::Client::new().post(format!("{url}/v1/responses")).json(&plain).send().await.unwrap();
+    let missing = reqwest::Client::new()
+        .post(format!("{url}/v1/responses"))
+        .json(&plain)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(missing.status(), reqwest::StatusCode::BAD_REQUEST);
     for field in ["previous_response_id", "conversation", "background"] {
         let mut request = plain.clone();
-        request[field] = if field == "background" { json!(true) } else { json!("opaque") };
-        assert_eq!(send(&url, &request, "a", "main").await.status(), reqwest::StatusCode::BAD_REQUEST);
+        request[field] = if field == "background" {
+            json!(true)
+        } else {
+            json!("opaque")
+        };
+        assert_eq!(
+            send(&url, &request, "a", "main").await.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
     }
-    assert_eq!(reqwest::get(format!("{url}/v1/responses/resp_opaque")).await.unwrap().status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        reqwest::get(format!("{url}/v1/responses/resp_opaque"))
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_IMPLEMENTED
+    );
     assert!(fixture.requests.lock().await.is_empty());
 }

@@ -481,13 +481,19 @@ mod tests {
                 json!({"type": "function_call", "call_id": "b", "name": "native", "arguments": "{}"}),
                 json!({"type": "function_call_output", "call_id": "a", "output": "one result"}),
             ];
-            if unknown { input.push(json!({"type": "unknown_native", "encrypted_content": "keep exact"})); }
+            if unknown {
+                input.push(json!({"type": "unknown_native", "encrypted_content": "keep exact"}));
+            }
             state.ingest(&input).unwrap();
-            for item in &mut state.history { item.exposed = true; }
+            for item in &mut state.history {
+                item.exposed = true;
+            }
             let group = state.groups().into_iter().find(|g| g.id == 2).unwrap();
             assert!(group.pinned);
             assert_eq!(group.members, vec![2, 3, 4, 5]);
-            if unknown { assert!(state.groups().last().unwrap().pinned); }
+            if unknown {
+                assert!(state.groups().last().unwrap().pinned);
+            }
         }
     }
 
@@ -510,13 +516,22 @@ mod tests {
         let initial = json!({"role": "user", "content": "goal"});
         state.ingest(&[initial.clone()]).unwrap();
         state.history[0].exposed = true;
-        state.pending_output = vec![json!({"type": "function_call", "id": "fc", "status": "completed", "call_id": "a", "name": "native", "arguments": "{}"})];
+        state.pending_output = vec![
+            json!({"type": "function_call", "id": "fc", "status": "completed", "call_id": "a", "name": "native", "arguments": "{}"}),
+        ];
         state.ingest(&[
             initial,
             json!({"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"}),
             json!({"type": "function_call_output", "call_id": "a", "output": "fresh"}),
         ]).unwrap();
-        assert!(!state.groups().into_iter().find(|g| g.id == 2).unwrap().exposed);
+        assert!(
+            !state
+                .groups()
+                .into_iter()
+                .find(|g| g.id == 2)
+                .unwrap()
+                .exposed
+        );
     }
 
     #[test]
@@ -529,7 +544,9 @@ mod tests {
             json!({"role": "user", "content": "latest goal"}),
         ];
         state.ingest(&input).unwrap();
-        for item in &mut state.history { item.exposed = true; }
+        for item in &mut state.history {
+            item.exposed = true;
+        }
         let groups = state.groups();
         state.observe_groups(&groups);
         state.apply_advice(&groups, &json!({"protected": ["g1"], "removable": ["g2"], "memories": [{"source_ids": ["g2"], "text": "durable learning"}]})).unwrap();
@@ -543,7 +560,15 @@ mod tests {
         assert!(main.contains("durable learning"));
         state.ingest(&input).unwrap();
         state.observe_groups(&state.groups());
-        assert!(!serde_json::to_string(&state.shadow_input()).unwrap().contains("REMOVED_EXACT_SOURCE"));
-        assert!(!serde_json::to_string(&state.render_primary()).unwrap().contains("REMOVED_EXACT_SOURCE"));
+        assert!(
+            !serde_json::to_string(&state.shadow_input())
+                .unwrap()
+                .contains("REMOVED_EXACT_SOURCE")
+        );
+        assert!(
+            !serde_json::to_string(&state.render_primary())
+                .unwrap()
+                .contains("REMOVED_EXACT_SOURCE")
+        );
     }
 }
