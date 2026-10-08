@@ -124,6 +124,13 @@ impl Session {
                 bail!("history diverged; use a new x-carry-branch or native compaction checkpoint");
             }
         }
+        // Stable IDs/exposure are preserved, but matching tolerates native
+        // output metadata omissions. Render the CURRENT client's exact values,
+        // not a reconstructed older echo. Cache prefix evidence then invalidates
+        // naturally when the actual wire prefix changes.
+        for (item, value) in self.history.iter_mut().zip(input) {
+            item.value = value.clone();
+        }
         let old_len = self.history.len();
         let pending = self.pending_output.iter().map(identity).collect::<Vec<_>>();
         let suffix = &input[old_len..];

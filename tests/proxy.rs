@@ -161,7 +161,7 @@ async fn start_proxy_options(
             .env("CARRY_PROXY_UPSTREAM_KEY", "fixture-primary")
             .env("CARRY_PROXY_CLASSIFIER_KEY", "fixture-shadow")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap(),
@@ -833,4 +833,34 @@ async fn native_codex_and_pi_echo_shapes_preserve_settings_and_unknown_model_pas
         .unwrap();
     assert_eq!(pi_state["last_plan"]["reason"], "unsupported_model_or_tier");
     assert_eq!(pi_state["primary"]["unavailable_cost_calls"], 2);
+}
+
+#[tokio::test]
+async fn numeric_benchmark_events_match_attempts_usage_and_censored_failures() {
+    use std::io::Read;
+    let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
+    let state = tempfile::tempdir().unwrap();
+    let (mut proxy, url) = start_proxy(state.path(), fixture.address, "off").await;
+    let request = json!({"model": "gpt-6-luna", "input": [{"role": "user", "content": "PRIVATE_SOURCE_NOT_PUBLIC_TELEMETRY"}]});
+    let _ = send(&url, &request, "a", "main").await.bytes().await.unwrap();
+    let mut failed = request;
+    failed["metadata"] = json!({"scenario": "http_error"});
+    let _ = send(&url, &failed, "a", "main").await.bytes().await.unwrap();
+    proxy.0.kill().unwrap();
+    proxy.0.wait().unwrap();
+    let mut output = String::new();
+    proxy.0.stdout.take().unwrap().read_to_string(&mut output).unwrap();
+    assert!(!output.contains("PRIVATE_SOURCE_NOT_PUBLIC_TELEMETRY"));
+    assert!(!output.contains("fixture-primary"));
+    let events = output.lines().filter_map(|line| line.strip_prefix("BENCHMARK_CONTEXT_EVENT "))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
+    let starts = events.iter().filter(|e| e["actor"] == "primary" && e["event"] == "started").collect::<Vec<_>>();
+    assert_eq!(starts.len(), 2, "each real attempt has numeric telemetry before network I/O");
+    assert_ne!(starts[0]["request_id"], starts[1]["request_id"]);
+    let completed = events.iter().filter(|e| e["actor"] == "primary" && e["event"] == "completed").collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0]["usage"]["input_tokens"], 11);
+    assert_eq!(completed[0]["usage"]["output_tokens"], 2);
+    assert_eq!(completed[0]["model"], "gpt-6-luna");
+    assert!(completed[0]["latency_ms"].is_number());
 }
