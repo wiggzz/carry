@@ -109,8 +109,14 @@ impl Session {
         }
         self.version = 1;
         if !self.native_checkpoint.is_empty() {
-            if !self.native_checkpoint.iter().all(|checkpoint| input.contains(checkpoint)) {
-                bail!("next epoch must echo the native opaque checkpoint, not pre-compaction source");
+            if !self
+                .native_checkpoint
+                .iter()
+                .all(|checkpoint| input.contains(checkpoint))
+            {
+                bail!(
+                    "next epoch must echo the native opaque checkpoint, not pre-compaction source"
+                );
             }
             self.native_checkpoint.clear();
         }
