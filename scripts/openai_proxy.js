@@ -65,7 +65,10 @@ function usageRecords(body) {
   return values;
 }
 
-function serve() {
+function serve(options = {}) {
+  const contextProxy = process.env.BENCHMARK_CONTEXT_PROXY === '1';
+  const primaryTransport = options.request || (contextProxy ? http.request : https.request);
+  const shadowTransport = options.request || https.request;
   const server = http.createServer((request, response) => {
     const parsed = parsedLocalUrl(request.url);
     if (!isAllowedRequest(request.method, request.url) || !parsed) {
@@ -74,17 +77,86 @@ function serve() {
       return;
     }
     if (parsed.pathname === '/healthz') {
-      response.writeHead(200, {'content-type': 'text/plain'});
-      response.end('ok\n');
+      if (contextProxy) {
+        const health = primaryTransport({hostname: 'carry-context-proxy', port: 8787, method: 'GET',
+          path: '/health', headers: {authorization: `Bearer ${process.env.CARRY_PROXY_AUTH_TOKEN}`},
+          timeout: 2000}, upstreamResponse => {
+          response.writeHead(upstreamResponse.statusCode === 200 ? 200 : 503);
+          upstreamResponse.resume(); response.end();
+        });
+        health.on('timeout', () => health.destroy());
+        health.on('error', () => { response.writeHead(503); response.end(); });
+        health.end();
+      } else {
+        response.writeHead(200, {'content-type': 'text/plain'});
+        response.end('ok\n');
+      }
       return;
     }
-
-    const upstream = https.request({
-      hostname: 'api.openai.com',
-      port: 443,
+    const shadow = contextProxy && Boolean(process.env.BENCHMARK_SHADOW_TOKEN) &&
+      request.headers.authorization === `Bearer ${process.env.BENCHMARK_SHADOW_TOKEN}`;
+    if (contextProxy && !shadow && (!process.env.BENCHMARK_CLIENT_TOKEN ||
+        request.headers.authorization !== `Bearer ${process.env.BENCHMARK_CLIENT_TOKEN}`)) {
+      response.writeHead(401); response.end(); return;
+    }
+    if (shadow && (request.method !== 'POST' || parsed.pathname !== '/v1/responses')) {
+      response.writeHead(403); response.end(); return;
+    }
+    const headers = cleanHeaders(request.headers);
+    if (contextProxy) {
+      // Trusted per-slot identity. Never forward a caller-selected tenant or branch.
+      for (const name of Object.keys(headers)) {
+        if (name.startsWith('x-carry-')) delete headers[name];
+      }
+      headers.authorization = `Bearer ${shadow ? process.env.BENCHMARK_CLASSIFIER_KEY : process.env.CARRY_PROXY_AUTH_TOKEN}`;
+      if (!shadow) {
+        headers['x-carry-session'] = process.env.BENCHMARK_SESSION_ID;
+        headers['x-carry-tenant'] = 'benchmark';
+        headers['x-carry-branch'] = 'main';
+      }
+    }
+    const throughCarry = contextProxy && !shadow;
+    const actor = shadow ? 'shadow' : 'primary';
+    const requestId = require('node:crypto').randomUUID();
+    const started = performance.now();
+    let model = null;
+    let serviceTier = null;
+    let nativeCompaction = parsed.pathname === '/v1/responses/compact';
+    let ended = false;
+    const emit = (event, extra = {}) => {
+      if (contextProxy) console.log('BENCHMARK_CONTEXT_EVENT ' + JSON.stringify({
+        actor, event, request_id: requestId, model, service_tier: serviceTier,
+        native_compaction: nativeCompaction, ...extra,
+      }));
+    };
+    emit('started');
+    const input = [];
+    let inputBytes = 0;
+    request.on('data', chunk => {
+      inputBytes += chunk.length;
+      if (inputBytes <= MAX_TELEMETRY_BYTES) input.push(chunk);
+    });
+    request.on('end', () => {
+      if (inputBytes > MAX_TELEMETRY_BYTES) return;
+      try {
+        const value = JSON.parse(Buffer.concat(input).toString('utf8'));
+        model = typeof value.model === 'string' ? value.model : null;
+        serviceTier = value.service_tier || null;
+        nativeCompaction ||= Boolean(value.compaction_trigger);
+      } catch (_) { /* Never write request contents or parse exceptions to logs. */ }
+    });
+    const finish = (usage, extra = {}) => {
+      if (ended) return;
+      ended = true;
+      emit(usage ? 'completed' : 'censored', {usage: usage || null,
+        latency_ms: Math.round(performance.now() - started), ...extra});
+    };
+    const upstream = (shadow ? shadowTransport : primaryTransport)({
+      hostname: throughCarry ? 'carry-context-proxy' : 'api.openai.com',
+      port: throughCarry ? 8787 : 443,
       method: request.method,
       path: parsed.pathname + parsed.search,
-      headers: cleanHeaders(request.headers),
+      headers,
       timeout: 600000,
     }, upstreamResponse => {
       response.writeHead(
@@ -93,16 +165,45 @@ function serve() {
       );
       const chunks = [];
       let captured = 0;
+      let truncated = false;
       upstreamResponse.on('data', chunk => {
         response.write(chunk);
         if (captured + chunk.length <= MAX_TELEMETRY_BYTES) {
           chunks.push(chunk);
           captured += chunk.length;
+        } else {
+          truncated = true;
         }
       });
+      upstreamResponse.on('error', () => { finish(null); response.destroy(); });
+      upstreamResponse.on('aborted', () => { finish(null); response.destroy(); });
       upstreamResponse.on('end', () => {
-        if (captured <= MAX_TELEMETRY_BYTES) {
-          for (const usage of usageRecords(Buffer.concat(chunks).toString('utf8'))) {
+        const body = Buffer.concat(chunks).toString('utf8');
+        if (contextProxy) {
+          let nativeUsage = null;
+          let toolCalls = null;
+          if (!truncated) {
+            const observe = event => {
+              const value = event.type === 'response.completed' ? event.response : !event.type ? event : null;
+              if (value?.usage) {
+                nativeUsage = value.usage;
+                toolCalls = Array.isArray(value.output)
+                  ? value.output.filter(item => item.type === 'function_call').length : null;
+                model = typeof value.model === 'string' ? value.model : model;
+                serviceTier = value.service_tier ?? serviceTier;
+              }
+            };
+            try { observe(JSON.parse(body)); } catch (_) { /* SSE, not whole JSON. */ }
+            for (const line of body.split(/\r?\n/)) {
+              const payload = line.startsWith('data: ') ? line.slice(6) : line;
+              try { observe(JSON.parse(payload)); }
+              catch (_) { /* Non-JSON or streaming fragment, never fabricate usage. */ }
+            }
+          }
+          finish(nativeUsage, {http_status: upstreamResponse.statusCode, tool_calls: toolCalls});
+        }
+        if (!contextProxy && captured <= MAX_TELEMETRY_BYTES) {
+          for (const usage of usageRecords(body)) {
             // Docker logs are outside the model-controlled agent container; retain
             // only aggregate provider accounting, never prompts or responses.
             console.log(`BENCHMARK_PROXY_USAGE ${JSON.stringify(usage)}`);
@@ -113,14 +214,16 @@ function serve() {
     });
     upstream.on('timeout', () => upstream.destroy(new Error('upstream timeout')));
     upstream.on('error', () => {
+      finish(null);
       if (!response.headersSent) response.writeHead(502, {'content-type': 'text/plain'});
       response.end('OpenAI upstream unavailable\n');
     });
     request.on('aborted', () => upstream.destroy());
     request.pipe(upstream);
   });
-  server.listen(8080, '0.0.0.0');
+  server.listen(options.port ?? 8080, options.host || '0.0.0.0');
+  return server;
 }
 
-module.exports = {isAllowedRequest, usageRecords};
+module.exports = {isAllowedRequest, usageRecords, serve};
 if (require.main === module) serve();

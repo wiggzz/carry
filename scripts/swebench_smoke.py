@@ -22,8 +22,10 @@ from collections import Counter
 from typing import Any, Mapping
 
 try:  # Direct worker script and package-based offline tests both use this module.
+    import proxy_benchmark
     from swebench_preparation_compat import transform_test_specs
 except ModuleNotFoundError:
+    from scripts import proxy_benchmark
     from scripts.swebench_preparation_compat import transform_test_specs
 
 HARNESSES = ("carry", "codex", "pi")
@@ -514,11 +516,13 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
 
     if not config["MODEL"] or not config["REASONING"]:
         raise ValueError("model and reasoning configuration are required")
+    config.update(proxy_benchmark.validate_config(values))
     return config
 
 
 def start_agent_network(*, identity: str, proxy_image: str, proxy_script: pathlib.Path,
-                        execute: Any = subprocess.run) -> dict[str, str]:
+                        execute: Any = subprocess.run, carry_image: str | None = None,
+                        state_dir: pathlib.Path | None = None) -> dict[str, str]:
     digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
     network = {
         "internal": f"carry-agent-internal-{digest}",
@@ -529,15 +533,50 @@ def start_agent_network(*, identity: str, proxy_image: str, proxy_script: pathli
     try:
         execute(["docker", "network", "create", "--internal", network["internal"]], check=True)
         execute(["docker", "network", "create", network["egress"]], check=True)
+        gateway_env_args = []
+        gateway_kwargs = {}
+        proxy_config = proxy_benchmark.validate_config(os.environ)
+        if proxy_config["CARRY_PROXY_MODE"] != "disabled":
+            import secrets
+            if not carry_image or state_dir is None:
+                raise ValueError("proxy lane requires the candidate Carry image and trusted state directory")
+            if not LOCAL_IMAGE_ID.fullmatch(carry_image):
+                raise ValueError("proxy candidate must be an immutable local image ID")
+            state_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
+            network.update(carry_proxy=f"carry-context-proxy-{digest}",
+                           client_token=secrets.token_urlsafe(32), session_id=secrets.token_hex(16),
+                           state_dir=str(state_dir.resolve()))
+            auth = secrets.token_urlsafe(32)
+            shadow_token = secrets.token_urlsafe(32)
+            secret = os.environ.get("OPENAI_API_KEY")
+            if not secret:
+                raise ValueError("trusted proxy requires the provider credential")
+            trusted_env = {key: value for key, value in os.environ.items()
+                           if not key.startswith(("OPENAI_", "CARRY_PROXY_"))}
+            trusted_env.update(CARRY_PROXY_UPSTREAM_KEY=secret, CARRY_PROXY_CLASSIFIER_KEY=shadow_token,
+                               CARRY_PROXY_AUTH_TOKEN=auth)
+            execute(proxy_benchmark.sidecar_command(image=carry_image, name=network["carry_proxy"],
+                    network=network["egress"], state_dir=state_dir, config=proxy_config),
+                    check=True, env=trusted_env, timeout=60)
+            gateway_env = {key: value for key, value in os.environ.items()
+                           if not key.startswith(("OPENAI_", "CARRY_PROXY_"))}
+            gateway_env.update(BENCHMARK_CONTEXT_PROXY="1", BENCHMARK_CLIENT_TOKEN=network["client_token"],
+                               CARRY_PROXY_AUTH_TOKEN=auth, BENCHMARK_SESSION_ID=network["session_id"],
+                               BENCHMARK_SHADOW_TOKEN=shadow_token, BENCHMARK_CLASSIFIER_KEY=secret)
+            gateway_env_args = ["--network-alias", "openai-proxy", "--env", "BENCHMARK_CONTEXT_PROXY", "--env", "BENCHMARK_CLIENT_TOKEN",
+                                "--env", "CARRY_PROXY_AUTH_TOKEN", "--env", "BENCHMARK_SESSION_ID",
+                                "--env", "BENCHMARK_SHADOW_TOKEN", "--env", "BENCHMARK_CLASSIFIER_KEY"]
+            gateway_kwargs = {"env": gateway_env}
         execute(
             [
                 "docker", "run", "--detach", "--name", network["proxy"],
                 "--network", network["egress"], "--read-only", "--cap-drop=ALL",
                 "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,nosuid,nodev,size=16m",
                 "--mount", f"type=bind,src={proxy_script.resolve()},dst=/proxy/openai_proxy.js,readonly",
+                *gateway_env_args,
                 "--entrypoint", "node", proxy_image, "/proxy/openai_proxy.js",
             ],
-            check=True,
+            check=True, **gateway_kwargs,
         )
         execute(
             ["docker", "network", "connect", "--alias", "openai-proxy",
@@ -610,9 +649,17 @@ Promise.all([
             time.sleep(1)
         if not healthy:
             raise RuntimeError("OpenAI-only proxy did not become reachable")
+        if network.get("carry_proxy"):
+            metrics = proxy_benchmark.read_metrics(network, execute=execute)
+            if not metrics or metrics.get("mode") != proxy_config["CARRY_PROXY_MODE"]:
+                raise RuntimeError("Carry proxy effective mode does not match requested mode")
         return network
     except Exception:
-        cleanup_agent_network(network, execute=execute)
+        try:
+            if network.get("state_dir"):
+                proxy_benchmark.capture_evidence(network, execute=execute)
+        finally:
+            cleanup_agent_network(network, execute=execute)
         raise
 
 
@@ -620,6 +667,8 @@ def cleanup_agent_network(network: Mapping[str, str], execute: Any = subprocess.
     leftovers: list[str] = []
     for attempt in range(3):
         execute(["docker", "rm", "--force", network["proxy"]], check=False, timeout=30)
+        if network.get("carry_proxy"):
+            execute(["docker", "rm", "--force", network["carry_proxy"]], check=False, timeout=30)
         execute(["docker", "network", "rm", network["internal"]], check=False, timeout=30)
         execute(["docker", "network", "rm", network["egress"]], check=False, timeout=30)
         proxy = execute(
@@ -635,6 +684,15 @@ def cleanup_agent_network(network: Mapping[str, str], execute: Any = subprocess.
             check=False, capture_output=True, text=True, timeout=30,
         )
         leftovers = []
+        if network.get("carry_proxy"):
+            carry = execute(["docker", "inspect", "--type", "container", network["carry_proxy"]],
+                            check=False, capture_output=True, text=True, timeout=30)
+            if carry.returncode == 0:
+                leftovers.append("Carry proxy container remains")
+            for label, result in (("Carry proxy", carry), ("gateway", proxy),
+                                  ("internal network", internal), ("egress network", egress)):
+                if result.returncode != 0 and 'no such' not in (result.stderr or '').lower():
+                    leftovers.append(f"{label} absence cannot be proven")
         if proxy.returncode == 0:
             leftovers.append("proxy container remains")
         if internal.returncode == 0:
@@ -1588,13 +1646,21 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
                        resume_session: pathlib.Path | None = None,
                        codex_session: pathlib.Path | None = None,
                        codex_thread: str | None = None,
-                       pi_session_dir: pathlib.Path | None = None) -> dict[str, Any]:
+                       pi_session_dir: pathlib.Path | None = None,
+                       carry_image: str | None = None) -> dict[str, Any]:
     identity = f"{instance_id}\0{harness}\0{output.resolve()}"
+    active_proxy = os.environ.get("CARRY_PROXY_MODE", "disabled") != "disabled"
+    network_kwargs = {}
+    if active_proxy:
+        network_kwargs = {"carry_image": carry_image,
+                          "state_dir": output.with_name(output.name + "-proxy-state")}
     network = start_agent_network(
-        identity=identity, proxy_image=proxy_image, proxy_script=proxy_script,
+        identity=identity, proxy_image=proxy_image, proxy_script=proxy_script, **network_kwargs,
     )
+    record = None
     try:
-        return run_agent(
+        client_kwargs = {"client_token": network["client_token"]} if active_proxy else {}
+        record = run_agent(
             instance_id=instance_id, harness=harness, image=image,
             harness_bundle=harness_bundle,
             repo=repo, task_input=task_input, output=output,
@@ -1602,10 +1668,21 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
             pricing=pricing, network=network["internal"], proxy_ip=network["proxy_ip"],
             proxy_container=network["proxy"], api_base=network["api_base"], resume_session=resume_session,
             codex_session=codex_session, codex_thread=codex_thread,
-            pi_session_dir=pi_session_dir,
+            pi_session_dir=pi_session_dir, **client_kwargs,
         )
+        return record
     finally:
-        cleanup_agent_network(network)
+        try:
+            if active_proxy:
+                summary = proxy_benchmark.capture_evidence(network)
+                if record is not None:
+                    record["proxy_summary"] = summary
+                    record["client_estimated_cost_usd"] = record.get("estimated_cost_usd")
+                    record["primary_estimated_cost_usd"] = summary["primary"]["estimated_cost_usd"]
+                    record["estimated_cost_usd"] = summary["estimated_total_cost_usd"]
+                    record["proxy_session_id"] = network["session_id"]
+        finally:
+            cleanup_agent_network(network)
 
 
 def agent_timed_out(error: BaseException) -> bool:
@@ -1624,7 +1701,8 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
               resume_session: pathlib.Path | None = None,
               codex_session: pathlib.Path | None = None,
               codex_thread: str | None = None,
-              pi_session_dir: pathlib.Path | None = None) -> dict[str, Any]:
+              pi_session_dir: pathlib.Path | None = None,
+              client_token: str | None = None) -> dict[str, Any]:
     slot_timeout = (
         timeout_seconds if timeout_seconds is not None
         else int(os.environ.get("AGENT_TIMEOUT_SECONDS", "1200"))
@@ -1648,7 +1726,13 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
         "instance_id": instance_id, "harness": harness, "state": "started",
     }, sort_keys=True), flush=True)
     try:
-        subprocess.run(command, check=True, timeout=slot_timeout)
+        launch_kwargs = {}
+        if client_token is not None:
+            client_env = {key: value for key, value in os.environ.items()
+                          if not key.startswith(("OPENAI_", "CARRY_PROXY_"))}
+            client_env["OPENAI_API_KEY"] = client_token
+            launch_kwargs["env"] = client_env
+        subprocess.run(command, check=True, timeout=slot_timeout, **launch_kwargs)
         patch_file = output / "final.patch"
         patch = patch_file.read_text(encoding="utf-8") if patch_file.is_file() else ""
         if not patch_file.is_file():
@@ -2229,6 +2313,27 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
             "costed_slots": len(costs),
             "statuses": dict(sorted(Counter(item["status"] for item in harness_records).items())),
         }
+        if provenance.get("proxy", {}).get("mode", "disabled") != "disabled":
+            summaries = [r.get("proxy_summary") for r in harness_records]
+            harness_reports[harness]["observed_cost_lower_bound_usd"] = sum(
+                (s or {}).get("observed_cost_lower_bound_usd", r.get("estimated_cost_usd") or 0)
+                for r, s in zip(harness_records, summaries))
+            if len(costs) != len(harness_records):
+                harness_reports[harness]["estimated_cost_usd"] = None
+            harness_reports[harness]["proxy"] = {
+                "evidenced_slots": sum(s is not None for s in summaries),
+                "censored_slots": sum(s is None or s.get("estimated_total_cost_usd") is None for s in summaries),
+                "primary": {key: sum((s or {}).get("primary", {}).get(key, 0) for s in summaries)
+                    for key in ("requests", "completed_requests", "censored_requests", "ordinary_input_tokens",
+                                "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "latency_ms", "tool_calls", "native_compaction_requests")},
+                "shadow": {key: sum((s or {}).get("shadow", {}).get(key, 0) for s in summaries)
+                    for key in ("requests", "completed_requests", "censored_requests", "ordinary_input_tokens",
+                                "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "latency_ms", "tool_calls", "native_compaction_requests")},
+                "proxy_rewrites": (sum(s["proxy_rewrites"] for s in summaries)
+                    if all(s and s.get("proxy_rewrites") is not None for s in summaries) else None),
+                "native_compactions": (sum(s["native_compactions"] for s in summaries)
+                    if all(s and s.get("native_compactions") is not None for s in summaries) else None),
+            }
     task_harness_reports = {}
     def wilson_95_interval(successes: int, trials: int) -> list[float]:
         # Fixed 1.96 z-score keeps the human-facing uncertainty interval deterministic.
@@ -2518,6 +2623,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
         "carry_compaction_neutral_high_watermark_tokens": validated["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"],
         "carry_compaction_neutral_low_watermark_tokens": validated["CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS"],
         "images": {},
+        "proxy": proxy_benchmark.provenance(config),
         "mode": mode, "harnesses": list(harnesses), "phase": "planned",
         "pricing_usd_per_million": pricing,
     }
@@ -2712,6 +2818,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 harness_bundle=harness_bundles[harness],
                 proxy_image=validated["BASE_IMAGE"],
                 proxy_script=source / "scripts" / "openai_proxy.js",
+                carry_image=provenance["carry"]["image_id"],
                 repo=task_root / harness / "repo",
                 task_input=task_root / "input", output=slot_output,
                 model=validated["MODEL"], reasoning=validated["REASONING"],

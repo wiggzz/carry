@@ -243,6 +243,10 @@ jobs:
           scripts/test_build_long_swebench_selection.py
           scripts/test_merge_swebench_attempts.py
           scripts/test_swebench_harness_entrypoint.py
+          scripts/test_proxy_benchmark.py
+          scripts/test_proxy_workflow.py
+          scripts/test_proxy_trial.py
+          scripts/test_proxy_native_fixture.py
           scripts/test_prepared_swebench_image.py
           scripts/test_swebench_ec2_worker.py
           scripts/test_docker_registry_login.py
@@ -262,6 +266,41 @@ jobs:
         run: |
           cargo build --release --locked --target x86_64-unknown-linux-musl
           target/x86_64-unknown-linux-musl/release/carry --help >/dev/null
+
+      - name: Upload exact-head portable Carry binary
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: carry-linux-amd64-musl-${{ github.sha }}
+          path: target/x86_64-unknown-linux-musl/release/carry
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Pinned Node for credential-free native client fixtures
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.19.0
+
+      - name: Actual Codex and Pi HTTP Responses through integrated Carry proxy
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/proxy-clients" --no-audit --no-fund \
+            '@openai/codex@0.147.0' '@earendil-works/pi-coding-agent@0.84.2'
+          "$RUNNER_TEMP/proxy-clients/node_modules/.bin/codex" --version
+          "$RUNNER_TEMP/proxy-clients/node_modules/.bin/pi" --version
+          python3 scripts/proxy_native_fixture.py \
+            --carry "$PWD/target/x86_64-unknown-linux-musl/release/carry" \
+            --codex "$RUNNER_TEMP/proxy-clients/node_modules/.bin/codex" \
+            --pi "$RUNNER_TEMP/proxy-clients/node_modules/.bin/pi" \
+            --output "$RUNNER_TEMP/proxy-native-fixture"
+
+      - name: Preserve credential-free native fixture evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: proxy-native-fixture-${{ github.sha }}
+          path: ${{ runner.temp }}/proxy-native-fixture
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Build and execute portable Carry harness binary
         run: |

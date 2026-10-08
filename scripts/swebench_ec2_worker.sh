@@ -126,6 +126,12 @@ worker_started_at=$(date +%s)
 : "${DOCKER_AUTH_URL_B64:=}"
 : "${REGISTRY_AUTH_URL_B64:=}"
 : "${CONTROL_URL_B64:=}"
+: "${CARRY_PROXY_MODE:=disabled}"
+: "${CARRY_PROXY_CLASSIFIER_MODEL:=gpt-6-luna}"
+: "${CARRY_PROXY_CLASSIFIER_EFFORT:=low}"
+: "${CARRY_PROXY_PAYOFF_REQUESTS:=1}"
+: "${CARRY_PROXY_MIN_PAYBACK_PERCENT:=25}"
+export CARRY_PROXY_MODE CARRY_PROXY_CLASSIFIER_MODEL CARRY_PROXY_CLASSIFIER_EFFORT CARRY_PROXY_PAYOFF_REQUESTS CARRY_PROXY_MIN_PAYBACK_PERCENT
 : "${MODEL:=gpt-6-luna}"
 : "${REASONING:=medium}"
 : "${CARRY_COMPACTION_POLICY:=economic}"
@@ -165,6 +171,10 @@ curl --proto '=https' --tlsv1.2 --fail --silent --location --retry 3 \
 printf '%s  %s\n' "$SOURCE_SHA256" "$CARRY_ROOT/source.tar.gz" | sha256sum -c -
 tar -xzf "$CARRY_ROOT/source.tar.gz" -C "$CARRY_ROOT/source"
 worker_event source_ready
+if [[ "$CARRY_PROXY_MODE" != disabled ]]; then
+  proxy_exports=$("$PYTHON_BIN" "$CARRY_ROOT/source/scripts/proxy_benchmark.py" --shell)
+  eval "$proxy_exports"
+fi
 if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 ]]; then
   "$PYTHON_BIN" "$CARRY_ROOT/source/scripts/benchmark_preparation_telemetry.py" \
     --root "$CARRY_ROOT/results" --work "$CARRY_ROOT/work" --interval 60 2>/dev/null &
