@@ -592,7 +592,8 @@ async fn review(service: &Service, id: &str, session: &mut Session, main: &Value
         return false;
     }
     session.observe_groups(&groups);
-    session.review_cache_key = format!("carry-review-{id}");
+    // Full domain-separated digest: preserve owner isolation within the provider's 64-character bound.
+    session.review_cache_key = format!("{:x}", Sha256::digest(format!("carry-review-{id}")));
     session.review_context = cache_base(main);
     let body = review_body(&service.config, session);
     if serde_json::to_vec(&body).unwrap().len() > 8 * 1024 * 1024 {
@@ -617,12 +618,40 @@ async fn review(service: &Service, id: &str, session: &mut Session, main: &Value
     session.last_review_request = session.completed_requests;
     let attempt = Attempt::start("shadow", &service.config.classifier_model, false, true);
     let response = request.send().await;
+    let mut diagnostic = json!({"reason": "review_transport_or_protocol_failure"});
+    let value = match response {
+        Ok(response) => {
+            let status = response.status();
+            diagnostic["http_status"] = json!(status.as_u16());
+            if status.is_success() {
+                bounded(response, 4 * 1024 * 1024)
+                    .await
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            } else {
+                // Private trace gets only bounded identifier tokens, never provider prose or raw bodies.
+                if let Ok(bytes) = bounded(response, 16 * 1024).await
+                    && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+                {
+                    for field in ["type", "code", "param"] {
+                        if let Some(token) = value["error"][field].as_str()
+                            && !token.is_empty()
+                            && token.len() <= 64
+                            && token
+                                .bytes()
+                                .all(|c| c.is_ascii_alphanumeric() || b"_.-[]".contains(&c))
+                        {
+                            diagnostic[format!("error_{field}")] = json!(token);
+                        }
+                    }
+                }
+                None
+            }
+        }
+        Err(_) => None,
+    };
     let mut valid = false;
-    if let Ok(response) = response
-        && response.status().is_success()
-        && let Ok(bytes) = bounded(response, 4 * 1024 * 1024).await
-        && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
-    {
+    if let Some(value) = value {
         attempt.finish(Some(&value), "observed");
         session.shadow.observe(
             &service.config.classifier_model,
@@ -647,6 +676,7 @@ async fn review(service: &Service, id: &str, session: &mut Session, main: &Value
         }
     } else {
         attempt.finish(None, "review_transport_or_protocol_failure");
+        let _ = trace(service, id, "shadow_failed", &diagnostic);
         session.shadow.calls += 1;
         session.shadow.unavailable_cost_calls += 1;
     }
