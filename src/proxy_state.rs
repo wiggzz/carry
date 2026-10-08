@@ -481,7 +481,10 @@ mod tests {
         let mut echoed = first;
         echoed[1].as_object_mut().unwrap().remove("id");
         echoed[1].as_object_mut().unwrap().remove("status");
-        echoed[1]["content"][0].as_object_mut().unwrap().remove("annotations");
+        echoed[1]["content"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("annotations");
         state.ingest(&echoed).unwrap();
         assert_eq!(
             state.render_primary(),
