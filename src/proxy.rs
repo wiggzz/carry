@@ -796,7 +796,7 @@ fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Option<Session>,
         ) else {
             continue;
         };
-        let Some(shadow) = view_costs(
+        let Some(mut shadow) = view_costs(
             &keep_shadow,
             &compact_shadow,
             &session.shadow_cache,
@@ -805,6 +805,14 @@ fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Option<Session>,
         ) else {
             continue;
         };
+        // A future completed review also pays for bounded output. The current
+        // completed review is sunk; future output is equal work, NOT zero cost.
+        // Long-context output rates can differ between the two actual views.
+        let keep_rates = Rates::for_model(&config.classifier_model, estimate(&keep_shadow)).unwrap();
+        let compact_rates = Rates::for_model(&config.classifier_model, estimate(&compact_shadow)).unwrap();
+        let future_output = future_reviews as f64 * config.classifier_max_output_tokens as f64;
+        shadow.keep += future_output * keep_rates.output;
+        shadow.compact += future_output * compact_rates.output;
         let decision = joint_decision(primary, shadow, config.min_payback_percent);
         reports.push(json!({"removed_groups": removed, "joint": decision, "primary_retained_estimated_tokens": estimate(&compact), "shadow_retained_estimated_tokens": estimate(&compact_shadow), "primary_cached_estimated_tokens": reusable(&session.primary_cache, &compact), "shadow_cached_estimated_tokens": reusable(&session.shadow_cache, &compact_shadow)}));
         if decision.accepted
@@ -815,7 +823,7 @@ fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Option<Session>,
             best = Some((candidate, decision));
         }
     }
-    let report = json!({"selected": best.is_some(), "mode": format!("{:?}",config.mode).to_lowercase(), "future_reviews": future_reviews, "payoff_requests": config.payoff_requests, "current_review_cost_is_sunk": true, "estimate_basis": "actual_rendered_json_bytes_div_four_not_provider_tokens_or_overflow_evidence", "cache_basis": "exact_prefix_native_cached_fraction_not_guarantee", "future_cache_assumption": "fixed_history_eligible_future_hits_sensitivity_not_forecast", "candidates": reports});
+    let report = json!({"selected": best.is_some(), "mode": format!("{:?}",config.mode).to_lowercase(), "future_reviews": future_reviews, "payoff_requests": config.payoff_requests, "current_review_cost_is_sunk": true, "estimate_basis": "actual_rendered_json_bytes_div_four_not_provider_tokens_or_overflow_evidence", "cache_basis": "exact_prefix_native_cached_fraction_not_guarantee", "future_cache_assumption": "fixed_history_eligible_future_hits_sensitivity_not_forecast", "future_review_output_assumption": "configured_max_output_tokens_per_future_review_not_prediction", "candidates": reports});
     (best.map(|(session, _)| session), report)
 }
 
