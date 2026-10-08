@@ -28,14 +28,27 @@ impl Observer {
                     self.completed = None;
                     return;
                 };
-                let data = text.lines().filter_map(|line| line.strip_prefix("data:").map(|s| s.strip_prefix(' ').unwrap_or(s))).collect::<Vec<_>>().join("\n");
+                let data = text
+                    .lines()
+                    .filter_map(|line| {
+                        line.strip_prefix("data:")
+                            .map(|s| s.strip_prefix(' ').unwrap_or(s))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 if let Ok(value) = serde_json::from_str::<Value>(&data) {
                     match value["type"].as_str() {
-                        Some("response.completed") if !self.terminal && value["response"]["status"] == "completed" => {
+                        Some("response.completed")
+                            if !self.terminal && value["response"]["status"] == "completed" =>
+                        {
                             self.terminal = true;
                             self.completed = Some(value["response"].clone());
                         }
-                        Some("response.failed" | "response.incomplete" | "error") if !self.terminal => self.terminal = true,
+                        Some("response.failed" | "response.incomplete" | "error")
+                            if !self.terminal =>
+                        {
+                            self.terminal = true
+                        }
                         _ => {}
                     }
                 }
