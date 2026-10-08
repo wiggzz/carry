@@ -471,6 +471,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unknown_item_in_secure_completed_output_cohort_pins_parallel_tools() {
+        let mut state = Session::default();
+        let goal = json!({"role": "user", "content": "goal"});
+        state.ingest(&[goal.clone()]).unwrap();
+        let call = json!({"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"});
+        let opaque = json!({"type": "future_native_output", "payload": "opaque"});
+        state.pending_output = vec![call.clone(), opaque.clone()];
+        state.ingest(&[goal, call, opaque, json!({"type": "function_call_output", "call_id": "a", "output": "result"})]).unwrap();
+        let group = state.groups().into_iter().find(|g| g.id == 2).unwrap();
+        assert!(group.pinned, "unknown native output pins its securely known completion cohort");
+        assert_eq!(group.members, vec![2, 3, 4]);
+    }
+
+    #[test]
     fn incomplete_and_unknown_parallel_native_cohorts_are_pinned() {
         for unknown in [false, true] {
             let mut state = Session::default();
