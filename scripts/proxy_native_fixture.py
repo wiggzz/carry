@@ -15,8 +15,10 @@ import threading
 
 
 class Fixture:
-    def __init__(self, client):
+    def __init__(self, client, case="off"):
         self.client = client
+        self.case = case
+        self.reviews = []
         self.calls = []
         self.errors = []
         outer = self
@@ -31,9 +33,16 @@ class Fixture:
                 try:
                     body = json.loads(self.rfile.read(int(self.headers['content-length'])))
                     if self.path == '/classifier':
+                        outer.reviews.append(body)
+                        targets=set()
+                        for record in body.get('input', []):
+                            try: data=json.loads(record.get('content', ''))
+                            except (ValueError, TypeError): continue
+                            if data.get('eligible') and 'DROP_COHORT_PAYLOAD' in json.dumps(data.get('items', [])):
+                                targets.add(data['group_id'])
                         value = {'id':'shadow-fixture','status':'completed','model':'gpt-6-luna',
                             'output':[{'type':'message','role':'assistant','content':[{'type':'output_text',
-                            'text':json.dumps({'protected':[], 'removable':[], 'memories':[]})}]}],
+                            'text':json.dumps({'protected':[], 'removable':sorted(targets), 'memories':[]})}]}],
                             'usage':{'input_tokens':100,'output_tokens':10,
                             'input_tokens_details':{'cached_tokens':0,'cache_write_tokens':0}}}
                         raw=json.dumps(value).encode(); content_type='application/json'
@@ -55,14 +64,35 @@ class Fixture:
                             arguments = ({'cmd':'printf FIXTURE_TOOL_OK > proxy-fixture.txt; cat proxy-fixture.txt',
                                           'yield_time_ms':1000,'max_output_tokens':128} if outer.client == 'codex'
                                          else {'command':'printf FIXTURE_TOOL_OK > proxy-fixture.txt; cat proxy-fixture.txt'})
-                            output = [{'type':'function_call','id':'fc_fixture','status':'completed',
-                                'name':name,'call_id':'call_fixture','arguments':json.dumps(arguments)}]
+                            if outer.case == 'compact':
+                                commands=['printf FIXTURE_TOOL_OK > proxy-fixture.txt; python3 -c '+
+                                    '\"print(\'DROP_COHORT_PAYLOAD_A \' * 1400)\"',
+                                    'printf FIXTURE_TOOL_OK_B > proxy-fixture-b.txt; python3 -c '+
+                                    '\"print(\'DROP_COHORT_PAYLOAD_B \' * 1400)\"']
+                                output=[]
+                                for suffix, command in zip(('a','b'),commands):
+                                    args=({'cmd':command,'yield_time_ms':1000,'max_output_tokens':15000}
+                                          if outer.client == 'codex' else {'command':command})
+                                    output.append({'type':'function_call','id':'fc_fixture_1_'+suffix,
+                                        'status':'completed','name':name,'call_id':'call_fixture_1_'+suffix,
+                                        'arguments':json.dumps(args)})
+                            else:
+                                output = [{'type':'function_call','id':'fc_fixture','status':'completed',
+                                    'name':name,'call_id':'call_fixture','arguments':json.dumps(arguments)}]
                         else:
                             if not any(item.get('type') == 'function_call_output'
                                        for item in body.get('input', []) if isinstance(item,dict)):
                                 raise ValueError('native full-history tool-result echo missing')
-                            output = [{'type':'message','id':'msg_fixture','status':'completed','role':'assistant',
-                                'content':[{'type':'output_text','text':'FIXTURE_COMPLETE','annotations':[]}]}]
+                            if outer.case == 'compact' and count < 4:
+                                command='printf SMALL_COHORT_'+str(count)
+                                args=({'cmd':command,'yield_time_ms':1000,'max_output_tokens':128}
+                                      if outer.client == 'codex' else {'command':command})
+                                output=[{'type':'function_call','id':f'fc_fixture_{count}',
+                                    'status':'completed','name':name,'call_id':f'call_fixture_{count}',
+                                    'arguments':json.dumps(args)}]
+                            else:
+                                output = [{'type':'message','id':'msg_fixture','status':'completed','role':'assistant',
+                                    'content':[{'type':'output_text','text':'FIXTURE_COMPLETE','annotations':[]}]}]
                         value = {'id':f'resp_fixture_{count}','object':'response','status':'completed',
                             'model':'gpt-6-luna','output':output,
                             'usage':{'input_tokens':1000,'output_tokens':10,'total_tokens':1010,
@@ -115,6 +145,40 @@ class Fixture:
         self.server.shutdown(); self.server.server_close(); self.thread.join(timeout=3)
 
 
+def compact_evidence(trial, fixture):
+    """Grade the executed native caller, wire projection and durable paired state."""
+    files=list((trial / 'state').glob('*.json'))
+    if len(files) != 1: raise AssertionError('exactly one owned session required')
+    state=json.loads(files[0].read_text())
+    events=[json.loads(line) for line in files[0].with_suffix('.jsonl').read_text().splitlines()]
+    received=[e['data'] for e in events if e['event']=='primary_received']
+    submitted=[e['data'] for e in events if e['event']=='primary_submitted']
+    cohort={'call_fixture_1_a','call_fixture_1_b'}
+    def members(body):
+        return [i for i in body['input'] if i.get('call_id') in cohort]
+    assert len(received)==len(submitted)==4, 'four actual native coding turns required'
+    assert len(members(received[2]))==4, 'caller must echo both calls and both outputs'
+    assert len(members(submitted[1]))==4, 'cohort must receive completed exposure before removal'
+    assert not members(submitted[2]) and not members(submitted[3]), 'atomic cohort must stay removed'
+    assert len(fixture.reviews)>=2, 'later shadow request required, not a source-only check'
+    assert 'DROP_COHORT_PAYLOAD' in json.dumps(fixture.reviews[0])
+    assert 'DROP_COHORT_PAYLOAD' not in json.dumps(fixture.reviews[1]), 'later shadow must mechanically prune'
+    removed=[i for i in state['history'] if i['removed'] and i['value'].get('call_id') in cohort]
+    assert len(removed)==4 and len({i['cohort'] for i in removed if i['value']['type']=='function_call'})==1
+    removed_ids={i['id'] for i in removed}
+    assert not any(r['source_id'] in removed_ids for r in state['active_shadow'])
+    assert state['invalid_reviews']==0 and state['compactions']>=1
+    # Forwarded surviving tool outputs must be the caller's unmodified bytes.
+    for before,after in zip(received,submitted):
+        originals={i['call_id']:i for i in before['input'] if i.get('type')=='function_call_output'}
+        for item in after['input']:
+            if item.get('type')=='function_call_output': assert item==originals[item['call_id']]
+    return {'compact_verified':True,'removed_atomic_members':len(removed),
+            'classifier_calls':len(fixture.reviews),'invalid_reviews':state['invalid_reviews'],
+            'coupled_later_shadow_pruning_verified':True,'tool_output_bytes_preserved':True,
+            'proxy_compactions':state['compactions']}
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--carry', required=True)
@@ -126,17 +190,19 @@ def main():
         parser.error('fixture output must be fresh')
     args.output.mkdir(parents=True)
     results=[]
-    for client in ('codex','pi'):
-        workspace=args.output / (client+'-workspace'); workspace.mkdir()
+    for client,case in ((c,m) for c in ('codex','pi') for m in ('off','compact')):
+        label=client+'-'+case
+        workspace=args.output / (label+'-workspace'); workspace.mkdir()
         subprocess.run(['git','init','-q',str(workspace)],check=True)
         env={k:v for k,v in os.environ.items() if not k.startswith(('OPENAI_','CARRY_PROXY_'))}
         env.update(CARRY_PROXY_UPSTREAM_KEY='synthetic-fixture-key', CARRY_PROXY_CLASSIFIER_KEY='synthetic-fixture-key')
-        with Fixture(client) as fixture, socket.socket() as sock:
+        with Fixture(client,case) as fixture, socket.socket() as sock:
             sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]; sock.close()
-            trial=args.output / (client+'-trial')
+            trial=args.output / (label+'-trial')
             command=['python3',str(Path(__file__).with_name('proxy_trial.py')),
                 '--client',client,'--carry-binary',args.carry,'--client-binary',getattr(args,client),
-                '--workspace',str(workspace),'--trial-dir',str(trial),'--mode','off',
+                '--workspace',str(workspace),'--trial-dir',str(trial),'--mode',case,
+                '--payoff-requests','5','--min-payback-percent','0',
                 '--listen',f'127.0.0.1:{port}','--upstream-url',fixture.url+'/v1/responses',
                 '--classifier-url',fixture.url+'/classifier','--timeout','60',
                 '--prompt','Run the supplied tool once and finish. This is a scripted offline fixture.']
@@ -145,14 +211,17 @@ def main():
             marker=workspace / 'proxy-fixture.txt'
             import hashlib
             cache_key=fixture.calls[0].get('prompt_cache_key') if fixture.calls else None
-            result={'client':client,'fixture_only':True,'exit_code':run.returncode,
+            result={'client':client,'case':case,'fixture_only':True,'exit_code':run.returncode,
                 'native_cache_namespace_sha256':hashlib.sha256(cache_key.encode()).hexdigest() if cache_key else None,
                 'native_requests':len(fixture.calls),'native_tool_result_echo':len(fixture.calls)>1,
                 'tool_effect_verified':marker.is_file() and marker.read_text()=='FIXTURE_TOOL_OK',
                 'native_final_verified':'FIXTURE_COMPLETE' in trace,'provider_errors':fixture.errors}
+            if case == 'compact' and not run.returncode:
+                try: result.update(compact_evidence(trial,fixture))
+                except AssertionError as error: result['acceptance_failure']=str(error)
             results.append(result)
             (args.output / 'results.json').write_text(json.dumps(results,indent=2)+'\n')
-            if run.returncode or fixture.errors or not result['tool_effect_verified'] or not result['native_final_verified'] or not result['native_tool_result_echo']:
+            if result.get('acceptance_failure') or run.returncode or fixture.errors or not result['tool_effect_verified'] or not result['native_final_verified'] or not result['native_tool_result_echo']:
                 raise RuntimeError(f'{client} integrated fixture failed; inspect isolated fixture artifacts')
     if len({r['native_cache_namespace_sha256'] for r in results}) != len(results):
         raise RuntimeError('fresh native clients reused a cache namespace')
