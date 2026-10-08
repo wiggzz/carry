@@ -336,6 +336,18 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
             .contains("DISCARD_SOURCE_PAYLOAD_"),
         "native compaction must operate on the same retained main view, not resurrect removed echo source"
     );
+    let stale = client
+        .post(format!("{url}/v1/responses"))
+        .header("x-carry-session", "fixture-session")
+        .json(&second)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        stale.status(),
+        reqwest::StatusCode::CONFLICT,
+        "after native compaction an old uncheckpointed echo cannot resurrect removed main source"
+    );
     let resumed = json!({"model": "gpt-6-luna", "input": [checkpoint["output"][0].clone(), json!({"role": "user", "content": "next goal"})], "store": false});
     let response = client
         .post(format!("{url}/v1/responses"))
