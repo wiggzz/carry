@@ -49,7 +49,9 @@ pathlib.Path(os.environ['HOME'],'client-evidence.json').write_text(json.dumps({'
                 result = subprocess.run(['python3', str(ROOT / 'scripts/proxy_trial.py'),
                     '--client', client, '--carry-binary', str(carry), '--client-binary', str(binary),
                     '--workspace', str(workspace), '--trial-dir', str(trial), '--mode', 'compact',
-                    '--listen', '127.0.0.1:' + str(port), '--prompt', 'fixture'],
+                    '--listen', '127.0.0.1:' + str(port), '--prompt', 'fixture',
+                    '--history-policy','reset-on-divergence',
+                    *(['--codex-sandbox','danger-full-access','--codex-native-compaction','v1'] if client=='codex' else [])],
                     env=env, text=True, capture_output=True, timeout=20)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 evidence = json.loads((trial / 'home/client-evidence.json').read_text())
@@ -60,12 +62,18 @@ pathlib.Path(os.environ['HOME'],'client-evidence.json').write_text(json.dumps({'
                     config = tomllib.loads((trial / 'codex/config.toml').read_text())
                     provider = config['model_providers']['carry-trial']
                     self.assertEqual(provider['wire_api'], 'responses')
+                    self.assertEqual(provider['name'],'OpenAI')
+                    self.assertEqual(config['model_auto_compact_token_limit'],20000)
+                    self.assertFalse(config['features']['remote_compaction_v2'])
+                    self.assertEqual(provider['http_headers']['x-carry-history-policy'],'reset-on-divergence')
+                    self.assertIn('danger-full-access',evidence['argv'])
                     self.assertTrue(provider['http_headers']['x-carry-session'])
                     self.assertFalse(provider.get('supports_websockets', True))
                 else:
                     config = json.loads((trial / 'pi/models.json').read_text())
                     self.assertEqual(config['providers']['carry-trial']['api'], 'openai-responses')
                     self.assertTrue(config['providers']['carry-trial']['headers']['x-carry-session'])
+                    self.assertEqual(config['providers']['carry-trial']['headers']['x-carry-history-policy'],'reset-on-divergence')
                 with socket.socket() as sock:
                     self.assertNotEqual(sock.connect_ex(('127.0.0.1',port)), 0, 'owned proxy not cleaned')
 

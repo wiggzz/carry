@@ -215,6 +215,43 @@ async fn explicit_non_prefix_rebase_retires_both_projections_without_inventing_a
     server.abort();
 }
 
+#[tokio::test]
+async fn off_forwards_non_prefix_and_stateful_delta_bytes_without_ancestry_rejection() {
+    use axum::{Router, routing::post};
+    let router = Router::new().route("/v1/responses", post(|bytes: axum::body::Bytes| async move {
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        axum::Json(json!({"status": "completed", "output": [], "echo": body, "usage": {"input_tokens": 100, "output_tokens": 1, "input_tokens_details": {"cached_tokens": 0}}}))
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let temp = tempfile::tempdir().unwrap();
+    let (_proxy, url) = start_proxy(temp.path(), address, "off").await;
+    let client = reqwest::Client::new();
+    for body in [
+        json!({"model": "gpt-6-luna", "input": [{"role": "user", "content": "old source"}]}),
+        json!({"model": "gpt-6-luna", "previous_response_id": "upstream-parent", "input": [{"role": "user", "content": "new delta"}]}),
+    ] {
+        let response = client
+            .post(format!("{url}/v1/responses"))
+            .header("x-carry-session", "off-rebase")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "off must never reject native replacements for review ancestry"
+        );
+        let value: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            value["echo"], body,
+            "off must preserve parent reference and exact delta"
+        );
+    }
+    server.abort();
+}
+
 async fn start_proxy(
     state: &std::path::Path,
     upstream: std::net::SocketAddr,
