@@ -693,7 +693,17 @@ def cleanup_agent_network(network: Mapping[str, str], execute: Any = subprocess.
                 leftovers.append("Carry proxy container remains")
             for label, result in (("Carry proxy", carry), ("gateway", proxy),
                                   ("internal network", internal), ("egress network", egress)):
-                if result.returncode != 0 and 'no such' not in (result.stderr or '').lower():
+                stderr = (result.stderr or '').strip()
+                named_network_absent = (
+                    label in ("internal network", "egress network")
+                    and result.returncode == 1
+                    and stderr == (
+                        "Error response from daemon: network "
+                        + network["internal" if label == "internal network" else "egress"]
+                        + " not found"
+                    )
+                )
+                if result.returncode != 0 and 'no such' not in stderr.lower() and not named_network_absent:
                     leftovers.append(f"{label} absence cannot be proven")
         if proxy.returncode == 0:
             leftovers.append("proxy container remains")

@@ -1696,6 +1696,33 @@ class SmokeWorkerTests(unittest.TestCase):
                     proxy_script=proxy_script, execute=execute,
                 )
 
+    def test_active_proxy_cleanup_accepts_exact_named_network_not_found(self):
+        network = {"internal": "carry-agent-internal-23cc6606ebf1929e",
+                   "egress": "carry-agent-egress-23cc6606ebf1929e",
+                   "proxy": "gateway", "carry_proxy": "carry"}
+        def execute(command, **kwargs):
+            if command[:3] == ["docker", "network", "inspect"]:
+                return mock.Mock(returncode=1, stderr=f"Error response from daemon: network {command[-1]} not found\n")
+            if command[:2] == ["docker", "inspect"]:
+                return mock.Mock(returncode=1, stderr=f"Error: No such container: {command[-1]}\n")
+            return mock.Mock(returncode=0, stderr="")
+        with mock.patch.object(self.worker.time, "sleep"):
+            self.worker.cleanup_agent_network(network, execute=execute)
+
+    def test_active_proxy_cleanup_rejects_ambiguous_or_other_network_errors(self):
+        network = {"internal": "internal", "egress": "egress", "proxy": "gateway", "carry_proxy": "carry"}
+        for error in ("Cannot connect to Docker: socket not found",
+                      "Error response from daemon: network internal-other not found"):
+            with self.subTest(error=error):
+                def execute(command, **kwargs):
+                    if command[:3] == ["docker", "network", "inspect"]:
+                        return mock.Mock(returncode=1, stderr=error)
+                    if command[:2] == ["docker", "inspect"]:
+                        return mock.Mock(returncode=1, stderr=f"Error: No such container: {command[-1]}\n")
+                    return mock.Mock(returncode=0, stderr="")
+                with mock.patch.object(self.worker.time, "sleep"), self.assertRaises(self.worker.ContainerCleanupError):
+                    self.worker.cleanup_agent_network(network, execute=execute)
+
     def test_agent_network_cleanup_fails_if_proxy_remains(self):
         network = {"internal": "internal", "egress": "egress", "proxy": "proxy"}
 
