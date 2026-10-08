@@ -465,3 +465,85 @@ fn parse_group(value: &Value) -> Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("invalid group ID"))?;
     Ok(digits.parse()?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_and_unknown_parallel_native_cohorts_are_pinned() {
+        for unknown in [false, true] {
+            let mut state = Session::default();
+            let mut input = vec![
+                json!({"role": "user", "content": "goal"}),
+                json!({"type": "reasoning", "encrypted_content": "opaque", "summary": []}),
+                json!({"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"}),
+                json!({"type": "function_call", "call_id": "b", "name": "native", "arguments": "{}"}),
+                json!({"type": "function_call_output", "call_id": "a", "output": "one result"}),
+            ];
+            if unknown { input.push(json!({"type": "unknown_native", "encrypted_content": "keep exact"})); }
+            state.ingest(&input).unwrap();
+            for item in &mut state.history { item.exposed = true; }
+            let group = state.groups().into_iter().find(|g| g.id == 2).unwrap();
+            assert!(group.pinned);
+            assert_eq!(group.members, vec![2, 3, 4, 5]);
+            if unknown { assert!(state.groups().last().unwrap().pinned); }
+        }
+    }
+
+    #[test]
+    fn duplicate_tool_results_pin_the_entire_completion() {
+        let mut state = Session::default();
+        state.ingest(&[
+            json!({"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "a", "output": "one"}),
+            json!({"type": "function_call_output", "call_id": "a", "output": "duplicate"}),
+        ]).unwrap();
+        let groups = state.groups();
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].pinned);
+    }
+
+    #[test]
+    fn new_outputs_and_results_do_not_inherit_prior_input_exposure() {
+        let mut state = Session::default();
+        let initial = json!({"role": "user", "content": "goal"});
+        state.ingest(&[initial.clone()]).unwrap();
+        state.history[0].exposed = true;
+        state.pending_output = vec![json!({"type": "function_call", "id": "fc", "status": "completed", "call_id": "a", "name": "native", "arguments": "{}"})];
+        state.ingest(&[
+            initial,
+            json!({"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "a", "output": "fresh"}),
+        ]).unwrap();
+        assert!(!state.groups().into_iter().find(|g| g.id == 2).unwrap().exposed);
+    }
+
+    #[test]
+    fn mixed_batch_projection_removes_only_main_source_and_keeps_shared_memory() {
+        let mut state = Session::default();
+        let input = vec![
+            json!({"role": "user", "content": "retained requirement"}),
+            json!({"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "a", "output": "REMOVED_EXACT_SOURCE"}),
+            json!({"role": "user", "content": "latest goal"}),
+        ];
+        state.ingest(&input).unwrap();
+        for item in &mut state.history { item.exposed = true; }
+        let groups = state.groups();
+        state.observe_groups(&groups);
+        state.apply_advice(&groups, &json!({"protected": ["g1"], "removable": ["g2"], "memories": [{"source_ids": ["g2"], "text": "durable learning"}]})).unwrap();
+        state.remove(&[2], &groups);
+        let shadow = serde_json::to_string(&state.shadow_input()).unwrap();
+        assert!(!shadow.contains("REMOVED_EXACT_SOURCE"));
+        assert!(!shadow.contains("g2"));
+        assert!(shadow.contains("retained requirement"));
+        assert!(shadow.contains("durable learning"));
+        let main = serde_json::to_string(&state.render_primary()).unwrap();
+        assert!(main.contains("durable learning"));
+        state.ingest(&input).unwrap();
+        state.observe_groups(&state.groups());
+        assert!(!serde_json::to_string(&state.shadow_input()).unwrap().contains("REMOVED_EXACT_SOURCE"));
+        assert!(!serde_json::to_string(&state.render_primary()).unwrap().contains("REMOVED_EXACT_SOURCE"));
+    }
+}
