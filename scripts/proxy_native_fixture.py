@@ -252,7 +252,7 @@ def main():
                 rpc=[json.loads(line) for line in trace.splitlines() if line.startswith('{')]
                 compact=[e for e in rpc if e.get('type')=='response' and e.get('id')=='c1']
                 if case=='pi-checkpoint-strict':
-                    result['explicit_strict_rejection_verified']=bool(run.returncode and compact and compact[0].get('success') is False and '409' in json.dumps(compact))
+                    result['explicit_strict_rejection_verified']=bool(result['tool_effect_verified'] and not fixture.errors and len(fixture.calls)==2 and run.returncode and compact and compact[0].get('success') is False and '409' in json.dumps(compact))
                     if result['explicit_strict_rejection_verified']:
                         results.append(result)
                         (args.output/'results.json').write_text(json.dumps(results,indent=2)+'\n')
@@ -263,7 +263,7 @@ def main():
                     events=[json.loads(line) for line in states[0].with_suffix('.jsonl').read_text().splitlines()]
                     received=[e['data'] for e in events if e['event']=='primary_received']
                     submitted=[e['data'] for e in events if e['event']=='primary_submitted']
-                    result['pi_checkpoint_verified']=bool(fixture.summary_calls and compact and compact[0].get('success') is True and
+                    result['pi_checkpoint_verified']=bool(len(fixture.calls)-len(fixture.summary_calls)==3 and fixture.calls[-1].get('prompt_cache_key') and fixture.summary_calls and compact and compact[0].get('success') is True and
                         'FIXTURE_PI_CHECKPOINT' in json.dumps(fixture.calls[-1]['input']) and
                         received[-1]==submitted[-1] and state['history_rebases']>=1 and
                         not state['active_shadow'] and sum(e.get('type')=='agent_settled' for e in rpc)>=2)

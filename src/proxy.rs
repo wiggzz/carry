@@ -175,6 +175,7 @@ pub async fn serve(config: ProxyCli) -> Result<()> {
         _directory_lock: directory_lock,
     });
     let listener = tokio::net::TcpListener::bind(service.config.listen).await?;
+    println!("CARRY_PROXY_LISTEN {}", listener.local_addr()?);
     let router = Router::new()
         .route(
             "/health",
@@ -1019,11 +1020,20 @@ async fn relay(
         if let Some(mut commit) = commit {
             let complete_transport = complete_transport && (!is_sse || sse_completed);
             let completed = observed.as_ref().is_some_and(|v| {
-                v["status"] == "completed"
-                    || (commit.native
-                        && v["output"]
-                            .as_array()
-                            .is_some_and(|out| out.iter().any(|i| i["type"] == "compaction")))
+                if commit.native {
+                    // Native V1 may omit status; V2 still requires its real
+                    // completed terminal. Neither a normal answer nor zero or
+                    // multiple anchors can advance a native checkpoint epoch.
+                    v.get("status").is_none_or(|status| status == "completed")
+                        && v["output"].as_array().is_some_and(|out| {
+                            out.iter()
+                                .filter(|item| item["type"] == "compaction")
+                                .count()
+                                == 1
+                        })
+                } else {
+                    v["status"] == "completed"
+                }
             });
             if complete_transport && status.is_success() && completed {
                 let value = observed.unwrap();
