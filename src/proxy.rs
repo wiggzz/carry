@@ -998,6 +998,13 @@ async fn relay(
                 );
                 if commit.native {
                     commit.candidate.reset_active();
+                    commit.candidate.native_checkpoint = value["output"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|item| item["type"] == "compaction")
+                        .cloned()
+                        .collect();
                     commit.candidate.native_compactions += 1;
                 } else {
                     for item in &mut commit.candidate.history {
