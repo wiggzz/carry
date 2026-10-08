@@ -70,7 +70,15 @@ def native_cost(model, usage, *, service_tier='default'):
     if not isinstance(usage, dict):
         return None
     details = usage.get('input_tokens_details', {})
-    if not isinstance(details, dict) or set(details) - {'cached_tokens', 'cache_write_tokens'}:
+    if (not isinstance(details, dict) or 'cached_tokens' not in details
+            or set(details) - {'cached_tokens', 'cache_write_tokens'}):
+        return None
+    output_details = usage.get('output_tokens_details', {})
+    if (not isinstance(output_details, dict)
+            or any(value != 0 for key, value in output_details.items()
+                   if key != 'reasoning_tokens')):
+        # Only text/reasoning output is covered by this reviewed price table.
+        # Do not assign the text rate to audio or other unreviewed categories.
         return None
     names = ('input_tokens', 'output_tokens')
     if any(type(usage.get(key)) is not int or usage[key] < 0 for key in names):

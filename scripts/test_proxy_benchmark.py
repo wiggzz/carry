@@ -138,6 +138,17 @@ upstream.listen(0, '127.0.0.1', () => {
             self.assertNotIn('real-provider-key', repr(launch))
 
 
+    def test_native_cost_rejects_missing_cache_partition(self):
+        usage = {'input_tokens': 100, 'output_tokens': 10,
+                 'input_tokens_details': {}}
+        self.assertIsNone(worker.proxy_benchmark.native_cost('gpt-6-luna', usage))
+
+    def test_native_cost_rejects_unpriced_output_audio(self):
+        usage = {'input_tokens': 100, 'output_tokens': 10,
+                 'input_tokens_details': {'cached_tokens': 0},
+                 'output_tokens_details': {'reasoning_tokens': 2, 'audio_tokens': 4}}
+        self.assertIsNone(worker.proxy_benchmark.native_cost('gpt-6-luna', usage))
+
     def test_summary_separates_native_costs_and_censors_unanswered_primary(self):
         events = [
             {'actor':'primary', 'event':'started', 'request_id':'p1'},
