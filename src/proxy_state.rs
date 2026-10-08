@@ -198,10 +198,10 @@ impl Session {
         let mut results = BTreeMap::<String, Vec<usize>>::new();
         for (index, item) in live.iter().enumerate() {
             let ty = item.value["type"].as_str().unwrap_or("message");
-            if matches!(ty, "reasoning" | "function_call") || item.value["role"] == "assistant" {
-                if let Some(prior) = cohorts.insert(item.cohort, index) {
-                    join(&mut parent, prior, index);
-                }
+            if (matches!(ty, "reasoning" | "function_call") || item.value["role"] == "assistant")
+                && let Some(prior) = cohorts.insert(item.cohort, index)
+            {
+                join(&mut parent, prior, index);
             }
             if let Some(call_id) = item.value["call_id"].as_str() {
                 match ty {

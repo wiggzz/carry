@@ -433,6 +433,9 @@ async fn forward(
             valid = review(&service, &id, &mut session, &body).await;
         }
         let reviewed = session.clone();
+        if native && service.config.mode == Mode::Compact {
+            outbound["input"] = json!(session.render_primary());
+        }
         if !native && service.config.mode != Mode::Off {
             // Previously applied removals stay applied on a full-history echo.
             outbound["input"] = json!(session.render_primary());
@@ -834,11 +837,13 @@ async fn relay(mut upstream: reqwest::Response, commit: Option<Commit>) -> Respo
             }
         }
         if let Some(mut commit) = commit {
+            let sse_completed = observer.completed.is_some();
             let observed = if is_sse {
-                observer.completed
+                observer.observed
             } else {
                 serde_json::from_slice::<Value>(&json_bytes).ok()
             };
+            let complete_transport = complete_transport && (!is_sse || sse_completed);
             let completed = observed.as_ref().is_some_and(|v| {
                 v["status"] == "completed"
                     || (commit.native
