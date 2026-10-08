@@ -133,6 +133,13 @@ impl UsageLedger {
             cached,
             input.and_then(|i| Rates::for_model(model, i as f64)),
         ) && standard
+            && !["input_tokens_details", "output_tokens_details"]
+                .iter()
+                .any(|field| {
+                    usage[*field]["audio_tokens"]
+                        .as_u64()
+                        .is_some_and(|n| n > 0)
+                })
             && cached.checked_add(written).is_some_and(|v| v <= input)
         {
             self.cost_usd += (input - cached - written) as f64 * rates.input
