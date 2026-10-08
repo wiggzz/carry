@@ -2,9 +2,157 @@
 import json
 import unittest
 import urllib.request
+from contextlib import contextmanager
+import http.server
+import os
+from pathlib import Path
+import select
+import subprocess
+import tempfile
+import threading
+
+
+class ShadowContractProvider:
+    """Real HTTP wire capture; no model, credentials or synthesized proxy state."""
+    def __init__(self):
+        self.primary = []
+        self.shadow = []
+        self.advice = lambda body: {'protected': [], 'removable': [], 'memories': []}
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['content-length'])))
+                review = self.path == '/review'
+                (outer.shadow if review else outer.primary).append(body)
+                advice = outer.advice(body) if review else None
+                failed = not review and body.get('metadata', {}).get('fail_primary')
+                value = {'status': 'failed' if failed else 'completed',
+                         'output': [{'type': 'message', 'role': 'assistant', 'content': [
+                             {'type': 'output_text', 'text': json.dumps(advice)}]}] if review else [],
+                         'usage': {'input_tokens': 100, 'output_tokens': 1,
+                                   'input_tokens_details': {'cached_tokens': 0}}}
+                raw = json.dumps(value).encode()
+                self.send_response(200)
+                self.send_header('content-type', 'application/json')
+                self.send_header('content-length', str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.url = 'http://127.0.0.1:' + str(self.server.server_port)
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+
+
+@contextmanager
+def contract_proxy(test, provider, state_dir, mode='audit'):
+    binary = Path(os.environ.get('CARRY_TEST_BINARY', 'target/debug/carry')).resolve()
+    if not binary.is_file():
+        test.skipTest('requires an existing Carry binary; never builds locally')
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(('OPENAI_', 'CARRY_PROXY_'))}
+    command = [str(binary), 'proxy', '--listen', '127.0.0.1:0',
+               '--upstream-url', provider.url + '/v1/responses',
+               '--classifier-url', provider.url + '/review', '--mode', mode,
+               '--min-payback-percent', '0', '--payoff-requests', '5',
+               '--state-dir', state_dir]
+    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, text=True)
+    try:
+        test.assertTrue(select.select([process.stdout], [], [], 5)[0], 'proxy startup timed out')
+        banner = process.stdout.readline().strip()
+        test.assertTrue(banner.startswith('CARRY_PROXY_LISTEN '), 'proxy failed to start')
+        yield 'http://' + banner.removeprefix('CARRY_PROXY_LISTEN ')
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+        process.stdout.close()
+
+
+def contract_send(url, body):
+    request = urllib.request.Request(url + '/v1/responses', data=json.dumps(body).encode(),
+        headers={'content-type': 'application/json', 'x-carry-session': 'contract'})
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.load(response)
+
+
+def wire_data(body):
+    result = []
+    for record in body['input']:
+        try:
+            result.append(json.loads(record.get('content', '')))
+        except (ValueError, TypeError):
+            pass
+    return result
+
+
+def contract_state(directory):
+    return json.loads(next(Path(directory).glob('*.json')).read_text())
 
 
 class NativeProviderFixtureTests(unittest.TestCase):
+    def test_proxy_observes_bulk_once_across_exposure_metadata_failed_primary_and_restart(self):
+        with ShadowContractProvider() as provider, tempfile.TemporaryDirectory() as directory:
+            body = {'model': 'gpt-6-luna', 'input': [
+                {'role': 'user', 'content': 'old requirement'},
+                {'role': 'user', 'content': 'current task'}]}
+            bulk = 'IMMUTABLE_BULK_MARKER ' * 3000
+            with contract_proxy(self, provider, directory) as url:
+                contract_send(url, body)
+                body['input'] += [
+                    {'type': 'function_call', 'id': 'native-a', 'status': 'completed',
+                     'call_id': 'a', 'name': 'native', 'arguments': '{}'},
+                    {'type': 'function_call_output', 'call_id': 'a', 'output': bulk}]
+                contract_send(url, body)
+                body['metadata'] = {'fail_primary': True}
+                contract_send(url, body)
+                self.assertEqual(contract_state(directory)['failed_primaries'], 1)
+                self.assertEqual(contract_state(directory)['shadow']['calls'], 2)
+            with contract_proxy(self, provider, directory) as url:
+                body.pop('metadata')
+                # Tolerated native echo metadata changes are not new source observations.
+                body['input'][2].pop('id')
+                body['input'][2].pop('status')
+                contract_send(url, body)
+                contract_send(url, body)
+            self.assertEqual(len(provider.shadow), 3)
+            self.assertEqual(provider.primary[-1], body, 'canonical native echo is untouched')
+            counts = [json.dumps(r).count('IMMUTABLE_BULK_MARKER') for r in provider.shadow]
+            if os.environ.get('CARRY_SHADOW_EVIDENCE'):
+                Path(os.environ['CARRY_SHADOW_EVIDENCE']).write_text(json.dumps({
+                    'fixture_only': True, 'bulk_mentions_per_review': counts,
+                    'review_input_bytes': [len(json.dumps(r['input']).encode()) for r in provider.shadow],
+                    'primary_calls': len(provider.primary), 'shadow_calls': len(provider.shadow)
+                }, indent=2) + '\n')
+            self.assertEqual(counts, [3000, 3000, 3000],
+                             'exposure/metadata bookkeeping must not duplicate immutable main source')
+            for index, review in enumerate(provider.shadow):
+                records = wire_data(review)
+                blocks = [r for r in records if 'items' in r]
+                self.assertTrue(blocks)
+                self.assertTrue(all('eligible' not in r for r in blocks),
+                                'immutable observation must not freeze stale eligibility')
+                self.assertEqual(records[-1]['eligible_group_ids'],
+                                 ['g1'] if index == 0 else ['g1', 'g3'])
+            self.assertEqual(contract_state(directory)['invalid_reviews'], 0)
+
+
     def test_json_mode_requires_json_in_actual_input_message_text(self):
         from scripts.proxy_native_fixture import Fixture
         import urllib.error
