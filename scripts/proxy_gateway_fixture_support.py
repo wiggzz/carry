@@ -58,4 +58,3 @@ class Gateway:
         except urllib.error.HTTPError as error:
             with error:
                 return error.code, error.read()
-
