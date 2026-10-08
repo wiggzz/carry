@@ -55,7 +55,10 @@ async fn proxy_cli_serves_health_and_forwards_opaque_json() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(healthy, "carry proxy must expose a working HTTP health route");
+    assert!(
+        healthy,
+        "carry proxy must expose a working HTTP health route"
+    );
     let input = json!({
         "model": "fixture-model",
         "input": [{"role": "user", "content": "opaque user's request"}],
