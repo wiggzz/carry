@@ -78,6 +78,29 @@ pathlib.Path(os.environ['HOME'],'client-evidence.json').write_text(json.dumps({'
                     self.assertNotEqual(sock.connect_ex(('127.0.0.1',port)), 0, 'owned proxy not cleaned')
 
 
+    def test_rpc_checkpoint_waits_for_settled_then_installs_and_continues(self):
+        from scripts.proxy_trial import run_rpc_checkpoint
+        import sys
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); binary=root/'fake-pi'
+            binary.write_text('''import json,sys
+for line in sys.stdin:
+ command=json.loads(line)
+ if command['type']=='prompt':
+  print(json.dumps({'type':'response','id':command['id'],'success':True}),flush=True)
+  print(json.dumps({'type':'agent_end'}),flush=True)
+  print(json.dumps({'type':'agent_settled'}),flush=True)
+ else:
+  print(json.dumps({'type':'response','id':command['id'],'success':True,'data':{'summary':'checkpoint'}}),flush=True)
+''')
+            with (root/'events').open('w') as output:
+                code=run_rpc_checkpoint([sys.executable,str(binary)],cwd=root,env=os.environ.copy(),
+                    output=output,prompt='fixture',timeout=3)
+            self.assertEqual(code,0)
+            events=[json.loads(line) for line in (root/'events').read_text().splitlines()]
+            self.assertEqual(sum(e['type']=='agent_settled' for e in events),2)
+            self.assertEqual([e['id'] for e in events if e['type']=='response'],['p1','c1','p2'])
+
     def test_effective_mode_is_checked_locally_before_client_start(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); workspace=root/'workspace'; workspace.mkdir()

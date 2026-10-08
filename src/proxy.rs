@@ -343,7 +343,7 @@ async fn metrics(
         "mode": format!("{:?}", service.config.mode).to_lowercase(),
         "scope": "explicit_session", "primary": session.primary, "shadow": session.shadow,
         "completed_requests": session.completed_requests, "compactions": session.compactions,
-        "native_compactions": session.native_compactions, "invalid_reviews": session.invalid_reviews,
+        "native_compactions": session.native_compactions, "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews,
         "failed_primaries": session.failed_primaries, "last_plan": session.last_plan,
         "cost_basis": "native_usage_standard_rate_model_not_invoice; estimates_are_not_token_counts"
     })))
@@ -385,7 +385,7 @@ async fn forward(
     service: Arc<Service>,
     headers: HeaderMap,
     bytes: Bytes,
-    native: bool,
+    legacy_native: bool,
 ) -> Result<Response, Failure> {
     authorize(&service, &headers)?;
     let id = identity(&headers)?;
@@ -416,13 +416,41 @@ async fn forward(
             "review modes support full-history HTTP Responses only, not previous_response_id/conversation/background",
         ));
     }
+    let native = legacy_native
+        || body["input"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["type"] == "compaction_trigger")
+        });
+    let reset_divergence = match headers.get("x-carry-history-policy") {
+        None => false,
+        Some(value) if value == "strict" => false,
+        Some(value) if value == "reset-on-divergence" => true,
+        Some(_) => {
+            return Err(failure(
+                StatusCode::BAD_REQUEST,
+                "unsupported explicit history policy",
+            ));
+        }
+    };
     let mut outbound = body.clone();
     let mut commit = None;
     if let Some(id) = id {
         let lock = session_lock(&service, &id).await;
         let mut session = load(&service, &id)?;
         if let Some(input) = body["input"].as_array() {
-            session.ingest(input).map_err(|_| failure(StatusCode::CONFLICT, "history diverged, invalid checkpoint or lineage limit; use explicit branch/native compaction"))?;
+            if service.config.mode == Mode::Off {
+                // Off is byte-faithful forwarding, not a review ancestry gate.
+                // Tracking failures may retire tracking state, never reject a
+                // caller checkpoint/summary or materialize stateful ancestors.
+                if session.ingest(input).is_err() {
+                    session.reset_active();
+                    session.history_rebases += 1;
+                    let _ = session.ingest(input);
+                }
+            } else {
+                session.ingest_with_rebase(input, reset_divergence).map_err(|_| failure(StatusCode::CONFLICT, "history diverged, invalid checkpoint or lineage limit; use explicit branch/native checkpoint or opt into x-carry-history-policy: reset-on-divergence"))?;
+            }
         } else if service.config.mode != Mode::Off {
             return Err(failure(
                 StatusCode::BAD_REQUEST,
@@ -480,7 +508,7 @@ async fn forward(
             _lock: lock,
         });
     }
-    let endpoint = if native {
+    let endpoint = if legacy_native {
         format!(
             "{}/compact",
             service.config.upstream_url.trim_end_matches('/')

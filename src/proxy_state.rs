@@ -70,6 +70,8 @@ pub(super) struct Session {
     pub failed_primaries: u64,
     pub compactions: u64,
     pub native_compactions: u64,
+    #[serde(default)]
+    pub history_rebases: u64,
     pub last_plan: Value,
     pub review_cache_key: String,
     pub review_context: Value,
@@ -104,6 +106,10 @@ fn identity(value: &Value) -> Value {
 
 impl Session {
     pub fn ingest(&mut self, input: &[Value]) -> Result<()> {
+        self.ingest_with_rebase(input, false)
+    }
+
+    pub fn ingest_with_rebase(&mut self, input: &[Value], reset_divergence: bool) -> Result<()> {
         if self.version != 0 && self.version != 1 {
             bail!("unsupported proxy checkpoint version");
         }
@@ -132,8 +138,11 @@ impl Session {
         if !prefix_compatible(&incoming, &previous) {
             // Native opaque compaction is an explicit ancestry discontinuity,
             // not a guess based on a common user prompt or numeric turn index.
-            if input.iter().any(|v| v["type"] == "compaction") {
+            if input.iter().any(|v| v["type"] == "compaction") || reset_divergence {
+                // Explicit reset is not a lineage assertion: retire all main
+                // selection, memories, shadow source/opinions and cache evidence.
                 self.reset_active();
+                self.history_rebases += 1;
             } else {
                 bail!("history diverged; use a new x-carry-branch or native compaction checkpoint");
             }

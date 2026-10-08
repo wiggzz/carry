@@ -19,6 +19,8 @@ class Fixture:
         self.client = client
         self.case = case
         self.reviews = []
+        self.compact_calls = []
+        self.summary_calls = []
         self.calls = []
         self.errors = []
         outer = self
@@ -47,24 +49,38 @@ class Fixture:
                             'input_tokens_details':{'cached_tokens':0,'cache_write_tokens':0}}}
                         raw=json.dumps(value).encode(); content_type='application/json'
                     else:
-                        if self.path != '/v1/responses':
+                        legacy=self.path == '/v1/responses/compact'
+                        native_compact=legacy or any(i.get('type')=='compaction_trigger' for i in body.get('input',[]))
+                        if self.path not in ('/v1/responses','/v1/responses/compact'):
                             raise ValueError('unsupported fixture route')
                         cache_key = body.get('prompt_cache_key')
-                        if not isinstance(cache_key, str) or not cache_key or (outer.calls and
-                                cache_key != outer.calls[0].get('prompt_cache_key')):
+                        summary=outer.case=='pi-checkpoint' and cache_key is None
+                        coding=[c for c in outer.calls if c.get('prompt_cache_key')]
+                        if not summary and (not isinstance(cache_key, str) or not cache_key or (coding and
+                                cache_key != coding[0].get('prompt_cache_key'))):
                             raise ValueError('native cache namespace missing or changed')
                         outer.calls.append(body)
-                        count = len(outer.calls)
-                        if count > 4:
+                        if native_compact: outer.compact_calls.append(body)
+                        if summary: outer.summary_calls.append(body)
+                        count = len(outer.calls)-len(outer.compact_calls)-len(outer.summary_calls)
+                        if len(outer.calls) > 8:
                             raise ValueError('unexpected client request loop')
                         name = 'exec_command' if outer.client == 'codex' else 'bash'
-                        if count == 1:
+                        if summary:
+                            output=[{'type':'message','id':'msg_summary_'+str(len(outer.summary_calls)),
+                                'status':'completed','role':'assistant','content':[{'type':'output_text',
+                                'text':'FIXTURE_PI_CHECKPOINT','annotations':[]}]}]
+                        elif native_compact:
+                            if outer.case not in ('v1','v2'): raise ValueError('unexpected native compaction')
+                            output=[{'type':'compaction','id':'cmp_fixture',
+                                'encrypted_content':'FIXTURE_ONLY_NOT_PROVIDER_STATE'}]
+                        elif count == 1:
                             if not any(tool.get('name') == name for tool in body.get('tools', [])):
                                 raise ValueError('native client tool schema missing')
                             arguments = ({'cmd':'printf FIXTURE_TOOL_OK > proxy-fixture.txt; cat proxy-fixture.txt',
                                           'yield_time_ms':1000,'max_output_tokens':128} if outer.client == 'codex'
                                          else {'command':'printf FIXTURE_TOOL_OK > proxy-fixture.txt; cat proxy-fixture.txt'})
-                            if outer.case == 'compact':
+                            if outer.case in ('compact','pi-checkpoint'):
                                 commands=['printf FIXTURE_TOOL_OK > proxy-fixture.txt; python3 -c '+
                                     '\"print(\'DROP_COHORT_PAYLOAD_A \' * 1400)\"',
                                     'printf FIXTURE_TOOL_OK_B > proxy-fixture-b.txt; python3 -c '+
@@ -80,8 +96,9 @@ class Fixture:
                                 output = [{'type':'function_call','id':'fc_fixture','status':'completed',
                                     'name':name,'call_id':'call_fixture','arguments':json.dumps(arguments)}]
                         else:
-                            if not any(item.get('type') == 'function_call_output'
-                                       for item in body.get('input', []) if isinstance(item,dict)):
+                            if not any(item.get('type') in ('function_call_output','compaction')
+                                       for item in body.get('input', []) if isinstance(item,dict)) and not (
+                                           outer.case=='pi-checkpoint' and 'FIXTURE_PI_CHECKPOINT' in json.dumps(body['input'])):
                                 raise ValueError('native full-history tool-result echo missing')
                             if outer.case == 'compact' and count < 4:
                                 command='printf SMALL_COHORT_'+str(count)
@@ -98,6 +115,10 @@ class Fixture:
                             'usage':{'input_tokens':1000,'output_tokens':10,'total_tokens':1010,
                             'input_tokens_details':{'cached_tokens':0,'cache_write_tokens':1000},
                             'output_tokens_details':{'reasoning_tokens':0}}}
+                        if outer.case in ('v1','v2') and not native_compact and count==1:
+                            value['usage']['input_tokens']=50000
+                            value['usage']['total_tokens']=50010
+                            value['usage']['input_tokens_details']['cache_write_tokens']=50000
                         events = [{'type':'response.created','response':{**value,'output':[],'status':'in_progress'}}]
                         for index, item in enumerate(output):
                             initial = {**item,'status':'in_progress'}
@@ -110,7 +131,7 @@ class Fixture:
                                     {'type':'response.function_call_arguments.done','output_index':index,
                                      'item_id':item['id'],'arguments':item['arguments']},
                                 ])
-                            else:
+                            elif item['type'] == 'message':
                                 initial['content']=[]
                                 part=item['content'][0]
                                 events.extend([
@@ -124,10 +145,15 @@ class Fixture:
                                     {'type':'response.content_part.done','output_index':index,'content_index':0,
                                      'item_id':item['id'],'part':part},
                                 ])
+                            else:
+                                events.append({'type':'response.output_item.added','output_index':index,'item':initial})
                             events.append({'type':'response.output_item.done','output_index':index,'item':item})
                         events.append({'type':'response.completed','response':value})
                         raw = b''.join(('event: '+event['type']+'\ndata: '+json.dumps(event)+'\n\n').encode() for event in events)
                         content_type='text/event-stream'
+                        if legacy:
+                            raw=json.dumps({'output':output,'usage':value['usage']}).encode()
+                            content_type='application/json'
                     self.send_response(200); self.send_header('content-type',content_type)
                     self.send_header('content-length',str(len(raw))); self.end_headers()
                     # Deliberately fragment UTF-8/JSON/SSE independently of lines.
@@ -190,22 +216,27 @@ def main():
         parser.error('fixture output must be fresh')
     args.output.mkdir(parents=True)
     results=[]
-    for client,case in ((c,m) for c in ('codex','pi') for m in ('off','compact')):
+    for client,case in [('codex','off'),('codex','compact'),('pi','off'),('pi','compact'),('codex','v1'),('codex','v2'),('pi','pi-checkpoint-strict'),('pi','pi-checkpoint'),('pi','pi-checkpoint-off')]:
         label=client+'-'+case
         workspace=args.output / (label+'-workspace'); workspace.mkdir()
         subprocess.run(['git','init','-q',str(workspace)],check=True)
         env={k:v for k,v in os.environ.items() if not k.startswith(('OPENAI_','CARRY_PROXY_'))}
         env.update(CARRY_PROXY_UPSTREAM_KEY='synthetic-fixture-key', CARRY_PROXY_CLASSIFIER_KEY='synthetic-fixture-key')
-        with Fixture(client,case) as fixture, socket.socket() as sock:
+        with Fixture(client,'pi-checkpoint' if case.startswith('pi-checkpoint') else case) as fixture, socket.socket() as sock:
             sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]; sock.close()
             trial=args.output / (label+'-trial')
             command=['python3',str(Path(__file__).with_name('proxy_trial.py')),
                 '--client',client,'--carry-binary',args.carry,'--client-binary',getattr(args,client),
-                '--workspace',str(workspace),'--trial-dir',str(trial),'--mode',case,
+                '--workspace',str(workspace),'--trial-dir',str(trial),'--mode','off' if case in ('off','pi-checkpoint-off') else 'compact',
+                '--codex-sandbox','danger-full-access',
+                '--codex-native-compaction',case if case in ('v1','v2') else 'disabled',
                 '--payoff-requests','5','--min-payback-percent','0',
                 '--listen',f'127.0.0.1:{port}','--upstream-url',fixture.url+'/v1/responses',
                 '--classifier-url',fixture.url+'/classifier','--timeout','60',
                 '--prompt','Run the supplied tool once and finish. This is a scripted offline fixture.']
+            if case.startswith('pi-checkpoint'):
+                command+=['--pi-checkpoint-fixture','--history-policy',
+                    'reset-on-divergence' if case=='pi-checkpoint' else 'strict']
             run=subprocess.run(command,env=env,text=True,capture_output=True,timeout=85)
             trace=(trial / 'client-events.jsonl').read_text() if (trial / 'client-events.jsonl').exists() else ''
             marker=workspace / 'proxy-fixture.txt'
@@ -216,6 +247,35 @@ def main():
                 'native_requests':len(fixture.calls),'native_tool_result_echo':len(fixture.calls)>1,
                 'tool_effect_verified':marker.is_file() and marker.read_text()=='FIXTURE_TOOL_OK',
                 'native_final_verified':'FIXTURE_COMPLETE' in trace,'provider_errors':fixture.errors}
+            if case.startswith('pi-checkpoint'):
+                rpc=[json.loads(line) for line in trace.splitlines() if line.startswith('{')]
+                compact=[e for e in rpc if e.get('type')=='response' and e.get('id')=='c1']
+                if case=='pi-checkpoint-strict':
+                    result['explicit_strict_rejection_verified']=bool(run.returncode and compact and compact[0].get('success') is False and '409' in json.dumps(compact))
+                    if result['explicit_strict_rejection_verified']:
+                        results.append(result)
+                        (args.output/'results.json').write_text(json.dumps(results,indent=2)+'\n')
+                        continue
+                elif not run.returncode:
+                    states=list((trial/'state').glob('*.json'))
+                    state=json.loads(states[0].read_text())
+                    events=[json.loads(line) for line in states[0].with_suffix('.jsonl').read_text().splitlines()]
+                    received=[e['data'] for e in events if e['event']=='primary_received']
+                    submitted=[e['data'] for e in events if e['event']=='primary_submitted']
+                    result['pi_checkpoint_verified']=bool(fixture.summary_calls and compact and compact[0].get('success') is True and
+                        'FIXTURE_PI_CHECKPOINT' in json.dumps(fixture.calls[-1]['input']) and
+                        received[-1]==submitted[-1] and state['history_rebases']>=1 and
+                        not state['active_shadow'] and sum(e.get('type')=='agent_settled' for e in rpc)>=2)
+                    result['pi_summary_calls']=len(fixture.summary_calls)
+                    result['history_rebases']=state['history_rebases']
+                    if not result['pi_checkpoint_verified']: result['acceptance_failure']='Pi checkpoint reset/continuation failed'
+            if case in ('v1','v2') and not run.returncode:
+                states=[json.loads(p.read_text()) for p in (trial/'state').glob('*.json')]
+                result['native_checkpoint_verified']=(len(fixture.compact_calls)==1 and
+                    states[0]['native_compactions']==1 and
+                    any(i.get('type')=='compaction' for i in fixture.calls[-1]['input']) and
+                    not any(i.get('type')=='function_call' for i in fixture.calls[-1]['input']))
+                if not result['native_checkpoint_verified']: result['acceptance_failure']='native checkpoint continuation failed'
             if case == 'compact' and not run.returncode:
                 try: result.update(compact_evidence(trial,fixture))
                 except AssertionError as error: result['acceptance_failure']=str(error)
