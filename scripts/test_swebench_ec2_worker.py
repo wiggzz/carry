@@ -205,7 +205,13 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             with self.subTest(harness=harness):
                 self._official_worker_configuration_case(proxy_mode='compact',harness=harness)
 
-    def _official_worker_configuration_case(self,proxy_mode='disabled',harness='carry'):
+    def test_worker_preserves_explicit_history_policy_and_rejects_invalid_before_credentials(self):
+        self._official_worker_configuration_case(proxy_mode='compact',harness='pi',history_policy='reset-on-divergence')
+        self._official_worker_configuration_case(proxy_mode='compact',harness='pi',history_policy='caller-decides')
+        self._official_worker_configuration_case(history_policy='caller-decides')
+        self._official_worker_configuration_case(proxy_mode='compact',harness='pi',history_policy='')
+
+    def _official_worker_configuration_case(self,proxy_mode='disabled',harness='carry',history_policy=None):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             payload = root / "payload"
@@ -219,6 +225,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             capability = base64.b64encode(b"https://example.invalid/object").decode()
             config = root / "worker-config"
             config.write_text(
+                (f"CARRY_PROXY_HISTORY_POLICY={history_policy}\n" if history_policy is not None else "") +
                 f"CARRY_PROXY_MODE={proxy_mode}\nCARRY_PROXY_CLASSIFIER_MODEL=gpt-6-sol\n"
                 "CARRY_PROXY_CLASSIFIER_EFFORT=medium\nCARRY_PROXY_PAYOFF_REQUESTS=5\nCARRY_PROXY_MIN_PAYBACK_PERCENT=3\n"
                 f"SOURCE_URL_B64={capability}\nKEY_URL_B64={capability}\nDOCKER_AUTH_URL_B64={capability}\n"
@@ -294,11 +301,17 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             )
             run = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
 
+            if history_policy in ('caller-decides',''):
+                self.assertNotEqual(run.returncode,0)
+                self.assertFalse((root/'secret').exists())
+                self.assertFalse(runner_env.exists())
+                self.assertIn('CARRY_PROXY_HISTORY_POLICY', (carry_root/'results/worker.log').read_text())
+                return
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual(json.loads(pathlib.Path(str(runner_env)+'.proxy').read_text()),{
                 'CARRY_PROXY_MODE':proxy_mode,'CARRY_PROXY_CLASSIFIER_MODEL':'gpt-6-sol',
                 'CARRY_PROXY_CLASSIFIER_EFFORT':'medium','CARRY_PROXY_PAYOFF_REQUESTS':'5',
-                'CARRY_PROXY_MIN_PAYBACK_PERCENT':'3'})
+                'CARRY_PROXY_MIN_PAYBACK_PERCENT':'3','CARRY_PROXY_HISTORY_POLICY':history_policy or 'strict'})
             self.assertEqual(
                 runner_env.read_text(),
                 "agent=5\nevaluator=5\nmode=official-50\nbenchmark_attempt=2\nbenchmark_attempts=3\npolicy=disabled\nlease=8\nmargin=25\nhigh=0\nlow=0\nworker=18900\n"

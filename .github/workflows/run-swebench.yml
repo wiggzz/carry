@@ -83,6 +83,12 @@ on:
         default: disabled
         type: choice
         options: [disabled, off, audit, compact]
+      proxy_history_policy:
+        description: Trusted checkpoint policy; reset retires both active projections on non-prefix native history
+        required: true
+        default: strict
+        type: choice
+        options: [strict, reset-on-divergence]
       proxy_classifier_model:
         description: Exact classifier model ID
         required: true
@@ -193,6 +199,7 @@ jobs:
       CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS: ${{ inputs.carry_compaction_neutral_high_watermark_tokens }}
       CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS: ${{ inputs.carry_compaction_neutral_low_watermark_tokens }}
       CARRY_PROXY_MODE: ${{ inputs.proxy_mode }}
+      CARRY_PROXY_HISTORY_POLICY: ${{ inputs.proxy_history_policy }}
       CARRY_PROXY_CLASSIFIER_MODEL: ${{ inputs.proxy_classifier_model }}
       CARRY_PROXY_CLASSIFIER_EFFORT: ${{ inputs.proxy_classifier_effort }}
       CARRY_PROXY_PAYOFF_REQUESTS: ${{ inputs.proxy_payoff_requests }}
