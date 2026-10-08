@@ -7,6 +7,7 @@ pub(super) struct Observer {
     terminal: bool,
     invalid: bool,
     pub completed: Option<Value>,
+    pub observed: Option<Value>,
 }
 
 impl Observer {
@@ -43,11 +44,15 @@ impl Observer {
                         {
                             self.terminal = true;
                             self.completed = Some(value["response"].clone());
+                            self.observed = Some(value["response"].clone());
                         }
                         Some("response.failed" | "response.incomplete" | "error")
                             if !self.terminal =>
                         {
-                            self.terminal = true
+                            self.terminal = true;
+                            if value["response"].is_object() {
+                                self.observed = Some(value["response"].clone());
+                            }
                         }
                         _ => {}
                     }
