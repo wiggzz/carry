@@ -5,6 +5,118 @@ import urllib.request
 
 
 class NativeProviderFixtureTests(unittest.TestCase):
+    def test_json_mode_requires_json_in_actual_input_message_text(self):
+        from scripts.proxy_native_fixture import Fixture
+        import urllib.error
+        rejected = [[], [{'role': 'user', 'content': 'Finish the task.'}],
+                    [{'role': 'user', 'content': [{'type': 'input_text', 'text': 'Finish.'}],
+                      'metadata': 'JSON'}],
+                    [{'type': 'function_call_output', 'call_id': 'a', 'output': 'JSON'}]]
+        accepted = [[{'role': 'user', 'content': 'Return JSON.'}],
+                    [{'type': 'message', 'role': 'user',
+                      'content': [{'type': 'input_text', 'text': 'Return jSoN.'}]}]]
+        for input_value in rejected + accepted:
+            with self.subTest(input=input_value), Fixture('pi') as fixture:
+                body = {'instructions': 'Return JSON.', 'input': input_value,
+                        'text': {'format': {'type': 'json_object'}}}
+                req = urllib.request.Request(fixture.url + '/classifier',
+                    data=json.dumps(body).encode(), headers={'content-type': 'application/json'})
+                if input_value in rejected:
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        with urllib.request.urlopen(req, timeout=3) as response:
+                            response.read()
+                    self.assertEqual(error.exception.code, 400)
+                    value = json.loads(error.exception.read())
+                    error.exception.close()
+                    self.assertEqual(value['error']['param'], 'input')
+                    self.assertEqual(value['error']['type'], 'invalid_request_error')
+                    self.assertNotIn('code', value['error'])
+                else:
+                    with urllib.request.urlopen(req, timeout=3) as response:
+                        self.assertEqual(response.status, 200)
+                        response.read()
+                    self.assertFalse(fixture.errors)
+
+    def test_proxy_json_mode_review_succeeds_without_json_in_primary_or_tools(self):
+        from scripts.proxy_native_fixture import Fixture
+        import os
+        import select
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        binary = Path(os.environ.get('CARRY_TEST_BINARY', 'target/debug/carry')).resolve()
+        if not binary.is_file():
+            self.skipTest('requires an existing Carry binary; never builds locally')
+        with Fixture('pi') as fixture, tempfile.TemporaryDirectory() as directory:
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith(('OPENAI_', 'CARRY_PROXY_'))}
+            env.update(CARRY_PROXY_UPSTREAM_KEY='synthetic-fixture-key',
+                       CARRY_PROXY_CLASSIFIER_KEY='synthetic-fixture-key')
+            command = [str(binary), 'proxy', '--listen', '127.0.0.1:0',
+                       '--upstream-url', fixture.url + '/v1/responses',
+                       '--classifier-url', fixture.url + '/classifier',
+                       '--classifier-model', 'gpt-6-luna', '--mode', 'audit',
+                       '--state-dir', directory]
+            process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, text=True)
+            assert process.stdout is not None
+            try:
+                self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'proxy startup timed out')
+                banner = process.stdout.readline().strip()
+                self.assertTrue(banner.startswith('CARRY_PROXY_LISTEN '), 'proxy failed to start')
+                url = 'http://' + banner.removeprefix('CARRY_PROXY_LISTEN ')
+                body = {'model': 'gpt-6-luna', 'prompt_cache_key': 'plain-conversation',
+                        'instructions': 'Finish the task.',
+                        'tools': [{'type': 'function', 'name': 'bash',
+                                   'description': 'Run a shell command.',
+                                   'parameters': {'type': 'object'}}],
+                        'input': [{'role': 'user', 'content': 'Finish the task.'},
+                                  {'type': 'function_call', 'name': 'bash',
+                                   'call_id': 'old', 'arguments': '{"command":"printf old"}'},
+                                  {'type': 'function_call_output', 'call_id': 'old', 'output': 'old'}]}
+                for turn in range(2):
+                    self.assertNotIn('json', json.dumps(body).lower())
+                    req = urllib.request.Request(url + '/v1/responses',
+                        data=json.dumps(body).encode(), headers={'content-type': 'application/json',
+                                                               'x-carry-session': 'plain-conversation'})
+                    try:
+                        with urllib.request.urlopen(req, timeout=5) as response:
+                            raw = response.read().decode()
+                    except urllib.error.HTTPError as error:
+                        detail = error.read().decode()
+                        error.close()
+                        self.fail(f'primary request {turn} failed: {detail}; {fixture.errors}')
+                    self.assertEqual(fixture.calls[-1], body, 'review must not alter primary/tool data')
+                    result = [json.loads(line[6:]) for line in raw.splitlines()
+                              if line.startswith('data: ')][-1]['response']
+                    if turn == 0:
+                        body['input'] += result['output'] + [
+                            {'type': 'function_call_output', 'call_id': result['output'][0]['call_id'],
+                             'output': 'FIXTURE_TOOL_OK'}]
+                state_file = next(Path(directory).glob('*.json'))
+                state = json.loads(state_file.read_text())
+                if os.environ.get('CARRY_TEST_EVIDENCE'):
+                    events = [json.loads(line) for line in state_file.with_suffix('.jsonl').read_text().splitlines()]
+                    Path(os.environ['CARRY_TEST_EVIDENCE']).write_text(json.dumps({
+                        'fixture_only': True, 'primary_calls': len(fixture.calls),
+                        'classifier_calls': len(fixture.reviews), 'provider_errors': fixture.errors,
+                        'invalid_reviews': state['invalid_reviews'],
+                        'shadow_failures': [e['data'] for e in events if e['event'] == 'shadow_failed']
+                    }, indent=2) + '\n')
+                self.assertEqual(len(fixture.reviews), 1, 'must execute a real classifier HTTP request')
+                self.assertEqual(fixture.reviews[0]['text']['format']['type'], 'json_object')
+                self.assertEqual(len(fixture.reviews[0]['prompt_cache_key']), 64)
+                self.assertEqual(state['invalid_reviews'], 0,
+                                 f'JSON-mode review rejected: {fixture.errors}')
+                self.assertFalse(fixture.errors)
+            finally:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill(); process.wait(timeout=3)
+                process.stdout.close()
+
     def test_classifier_rejects_present_cache_keys_above_provider_character_limit(self):
         from scripts.proxy_native_fixture import Fixture
         import urllib.error

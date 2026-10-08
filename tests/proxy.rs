@@ -450,6 +450,11 @@ async fn classifier_cache_affinity_is_bounded_stable_and_identity_isolated() {
             }
             let reviews = shadow.lock().await;
             let review = reviews.last().unwrap();
+            assert_eq!(
+                review["input"][0],
+                json!({"role": "user", "content": "Return JSON."}),
+                "JSON-mode instruction must be a stable reviewer-only input message"
+            );
             let key = review["prompt_cache_key"].as_str().unwrap();
             assert!(
                 key.len() <= 64,
