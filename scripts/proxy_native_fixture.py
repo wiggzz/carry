@@ -48,6 +48,26 @@ class Fixture:
                             self.send_header('content-length', str(len(raw))); self.end_headers()
                             self.wfile.write(raw)
                             return
+                        # JSON mode checks message text, not instructions, metadata or format keys.
+                        message_text = []
+                        for record in body.get('input', []):
+                            if record.get('type', 'message') != 'message':
+                                continue
+                            content = record.get('content', '')
+                            if isinstance(content, str):
+                                message_text.append(content)
+                            elif isinstance(content, list):
+                                message_text.extend(part['text'] for part in content
+                                    if isinstance(part, dict) and isinstance(part.get('text'), str))
+                        if (body.get('text', {}).get('format', {}).get('type') == 'json_object'
+                                and not any('json' in text.lower() for text in message_text)):
+                            outer.errors.append('json_instruction_missing')
+                            raw = json.dumps({'error': {'type': 'invalid_request_error', 'param': 'input',
+                                'message': "Response input messages must contain the word 'json' in some form to use 'text.format' of type 'json_object'."}}).encode()
+                            self.send_response(400); self.send_header('content-type', 'application/json')
+                            self.send_header('content-length', str(len(raw))); self.end_headers()
+                            self.wfile.write(raw)
+                            return
                         targets=set()
                         for record in body.get('input', []):
                             try: data=json.loads(record.get('content', ''))
