@@ -2364,6 +2364,14 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
                 "solved_at_least_once": bool(resolved_count),
                 "wilson_95_interval": wilson_95_interval(resolved_count, attempt_count),
             }
+            if provenance.get("proxy", {}).get("mode", "disabled") != "disabled":
+                summary = task_harness_reports[f"{task['instance_id']}/{harness}"]
+                summary["observed_cost_lower_bound_usd"] = sum(
+                    (item.get("proxy_summary") or {}).get(
+                        "observed_cost_lower_bound_usd", item.get("estimated_cost_usd") or 0)
+                    for item in task_records)
+                if len(costs) != len(task_records):
+                    summary["estimated_cost_usd"] = None
     report = {
         "denominator": denominator, "attempts_per_task_harness": attempt_count,
         "attempt_numbers": list(attempt_numbers), "completed": completed, "resolved": resolved,
