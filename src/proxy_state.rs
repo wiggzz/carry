@@ -198,9 +198,9 @@ impl Session {
         let mut results = BTreeMap::<String, Vec<usize>>::new();
         for (index, item) in live.iter().enumerate() {
             let ty = item.value["type"].as_str().unwrap_or("message");
-            if (matches!(ty, "reasoning" | "function_call") || item.value["role"] == "assistant")
-                && let Some(prior) = cohorts.insert(item.cohort, index)
-            {
+            // Securely echoed provider outputs share a cohort even when a new
+            // opaque output type is unknown. Its pin applies to the whole unit.
+            if let Some(prior) = cohorts.insert(item.cohort, index) {
                 join(&mut parent, prior, index);
             }
             if let Some(call_id) = item.value["call_id"].as_str() {
@@ -471,10 +471,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tolerated_native_metadata_echo_uses_current_exact_wire_values() {
+        let mut state = Session::default();
+        let first = vec![
+            json!({"role": "user", "content": "goal"}),
+            json!({"type": "message", "id": "msg", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "done", "annotations": []}]}),
+        ];
+        state.ingest(&first).unwrap();
+        let mut echoed = first;
+        echoed[1].as_object_mut().unwrap().remove("id");
+        echoed[1].as_object_mut().unwrap().remove("status");
+        echoed[1]["content"][0].as_object_mut().unwrap().remove("annotations");
+        state.ingest(&echoed).unwrap();
+        assert_eq!(
+            state.render_primary(),
+            echoed,
+            "tolerant echo matching must not rewrite native metadata back to prior values"
+        );
+    }
+
+    #[test]
     fn unknown_item_in_secure_completed_output_cohort_pins_parallel_tools() {
         let mut state = Session::default();
         let goal = json!({"role": "user", "content": "goal"});
-        state.ingest(&[goal.clone()]).unwrap();
+        state.ingest(std::slice::from_ref(&goal)).unwrap();
         let call =
             json!({"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"});
         let opaque = json!({"type": "future_native_output", "payload": "opaque"});
@@ -539,7 +559,7 @@ mod tests {
     fn new_outputs_and_results_do_not_inherit_prior_input_exposure() {
         let mut state = Session::default();
         let initial = json!({"role": "user", "content": "goal"});
-        state.ingest(&[initial.clone()]).unwrap();
+        state.ingest(std::slice::from_ref(&initial)).unwrap();
         state.history[0].exposed = true;
         state.pending_output = vec![
             json!({"type": "function_call", "id": "fc", "status": "completed", "call_id": "a", "name": "native", "arguments": "{}"}),
