@@ -4,6 +4,7 @@ mod log;
 mod mcp;
 mod openai;
 mod protocol;
+mod proxy;
 mod run;
 mod terminal;
 mod web;
@@ -249,6 +250,10 @@ impl ReasoningEffort {
 async fn main() -> Result<()> {
     let mut argv = std::env::args_os().collect::<Vec<_>>();
     match argv.get(1).and_then(|argument| argument.to_str()) {
+        Some("proxy") => {
+            argv.remove(1);
+            return proxy::serve(proxy::ProxyCli::parse_from(argv)).await;
+        }
         Some("login") => {
             argv.remove(1);
             let login = LoginCli::parse_from(argv);
