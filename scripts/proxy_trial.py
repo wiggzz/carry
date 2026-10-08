@@ -81,6 +81,8 @@ def run_rpc_checkpoint(command, *, cwd, env, output, prompt, timeout):
     finally:
         stop_process_group(process)
         reader.join(timeout=3)
+        process.stdin.close()
+        process.stdout.close()
 
 
 def main():

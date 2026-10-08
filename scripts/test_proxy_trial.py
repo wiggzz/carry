@@ -93,9 +93,13 @@ for line in sys.stdin:
  else:
   print(json.dumps({'type':'response','id':command['id'],'success':True,'data':{'summary':'checkpoint'}}),flush=True)
 ''')
-            with (root/'events').open('w') as output:
-                code=run_rpc_checkpoint([sys.executable,str(binary)],cwd=root,env=os.environ.copy(),
-                    output=output,prompt='fixture',timeout=3)
+            import warnings
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always',ResourceWarning)
+                with (root/'events').open('w') as output:
+                    code=run_rpc_checkpoint([sys.executable,str(binary)],cwd=root,env=os.environ.copy(),
+                        output=output,prompt='fixture',timeout=3)
+            self.assertFalse(caught,'RPC supervisor must close owned subprocess pipes')
             self.assertEqual(code,0)
             events=[json.loads(line) for line in (root/'events').read_text().splitlines()]
             self.assertEqual(sum(e['type']=='agent_settled' for e in events),2)
