@@ -17,30 +17,9 @@ impl Drop for Proxy {
 async fn proxy_cli_serves_health_and_forwards_opaque_json() {
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
-    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = reservation.local_addr().unwrap();
-    drop(reservation);
     let state = tempfile::tempdir().unwrap();
-    let mut proxy = Proxy(
-        Command::new(env!("CARGO_BIN_EXE_carry"))
-            .args([
-                "proxy",
-                "--listen",
-                &address.to_string(),
-                "--upstream-url",
-                &format!("http://{upstream_address}/v1/responses"),
-                "--state-dir",
-                state.path().to_str().unwrap(),
-            ])
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("CARRY_PROXY_AUTH_TOKEN")
-            .env("CARRY_PROXY_UPSTREAM_KEY", "fixture-only")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let (mut proxy, url) = start_proxy(state.path(), upstream_address, "off").await;
+    let address = url.strip_prefix("http://").unwrap();
     let client = reqwest::Client::new();
     let mut healthy = false;
     for _ in 0..100 {
@@ -90,7 +69,7 @@ async fn proxy_cli_serves_health_and_forwards_opaque_json() {
                     let body: serde_json::Value =
                         serde_json::from_slice(&bytes[split + 4..split + 4 + length]).unwrap();
                     assert_eq!(body, expected, "primary request must remain opaque");
-                    assert!(headers.contains("Bearer fixture-only"));
+                    assert!(headers.contains("Bearer fixture-primary"));
                     break;
                 }
             }
@@ -338,15 +317,12 @@ async fn start_proxy_options(
     extra: &[&str],
     gateway: &str,
 ) -> (Proxy, String) {
-    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = reservation.local_addr().unwrap();
-    drop(reservation);
     let mut proxy = Proxy(
         Command::new(env!("CARGO_BIN_EXE_carry"))
             .args([
                 "proxy",
                 "--listen",
-                &address.to_string(),
+                "127.0.0.1:0",
                 "--upstream-url",
                 &format!("http://{upstream}/v1/responses"),
                 "--classifier-url",
@@ -371,6 +347,16 @@ async fn start_proxy_options(
             .spawn()
             .unwrap(),
     );
+    let mut reader = std::io::BufReader::new(proxy.0.stdout.take().unwrap());
+    let mut banner = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut banner).unwrap();
+    let address: std::net::SocketAddr = banner
+        .trim()
+        .strip_prefix("CARRY_PROXY_LISTEN ")
+        .expect("proxy must announce its own bound listener before readiness")
+        .parse()
+        .unwrap();
+    proxy.0.stdout = Some(reader.into_inner());
     let url = format!("http://{address}");
     for _ in 0..100 {
         if reqwest::get(format!("{url}/health"))
