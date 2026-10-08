@@ -1831,6 +1831,31 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertEqual(set(report["harnesses"]), {"carry"})
             self.assertEqual(len(json.loads((output / "records.json").read_text())), 5)
 
+    def test_finalize_keeps_proxy_task_cost_unavailable_when_one_attempt_is_censored(self):
+        tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
+        records = [
+            {"instance_id": task["instance_id"], "harness": "pi", "attempt": attempt,
+             "status": "evaluated", "patch": "", "resolved": True,
+             "estimated_cost_usd": 1.0 if attempt == 1 else None,
+             "proxy_summary": {"estimated_total_cost_usd": 1.0 if attempt == 1 else None,
+                               "observed_cost_lower_bound_usd": 1.0 if attempt == 1 else 0.25}}
+            for task in tasks for attempt in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            self.worker.finalize(tasks=tasks, records=records, output=output,
+                provenance={"proxy": {"mode": "compact"}}, harnesses=("pi",),
+                attempt_numbers=(1, 2))
+            report = json.loads((output / "report.json").read_text())
+            self.assertEqual(report["denominator"], 10)
+            self.assertIsNone(report["harnesses"]["pi"]["estimated_cost_usd"])
+            for task in tasks:
+                summary = report["task_harnesses"][f"{task['instance_id']}/pi"]
+                self.assertEqual(summary["attempts"], 2)
+                self.assertEqual(summary["resolved"], 2)
+                self.assertIsNone(summary["estimated_cost_usd"])
+                self.assertEqual(summary["observed_cost_lower_bound_usd"], 1.25)
+
     def test_finalize_preserves_three_independent_attempts_per_task_and_harness(self):
         tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
         records = [
