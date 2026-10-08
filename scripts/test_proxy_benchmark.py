@@ -15,10 +15,11 @@ class ProxyBenchmarkTests(unittest.TestCase):
     def test_opt_in_config_survives_runner_validation(self):
         config = worker.validate_config(dict(BASE_IMAGE='rust@sha256:' + 'a' * 64,
             CODEX_VERSION='0.147.0', PI_VERSION='0.84.2', MODEL='gpt-6-luna', REASONING='medium',
-            CARRY_PROXY_MODE='compact', CARRY_PROXY_CLASSIFIER_MODEL='gpt-6-luna',
+            CARRY_PROXY_MODE='compact', CARRY_PROXY_HISTORY_POLICY='reset-on-divergence', CARRY_PROXY_CLASSIFIER_MODEL='gpt-6-luna',
             CARRY_PROXY_CLASSIFIER_EFFORT='low', CARRY_PROXY_PAYOFF_REQUESTS='5',
             CARRY_PROXY_MIN_PAYBACK_PERCENT='3', BENCHMARK_HARNESS='codex'))
         self.assertEqual(config.get('CARRY_PROXY_MODE'), 'compact')
+        self.assertEqual(config.get('CARRY_PROXY_HISTORY_POLICY'), 'reset-on-divergence')
         self.assertEqual(config.get('CARRY_PROXY_MIN_PAYBACK_PERCENT'), '3')
 
 
@@ -34,7 +35,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 1, '', 'No such container')
             return subprocess.CompletedProcess(command, 0, '172.20.0.2\n' if '--format' in command else '', '')
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
-                'CARRY_PROXY_MODE': 'compact', 'BENCHMARK_HARNESS': 'pi',
+                'CARRY_PROXY_MODE': 'compact', 'CARRY_PROXY_HISTORY_POLICY':'reset-on-divergence', 'BENCHMARK_HARNESS': 'pi',
                 'OPENAI_API_KEY': 'provider-private'}):
             network = worker.start_agent_network(identity='one-slot', proxy_image='node-image',
                 proxy_script=ROOT / 'scripts/openai_proxy.js', execute=docker,
@@ -48,6 +49,9 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(command[command.index('--user')+1], f'{os.getuid()}:{os.getgid()}')
             gateway = next((kw for cmd, kw in calls if '/proxy/openai_proxy.js' in cmd), {})
             self.assertNotIn('OPENAI_API_KEY', gateway.get('env', {}))
+            self.assertEqual(gateway.get('env', {}).get('BENCHMARK_CONTEXT_HISTORY_POLICY'), 'reset-on-divergence')
+            gateway_cmd = next(cmd for cmd,kw in calls if '/proxy/openai_proxy.js' in cmd)
+            self.assertIn('BENCHMARK_CONTEXT_HISTORY_POLICY',gateway_cmd)
             self.assertNotEqual(network['client_token'], 'provider-private')
             self.assertTrue(network['session_id'])
             worker.cleanup_agent_network(network, execute=docker)
@@ -377,6 +381,21 @@ upstream.listen(0,'127.0.0.1',()=>{ const transport=(opts,cb)=>http.request({...
         summary=worker.proxy_benchmark.summarize_events(events)
         self.assertIsNone(summary['estimated_total_cost_usd'])
         self.assertEqual(summary['primary']['unpriced_requests'],1)
+
+
+class HistoryPolicyContractTests(unittest.TestCase):
+    def test_validation_provenance_and_report_gate_preserve_explicit_policy(self):
+        proxy=worker.proxy_benchmark
+        values={'BENCHMARK_HARNESS':'pi','CARRY_PROXY_MODE':'compact',
+                'CARRY_PROXY_HISTORY_POLICY':'reset-on-divergence'}
+        self.assertEqual(proxy.provenance(values)['history_policy'],'reset-on-divergence')
+        self.assertEqual(proxy.provenance({})['history_policy'],'strict')
+        for invalid in ('','caller-decides','STRICT'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                proxy.validate_config({**values,'CARRY_PROXY_HISTORY_POLICY':invalid})
+        strict=proxy.provenance({**values,'CARRY_PROXY_HISTORY_POLICY':'strict'})
+        with self.assertRaisesRegex(ValueError,'dispatched'):
+            proxy.validate_report({'provenance':{'proxy':strict}},[],values)
 
 
 if __name__ == '__main__':

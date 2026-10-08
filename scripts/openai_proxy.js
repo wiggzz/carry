@@ -4,6 +4,43 @@ const http = require('node:http');
 const https = require('node:https');
 
 const MAX_TELEMETRY_BYTES = 8 * 1024 * 1024;
+// Fixed public vocabulary, not arbitrary caller/provider strings or object keys.
+const TELEMETRY_MODELS = new Set(['gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol']);
+const TELEMETRY_TIERS = new Set(['auto', 'default', 'standard', 'flex', 'priority', 'scale']);
+function telemetryModel(value) {
+  return TELEMETRY_MODELS.has(value) ? value : 'unrecognized';
+}
+function telemetryTier(value) {
+  return value == null ? null : TELEMETRY_TIERS.has(value) ? value : 'unrecognized';
+}
+function telemetryUsage(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const result = {};
+  let unknown = Object.keys(value).some(k => !['input_tokens', 'output_tokens', 'total_tokens',
+    'input_tokens_details', 'output_tokens_details'].includes(k));
+  const number = (source, target, key) => {
+    if (Object.hasOwn(source, key)) {
+      if (Number.isSafeInteger(source[key]) && source[key] >= 0) target[key] = source[key];
+      else unknown = true;
+    }
+  };
+  for (const key of ['input_tokens', 'output_tokens', 'total_tokens']) number(value, result, key);
+  for (const [key, names] of [['input_tokens_details', ['cached_tokens', 'cache_write_tokens']],
+    ['output_tokens_details', ['reasoning_tokens', 'audio_tokens', 'accepted_prediction_tokens', 'rejected_prediction_tokens']]]) {
+    if (!Object.hasOwn(value, key)) continue;
+    const details = value[key];
+    result[key] = {};
+    if (!details || typeof details !== 'object' || Array.isArray(details)) { unknown = true; continue; }
+    if (Object.keys(details).some(k => !names.includes(k))) unknown = true;
+    for (const name of names) number(details, result[key], name);
+  }
+  // Preserve unknown pricing semantics without retaining unknown payload or keys.
+  if (unknown) {
+    result.input_tokens_details ||= {};
+    result.input_tokens_details.unrecognized_billing = 1;
+  }
+  return result;
+}
 
 const LOCAL_ORIGIN = 'http://proxy.invalid';
 const HOP_BY_HOP = new Set([
@@ -67,6 +104,10 @@ function usageRecords(body) {
 
 function serve(options = {}) {
   const contextProxy = process.env.BENCHMARK_CONTEXT_PROXY === '1';
+  const historyPolicy = process.env.BENCHMARK_CONTEXT_HISTORY_POLICY ?? 'strict';
+  if (contextProxy && !['strict', 'reset-on-divergence'].includes(historyPolicy)) {
+    throw new Error('invalid trusted CARRY_PROXY_HISTORY_POLICY');
+  }
   const primaryTransport = options.request || (contextProxy ? http.request : https.request);
   const shadowTransport = options.request || https.request;
   const server = http.createServer((request, response) => {
@@ -113,6 +154,7 @@ function serve(options = {}) {
         headers['x-carry-session'] = process.env.BENCHMARK_SESSION_ID;
         headers['x-carry-tenant'] = 'benchmark';
         headers['x-carry-branch'] = 'main';
+        headers['x-carry-history-policy'] = historyPolicy;
       }
     }
     const throughCarry = contextProxy && !shadow;
@@ -140,8 +182,8 @@ function serve(options = {}) {
       if (inputBytes > MAX_TELEMETRY_BYTES) return;
       try {
         const value = JSON.parse(Buffer.concat(input).toString('utf8'));
-        model = typeof value.model === 'string' ? value.model : null;
-        serviceTier = value.service_tier || null;
+        model = telemetryModel(value.model);
+        serviceTier = telemetryTier(value.service_tier);
         nativeCompaction ||= Boolean(value.compaction_trigger);
       } catch (_) { /* Never write request contents or parse exceptions to logs. */ }
     });
@@ -185,12 +227,12 @@ function serve(options = {}) {
           if (!truncated) {
             const observe = event => {
               const value = event.type === 'response.completed' ? event.response : !event.type ? event : null;
-              if (value?.usage) {
-                nativeUsage = value.usage;
+              if (value?.usage && upstreamResponse.statusCode >= 200 && upstreamResponse.statusCode < 300) {
+                nativeUsage = telemetryUsage(value.usage);
                 toolCalls = Array.isArray(value.output)
                   ? value.output.filter(item => item.type === 'function_call').length : null;
-                model = typeof value.model === 'string' ? value.model : model;
-                serviceTier = value.service_tier ?? serviceTier;
+                if (Object.hasOwn(value, 'model')) model = telemetryModel(value.model);
+                if (Object.hasOwn(value, 'service_tier')) serviceTier = telemetryTier(value.service_tier);
               }
             };
             try { observe(JSON.parse(body)); } catch (_) { /* SSE, not whole JSON. */ }

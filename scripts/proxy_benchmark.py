@@ -3,6 +3,7 @@ from decimal import Decimal, InvalidOperation
 
 DEFAULTS = {
     'CARRY_PROXY_MODE': 'disabled',
+    'CARRY_PROXY_HISTORY_POLICY': 'strict',
     'CARRY_PROXY_CLASSIFIER_MODEL': 'gpt-6-luna',
     'CARRY_PROXY_CLASSIFIER_EFFORT': 'low',
     'CARRY_PROXY_PAYOFF_REQUESTS': '1',
@@ -14,6 +15,8 @@ def validate_config(values):
     config = {key: values.get(key, default) for key, default in DEFAULTS.items()}
     if config['CARRY_PROXY_MODE'] not in {'disabled', 'off', 'audit', 'compact'}:
         raise ValueError('CARRY_PROXY_MODE must be disabled, off, audit, or compact')
+    if config['CARRY_PROXY_HISTORY_POLICY'] not in {'strict', 'reset-on-divergence'}:
+        raise ValueError('CARRY_PROXY_HISTORY_POLICY must be strict or reset-on-divergence')
     if config['CARRY_PROXY_MODE'] != 'disabled':
         if values.get('BENCHMARK_HARNESS', '') not in {'codex', 'pi'}:
             raise ValueError('proxy lanes require exactly one Codex or Pi harness')

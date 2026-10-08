@@ -66,6 +66,31 @@ class AttemptMergeTests(unittest.TestCase):
             },
         }), encoding="utf-8")
 
+    def test_history_policy_is_immutable_with_absent_field_historical_strict(self):
+        from scripts.proxy_benchmark import provenance
+        tasks=[f'task-{i:02d}' for i in range(50)]
+        for second_policy,passes in [('strict',True),('reset-on-divergence',False)]:
+            with self.subTest(policy=second_policy), tempfile.TemporaryDirectory() as directory:
+                root=pathlib.Path(directory); artifacts=root/'artifacts'; artifacts.mkdir()
+                for attempt in (1,2):
+                    self.write_attempt(artifacts,attempt,tasks,total=2)
+                    path=artifacts/f'attempt-{attempt}'/'report.json'
+                    report=json.loads(path.read_text())
+                    report['provenance']['proxy']=provenance({'BENCHMARK_HARNESS':'pi',
+                        'CARRY_PROXY_MODE':'compact','CARRY_PROXY_HISTORY_POLICY':second_policy if attempt==2 else 'strict'})
+                    if attempt==1: report['provenance']['proxy'].pop('history_policy')
+                    path.write_text(json.dumps(report))
+                manifest=root/'tasks.json'; manifest.write_text(json.dumps({'instance_ids':tasks}))
+                result=subprocess.run(['python3',str(SCRIPT),'--artifacts',str(artifacts),
+                    '--manifest',str(manifest),'--harness','all','--attempts','2','--out',str(root/'out')],
+                    text=True,capture_output=True,timeout=10)
+                self.assertEqual(result.returncode==0,passes,result.stderr)
+                if passes:
+                    merged=json.loads((root/'out/report.json').read_text())
+                    self.assertEqual(merged['provenance']['proxy']['history_policy'],'strict')
+                else:
+                    self.assertIn('immutable provenance',result.stderr)
+
     def test_cli_merges_a_declared_four_attempt_official_study(self):
         tasks = [f"task-{index:02d}" for index in range(50)]
         with tempfile.TemporaryDirectory() as directory:

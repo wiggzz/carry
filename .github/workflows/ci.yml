@@ -247,6 +247,8 @@ jobs:
           scripts/test_proxy_workflow.py
           scripts/test_proxy_trial.py
           scripts/test_proxy_native_fixture.py
+          scripts/test_proxy_gateway.py
+          scripts/test_proxy_gateway_native_fixture.py
           scripts/test_prepared_swebench_image.py
           scripts/test_swebench_ec2_worker.py
           scripts/test_docker_registry_login.py
@@ -292,6 +294,22 @@ jobs:
             --codex "$RUNNER_TEMP/proxy-clients/node_modules/.bin/codex" \
             --pi "$RUNNER_TEMP/proxy-clients/node_modules/.bin/pi" \
             --output "$RUNNER_TEMP/proxy-native-fixture"
+
+      - name: Pinned Pi checkpoint policy through production gateway and integrated Carry
+        run: |
+          python3 scripts/proxy_gateway_native_fixture.py \
+            --carry "$PWD/target/x86_64-unknown-linux-musl/release/carry" \
+            --pi "$RUNNER_TEMP/proxy-clients/node_modules/.bin/pi" \
+            --output "$RUNNER_TEMP/proxy-gateway-native-fixture"
+
+      - name: Preserve credential-free production gateway fixture evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: proxy-gateway-native-fixture-${{ github.sha }}
+          path: ${{ runner.temp }}/proxy-gateway-native-fixture
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Preserve credential-free native fixture evidence
         if: always()
