@@ -5,6 +5,8 @@ mod mcp;
 mod openai;
 mod protocol;
 mod proxy;
+mod proxy_state;
+mod proxy_sse;
 mod report;
 mod run;
 mod savings;
