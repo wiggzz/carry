@@ -8,7 +8,9 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
+from unittest import mock
 import sys
 import tempfile
 import unittest
@@ -18,6 +20,33 @@ from scripts.proxy_gateway_fixture_support import Gateway
 
 ROOT = Path(__file__).resolve().parents[1]
 CODEX = os.environ.get('CARRY_HOSTED_TOOL_FIXTURE_CODEX')
+
+
+def stage_node_runtime(bin_dir):
+    # setup-node places its pinned runtime outside os.defpath on hosted runners.
+    # Preserve only that executable, not the ambient PATH or credentials.
+    node = shutil.which('node')
+    if node is None:
+        raise RuntimeError('installed Codex fixture requires an available Node runtime')
+    (bin_dir / 'node').symlink_to(Path(node).resolve())
+
+
+class NodeRuntimePathTests(unittest.TestCase):
+    def test_isolated_path_preserves_selected_node_outside_default_system_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / 'selected-node'; runtime.mkdir()
+            binary = runtime / 'node'
+            binary.write_text('#!/bin/sh\nprintf "SELECTED_NODE_RUNTIME_OK"\n'); binary.chmod(0o755)
+            bin_dir = root / 'bin'; bin_dir.mkdir()
+            client = root / 'npm-wrapper'
+            client.write_text('#!/usr/bin/env node\nnot-real-javascript\n'); client.chmod(0o755)
+            with mock.patch.dict(os.environ, {'PATH': str(runtime)}, clear=True):
+                stage_node_runtime(bin_dir)
+            result = subprocess.run([str(client)], env={'PATH': str(bin_dir) + ':' + os.defpath},
+                capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, 'SELECTED_NODE_RUNTIME_OK')
 
 
 @unittest.skipUnless(CODEX, 'opt in with an installed pinned Codex executable')
@@ -33,6 +62,7 @@ class InstalledCodexHostedToolTests(unittest.TestCase):
             bin_dir = root / 'bin'; bin_dir.mkdir()
             scratch = root / 'tmp'; scratch.mkdir(mode=0o700)
             (bin_dir / 'codex').symlink_to(Path(CODEX).resolve())
+            stage_node_runtime(bin_dir)
             repo = root / 'workspace'; repo.mkdir()
             # Reuse the immutable base object, without creating any Git commits.
             subprocess.run(['git', 'init', '-q', str(repo)], check=True)
