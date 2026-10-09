@@ -108,6 +108,8 @@ def main():
     parser.add_argument('--reasoning', default='medium')
     parser.add_argument('--classifier-model', default='gpt-6-luna')
     parser.add_argument('--classifier-effort', default='low')
+    parser.add_argument('--classifier-cache-policy', choices=['auto','disabled','openai-explicit'],
+        default='auto', help='Reviewer-only stable cache writes; explicit attests a trusted OpenAI gateway')
     parser.add_argument('--payoff-requests', default='1')
     parser.add_argument('--min-payback-percent', default='25')
     parser.add_argument('--timeout', type=int, default=300)
@@ -132,6 +134,7 @@ def main():
     command = [args.carry_binary,'proxy','--listen',args.listen,'--upstream-url',args.upstream_url,
         '--classifier-url',args.classifier_url,'--state-dir',str(root / 'state'), '--mode',args.mode,
         '--classifier-model',args.classifier_model,'--classifier-reasoning-effort',args.classifier_effort,
+        '--classifier-cache-policy',args.classifier_cache_policy,
         '--payoff-requests',args.payoff_requests,'--min-payback-percent',args.min_payback_percent]
     proxy = None
     try:
@@ -185,6 +188,7 @@ def main():
                 'history_policy':args.history_policy,'codex_sandbox':args.codex_sandbox,
                 'codex_native_compaction':args.codex_native_compaction,
                 'classifier_model':args.classifier_model,'classifier_effort':args.classifier_effort,
+                'classifier_cache_policy':args.classifier_cache_policy,
                 'payoff_requests':args.payoff_requests,'min_payback_percent':args.min_payback_percent}, indent=2)+'\n')
             with (root / 'client-events.jsonl').open('w') as output:
                 if args.pi_checkpoint_fixture:

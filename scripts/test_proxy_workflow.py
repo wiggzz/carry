@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -47,6 +48,7 @@ class WorkflowProxyTests(unittest.TestCase):
             self.assertEqual(values.get('CARRY_PROXY_PAYOFF_REQUESTS'), '5')
             self.assertEqual(values.get('CARRY_PROXY_MIN_PAYBACK_PERCENT'), '3')
             self.assertEqual(values.get('CARRY_PROXY_HISTORY_POLICY'), 'reset-on-divergence')
+            self.assertEqual(values.get('CARRY_PROXY_CLASSIFIER_CACHE_POLICY'), 'openai-explicit')
 
 
     def test_parsed_mode_choices_reach_actual_configuration_validator(self):
@@ -75,6 +77,20 @@ class WorkflowProxyTests(unittest.TestCase):
                 'CARRY_PROXY_HISTORY_POLICY':policy})
             self.assertEqual(resolved['CARRY_PROXY_HISTORY_POLICY'],policy)
 
+    def test_parsed_workflow_cache_policy_reaches_real_validator(self):
+        import yaml
+        from scripts.proxy_benchmark import validate_config
+        workflow=yaml.safe_load((ROOT/'.github/workflows/run-swebench.yml').read_text())
+        inputs=workflow.get('on',workflow.get(True))['workflow_dispatch']['inputs']
+        setting=inputs['proxy_classifier_cache_policy']
+        self.assertEqual(setting['default'],'openai-explicit')
+        self.assertEqual(setting['options'],['openai-explicit','disabled','auto'])
+        self.assertEqual(workflow['jobs']['bootstrap-worker']['env']['CARRY_PROXY_CLASSIFIER_CACHE_POLICY'],
+                         '${{ inputs.proxy_classifier_cache_policy }}')
+        for policy in setting['options']:
+            self.assertEqual(validate_config({'CARRY_PROXY_CLASSIFIER_CACHE_POLICY':policy})[
+                'CARRY_PROXY_CLASSIFIER_CACHE_POLICY'],policy)
+
     def test_ci_native_gateway_command_uses_built_binary_and_pinned_pi_prefix(self):
         import yaml
         workflow=yaml.safe_load((ROOT/'.github/workflows/ci.yml').read_text())
@@ -95,6 +111,70 @@ class WorkflowProxyTests(unittest.TestCase):
                 '--carry',str(ROOT/'target/x86_64-unknown-linux-musl/release/carry'),
                 '--pi',str(root/'proxy-clients/node_modules/.bin/pi'),
                 '--output',str(root/'proxy-gateway-native-fixture')])
+
+    def test_ci_reviewer_cache_command_uses_the_exact_built_binary(self):
+        import yaml
+        workflow=yaml.safe_load((ROOT/'.github/workflows/ci.yml').read_text())
+        step=next(s for s in workflow['jobs']['test']['steps'] if s.get('name')==
+                  'Reviewer stable cache boundaries through integrated Carry')
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); binary=root/'bin'; binary.mkdir()
+            fake=binary/'python3'
+            fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$RECORDED_ARGV"\n')
+            fake.chmod(0o755)
+            record=root/'argv'
+            result=subprocess.run(['bash','-eu','-c',step['run']],cwd=ROOT,
+                env={**os.environ,'PATH':str(binary)+':'+os.environ['PATH'],
+                     'RUNNER_TEMP':str(root),'RECORDED_ARGV':str(record)},
+                text=True,capture_output=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(record.read_text().splitlines(),['scripts/proxy_reviewer_cache_fixture.py',
+                '--carry',str(ROOT/'target/x86_64-unknown-linux-musl/release/carry'),
+                '--output',str(root/'proxy-reviewer-cache-fixture')])
+
+    def test_checkpoint_hosted_red_green_restores_source_and_rejects_setup_failures(self):
+        import yaml
+        workflow=yaml.safe_load((ROOT/'.github/workflows/ci.yml').read_text())
+        matches=[s for s in workflow['jobs']['test']['steps'] if s.get('name')==
+                 'Checkpoint size guard behavioral RED and GREEN']
+        self.assertEqual(len(matches),1,'hosted-only Rust regression must exercise intended RED and restore final source')
+        names=['checkpoint_save_limit_accepts_exact_serialized_file_length',
+               'checkpoint_save_limit_preserves_last_loadable_file',
+               'checkpoint_save_limit_rejects_first_oversized_file_without_temporary']
+        for case in ('expected-red','compile-error','zero-tests','unexpected-green','green-failure'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory); (root/'src').mkdir(); (root/'bin').mkdir()
+                source=(ROOT/'src/proxy.rs').read_bytes(); (root/'src/proxy.rs').write_bytes(source)
+                cargo=root/'bin/cargo'
+                cargo.write_text('#!'+os.path.realpath(sys.executable)+'\n'+
+                    'import json,os,pathlib,sys\n'
+                    'p=pathlib.Path("src/proxy.rs"); src=p.read_text(); countfile=pathlib.Path("calls.json")\n'
+                    'calls=json.loads(countfile.read_text()) if countfile.exists() else []\n'
+                    'calls.append(sys.argv[1:]); countfile.write_text(json.dumps(calls))\n'
+                    'case=os.environ["CARGO_CASE"]; names=json.loads(os.environ["CASE_NAMES"])\n'
+                    'if len(calls)==1:\n'
+                    ' assert "if file.metadata()?.len() > max_bytes as u64" not in src\n'
+                    ' if case=="compile-error": print("error: fixture-only compiler failure"); sys.exit(101)\n'
+                    ' if case=="zero-tests": print("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out"); sys.exit(0)\n'
+                    ' if case=="unexpected-green": print("test result: ok. 3 passed; 0 failed"); sys.exit(0)\n'
+                    ' for name,status in zip(names,["ok","FAILED","FAILED"]): print("test proxy::tests::"+name+" ... "+status)\n'
+                    ' print("called `Result::unwrap_err()` on an `Ok` value: ()")\n'
+                    ' print("called `Result::unwrap_err()` on an `Ok` value: ()")\n'
+                    ' print("test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out")\n'
+                    ' sys.exit(101)\n'
+                    'assert "if file.metadata()?.len() > max_bytes as u64" in src\n'
+                    'print("test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out")\n'
+                    'sys.exit(1 if case=="green-failure" else 0)\n')
+                cargo.chmod(0o755)
+                result=subprocess.run(['bash','-eu','-c',matches[0]['run']],cwd=root,
+                    env={**os.environ,'PATH':str(root/'bin')+':'+os.environ['PATH'],
+                         'CARGO_CASE':case,'CASE_NAMES':json.dumps(names)},
+                    text=True,capture_output=True,timeout=10)
+                self.assertEqual(result.returncode==0,case=='expected-red',result.stdout+result.stderr)
+                self.assertEqual((root/'src/proxy.rs').read_bytes(),source,'final source must survive every outcome')
+                calls=json.loads((root/'calls.json').read_text())
+                self.assertEqual(len(calls),2 if case in ('expected-red','green-failure') else 1)
+                self.assertTrue(all(c==['test','--locked','--bin','carry','checkpoint_save_limit_','--','--nocapture'] for c in calls))
 
     def test_actual_result_gate_rejects_missing_and_mismatched_effective_modes(self):
         import tarfile

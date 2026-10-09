@@ -4,6 +4,32 @@
 
 The benchmark default is **`disabled`**, which retains the existing direct lanes. `disabled` and proxy `off` are distinct treatments. Compare `off` versus `compact` on the same candidate, tasks, model, effort, client configuration and native-compaction settings. Measure `disabled` versus `off` separately as transport overhead.
 
+## Reviewer cache policy
+
+The classifier cache policy is **reviewer-only**. It does not add cache fields,
+Carry prompts, or tools to primary requests. `--classifier-cache-policy auto`
+(the local-launcher default) enables stable explicit write boundaries only for
+supported exact classifier models at the official OpenAI Responses endpoint.
+`disabled` preserves the unmarked reviewer representation. `openai-explicit`
+is an explicit assertion that a custom classifier URL is a trusted OpenAI
+Responses gateway; it is not a generic-provider compatibility claim.
+
+The supported exact model IDs are `gpt-6-luna`, `gpt-6-sol`, and `gpt-6.1-sol`.
+Unknown models do not automatically receive this provider-specific schema;
+explicit mode rejects unsupported models before launch. The protected benchmark
+lane uses a fixed OpenAI upstream behind its local gateway, so its recorded
+`CARRY_PROXY_CLASSIFIER_CACHE_POLICY` / workflow
+`proxy_classifier_cache_policy` defaults to `openai-explicit`.
+
+Write endpoints belong to stable reviewer observations, **never the changing
+final ledger**. Up to four compatible write boundaries are retained/rotated.
+Main retention still controls shadow pruning; the classifier has no independent
+retention policy. Native usage receipts—not marker presence or simulated fixture
+usage—are the authority for actual cache reads and billed costs. A cache repair
+requires a new source-frozen matched cohort before changing any savings claim.
+Absent cache-policy fields in historical benchmark provenance mean `disabled`,
+not the new benchmark default. Explicit recorded values remain unchanged.
+
 ## A local trial
 
 Prerequisites: Python 3.10+, a candidate Carry binary, and Codex **0.147.0** or Pi **0.84.2** already installed in an isolated location. Pi requires Node 22.19.0+. The launcher never installs packages, edits your ordinary client home, or creates a service.

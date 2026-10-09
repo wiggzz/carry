@@ -69,9 +69,10 @@ def normalize_legacy_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
         from proxy_benchmark import provenance as proxy_provenance
     except ModuleNotFoundError:
         from scripts.proxy_benchmark import provenance as proxy_provenance
-    normalized.setdefault("proxy", proxy_provenance({}))
+    normalized.setdefault("proxy", proxy_provenance({"CARRY_PROXY_CLASSIFIER_CACHE_POLICY": "disabled"}))
     if isinstance(normalized["proxy"], dict):
-        normalized["proxy"] = {"history_policy": "strict", **normalized["proxy"]}
+        normalized["proxy"] = {"history_policy": "strict", "classifier_cache_policy": "disabled",
+                               **normalized["proxy"]}
     for key, value in LEGACY_COMPACTION_DEFAULTS.items():
         normalized.setdefault(key, value)
     return normalized

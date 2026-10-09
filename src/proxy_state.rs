@@ -46,6 +46,21 @@ pub(super) struct CacheEvidence {
     pub native_cached_fraction: f64,
 }
 
+/// Reviewer-only boundary requested on the actual wire. A requested write is
+/// NOT proof of a provider write; economic credit requires a confirmed read.
+/// Identity of the exact marked stable prefix, with ONLY renderer-owned marker
+/// metadata removed. Never retain another source payload per boundary.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct ReviewerCacheBoundary {
+    pub format_version: u32,
+    pub base: Value,
+    pub input_len: usize,
+    pub input_sha256: String,
+    pub at: u64,
+    pub read_estimated_tokens: f64,
+    pub read_confirmed_at: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(super) struct Session {
     pub version: u32,
@@ -63,7 +78,11 @@ pub(super) struct Session {
     /// Strings retain checkpoint compatibility with the former payload map.
     pub observed: BTreeMap<u64, String>,
     pub primary_cache: Vec<CacheEvidence>,
+    /// Legacy whole-review receipts decode unchanged, but cannot establish a
+    /// shorter stable reviewer boundary and are no longer used by its planner.
     pub shadow_cache: Vec<CacheEvidence>,
+    #[serde(default)]
+    pub reviewer_cache: Vec<ReviewerCacheBoundary>,
     pub primary: UsageLedger,
     pub shadow: UsageLedger,
     pub completed_requests: u64,
@@ -206,6 +225,7 @@ impl Session {
         self.observed.clear();
         self.primary_cache.clear();
         self.shadow_cache.clear();
+        self.reviewer_cache.clear();
     }
 
     pub fn groups(&self) -> Vec<Group> {

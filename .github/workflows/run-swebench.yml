@@ -94,6 +94,13 @@ on:
         required: true
         default: gpt-6-luna
         type: string
+      proxy_classifier_cache_policy:
+        description: Reviewer stable cache writes (explicit attests this lane's trusted OpenAI gateway)
+        required: true
+        default: openai-explicit
+        type: choice
+        options: [openai-explicit, disabled, auto]
+
       proxy_classifier_effort:
         description: Classifier reasoning effort
         required: true
@@ -202,6 +209,7 @@ jobs:
       CARRY_PROXY_HISTORY_POLICY: ${{ inputs.proxy_history_policy }}
       CARRY_PROXY_CLASSIFIER_MODEL: ${{ inputs.proxy_classifier_model }}
       CARRY_PROXY_CLASSIFIER_EFFORT: ${{ inputs.proxy_classifier_effort }}
+      CARRY_PROXY_CLASSIFIER_CACHE_POLICY: ${{ inputs.proxy_classifier_cache_policy }}
       CARRY_PROXY_PAYOFF_REQUESTS: ${{ inputs.proxy_payoff_requests }}
       CARRY_PROXY_MIN_PAYBACK_PERCENT: ${{ inputs.proxy_min_payback_percent }}
       MODEL: ${{ inputs.model }}
