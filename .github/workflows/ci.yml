@@ -295,6 +295,21 @@ jobs:
             --pi "$RUNNER_TEMP/proxy-clients/node_modules/.bin/pi" \
             --output "$RUNNER_TEMP/proxy-native-fixture"
 
+      - name: Pinned Codex benchmark hosted-tool isolation through actual entrypoint
+        run: |
+          CARRY_HOSTED_TOOL_FIXTURE_CODEX="$RUNNER_TEMP/proxy-clients/node_modules/.bin/codex" \
+          CARRY_HOSTED_TOOL_FIXTURE_OUTPUT="$RUNNER_TEMP/proxy-codex-hosted-tool-fixture" \
+            python3 -B -m unittest -v scripts.test_codex_hosted_tools
+
+      - name: Preserve credential-free Codex hosted-tool fixture evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: proxy-codex-hosted-tool-fixture-${{ github.sha }}
+          path: ${{ runner.temp }}/proxy-codex-hosted-tool-fixture
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Pinned Pi checkpoint policy through production gateway and integrated Carry
         run: |
           python3 scripts/proxy_gateway_native_fixture.py \

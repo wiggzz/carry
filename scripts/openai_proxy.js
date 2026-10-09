@@ -4,6 +4,8 @@ const http = require('node:http');
 const https = require('node:https');
 
 const MAX_TELEMETRY_BYTES = 8 * 1024 * 1024;
+// Match Carry's existing HTTP body admission; telemetry is a separate capture budget.
+const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 // Fixed public vocabulary, not arbitrary caller/provider strings or object keys.
 const TELEMETRY_MODELS = new Set(['gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol']);
 const TELEMETRY_TIERS = new Set(['auto', 'default', 'standard', 'flex', 'priority', 'scale']);
@@ -73,6 +75,28 @@ function cleanHeaders(headers) {
     }
   }
   return result;
+}
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+// Execution location is determined by the wire type, never by a tool's name.
+function allowedClientTools(tools) {
+  return Array.isArray(tools) && tools.every(tool => {
+    if (!isObject(tool) || typeof tool.name !== 'string' || !tool.name.length) return false;
+    switch (tool.type) {
+      case 'function':
+        return (tool.parameters == null || isObject(tool.parameters)) &&
+          (tool.strict == null || typeof tool.strict === 'boolean');
+      case 'custom':
+        return !Object.hasOwn(tool, 'format') || isObject(tool.format);
+      case 'namespace':
+        return allowedClientTools(tool.tools);
+      default:
+        return false;
+    }
+  });
 }
 
 function usageRecords(body) {
@@ -172,96 +196,118 @@ function serve(options = {}) {
       }));
     };
     emit('started');
-    const input = [];
-    let inputBytes = 0;
-    request.on('data', chunk => {
-      inputBytes += chunk.length;
-      if (inputBytes <= MAX_TELEMETRY_BYTES) input.push(chunk);
-    });
-    request.on('end', () => {
-      if (inputBytes > MAX_TELEMETRY_BYTES) return;
-      try {
-        const value = JSON.parse(Buffer.concat(input).toString('utf8'));
-        model = telemetryModel(value.model);
-        serviceTier = telemetryTier(value.service_tier);
-        nativeCompaction ||= Boolean(value.compaction_trigger);
-      } catch (_) { /* Never write request contents or parse exceptions to logs. */ }
-    });
     const finish = (usage, extra = {}) => {
       if (ended) return;
       ended = true;
       emit(usage ? 'completed' : 'censored', {usage: usage || null,
         latency_ms: Math.round(performance.now() - started), ...extra});
     };
-    const upstream = (shadow ? shadowTransport : primaryTransport)({
-      hostname: throughCarry ? 'carry-context-proxy' : 'api.openai.com',
-      port: throughCarry ? 8787 : 443,
-      method: request.method,
-      path: parsed.pathname + parsed.search,
-      headers,
-      timeout: 600000,
-    }, upstreamResponse => {
-      response.writeHead(
-        upstreamResponse.statusCode || 502,
-        cleanHeaders(upstreamResponse.headers),
-      );
-      const chunks = [];
-      let captured = 0;
-      let truncated = false;
-      upstreamResponse.on('data', chunk => {
-        response.write(chunk);
-        if (captured + chunk.length <= MAX_TELEMETRY_BYTES) {
-          chunks.push(chunk);
-          captured += chunk.length;
-        } else {
-          truncated = true;
-        }
-      });
-      upstreamResponse.on('error', () => { finish(null); response.destroy(); });
-      upstreamResponse.on('aborted', () => { finish(null); response.destroy(); });
-      upstreamResponse.on('end', () => {
-        const body = Buffer.concat(chunks).toString('utf8');
-        if (contextProxy) {
-          let nativeUsage = null;
-          let toolCalls = null;
-          if (!truncated) {
-            const observe = event => {
-              const value = event.type === 'response.completed' ? event.response : !event.type ? event : null;
-              if (value?.usage && upstreamResponse.statusCode >= 200 && upstreamResponse.statusCode < 300) {
-                nativeUsage = telemetryUsage(value.usage);
-                toolCalls = Array.isArray(value.output)
-                  ? value.output.filter(item => item.type === 'function_call').length : null;
-                if (Object.hasOwn(value, 'model')) model = telemetryModel(value.model);
-                if (Object.hasOwn(value, 'service_tier')) serviceTier = telemetryTier(value.service_tier);
+    const forward = raw => {
+      const upstream = (shadow ? shadowTransport : primaryTransport)({
+        hostname: throughCarry ? 'carry-context-proxy' : 'api.openai.com',
+        port: throughCarry ? 8787 : 443,
+        method: request.method,
+        path: parsed.pathname + parsed.search,
+        headers,
+        timeout: 600000,
+      }, upstreamResponse => {
+        response.writeHead(
+          upstreamResponse.statusCode || 502,
+          cleanHeaders(upstreamResponse.headers),
+        );
+        const chunks = [];
+        let captured = 0;
+        let truncated = false;
+        upstreamResponse.on('data', chunk => {
+          response.write(chunk);
+          if (captured + chunk.length <= MAX_TELEMETRY_BYTES) {
+            chunks.push(chunk);
+            captured += chunk.length;
+          } else {
+            truncated = true;
+          }
+        });
+        upstreamResponse.on('error', () => { finish(null); response.destroy(); });
+        upstreamResponse.on('aborted', () => { finish(null); response.destroy(); });
+        upstreamResponse.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8');
+          if (contextProxy) {
+            let nativeUsage = null;
+            let toolCalls = null;
+            if (!truncated) {
+              const observe = event => {
+                const value = event.type === 'response.completed' ? event.response : !event.type ? event : null;
+                if (value?.usage && upstreamResponse.statusCode >= 200 && upstreamResponse.statusCode < 300) {
+                  nativeUsage = telemetryUsage(value.usage);
+                  toolCalls = Array.isArray(value.output)
+                    ? value.output.filter(item => item.type === 'function_call').length : null;
+                  if (Object.hasOwn(value, 'model')) model = telemetryModel(value.model);
+                  if (Object.hasOwn(value, 'service_tier')) serviceTier = telemetryTier(value.service_tier);
+                }
+              };
+              try { observe(JSON.parse(body)); } catch (_) { /* SSE, not whole JSON. */ }
+              for (const line of body.split(/\r?\n/)) {
+                const payload = line.startsWith('data: ') ? line.slice(6) : line;
+                try { observe(JSON.parse(payload)); }
+                catch (_) { /* Non-JSON or streaming fragment, never fabricate usage. */ }
               }
-            };
-            try { observe(JSON.parse(body)); } catch (_) { /* SSE, not whole JSON. */ }
-            for (const line of body.split(/\r?\n/)) {
-              const payload = line.startsWith('data: ') ? line.slice(6) : line;
-              try { observe(JSON.parse(payload)); }
-              catch (_) { /* Non-JSON or streaming fragment, never fabricate usage. */ }
+            }
+            finish(nativeUsage, {http_status: upstreamResponse.statusCode, tool_calls: toolCalls});
+          }
+          if (!contextProxy && captured <= MAX_TELEMETRY_BYTES) {
+            for (const usage of usageRecords(body)) {
+              // Docker logs are outside the model-controlled agent container; retain
+              // only aggregate provider accounting, never prompts or responses.
+              console.log(`BENCHMARK_PROXY_USAGE ${JSON.stringify(usage)}`);
             }
           }
-          finish(nativeUsage, {http_status: upstreamResponse.statusCode, tool_calls: toolCalls});
-        }
-        if (!contextProxy && captured <= MAX_TELEMETRY_BYTES) {
-          for (const usage of usageRecords(body)) {
-            // Docker logs are outside the model-controlled agent container; retain
-            // only aggregate provider accounting, never prompts or responses.
-            console.log(`BENCHMARK_PROXY_USAGE ${JSON.stringify(usage)}`);
-          }
-        }
-        response.end();
+          response.end();
+        });
       });
+      upstream.on('timeout', () => upstream.destroy(new Error('upstream timeout')));
+      upstream.on('error', () => {
+        finish(null);
+        if (!response.headersSent) response.writeHead(502, {'content-type': 'text/plain'});
+        response.end('OpenAI upstream unavailable\n');
+      });
+      request.on('aborted', () => upstream.destroy());
+      if (raw === null) request.pipe(upstream);
+      else upstream.end(raw);
+    };
+    if (request.method !== 'POST') {
+      forward(null);
+      return;
+    }
+    // Validate the entire model request before creating either upstream transport.
+    // Relay the original bytes, not a reserialized or rewritten tool payload.
+    const input = [];
+    let inputBytes = 0;
+    const deny = status => {
+      finish(null, {http_status: status});
+      response.writeHead(status, {'content-type': 'text/plain'});
+      response.end('benchmark request denied\n');
+    };
+    request.on('data', chunk => {
+      inputBytes += chunk.length;
+      if (inputBytes <= MAX_REQUEST_BYTES) input.push(chunk);
     });
-    upstream.on('timeout', () => upstream.destroy(new Error('upstream timeout')));
-    upstream.on('error', () => {
-      finish(null);
-      if (!response.headersSent) response.writeHead(502, {'content-type': 'text/plain'});
-      response.end('OpenAI upstream unavailable\n');
+    request.on('error', () => { finish(null); response.destroy(); });
+    request.on('aborted', () => finish(null));
+    request.on('end', () => {
+      if (inputBytes > MAX_REQUEST_BYTES) { deny(413); return; }
+      const raw = Buffer.concat(input);
+      try {
+        const value = JSON.parse(raw.toString('utf8'));
+        if (!isObject(value) ||
+            (Object.hasOwn(value, 'tools') && !allowedClientTools(value.tools))) {
+          deny(400); return;
+        }
+        model = telemetryModel(value.model);
+        serviceTier = telemetryTier(value.service_tier);
+        nativeCompaction ||= Boolean(value.compaction_trigger);
+      } catch (_) { deny(400); return; }
+      forward(raw);
     });
-    request.on('aborted', () => upstream.destroy());
-    request.pipe(upstream);
   });
   server.listen(options.port ?? 8080, options.host || '0.0.0.0');
   return server;
