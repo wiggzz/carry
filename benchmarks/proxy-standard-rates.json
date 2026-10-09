@@ -1,0 +1,42 @@
+{
+  "schema": "carry.proxy-study.verified-standard-rates.v1",
+  "verified_local_date": "2026-10-07",
+  "verified_utc_date": "2026-10-08",
+  "processing": "standard",
+  "regional_premium": false,
+  "units": "USD per 1000000 tokens",
+  "input_partition": "ordinary = input_tokens - cached_tokens - cache_write_tokens; reasoning tokens are an output subset, not extra output",
+  "models": {
+    "gpt-6-luna": {
+      "ordinary_input": "0.10",
+      "cached_input": "0.01",
+      "cache_write_input": "0.125",
+      "output": "0.50",
+      "source": "https://developers.openai.com/api/docs/models/gpt-6-luna"
+    },
+    "gpt-6-sol": {
+      "ordinary_input": "2.00",
+      "cached_input": "0.20",
+      "cache_write_input": "2.50",
+      "output": "10.00",
+      "source": "https://developers.openai.com/api/docs/models/gpt-6-sol"
+    },
+    "gpt-6.1-sol": {
+      "ordinary_input": "2.00",
+      "cached_input": "0.10",
+      "cache_write_input": "2.50",
+      "output": "10.00",
+      "source": "https://developers.openai.com/api/docs/models/gpt-6.1-sol"
+    }
+  },
+  "long_context": {
+    "threshold_input_tokens": 272000,
+    "trigger": "strictly greater than threshold; applies to full request",
+    "ordinary_input_multiplier": "2",
+    "cached_input_multiplier": "2",
+    "cache_write_input_multiplier": "2",
+    "output_multiplier": "1.5"
+  },
+  "unsupported": "Unknown models, aliases, provider-specific overrides, nonstandard tiers, regional premiums, unsupported billed token categories => cost unavailable, not neighbor-model rates",
+  "scope": "Native usage times official standard rate model, not provider invoice or infrastructure spend"
+}

@@ -116,6 +116,11 @@ class HarnessEntrypointTests(unittest.TestCase):
                 "if sys.argv[1] == 'login': sys.exit(0)\n"
                 "assert os.environ['CODEX_HOME'] == " + repr(str(session)) + ", (os.environ, sys.argv)\n"
                 "assert sys.argv[1:3] == ['exec', 'resume'], sys.argv\n"
+                "import tomllib\n"
+                "config=tomllib.loads((pathlib.Path(os.environ['CODEX_HOME'])/'config.toml').read_text())\n"
+                "for i,arg in enumerate(sys.argv[:-1]):\n"
+                " if arg == '--config' and sys.argv[i+1].startswith('web_search='): config.update(tomllib.loads(sys.argv[i+1]))\n"
+                "assert config.get('web_search') == 'disabled', config\n"
                 "assert '" + thread + "' in sys.argv, sys.argv\n"
                 "pathlib.Path('file.txt').write_text('after\\n')\n"
             )
@@ -131,7 +136,7 @@ class HarnessEntrypointTests(unittest.TestCase):
                  "--codex-session", str(session), "--codex-thread", thread],
                 cwd=repo, env=env, text=True, capture_output=True,
             )
-            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(run.returncode, 0, run.stderr + (output / "trace.log").read_text())
             self.assertIn("+after", (output / "final.patch").read_text())
 
     def test_codex_initial_task_uses_native_session_home_without_resume(self):
@@ -152,6 +157,11 @@ class HarnessEntrypointTests(unittest.TestCase):
                 "if sys.argv[1] == 'login': sys.exit(0)\n"
                 "assert os.environ['CODEX_HOME'] == " + repr(str(session)) + "\n"
                 "assert sys.argv[1] == 'exec' and 'resume' not in sys.argv, sys.argv\n"
+                "import tomllib\n"
+                "config=tomllib.loads((pathlib.Path(os.environ['CODEX_HOME'])/'config.toml').read_text())\n"
+                "assert config.get('web_search') == 'disabled', config\n"
+                "overrides=[sys.argv[i+1] for i,arg in enumerate(sys.argv[:-1]) if arg == '--config']\n"
+                "assert any(item.startswith('web_search=') and tomllib.loads(item).get('web_search') == 'disabled' for item in overrides), overrides\n"
                 "pathlib.Path('file.txt').write_text('after\\n')\n"
             )
             binary.chmod(0o755)
@@ -162,7 +172,7 @@ class HarnessEntrypointTests(unittest.TestCase):
                  "--prompt", str(prompt_dir / "task.md"), "--output", str(output), "--codex-session", str(session)],
                 cwd=repo, env=env, text=True, capture_output=True,
             )
-            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(run.returncode, 0, run.stderr + (output / "trace.log").read_text())
             self.assertIn("+after", (output / "final.patch").read_text())
 
     def test_pi_native_session_does_not_include_no_session(self):

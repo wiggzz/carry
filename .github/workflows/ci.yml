@@ -217,6 +217,39 @@ jobs:
       - name: Build terminal editor binary
         run: cargo build --locked
 
+      - name: Checkpoint size guard behavioral RED and GREEN
+        run: |
+          python3 - <<'PY'
+          import hashlib, subprocess
+          from pathlib import Path
+          path = Path('src/proxy.rs')
+          original = path.read_bytes()
+          source = original.decode()
+          start = source.index('    // Never replace a loadable checkpoint with one the loader would reject.\n')
+          stop = source.index('    file.sync_all()?;\n', start)
+          command = ['cargo', 'test', '--locked', '--bin', 'carry', 'checkpoint_save_limit_', '--', '--nocapture']
+          try:
+              # Negative control: preserve the exact tests and saver seam, remove
+              # only the new size guard. This is not a shipping source artifact.
+              path.write_text(source[:start] + '    let _ = max_bytes;\n' + source[stop:])
+              red = subprocess.run(command, text=True, capture_output=True, timeout=600)
+          finally:
+              path.write_bytes(original)
+          assert hashlib.sha256(path.read_bytes()).digest() == hashlib.sha256(original).digest()
+          print(red.stdout + red.stderr, flush=True)
+          expected = ['checkpoint_save_limit_preserves_last_loadable_file',
+                      'checkpoint_save_limit_rejects_first_oversized_file_without_temporary']
+          assert red.returncode == 101, 'negative control must fail, not pass or fail setup'
+          assert all('test proxy::tests::' + name + ' ... FAILED' in red.stdout for name in expected)
+          assert 'test proxy::tests::checkpoint_save_limit_accepts_exact_serialized_file_length ... ok' in red.stdout
+          assert 'test result: FAILED. 1 passed; 2 failed;' in red.stdout
+          assert (red.stdout + red.stderr).count('called `Result::unwrap_err()` on an `Ok` value') == 2
+          green = subprocess.run(command, text=True, capture_output=True, timeout=600)
+          print(green.stdout + green.stderr, flush=True)
+          assert green.returncode == 0 and 'test result: ok. 3 passed; 0 failed;' in green.stdout
+          print('CHECKPOINT_SIZE_GUARD_RED_GREEN_PASS: source restored; expected two RED failures and three GREEN passes')
+          PY
+
       - name: Unit tests
         run: cargo test --locked
 
@@ -243,6 +276,13 @@ jobs:
           scripts/test_build_long_swebench_selection.py
           scripts/test_merge_swebench_attempts.py
           scripts/test_swebench_harness_entrypoint.py
+          scripts/test_proxy_benchmark.py
+          scripts/test_proxy_workflow.py
+          scripts/test_proxy_trial.py
+          scripts/test_proxy_native_fixture.py
+          scripts/test_proxy_reviewer_cache_fixture.py
+          scripts/test_proxy_gateway.py
+          scripts/test_proxy_gateway_native_fixture.py
           scripts/test_prepared_swebench_image.py
           scripts/test_swebench_ec2_worker.py
           scripts/test_docker_registry_login.py
@@ -262,6 +302,87 @@ jobs:
         run: |
           cargo build --release --locked --target x86_64-unknown-linux-musl
           target/x86_64-unknown-linux-musl/release/carry --help >/dev/null
+
+      - name: Upload exact-head portable Carry binary
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: carry-linux-amd64-musl-${{ github.sha }}
+          path: target/x86_64-unknown-linux-musl/release/carry
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Pinned Node for credential-free native client fixtures
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.19.0
+
+      - name: Actual Codex and Pi HTTP Responses through integrated Carry proxy
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/proxy-clients" --no-audit --no-fund \
+            '@openai/codex@0.147.0' '@earendil-works/pi-coding-agent@0.84.2'
+          "$RUNNER_TEMP/proxy-clients/node_modules/.bin/codex" --version
+          "$RUNNER_TEMP/proxy-clients/node_modules/.bin/pi" --version
+          python3 scripts/proxy_native_fixture.py \
+            --carry "$PWD/target/x86_64-unknown-linux-musl/release/carry" \
+            --codex "$RUNNER_TEMP/proxy-clients/node_modules/.bin/codex" \
+            --pi "$RUNNER_TEMP/proxy-clients/node_modules/.bin/pi" \
+            --output "$RUNNER_TEMP/proxy-native-fixture"
+
+      - name: Pinned Codex benchmark hosted-tool isolation through actual entrypoint
+        run: |
+          CARRY_HOSTED_TOOL_FIXTURE_CODEX="$RUNNER_TEMP/proxy-clients/node_modules/.bin/codex" \
+          CARRY_HOSTED_TOOL_FIXTURE_OUTPUT="$RUNNER_TEMP/proxy-codex-hosted-tool-fixture" \
+            python3 -B -m unittest -v scripts.test_codex_hosted_tools
+
+      - name: Preserve credential-free Codex hosted-tool fixture evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: proxy-codex-hosted-tool-fixture-${{ github.sha }}
+          path: ${{ runner.temp }}/proxy-codex-hosted-tool-fixture
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Pinned Pi checkpoint policy through production gateway and integrated Carry
+        run: |
+          python3 scripts/proxy_gateway_native_fixture.py \
+            --carry "$PWD/target/x86_64-unknown-linux-musl/release/carry" \
+            --pi "$RUNNER_TEMP/proxy-clients/node_modules/.bin/pi" \
+            --output "$RUNNER_TEMP/proxy-gateway-native-fixture"
+
+      - name: Reviewer stable cache boundaries through integrated Carry
+        run: |
+          python3 scripts/proxy_reviewer_cache_fixture.py \
+            --carry "$PWD/target/x86_64-unknown-linux-musl/release/carry" \
+            --output "$RUNNER_TEMP/proxy-reviewer-cache-fixture"
+
+      - name: Preserve credential-free reviewer cache fixture evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: proxy-reviewer-cache-fixture-${{ github.sha }}
+          path: ${{ runner.temp }}/proxy-reviewer-cache-fixture
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Preserve credential-free production gateway fixture evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: proxy-gateway-native-fixture-${{ github.sha }}
+          path: ${{ runner.temp }}/proxy-gateway-native-fixture
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Preserve credential-free native fixture evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: proxy-native-fixture-${{ github.sha }}
+          path: ${{ runner.temp }}/proxy-native-fixture
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Build and execute portable Carry harness binary
         run: |

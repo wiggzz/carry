@@ -77,6 +77,46 @@ on:
         required: true
         default: "0"
         type: string
+      proxy_mode:
+        description: Opt-in trusted Carry proxy (disabled preserves direct lanes; audit pays classifier)
+        required: true
+        default: disabled
+        type: choice
+        options: [disabled, "off", audit, compact]
+      proxy_history_policy:
+        description: Trusted checkpoint policy; reset retires both active projections on non-prefix native history
+        required: true
+        default: strict
+        type: choice
+        options: [strict, reset-on-divergence]
+      proxy_classifier_model:
+        description: Exact classifier model ID
+        required: true
+        default: gpt-6-luna
+        type: string
+      proxy_classifier_cache_policy:
+        description: Reviewer stable cache writes (explicit attests this lane's trusted OpenAI gateway)
+        required: true
+        default: openai-explicit
+        type: choice
+        options: [openai-explicit, disabled, auto]
+
+      proxy_classifier_effort:
+        description: Classifier reasoning effort
+        required: true
+        default: low
+        type: choice
+        options: [minimal, low, medium, high]
+      proxy_payoff_requests:
+        description: Proxy joint economic payoff horizon
+        required: true
+        default: "1"
+        type: string
+      proxy_min_payback_percent:
+        description: Proxy minimum joint saving percentage (integer 0-100)
+        required: true
+        default: "25"
+        type: string
       catalog_digest:
         description: Immutable prepare-50 catalog digest (sha256:... or 64 lowercase hex); required for model-bearing modes
         required: false
@@ -165,6 +205,13 @@ jobs:
       CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT: ${{ inputs.carry_compaction_rollout_stop_probability_percent }}
       CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS: ${{ inputs.carry_compaction_neutral_high_watermark_tokens }}
       CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS: ${{ inputs.carry_compaction_neutral_low_watermark_tokens }}
+      CARRY_PROXY_MODE: ${{ inputs.proxy_mode }}
+      CARRY_PROXY_HISTORY_POLICY: ${{ inputs.proxy_history_policy }}
+      CARRY_PROXY_CLASSIFIER_MODEL: ${{ inputs.proxy_classifier_model }}
+      CARRY_PROXY_CLASSIFIER_EFFORT: ${{ inputs.proxy_classifier_effort }}
+      CARRY_PROXY_CLASSIFIER_CACHE_POLICY: ${{ inputs.proxy_classifier_cache_policy }}
+      CARRY_PROXY_PAYOFF_REQUESTS: ${{ inputs.proxy_payoff_requests }}
+      CARRY_PROXY_MIN_PAYBACK_PERCENT: ${{ inputs.proxy_min_payback_percent }}
       MODEL: ${{ inputs.model }}
       REASONING: ${{ inputs.reasoning }}
     steps:
@@ -185,6 +232,10 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+
+      - name: Validate opt-in proxy settings before credentials
+        shell: bash
+        run: python3 scripts/proxy_benchmark.py
 
       - name: Resolve and archive selected source before AWS authentication
         id: source
@@ -470,6 +521,9 @@ jobs:
                   'CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS', 'CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS', 'BOOTSTRAP_WAIT_SECONDS', 'RUN_ID',
                   'MODEL', 'REASONING', 'TASK_IMAGE_REPOSITORY', 'TASK_IMAGE_CATALOG')},
           }
+          sys.path.insert(0, 'scripts')
+          import proxy_benchmark
+          values.update(proxy_benchmark.validate_config(os.environ))
           with open(sys.argv[1], 'w', encoding='utf-8') as stream:
               for key, value in values.items(): stream.write(f'{key}={shlex.quote(value)}\n')
           os.chmod(sys.argv[1], 0o600)
@@ -675,6 +729,10 @@ jobs:
           else:
               assert attempts == 1 and attempt == 1, 'non-official worker has unexpected attempt identity'
           assert report['provenance']['phase']=='complete', 'benchmark did not complete official grading'
+          import sys
+          sys.path.insert(0, 'scripts')
+          import proxy_benchmark
+          proxy_benchmark.validate_report(report, records, os.environ)
           blocked={'not-run', 'evaluator-failed'}
           assert not any(r.get('status') in blocked for r in records), 'benchmark has unexecuted or ungraded slots'
           PY

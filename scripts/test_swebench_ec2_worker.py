@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import shutil
+import shlex
 import sys
 import time
 import os
@@ -197,10 +198,34 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             self.assertFalse((root / "credential-fetched").exists())
 
     def test_official_worker_forwards_one_declared_attempt_with_official_limits(self):
+        self._official_worker_configuration_case()
+
+    def test_official_worker_forwards_opt_in_proxy_to_both_native_harnesses(self):
+        for harness in ('codex','pi'):
+            with self.subTest(harness=harness):
+                self._official_worker_configuration_case(proxy_mode='compact',harness=harness)
+
+    def test_worker_preserves_explicit_history_policy_and_rejects_invalid_before_credentials(self):
+        self._official_worker_configuration_case(proxy_mode='compact',harness='pi',history_policy='reset-on-divergence')
+        self._official_worker_configuration_case(proxy_mode='compact',harness='pi',history_policy='caller-decides')
+        self._official_worker_configuration_case(history_policy='caller-decides')
+        self._official_worker_configuration_case(proxy_mode='compact',harness='pi',history_policy='')
+
+    def test_worker_records_cache_policy_and_rejects_invalid_before_credentials(self):
+        for policy in ('auto', 'disabled', 'openai-explicit', 'caller-decides', ''):
+            with self.subTest(policy=policy):
+                self._official_worker_configuration_case(proxy_mode='compact',harness='pi',cache_policy=policy)
+        for policy in ('caller-decides', ''):
+            with self.subTest(disabled_policy=policy):
+                self._official_worker_configuration_case(cache_policy=policy)
+
+    def _official_worker_configuration_case(self,proxy_mode='disabled',harness='carry',history_policy=None,cache_policy=None):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             payload = root / "payload"
             (payload / "scripts").mkdir(parents=True)
+            import shutil
+            shutil.copyfile(SCRIPT.with_name('proxy_benchmark.py'),payload/'scripts/proxy_benchmark.py')
             archive = root / "source.tar.gz"
             with tarfile.open(archive, "w:gz") as stream:
                 stream.add(payload / "scripts", arcname="scripts")
@@ -208,11 +233,15 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             capability = base64.b64encode(b"https://example.invalid/object").decode()
             config = root / "worker-config"
             config.write_text(
+                (f"CARRY_PROXY_HISTORY_POLICY={history_policy}\n" if history_policy is not None else "") +
+                (f"CARRY_PROXY_CLASSIFIER_CACHE_POLICY={cache_policy}\n" if cache_policy is not None else "") +
+                f"CARRY_PROXY_MODE={proxy_mode}\nCARRY_PROXY_CLASSIFIER_MODEL=gpt-6-sol\n"
+                "CARRY_PROXY_CLASSIFIER_EFFORT=medium\nCARRY_PROXY_PAYOFF_REQUESTS=5\nCARRY_PROXY_MIN_PAYBACK_PERCENT=3\n"
                 f"SOURCE_URL_B64={capability}\nKEY_URL_B64={capability}\nDOCKER_AUTH_URL_B64={capability}\n"
                 "RESULT_URL_B64=\n"
                 "SOURCE_SHA256=" + hashlib.sha256(archive.read_bytes()).hexdigest() + "\n"
                 "SOURCE_COMMIT=" + "a" * 40 + "\n"
-                "BENCHMARK_MODE=official-50\nBENCHMARK_HARNESS=carry\n"
+                f"BENCHMARK_MODE=official-50\nBENCHMARK_HARNESS={harness}\n"
                 "BENCHMARK_ATTEMPT=2\nBENCHMARK_ATTEMPTS=3\nBOOTSTRAP_WAIT_SECONDS=1\nRUN_ID=gh-test-2\n"
                 "CARRY_COMPACTION_POLICY=disabled\nCARRY_KEEP_LEASE_TURNS=8\n"
                 "CARRY_COMPACTION_MIN_PAYBACK_PERCENT=25\n"
@@ -256,8 +285,10 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 "  exit 0\n"
                 "fi\n"
                 "case \"$*\" in\n"
+                f'  *proxy_benchmark.py*) exec {shlex.quote(sys.executable)} "$@";;\n'
                 "  *swebench_smoke.py*)\n"
-                "    printf 'agent=%s\\nevaluator=%s\\nmode=%s\\nbenchmark_attempt=%s\\nbenchmark_attempts=%s\\npolicy=%s\\nlease=%s\\nmargin=%s\\nhigh=%s\\nlow=%s\\nworker=%s\\nagent_phase=%s\\n' \"$AGENT_CONCURRENCY\" \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" \"$BENCHMARK_ATTEMPT\" \"$BENCHMARK_ATTEMPTS\" \"${CARRY_COMPACTION_POLICY-unset}\" \"${CARRY_KEEP_LEASE_TURNS-unset}\" \"${CARRY_COMPACTION_MIN_PAYBACK_PERCENT-unset}\" \"${CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS-unset}\" \"${CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS-unset}\" \"$OFFICIAL_WORKER_SECONDS\" \"$OFFICIAL_AGENT_PHASE_SECONDS\" > \"$FAKE_RUNNER_ENV\";;\n"
+                f"    {shlex.quote(sys.executable)} -c 'import os,json; json.dump({{k:v for k,v in os.environ.items() if k.startswith(\"CARRY_PROXY_\")}},open(os.environ[\"FAKE_RUNNER_ENV\"]+\".proxy\",\"w\"))'\n"
+                "    printf 'agent=%s\\nevaluator=%s\\nmode=%s\\nbenchmark_attempt=%s\\nbenchmark_attempts=%s\\npolicy=%s\\nlease=%s\\nmargin=%s\\nhigh=%s\\nlow=%s\\nworker=%s\\nagent_phase=%s\\n' \"$AGENT_CONCURRENCY\" \"$EVALUATOR_CONCURRENCY\" \"$BENCHMARK_MODE\" \"$BENCHMARK_ATTEMPT\" \"$BENCHMARK_ATTEMPTS\" \"${CARRY_COMPACTION_POLICY-unset}\" \"${CARRY_KEEP_LEASE_TURNS-unset}\" \"${CARRY_COMPACTION_MIN_PAYBACK_PERCENT-unset}\" \"${CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS-unset}\" \"${CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS-unset}\" \"$OFFICIAL_WORKER_SECONDS\" \"$OFFICIAL_AGENT_PHASE_SECONDS\" > \"$FAKE_RUNNER_ENV\"; printf 'proxy=%s\\n' \"${CARRY_PROXY_MODE-unset}\" >> \"$FAKE_RUNNER_ENV\";;\n"
                 "esac\n"
                 "exit 0\n"
             )
@@ -279,11 +310,28 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             )
             run = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
 
+            if history_policy in ('caller-decides',''):
+                self.assertNotEqual(run.returncode,0)
+                self.assertFalse((root/'secret').exists())
+                self.assertFalse(runner_env.exists())
+                self.assertIn('CARRY_PROXY_HISTORY_POLICY', (carry_root/'results/worker.log').read_text())
+                return
+            if cache_policy in ('caller-decides',''):
+                self.assertNotEqual(run.returncode,0)
+                self.assertFalse((root/'secret').exists())
+                self.assertFalse(runner_env.exists())
+                self.assertIn('CARRY_PROXY_CLASSIFIER_CACHE_POLICY', (carry_root/'results/worker.log').read_text())
+                return
             self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(json.loads(pathlib.Path(str(runner_env)+'.proxy').read_text()),{
+                'CARRY_PROXY_MODE':proxy_mode,'CARRY_PROXY_CLASSIFIER_MODEL':'gpt-6-sol',
+                'CARRY_PROXY_CLASSIFIER_EFFORT':'medium','CARRY_PROXY_PAYOFF_REQUESTS':'5',
+                'CARRY_PROXY_CLASSIFIER_CACHE_POLICY':cache_policy if cache_policy is not None else 'openai-explicit',
+                'CARRY_PROXY_MIN_PAYBACK_PERCENT':'3','CARRY_PROXY_HISTORY_POLICY':history_policy or 'strict'})
             self.assertEqual(
                 runner_env.read_text(),
                 "agent=5\nevaluator=5\nmode=official-50\nbenchmark_attempt=2\nbenchmark_attempts=3\npolicy=disabled\nlease=8\nmargin=25\nhigh=0\nlow=0\nworker=18900\n"
-                "agent_phase=4500\n",
+                f"agent_phase=4500\nproxy={proxy_mode}\n",
             )
 
     def test_prepare_worker_uses_registry_auth_without_model_credentials(self):
