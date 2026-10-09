@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ProxyTrialTests(unittest.TestCase):
     def test_both_clients_use_fresh_homes_scoped_auth_and_stable_session(self):
-        for client in ('codex', 'pi'):
+        for client, cache_policy in (('codex', 'auto'), ('pi', 'disabled'), ('codex', 'openai-explicit')):
             with self.subTest(client=client), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory); workspace = root / 'workspace'; workspace.mkdir()
                 carry = root / 'carry'
@@ -19,6 +19,7 @@ class ProxyTrialTests(unittest.TestCase):
 import http.server,json,os,sys
 assert os.environ.get('CARRY_PROXY_UPSTREAM_KEY') == 'provider-private'
 assert '--mode' in sys.argv and sys.argv[sys.argv.index('--mode')+1] == 'compact'
+assert sys.argv[sys.argv.index('--classifier-cache-policy')+1] == os.environ['EXPECT_REVIEWER_CACHE_POLICY']
 class Handler(http.server.BaseHTTPRequestHandler):
  def do_GET(self):
   self.send_response(200); self.end_headers(); self.wfile.write(b'{"mode":"compact"}')
@@ -45,16 +46,19 @@ pathlib.Path(os.environ['HOME'],'client-evidence.json').write_text(json.dumps({'
                     sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]
                 trial = root / 'trial'
                 env = dict(os.environ, CARRY_PROXY_UPSTREAM_KEY='provider-private',
-                           CARRY_PROXY_CLASSIFIER_KEY='provider-private')
+                           CARRY_PROXY_CLASSIFIER_KEY='provider-private',
+                           EXPECT_REVIEWER_CACHE_POLICY=cache_policy)
                 result = subprocess.run(['python3', str(ROOT / 'scripts/proxy_trial.py'),
                     '--client', client, '--carry-binary', str(carry), '--client-binary', str(binary),
                     '--workspace', str(workspace), '--trial-dir', str(trial), '--mode', 'compact',
                     '--listen', '127.0.0.1:' + str(port), '--prompt', 'fixture',
                     '--history-policy','reset-on-divergence',
+                    *(['--classifier-cache-policy',cache_policy] if cache_policy != 'auto' else []),
                     *(['--codex-sandbox','danger-full-access','--codex-native-compaction','v1'] if client=='codex' else [])],
                     env=env, text=True, capture_output=True, timeout=20)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 evidence = json.loads((trial / 'home/client-evidence.json').read_text())
+                self.assertEqual(json.loads((trial/'trial.json').read_text())['classifier_cache_policy'],cache_policy)
                 self.assertNotEqual(evidence['home'], os.environ['HOME'])
                 self.assertNotIn('provider-private', ''.join(p.read_text() for p in trial.rglob('*') if p.is_file()))
                 if client == 'codex':

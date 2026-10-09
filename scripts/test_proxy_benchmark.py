@@ -12,6 +12,31 @@ spec.loader.exec_module(worker)
 
 
 class ProxyBenchmarkTests(unittest.TestCase):
+    def test_classifier_cache_policy_rejects_unsupported_inputs_before_launch(self):
+        proxy = worker.proxy_benchmark
+        for policy in ('', 'caller-decides', 'OPENAI-EXPLICIT'):
+            with self.subTest(policy=policy), self.assertRaisesRegex(ValueError, 'CACHE_POLICY'):
+                proxy.validate_config({'CARRY_PROXY_CLASSIFIER_CACHE_POLICY': policy})
+        with self.assertRaisesRegex(ValueError, 'supported classifier model'):
+            proxy.validate_config({'CARRY_PROXY_CLASSIFIER_CACHE_POLICY': 'openai-explicit',
+                                   'CARRY_PROXY_CLASSIFIER_MODEL': 'generic-compatible-model'})
+        for policy in ('disabled', 'auto'):
+            config = proxy.validate_config({'CARRY_PROXY_CLASSIFIER_CACHE_POLICY': policy,
+                                            'CARRY_PROXY_CLASSIFIER_MODEL': 'generic-compatible-model'})
+            self.assertEqual(config['CARRY_PROXY_CLASSIFIER_CACHE_POLICY'], policy)
+
+    def test_trusted_sidecar_records_and_forwards_explicit_classifier_cache_policy(self):
+        proxy = worker.proxy_benchmark
+        values = {'BENCHMARK_HARNESS': 'pi', 'CARRY_PROXY_MODE': 'compact',
+                  'CARRY_PROXY_CLASSIFIER_CACHE_POLICY': 'openai-explicit'}
+        config = proxy.validate_config(values)
+        self.assertEqual(config.get('CARRY_PROXY_CLASSIFIER_CACHE_POLICY'), 'openai-explicit')
+        self.assertEqual(proxy.provenance(values).get('classifier_cache_policy'), 'openai-explicit')
+        command = proxy.sidecar_command(image='fixed-image', name='fixture', network='fixed',
+            state_dir=pathlib.Path('/nonsecret-fixture'), config=config)
+        self.assertIn('--classifier-cache-policy', command)
+        self.assertEqual(command[command.index('--classifier-cache-policy') + 1], 'openai-explicit')
+
     def test_opt_in_config_survives_runner_validation(self):
         config = worker.validate_config(dict(BASE_IMAGE='rust@sha256:' + 'a' * 64,
             CODEX_VERSION='0.147.0', PI_VERSION='0.84.2', MODEL='gpt-6-luna', REASONING='medium',
@@ -384,6 +409,18 @@ upstream.listen(0,'127.0.0.1',()=>{ const transport=(opts,cb)=>http.request({...
 
 
 class HistoryPolicyContractTests(unittest.TestCase):
+    def test_only_absent_legacy_classifier_cache_policy_normalizes_to_disabled(self):
+        from scripts.merge_swebench_attempts import normalize_legacy_provenance
+        old = worker.proxy_benchmark.provenance({'CARRY_PROXY_MODE': 'off', 'BENCHMARK_HARNESS': 'pi'})
+        old.pop('classifier_cache_policy')
+        normalized = normalize_legacy_provenance({'proxy': old})['proxy']
+        self.assertEqual(normalized.get('classifier_cache_policy'), 'disabled')
+        self.assertEqual({k: v for k, v in normalized.items() if k != 'classifier_cache_policy'}, old)
+        for policy in ('auto', 'disabled', 'openai-explicit'):
+            explicit = {**old, 'classifier_cache_policy': policy}
+            self.assertEqual(normalize_legacy_provenance({'proxy': explicit})['proxy'], explicit)
+        self.assertEqual(normalize_legacy_provenance({})['proxy'].get('classifier_cache_policy'), 'disabled')
+
     def test_validation_provenance_and_report_gate_preserve_explicit_policy(self):
         proxy=worker.proxy_benchmark
         values={'BENCHMARK_HARNESS':'pi','CARRY_PROXY_MODE':'compact',

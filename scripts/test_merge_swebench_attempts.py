@@ -11,6 +11,30 @@ SCRIPT = pathlib.Path(__file__).with_name("merge_swebench_attempts.py")
 
 
 class AttemptMergeTests(unittest.TestCase):
+    def test_cache_policy_is_immutable_and_legacy_absence_is_unmarked(self):
+        from scripts.proxy_benchmark import provenance
+        tasks = [f'task-{index:02d}' for index in range(50)]
+        for policy in ('disabled', 'openai-explicit', 'auto'):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory); artifacts = root/'artifacts'; artifacts.mkdir()
+                for attempt in (1,2):
+                    self.write_attempt(artifacts,attempt,tasks,total=2)
+                second = artifacts/'attempt-2/report.json'
+                payload=json.loads(second.read_text())
+                payload['provenance']['proxy']=provenance({'CARRY_PROXY_CLASSIFIER_CACHE_POLICY':policy})
+                second.write_text(json.dumps(payload))
+                manifest=root/'tasks.json'; manifest.write_text(json.dumps({'instance_ids':tasks}))
+                result=subprocess.run(['python3',str(SCRIPT),'--artifacts',str(artifacts),
+                    '--manifest',str(manifest),'--harness','all','--attempts','2','--out',str(root/'out')],
+                    capture_output=True,text=True,timeout=5)
+                if policy == 'disabled':
+                    self.assertEqual(result.returncode,0,result.stderr)
+                    merged=json.loads((root/'out/report.json').read_text())
+                    self.assertEqual(merged['provenance']['proxy']['classifier_cache_policy'],'disabled')
+                else:
+                    self.assertNotEqual(result.returncode,0)
+                    self.assertIn('identical immutable provenance',result.stderr)
+
     def write_attempt(self, root: pathlib.Path, attempt: int, tasks: list[str],
                       total: int = 3, source_commit: str = "a" * 40) -> None:
         artifact = root / f"attempt-{attempt}"

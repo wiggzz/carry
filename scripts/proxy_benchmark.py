@@ -6,6 +6,8 @@ DEFAULTS = {
     'CARRY_PROXY_HISTORY_POLICY': 'strict',
     'CARRY_PROXY_CLASSIFIER_MODEL': 'gpt-6-luna',
     'CARRY_PROXY_CLASSIFIER_EFFORT': 'low',
+    # This trusted lane has a fixed OpenAI upstream even behind the local gateway.
+    'CARRY_PROXY_CLASSIFIER_CACHE_POLICY': 'openai-explicit',
     'CARRY_PROXY_PAYOFF_REQUESTS': '1',
     'CARRY_PROXY_MIN_PAYBACK_PERCENT': '25',
 }
@@ -27,6 +29,11 @@ def validate_config(values):
     if config['CARRY_PROXY_CLASSIFIER_EFFORT'] not in {'minimal', 'low', 'medium', 'high'}:
         raise ValueError('invalid CARRY_PROXY_CLASSIFIER_EFFORT')
     model = config['CARRY_PROXY_CLASSIFIER_MODEL']
+    policy = config['CARRY_PROXY_CLASSIFIER_CACHE_POLICY']
+    if policy not in {'auto', 'disabled', 'openai-explicit'}:
+        raise ValueError('CARRY_PROXY_CLASSIFIER_CACHE_POLICY must be auto, disabled, or openai-explicit')
+    if policy == 'openai-explicit' and model not in {'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol'}:
+        raise ValueError('openai-explicit requires a supported classifier model')
     if not model or not model.isascii() or any(c.isspace() or c in '\x00\r\n' for c in model):
         raise ValueError('invalid CARRY_PROXY_CLASSIFIER_MODEL')
     horizon = config['CARRY_PROXY_PAYOFF_REQUESTS']
@@ -58,6 +65,7 @@ def sidecar_command(*, image, name, network, state_dir, config):
         '--classifier-url', 'http://openai-proxy:8080/v1/responses',
         '--state-dir', '/proxy-state', '--mode', config['CARRY_PROXY_MODE'],
         '--classifier-model', config['CARRY_PROXY_CLASSIFIER_MODEL'],
+        '--classifier-cache-policy', config['CARRY_PROXY_CLASSIFIER_CACHE_POLICY'],
         '--classifier-reasoning-effort', config['CARRY_PROXY_CLASSIFIER_EFFORT'],
         '--payoff-requests', config['CARRY_PROXY_PAYOFF_REQUESTS'],
         '--min-payback-percent', config['CARRY_PROXY_MIN_PAYBACK_PERCENT']]

@@ -133,6 +133,18 @@ case "$CARRY_PROXY_HISTORY_POLICY" in
   *) printf 'CARRY_PROXY_HISTORY_POLICY must be strict or reset-on-divergence\n' >&2; exit 2 ;;
 esac
 : "${CARRY_PROXY_CLASSIFIER_MODEL:=gpt-6-luna}"
+: "${CARRY_PROXY_CLASSIFIER_CACHE_POLICY=openai-explicit}"
+case "$CARRY_PROXY_CLASSIFIER_CACHE_POLICY" in
+  auto|disabled|openai-explicit) ;;
+  *) printf 'CARRY_PROXY_CLASSIFIER_CACHE_POLICY must be auto, disabled, or openai-explicit\n' >&2; exit 2 ;;
+esac
+if [[ "$CARRY_PROXY_CLASSIFIER_CACHE_POLICY" == openai-explicit ]]; then
+  case "$CARRY_PROXY_CLASSIFIER_MODEL" in
+    gpt-6-luna|gpt-6-sol|gpt-6.1-sol) ;;
+    *) printf 'openai-explicit requires a supported classifier model\n' >&2; exit 2 ;;
+  esac
+fi
+export CARRY_PROXY_CLASSIFIER_CACHE_POLICY
 : "${CARRY_PROXY_CLASSIFIER_EFFORT:=low}"
 : "${CARRY_PROXY_PAYOFF_REQUESTS:=1}"
 : "${CARRY_PROXY_MIN_PAYBACK_PERCENT:=25}"
