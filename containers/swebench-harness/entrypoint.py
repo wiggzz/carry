@@ -123,6 +123,10 @@ if args.harness == "pi":
         ])
     else:
         command.append("--no-session")
+if args.harness == "codex":
+    # Pinned Codex 0.147.0's enum setting; not a feature-toggle alias.
+    # Last override also covers fresh/resume and custom AGENT_COMMAND templates.
+    command.extend(["--config", 'web_search="disabled"'])
 workspace = os.environ.get("BENCHMARK_WORKSPACE", "/workspace")
 subprocess.run(
     ["git", "config", "--global", "--add", "safe.directory", workspace],
@@ -183,7 +187,8 @@ with trace_path.open("w", encoding="utf-8") as trace:
                 codex_home = pathlib.Path(agent_env.get("CODEX_HOME", str(pathlib.Path(os.environ["HOME"]) / ".codex")))
                 codex_home.mkdir(parents=True, exist_ok=True)
                 (codex_home / "config.toml").write_text(
-                    'model_provider = "openai-benchmark"\n\n'
+                    'model_provider = "openai-benchmark"\n'
+                    'web_search = "disabled"\n\n'
                     '[model_providers.openai-benchmark]\n'
                     'name = "OpenAI benchmark proxy"\n'
                     f'base_url = {json.dumps(os.environ["OPENAI_BASE_URL"])}\n'
