@@ -91,6 +91,10 @@ pub(super) struct Session {
     pub shadow: UsageLedger,
     pub completed_requests: u64,
     pub last_review_request: u64,
+    /// A replay import still needs pre-primary review until that epoch's first
+    /// primary completes. Persist this across failed calls and process restarts.
+    #[serde(default)]
+    pub bootstrap_review_pending: bool,
     pub invalid_reviews: u64,
     pub failed_primaries: u64,
     pub compactions: u64,
@@ -219,7 +223,31 @@ impl Session {
         Ok(())
     }
 
+    /// Caller explicitly attests that complete turns before the latest user
+    /// message were already consumed outside this proxy. Never infer this on
+    /// ordinary fresh input, and never expose the current turn's tool results.
+    pub fn import_replayed_prefix(&mut self) {
+        let Some(end) = self
+            .history
+            .iter()
+            .rposition(|item| item.value["role"] == "user")
+        else {
+            return;
+        };
+        if !self.history[..end]
+            .iter()
+            .any(|item| item.value["role"] == "user")
+        {
+            return;
+        }
+        for item in &mut self.history[..end] {
+            item.exposed = true;
+        }
+        self.bootstrap_review_pending = true;
+    }
+
     pub fn reset_active(&mut self) {
+        self.bootstrap_review_pending = false;
         self.history.clear();
         self.pending_output.clear();
         self.last_response_id = None;

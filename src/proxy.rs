@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
-    io::Write,
+    io::{IsTerminal, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -15,7 +15,7 @@ use anyhow::{Result, bail};
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -60,6 +60,12 @@ pub struct ProxyCli {
     codex_home: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:8787")]
     listen: SocketAddr,
+    /// Open the stats dashboard in a browser (automatic on interactive startup).
+    #[arg(long, conflicts_with = "no_open_dashboard")]
+    open_dashboard: bool,
+    /// Do not launch a browser, even when started from a terminal.
+    #[arg(long)]
+    no_open_dashboard: bool,
     /// Full upstream Responses endpoint, not an API base URL.
     #[arg(long, default_value = "https://api.openai.com/v1/responses")]
     upstream_url: String,
@@ -81,6 +87,10 @@ pub struct ProxyCli {
     payoff_requests: u64,
     #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u8).range(0..=100))]
     min_payback_percent: u8,
+    /// Declare full-history turns before the latest user message as previously
+    /// consumed context on a new lineage. Allows review before request one.
+    #[arg(long)]
+    review_replayed_history: bool,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=100))]
     review_every_requests: u64,
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
@@ -223,7 +233,37 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         _directory_lock: directory_lock,
     });
     let listener = tokio::net::TcpListener::bind(service.config.listen).await?;
-    println!("CARRY_PROXY_LISTEN {}", listener.local_addr()?);
+    let address = listener.local_addr()?;
+    println!("CARRY_PROXY_LISTEN {address}");
+    let mut dashboard_address = address;
+    if address.ip().is_unspecified() {
+        dashboard_address.set_ip(if address.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    let mut dashboard_url = format!("http://{dashboard_address}/carry/dashboard");
+    if !dashboard_address.ip().is_loopback()
+        && let Some(token) = &service.auth_token
+    {
+        let mut url = url::Url::parse(&dashboard_url)?;
+        let fragment = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("token", token)
+            .finish();
+        url.set_fragment(Some(&fragment));
+        dashboard_url = url.into();
+    }
+    writeln!(
+        private_file(&service.config.state_dir.join("dashboard-url"), false)?,
+        "{dashboard_url}"
+    )?;
+    println!("CARRY_PROXY_DASHBOARD {dashboard_url}");
+    if !service.config.no_open_dashboard
+        && (service.config.open_dashboard || std::io::stdin().is_terminal())
+    {
+        crate::auth::open_browser(&dashboard_url);
+    }
     let router = Router::new()
         .route(
             "/health",
@@ -238,7 +278,11 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         .route("/carry/dashboard/stats", get(dashboard_stats))
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(service);
-    axum::serve(listener, router).await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -253,6 +297,18 @@ fn authorize(service: &Service, headers: &HeaderMap) -> Result<(), Failure> {
         ));
     }
     Ok(())
+}
+
+fn authorize_dashboard(
+    service: &Service,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Result<(), Failure> {
+    if peer.ip().is_loopback() {
+        Ok(())
+    } else {
+        authorize(service, headers)
+    }
 }
 
 fn identity(headers: &HeaderMap) -> Result<Option<String>, Failure> {
@@ -441,9 +497,10 @@ async fn dashboard() -> Response {
 
 async fn dashboard_stats(
     State(service): State<Arc<Service>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Response, Failure> {
-    authorize(&service, &headers)?;
+    authorize_dashboard(&service, &headers, peer)?;
     let entries = std::fs::read_dir(&service.config.state_dir).map_err(|_| {
         failure(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -494,6 +551,19 @@ async fn dashboard_stats(
         "auth": if service.config.codex_login { "codex" } else { "api-key" },
         "classifier_model": service.config.classifier_model,
         "classifier_effort": service.config.classifier_reasoning_effort,
+        "classifier_cache_policy": match service.config.classifier_cache_policy {
+            ClassifierCachePolicy::Auto => "auto",
+            ClassifierCachePolicy::Disabled => "disabled",
+            ClassifierCachePolicy::OpenaiExplicit => "openai-explicit",
+        },
+        "classifier_explicit_cache": classifier_cache_enabled(&service.config).unwrap_or(false),
+        "reviewer_cache_mode": if service.config.codex_login && service.config.classifier_url.is_none() {
+            "codex-implicit"
+        } else if classifier_cache_enabled(&service.config).unwrap_or(false) {
+            "openai-explicit"
+        } else {
+            "provider-implicit"
+        },
         "sessions": sessions, "unavailable_sessions": unavailable_sessions,
         "cost_basis": "standard API rate equivalents, not subscription charges or an invoice",
         "scope": "checkpoints in this proxy state directory; completed/observed usage only"
@@ -592,11 +662,23 @@ async fn forward(
             ));
         }
     };
+    let replay_history = match headers.get("x-carry-replay-history") {
+        None => service.config.review_replayed_history,
+        Some(value) if value == "before-latest-user" => true,
+        Some(_) => {
+            return Err(failure(
+                StatusCode::BAD_REQUEST,
+                "unsupported explicit replay history policy",
+            ));
+        }
+    };
     let mut outbound = body.clone();
     let mut commit = None;
     if let Some(id) = id {
         let lock = session_lock(&service, &id).await;
         let mut session = load(&service, &id)?;
+        let new_lineage = session.history.is_empty();
+        let prior_rebases = session.history_rebases;
         if let Some(input) = body["input"].as_array() {
             if service.config.mode == Mode::Off {
                 // Off is byte-faithful forwarding, not a review ancestry gate.
@@ -648,11 +730,22 @@ async fn forward(
                 "review modes require array-valued native input",
             ));
         }
+        if !native
+            && standard(&body)
+            && service.config.mode != Mode::Off
+            && replay_history
+            && (new_lineage || session.history_rebases != prior_rebases)
+        {
+            session.import_replayed_prefix();
+        }
         trace(&service, &id, "primary_received", &body)
             .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "trace write failed"))?;
         let mut valid = false;
         if !native && service.config.mode != Mode::Off && standard(&body) {
-            valid = review(&service, &id, &mut session, &body).await;
+            // Keep bootstrap review pending across failed primaries/restarts,
+            // including imported rebases with prior completed-request counters.
+            let bootstrap = session.bootstrap_review_pending;
+            valid = review(&service, &id, &mut session, &body, bootstrap).await;
         }
         let reviewed = session.clone();
         if native && service.config.mode != Mode::Off {
@@ -1128,11 +1221,18 @@ fn reviewer_view_costs(
     })
 }
 
-async fn review(service: &Service, id: &str, session: &mut Session, main: &Value) -> bool {
-    if session
-        .completed_requests
-        .saturating_sub(session.last_review_request)
-        < service.config.review_every_requests
+async fn review(
+    service: &Service,
+    id: &str,
+    session: &mut Session,
+    main: &Value,
+    bootstrap: bool,
+) -> bool {
+    if !bootstrap
+        && session
+            .completed_requests
+            .saturating_sub(session.last_review_request)
+            < service.config.review_every_requests
     {
         return false;
     }
@@ -1773,6 +1873,7 @@ async fn relay(
                         &commit.outbound,
                         &value["usage"],
                     );
+                    commit.candidate.bootstrap_review_pending = false;
                     commit.candidate.completed_requests += 1;
                 }
                 let _ = trace(&commit.service, &commit.id, "primary_completed", &value);
@@ -1858,6 +1959,35 @@ mod tests {
             classifier_key: None,
             auth_token: None,
             locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn dashboard_auth_uses_real_peer_not_forwarded_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = checkpoint_service(directory.path());
+        service.auth_token = Some("fixture-token".into());
+        let mut headers = HeaderMap::new();
+        for peer in ["127.0.0.1:1234", "[::1]:1234"] {
+            assert!(authorize_dashboard(&service, &headers, peer.parse().unwrap()).is_ok());
+        }
+        headers.insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+        headers.insert("host", "localhost:8787".parse().unwrap());
+        headers.insert("forwarded", "for=127.0.0.1".parse().unwrap());
+        for peer in ["192.0.2.1:1234", "[2001:db8::1]:1234"] {
+            let peer = peer.parse().unwrap();
+            assert_eq!(
+                authorize_dashboard(&service, &headers, peer).unwrap_err().0,
+                StatusCode::UNAUTHORIZED
+            );
+            headers.insert("authorization", "Bearer wrong".parse().unwrap());
+            assert_eq!(
+                authorize_dashboard(&service, &headers, peer).unwrap_err().0,
+                StatusCode::UNAUTHORIZED
+            );
+            headers.insert("authorization", "Bearer fixture-token".parse().unwrap());
+            assert!(authorize_dashboard(&service, &headers, peer).is_ok());
+            headers.remove("authorization");
         }
     }
 

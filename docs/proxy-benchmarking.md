@@ -45,6 +45,79 @@ modeled API equivalents, **not subscription charges or an invoice**. Neither
 this adapter nor protocol fixtures establish savings. The protected API-key
 benchmark lanes and default forwarding behavior are unchanged.
 
+## Standalone proxy
+
+Start Carry once, then connect any OpenAI Responses client independently:
+
+```sh
+carry login  # once, for subscription authentication
+carry proxy --codex-login --mode compact --review-replayed-history \
+  --state-dir "$HOME/.local/share/carry-proxy/state" --payoff-requests 1
+```
+
+Interactive startup opens the dashboard automatically. Use `--open-dashboard`
+to open it from a noninteractive launch, or `--no-open-dashboard` to suppress
+browser launch. The proxy prints the bound address and dashboard URL and saves
+that URL as `dashboard-url` in the state directory. No client or model request
+is started. The default reviewer is `gpt-6-luna`; the primary model is chosen by
+the client. API-key users omit `--codex-login` and supply the upstream/reviewer
+keys through the proxy environment.
+
+Clients use `http://127.0.0.1:8787/v1` and an explicit `x-carry-session` header.
+Choose a unique identity per conversation and reuse it when resuming. Optional
+`x-carry-tenant` and `x-carry-branch` headers isolate owners and branches. Restart
+Carry with the **same state directory** to recover checkpoints, removals,
+reviewer state and usage. Do not put provider keys in the client configuration.
+For a shared listener, set `CARRY_PROXY_AUTH_TOKEN` securely and give clients
+only that scoped gateway token. Loopback model endpoints also enforce it when
+configured; token-free local dashboard access does not relax API authorization.
+
+Pi needs only an ordinary Responses provider in `models.json` (merge, do not
+replace other providers):
+
+```json
+{
+  "providers": {
+    "carry": {
+      "baseUrl": "http://127.0.0.1:8787/v1",
+      "api": "openai-responses",
+      "apiKey": "carry-local",
+      "headers": {"x-carry-session": "$CARRY_SESSION_ID"},
+      "models": [{"id": "gpt-6.1-sol", "reasoning": true, "input": ["text", "image"], "contextWindow": 272000, "maxTokens": 128000}]
+    }
+  }
+}
+```
+
+`carry-local` is a placeholder for a loopback proxy **without** a gateway token.
+If gateway authentication is configured, use an environment reference to that
+scoped token instead. Start Pi separately with, for example,
+`CARRY_SESSION_ID=my-unique-conversation pi --model carry/gpt-6.1-sol`.
+Use that same ID for a resume; choose a different one for a new conversation.
+No Pi plugin, Pi runtime dependency, or client process management is required
+by the proxy. Pi summary replacement needs an explicit new branch or the
+`x-carry-history-policy: reset-on-divergence` opt-in described below.
+
+### First replay compaction
+
+`--review-replayed-history` explicitly declares that full-history turns before
+the latest user message were already consumed by a main model. A caller can
+also opt in per request with `x-carry-replay-history: before-latest-user`.
+On a new or explicitly rebased lineage, these prior turns become reviewable
+before the first primary request, independently of the normal review cadence.
+The reviewer sees the whole conversation, but the latest user turn and its
+fresh tool results are not made removable by this import. Cross-boundary tool
+cohorts, opaque items and other pinned groups remain protected.
+
+This is a caller declaration, **not automatic ancestry inference**. With neither
+opt-in, fresh input retains the old exposure rule. A genuinely fresh first user
+request (even with leading system instructions) does not trigger a replay
+review. `off` is unchanged; `audit` reviews without rewriting; `compact` rewrites
+only after valid advice and the ordinary economic admission check. Imported
+history does not fabricate completed requests or native usage. Failed primaries
+do not grant exposure to fresh input; bootstrap retries still review and plan.
+Previously committed removals remain applied to echoed histories after restart.
+
 ## Everyday Pi launcher
 
 `scripts/pi_carry.py` is the shareable version of the local `pi-carry` wrapper.
@@ -97,7 +170,7 @@ the subscription authentication. Choose a model available to your account.
 `pi-carry --check` checks authenticated proxy readiness and Pi’s model listing;
 it makes no model requests. `pi-carry` then starts an ordinary interactive Pi
 session. It prints the stats dashboard link and saves it with mode 0600 to
-`~/.local/share/carry-proxy/dashboard-url`. Treat that link as a credential.
+`~/.local/share/carry-proxy/dashboard-url`. Local dashboard access needs no token.
 Private logs/state remain under `~/.local/share/carry-proxy/runs/<session>` and
 may contain conversation contents.
 
@@ -106,7 +179,7 @@ Optional environment settings:
 - `CARRY_PI_MODE`: `compact` (default), `audit`, or `off`.
 - `CARRY_PI_AUTH`: `codex` (default, Carry’s saved login) or `api-key`.
 - `CARRY_PI_MODEL`: primary model ID (default `gpt-6.1-sol`).
-- `CARRY_PI_CLASSIFIER_MODEL`: reviewer model ID (default the primary model).
+- `CARRY_PI_CLASSIFIER_MODEL`: reviewer model ID (default `gpt-6-luna`, independent of the primary model).
 - `CARRY_PI_BINARY`: Carry executable (default `~/.local/share/carry-proxy/carry`).
 - `CARRY_PI_CLIENT`: Pi executable (default `pi` on `PATH`).
 
@@ -119,8 +192,11 @@ model also needs a matching entry in Pi’s `models.json`.
 
 The launcher creates a fresh proxy session on each invocation; Pi summary
 replacements explicitly rebase that session. It does not recover the previous
-proxy state when resuming Pi. Port 8787 must be free; stop/restart your own
-launcher rather than replacing a running binary’s process.
+proxy state when resuming Pi. It opts into first replay review so a resumed
+conversation can be compacted before the first primary call even with no proxy
+checkpoint. For durable state independent of client restarts, use the standalone
+workflow above. Port 8787 must be free; stop/restart your own launcher rather than
+replacing a running binary’s process.
 
 ## Reviewer cache policy
 
@@ -147,6 +223,15 @@ usage—are the authority for actual cache reads and billed costs. A cache repai
 requires a new source-frozen matched cohort before changing any savings claim.
 Absent cache-policy fields in historical benchmark provenance mean `disabled`,
 not the new benchmark default. Explicit recorded values remain unchanged.
+
+Codex subscription transport does **not** accept the API's explicit cache schema;
+Carry strips those fields and uses the stable reviewer cache key with
+provider-managed implicit caching. A disabled explicit policy is not proof that
+implicit reads are disabled. The dashboard reports `codex-implicit`,
+`provider-implicit`, or `openai-explicit` separately from the policy. Its cached
+read counters come from native receipts, not boundary estimates. Cold starts,
+provider warm-up/routing and removed prefixes can miss even when stable source
+remains; do not treat a byte-identical prefix as a guaranteed hit.
 
 ## A local trial
 
@@ -267,14 +352,18 @@ Both fixtures use fabricated provider responses and usage **only as labeled prot
 ### Local stats dashboard
 
 Open `/carry/dashboard` on the proxy (normally
-`http://127.0.0.1:8787/carry/dashboard`). `pi-carry` prints a dashboard link
-containing the scoped gateway token in the URL fragment. The page removes that
-fragment immediately and holds the token only in page memory; alternatively,
-enter the **proxy** token in the page, never your OpenAI credential.
+`http://127.0.0.1:8787/carry/dashboard`). Loopback connections need no token.
+`pi-carry` prints this plain URL. For remote access, enter the **proxy** token
+in the page, never your OpenAI credential. A URL fragment `#token=...` is still
+supported; the page removes it immediately and holds the token only in memory.
 
-The shell is public; `/carry/dashboard/stats` uses the same gateway authorization
-as other proxy endpoints. On a shared/non-loopback listener, configure a gateway
-token: dashboard stats are gateway-wide, not restricted to a single session.
+The shell is public; `/carry/dashboard/stats` waives gateway authorization only
+when the TCP peer is loopback (IPv4 or IPv6). Model, metrics, and other API
+endpoints still require the gateway token. Host and forwarded headers cannot
+claim local access. A local reverse proxy counts as a local peer, so it must
+enforce its own authentication before exposing these routes remotely.
+On a shared/non-loopback listener, configure a gateway token: dashboard stats
+are gateway-wide, not restricted to a single session.
 The endpoint only returns counters, hashes, ledger totals, and context sizes,
 not conversation text, reviewer memory, or credentials. All responses are
 `Cache-Control: no-store`.

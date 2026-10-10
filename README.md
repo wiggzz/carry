@@ -131,6 +131,15 @@ carry --interactive -p "investigate the flaky test"
 printf 'explain the failing tests' | carry --print
 ```
 
+### Use Carry as a standalone context proxy
+
+Run `carry proxy --codex-login --mode compact --review-replayed-history`, then
+connect a separate OpenAI Responses client to `http://127.0.0.1:8787/v1` with a
+stable `x-carry-session` header. Interactive startup opens the local, token-free
+stats dashboard. Reusing the state directory and session identity preserves
+committed state across restarts. See the [standalone proxy setup](docs/proxy-benchmarking.md#standalone-proxy)
+for API-key authentication, client configuration, and replay-import boundaries.
+
 ### Terminal input and formatting
 
 In `--interactive` mode, Enter sends the draft. Alt+Enter or Ctrl+J inserts a
