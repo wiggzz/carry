@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Carry Proxy</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#10151d;color:#e4eaf3}body{max-width:1200px;margin:auto;padding:24px}h1{margin-bottom:4px}p{color:#9eabc0}button,input{padding:10px;border:1px solid #39465a;border-radius:6px;background:#182231;color:inherit}button{cursor:pointer}input{width:min(65vw,480px)}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:24px 0}.card{background:#1a2432;border:1px solid #2c3b50;border-radius:8px;padding:16px}.value{font-size:26px;font-weight:600;margin-top:6px}.label{color:#aebbd0;font-size:13px}.scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;white-space:nowrap;font-size:14px}th,td{text-align:left;padding:12px;border-bottom:1px solid #2b3748}th{color:#acbdd4}#status{padding:10px 0;color:#b1c4dc}.warning{color:#edc887}summary{cursor:pointer}a{color:#a1caff}small{color:#9eabc0}
+</style>
+</head>
+<body>
+<h1>Carry Proxy</h1><p id="config">Live usage &amp; retained-context stats</p>
+<form id="login"><input id="token" type="password" placeholder="Scoped proxy token (not your provider credential)" autocomplete="off" aria-label="Proxy token"> <button>Connect</button></form>
+<div id="status" role="status">Connecting…</div>
+<div class="cards" id="cards"></div>
+<h2>Usage</h2><div class="scroll"><table><thead><tr><th>Lane</th><th>Calls</th><th>Input tokens</th><th>Cached reads</th><th>Read share</th><th>Cache writes</th><th>Output tokens</th><th>API-equivalent cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
+<p><small>Costs are standard API-rate estimates, not subscription charges or an invoice. Unknown/unpriced calls make the total unavailable; the observed priced subtotal is shown separately. Counters update after observations/checkpoints, not token by token.</small></p>
+<h2>Sessions</h2><div class="scroll"><table><thead><tr><th>Session hash</th><th>Completed</th><th>Rewrites</th><th>Native compactions</th><th>Rebases</th><th>Retained items</th><th>Removed items</th><th>Retained input bytes</th><th>Shadow records</th><th>Failed primaries</th><th>Invalid reviews</th></tr></thead><tbody id="sessions"></tbody></table></div>
+<p><small>Scope: this proxy's state directory only. Retained bytes are serialized input bytes, not token counts or measured savings. Conversation text and credentials are never returned by this stats endpoint.</small></p>
+<details><summary>Inspect stats JSON</summary><pre id="raw"></pre></details>
+<script>
+'use strict';
+let token = new URLSearchParams(location.hash.slice(1)).get('token') || '';
+if(location.hash) history.replaceState(null,'',location.pathname + location.search);
+let busy=false;
+const $=id=>document.getElementById(id);
+const fmt=n=>Number(n).toLocaleString();
+const sum=(xs,key)=>xs.reduce((a,x)=>a+(Number(x[key])||0),0);
+const money=n=>'$'+Number(n).toFixed(6);
+function row(values){const tr=document.createElement('tr');for(const value of values){const td=document.createElement('td');td.textContent=value;tr.append(td)}return tr}
+function card(label,value){const el=document.createElement('div');el.className='card';const l=document.createElement('div');l.className='label';l.textContent=label;const v=document.createElement('div');v.className='value';v.textContent=value;el.append(l,v);return el}
+async function refresh(){
+ if(busy)return;busy=true;
+ try{
+  const headers=token?{Authorization:'Bearer '+token}:{};
+  const res=await fetch('/carry/dashboard/stats',{headers,cache:'no-store'});
+  if(!res.ok)throw Error(res.status===401?'Enter the scoped proxy token from pi-carry.':'Stats request failed (HTTP '+res.status+').');
+  const data=await res.json();const sessions=data.sessions;
+  $('config').textContent='Mode: '+data.mode+' · Auth: '+data.auth+' · Reviewer: '+data.classifier_model+' / '+data.classifier_effort;
+  $('status').textContent='Updated '+new Date().toLocaleTimeString()+' · auto-refresh every 2 seconds'+(data.unavailable_sessions?' · WARNING: '+data.unavailable_sessions+' unreadable checkpoints; totals incomplete':'');
+  $('login').hidden=true;
+  const primary=sessions.map(s=>s.primary),shadow=sessions.map(s=>s.shadow);
+  const unavailable=sum(primary,'unavailable_cost_calls')+sum(shadow,'unavailable_cost_calls')+data.unavailable_sessions;
+  const subtotal=sum(primary,'cost_usd')+sum(shadow,'cost_usd');
+  $('cards').replaceChildren(...[
+   ['Sessions',fmt(sessions.length)],['Completed requests',fmt(sum(sessions,'completed_requests'))],
+   ['Proxy rewrites',fmt(sum(sessions,'compactions'))],['Failed primaries',fmt(sum(sessions,'failed_primaries'))],
+   ['Invalid reviews',fmt(sum(sessions,'invalid_reviews'))],['API-equivalent total',unavailable?'Unavailable':money(subtotal)],
+   ['Observed priced subtotal',money(subtotal)]
+  ].map(([label,value])=>card(label,value)));
+  $('usage').replaceChildren(...[['Primary',primary],['Reviewer',shadow]].map(([name,ledgers])=>{
+   const input=sum(ledgers,'input_tokens'),cached=sum(ledgers,'cached_tokens'),missing=sum(ledgers,'unavailable_cost_calls');
+   return row([name,fmt(sum(ledgers,'calls')),fmt(input),fmt(cached),input?(100*cached/input).toFixed(1)+'%':'—',fmt(sum(ledgers,'cache_write_tokens')),fmt(sum(ledgers,'output_tokens')),missing?'Unavailable (subtotal '+money(sum(ledgers,'cost_usd'))+')':money(sum(ledgers,'cost_usd')),fmt(missing)]);
+  }));
+  $('sessions').replaceChildren(...sessions.map(s=>row([s.id.slice(0,12),s.completed_requests,s.compactions,s.native_compactions,s.history_rebases,s.context.retained_items,s.context.removed_items,fmt(s.context.retained_input_bytes),s.context.shadow_records,s.failed_primaries,s.invalid_reviews])));
+  $('raw').textContent=JSON.stringify(data,null,2);
+ }catch(err){$('status').textContent=err.message+' Previous stats may be stale.';$('login').hidden=false}
+ finally{busy=false}
+}
+$('login').addEventListener('submit',event=>{event.preventDefault();token=$('token').value.trim();$('token').value='';refresh()});
+refresh();setInterval(()=>{if(!document.hidden)refresh()},2000);
+</script>
+</body>
+</html>

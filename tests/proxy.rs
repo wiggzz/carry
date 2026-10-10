@@ -302,6 +302,202 @@ async fn ephemeral_proxy_listen_announces_its_actual_bound_port() {
     );
 }
 
+#[tokio::test]
+async fn codex_login_authenticates_primary_and_streamed_reviewer_with_shared_credentials() {
+    use axum::{Router, http::HeaderMap, routing::post};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let home = tempfile::tempdir().unwrap();
+    let token = format!(
+        "header.{}.signature",
+        URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#)
+    );
+    std::fs::write(
+        home.path().join("auth.json"),
+        serde_json::to_vec(&json!({
+            "version": 1, "access_token": token, "refresh_token": "fixture-refresh",
+            "expires_at_ms": 4102444800000u64
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reviews = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let shadow = reviews.clone();
+    let router = Router::new().route("/v1/responses", post(move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+        let token = token.clone(); let calls = seen.clone(); let reviews = shadow.clone();
+        async move {
+            assert_eq!(headers["authorization"], format!("Bearer {token}"));
+            assert_eq!(headers["chatgpt-account-id"], "fixture-account");
+            assert_eq!(headers["openai-beta"], "responses=experimental");
+            assert_eq!(headers["accept"], "text/event-stream");
+            assert_eq!(headers["session-id"], body["prompt_cache_key"].as_str().unwrap());
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["store"], false);
+            assert!(body["instructions"].is_string());
+            assert!(body.get("max_output_tokens").is_none());
+            assert!(body.get("prompt_cache_options").is_none());
+            assert!(!body.to_string().contains("prompt_cache_breakpoint"));
+            let reviewer = body["prompt_cache_key"] != "fixture-main";
+            let text = if reviewer {
+                reviews.fetch_add(1, Ordering::SeqCst);
+                r#"{"protected":[],"removable":[],"memories":[]}"#
+            } else { calls.fetch_add(1, Ordering::SeqCst); "fixture answer" };
+            let value = json!({"status":"completed", "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],
+                "usage":{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":0}}});
+            // Like some subscription deployments, deliberately mislabel the SSE.
+            ([ ("content-type", "application/json") ], format!("data: {}\n\n", json!({"type":"response.completed","response":value})))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let state = tempfile::tempdir().unwrap();
+    let (_proxy, url) = start_proxy_options(
+        state.path(),
+        address,
+        "audit",
+        &[
+            "--codex-login",
+            "--codex-home",
+            home.path().to_str().unwrap(),
+        ],
+        "",
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let mut input = vec![json!({"role":"user","content":"goal"})];
+    for n in 0..3 {
+        let response = client
+            .post(format!("{url}/v1/responses"))
+            .header("x-carry-session", "codex-fixture")
+            .json(&json!({"model":"gpt-6-sol", "input":input, "stream":false,
+                "max_output_tokens":1000, "prompt_cache_key":"fixture-main",
+                "prompt_cache_options":{"mode":"implicit"}}))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let value: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(value["status"], "completed");
+        input.extend(value["output"].as_array().unwrap().clone());
+        input.push(json!({"role":"user","content":format!("followup {n}")}));
+    }
+    let response = client.post(format!("{url}/v1/responses"))
+        .header("x-carry-session", "codex-stream-fixture")
+        .json(&json!({"model":"gpt-6-sol", "stream":true, "input":[{"role":"system","content":"Preserve this system instruction"},{"role":"user","content":"stream test"}], "prompt_cache_key":"fixture-main"}))
+        .send().await.unwrap();
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("response.completed")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert!(
+        reviews.load(Ordering::SeqCst) >= 1,
+        "OAuth reviewer must consume SSE"
+    );
+    let metrics: serde_json::Value = client
+        .get(format!("{url}/carry/metrics"))
+        .header("x-carry-session", "codex-fixture")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(metrics["invalid_reviews"], 0);
+    assert_eq!(metrics["completed_requests"], 3);
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_login_rejects_non_codex_remote_endpoints_before_loading_credentials() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carry"))
+        .args([
+            "proxy",
+            "--codex-login",
+            "--codex-home",
+            home.path().to_str().unwrap(),
+            "--upstream-url",
+            "https://untrusted.example/responses",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("official Codex endpoint"));
+}
+
+#[tokio::test]
+async fn dashboard_is_authenticated_and_reports_stats_without_conversation_content() {
+    use axum::{Router, routing::post};
+    let router = Router::new().route(
+        "/v1/responses",
+        post(|| async {
+            axum::Json(json!({"status":"completed", "output":[], "usage":{
+            "input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":40}}}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let state = tempfile::tempdir().unwrap();
+    let (_proxy, url) =
+        start_proxy_options(state.path(), address, "off", &[], "dashboard-token").await;
+    let client = reqwest::Client::new();
+    let shell = client
+        .get(format!("{url}/carry/dashboard"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        shell.status(),
+        200,
+        "dashboard shell must be available in a browser"
+    );
+    assert!(shell.text().await.unwrap().contains("Carry Proxy"));
+    let stats_url = format!("{url}/carry/dashboard/stats");
+    assert_eq!(client.get(&stats_url).send().await.unwrap().status(), 401);
+    for session in ["one", "two"] {
+        let response = client.post(format!("{url}/v1/responses"))
+            .bearer_auth("dashboard-token").header("x-carry-session",session)
+            .json(&json!({"model":"gpt-6-luna", "input":[{"role":"user","content":"PRIVATE_TASK_DO_NOT_EXPOSE"}]}))
+            .send().await.unwrap();
+        assert!(response.status().is_success());
+        response.bytes().await.unwrap();
+    }
+    let response = client
+        .get(&stats_url)
+        .bearer_auth("dashboard-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let data: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(data["mode"], "off");
+    assert_eq!(data["classifier_model"], "gpt-6-luna");
+    assert_eq!(data["sessions"].as_array().unwrap().len(), 2);
+    for session in data["sessions"].as_array().unwrap() {
+        assert_eq!(session["completed_requests"], 1);
+        assert_eq!(session["primary"]["input_tokens"], 100);
+        assert_eq!(session["primary"]["cached_tokens"], 40);
+        assert_eq!(session["context"]["retained_items"], 1);
+    }
+    assert!(!data.to_string().contains("PRIVATE_TASK_DO_NOT_EXPOSE"));
+    assert!(!data.to_string().contains("dashboard-token"));
+    server.abort();
+}
+
 async fn start_proxy(
     state: &std::path::Path,
     upstream: std::net::SocketAddr,
@@ -325,8 +521,6 @@ async fn start_proxy_options(
                 "127.0.0.1:0",
                 "--upstream-url",
                 &format!("http://{upstream}/v1/responses"),
-                "--classifier-url",
-                &format!("http://{upstream}/review"),
                 "--classifier-model",
                 "gpt-6-luna",
                 "--min-payback-percent",
@@ -336,6 +530,14 @@ async fn start_proxy_options(
                 "--state-dir",
                 state.to_str().unwrap(),
             ])
+            .args(if extra.contains(&"--codex-login") {
+                vec![]
+            } else {
+                vec![
+                    "--classifier-url".to_owned(),
+                    format!("http://{upstream}/review"),
+                ]
+            })
             .args(extra)
             .env_remove("OPENAI_API_KEY")
             .env("CARRY_PROXY_AUTH_TOKEN", gateway)
@@ -1010,7 +1212,7 @@ async fn unsupported_stateful_review_and_retrieval_fail_explicitly() {
         .await
         .unwrap();
     assert_eq!(missing.status(), reqwest::StatusCode::BAD_REQUEST);
-    for field in ["previous_response_id", "conversation", "background"] {
+    for field in ["conversation", "background"] {
         let mut request = plain.clone();
         request[field] = if field == "background" {
             json!(true)
@@ -1285,4 +1487,65 @@ async fn numeric_benchmark_events_match_attempts_usage_and_censored_failures() {
     assert_eq!(completed[0]["usage"]["output_tokens"], 2);
     assert_eq!(completed[0]["model"], "gpt-6-luna");
     assert!(completed[0]["latency_ms"].is_number());
+}
+
+#[tokio::test]
+async fn client_continuation_is_expanded_but_never_forwarded_upstream() {
+    use axum::{Router, routing::post};
+    use std::sync::Arc;
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let seen = requests.clone();
+    let router = Router::new().route("/v1/responses", post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+        let seen = seen.clone();
+        async move {
+            let mut requests = seen.lock().await;
+            requests.push(body);
+            axum::Json(json!({"id": format!("resp_{}", requests.len()), "status": "completed", "output": [{"role": "assistant", "content": "answer"}]}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let state = tempfile::tempdir().unwrap();
+    let (proxy, url) = start_proxy(state.path(), address, "compact").await;
+    let first = json!({"model": "fixture-model", "input": [{"role": "user", "content": "goal"}]});
+    let response = send(&url, &first, "a", "main").await;
+    assert!(response.status().is_success());
+    let _: serde_json::Value = response.json().await.unwrap();
+    let delta = json!({"model": "fixture-model", "previous_response_id": "resp_1", "input": [{"role": "user", "content": "next"}]});
+    let response = send(&url, &delta, "a", "main").await;
+    assert!(
+        response.status().is_success(),
+        "known client continuation must be accepted"
+    );
+    let _: serde_json::Value = response.json().await.unwrap();
+    let captured = requests.lock().await;
+    assert_eq!(captured.len(), 2);
+    assert!(captured[1].get("previous_response_id").is_none());
+    assert_eq!(
+        captured[1]["input"],
+        json!([{"role": "user", "content": "goal"}, {"role": "assistant", "content": "answer"}, {"role": "user", "content": "next"}])
+    );
+    drop(captured);
+    assert_eq!(
+        send(&url, &delta, "other", "main").await.status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(&url, &delta, "a", "main").await.status(),
+        reqwest::StatusCode::CONFLICT,
+        "a stale response ID must not silently fork the session"
+    );
+    drop(proxy);
+    let (_proxy, url) = start_proxy(state.path(), address, "compact").await;
+    let resumed = json!({"model": "fixture-model", "previous_response_id": "resp_2", "input": [{"role": "user", "content": "after restart"}]});
+    let response = send(&url, &resumed, "a", "main").await;
+    assert!(response.status().is_success());
+    let _: serde_json::Value = response.json().await.unwrap();
+    let captured = requests.lock().await;
+    assert_eq!(captured.len(), 3);
+    assert!(captured[2].get("previous_response_id").is_none());
+    assert_eq!(captured[2]["input"].as_array().unwrap().len(), 5);
+    assert_eq!(captured[2]["input"][4]["content"], "after restart");
+    server.abort();
 }
