@@ -63,11 +63,21 @@ is started. The default reviewer is `gpt-6-luna`; the primary model is chosen by
 the client. API-key users omit `--codex-login` and supply the upstream/reviewer
 keys through the proxy environment.
 
-Clients use `http://127.0.0.1:8787/v1` and an explicit `x-carry-session` header.
-Choose a unique identity per conversation and reuse it when resuming. Optional
-`x-carry-tenant` and `x-carry-branch` headers isolate owners and branches. Restart
-Carry with the **same state directory** to recover checkpoints, removals,
-reviewer state and usage. Do not put provider keys in the client configuration.
+Clients use `http://127.0.0.1:8787/v1`. A full-history client may omit
+`x-carry-session`: Carry keeps one active prefix per tenant/branch and request
+settings scope. Matching prefixes reuse removals and reviewer decisions; a
+shorter or divergent history replaces that state, without searching old forks.
+This also works across restarts with the same state directory. Headerless
+clients sharing a scope share its active history; use explicit identities when
+conversations must stay independent.
+
+For explicit continuity, choose a unique `x-carry-session` per conversation and
+reuse it when resuming. Optional `x-carry-tenant` and `x-carry-branch` headers
+isolate owners and branches. Explicit sessions remain strict on divergence
+unless the caller opts into a reset. `previous_response_id` requires an explicit
+session and is validated there; Carry never discovers sessions from response
+IDs. Restart Carry with the **same state directory** to recover checkpoints,
+removals, reviewer state and usage. Do not put provider keys in client configuration.
 For a shared listener, set `CARRY_PROXY_AUTH_TOKEN` securely and give clients
 only that scoped gateway token. Loopback model endpoints also enforce it when
 configured; token-free local dashboard access does not relax API authorization.
@@ -100,23 +110,47 @@ by the proxy. Pi summary replacement needs an explicit new branch or the
 
 ### First replay compaction
 
-`--review-replayed-history` explicitly declares that full-history turns before
-the latest user message were already consumed by a main model. A caller can
-also opt in per request with `x-carry-replay-history: before-latest-user`.
-On a new or explicitly rebased lineage, these prior turns become reviewable
-before the first primary request, independently of the normal review cadence.
-The reviewer sees the whole conversation, but the latest user turn and its
-fresh tool results are not made removable by this import. Cross-boundary tool
-cohorts, opaque items and other pinned groups remain protected.
+On a new or rebased history, Carry automatically imports complete turns before
+the latest user message when serialized input is at least 16 KiB. This applies
+to both implicit prefixes and explicit sessions. Small histories skip this
+bootstrap, and a fresh system/user request never qualifies as replay. Increase
+`--bootstrap-min-input-bytes` to avoid automatic import for histories below a
+chosen size. The threshold is a simple size heuristic, not a claim of savings.
 
-This is a caller declaration, **not automatic ancestry inference**. With neither
-opt-in, fresh input retains the old exposure rule. A genuinely fresh first user
-request (even with leading system instructions) does not trigger a replay
-review. `off` is unchanged; `audit` reviews without rewriting; `compact` rewrites
-only after valid advice and the ordinary economic admission check. Imported
-history does not fabricate completed requests or native usage. Failed primaries
-do not grant exposure to fresh input; bootstrap retries still review and plan.
-Previously committed removals remain applied to echoed histories after restart.
+`--review-replayed-history` or the per-request header
+`x-carry-replay-history: before-latest-user` explicitly declares prior turns
+consumed and overrides that threshold. Imported turns become reviewable before
+the first primary request, independently of normal review cadence. The latest
+user turn and its fresh tool results are not made removable by import.
+Cross-boundary tool cohorts, opaque items and other pinned groups stay protected.
+Histories with no eligible sources incur no bootstrap reviewer calls.
+
+Long histories are reviewed in chronological windows of complete atomic groups.
+Each serialized reviewer request, including its ledger and carried memories, is
+bounded by `--classifier-max-input-bytes` (default 256 KiB). This bound also guards
+ordinary reviews. Oversized groups are kept whole and protected, never split or
+truncated. Earlier source windows retire from the active reviewer projection;
+canonical history, retention decisions and sourced memories remain checkpointed.
+Successful windows are saved before the primary and are not reviewed again on a
+retry or restart. Invalid reviews stop the bootstrap attempt without discarding
+completed windows.
+
+`--bootstrap-max-calls` defaults to 16 per primary request; subsequent requests
+resume unfinished windows. `--bootstrap-max-cost-usd` defaults to $1 of cumulative
+estimated spend per active history. Spend is reserved durably before dispatch,
+including failed attempts, using conservative input/cache-write pricing and the
+configured reviewer output cap. Zero disables paid bootstrap calls; unknown
+reviewer pricing also prevents dispatch. Restarting does not replenish this
+allowance. These are modeled estimates, **not a hard provider billing limit**;
+subscription estimates are API equivalents, and the subscription adapter does
+not enforce the API output cap. Limits leave unreviewed history intact and never
+block the primary request.
+
+`off` is unchanged; `audit` reviews without rewriting; `compact` rewrites only
+after valid advice and the ordinary economic admission check. Import does not
+fabricate completed requests or native usage. Failed primaries do not grant
+exposure to fresh input or commit speculative removals. Previously committed
+removals remain applied to matching echoed histories after restart.
 
 ## Everyday Pi launcher
 
