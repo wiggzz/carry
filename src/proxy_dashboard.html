@@ -9,7 +9,7 @@
 </head>
 <body>
 <h1>Carry Proxy</h1><p id="config">Live usage &amp; retained-context stats</p>
-<form id="login"><input id="token" type="password" placeholder="Scoped proxy token (not your provider credential)" autocomplete="off" aria-label="Proxy token"> <button>Connect</button></form>
+<form id="login" hidden><input id="token" type="password" placeholder="Scoped proxy token (not your provider credential)" autocomplete="off" aria-label="Proxy token"> <button>Connect</button></form>
 <div id="status" role="status">Connecting…</div>
 <div class="cards" id="cards"></div>
 <h2>Usage</h2><div class="scroll"><table><thead><tr><th>Lane</th><th>Calls</th><th>Input tokens</th><th>Cached reads</th><th>Read share</th><th>Cache writes</th><th>Output tokens</th><th>API-equivalent cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
@@ -33,9 +33,9 @@ async function refresh(){
  try{
   const headers=token?{Authorization:'Bearer '+token}:{};
   const res=await fetch('/carry/dashboard/stats',{headers,cache:'no-store'});
-  if(!res.ok)throw Error(res.status===401?'Enter the scoped proxy token from pi-carry.':'Stats request failed (HTTP '+res.status+').');
+  if(!res.ok)throw Error(res.status===401?'Enter the scoped proxy token for remote dashboard access.':'Stats request failed (HTTP '+res.status+').');
   const data=await res.json();const sessions=data.sessions;
-  $('config').textContent='Mode: '+data.mode+' · Auth: '+data.auth+' · Reviewer: '+data.classifier_model+' / '+data.classifier_effort;
+  $('config').textContent='Mode: '+data.mode+' · Auth: '+data.auth+' · Reviewer: '+data.classifier_model+' / '+data.classifier_effort+' · Reviewer cache: '+data.reviewer_cache_mode;
   $('status').textContent='Updated '+new Date().toLocaleTimeString()+' · auto-refresh every 2 seconds'+(data.unavailable_sessions?' · WARNING: '+data.unavailable_sessions+' unreadable checkpoints; totals incomplete':'');
   $('login').hidden=true;
   const primary=sessions.map(s=>s.primary),shadow=sessions.map(s=>s.shadow);

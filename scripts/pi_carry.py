@@ -16,7 +16,7 @@ carry_binary = os.environ.get('CARRY_PI_BINARY', str(root / 'carry'))
 pi_binary = os.environ.get('CARRY_PI_CLIENT', 'pi')
 mode = os.environ.get('CARRY_PI_MODE', 'compact')
 model = os.environ.get('CARRY_PI_MODEL', 'gpt-6.1-sol')
-reviewer_model = os.environ.get('CARRY_PI_CLASSIFIER_MODEL', model)
+reviewer_model = os.environ.get('CARRY_PI_CLASSIFIER_MODEL', 'gpt-6-luna')
 if mode not in ('off', 'audit', 'compact'):
     sys.exit('CARRY_PI_MODE must be off, audit, or compact')
 check = sys.argv[1:] == ['--check']
@@ -37,7 +37,7 @@ env.update(CARRY_PROXY_AUTH_TOKEN=token, CARRY_PI_TOKEN=token, CARRY_PI_SESSION=
 command = [carry_binary, 'proxy', '--listen', '127.0.0.1:8787',
            '--state-dir', str(run_dir / 'state'), '--mode', mode,
            '--classifier-model', reviewer_model, '--classifier-reasoning-effort', 'low',
-           '--classifier-cache-policy', 'auto', '--payoff-requests', '1',
+           '--classifier-cache-policy', 'auto', '--review-replayed-history', '--payoff-requests', '1',
            '--min-payback-percent', '25']
 if auth == 'codex':
     command.append('--codex-login')
@@ -64,7 +64,7 @@ try:
         if check:
             print(f'Carry proxy ready: authenticated loopback, mode={mode}, auth={auth}; no model calls made.')
         else:
-            dashboard_url = f'http://127.0.0.1:8787/carry/dashboard#token={token}'
+            dashboard_url = 'http://127.0.0.1:8787/carry/dashboard'
             link_file = root / 'dashboard-url'
             temporary = run_dir / 'dashboard-url'
             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
