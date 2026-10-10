@@ -1,5 +1,5 @@
 //! Native codec and durable lineage. No Carry action/tool interpretation lives here.
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -95,6 +95,14 @@ pub(super) struct Session {
     /// primary completes. Persist this across failed calls and process restarts.
     #[serde(default)]
     pub bootstrap_review_pending: bool,
+    #[serde(default)]
+    pub bootstrap_end_id: u64,
+    #[serde(default)]
+    pub bootstrap_reviewed_ids: BTreeSet<u64>,
+    #[serde(default)]
+    pub bootstrap_review_complete: bool,
+    #[serde(default)]
+    pub bootstrap_estimated_cost_usd: f64,
     pub invalid_reviews: u64,
     pub failed_primaries: u64,
     pub compactions: u64,
@@ -223,9 +231,9 @@ impl Session {
         Ok(())
     }
 
-    /// Caller explicitly attests that complete turns before the latest user
-    /// message were already consumed outside this proxy. Never infer this on
-    /// ordinary fresh input, and never expose the current turn's tool results.
+    /// Treat complete turns before the latest user message as consumed replay.
+    /// Called for declared replay or sufficiently large unseen histories; never
+    /// exposes the current turn's tool results or a fresh system/user request.
     pub fn import_replayed_prefix(&mut self) {
         let Some(end) = self
             .history
@@ -244,10 +252,16 @@ impl Session {
             item.exposed = true;
         }
         self.bootstrap_review_pending = true;
+        self.bootstrap_end_id = self.history[end - 1].id;
+        self.bootstrap_review_complete = false;
     }
 
     pub fn reset_active(&mut self) {
         self.bootstrap_review_pending = false;
+        self.bootstrap_end_id = 0;
+        self.bootstrap_reviewed_ids.clear();
+        self.bootstrap_review_complete = false;
+        self.bootstrap_estimated_cost_usd = 0.0;
         self.history.clear();
         self.pending_output.clear();
         self.last_response_id = None;
@@ -410,13 +424,17 @@ impl Session {
         input
     }
 
+    #[cfg(test)]
     pub fn shadow_input(&self) -> Vec<Value> {
+        self.shadow_input_for_groups(&self.groups())
+    }
+
+    pub fn shadow_input_for_groups(&self, groups: &[Group]) -> Vec<Value> {
         let mut input = self
             .active_shadow
             .iter()
             .map(|r| r.value.clone())
             .collect::<Vec<_>>();
-        let groups = self.groups();
         let eligible = groups
             .iter()
             .filter(|g| g.exposed && !g.pinned)
