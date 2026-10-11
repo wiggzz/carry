@@ -113,6 +113,9 @@ pub(super) struct Session {
     #[serde(default)]
     pub bootstrap_estimated_cost_usd: f64,
     pub invalid_reviews: u64,
+    /// Only bounded item indexes/reasons, never rejected source text or raw advice.
+    #[serde(default)]
+    pub review_feedback: Value,
     pub failed_primaries: u64,
     pub compactions: u64,
     pub native_compactions: u64,
@@ -288,6 +291,7 @@ impl Session {
         self.primary_cache.clear();
         self.shadow_cache.clear();
         self.reviewer_cache.clear();
+        self.review_feedback = Value::Null;
     }
 
     pub fn groups(&self) -> Vec<Group> {
@@ -462,7 +466,8 @@ impl Session {
             })
             .collect::<Vec<_>>();
         input.push(json!({"role": "user", "content": json!({
-            "eligible_group_ids": eligible, "current_groups": ledger
+            "eligible_group_ids": eligible, "current_groups": ledger,
+            "previous_review_feedback": self.review_feedback
         }).to_string()}));
         input
     }
@@ -536,63 +541,108 @@ impl Session {
     }
 
     pub fn apply_advice(&mut self, groups: &[Group], value: &Value) -> Result<()> {
-        let object = value
+        self.review_feedback = Value::Null;
+        value
             .as_object()
-            .filter(|o| o.len() == 3)
-            .ok_or_else(|| anyhow::anyhow!("advice object invalid"))?;
-        let _ = object;
+            .filter(|o| {
+                o.len() == 3
+                    && ["protected", "removable", "memories"]
+                        .iter()
+                        .all(|k| o.contains_key(*k))
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("advice must contain exactly protected, removable and memories")
+            })?;
         let known = groups
             .iter()
             .filter(|g| g.exposed && !g.pinned)
             .map(|g| g.id)
             .collect::<HashSet<_>>();
         let all = groups.iter().map(|g| g.id).collect::<HashSet<_>>();
+        let mut rejected = Vec::new();
+        let mut rejected_count = 0usize;
+        let mut reject = |field: &str, index: usize, reason: &str| {
+            rejected_count += 1;
+            if rejected.len() < 64 {
+                rejected.push(json!({"field":field,"index":index,"reason":reason}));
+            }
+        };
         let mut updates = BTreeMap::new();
+        // Protect takes precedence over a conflicting drop, irrespective of order.
         for (field, opinion) in [("protected", "keep"), ("removable", "drop")] {
-            let ids = value[field]
-                .as_array()
-                .filter(|a| a.len() <= 256)
-                .ok_or_else(|| anyhow::anyhow!("advice IDs invalid"))?;
-            for id in ids {
-                let id = parse_group(id)?;
-                if !(known.contains(&id) || (opinion == "keep" && all.contains(&id)))
-                    || updates.insert(id, opinion).is_some()
-                {
-                    bail!("advice ID unknown, pinned, unexposed or contradictory");
+            let Some(ids) = value[field].as_array().filter(|a| a.len() <= 256) else {
+                reject(field, 0, "expected an array of at most 256 group IDs");
+                continue;
+            };
+            for (index, raw) in ids.iter().enumerate() {
+                let Ok(id) = parse_group(raw) else {
+                    reject(field, index, "expected a group ID such as g1");
+                    continue;
+                };
+                if !(known.contains(&id) || (opinion == "keep" && all.contains(&id))) {
+                    reject(
+                        field,
+                        index,
+                        "group is unknown, pinned or not exposed; use current eligible_group_ids",
+                    );
+                } else if updates.contains_key(&id) {
+                    reject(
+                        field,
+                        index,
+                        "duplicate or conflicting opinion; protection takes precedence",
+                    );
+                } else {
+                    updates.insert(id, opinion);
                 }
             }
         }
         let mut memories = Vec::new();
-        for memory in value["memories"]
-            .as_array()
-            .filter(|a| a.len() <= 64)
-            .ok_or_else(|| anyhow::anyhow!("memories invalid"))?
-        {
-            if memory.as_object().is_none_or(|o| o.len() != 2) {
-                bail!("memory shape invalid");
+        if let Some(items) = value["memories"].as_array().filter(|a| a.len() <= 64) {
+            for (index, memory) in items.iter().enumerate() {
+                let parsed = (|| -> Result<(Vec<u64>, String)> {
+                    if memory.as_object().is_none_or(|o| {
+                        o.len() != 2 || !o.contains_key("text") || !o.contains_key("source_ids")
+                    }) {
+                        bail!("memory must contain exactly source_ids and text");
+                    }
+                    let text = memory["text"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty() && s.len() <= 4096)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("memory text must be nonempty and at most 4096 bytes")
+                        })?;
+                    let sources = memory["source_ids"]
+                        .as_array()
+                        .filter(|a| !a.is_empty() && a.len() <= 32)
+                        .ok_or_else(|| anyhow::anyhow!("memory needs 1 to 32 eligible source IDs"))?
+                        .iter()
+                        .map(parse_group)
+                        .collect::<Result<Vec<_>>>()?;
+                    if sources.iter().any(|id| !known.contains(id)) {
+                        bail!("all memory sources must be in current eligible_group_ids");
+                    }
+                    Ok((sources, text.to_owned()))
+                })();
+                match parsed {
+                    Ok(memory)
+                        if self
+                            .memories
+                            .iter()
+                            .any(|m| m.source_ids == memory.0 && m.text == memory.1)
+                            || memories.contains(&memory) => {}
+                    Ok(memory) if self.memories.len() + memories.len() < 128 => {
+                        memories.push(memory)
+                    }
+                    Ok(_) => reject("memories", index, "active memory limit of 128 reached"),
+                    Err(error) => reject("memories", index, &error.to_string()),
+                }
             }
-            let text = memory["text"]
-                .as_str()
-                .filter(|s| !s.trim().is_empty() && s.len() <= 4096)
-                .ok_or_else(|| anyhow::anyhow!("memory text invalid"))?;
-            let sources = memory["source_ids"]
-                .as_array()
-                .filter(|a| !a.is_empty() && a.len() <= 32)
-                .ok_or_else(|| anyhow::anyhow!("memory sources invalid"))?
-                .iter()
-                .map(parse_group)
-                .collect::<Result<Vec<_>>>()?;
-            if sources.iter().any(|id| !known.contains(id)) {
-                bail!("memory source not eligible");
-            }
-            memories.push((sources, text.to_owned()));
+        } else {
+            reject("memories", 0, "expected an array of at most 64 memories");
         }
-        if self.memories.len() + memories.len() > 128 {
-            bail!("memory limit exceeded");
-        }
-        // Validate the ENTIRE batch before applying anything. Review records are
-        // split by source here; retaining a mixed raw response would leave a
-        // hidden reservoir of removed source/opinion records in the active view.
+        self.review_feedback = json!({"accepted_opinions":updates.len(), "accepted_memories":memories.len(),
+            "rejected_count":rejected_count, "rejected":rejected,
+            "guidance":"Accepted items were applied. Correct rejected items in a future review using the current eligible ledger; do not repeat accepted memories."});
         for (id, opinion) in updates {
             self.opinions.insert(id, opinion.into());
         }
@@ -663,6 +713,94 @@ fn parse_group(value: &Value) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_advice_applies_valid_items_without_invalid_sources() {
+        let mut state = Session::default();
+        state
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                json!({"role":"assistant","content":"evidence"}),
+                json!({"role":"user","content":"latest goal"}),
+            ])
+            .unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        let groups = state.groups();
+        let result = state.apply_advice(
+            &groups,
+            &json!({
+                "protected":["g1"], "removable":["g999","g2"],
+                "memories":[{"source_ids":["g999"],"text":"unsafe"},
+                            {"source_ids":["g2"],"text":"valid fact"}]
+            }),
+        );
+        assert!(result.is_ok(), "one invalid item must not reject the batch");
+        assert_eq!(state.opinions.get(&2).map(String::as_str), Some("drop"));
+        assert_eq!(state.memories.len(), 1);
+        assert_eq!(state.memories[0].text, "valid fact");
+        assert_eq!(state.review_feedback["rejected_count"], 2);
+        let restored: Session =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        let shadow = restored.shadow_input();
+        let ledger: Value =
+            serde_json::from_str(shadow.last().unwrap()["content"].as_str().unwrap()).unwrap();
+        assert_eq!(ledger["previous_review_feedback"], state.review_feedback);
+        assert!(
+            !ledger["previous_review_feedback"]
+                .to_string()
+                .contains("unsafe")
+        );
+        state.reset_active();
+        assert!(state.review_feedback.is_null());
+    }
+
+    #[test]
+    fn conflicting_and_malformed_advice_items_are_isolated_and_feedback_is_bounded() {
+        let mut state = Session::default();
+        state
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                json!({"role":"assistant","content":"evidence"}),
+                json!({"role":"user","content":"current"}),
+            ])
+            .unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        let groups = state.groups();
+        state
+            .apply_advice(
+                &groups,
+                &json!({"protected":["g2","g2"],"removable":["g2","g3",17],
+            "memories":[{"source_ids":["g2"],"text":"fact"},{"source_ids":["g3"],"text":"pinned"},
+                {"source_ids":["g2"],"text":""},{"source_ids":["g2"],"text":"fact"}]}),
+            )
+            .unwrap();
+        assert_eq!(state.opinions.get(&2).map(String::as_str), Some("keep"));
+        assert_eq!(state.memories.len(), 1);
+        assert_eq!(state.review_feedback["rejected_count"], 6);
+        state
+            .apply_advice(
+                &groups,
+                &json!({"protected":null,"removable":["g2"],"memories":[]}),
+            )
+            .unwrap();
+        assert_eq!(state.opinions.get(&2).map(String::as_str), Some("drop"));
+        assert_eq!(state.review_feedback["rejected_count"], 1);
+        state
+            .apply_advice(
+                &groups,
+                &json!({"protected":vec!["g999";256],"removable":[],"memories":[]}),
+            )
+            .unwrap();
+        assert_eq!(state.review_feedback["rejected_count"], 256);
+        assert_eq!(
+            state.review_feedback["rejected"].as_array().unwrap().len(),
+            64
+        );
+    }
 
     #[test]
     fn memories_activate_on_any_removed_source_at_latest_source_position() {

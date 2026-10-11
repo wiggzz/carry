@@ -1532,8 +1532,8 @@ async fn branch_tenant_and_restart_are_explicit_and_credentials_are_not_persiste
 }
 
 #[tokio::test]
-async fn invalid_mixed_advice_is_atomic_and_failed_primary_keeps_completed_shadow() {
-    let fixture = fixture(json!({"protected": ["g2"], "removable": ["g2"], "memories": [{"source_ids": ["g2"], "text": "must not be partially applied"}]})).await;
+async fn mixed_advice_applies_valid_items_and_failed_primary_keeps_feedback() {
+    let fixture = fixture(json!({"protected": ["g2"], "removable": ["g2"], "memories": [{"source_ids": ["g2"], "text": "valid sourced fact"}]})).await;
     let state = tempfile::tempdir().unwrap();
     // Preserve the live-primary exposure boundary rather than importing replay.
     let (_proxy, url) = start_proxy_options(
@@ -1567,8 +1567,19 @@ async fn invalid_mixed_advice_is_atomic_and_failed_primary_keeps_completed_shado
     let saved = checkpoint_states(state.path()).remove(0);
     assert_eq!(saved["invalid_reviews"], 1);
     assert_eq!(saved["shadow"]["calls"], 1);
-    assert_eq!(saved["memories"], json!([]));
-    assert_eq!(saved["opinions"], json!({}));
+    assert_eq!(saved["memories"][0]["text"], "valid sourced fact");
+    assert_eq!(saved["opinions"]["2"], "keep");
+    assert_eq!(saved["review_feedback"]["rejected_count"], 1);
+    assert_eq!(
+        saved["review_feedback"]["rejected"][0]["field"],
+        "removable"
+    );
+    assert!(
+        saved["review_feedback"]["rejected"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("conflicting")
+    );
     assert_eq!(saved["compactions"], 0);
     assert!(
         fixture.requests.lock().await[1]
@@ -2269,7 +2280,7 @@ async fn ongoing_windows_resume_after_failed_primary_restart_and_invalid_advice(
                 let ledger: serde_json::Value = serde_json::from_str(body["input"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap()).unwrap();
                 let eligible = ledger["eligible_group_ids"].as_array().unwrap();
                 let advice = if captured.len() == 2 {
-                    json!({"protected": eligible, "removable": eligible, "memories": []})
+                    json!({"protected": [], "removable": ["g999"], "memories": []})
                 } else {
                     json!({"protected": eligible, "removable": [], "memories": [{"source_ids": [eligible[0]], "text": "durable window fact"}]})
                 };
@@ -2391,6 +2402,22 @@ async fn ongoing_windows_resume_after_failed_primary_restart_and_invalid_advice(
             ids(&captured[1]),
             ids(&captured[2]),
             "retry the invalid window, not completed windows"
+        );
+        let retry_ledger: serde_json::Value = serde_json::from_str(
+            captured[2]["input"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            retry_ledger["previous_review_feedback"]["rejected_count"],
+            1
+        );
+        assert!(
+            retry_ledger["previous_review_feedback"]["rejected"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("unknown")
         );
         let first_ids = ids(&captured[0]);
         let mut successful = first_ids.clone();
