@@ -357,15 +357,15 @@ impl OpenAiClient {
                     access_token,
                     account_id,
                     ..
-                } => request
-                    .bearer_auth(access_token)
-                    .header("chatgpt-account-id", account_id)
-                    .header("OpenAI-Beta", "responses=experimental")
-                    .header("Accept", "text/event-stream")
-                    .header("session-id", &self.prompt_cache_key)
-                    .header("x-client-request-id", &client_request_id)
-                    .header("originator", "carry")
-                    .header("User-Agent", concat!("carry/", env!("CARGO_PKG_VERSION"))),
+                } => crate::auth::authorize_codex_request(
+                    request,
+                    &crate::auth::CodexAuth {
+                        access_token: access_token.clone(),
+                        account_id: account_id.clone(),
+                    },
+                    &self.prompt_cache_key,
+                    &client_request_id,
+                ),
             };
             let response = match request.send().await {
                 Ok(response) => response,
@@ -637,7 +637,7 @@ pub(crate) fn new_prompt_cache_key() -> String {
     format!("carry-{}-{now}-{sequence}", std::process::id())
 }
 
-fn remove_prompt_cache_breakpoints(value: &mut Value) {
+pub(crate) fn remove_prompt_cache_breakpoints(value: &mut Value) {
     match value {
         Value::Object(object) => {
             object.remove("prompt_cache_breakpoint");

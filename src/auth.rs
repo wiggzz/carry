@@ -83,6 +83,24 @@ pub(crate) fn codex_responses_url() -> &'static str {
     CODEX_RESPONSES_URL
 }
 
+/// Shared subscription headers for the direct agent and native-client proxy.
+pub(crate) fn authorize_codex_request(
+    request: reqwest::RequestBuilder,
+    credential: &CodexAuth,
+    session: &str,
+    request_id: &str,
+) -> reqwest::RequestBuilder {
+    request
+        .bearer_auth(&credential.access_token)
+        .header("chatgpt-account-id", &credential.account_id)
+        .header("OpenAI-Beta", "responses=experimental")
+        .header("Accept", "text/event-stream")
+        .header("session-id", session)
+        .header("x-client-request-id", request_id)
+        .header("originator", "carry")
+        .header("User-Agent", concat!("carry/", env!("CARGO_PKG_VERSION")))
+}
+
 pub(crate) async fn load_auth(home: &Path) -> Result<Option<CodexAuth>> {
     load_auth_inner(home, false, TOKEN_URL).await
 }

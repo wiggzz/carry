@@ -279,6 +279,7 @@ jobs:
           scripts/test_proxy_benchmark.py
           scripts/test_proxy_workflow.py
           scripts/test_proxy_trial.py
+          scripts/test_pi_carry.py
           scripts/test_proxy_native_fixture.py
           scripts/test_proxy_reviewer_cache_fixture.py
           scripts/test_proxy_gateway.py

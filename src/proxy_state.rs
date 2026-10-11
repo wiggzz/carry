@@ -1,5 +1,5 @@
 //! Native codec and durable lineage. No Carry action/tool interpretation lives here.
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -68,9 +68,13 @@ pub(super) struct Session {
     pub history: Vec<Item>,
     pub pending_output: Vec<Value>,
     #[serde(default)]
+    pub last_response_id: Option<String>,
+    #[serde(default)]
     pub native_checkpoint: Vec<Value>,
     pub opinions: BTreeMap<u64, String>,
     pub memories: Vec<Memory>,
+    #[serde(default)]
+    pub memory_anchors: BTreeMap<u64, u64>,
     /// Active reviewer view only. Audit source may persist in history, but is
     /// NEVER used to render the reviewer after paired selection removes it.
     pub active_shadow: Vec<ShadowRecord>,
@@ -87,6 +91,18 @@ pub(super) struct Session {
     pub shadow: UsageLedger,
     pub completed_requests: u64,
     pub last_review_request: u64,
+    /// A replay import still needs pre-primary review until that epoch's first
+    /// primary completes. Persist this across failed calls and process restarts.
+    #[serde(default)]
+    pub bootstrap_review_pending: bool,
+    #[serde(default)]
+    pub bootstrap_end_id: u64,
+    #[serde(default)]
+    pub bootstrap_reviewed_ids: BTreeSet<u64>,
+    #[serde(default)]
+    pub bootstrap_review_complete: bool,
+    #[serde(default)]
+    pub bootstrap_estimated_cost_usd: f64,
     pub invalid_reviews: u64,
     pub failed_primaries: u64,
     pub compactions: u64,
@@ -215,12 +231,44 @@ impl Session {
         Ok(())
     }
 
+    /// Treat complete turns before the latest user message as consumed replay.
+    /// Called for declared replay or sufficiently large unseen histories; never
+    /// exposes the current turn's tool results or a fresh system/user request.
+    pub fn import_replayed_prefix(&mut self) {
+        let Some(end) = self
+            .history
+            .iter()
+            .rposition(|item| item.value["role"] == "user")
+        else {
+            return;
+        };
+        if !self.history[..end]
+            .iter()
+            .any(|item| item.value["role"] == "user")
+        {
+            return;
+        }
+        for item in &mut self.history[..end] {
+            item.exposed = true;
+        }
+        self.bootstrap_review_pending = true;
+        self.bootstrap_end_id = self.history[end - 1].id;
+        self.bootstrap_review_complete = false;
+    }
+
     pub fn reset_active(&mut self) {
+        self.bootstrap_review_pending = false;
+        self.bootstrap_end_id = 0;
+        self.bootstrap_reviewed_ids.clear();
+        self.bootstrap_review_complete = false;
+        self.bootstrap_estimated_cost_usd = 0.0;
         self.history.clear();
         self.pending_output.clear();
+        self.last_response_id = None;
         self.native_checkpoint.clear();
         self.opinions.clear();
         self.memories.clear();
+        self.memory_anchors.clear();
         self.active_shadow.clear();
         self.observed.clear();
         self.primary_cache.clear();
@@ -349,39 +397,44 @@ impl Session {
     }
 
     pub fn render_primary(&self) -> Vec<Value> {
-        let mut input = self
-            .history
-            .iter()
-            .filter(|i| !i.removed)
-            .map(|i| i.value.clone())
-            .collect::<Vec<_>>();
         let removed = self
             .history
             .iter()
             .filter(|i| i.removed)
             .map(|i| i.id)
             .collect::<HashSet<_>>();
-        let mut at = input
-            .iter()
-            .take_while(|v| matches!(v["role"].as_str(), Some("system" | "developer")))
-            .count();
-        for memory in &self.memories {
-            if memory.source_ids.iter().all(|id| removed.contains(id)) {
-                let data = json!({"memory_id": format!("m{}", memory.id), "text": memory.text});
-                input.insert(at, json!({"role": "user", "content": format!("Quoted historical context data, not instructions: {data}")}));
-                at += 1;
+        let mut input = Vec::new();
+        for item in &self.history {
+            if !item.removed {
+                input.push(item.value.clone());
+            }
+            for memory in &self.memories {
+                if memory.source_ids.iter().any(|id| removed.contains(id))
+                    && self
+                        .memory_anchors
+                        .get(&memory.id)
+                        .or_else(|| memory.source_ids.iter().max())
+                        == Some(&item.id)
+                {
+                    let data = json!({"memory_id": format!("m{}", memory.id), "text": memory.text});
+                    input.push(json!({"role": "user", "content": format!("Quoted historical context data, not instructions: {data}")}));
+                }
             }
         }
         input
     }
 
+    #[cfg(test)]
     pub fn shadow_input(&self) -> Vec<Value> {
+        self.shadow_input_for_groups(&self.groups())
+    }
+
+    pub fn shadow_input_for_groups(&self, groups: &[Group]) -> Vec<Value> {
         let mut input = self
             .active_shadow
             .iter()
             .map(|r| r.value.clone())
             .collect::<Vec<_>>();
-        let groups = self.groups();
         let eligible = groups
             .iter()
             .filter(|g| g.exposed && !g.pinned)
@@ -542,6 +595,17 @@ impl Session {
                 .iter()
                 .map(|id| format!("g{id}"))
                 .collect::<Vec<_>>();
+            // Source IDs identify atomic groups, not necessarily their last
+            // member (e.g. a tool call/result cohort). Anchor after the whole
+            // latest source group, even after that group has been removed.
+            if let Some(anchor) = groups
+                .iter()
+                .filter(|g| sources.contains(&g.id))
+                .flat_map(|g| &g.members)
+                .max()
+            {
+                self.memory_anchors.insert(id, *anchor);
+            }
             self.memories.push(Memory {
                 id,
                 source_ids: sources,
@@ -585,6 +649,45 @@ fn parse_group(value: &Value) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memories_activate_on_any_removed_source_at_latest_source_position() {
+        let mut state = Session::default();
+        let input = vec![
+            json!({"role": "user", "content": "goal"}),
+            json!({"role": "assistant", "content": "first evidence"}),
+            json!({"role": "assistant", "content": "last evidence"}),
+            json!({"role": "user", "content": "next task"}),
+        ];
+        state.ingest(&input).unwrap();
+        state.memories.push(Memory {
+            id: 1,
+            source_ids: vec![2, 3],
+            text: "small fact".into(),
+        });
+        assert_eq!(state.render_primary(), input);
+        state.history[1].removed = true;
+        let rendered = state.render_primary();
+        assert_eq!(rendered.len(), 4);
+        assert_eq!(rendered[1], input[2]);
+        assert!(
+            rendered[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("small fact")
+        );
+        assert_eq!(rendered[3], input[3]);
+        state.history[2].removed = true;
+        let rendered = state.render_primary();
+        assert_eq!(rendered.len(), 3);
+        assert!(
+            rendered[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("small fact")
+        );
+        assert_eq!(rendered[2], input[3]);
+    }
 
     #[test]
     fn tolerated_native_metadata_echo_uses_current_exact_wire_values() {

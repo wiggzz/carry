@@ -4,6 +4,234 @@
 
 The benchmark default is **`disabled`**, which retains the existing direct lanes. `disabled` and proxy `off` are distinct treatments. Compare `off` versus `compact` on the same candidate, tasks, model, effort, client configuration and native-compaction settings. Measure `disabled` versus `off` separately as transport overhead.
 
+## Local ChatGPT/Codex login
+
+The opt-in `--codex-login` adapter uses the same saved credential, proactive
+refresh, account extraction and subscription headers as Carry's direct agent:
+
+```sh
+carry login                         # or: carry login --device-auth
+carry proxy --codex-login --mode compact --classifier-model gpt-6.1-sol \
+  --listen 127.0.0.1:8787 --state-dir /path/to/private-proxy-state
+```
+
+Credentials live in `CARRY_HOME` or `~/.carry`; `--codex-home` overrides that
+directory. This reads **Carry's login**, not Pi's `auth.json` or a Codex CLI login.
+No API key is needed when both primary and reviewer use the subscription. With
+no `--classifier-url`, reviews use the same login/endpoint. Set an explicit
+`--classifier-url` and `CARRY_PROXY_CLASSIFIER_KEY` to keep API-key-backed reviews.
+Choose a reviewer model available to your subscription; model discovery is not
+implemented for this adapter. `gpt-6.1-sol` has been exercised locally.
+
+The default upstream switches to `https://chatgpt.com/backend-api/codex/responses`.
+Subscription credentials are restricted to that exact endpoint (and explicit
+HTTP loopback endpoints for credential-free fixtures). The proxy reloads and
+refreshes the credential before requests, and refreshes/retries once on HTTP 401.
+
+Unlike ordinary opaque API-key forwarding, this is an explicit wire adapter:
+`store:false` and upstream SSE are required; initial system/developer messages
+move to `instructions`; unsupported output limits, cache options/retention and
+cache breakpoints are removed. Reviewer JSON formatting is instruction-driven.
+Successful SSE bytes are relayed with the correct content type even when the
+subscription server mislabels them. Nonstreaming callers receive the completed
+Responses object extracted from the SSE. Public API explicit reviewer cache
+writes are disabled for subscription reviews. Primary tools and surviving
+ordinary input items are otherwise retained. Pi's summary requests work through
+`/responses`; subscription `/responses/compact` and model discovery return 501.
+This is not a broad Codex-client/native-compaction compatibility claim.
+
+Reviews consume subscription capacity. Standard-rate usage estimates are still
+modeled API equivalents, **not subscription charges or an invoice**. Neither
+this adapter nor protocol fixtures establish savings. The protected API-key
+benchmark lanes and default forwarding behavior are unchanged.
+
+## Standalone proxy
+
+Start Carry once, then connect any OpenAI Responses client independently:
+
+```sh
+carry login  # once, for subscription authentication
+carry proxy --codex-login --mode compact --review-replayed-history \
+  --state-dir "$HOME/.local/share/carry-proxy/state" --payoff-requests 1
+```
+
+Interactive startup opens the dashboard automatically. Use `--open-dashboard`
+to open it from a noninteractive launch, or `--no-open-dashboard` to suppress
+browser launch. The proxy prints the bound address and dashboard URL and saves
+that URL as `dashboard-url` in the state directory. No client or model request
+is started. The default reviewer is `gpt-6-luna`; the primary model is chosen by
+the client. API-key users omit `--codex-login` and supply the upstream/reviewer
+keys through the proxy environment.
+
+Clients use `http://127.0.0.1:8787/v1`. A full-history client may omit
+`x-carry-session`: Carry keeps one active prefix per tenant/branch and request
+settings scope. Matching prefixes reuse removals and reviewer decisions; a
+shorter or divergent history replaces that state, without searching old forks.
+This also works across restarts with the same state directory. Headerless
+clients sharing a scope share its active history; use explicit identities when
+conversations must stay independent.
+
+For explicit continuity, choose a unique `x-carry-session` per conversation and
+reuse it when resuming. Optional `x-carry-tenant` and `x-carry-branch` headers
+isolate owners and branches. Explicit sessions remain strict on divergence
+unless the caller opts into a reset. `previous_response_id` requires an explicit
+session and is validated there; Carry never discovers sessions from response
+IDs. Restart Carry with the **same state directory** to recover checkpoints,
+removals, reviewer state and usage. Do not put provider keys in client configuration.
+For a shared listener, set `CARRY_PROXY_AUTH_TOKEN` securely and give clients
+only that scoped gateway token. Loopback model endpoints also enforce it when
+configured; token-free local dashboard access does not relax API authorization.
+
+Pi needs only an ordinary Responses provider in `models.json` (merge, do not
+replace other providers):
+
+```json
+{
+  "providers": {
+    "carry": {
+      "baseUrl": "http://127.0.0.1:8787/v1",
+      "api": "openai-responses",
+      "apiKey": "carry-local",
+      "headers": {"x-carry-session": "$CARRY_SESSION_ID"},
+      "models": [{"id": "gpt-6.1-sol", "reasoning": true, "input": ["text", "image"], "contextWindow": 272000, "maxTokens": 128000}]
+    }
+  }
+}
+```
+
+`carry-local` is a placeholder for a loopback proxy **without** a gateway token.
+If gateway authentication is configured, use an environment reference to that
+scoped token instead. Start Pi separately with, for example,
+`CARRY_SESSION_ID=my-unique-conversation pi --model carry/gpt-6.1-sol`.
+Use that same ID for a resume; choose a different one for a new conversation.
+No Pi plugin, Pi runtime dependency, or client process management is required
+by the proxy. Pi summary replacement needs an explicit new branch or the
+`x-carry-history-policy: reset-on-divergence` opt-in described below.
+
+### First replay compaction
+
+On a new or rebased history, Carry automatically imports complete turns before
+the latest user message when serialized input is at least 16 KiB. This applies
+to both implicit prefixes and explicit sessions. Small histories skip this
+bootstrap, and a fresh system/user request never qualifies as replay. Increase
+`--bootstrap-min-input-bytes` to avoid automatic import for histories below a
+chosen size. The threshold is a simple size heuristic, not a claim of savings.
+
+`--review-replayed-history` or the per-request header
+`x-carry-replay-history: before-latest-user` explicitly declares prior turns
+consumed and overrides that threshold. Imported turns become reviewable before
+the first primary request, independently of normal review cadence. The latest
+user turn and its fresh tool results are not made removable by import.
+Cross-boundary tool cohorts, opaque items and other pinned groups stay protected.
+Histories with no eligible sources incur no bootstrap reviewer calls.
+
+Long histories are reviewed in chronological windows of complete atomic groups.
+Each serialized reviewer request, including its ledger and carried memories, is
+bounded by `--classifier-max-input-bytes` (default 256 KiB). This bound also guards
+ordinary reviews. Oversized groups are kept whole and protected, never split or
+truncated. Earlier source windows retire from the active reviewer projection;
+canonical history, retention decisions and sourced memories remain checkpointed.
+Successful windows are saved before the primary and are not reviewed again on a
+retry or restart. Invalid reviews stop the bootstrap attempt without discarding
+completed windows.
+
+`--bootstrap-max-calls` defaults to 16 per primary request; subsequent requests
+resume unfinished windows. `--bootstrap-max-cost-usd` defaults to $1 of cumulative
+estimated spend per active history. Spend is reserved durably before dispatch,
+including failed attempts, using conservative input/cache-write pricing and the
+configured reviewer output cap. Zero disables paid bootstrap calls; unknown
+reviewer pricing also prevents dispatch. Restarting does not replenish this
+allowance. These are modeled estimates, **not a hard provider billing limit**;
+subscription estimates are API equivalents, and the subscription adapter does
+not enforce the API output cap. Limits leave unreviewed history intact and never
+block the primary request.
+
+`off` is unchanged; `audit` reviews without rewriting; `compact` rewrites only
+after valid advice and the ordinary economic admission check. Import does not
+fabricate completed requests or native usage. Failed primaries do not grant
+exposure to fresh input or commit speculative removals. Previously committed
+removals remain applied to matching echoed histories after restart.
+
+## Everyday Pi launcher
+
+`scripts/pi_carry.py` is the shareable version of the local `pi-carry` wrapper.
+It uses your existing Pi configuration, starts one loopback proxy per invocation,
+passes Pi only a scoped gateway token, and stops its own proxy on exit. It does
+not install Pi, edit its settings, or replace a proxy that is already running.
+This is a convenience launcher, **not a sandbox**: tools run with your user’s
+permissions and can still access same-user credentials and processes.
+
+```sh
+cargo build --release
+mkdir -p ~/.local/share/carry-proxy ~/.local/bin
+install -m755 target/release/carry ~/.local/share/carry-proxy/carry
+install -m755 scripts/pi_carry.py ~/.local/bin/pi-carry
+carry login
+```
+
+Merge the following provider into your Pi agent-directory `models.json`
+(default `~/.pi/agent/models.json`); do not overwrite other providers. This is
+an OpenAI Responses endpoint, not an OpenAI Codex OAuth provider. Carry owns
+the subscription authentication. Choose a model available to your account.
+
+```json
+{
+  "providers": {
+    "carry": {
+      "baseUrl": "http://127.0.0.1:8787/v1",
+      "api": "openai-responses",
+      "apiKey": "$CARRY_PI_TOKEN",
+      "headers": {
+        "x-carry-session": "$CARRY_PI_SESSION",
+        "x-carry-tenant": "local-pi",
+        "x-carry-branch": "main",
+        "x-carry-history-policy": "reset-on-divergence"
+      },
+      "models": [
+        {
+          "id": "gpt-6.1-sol",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 272000,
+          "maxTokens": 128000
+        }
+      ]
+    }
+  }
+}
+```
+
+`pi-carry --check` checks authenticated proxy readiness and Pi’s model listing;
+it makes no model requests. `pi-carry` then starts an ordinary interactive Pi
+session. It prints the stats dashboard link and saves it with mode 0600 to
+`~/.local/share/carry-proxy/dashboard-url`. Local dashboard access needs no token.
+Private logs/state remain under `~/.local/share/carry-proxy/runs/<session>` and
+may contain conversation contents.
+
+Optional environment settings:
+
+- `CARRY_PI_MODE`: `compact` (default), `audit`, or `off`.
+- `CARRY_PI_AUTH`: `codex` (default, Carry’s saved login) or `api-key`.
+- `CARRY_PI_MODEL`: primary model ID (default `gpt-6.1-sol`).
+- `CARRY_PI_CLASSIFIER_MODEL`: reviewer model ID (default `gpt-6-luna`, independent of the primary model).
+- `CARRY_PI_BINARY`: Carry executable (default `~/.local/share/carry-proxy/carry`).
+- `CARRY_PI_CLIENT`: Pi executable (default `pi` on `PATH`).
+
+For API-key mode, supply `CARRY_PROXY_UPSTREAM_KEY` and
+`CARRY_PROXY_CLASSIFIER_KEY` securely in the launcher environment (or the
+proxy’s `OPENAI_API_KEY` fallback). These variables are removed from Pi’s child
+environment, not hidden from same-user tools. Compact/audit reviews consume
+API or subscription capacity even if no rewrite occurs. An alternate primary
+model also needs a matching entry in Pi’s `models.json`.
+
+The launcher creates a fresh proxy session on each invocation; Pi summary
+replacements explicitly rebase that session. It does not recover the previous
+proxy state when resuming Pi. It opts into first replay review so a resumed
+conversation can be compacted before the first primary call even with no proxy
+checkpoint. For durable state independent of client restarts, use the standalone
+workflow above. Port 8787 must be free; stop/restart your own launcher rather than
+replacing a running binary’s process.
+
 ## Reviewer cache policy
 
 The classifier cache policy is **reviewer-only**. It does not add cache fields,
@@ -29,6 +257,15 @@ usage—are the authority for actual cache reads and billed costs. A cache repai
 requires a new source-frozen matched cohort before changing any savings claim.
 Absent cache-policy fields in historical benchmark provenance mean `disabled`,
 not the new benchmark default. Explicit recorded values remain unchanged.
+
+Codex subscription transport does **not** accept the API's explicit cache schema;
+Carry strips those fields and uses the stable reviewer cache key with
+provider-managed implicit caching. A disabled explicit policy is not proof that
+implicit reads are disabled. The dashboard reports `codex-implicit`,
+`provider-implicit`, or `openai-explicit` separately from the policy. Its cached
+read counters come from native receipts, not boundary estimates. Cold starts,
+provider warm-up/routing and removed prefixes can miss even when stable source
+remains; do not treat a byte-identical prefix as a guaranteed hit.
 
 ## A local trial
 
@@ -145,3 +382,43 @@ A separate `scripts/proxy_gateway_native_fixture.py` CI step uses the same exact
 The optional installed-client test `scripts.test_codex_hosted_tools` runs four additional pinned-Codex fresh/resume/native/custom cases through the actual benchmark entrypoint and production gateway against the scripted loopback provider. Regular CI explicitly enables it using the already installed Codex executable. It checks recursively inspected outbound tool types, real local tool effects, native completion and synthetic-auth removal; handler regressions prove forbidden tools create zero upstream requests. These are protocol/isolation fixtures, not paid benchmark scores.
 
 Both fixtures use fabricated provider responses and usage **only as labeled protocol fixtures**. They do not establish real model quality, paid usage, live cache hits, automatic Pi compaction, arbitrary-length histories, or cost savings. Two-summary RPC coverage proves repeated manual native summary/continuation, not Pi's automatic trigger. Standalone handler canary/HTTP-400 tests additionally verify content-free telemetry and byte-preserving forwarding, but are not a substitute for the complete pinned-Pi gateway path. A live comparison still requires exact-head successful CI plus independent evidence/quality/cost gates. A compact arm that never rewrites proves only forwarding/review overhead, not savings.
+
+### Local stats dashboard
+
+Open `/carry/dashboard` on the proxy (normally
+`http://127.0.0.1:8787/carry/dashboard`). Loopback connections need no token.
+`pi-carry` prints this plain URL. For remote access, enter the **proxy** token
+in the page, never your OpenAI credential. A URL fragment `#token=...` is still
+supported; the page removes it immediately and holds the token only in memory.
+
+The shell is public; `/carry/dashboard/stats` waives gateway authorization only
+when the TCP peer is loopback (IPv4 or IPv6). Model, metrics, and other API
+endpoints still require the gateway token. Host and forwarded headers cannot
+claim local access. A local reverse proxy counts as a local peer, so it must
+enforce its own authentication before exposing these routes remotely.
+On a shared/non-loopback listener, configure a gateway token: dashboard stats
+are gateway-wide, not restricted to a single session.
+The endpoint only returns counters, hashes, ledger totals, and context sizes,
+not conversation text, reviewer memory, or credentials. All responses are
+`Cache-Control: no-store`.
+
+The dashboard refreshes every two seconds while visible. It shows primary and
+reviewer usage separately, native cached-read share, cache writes, rewrites,
+failures, explicit history rebases, and retained/removed item counts. Retained
+input bytes are serialized bytes, **not** tokens. State is checkpoint-based,
+not a live stream of tokens. Unreadable checkpoints are flagged and totals are
+marked incomplete. Cost values are standard API equivalents, not subscription
+charges, invoices, or measured savings; unpriced calls make the total unavailable
+while the known priced subtotal remains visible.
+
+Review modes (`compact`/`audit`) accept full-history input or a delta referencing
+the latest completed `previous_response_id` in the explicit session/branch. Unknown
+or stale IDs return 409; an explicit rebase retires the continuation. The proxy
+reconstructs history and sends full retained input upstream, without
+`previous_response_id`. Conversation handles and background requests are rejected.
+Reviewer memories are small atomic facts: they activate when any source is removed
+and are inserted after the latest source group’s last member, retained or removed. The
+proxy renders the retained primary history, including any previously applied
+rewrites, into the outbound `input`. `off` forwards the caller's wire request
+unchanged, including a caller-supplied `previous_response_id`; the proxy does
+not automatically build server-side response chains in any mode.
