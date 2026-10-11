@@ -39,13 +39,29 @@ const cards = () => new Map(elements.get('cards').children.map(card => card.chil
   assert.ok(elements.get('assumptions').textContent.includes('272,000'));
   data.sessions.push(session(100, 200, false));
   await vm.runInContext('refresh()', sandbox);
-  assert.equal(cards().get('Estimated scenario saving'), 'Unavailable', 'partial trajectories cannot masquerade as complete savings');
-  assert.equal(cards().get('Carry scenario'), 'Unavailable');
+  assert.equal(cards().get('Estimated scenario saving'), '$2.000000 (33.3%)', 'exclude incomplete trajectories from both branches');
+  assert.equal(cards().get('Carry scenario'), '$4.000000');
+  assert.ok(elements.get('estimate-coverage').textContent.includes('Includes 2 of 3 sessions'));
+  assert.equal(elements.get('sessions').children[2].children[1].textContent, '—');
+  assert.equal(elements.get('sessions').children[2].children[3].textContent, 'Excluded');
   data.sessions = [session(3, 2)];
   await vm.runInContext('refresh()', sandbox);
   assert.equal(cards().get('Estimated scenario saving'), '$-1.000000 (-50.0%)', 'do not clamp estimated losses to zero');
   data.unavailable_sessions = 1;
   await vm.runInContext('refresh()', sandbox);
-  assert.equal(cards().get('Traditional scenario'), 'Unavailable');
+  assert.equal(cards().get('Traditional scenario'), '$2.000000', 'unreadable checkpoints do not suppress eligible estimates');
+  assert.equal(cards().get('API-equivalent total'), 'Unavailable', 'usage totals must still flag unreadable checkpoints');
+  assert.ok(elements.get('estimate-coverage').textContent.includes('Includes 1 of 2 sessions'));
+  data.unavailable_sessions = 0;
+  data.sessions = [session(100, 200, false), { ...session(1, 2), cost_estimate: undefined }];
+  await vm.runInContext('refresh()', sandbox);
+  for (const label of ['Carry scenario', 'Traditional scenario', 'Estimated scenario saving']) {
+    assert.equal(cards().get(label), 'No eligible sessions');
+  }
+  assert.ok(elements.get('estimate-coverage').textContent.includes('Includes 0 of 2 sessions'));
+  data.sessions = [];
+  await vm.runInContext('refresh()', sandbox);
+  assert.equal(cards().get('Estimated scenario saving'), 'No eligible sessions');
+  assert.ok(elements.get('estimate-coverage').textContent.includes('Includes 0 of 0 sessions'));
   console.log('proxy dashboard scenarios: ok');
 })().catch(error => { console.error(error); process.exitCode = 1; });

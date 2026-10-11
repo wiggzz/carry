@@ -466,7 +466,11 @@ Scenario state survives restart. Failed calls, missing usage, unknown pricing,
 explicit native compaction, native image/audio/video requests, or older untracked
 history mark the comparison
 unavailable, with coverage counters in stats JSON. This change does not backfill
-older checkpoints from raw traces. Dashboard responses include only numerical
+older checkpoints from raw traces. Dashboard comparison cards sum only sessions
+with complete estimates and display the included/total session count. Excluded
+sessions remain in usage totals and the session list, labeled `Excluded` with
+dashes for scenario values. With no eligible sessions, comparison cards show
+`No eligible sessions` rather than zero savings. Dashboard responses include only numerical
 scenario estimates, never the prior prompt kept privately for cache matching.
 See [the proxy backlog](proxy-backlog.md) for background review and consolidation
 with the shared main savings/report estimator after its merge.

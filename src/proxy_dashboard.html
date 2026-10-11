@@ -14,7 +14,7 @@
 <div class="cards" id="cards"></div>
 <h2>Usage</h2><div class="scroll"><table><thead><tr><th>Lane</th><th>Calls</th><th>Input tokens</th><th>Cached reads</th><th>Read share</th><th>Cache writes</th><th>Output tokens</th><th>API-equivalent cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
 <p><small>Costs are standard API-rate estimates, not subscription charges or an invoice. Unknown/unpriced calls make the total unavailable; the observed priced subtotal is shown separately. Counters update after observations/checkpoints, not token by token.</small></p>
-<h2>Cost comparison scenario</h2><p id="assumptions"></p>
+<h2>Cost comparison scenario</h2><p id="estimate-coverage"></p><p id="assumptions"></p>
 <p><small>A best-effort frozen-trajectory comparison, not billed or measured savings. Both branches use local o200k_base token estimates for rendered JSON input and the same recorded output tokens. Carry includes paid reviewer calls. Conventional summaries, cache reuse and their effects on future behavior are hypothetical. Missing usage, failed/unmodeled calls or older untracked history make savings unavailable.</small></p>
 <h2>Sessions</h2><div class="scroll"><table><thead><tr><th>Session hash</th><th>Carry scenario</th><th>Traditional scenario</th><th>Estimated saving</th><th>Simulated summaries</th><th>Completed</th><th>Rewrites</th><th>Native compactions</th><th>Rebases</th><th>Retained items</th><th>Removed items</th><th>Retained input bytes</th><th>Shadow records</th><th>Failed primaries</th><th>Invalid reviews</th></tr></thead><tbody id="sessions"></tbody></table></div>
 <p><small>Scope: this proxy's state directory only. Retained bytes are serialized input bytes, not token counts or measured savings. Conversation text and credentials are never returned by this stats endpoint.</small></p>
@@ -43,8 +43,10 @@ async function refresh(){
   const primary=sessions.map(s=>s.primary),shadow=sessions.map(s=>s.shadow);
   const unavailable=sum(primary,'unavailable_cost_calls')+sum(shadow,'unavailable_cost_calls')+data.unavailable_sessions;
   const subtotal=sum(primary,'cost_usd')+sum(shadow,'cost_usd');
-  const estimates=sessions.map(s=>s.cost_estimate);
-  const scenarioComplete=estimates.length>0 && !data.unavailable_sessions && estimates.every(e=>e?.priced);
+  const estimates=sessions.map(s=>s.cost_estimate).filter(e=>e?.priced);
+  const hasEstimates=estimates.length>0;
+  const totalSessions=sessions.length+data.unavailable_sessions;
+  $('estimate-coverage').textContent='Includes '+fmt(estimates.length)+' of '+fmt(totalSessions)+' sessions; '+fmt(totalSessions-estimates.length)+' excluded because complete estimates are unavailable. Usage totals still include all readable sessions.';
   const carryScenario=sum(estimates,'carry_cost'),traditionalScenario=sum(estimates,'traditional_cost');
   const saving=traditionalScenario-carryScenario;
   const savingText=money(saving)+(traditionalScenario>0?' ('+(100*saving/traditionalScenario).toFixed(1)+'%)':'');
@@ -55,9 +57,9 @@ async function refresh(){
    ['Proxy rewrites',fmt(sum(sessions,'compactions'))],['Failed primaries',fmt(sum(sessions,'failed_primaries'))],
    ['Invalid reviews',fmt(sum(sessions,'invalid_reviews'))],['API-equivalent total',unavailable?'Unavailable':money(subtotal)],
    ['Observed priced subtotal',money(subtotal)],
-   ['Carry scenario',scenarioComplete?money(carryScenario):'Unavailable'],
-   ['Traditional scenario',scenarioComplete?money(traditionalScenario):'Unavailable'],
-   ['Estimated scenario saving',scenarioComplete?savingText:'Unavailable']
+   ['Carry scenario',hasEstimates?money(carryScenario):'No eligible sessions'],
+   ['Traditional scenario',hasEstimates?money(traditionalScenario):'No eligible sessions'],
+   ['Estimated scenario saving',hasEstimates?savingText:'No eligible sessions']
   ].map(([label,value])=>card(label,value)));
   $('usage').replaceChildren(...[['Primary',primary],['Reviewer',shadow]].map(([name,ledgers])=>{
    const input=sum(ledgers,'input_tokens'),cached=sum(ledgers,'cached_tokens'),missing=sum(ledgers,'unavailable_cost_calls');
@@ -65,8 +67,8 @@ async function refresh(){
   }));
   $('sessions').replaceChildren(...sessions.map(s=>{
    const e=s.cost_estimate;
-   const savings=e?.priced?money(e.savings)+(e.savings_percent!==null?' ('+e.savings_percent.toFixed(1)+'%)':''):'Unavailable';
-   return row([s.id.slice(0,12),e?.priced?money(e.carry_cost):'Unavailable',e?.priced?money(e.traditional_cost):'Unavailable',savings,e?.traditional_compactions??'—',s.completed_requests,s.compactions,s.native_compactions,s.history_rebases,s.context.retained_items,s.context.removed_items,fmt(s.context.retained_input_bytes),s.context.shadow_records,s.failed_primaries,s.invalid_reviews]);
+   const savings=e?.priced?money(e.savings)+(e.savings_percent!==null?' ('+e.savings_percent.toFixed(1)+'%)':''):'Excluded';
+   return row([s.id.slice(0,12),e?.priced?money(e.carry_cost):'—',e?.priced?money(e.traditional_cost):'—',savings,e?.priced?e.traditional_compactions:'—',s.completed_requests,s.compactions,s.native_compactions,s.history_rebases,s.context.retained_items,s.context.removed_items,fmt(s.context.retained_input_bytes),s.context.shadow_records,s.failed_primaries,s.invalid_reviews]);
   }));
   $('raw').textContent=JSON.stringify(data,null,2);
  }catch(err){$('status').textContent=err.message+' Previous stats may be stale.';$('login').hidden=false}
