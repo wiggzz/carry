@@ -1,0 +1,98 @@
+{
+  "study": "Private local Carry session report, August16\u2013October2,2026 US Central",
+  "privacy": "Aggregates only; underlying traces, prompts, tool outputs, session identities and credentials are not released",
+  "coverage": {
+    "zip_session_directories": 43,
+    "trace_directories": 36,
+    "response_bearing_sessions": 30,
+    "no_response_trace_directories": 6,
+    "directories_without_trace": 7,
+    "requests": 1383,
+    "matched_responses": 1370,
+    "unmatched_requests": 13,
+    "response_bearing_sessions_with_unmatched_requests": 4,
+    "native_compactions": 142,
+    "native_compaction_sessions": 20,
+    "retry_counters_total": 2
+  },
+  "normalized_provider_usage_reconciled": 1370,
+  "models": {
+    "gpt-5.6-luna": 165,
+    "gpt-5.6-terra": 150,
+    "gpt-5.6-sol": 312,
+    "gpt-6-astra": 144,
+    "gpt-6-sol": 599
+  },
+  "recorded_usage_priced_at_reviewed_rate_card_usd": 35.06519975,
+  "cost_scope": "Completed-response modeled subtotal, not invoice or complete spend; missing requests/retry charges not imputed",
+  "scenario_scope": "Conditional frozen serialized UTF-8 byte-proxy input comparison, identical basis in both branches; not provider/invoice savings, exact Pi, or quality evidence",
+  "context_statistics": {
+    "median_responses": 32.5,
+    "max_responses": 144,
+    "median_peak_input": 29849.5,
+    "max_input": 134702,
+    "cached_input_fraction": 0.8599164992131186
+  },
+  "corrected_replay": {
+    "carry_proxy_usd": 84.02416092,
+    "conditional_savings_percent": 39.15025675399108,
+    "conditional_savings_usd": 54.06049882999996,
+    "coverage": {
+      "invalid_lines": 0,
+      "missing_output_projection": 0,
+      "missing_projection": 0,
+      "missing_usage": 0,
+      "orphan_responses": 0,
+      "requests": 1383,
+      "responses": 1370,
+      "retries": 2,
+      "unknown_cache_requests": 111,
+      "unknown_expiry_requests": 27,
+      "unknown_route_requests": 1383,
+      "unmatched_requests": 13,
+      "unpriced_responses": 0
+    },
+    "native_compactions": 142,
+    "observed_response_subtotal_usd": 35.06519975,
+    "pi_proxy_usd": 138.08465974999996,
+    "response_bearing_sessions": 30,
+    "scenario_observed_subtotal_usd": 29.07699367,
+    "scenario_pi_compactions": 0,
+    "scenario_responses": 1122,
+    "scenario_sessions": 25,
+    "scenario_summary_usd": 0.0,
+    "trace_directories": 36,
+    "excluded_response_bearing_sessions": 5,
+    "exclusion_session_counts_overlapping": {
+      "unmatched_requests": 4,
+      "retries": 1,
+      "missing_usage": 0,
+      "missing_projection": 0,
+      "missing_output_projection": 0,
+      "unpriced_responses": 0,
+      "invalid_lines": 0
+    }
+  },
+  "scenario_assumptions": {
+    "input_units": "serialized prompt-bearing input/tools/instructions UTF-8 bytes /4 rounded up; native dropped proxies restored only to alternative",
+    "frozen_output": "metered output tokens common to both branches at base output rate",
+    "default_context_window": 272000,
+    "reserve": 16384,
+    "keep_recent": 20000,
+    "summary": 1000,
+    "recorded_context_window": "overrides configured scenario when present; not verified model token limits",
+    "cache": "symmetric writes/minimums/model-key-recorded-route boundaries/recordedTTL; edited Carryprefix resets; alternative retained-size append reuse conditional; unknownroute/expiry assume sameroute/unexpired; unknown capability uncached",
+    "savings_denominator": "Pi-style scenario cost across exactly same eligible session set; never observed spend"
+  },
+  "source_sha256": {
+    "src/savings.rs": "c74c51e3e3e7ac67c1147091f57e8a9ad5fc2f492d3b217f9c895a97f18d77ec",
+    "src/report.rs": "0614e727214102bcaa06a46ff4b26f67f7908e5c231d9d1fc1bfba4f7bd9b061",
+    "src/openai.rs": "c0a0ae0c0e535f97d26d29aeaac98b9988853e3ab8f8c8b060156b2c798bf479"
+  },
+  "verification": "Exact current shared estimator source replayed locally over full traces; actual report parser/HTML aggregates read back; no provider calls; underlying data private",
+  "no_removal_control": {
+    "eligible_sessions": 8,
+    "responses": 112,
+    "conditional_savings_usd": 0.0
+  }
+}

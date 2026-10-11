@@ -96,10 +96,14 @@ pub struct Usage {
     pub total_tokens: u64,
 }
 
-/// Modeled USD rates from scripts/swebench_smoke.py, not a billing quote.
+/// Modeled USD rates from scripts/swebench_smoke.py and published OpenAI pricing, not a billing quote.
 pub(crate) fn estimated_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
     let (input, cached_input, cache_write_input, output) = match model {
         "gpt-5.6-luna" => (0.20, 0.02, 0.25, 1.20),
+        "gpt-5.6-sol" => (4.00, 0.40, 5.00, 20.00),
+        "gpt-5.6-terra" => (2.00, 0.20, 2.50, 12.00),
+        "gpt-6-astra" if usage.input_tokens > 272_000 => (20.00, 2.00, 25.00, 75.00),
+        "gpt-6-astra" => (10.00, 1.00, 12.50, 50.00),
         "gpt-6-luna" if usage.input_tokens > 272_000 => (0.20, 0.02, 0.25, 0.75),
         "gpt-6-luna" => (0.10, 0.01, 0.125, 0.50),
         "gpt-6-sol" if usage.input_tokens > 272_000 => (4.00, 0.40, 5.00, 15.00),
