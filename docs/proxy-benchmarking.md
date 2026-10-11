@@ -31,7 +31,8 @@ refreshes the credential before requests, and refreshes/retries once on HTTP 401
 Unlike ordinary opaque API-key forwarding, this is an explicit wire adapter:
 `store:false` and upstream SSE are required; initial system/developer messages
 move to `instructions`; unsupported output limits, cache options/retention and
-cache breakpoints are removed. Reviewer JSON formatting is instruction-driven.
+cache breakpoints are removed. Reviewer strict JSON-schema formatting survives
+this adapter; it is not downgraded to instruction-only JSON.
 Successful SSE bytes are relayed with the correct content type even when the
 subscription server mislabels them. Nonstreaming callers receive the completed
 Responses object extracted from the SSE. Public API explicit reviewer cache
@@ -125,18 +126,48 @@ user turn and its fresh tool results are not made removable by import.
 Cross-boundary tool cohorts, opaque items and other pinned groups stay protected.
 Histories with no eligible sources incur no bootstrap reviewer calls.
 
-Long histories are reviewed in chronological windows of complete atomic groups.
-Each serialized reviewer request, including its ledger and carried memories, is
-bounded by `--classifier-max-input-bytes` (default 256 KiB). This bound also guards
-ordinary reviews. Oversized groups are kept whole and protected, never split or
-truncated. Earlier source windows retire from the active reviewer projection;
-canonical history, retention decisions and sourced memories remain checkpointed.
-Successful windows are saved before the primary and are not reviewed again on a
-retry or restart. Invalid reviews stop the bootstrap attempt without discarding
-completed windows.
+Each reviewer requests provider-enforced structured output with
+`text.format.type=json_schema` and `strict:true`, on both API-key and Codex
+routes. The schema enforces the three advice fields and memory shapes. Carry
+still validates eligible IDs, disjoint decisions, provenance and size limits
+before applying the entire batch. Refusals, incomplete output, invalid advice
+or a provider rejecting the schema reject that review; there is no silent
+unconstrained-output fallback. The primary request can continue unchanged.
+The newest live user group is pinned independently of reviewer advice.
 
-`--bootstrap-max-calls` defaults to 16 per primary request; subsequent requests
-resume unfinished windows. `--bootstrap-max-cost-usd` defaults to $1 of cumulative
+Long histories use the same chronological windowing path for bootstrap imports
+and oversized ongoing reviews. Each window contains complete atomic groups.
+Each rendered reviewer request, including instructions, schema, ledger and
+carried memories, is bounded by `--classifier-max-input-tokens` (default 120,000).
+A simple local `o200k_base` tokenizer over rendered JSON replaces bytes/4 for
+input estimates and planner economics. These estimates include JSON wrappers;
+they are not provider token counts, and native whole-request usage cannot assign
+exact costs to individual quoted context items. Native usage remains the source
+for the observed cost ledger, with cache fractions kept on one local estimate
+basis in the planner. Set the input budget conservatively for the model, leaving
+room for output and provider overhead; it is separate from the output cap.
+`--classifier-max-input-bytes` (default 8 MiB) remains a transport guard.
+Small ongoing views keep their existing single-call, stable-prefix behavior.
+When a full view exceeds either limit, it is reviewed in bounded windows instead
+of being rejected. A single oversized atomic group stays whole and protected;
+it is skipped without a paid call or an invalid-review increment. Pinned-only
+windows likewise make no paid call. Earlier source windows retire from the
+active reviewer projection; canonical history, retention decisions and sourced
+memories remain checkpointed. Source observations stay immutable within an
+active window and are rebuilt from canonical history after retirement.
+
+An ongoing sweep freezes the exposed-history frontier when it starts. Newer
+context waits for a later sweep, so a growing conversation cannot prevent the
+current sweep from finishing. Completed members and the frontier are saved;
+unfinished windows resume even before the normal review cadence is due.
+Successful windows survive failed primaries and restarts. Invalid advice stops
+the attempt without advancing that window or discarding completed windows.
+A rebase/native epoch reset clears this progress.
+
+`--review-max-calls` defaults to 16 per primary request, for bootstrap and ongoing
+windows alike; `--bootstrap-max-calls` remains a compatible alias. Subsequent
+requests resume unfinished windows. `--bootstrap-max-cost-usd` is still
+bootstrap-only and defaults to $1 of cumulative
 estimated spend per active history. Spend is reserved durably before dispatch,
 including failed attempts, using conservative input/cache-write pricing and the
 configured reviewer output cap. Zero disables paid bootstrap calls; unknown
@@ -144,7 +175,9 @@ reviewer pricing also prevents dispatch. Restarting does not replenish this
 allowance. These are modeled estimates, **not a hard provider billing limit**;
 subscription estimates are API equivalents, and the subscription adapter does
 not enforce the API output cap. Limits leave unreviewed history intact and never
-block the primary request.
+block the primary request. Reviews remain synchronous in this version; lower
+`--review-max-calls` to bound paid round trips per primary while backlog windows
+resume later. This call limit does not replenish or extend bootstrap spend.
 
 `off` is unchanged; `audit` reviews without rewriting; `compact` rewrites only
 after valid advice and the ordinary economic admission check. Import does not
@@ -410,6 +443,33 @@ not a live stream of tokens. Unreadable checkpoints are flagged and totals are
 marked incomplete. Cost values are standard API equivalents, not subscription
 charges, invoices, or measured savings; unpriced calls make the total unavailable
 while the known priced subtotal remains visible.
+
+The separate **cost comparison scenario** follows the main savings estimator's
+frozen-trajectory approach: compare Carry's retained input against restoring
+its removed context until a conventional threshold-triggered summary. Both
+branches use the same local token estimates for inputs and the same recorded
+output tokens. Carry includes reviewer calls (priced uncached); the
+traditional branch pays for hypothetical summary calls. A negative saving is
+shown as a loss, not clamped to zero, and percentages use traditional scenario
+cost as the denominator—not actual provider spend.
+
+Assumptions are displayed: 272,000-token window, 16,384 reserve, 20,000 recent
+tokens retained and a 1,000-token summary, checked after completed non-tool
+responses. Cache reuse assumes matching route/key/settings, append-compatible
+prefixes and a 30-minute expiry; the restored branch's literal prefix after a
+Carry edit is unknown, so its frozen-size reuse is conditional. These are not
+reconstructed client/provider compaction or cache guarantees. Summaries could
+change subsequent actions, quality or rereads; the scenario does not model that.
+Both scenario totals remain separate from the observed native-usage ledger.
+
+Scenario state survives restart. Failed calls, missing usage, unknown pricing,
+explicit native compaction, native image/audio/video requests, or older untracked
+history mark the comparison
+unavailable, with coverage counters in stats JSON. This change does not backfill
+older checkpoints from raw traces. Dashboard responses include only numerical
+scenario estimates, never the prior prompt kept privately for cache matching.
+See [the proxy backlog](proxy-backlog.md) for background review and consolidation
+with the shared main savings/report estimator after its merge.
 
 Review modes (`compact`/`audit`) accept full-history input or a delta referencing
 the latest completed `previous_response_id` in the explicit session/branch. Unknown

@@ -403,7 +403,8 @@ class NativeProviderFixtureTests(unittest.TestCase):
                         'shadow_failures': [e['data'] for e in events if e['event'] == 'shadow_failed']
                     }, indent=2) + '\n')
                 self.assertEqual(len(fixture.reviews), 1, 'must execute a real classifier HTTP request')
-                self.assertEqual(fixture.reviews[0]['text']['format']['type'], 'json_object')
+                self.assertEqual(fixture.reviews[0]['text']['format']['type'], 'json_schema')
+                self.assertTrue(fixture.reviews[0]['text']['format']['strict'])
                 self.assertEqual(len(fixture.reviews[0]['prompt_cache_key']), 64)
                 self.assertEqual(state['invalid_reviews'], 0,
                                  f'JSON-mode review rejected: {fixture.errors}')

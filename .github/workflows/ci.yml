@@ -317,6 +317,9 @@ jobs:
         with:
           node-version: 22.19.0
 
+      - name: Proxy dashboard scenario rendering
+        run: node tests/proxy_dashboard.cjs
+
       - name: Actual Codex and Pi HTTP Responses through integrated Carry proxy
         run: |
           set -euo pipefail

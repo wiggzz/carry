@@ -91,12 +91,16 @@ pub struct ProxyCli {
     /// consumed context on a new lineage. Allows review before request one.
     #[arg(long)]
     review_replayed_history: bool,
-    /// Maximum serialized reviewer request size (including its ledger).
-    #[arg(long, default_value_t = 262144, value_parser = clap::value_parser!(u32).range(4096..=8388608))]
+    /// Maximum estimated reviewer input tokens (o200k_base); output cap is separate.
+    #[arg(long, default_value_t = 120000, value_parser = clap::value_parser!(u32).range(1024..=2000000))]
+    classifier_max_input_tokens: u32,
+    /// Serialized transport guard; token budget controls reviewer context size.
+    #[arg(long, default_value_t = 8388608, value_parser = clap::value_parser!(u32).range(4096..=8388608))]
     classifier_max_input_bytes: u32,
-    /// Maximum bootstrap reviewer calls per primary request; later requests resume.
-    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=100))]
-    bootstrap_max_calls: u32,
+    /// Maximum bounded reviewer calls per primary request, including bootstrap.
+    /// Unfinished windows resume on later requests. bootstrap-max-calls is an alias.
+    #[arg(long, alias = "bootstrap-max-calls", default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=100))]
+    review_max_calls: u32,
     /// Cumulative estimated bootstrap spend per active history, including output cap.
     #[arg(long, default_value_t = 1.0)]
     bootstrap_max_cost_usd: f64,
@@ -551,6 +555,7 @@ async fn dashboard_stats(
         let retained = session.history.iter().filter(|item| !item.removed).count();
         sessions.push(json!({
             "id": id, "primary": session.primary, "shadow": session.shadow,
+            "cost_estimate": session.cost_trajectory.as_ref().map(|t| t.snapshot()).unwrap_or_default(),
             "completed_requests": session.completed_requests,
             "compactions": session.compactions, "native_compactions": session.native_compactions,
             "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews,
@@ -582,6 +587,8 @@ async fn dashboard_stats(
         },
         "sessions": sessions, "unavailable_sessions": unavailable_sessions,
         "cost_basis": "standard API rate equivalents, not subscription charges or an invoice",
+        "cost_scenario": crate::proxy_savings::Scenario::default(),
+        "cost_estimate_basis": "frozen_trajectory_o200k_base_json_inputs_common_metered_output;carry_includes_reviewer;conditional_same_route_30min_append_cache;reviewer_uncached;not_measured_savings",
         "scope": "checkpoints in this proxy state directory; completed/observed usage only"
     }))
     .into_response();
@@ -711,6 +718,11 @@ async fn forward(
     if let Some(id) = id {
         let lock = session_lock(&service, &id).await;
         let mut session = load(&service, &id)?;
+        if session.cost_trajectory.is_none() {
+            let mut trajectory = crate::proxy_savings::Trajectory::default();
+            trajectory.prior_untracked(session.primary.calls + session.shadow.calls);
+            session.cost_trajectory = Some(trajectory);
+        }
         let new_lineage = session.history.is_empty();
         let prior_rebases = session.history_rebases;
         if let Some(input) = body["input"].as_array() {
@@ -809,6 +821,13 @@ async fn forward(
                 if service.config.mode == Mode::Compact
                     && let Some(mut candidate) = candidate
                 {
+                    let before =
+                        crate::proxy_savings::token_units(&json!(session.render_primary()));
+                    let after =
+                        crate::proxy_savings::token_units(&json!(candidate.render_primary()));
+                    if let Some(trajectory) = &mut candidate.cost_trajectory {
+                        trajectory.compacted(before, after);
+                    }
                     candidate.last_plan = plan;
                     candidate.compactions += 1;
                     session = candidate;
@@ -827,7 +846,7 @@ async fn forward(
             .map(|i| i.id)
             .collect();
         if service.config.codex_login {
-            outbound = codex_body(&outbound, false);
+            outbound = codex_body(&outbound);
         }
         trace(&service, &id, "primary_submitted", &outbound)
             .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "submission trace failed"))?;
@@ -843,7 +862,7 @@ async fn forward(
         });
     }
     if service.config.codex_login && commit.is_none() {
-        outbound = codex_body(&outbound, false);
+        outbound = codex_body(&outbound);
     }
     let endpoint = if legacy_native {
         format!(
@@ -914,6 +933,9 @@ async fn forward(
         Err(_) => {
             if let Some(mut commit) = commit {
                 commit.reviewed.failed_primaries += 1;
+                if let Some(trajectory) = &mut commit.reviewed.cost_trajectory {
+                    trajectory.failed_call();
+                }
                 commit.reviewed.primary.calls += 1;
                 commit.reviewed.primary.unavailable_cost_calls += 1;
                 let _ = save(&service, &commit.id, &commit.reviewed);
@@ -943,13 +965,31 @@ fn review_body_for_groups(config: &ProxyCli, session: &Session, groups: &[Group]
     let mut body = json!({
         "model": config.classifier_model,
         "instructions": REVIEW_INSTRUCTIONS,
-        // JSON mode requires the instruction in input text, not only top-level instructions.
+        // Keep the stable preamble for checkpoint/cache-prefix compatibility.
         "input": std::iter::once(json!({"role": "user", "content": "Return JSON."})).chain(std::iter::once(json!({"role": "user", "content": json!({"current_request": session.review_context}).to_string()}))).chain(session.shadow_input_for_groups(groups)).collect::<Vec<_>>(),
         "store": false, "stream": false,
         "prompt_cache_key": session.review_cache_key,
         "reasoning": {"effort": config.classifier_reasoning_effort},
         "max_output_tokens": config.classifier_max_output_tokens,
-        "text": {"format": {"type": "json_object"}}
+        "text": {"format": {
+            "type": "json_schema", "name": "carry_review", "strict": true,
+            "schema": {
+                "type": "object", "additionalProperties": false,
+                "required": ["protected", "removable", "memories"],
+                "properties": {
+                    "protected": {"type": "array", "items": {"type": "string"}},
+                    "removable": {"type": "array", "items": {"type": "string"}},
+                    "memories": {"type": "array", "items": {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["source_ids", "text"],
+                        "properties": {
+                            "source_ids": {"type": "array", "items": {"type": "string"}},
+                            "text": {"type": "string"}
+                        }
+                    }}
+                }
+            }
+        }}
     });
     if classifier_cache_enabled(config).unwrap_or(false) {
         body["prompt_cache_options"] = json!({"mode": "explicit"});
@@ -990,7 +1030,7 @@ fn review_body_for_groups(config: &ProxyCli, session: &Session, groups: &[Group]
         }
     }
     if config.codex_login && config.classifier_url.is_none() {
-        codex_body(&body, true)
+        codex_body(&body)
     } else {
         body
     }
@@ -1121,7 +1161,7 @@ fn reviewer_markers(body: &Value) -> Vec<usize> {
 }
 
 fn reviewer_prefix_estimate(body: &Value, end: usize) -> f64 {
-    // Same economic byte basis as the full request, including static settings;
+    // Same local token basis as the full request, including static settings;
     // only actual input THROUGH the selected wire boundary, never its ledger.
     let mut prefix = body.clone();
     prefix["input"].as_array_mut().unwrap().truncate(end);
@@ -1137,7 +1177,7 @@ fn reviewer_reusable(config: &ProxyCli, cache: &[ReviewerCacheBoundary], body: &
     };
     let base = reviewer_base(config, body);
     let points = reviewer_markers(body);
-    cache
+    let reusable = cache
         .iter()
         .filter(|e| {
             e.base == base
@@ -1152,8 +1192,12 @@ fn reviewer_reusable(config: &ProxyCli, cache: &[ReviewerCacheBoundary], body: &
                 .min(reviewer_prefix_estimate(body, e.input_len))
         })
         // Aggregate reads are never summed or multiplied across boundaries.
-        .fold(0.0, f64::max)
-        .min(estimate(body))
+        .fold(0.0, f64::max);
+    if reusable > 0.0 {
+        reusable.min(estimate(body))
+    } else {
+        0.0 // No confirmed read: avoid tokenizing a potentially multi-MiB view.
+    }
 }
 
 fn observe_reviewer_cache(
@@ -1252,7 +1296,7 @@ fn reviewer_view_costs(
             rates.cached,
         ) + (tokens - prefix).max(0.0) * rates.input;
         // Sensitivity only: discount the marked stable prefix, NEVER the
-        // volatile ledger/suffix. Bytes/4 are economics, not native counts or
+        // volatile ledger/suffix. Local tokens are economics, not native counts or
         // evidence that a prefix meets the provider's cache minimum.
         let future = input_cost(
             tokens,
@@ -1280,6 +1324,7 @@ async fn review(
     bootstrap: bool,
 ) -> bool {
     if !bootstrap
+        && session.review_end_id == 0
         && session
             .completed_requests
             .saturating_sub(session.last_review_request)
@@ -1287,87 +1332,117 @@ async fn review(
     {
         return false;
     }
-    if bootstrap {
-        return bootstrap_review(service, id, session, main).await;
-    }
-    let groups = session.groups();
-    if !groups.iter().any(|g| g.exposed && !g.pinned) {
-        return false;
-    }
-    session.observe_groups(&groups);
     // Full domain-separated digest: preserve owner isolation within the provider's 64-character bound.
     session.review_cache_key = format!("{:x}", Sha256::digest(format!("carry-review-{id}")));
     session.review_context = cache_base(main);
-    let body = review_body(&service.config, session);
-    if serde_json::to_vec(&body).unwrap().len() > service.config.classifier_max_input_bytes as usize
-    {
-        session.invalid_reviews += 1;
-        return false;
+    if !bootstrap && session.review_end_id == 0 {
+        let groups = session.groups();
+        if !groups.iter().any(|g| g.exposed && !g.pinned) {
+            return false;
+        }
+        // Preserve immutable observations and stable cache prefixes when the
+        // entire current view fits. Retired windows clear their observations,
+        // so this cannot expose a ledger without its corresponding sources.
+        session.observe_groups(&groups);
+        let body = review_body(&service.config, session);
+        if review_fits(&service.config, &body) {
+            return review_chunk(service, id, session, &body, &groups).await;
+        }
     }
-    review_chunk(service, id, session, &body, &groups).await
+    review_windows(service, id, session, bootstrap).await
 }
 
-/// Replay only complete atomic groups in chronological, bounded windows.
-/// Canonical source and decisions stay in the checkpoint; reviewer payloads
-/// from older windows are retired, with derived memories carried forward.
-async fn bootstrap_review(
+fn mark_reviewed(session: &mut Session, groups: &[Group], bootstrap: bool) {
+    if bootstrap {
+        session
+            .bootstrap_reviewed_ids
+            .extend(groups.iter().map(|g| g.id));
+    } else {
+        session
+            .reviewed_members
+            .extend(groups.iter().flat_map(|g| g.members.iter().copied()));
+    }
+}
+
+/// Bootstrap imports and oversized ongoing reviews share chronological windows
+/// of complete atomic groups. Canonical source and opinions stay checkpointed;
+/// old reviewer payloads retire, with sourced memories carried forward.
+async fn review_windows(
     service: &Service,
     id: &str,
     session: &mut Session,
-    main: &Value,
+    bootstrap: bool,
 ) -> bool {
-    session.review_cache_key = format!("{:x}", Sha256::digest(format!("carry-review-{id}")));
-    session.review_context = cache_base(main);
-    // Older checkpoints had only the pending flag.
-    if session.bootstrap_end_id == 0 {
-        session.bootstrap_end_id = session
-            .history
-            .iter()
-            .filter(|i| i.exposed)
-            .map(|i| i.id)
-            .max()
-            .unwrap_or(0);
-    }
+    let frontier = session
+        .history
+        .iter()
+        .filter(|i| i.exposed)
+        .map(|i| i.id)
+        .max()
+        .unwrap_or(0);
+    let end = if bootstrap {
+        // Older checkpoints had only the pending flag.
+        if session.bootstrap_end_id == 0 {
+            session.bootstrap_end_id = frontier;
+        }
+        session.bootstrap_end_id
+    } else {
+        if session.review_end_id == 0 {
+            session.review_end_id = frontier;
+        }
+        session.review_end_id
+    };
     let mut calls = 0;
+    let mut reviewed = false;
     loop {
         let remaining = session
             .groups()
             .into_iter()
             .filter(|g| {
-                g.members.iter().all(|id| *id <= session.bootstrap_end_id)
-                    && !session.bootstrap_reviewed_ids.contains(&g.id)
+                g.members.iter().all(|id| *id <= end)
+                    && if bootstrap {
+                        !session.bootstrap_reviewed_ids.contains(&g.id)
+                    } else {
+                        g.members
+                            .iter()
+                            .any(|id| !session.reviewed_members.contains(id))
+                    }
             })
             .collect::<Vec<_>>();
         if !remaining.iter().any(|g| g.exposed && !g.pinned) {
-            session.bootstrap_review_complete = true;
+            if bootstrap {
+                session.bootstrap_review_complete = true;
+            } else {
+                session.review_end_id = 0;
+                session.reviewed_members.clear();
+                session.last_review_request = session.completed_requests;
+            }
             break;
         }
-        if calls >= service.config.bootstrap_max_calls {
+        if calls >= service.config.review_max_calls {
             break;
         }
         let mut view = session.clone();
         view.active_shadow.retain(|record| record.source_id == 0);
+        // Observations belong to the active window. Keep canonical IDs/opinions,
+        // but do not let retired observations suppress source reconstruction.
+        view.observed.clear();
         let mut chunk = Vec::new();
         let mut body = None;
         for group in remaining.into_iter().take(128) {
             let mut next = view.clone();
-            // A failed attempt may already have observed this source. Rebuild
-            // this window from canonical data, never replay completed windows.
-            for member in &group.members {
-                next.observed.remove(member);
-            }
             next.observe_groups(std::slice::from_ref(&group));
             chunk.push(group.clone());
             let request = review_body_for_groups(&service.config, &next, &chunk);
-            if serde_json::to_vec(&request).unwrap().len()
-                > service.config.classifier_max_input_bytes as usize
-            {
+            if !review_fits(&service.config, &request) {
                 chunk.pop();
                 if chunk.is_empty() {
-                    // Never split or truncate an atomic group. An oversized
-                    // source stays protected and is skipped without a paid call.
+                    // Never split/truncate an atomic group, or dispatch an
+                    // oversized request. Keep this source and advance past it.
                     session.opinions.insert(group.id, "keep".into());
-                    session.bootstrap_reviewed_ids.insert(group.id);
+                    mark_reviewed(session, std::slice::from_ref(&group), bootstrap);
+                    session.active_shadow.retain(|record| record.source_id == 0);
+                    session.observed.clear();
                 }
                 break;
             }
@@ -1375,29 +1450,36 @@ async fn bootstrap_review(
             body = Some(request);
         }
         let Some(body) = body else { continue };
-        let Some(rates) = Rates::for_model(&service.config.classifier_model, estimate(&body))
-        else {
-            break; // Unknown pricing cannot satisfy the bootstrap spend limit.
-        };
-        let cost = estimate(&body) * rates.write.max(rates.input)
-            + service.config.classifier_max_output_tokens as f64 * rates.output;
-        if session.bootstrap_estimated_cost_usd + cost > service.config.bootstrap_max_cost_usd {
-            break;
+        if !chunk.iter().any(|g| g.exposed && !g.pinned) {
+            // Pinned-only windows have no actionable sources; no paid call.
+            *session = view;
+            mark_reviewed(session, &chunk, bootstrap);
+            continue;
         }
-        view.bootstrap_estimated_cost_usd += cost;
+        if bootstrap {
+            let Some(rates) = Rates::for_model(&service.config.classifier_model, estimate(&body))
+            else {
+                break; // Unknown pricing cannot satisfy the bootstrap spend limit.
+            };
+            let cost = estimate(&body) * rates.write.max(rates.input)
+                + service.config.classifier_max_output_tokens as f64 * rates.output;
+            if session.bootstrap_estimated_cost_usd + cost > service.config.bootstrap_max_cost_usd {
+                break;
+            }
+            view.bootstrap_estimated_cost_usd += cost;
+        }
         *session = view;
-        // Reserve estimated spend before dispatch, including failed attempts.
+        // Reserve bootstrap spend before dispatch, including failed attempts.
         if save(service, id, session).is_err() {
             return false;
         }
         calls += 1;
         let valid = review_chunk(service, id, session, &body, &chunk).await;
         if valid {
-            session
-                .bootstrap_reviewed_ids
-                .extend(chunk.iter().map(|g| g.id));
+            mark_reviewed(session, &chunk, bootstrap);
+            reviewed = true;
         }
-        // Successful chunks survive a crash or failure before the primary.
+        // Successful windows survive failed primaries and process restarts.
         if save(service, id, session).is_err() {
             return false;
         }
@@ -1405,7 +1487,11 @@ async fn bootstrap_review(
             break;
         }
     }
-    !session.opinions.is_empty()
+    if bootstrap {
+        !session.opinions.is_empty()
+    } else {
+        reviewed
+    }
 }
 
 async fn review_chunk(
@@ -1429,12 +1515,12 @@ async fn review_chunk(
     if let Some(key) = &service.classifier_key {
         request = request.bearer_auth(key);
     }
-    let _ = trace(service, id, "shadow_submitted", &body);
+    let _ = trace(service, id, "shadow_submitted", body);
     session.last_review_request = session.completed_requests;
     let attempt = Attempt::start("shadow", &service.config.classifier_model, false, true);
     let codex_reviewer = service.config.codex_login && service.config.classifier_url.is_none();
     let response = if codex_reviewer {
-        send_codex(service, &service.config.upstream_url, &body, true).await
+        send_codex(service, &service.config.upstream_url, body, true).await
     } else {
         request.send().await.map_err(anyhow::Error::from)
     };
@@ -1486,11 +1572,18 @@ async fn review_chunk(
             &value["usage"],
             value.get("service_tier").is_none_or(|v| v == "default"),
         );
+        if let Some(trajectory) = &mut session.cost_trajectory {
+            trajectory.reviewer(
+                body,
+                &value,
+                value.get("service_tier").is_none_or(|v| v == "default"),
+            );
+        }
         if value["status"] == "completed" {
             observe_reviewer_cache(
                 &service.config,
                 &mut session.reviewer_cache,
-                &body,
+                body,
                 &value["usage"],
             );
         }
@@ -1514,6 +1607,9 @@ async fn review_chunk(
         let _ = trace(service, id, "shadow_failed", &diagnostic);
         session.shadow.calls += 1;
         session.shadow.unavailable_cost_calls += 1;
+        if let Some(trajectory) = &mut session.cost_trajectory {
+            trajectory.failed_call();
+        }
     }
     if !valid {
         session.invalid_reviews += 1;
@@ -1522,7 +1618,7 @@ async fn review_chunk(
 }
 
 /// Explicit subscription adapter; API-key forwarding remains opaque.
-fn codex_body(body: &Value, reviewer: bool) -> Value {
+fn codex_body(body: &Value) -> Value {
     let mut body = body.clone();
     let object = body.as_object_mut().expect("validated request object");
     for field in [
@@ -1575,9 +1671,8 @@ fn codex_body(body: &Value, reviewer: bool) -> Value {
             json!(crate::openai::new_prompt_cache_key()),
         );
     }
-    if reviewer && let Some(text) = object.get_mut("text").and_then(Value::as_object_mut) {
-        text.remove("format");
-    }
+    // Codex supports text.format=json_schema too; do not downgrade the reviewer
+    // to unconstrained JSON/text. Refusals and semantic errors still fail locally.
     crate::openai::remove_prompt_cache_breakpoints(&mut body);
     body
 }
@@ -1654,7 +1749,13 @@ fn cache_base(body: &Value) -> Value {
 }
 
 fn estimate(body: &Value) -> f64 {
-    serde_json::to_vec(body).unwrap().len() as f64 / 4.0
+    crate::proxy_savings::token_units(body) as f64
+}
+
+fn review_fits(config: &ProxyCli, body: &Value) -> bool {
+    // Check transport first, avoiding tokenization of an oversized wire payload.
+    reviewer_serialized_identity(body).0 <= config.classifier_max_input_bytes as usize
+        && estimate(body) <= config.classifier_max_input_tokens as f64
 }
 
 fn reusable(cache: &[CacheEvidence], body: &Value) -> f64 {
@@ -1687,8 +1788,8 @@ fn observe_cache(cache: &mut Vec<CacheEvidence>, body: &Value, usage: &Value) {
     if total == 0 || cached > total {
         return;
     }
-    // Calibrated fraction transferred to ONE consistent byte-estimated basis;
-    // no native token subtotal is subtracted directly from a byte estimate.
+    // Native receipts give a whole-input fraction, not per-item token counts.
+    // Transfer that fraction to one consistent local tokenizer basis.
     cache.push(CacheEvidence {
         base: cache_base(body),
         input: input.clone(),
@@ -1823,7 +1924,7 @@ fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Option<Session>,
             best = Some((candidate, decision));
         }
     }
-    let report = json!({"selected": best.is_some(), "mode": format!("{:?}",config.mode).to_lowercase(), "future_reviews": future_reviews, "payoff_requests": config.payoff_requests, "current_review_cost_is_sunk": true, "estimate_basis": "actual_rendered_json_bytes_div_four_not_provider_tokens_or_overflow_evidence", "cache_basis": "exact_prefix_native_cached_fraction_not_guarantee", "reviewer_cache_basis": "one_prior_transmitted_stable_boundary_bounded_by_native_read_fraction_not_guaranteed_write", "classifier_cache_policy": format!("{:?}", config.classifier_cache_policy), "classifier_explicit_cache": classifier_cache_enabled(config).unwrap_or(false), "future_cache_assumption": "fixed_history_eligible_future_hits_sensitivity_not_forecast;reviewer_stable_marked_prefix_only_never_ledger", "future_review_output_assumption": "configured_max_output_tokens_per_future_review_not_prediction", "candidates": reports});
+    let report = json!({"selected": best.is_some(), "mode": format!("{:?}",config.mode).to_lowercase(), "future_reviews": future_reviews, "payoff_requests": config.payoff_requests, "current_review_cost_is_sunk": true, "estimate_basis": "o200k_base_rendered_json_estimate_not_provider_tokens_or_overflow_evidence", "cache_basis": "exact_prefix_native_cached_fraction_not_guarantee", "reviewer_cache_basis": "one_prior_transmitted_stable_boundary_bounded_by_native_read_fraction_not_guaranteed_write", "classifier_cache_policy": format!("{:?}", config.classifier_cache_policy), "classifier_explicit_cache": classifier_cache_enabled(config).unwrap_or(false), "future_cache_assumption": "fixed_history_eligible_future_hits_sensitivity_not_forecast;reviewer_stable_marked_prefix_only_never_ledger", "future_review_output_assumption": "configured_max_output_tokens_per_future_review_not_prediction", "candidates": reports});
     (best.map(|(session, _)| session), report)
 }
 
@@ -2015,6 +2116,20 @@ async fn relay(
                     standard(&commit.outbound)
                         && value.get("service_tier").is_none_or(|v| v == "default"),
                 );
+                if let Some(trajectory) = &mut commit.candidate.cost_trajectory {
+                    if commit.native {
+                        trajectory.unmodeled_call();
+                    } else {
+                        trajectory.primary(
+                            &commit.outbound,
+                            &value,
+                            &commit.service.config.upstream_url,
+                            now(),
+                            standard(&commit.outbound)
+                                && value.get("service_tier").is_none_or(|v| v == "default"),
+                        );
+                    }
+                }
                 if commit.native {
                     commit.candidate.reset_active();
                     commit.candidate.native_checkpoint = value["output"]
@@ -2052,6 +2167,9 @@ async fn relay(
                 }
             } else {
                 commit.reviewed.failed_primaries += 1;
+                if let Some(trajectory) = &mut commit.reviewed.cost_trajectory {
+                    trajectory.failed_call();
+                }
                 if let Some(value) = &observed {
                     commit.reviewed.primary.observe(
                         commit.outbound["model"].as_str().unwrap_or(""),
@@ -2128,6 +2246,158 @@ mod tests {
             auth_token: None,
             locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    #[test]
+    fn reviewer_requests_strict_schema_on_api_and_codex() {
+        for codex in [false, true] {
+            let mut config = reviewer_config();
+            config.codex_login = codex;
+            let body = review_body(&config, &Session::default());
+            let format = &body["text"]["format"];
+            assert_eq!(format["type"], "json_schema");
+            assert_eq!(format["strict"], true);
+            let schema = &format["schema"];
+            assert_eq!(schema["additionalProperties"], false);
+            assert_eq!(
+                schema["required"],
+                json!(["protected", "removable", "memories"])
+            );
+            for field in ["protected", "removable"] {
+                assert_eq!(schema["properties"][field]["items"]["type"], "string");
+            }
+            let memory = &schema["properties"]["memories"]["items"];
+            assert_eq!(memory["additionalProperties"], false);
+            assert_eq!(memory["required"], json!(["source_ids", "text"]));
+            assert_eq!(
+                memory["properties"]["source_ids"]["items"]["type"],
+                "string"
+            );
+            assert_eq!(memory["properties"]["text"]["type"], "string");
+        }
+    }
+
+    #[test]
+    fn local_token_estimate_is_not_a_bytes_div_four_guess() {
+        let repetitive = json!({"input": [{"role": "user", "content": "xxxxxxxx".repeat(2000)}]});
+        let bytes = serde_json::to_vec(&repetitive).unwrap().len() as f64;
+        assert!(
+            estimate(&repetitive) < bytes / 5.0,
+            "repetitive text tokenizes below the old estimate"
+        );
+        let unicode = json!({"input": [{"role": "user", "content": "🦀".repeat(1000)}]});
+        assert!(
+            estimate(&unicode) > 1500.0,
+            "Unicode is not one token per four bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn ongoing_review_keeps_oversized_group_without_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = checkpoint_service(directory.path());
+        service.config.classifier_max_input_tokens = 1024;
+        service.config.classifier_max_input_bytes = 8 * 1024 * 1024;
+        service.config.classifier_url = Some("http://127.0.0.1:1/review".into());
+        let mut session = Session::default();
+        observe_source(&mut session, &"🦀".repeat(2000));
+        observe_source(&mut session, "current task");
+        session.completed_requests = 1;
+        let main = json!({"model": "gpt-6-luna"});
+        assert!(!review(&service, "token-overflow", &mut session, &main, false).await);
+        assert_eq!(session.invalid_reviews, 0);
+        assert_eq!(session.opinions.get(&1).map(String::as_str), Some("keep"));
+        assert_eq!(
+            session.shadow.calls, 0,
+            "an oversized atomic group must not dispatch a paid review"
+        );
+        assert_eq!(session.last_review_request, 1);
+    }
+
+    #[test]
+    fn newest_user_survives_reviewer_and_planner_even_with_stale_drop_opinion() {
+        let mut config = reviewer_config();
+        config.min_payback_percent = 0;
+        let mut session = Session::default();
+        observe_source(&mut session, &"old human request ".repeat(1000));
+        observe_source(&mut session, "latest real user request");
+        let groups = session.groups();
+        let before = serde_json::to_value(&session).unwrap();
+        assert!(
+            session
+                .apply_advice(
+                    &groups,
+                    &json!({"protected": [], "removable": ["g1", "g2"], "memories": []})
+                )
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(&session).unwrap(),
+            before,
+            "bad batch applies nothing"
+        );
+        session
+            .apply_advice(
+                &groups,
+                &json!({"protected": [], "removable": ["g1"], "memories": []}),
+            )
+            .unwrap();
+        session.opinions.insert(2, "drop".into());
+        let main = json!({"model": "gpt-6-luna", "input": session.render_primary()});
+        let (candidate, _) = plan(&config, &session, &main);
+        let candidate = candidate.expect("older human message should be removable");
+        assert_eq!(
+            candidate.render_primary(),
+            vec![json!({"role": "user", "content": "latest real user request"})]
+        );
+    }
+
+    #[test]
+    fn codex_adapter_preserves_structured_output() {
+        let body = json!({"input": [], "text": {"format": {
+            "type": "json_schema", "name": "test_schema", "strict": true,
+            "schema": {"type": "object", "properties": {}, "required": [], "additionalProperties": false}
+        }}});
+        assert_eq!(codex_body(&body)["text"], body["text"]);
+    }
+
+    #[tokio::test]
+    async fn dashboard_exposes_only_typed_scenario_estimate() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Arc::new(checkpoint_service(directory.path()));
+        let mut value = serde_json::to_value(Session::default()).unwrap();
+        value["cost_trajectory"] =
+            serde_json::to_value(crate::proxy_savings::Trajectory::default()).unwrap();
+        value["cost_trajectory"]["previous"] = json!({
+            "model": "gpt-6-luna", "prefix": "must not leak", "overhead": "private settings",
+            "route": "private route", "input": 100, "at": now()
+        });
+        let id = "a".repeat(64);
+        std::fs::write(
+            directory.path().join(format!("{id}.json")),
+            value.to_string(),
+        )
+        .unwrap();
+        let response = dashboard_stats(
+            State(service),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stats: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            stats["sessions"][0]["cost_estimate"].is_object(),
+            "dashboard must expose a scenario estimate"
+        );
+        assert_eq!(
+            stats["sessions"][0]["cost_estimate"]["priced"], false,
+            "no observations are not zero-cost evidence"
+        );
+        assert!(!String::from_utf8_lossy(&bytes).contains("must not leak"));
     }
 
     #[test]

@@ -78,7 +78,8 @@ pub(super) struct Session {
     /// Active reviewer view only. Audit source may persist in history, but is
     /// NEVER used to render the reviewer after paired selection removes it.
     pub active_shadow: Vec<ShadowRecord>,
-    /// One immutable observation per main item ID; value is its coupled group ID.
+    /// One immutable observation per active-window main item ID; value is its coupled group ID.
+    /// Retired windows are reconstructed from canonical source when reconsidered.
     /// Strings retain checkpoint compatibility with the former payload map.
     pub observed: BTreeMap<u64, String>,
     pub primary_cache: Vec<CacheEvidence>,
@@ -87,10 +88,18 @@ pub(super) struct Session {
     pub shadow_cache: Vec<CacheEvidence>,
     #[serde(default)]
     pub reviewer_cache: Vec<ReviewerCacheBoundary>,
+    #[serde(default)]
+    pub cost_trajectory: Option<crate::proxy_savings::Trajectory>,
     pub primary: UsageLedger,
     pub shadow: UsageLedger,
     pub completed_requests: u64,
     pub last_review_request: u64,
+    /// Frozen frontier and completed members of an ongoing bounded review sweep.
+    /// Membership (not only group ID) lets extended tool cohorts be reconsidered.
+    #[serde(default)]
+    pub review_end_id: u64,
+    #[serde(default)]
+    pub reviewed_members: BTreeSet<u64>,
     /// A replay import still needs pre-primary review until that epoch's first
     /// primary completes. Persist this across failed calls and process restarts.
     #[serde(default)]
@@ -257,6 +266,11 @@ impl Session {
     }
 
     pub fn reset_active(&mut self) {
+        if let Some(trajectory) = &mut self.cost_trajectory {
+            trajectory.reset_epoch();
+        }
+        self.review_end_id = 0;
+        self.reviewed_members.clear();
         self.bootstrap_review_pending = false;
         self.bootstrap_end_id = 0;
         self.bootstrap_reviewed_ids.clear();
@@ -826,6 +840,8 @@ mod tests {
         };
         state.primary_cache.push(evidence.clone());
         state.shadow_cache.push(evidence);
+        state.review_end_id = state.next_id;
+        state.reviewed_members.extend([1, 2, 3]);
         state.primary.calls = 3;
         state.shadow.calls = 2;
         let prior_id = state.next_id;
@@ -849,6 +865,8 @@ mod tests {
         );
         assert!(state.next_id > prior_id && !state.history[0].exposed);
         assert_eq!(state.history_rebases, 1);
+        assert_eq!(state.review_end_id, 0);
+        assert!(state.reviewed_members.is_empty());
         assert_eq!((state.primary.calls, state.shadow.calls), (3, 2));
     }
 
