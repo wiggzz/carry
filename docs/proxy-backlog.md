@@ -13,7 +13,7 @@ Current work is in `feat/proxy-local-client-support` (`~/carry-pr-140`).
 - [x] Dashboard cost comparison using the main estimator's frozen-trajectory
   approach: conventional threshold summaries vs Carry, including reviewer cost,
   separate from observed provider-usage costs and with incomplete coverage visible.
-- [ ] Consolidate the proxy estimator with the shared savings/report estimator
+- [x] Consolidate the proxy estimator with the shared savings/report estimator
   after `feat/pi-cost-savings-estimate` merges. Both must use the same local token
   basis; do not add tokenized removals directly to provider input usage.
 - [x] Shared bounded windows for bootstrap and oversized ongoing reviews.

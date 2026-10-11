@@ -1,10 +1,10 @@
-//! Conditional frozen-trajectory scenario in serialized UTF-8 bytes / 4.
-//! Provider usage is a separate modeled ledger, never an input proxy calibration.
+//! Conditional frozen-trajectory scenario using local o200k_base token estimates.
+//! Provider usage remains a separate modeled ledger.
 use crate::openai::{Usage, estimated_cost_usd, prompt_cache_capabilities};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct Scenario {
     pub context_window: u64,
     pub reserve: u64,
@@ -12,7 +12,7 @@ pub struct Scenario {
     pub summary: u64,
 }
 impl Scenario {
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         self.context_window > self.reserve
             && self.keep_recent.saturating_add(self.summary) <= self.context_window - self.reserve
     }
@@ -79,7 +79,7 @@ pub struct Trajectory {
     pending_step: Option<u64>,
     pending_run: Option<String>,
     previous: Option<Prompt>,
-    restored: u64,
+    restored: i128,
     removed: u64,
     summary: u64,
     last_pi_input: u64,
@@ -185,8 +185,8 @@ impl Trajectory {
             }
             "context_compacted" => {
                 self.carry_edited = true;
-                if let Some(dropped) = data["compaction"]["dropped_tokens"].as_u64() {
-                    self.restored = self.restored.saturating_add(dropped);
+                if let Some(dropped) = data["compaction_token_delta"].as_i64() {
+                    self.restored = self.restored.saturating_add(dropped as i128);
                 } else {
                     self.result.coverage.missing_projection += 1;
                     self.scenario_available = false;
@@ -248,11 +248,11 @@ impl Trajectory {
                 }
                 let prompt = if matched { self.pending.take() } else { None };
                 if let (Some(mut prompt), Some(usage)) = (prompt, usage) {
-                    let pi_input = prompt
-                        .input
+                    let pi_input = (prompt.input as i128)
                         .saturating_add(self.restored)
-                        .saturating_sub(self.removed)
-                        .saturating_add(self.summary);
+                        .saturating_sub(self.removed as i128)
+                        .saturating_add(self.summary as i128)
+                        .clamp(0, u64::MAX as i128) as u64;
                     // Frozen provider output is a common charge, independent of input proxy tiers.
                     let output = estimated_cost_usd(
                         &prompt.model,
@@ -280,7 +280,7 @@ impl Trajectory {
                     } else {
                         0
                     };
-                    // Alternative bytes are unknown after a native edit: declared append/frozen-size reuse.
+                    // Alternative prefixes are unknown after a native edit: declared append/frozen-size reuse.
                     let pi_cached =
                         if compatible && (append || self.carry_edited) && !self.pi_edited {
                             self.last_pi_input.min(pi_input)
@@ -301,7 +301,7 @@ impl Trajectory {
                     }
                     self.last_pi_input = pi_input;
                     if let Some(output) = data["raw"].get("output").filter(|v| !v.is_null()) {
-                        self.last_output_proxy = byte_units(output);
+                        self.last_output_proxy = token_units(output);
                     } else {
                         self.scenario_available = false;
                         self.result.coverage.missing_output_projection += 1;
@@ -354,13 +354,24 @@ impl Trajectory {
     }
 }
 fn input_cost(model: &str, input: u64, cached: u64, minimum: Option<u64>) -> Option<f64> {
+    scenario_input_cost(model, input, cached, minimum, estimated_cost_usd)
+}
+
+/// Shared cache eligibility math; each frontend retains its pricing policy.
+pub(crate) fn scenario_input_cost(
+    model: &str,
+    input: u64,
+    cached: u64,
+    minimum: Option<u64>,
+    price: impl FnOnce(&str, &Usage) -> Option<f64>,
+) -> Option<f64> {
     let eligible = minimum.is_some_and(|min| input >= min);
     let cached = if minimum.is_some_and(|min| cached >= min) {
         cached.min(input)
     } else {
         0
     };
-    estimated_cost_usd(
+    price(
         model,
         &Usage {
             input_tokens: input,
@@ -375,22 +386,30 @@ fn valid_usage(value: &Value) -> Option<Usage> {
     value["output_tokens"].as_u64()?;
     serde_json::from_value(value.clone()).ok()
 }
-fn byte_units(value: &Value) -> u64 {
-    (serde_json::to_vec(value).expect("JSON value").len() as u64).div_ceil(4)
+pub(crate) fn token_units(value: &Value) -> u64 {
+    // Rendered JSON is a local text estimate, not provider or multimodal tokenization.
+    tiktoken_rs::o200k_base_singleton()
+        .encode_ordinary(&value.to_string())
+        .len() as u64
+}
+
+/// Shared prompt-bearing projection, excluding transport and sampling fields.
+pub(crate) fn prompt_projection(body: &Value) -> Option<(String, String, u64)> {
+    let input = body["input"].as_array()?;
+    let overhead = json!({"instructions":body.get("instructions"),"tools":body.get("tools"),"text":body.get("text")});
+    let units = token_units(&json!({"overhead":overhead,"input":input}));
+    let overhead = overhead.to_string();
+    let serialized = serde_json::to_string(input).ok()?;
+    let prefix = format!("{overhead}{}", &serialized[..serialized.len() - 1]);
+    Some((prefix, overhead, units))
 }
 fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
     let request = &data["request"];
-    let input = request["input"].as_array()?;
-    let overhead = json!({"tools":request.get("tools"),"instructions":request.get("instructions")});
-    // Exclude routing, auth, sampling and cache configuration from prompt units.
-    let overhead = serde_json::to_string(&overhead).ok()?;
-    let mut prefix = overhead.clone();
-    let serialized = serde_json::to_string(input).ok()?;
-    prefix.push_str(&serialized[..serialized.len() - 1]);
+    let (prefix, overhead, input) = prompt_projection(request)?;
     let route=serde_json::to_string(&json!({"api_base":data["transport"].get("api_base"),"route":data.get("route"),"cache_key":request.get("prompt_cache_key")})).ok()?;
     Some(Prompt {
         model: request["model"].as_str().unwrap_or(fallback).to_owned(),
-        input: (prefix.len() as u64 + 1).div_ceil(4),
+        input,
         prefix,
         overhead,
         route,
@@ -408,49 +427,56 @@ pub fn savings_percent(savings: f64, carry_cost: f64) -> Option<f64> {
 mod tests {
     use super::*;
     fn request(t: &mut Trajectory, units: u64) {
-        t.record(&json!({"event":"model_request","data":{"step":1,"request":{"input":["x".repeat((units*4) as usize)],"tools":[]}}}));
+        t.record(&json!({"event":"model_request","data":{"step":1,"request":{"input":["a ".repeat(units as usize)],"tools":[]}}}));
     }
     fn response(t: &mut Trajectory, input: u64, output: u64, proxy_output: u64) -> Estimate {
-        t.record(&json!({"event":"model_response","data":{"step":1,"usage":{"input_tokens":input,"output_tokens":output},"raw":{"output":"x".repeat((proxy_output*4) as usize)}}})).unwrap()
+        t.record(&json!({"event":"model_response","data":{"step":1,"usage":{"input_tokens":input,"output_tokens":output},"raw":{"output":"a ".repeat(proxy_output as usize)}}})).unwrap()
     }
+    #[test]
+    fn session_projection_uses_the_same_tokenizer_as_the_proxy() {
+        let body = json!({"model":"gpt-6-sol", "input":[{"role":"user", "content":"hello ".repeat(2000)}], "tools":[], "text":{"format":{"type":"json_object"}}});
+        let mut t = Trajectory::default();
+        t.record(&json!({"event":"model_request", "data":{"request":body}}));
+        let rendered = json!({"overhead":{"instructions":body.get("instructions"),"tools":body.get("tools"),"text":body.get("text")}, "input":body["input"]});
+        assert_eq!(
+            t.pending.unwrap().input,
+            crate::proxy_savings::token_units(&rendered)
+        );
+    }
+
     #[test]
     fn missing_projection_never_uses_provider_input_as_proxy() {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
-        t.record(
-            &json!({"event":"context_compacted","data":{"compaction":{"dropped_tokens":40000}}}),
-        );
+        t.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":40000}}));
         let e = response(&mut t, 220000, 100, 0);
         assert!(!e.priced);
         assert!(e.observed_cost > 0.0);
     }
     #[test]
     fn missing_native_removal_projection_invalidates_only_scenario() {
-        for compaction in [
-            json!({"dropped": [2]}),
-            json!({"dropped_tokens": null}),
-            json!({"dropped_tokens": -1}),
-            json!({"dropped_tokens": 1.5}),
-            json!({"dropped_tokens": "600"}),
-            json!({"dropped_tokens": true}),
-            json!({"dropped_tokens": 0}),
+        for delta in [
+            json!(null),
+            json!(-1),
+            json!(1.5),
+            json!("600"),
+            json!(true),
+            json!(0),
         ] {
             let mut t = Trajectory::with_model("gpt-6-sol".into());
             request(&mut t, 2000);
             let before = response(&mut t, 10, 0, 0);
-            let valid = compaction["dropped_tokens"].as_u64().is_some();
-            t.record(&json!({"event":"context_compacted","data":{"compaction":compaction}}));
+            let valid = delta.as_i64().is_some();
+            t.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":delta}}));
             request(&mut t, 1000);
             let after = response(&mut t, 10, 0, 0);
-            assert_eq!(after.priced, valid, "compaction: {compaction}");
+            assert_eq!(after.priced, valid, "delta: {delta}");
             assert_eq!(after.coverage.missing_projection, usize::from(!valid));
             assert!(after.observed_priced);
             assert!((after.observed_cost - 2.0 * before.observed_cost).abs() < 1e-12);
             // Later valid telemetry cannot backfill the unknown removal.
-            t.record(
-                &json!({"event":"context_compacted","data":{"compaction":{"dropped_tokens":600}}}),
-            );
+            t.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":600}}));
             assert_eq!(t.snapshot().priced, valid);
-            assert_eq!(t.restored, 600);
+            assert_eq!(t.restored, 600 + delta.as_i64().unwrap_or(0) as i128);
         }
     }
     #[test]
@@ -458,7 +484,9 @@ mod tests {
         fn replay(metered: u64) -> Estimate {
             let mut t = Trajectory::with_model("gpt-6-sol".into());
             for dropped in [0, 600] {
-                t.record(&json!({"event":"context_compacted","data":{"compaction":{"dropped_tokens":dropped}}}));
+                t.record(
+                    &json!({"event":"context_compacted","data":{"compaction_token_delta":dropped}}),
+                );
                 request(&mut t, 2000);
                 response(&mut t, metered, 100, 0);
             }
@@ -563,7 +591,9 @@ mod tests {
                 let before = response(&mut t, 10, 0, 0);
                 let carry_input = t.previous.as_ref().unwrap().input;
                 let prior_pi_input = t.last_pi_input;
-                t.record(&json!({"event":"context_compacted","data":{"compaction":{"dropped_tokens":600}}}));
+                t.record(
+                    &json!({"event":"context_compacted","data":{"compaction_token_delta":600}}),
+                );
                 t.record(&json!({"event":event,"data":{"model":"gpt-6-sol","implicit_cache_minimum_prefix_tokens":1024}}));
                 assert_eq!(t.last_pi_input, prior_pi_input);
                 request(&mut t, 2000);
@@ -597,7 +627,7 @@ mod tests {
         let units = t.last_pi_input;
         // The request model can differ from the new run's fallback model.
         t.record(&json!({"event":"session_resumed","data":{"model":"gpt-5.6-sol","implicit_cache_minimum_prefix_tokens":null}}));
-        t.record(&json!({"event":"model_request","data":{"step":1,"request":{"model":"gpt-6-sol","input":["x".repeat(8000)],"tools":[]}}}));
+        t.record(&json!({"event":"model_request","data":{"step":1,"request":{"model":"gpt-6-sol","input":["a ".repeat(2000)],"tools":[]}}}));
         let after = response(&mut t, 10, 0, 0);
         let cold = input_cost("gpt-6-sol", units, 0, Some(1024)).unwrap();
         assert!((after.carry_cost - before.carry_cost - cold).abs() < 1e-12);
@@ -633,7 +663,7 @@ mod tests {
         let b = response(&mut t, 2000, 100, 0);
         assert!((b.carry_cost - 2.0 * a.carry_cost).abs() < 1e-12);
         assert_eq!(b.carry_cost, b.pi_cost);
-        t.record(&json!({"event":"model_request","data":{"step":1,"transport":{"api_base":"another-route"},"request":{"input":["x".repeat(8000)],"tools":[]}}}));
+        t.record(&json!({"event":"model_request","data":{"step":1,"transport":{"api_base":"another-route"},"request":{"input":["a ".repeat(2000)],"tools":[]}}}));
         let c = response(&mut t, 2000, 100, 0);
         assert!((c.carry_cost - 3.0 * a.carry_cost).abs() < 1e-12);
         assert_eq!(c.carry_cost, c.pi_cost);
@@ -690,7 +720,7 @@ mod tests {
     fn recorded_ttl_and_minimum_override_cache_assumptions() {
         let mut t = Trajectory::default();
         t.record(&json!({"event":"run_started","data":{"model":"gpt-6-sol","cache_ttl_seconds":1,"implicit_cache_minimum_prefix_tokens":1024,"context_window":100000}}));
-        let req = |time| json!({"event":"model_request","timestamp_ms":time,"data":{"step":1,"request":{"input":["x".repeat(8000)],"tools":[]}}});
+        let req = |time| json!({"event":"model_request","timestamp_ms":time,"data":{"step":1,"request":{"input":["a ".repeat(2000)],"tools":[]}}});
         t.record(&req(10));
         let a=t.record(&json!({"event":"model_response","timestamp_ms":20,"data":{"step":1,"usage":{"input_tokens":2000,"output_tokens":100},"raw":{"output":[]}}})).unwrap();
         t.record(&req(1020));

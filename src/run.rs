@@ -1231,7 +1231,9 @@ fn maybe_compact(
     let Some((plan, rollout)) = select_compaction_plan(state, protected, cache, config) else {
         return Ok(false);
     };
+    let before = crate::savings::token_units(&json!(state.input_items()));
     let change = state.compact(plan);
+    let after = crate::savings::token_units(&json!(state.input_items()));
     cache.mark_compaction(&change.invalidated_generations);
     metrics.record_compaction();
     logger.raw_event(
@@ -1239,6 +1241,7 @@ fn maybe_compact(
         json!({
             "trigger": trigger,
             "compaction": &change,
+            "compaction_token_delta": before as i64 - after as i64,
             "retained_context": state.snapshot(),
             "rollout": rollout,
         }),

@@ -1,41 +1,9 @@
-//! Frozen-trajectory comparison, adapted from Carry's shared savings estimator.
-//! Both input branches use the same local tokenizer; native usage stays separate.
+//! Proxy-specific coverage and lifecycle around the shared savings estimator.
 use crate::openai::{Usage, prompt_cache_capabilities};
+pub(crate) use crate::savings::{Scenario, token_units};
 use carry::core::Rates;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-pub fn token_units(value: &Value) -> u64 {
-    // A deliberately simple first pass over rendered JSON, including quoting and
-    // wrappers. This is not provider tokenization or an image/audio estimator.
-    tiktoken_rs::o200k_base_singleton()
-        .encode_ordinary(&value.to_string())
-        .len() as u64
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Scenario {
-    pub context_window: u64,
-    pub reserve: u64,
-    pub keep_recent: u64,
-    pub summary: u64,
-}
-impl Default for Scenario {
-    fn default() -> Self {
-        Self {
-            context_window: 272_000,
-            reserve: 16_384,
-            keep_recent: 20_000,
-            summary: 1_000,
-        }
-    }
-}
-impl Scenario {
-    fn valid(&self) -> bool {
-        self.context_window > self.reserve
-            && self.keep_recent.saturating_add(self.summary) <= self.context_window - self.reserve
-    }
-}
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Coverage {
@@ -108,8 +76,10 @@ impl Trajectory {
         estimate.savings = estimate.traditional_cost - estimate.carry_cost;
         estimate.priced =
             self.available && self.scenario.valid() && estimate.coverage.primary_responses > 0;
-        estimate.savings_percent = (estimate.priced && estimate.traditional_cost > 0.0)
-            .then(|| 100.0 * estimate.savings / estimate.traditional_cost);
+        estimate.savings_percent = estimate
+            .priced
+            .then(|| crate::savings::savings_percent(estimate.savings, estimate.carry_cost))
+            .flatten();
         estimate
     }
 
@@ -330,24 +300,7 @@ fn estimated_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
 }
 
 fn scenario_input_cost(model: &str, input: u64, cached: u64, minimum: Option<u64>) -> Option<f64> {
-    let cached = if minimum.is_some_and(|minimum| cached >= minimum) {
-        cached.min(input)
-    } else {
-        0
-    };
-    estimated_cost_usd(
-        model,
-        &Usage {
-            input_tokens: input,
-            cached_input_tokens: cached,
-            cache_write_input_tokens: if minimum.is_some_and(|minimum| input >= minimum) {
-                input - cached
-            } else {
-                0
-            },
-            ..Usage::default()
-        },
-    )
+    crate::savings::scenario_input_cost(model, input, cached, minimum, estimated_cost_usd)
 }
 
 fn has_native_modalities(value: &Value) -> bool {
@@ -369,15 +322,10 @@ fn has_native_modalities(value: &Value) -> bool {
 }
 
 fn projection(body: &Value, route: &str, at: u64) -> Option<Prompt> {
-    let input = body["input"].as_array()?;
-    let overhead = json!({"instructions": body.get("instructions"), "tools": body.get("tools"), "text": body.get("text")});
-    let prompt = json!({"overhead": overhead, "input": input});
-    let overhead = overhead.to_string();
-    let serialized = serde_json::to_string(input).ok()?;
-    let prefix = format!("{overhead}{}", &serialized[..serialized.len() - 1]);
+    let (prefix, overhead, input) = crate::savings::prompt_projection(body)?;
     Some(Prompt {
         model: body["model"].as_str()?.to_owned(),
-        input: token_units(&prompt),
+        input,
         prefix,
         overhead,
         route: json!({"endpoint": route, "cache_key": body.get("prompt_cache_key")}).to_string(),
