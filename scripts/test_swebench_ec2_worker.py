@@ -193,7 +193,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             )
             run = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
             self.assertEqual(run.returncode, 2)
-            self.assertIn("CARRY_COMPACTION_MIN_PAYBACK_PERCENT must be an integer from 0 through 100", (carry_root / "results" / "worker.log").read_text())
+            self.assertIn("CARRY_COMPACTION_MIN_PAYBACK_PERCENT must be 0 through 100 with at most one decimal place", (carry_root / "results" / "worker.log").read_text())
             self.assertFalse((root / "credential-fetched").exists())
 
     def test_official_worker_forwards_one_declared_attempt_with_official_limits(self):
@@ -215,7 +215,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
                 "BENCHMARK_MODE=official-50\nBENCHMARK_HARNESS=carry\n"
                 "BENCHMARK_ATTEMPT=2\nBENCHMARK_ATTEMPTS=3\nBOOTSTRAP_WAIT_SECONDS=1\nRUN_ID=gh-test-2\n"
                 "CARRY_COMPACTION_POLICY=disabled\nCARRY_KEEP_LEASE_TURNS=8\n"
-                "CARRY_COMPACTION_MIN_PAYBACK_PERCENT=25\n"
+                "CARRY_COMPACTION_MIN_PAYBACK_PERCENT=2.5\n"
                 "CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS=0\n"
                 "CARRY_COMPACTION_NEUTRAL_LOW_WATERMARK_TOKENS=0\n",
                 encoding="utf-8",
@@ -282,7 +282,7 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual(
                 runner_env.read_text(),
-                "agent=5\nevaluator=5\nmode=official-50\nbenchmark_attempt=2\nbenchmark_attempts=3\npolicy=disabled\nlease=8\nmargin=25\nhigh=0\nlow=0\nworker=18900\n"
+                "agent=5\nevaluator=5\nmode=official-50\nbenchmark_attempt=2\nbenchmark_attempts=3\npolicy=disabled\nlease=8\nmargin=2.5\nhigh=0\nlow=0\nworker=18900\n"
                 "agent_phase=4500\n",
             )
 
