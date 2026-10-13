@@ -542,6 +542,74 @@ async fn codex_login_rejects_non_codex_remote_endpoints_before_loading_credentia
 }
 
 #[tokio::test]
+async fn codex_primary_fallback_cache_key_is_stable_and_scoped_to_session() {
+    use axum::{Router, routing::post};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use std::sync::Arc;
+    let home = tempfile::tempdir().unwrap();
+    let token = format!(
+        "header.{}.signature",
+        URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#)
+    );
+    std::fs::write(
+        home.path().join("auth.json"),
+        serde_json::to_vec(&json!({
+        "version":1, "access_token":token, "refresh_token":"fixture-refresh",
+        "expires_at_ms":4102444800000u64}))
+        .unwrap(),
+    )
+    .unwrap();
+    let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let captured = bodies.clone();
+    let router = Router::new().route("/v1/responses", post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+        let captured = captured.clone();
+        async move {
+            captured.lock().await.push(body);
+            ([("content-type", "text/event-stream")], "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":50}}}}\n\n")
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let state = tempfile::tempdir().unwrap();
+    let (_proxy, url) = start_proxy_options(
+        state.path(),
+        address,
+        "off",
+        &[
+            "--codex-login",
+            "--codex-home",
+            home.path().to_str().unwrap(),
+        ],
+        "",
+    )
+    .await;
+    for (session, caller_key) in [
+        ("a", None),
+        ("a", None),
+        ("b", None),
+        ("a", Some("caller-owned")),
+    ] {
+        let mut body = json!({"model":"gpt-6-luna", "input":[{"role":"user","content":"goal"}]});
+        if let Some(key) = caller_key {
+            body["prompt_cache_key"] = json!(key);
+        }
+        let response = send(&url, &body, session, "main").await;
+        assert!(response.status().is_success());
+        response.bytes().await.unwrap();
+    }
+    let bodies = bodies.lock().await;
+    assert_eq!(
+        bodies[0]["prompt_cache_key"], bodies[1]["prompt_cache_key"],
+        "repeat primary requests in one explicit session must share cache affinity"
+    );
+    assert_ne!(bodies[0]["prompt_cache_key"], bodies[2]["prompt_cache_key"]);
+    assert_eq!(bodies[3]["prompt_cache_key"], "caller-owned");
+    server.abort();
+}
+
+#[tokio::test]
 async fn dashboard_is_public_locally_and_reports_stats_without_conversation_content() {
     use axum::{Router, routing::post};
     let router = Router::new().route(

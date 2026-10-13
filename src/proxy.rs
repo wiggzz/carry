@@ -32,8 +32,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::proxy_cache::serialized_identity as reviewer_serialized_identity;
 
 use crate::{
-    proxy_sse::Observer,
-    proxy_state::{CacheEvidence, Group, ReviewerCacheBoundary, Session},
+    proxy_sse::{JsonObserver, Observer},
+    proxy_state::{CacheEvidence, Group, ReviewGroup, ReviewerCacheBoundary, Session},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -138,6 +138,14 @@ struct Service {
 #[path = "proxy_review_window.rs"]
 mod review_window;
 use review_window::{ReviewWindow, select_review_window};
+
+#[path = "proxy_plan.rs"]
+mod planning;
+use planning::plan;
+#[cfg(test)]
+use planning::{
+    PricedReviewWindow, ReviewProjection, frozen_review_sweep, review_schedule, sweep_cost,
+};
 
 type Failure = (StatusCode, axum::Json<Value>);
 
@@ -760,6 +768,12 @@ async fn forward(
     let mut outbound = body.clone();
     let mut commit = None;
     if let Some(id) = id {
+        if service.config.codex_login && outbound.get("prompt_cache_key").is_none() {
+            outbound["prompt_cache_key"] = json!(format!(
+                "{:x}",
+                Sha256::digest(format!("carry-primary-{id}").as_bytes())
+            ));
+        }
         let lock = session_lock(&service, &id).await;
         let mut session = load(&service, &id)?;
         if session.cost_trajectory.is_none() {
@@ -919,9 +933,7 @@ async fn forward(
             .filter(|i| !i.removed)
             .map(|i| i.id)
             .collect();
-        if service.config.codex_login {
-            outbound = codex_body(&outbound);
-        }
+        outbound = primary_wire_body(&service.config, &outbound);
         trace(&service, &id, "primary_submitted", &outbound)
             .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "submission trace failed"))?;
         commit = Some(Commit {
@@ -936,7 +948,7 @@ async fn forward(
         });
     }
     if service.config.codex_login && commit.is_none() {
-        outbound = codex_body(&outbound);
+        outbound = primary_wire_body(&service.config, &outbound);
     }
     let endpoint = if legacy_native {
         format!(
@@ -1048,11 +1060,15 @@ fn review_body(config: &ProxyCli, session: &Session) -> Value {
 }
 
 fn review_body_for_groups(config: &ProxyCli, session: &Session, groups: &[Group]) -> Value {
+    review_body_with_input(config, session, session.shadow_input_for_groups(groups))
+}
+
+fn review_body_with_input(config: &ProxyCli, session: &Session, input: Vec<Value>) -> Value {
     let mut body = json!({
         "model": config.classifier_model,
         "instructions": REVIEW_INSTRUCTIONS,
         // Keep the stable preamble for checkpoint/cache-prefix compatibility.
-        "input": std::iter::once(json!({"role": "user", "content": "Return JSON."})).chain(std::iter::once(json!({"role": "user", "content": json!({"current_request": session.review_context}).to_string()}))).chain(session.shadow_input_for_groups(groups)).collect::<Vec<_>>(),
+        "input": std::iter::once(json!({"role": "user", "content": "Return JSON."})).chain(std::iter::once(json!({"role": "user", "content": json!({"current_request": session.review_context}).to_string()}))).chain(input).collect::<Vec<_>>(),
         "store": false, "stream": false,
         "prompt_cache_key": session.review_cache_key,
         "reasoning": {"effort": config.classifier_reasoning_effort},
@@ -1604,6 +1620,8 @@ fn merge_review(
     current.reviewer_cache = reviewed.reviewer_cache.clone();
     current.review_end_id = reviewed.review_end_id;
     current.reviewed_members = reviewed.reviewed_members.clone();
+    current.reviewer_windows = reviewed.reviewer_windows.clone();
+    current.pending_reviewer_windows = reviewed.pending_reviewer_windows.clone();
     current.last_review_request = reviewed.last_review_request;
 }
 
@@ -1667,7 +1685,12 @@ async fn review(
                         .is_some_and(|(split, whole)| split < whole)
                 });
             if !split_is_cheaper {
-                return review_chunk(service, id, session, &body, &groups, run).await;
+                let valid = review_chunk(service, id, session, &body, &groups, run).await;
+                if valid {
+                    session.reviewer_windows = vec![review_membership(&groups)];
+                    session.pending_reviewer_windows.clear();
+                }
+                return valid;
             }
         }
     }
@@ -1684,6 +1707,17 @@ fn mark_reviewed(session: &mut Session, groups: &[Group], bootstrap: bool) {
             .reviewed_members
             .extend(groups.iter().flat_map(|g| g.members.iter().copied()));
     }
+}
+
+fn review_membership(groups: &[Group]) -> Vec<ReviewGroup> {
+    groups
+        .iter()
+        .filter(|group| group.replayable)
+        .map(|group| ReviewGroup {
+            id: group.id,
+            members: group.members.clone(),
+        })
+        .collect()
 }
 
 /// Bootstrap and ongoing reviews share restart-safe sweeps. Window selection
@@ -1710,6 +1744,7 @@ async fn review_windows(
         session.bootstrap_end_id
     } else {
         if session.review_end_id == 0 {
+            session.pending_reviewer_windows.clear();
             session.review_end_id = frontier;
         }
         session.review_end_id
@@ -1732,6 +1767,9 @@ async fn review_windows(
             })
             .collect::<Vec<_>>();
         if !remaining.iter().any(|g| g.exposed && !g.pinned) {
+            if !session.pending_reviewer_windows.is_empty() {
+                session.reviewer_windows = std::mem::take(&mut session.pending_reviewer_windows);
+            }
             if bootstrap {
                 session.bootstrap_review_complete = true;
             } else {
@@ -1784,6 +1822,9 @@ async fn review_windows(
         calls += 1;
         let valid = review_chunk(service, id, session, &body, &chunk, run).await;
         if valid {
+            session
+                .pending_reviewer_windows
+                .push(review_membership(&chunk));
             mark_reviewed(session, &chunk, bootstrap);
             reviewed = true;
         }
@@ -1983,6 +2024,15 @@ async fn review_chunk(
     }
     let _ = trace(service, id, "shadow_feedback", &session.review_feedback);
     valid
+}
+
+/// Use the same primary representation for cache planning and transmission.
+fn primary_wire_body(config: &ProxyCli, body: &Value) -> Value {
+    if config.codex_login {
+        codex_body(body)
+    } else {
+        body.clone()
+    }
 }
 
 /// Explicit subscription adapter; API-key forwarding remains opaque.
@@ -2237,102 +2287,6 @@ fn view_costs(
     })
 }
 
-fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Option<Session>, Value) {
-    if !standard(body)
-        || Rates::for_model(body["model"].as_str().unwrap_or(""), estimate(body)).is_none()
-    {
-        return (
-            None,
-            json!({"selected": false, "reason": "unsupported_model_or_tier"}),
-        );
-    }
-    let groups = session.groups();
-    let eligible = groups
-        .iter()
-        .filter(|g| {
-            g.exposed && !g.pinned && session.opinions.get(&g.id).is_some_and(|s| s == "drop")
-        })
-        .map(|g| g.id)
-        .collect::<HashSet<_>>();
-    let mut candidates = vec![HashSet::new()];
-    for evidence in &session.primary_cache {
-        if now().saturating_sub(evidence.at) <= 1800
-            && body["input"]
-                .as_array()
-                .is_some_and(|input| evidence.matches(&cache_base(body), input))
-        {
-            let frontier_ids = session
-                .history
-                .iter()
-                .filter(|i| !i.removed)
-                .take(evidence.input_len())
-                .map(|i| i.id)
-                .collect::<HashSet<_>>();
-            candidates.push(
-                groups
-                    .iter()
-                    .filter(|g| g.members.iter().any(|id| frontier_ids.contains(id)))
-                    .map(|g| g.id)
-                    .collect(),
-            );
-        }
-    }
-    let future_reviews = config.payoff_requests.saturating_sub(1) / config.review_every_requests;
-    let mut reports = Vec::new();
-    let mut best: Option<(Session, JointDecision)> = None;
-    for protected in candidates {
-        let removed = select_removals(groups.iter().map(|g| g.id), &eligible, &protected);
-        if removed.is_empty() {
-            continue;
-        }
-        let mut candidate = session.clone();
-        candidate.remove(&removed, &groups);
-        let mut compact = body.clone();
-        compact["input"] = json!(candidate.render_primary());
-        let keep_shadow = review_body(config, session);
-        let compact_shadow = review_body(config, &candidate);
-        let Some(primary) = view_costs(
-            body,
-            &compact,
-            &session.primary_cache,
-            body["model"].as_str().unwrap_or(""),
-            config.payoff_requests,
-        ) else {
-            continue;
-        };
-        let Some(mut shadow) = reviewer_view_costs(
-            config,
-            &session.reviewer_cache,
-            &keep_shadow,
-            &compact_shadow,
-            future_reviews,
-        ) else {
-            continue;
-        };
-        // A future completed review also pays for bounded output. The current
-        // completed review is sunk; future output is equal work, NOT zero cost.
-        // Long-context output rates can differ between the two actual views.
-        let keep_rates =
-            Rates::for_model(&config.classifier_model, estimate(&keep_shadow)).unwrap();
-        let compact_rates =
-            Rates::for_model(&config.classifier_model, estimate(&compact_shadow)).unwrap();
-        let future_output = future_reviews as f64 * config.classifier_max_output_tokens as f64;
-        shadow.keep += future_output * keep_rates.output;
-        shadow.compact += future_output * compact_rates.output;
-        let decision = joint_decision(primary, shadow, config.min_payback_percent);
-        reports.push(json!({"removed_groups": removed, "joint": decision, "primary_retained_estimated_tokens": estimate(&compact), "shadow_retained_estimated_tokens": estimate(&compact_shadow), "primary_cached_estimated_tokens": reusable(&session.primary_cache, &compact), "shadow_cached_estimated_tokens": reviewer_reusable(config, &session.reviewer_cache, &compact_shadow)}));
-        if decision.accepted
-            && best
-                .as_ref()
-                .is_none_or(|(_, prior)| decision.savings > prior.savings)
-        {
-            best = Some((candidate, decision));
-        }
-    }
-    let report = json!({"selected": best.is_some(), "mode": format!("{:?}",config.mode).to_lowercase(), "future_reviews": future_reviews, "payoff_requests": config.payoff_requests, "current_review_cost_is_sunk": true, "estimate_basis": "o200k_base_rendered_json_estimate_not_provider_tokens_or_overflow_evidence", "cache_basis": "exact_prefix_native_cached_fraction_not_guarantee", "reviewer_cache_basis": "one_prior_transmitted_stable_boundary_bounded_by_native_read_fraction_not_guaranteed_write", "classifier_cache_policy": format!("{:?}", config.classifier_cache_policy), "classifier_explicit_cache": classifier_cache_enabled(config).unwrap_or(false), "future_cache_assumption": "fixed_history_eligible_future_hits_sensitivity_not_forecast;reviewer_stable_marked_prefix_only_never_ledger", "future_review_output_assumption": "configured_max_output_tokens_per_future_review_not_prediction", "candidates": reports});
-    (best.map(|(session, _)| session), report)
-}
-
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
 struct Attempt {
@@ -2456,7 +2410,7 @@ async fn relay(
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
     tokio::spawn(async move {
         let mut observer = Observer::default();
-        let mut json_bytes = Vec::new();
+        let mut json_observer = JsonObserver::default();
         let mut complete_transport = false;
         loop {
             tokio::select! {
@@ -2464,7 +2418,7 @@ async fn relay(
                 chunk = upstream.chunk() => match chunk {
                     Ok(Some(chunk)) => {
                         if is_sse { observer.feed(&chunk); }
-                        else if json_bytes.len() + chunk.len() <= 4 * 1024 * 1024 { json_bytes.extend_from_slice(&chunk); }
+                        else { json_observer.feed(&chunk); }
                         if let Some(commit) = &commit {
                             let _ = trace(&commit.service, &commit.id, "primary_response_chunk", &json!({"bytes": chunk.as_ref()}));
                         }
@@ -2482,7 +2436,7 @@ async fn relay(
         let observed = if is_sse {
             observer.observed
         } else {
-            serde_json::from_slice::<Value>(&json_bytes).ok()
+            json_observer.observed()
         };
         if let Some(attempt) = attempt {
             attempt.finish(
@@ -2623,6 +2577,41 @@ async fn relay(
 mod tests {
     use super::*;
     use carry::core::prefix_compatible;
+
+    #[test]
+    fn primary_wire_adapter_keeps_default_instructions_and_append_prefix_stable() {
+        let mut config = reviewer_config();
+        config.codex_login = true;
+        let mut raw = json!({"model":"gpt-6-luna","prompt_cache_key":"session-key",
+            "input":[{"role":"user","content":"goal"}], "max_output_tokens":100});
+        let first = primary_wire_body(&config, &raw);
+        assert!(first["instructions"].is_string());
+        raw["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"assistant","content":"result"}));
+        let appended = primary_wire_body(&config, &raw);
+        assert_eq!(cache_base(&first), cache_base(&appended));
+        assert!(
+            appended["input"]
+                .as_array()
+                .unwrap()
+                .starts_with(first["input"].as_array().unwrap())
+        );
+        let mut cache = Vec::new();
+        observe_cache(
+            &mut cache,
+            &first,
+            &json!({"input_tokens":100,"input_tokens_details":{"cached_tokens":50}}),
+        );
+        assert!(reusable(&cache, &appended) > 0.0);
+        config.codex_login = false;
+        assert_eq!(
+            primary_wire_body(&config, &raw),
+            raw,
+            "generic API forwarding preserves the original body"
+        );
+    }
 
     #[test]
     fn reviewer_final_json_is_separate_from_progress_messages() {
@@ -3757,6 +3746,277 @@ mod tests {
     }
 
     #[test]
+    fn unfinished_sweep_prices_only_remaining_sources_without_old_whole_window_credit() {
+        let mut config = reviewer_config();
+        config.payoff_requests = 2;
+        config.review_every_requests = 100;
+        let mut session = Session::default();
+        observe_source(&mut session, &"already reviewed source ".repeat(1800));
+        observe_source(&mut session, &"remaining unreviewed source ".repeat(1800));
+        observe_source(&mut session, "current task");
+        let groups = session.groups();
+        session.reviewer_windows = vec![review_membership(&groups[..2])];
+        let whole = ReviewProjection::new(&session).body(&config, &groups[..2]);
+        observe_reviewer_cache(&config, &mut session.reviewer_cache, &whole, &receipt(0));
+        observe_reviewer_cache(&config, &mut session.reviewer_cache, &whole, &receipt(9000));
+        assert!(reviewer_reusable(&config, &session.reviewer_cache, &whole) > 0.0);
+        session.review_end_id = 2;
+        session.reviewed_members.insert(1);
+        let projection = ReviewProjection::new(&session);
+        let remaining = projection.body(&config, &groups[1..2]);
+        assert_eq!(
+            reviewer_reusable(&config, &session.reviewer_cache, &remaining),
+            0.0
+        );
+        let windows = frozen_review_sweep(&config, &session, &groups, &projection).unwrap();
+        let schedule = review_schedule(&config, &session, &windows);
+        let actual = sweep_cost(&config, &session, &windows, &schedule).unwrap();
+        let expected =
+            reviewer_view_costs(&config, &session.reviewer_cache, &remaining, &remaining, 1)
+                .unwrap()
+                .keep
+                + config.classifier_max_output_tokens as f64
+                    * Rates::for_model(&config.classifier_model, estimate(&remaining))
+                        .unwrap()
+                        .output;
+        assert!((actual - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn changed_frozen_membership_can_use_a_fresh_fitting_complete_domain() {
+        let config = reviewer_config();
+        let mut session = Session::default();
+        session
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                json!({"role":"assistant","content":"first result"}),
+                json!({"role":"user","content":"obsolete separator"}),
+                json!({"role":"assistant","content":"second result"}),
+                json!({"role":"user","content":"current task"}),
+            ])
+            .unwrap();
+        for item in &mut session.history {
+            item.exposed = true;
+        }
+        let groups = session.groups();
+        session.observe_groups(&groups);
+        session.reviewer_windows = vec![
+            review_membership(&groups[1..2]),
+            review_membership(&groups[3..4]),
+        ];
+        session.remove(&[3], &groups);
+        let current = session.groups();
+        assert_eq!(
+            current.iter().find(|group| group.id == 2).unwrap().members,
+            vec![2, 4]
+        );
+        let projection = ReviewProjection::new(&session);
+        let windows = frozen_review_sweep(&config, &session, &current, &projection).unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].body, projection.body(&config, &current));
+    }
+
+    #[test]
+    fn projected_review_matches_the_actual_single_window_wire() {
+        let config = reviewer_config();
+        let mut session = Session::default();
+        observe_source(&mut session, "first evidence");
+        observe_source(&mut session, "current task");
+        let groups = session.groups();
+        assert_eq!(
+            ReviewProjection::new(&session).body(&config, &groups),
+            review_body(&config, &session)
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_window_partition_survives_a_bounded_sweep_restart() {
+        async fn respond() -> axum::Json<Value> {
+            axum::Json(
+                json!({"status":"completed","usage":{"input_tokens":100,"output_tokens":5,"input_tokens_details":{"cached_tokens":0}},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"protected\":[],\"removable\":[],\"memories\":[]}"}]}]}),
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/responses", post(respond)))
+                .await
+                .unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = checkpoint_service(directory.path());
+        service.config.classifier_url = Some(format!("http://{address}/responses"));
+        service.config.review_max_calls = 1;
+        let mut session = Session::default();
+        observe_source(&mut session, &"first window source ".repeat(1800));
+        observe_source(&mut session, &"second window source ".repeat(1800));
+        observe_source(&mut session, "current task");
+        session.completed_requests = 1;
+        let groups = session.groups();
+        let projection = ReviewProjection::new(&session);
+        service.config.classifier_max_input_tokens =
+            (estimate(&projection.body(&service.config, &groups[..1]))
+                .max(estimate(&projection.body(&service.config, &groups[1..2])))
+                + 200.0) as u32;
+        let main = json!({"model":"gpt-6.1-sol","input":session.render_primary()});
+        assert!(
+            review(
+                &service,
+                "partition",
+                &mut session,
+                &main,
+                false,
+                &mut ReviewRun::default()
+            )
+            .await
+        );
+        assert_eq!(session.pending_reviewer_windows.len(), 1);
+        assert!(session.reviewer_windows.is_empty());
+        let mut restored: Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        assert!(
+            review(
+                &service,
+                "partition",
+                &mut restored,
+                &main,
+                false,
+                &mut ReviewRun::default()
+            )
+            .await
+        );
+        assert_eq!(restored.review_end_id, 0);
+        assert!(restored.pending_reviewer_windows.is_empty());
+        assert_eq!(restored.reviewer_windows.len(), 2);
+        assert_eq!(restored.reviewer_windows[0][0].members, vec![1]);
+        assert_eq!(restored.reviewer_windows[1][0].members, vec![2]);
+        provider.abort();
+    }
+
+    #[test]
+    fn planner_prices_complete_frozen_sweeps_and_new_eligible_tail() {
+        let mut config = reviewer_config();
+        let mut session = Session::default();
+        observe_source(&mut session, &"first historical source ".repeat(1800));
+        observe_source(&mut session, &"second historical source ".repeat(1800));
+        observe_source(&mut session, "current task");
+        let groups = session.groups();
+        let projection = ReviewProjection::new(&session);
+        let first = projection.body(&config, &groups[..1]);
+        let second = projection.body(&config, &groups[1..2]);
+        config.classifier_max_input_tokens =
+            (estimate(&first).max(estimate(&second)) + 200.0) as u32;
+        assert!(!review_fits(&config, &review_body(&config, &session)));
+        session.reviewer_windows = vec![
+            review_membership(&groups[..1]),
+            review_membership(&groups[1..2]),
+        ];
+        session.active_shadow.retain(|record| record.source_id == 2);
+        session.observed.retain(|_, owner| owner == "2");
+        session
+            .apply_advice(
+                &groups,
+                &json!({"protected":[],"removable":["g1"],"memories":[]}),
+            )
+            .unwrap();
+        let main = json!({"model":"gpt-6.1-sol","input":session.render_primary()});
+        let (_, report) = plan(&config, &session, &main);
+        assert_eq!(report["reviewer_economics_priced"], true);
+        assert_eq!(report["future_review_events"], 4);
+        assert_eq!(report["future_reviewer_calls"], 8);
+        let output_floor = 8.0
+            * config.classifier_max_output_tokens as f64
+            * Rates::for_model(&config.classifier_model, 0.0)
+                .unwrap()
+                .output;
+        assert!(
+            report["candidates"][0]["joint"]["future_shadow_keep"]
+                .as_f64()
+                .unwrap()
+                > output_floor
+        );
+
+        // Finishing an older background sweep must not indefinitely block
+        // economic decisions as new completed context becomes eligible.
+        observe_source(&mut session, &"newer completed source ".repeat(1800));
+        observe_source(&mut session, "latest task");
+        let main = json!({"model":"gpt-6.1-sol","input":session.render_primary()});
+        let (_, report) = plan(&config, &session, &main);
+        assert_eq!(report["reviewer_economics_priced"], true);
+        assert!(report["added_tail_windows"].as_u64().unwrap() > 0);
+        assert_eq!(
+            report["future_reviewer_calls"].as_u64().unwrap(),
+            4 * report["reviewer_windows"].as_u64().unwrap()
+        );
+        assert!(
+            report["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["joint"].is_object())
+        );
+    }
+
+    #[test]
+    fn frozen_sweep_scheduling_obeys_call_limit_cadence_and_pending_progress() {
+        let mut config = reviewer_config();
+        config.review_every_requests = 2;
+        config.review_max_calls = 1;
+        let mut session = Session::default();
+        observe_source(&mut session, "source one");
+        observe_source(&mut session, "source two");
+        observe_source(&mut session, "current task");
+        let groups = session.groups();
+        let windows = groups[..2]
+            .iter()
+            .map(|group| PricedReviewWindow {
+                groups: vec![group.clone()],
+                body: json!({}),
+                added_tail: false,
+                pending_body: None,
+            })
+            .collect::<Vec<_>>();
+        let schedule = review_schedule(&config, &session, &windows);
+        assert_eq!(schedule.events, 2);
+        assert_eq!(schedule.calls, vec![1, 1]);
+
+        config.review_every_requests = 100;
+        session.review_end_id = 2;
+        session.reviewed_members.insert(1);
+        session.pending_reviewer_windows = vec![review_membership(&groups[..1])];
+        let restored: Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        assert_eq!(restored.pending_reviewer_windows[0][0].members, vec![1]);
+        let schedule = review_schedule(&config, &restored, &windows);
+        assert_eq!(schedule.events, 1);
+        assert_eq!(schedule.calls, vec![0, 1]);
+    }
+
+    #[test]
+    fn planner_does_not_price_only_last_window_of_an_unknown_oversized_sweep() {
+        let mut config = reviewer_config();
+        config.classifier_max_input_tokens = 6000;
+        let mut session = Session::default();
+        observe_source(&mut session, &"older removable source ".repeat(1800));
+        observe_source(&mut session, &"later protected source ".repeat(1800));
+        observe_source(&mut session, "current task");
+        let groups = session.groups();
+        session
+            .apply_advice(
+                &groups,
+                &json!({"protected":[],"removable":["g1"],"memories":[]}),
+            )
+            .unwrap();
+        assert!(!review_fits(&config, &review_body(&config, &session)));
+        session.active_shadow.retain(|record| record.source_id == 2);
+        session.observed.retain(|_, owner| owner == "2");
+        let main = json!({"model":"gpt-6.1-sol","input":session.render_primary()});
+        let (candidate, report) = plan(&config, &session, &main);
+        assert!(candidate.is_none());
+        assert_eq!(report["reason"], "reviewer_partition_unknown");
+    }
+
+    #[test]
     fn actual_paired_rendering_and_separate_cache_evidence_can_veto_main_savings() {
         let config = ProxyCli::try_parse_from([
             "carry proxy",
@@ -3823,7 +4083,8 @@ mod tests {
             "cold actual reviewer view repays the same coupled rewrite"
         );
         assert_eq!(report["current_review_cost_is_sunk"], true);
-        assert_eq!(report["future_reviews"], 4);
+        assert_eq!(report["future_review_events"], 4);
+        assert_eq!(report["future_reviewer_calls"], 4);
         let mut expensive_future_reviews = config;
         expensive_future_reviews.min_payback_percent = 25;
         expensive_future_reviews.classifier_max_output_tokens = 16_384;

@@ -173,6 +173,9 @@ active reviewer projection; canonical history, retention decisions and sourced
 memories remain checkpointed. Source observations stay immutable within an
 active window and are rebuilt from canonical history after retirement. Legacy
 split cohorts are repaired in native source order with corrected annotation IDs.
+Subscription cache comparisons use the same adapted wire shape as submission,
+including folded instructions and inserted memory slots. A missing client cache
+key gets a stable session key; caller-provided keys remain intact.
 Primary cache receipts use bounded exact-prefix fingerprints; older prompt-copy
 checkpoints migrate on load. Memory retirement updates the scenario restoration
 delta separately from source-compaction counts.
@@ -184,6 +187,17 @@ unfinished windows resume even before the normal review cadence is due.
 Successful windows survive failed primaries and restarts. A wholly rejected review
 stops the attempt without advancing that window or discarding completed windows;
 partially accepted reviews advance while reporting rejected items for correction.
+Completed window memberships are checkpointed as source IDs/member snapshots,
+without duplicate payloads. Rewrite economics price the complete frozen sweep,
+including each scheduled call and output cap across the payoff horizon. Cadence,
+per-request call limits and unfinished sweep progress determine those calls.
+New eligible tail context is priced as conservative bounded chronological windows;
+partial-window continuation prices only remaining sources, with no credit from a
+removed prefix. Missing oversized coverage reports `reviewer_partition_unknown`
+instead of pricing only the last active window. These fixed-partition projections
+are conditional assumptions and do not predict provider latency or future changes.
+Reports separate `future_review_events` from `future_reviewer_calls`; reviewer
+input/cache totals are named for the whole sweep, rather than one request.
 A rebase/native epoch reset clears this progress. The dashboard distinguishes wholly invalid reviews from partially accepted reviews; legacy invalid-review totals remain historical.
 
 Reviewer requests replay native messages, reasoning (including encrypted content),

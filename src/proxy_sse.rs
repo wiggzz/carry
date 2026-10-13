@@ -2,6 +2,35 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
+/// JSON observation has the same bound as SSE, independently of byte relay.
+#[derive(Default)]
+pub(super) struct JsonObserver {
+    bytes: Vec<u8>,
+    invalid: bool,
+}
+
+impl JsonObserver {
+    pub fn feed(&mut self, chunk: &[u8]) {
+        if self.invalid {
+            return;
+        }
+        if self.bytes.len() + chunk.len() > 4 * 1024 * 1024 {
+            self.bytes.clear();
+            self.invalid = true;
+        } else {
+            self.bytes.extend_from_slice(chunk);
+        }
+    }
+
+    pub fn observed(self) -> Option<Value> {
+        if self.invalid {
+            None
+        } else {
+            serde_json::from_slice(&self.bytes).ok()
+        }
+    }
+}
+
 /// Persist identifiers only; provider prose can contain private request data.
 pub(super) fn safe_error(error: &Value) -> Value {
     let mut safe = serde_json::Map::new();
@@ -122,6 +151,28 @@ impl Observer {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn oversized_json_never_becomes_a_shortened_completed_response() {
+        let mut observer = JsonObserver::default();
+        observer.feed(b"{\"status\":\"completed\",\"output\":[{\"text\":\"");
+        observer.feed(&vec![b'x'; 4 * 1024 * 1024 + 1]);
+        observer.feed(b"\"}],\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}");
+        assert!(
+            observer.observed().is_none(),
+            "never commit shortened output after capture overflow"
+        );
+    }
+
+    #[test]
+    fn bounded_json_observation_preserves_fragmented_native_output() {
+        let value = json!({"status":"completed","output":[{"type":"message","text":"é 🦀"}],"usage":{"input_tokens":10,"output_tokens":2}});
+        let mut observer = JsonObserver::default();
+        for chunk in value.to_string().as_bytes().chunks(3) {
+            observer.feed(chunk);
+        }
+        assert_eq!(observer.observed(), Some(value));
+    }
 
     #[test]
     fn stream_error_retains_only_safe_identifiers() {
