@@ -590,14 +590,15 @@ impl Session {
                         index,
                         "group is unknown, pinned or not exposed; use current eligible_group_ids",
                     );
-                } else if updates.contains_key(&id) {
+                } else if let std::collections::btree_map::Entry::Vacant(entry) = updates.entry(id)
+                {
+                    entry.insert(opinion);
+                } else {
                     reject(
                         field,
                         index,
                         "duplicate or conflicting opinion; protection takes precedence",
                     );
-                } else {
-                    updates.insert(id, opinion);
                 }
             }
         }
