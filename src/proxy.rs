@@ -501,7 +501,7 @@ async fn metrics(
         "mode": format!("{:?}", service.config.mode).to_lowercase(),
         "scope": "explicit_session", "primary": session.primary, "shadow": session.shadow,
         "completed_requests": session.completed_requests, "compactions": session.compactions,
-        "native_compactions": session.native_compactions, "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews,
+        "native_compactions": session.native_compactions, "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews, "partial_reviews": session.partial_reviews,
         "failed_primaries": session.failed_primaries, "last_plan": session.last_plan,
         "cost_basis": "native_usage_standard_rate_model_not_invoice; estimates_are_not_token_counts"
     })))
@@ -573,7 +573,7 @@ async fn dashboard_stats(
             "background_review_pending": session.background_review_pending,
             "completed_requests": session.completed_requests,
             "compactions": session.compactions, "native_compactions": session.native_compactions,
-            "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews,
+            "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews, "partial_reviews": session.partial_reviews,
             "failed_primaries": session.failed_primaries,
             "context": {"retained_items": retained,
                 "removed_items": session.history.len() - retained,
@@ -1475,6 +1475,9 @@ fn merge_review(
     current.invalid_reviews += reviewed
         .invalid_reviews
         .saturating_sub(before.invalid_reviews);
+    current.partial_reviews += reviewed
+        .partial_reviews
+        .saturating_sub(before.partial_reviews);
     let groups = current
         .groups()
         .into_iter()
@@ -1848,13 +1851,14 @@ async fn review_chunk(
             trajectory.failed_call();
         }
     }
-    if !valid
-        || session.review_feedback["rejected_count"]
-            .as_u64()
-            .unwrap_or(0)
-            > 0
-    {
+    if !valid {
         session.invalid_reviews += 1;
+    } else if session.review_feedback["rejected_count"]
+        .as_u64()
+        .unwrap_or(0)
+        > 0
+    {
+        session.partial_reviews += 1;
     }
     let _ = trace(service, id, "shadow_feedback", &session.review_feedback);
     valid

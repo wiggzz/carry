@@ -1770,7 +1770,8 @@ async fn mixed_advice_applies_valid_items_and_failed_primary_keeps_feedback() {
     assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(response.text().await.unwrap(), "native-quota-body");
     let saved = checkpoint_states(state.path()).remove(0);
-    assert_eq!(saved["invalid_reviews"], 1);
+    assert_eq!(saved["invalid_reviews"], 0);
+    assert_eq!(saved["partial_reviews"], 1);
     assert_eq!(saved["shadow"]["calls"], 1);
     assert_eq!(saved["memories"][0]["text"], "valid sourced fact");
     assert_eq!(saved["opinions"]["2"], "keep");

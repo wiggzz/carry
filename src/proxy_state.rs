@@ -113,6 +113,8 @@ pub(super) struct Session {
     #[serde(default)]
     pub bootstrap_estimated_cost_usd: f64,
     pub invalid_reviews: u64,
+    #[serde(default)]
+    pub partial_reviews: u64,
     /// Only bounded item indexes/reasons, never rejected source text or raw advice.
     #[serde(default)]
     pub review_feedback: Value,
