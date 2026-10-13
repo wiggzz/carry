@@ -19,6 +19,12 @@ import time
 import urllib.request
 
 
+try:
+    from .proxy_native_fixture import review_records
+except ImportError:
+    from proxy_native_fixture import review_records
+
+
 def text(item):
     content = item.get('content', '')
     if isinstance(content, str):
@@ -28,7 +34,15 @@ def text(item):
 
 
 def canonical(items):
-    return [{'role': item['role'], 'content': text(item)} for item in items]
+    result = copy.deepcopy(items)
+    for item in result:
+        content = item.get('content')
+        if isinstance(content, list):
+            for block in content:
+                block.pop('prompt_cache_breakpoint', None)
+            if len(content) == 1 and content[0].get('type') in ('input_text', 'output_text'):
+                item['content'] = content[0]['text']
+    return result
 
 
 def prefix_identity(body, end):
@@ -36,7 +50,7 @@ def prefix_identity(body, end):
     # fields; remove ONLY the owned content-block marker, not quoted source.
     items = copy.deepcopy(body['input'][:end])
     for item in items:
-        for block in item['content']:
+        for block in item.get('content', []) if isinstance(item.get('content'), list) else []:
             marker = block.pop('prompt_cache_breakpoint', None)
             assert marker is None or marker == {'mode': 'explicit'}
     wire = json.dumps(items, separators=(',', ':'), ensure_ascii=False).encode()
@@ -106,9 +120,9 @@ class Provider:
                                                'matched_boundaries': matched,
                                                'transmitted_boundaries': points})
                         ids = ledger['eligible_group_ids']
-                        targets = [json.loads(item['content'])['group_id'] for item in data[:-1]
-                                   if 'DISCARD_NATIVE_BYTES' in item['content']
-                                   and json.loads(item['content']).get('group_id') in ids]
+                        targets = [record['group_id'] for record in review_records(body)
+                                   if record.get('group_id') in ids
+                                   and 'DISCARD_NATIVE_BYTES' in json.dumps(record.get('items', []))]
                         # Omission preserves Rust's existing opinion. Audit
                         # cases explicitly replace the same eligible ID so the
                         # final two no-append reviews really change the ledger.

@@ -2376,9 +2376,10 @@ async fn bootstrap_call_limit_resumes_and_spend_limit_survives_restart() {
     for cost_limit in ["1", "0", "0.0017"] {
         let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
         let state = tempfile::tempdir().unwrap();
+        let byte_limit = "6000";
         let options = [
             "--classifier-max-input-bytes",
-            "4096",
+            byte_limit,
             "--bootstrap-max-calls",
             "1",
             "--bootstrap-max-cost-usd",
@@ -2452,7 +2453,8 @@ async fn bootstrap_call_limit_resumes_and_spend_limit_survives_restart() {
         assert!(
             reviews
                 .iter()
-                .all(|body| serde_json::to_vec(body).unwrap().len() <= 4096)
+                .all(|body| serde_json::to_vec(body).unwrap().len()
+                    <= byte_limit.parse::<usize>().unwrap())
         );
         assert_eq!(
             fixture.requests.lock().await.len(),
@@ -2655,7 +2657,13 @@ async fn ongoing_windows_resume_after_failed_primary_restart_and_invalid_advice(
                 .unwrap()
                 .iter()
                 .filter_map(|item| {
-                    serde_json::from_str::<serde_json::Value>(item["content"].as_str()?).ok()
+                    serde_json::from_str::<serde_json::Value>(
+                        item["content"]
+                            .as_str()?
+                            .rsplit("[carry context] ")
+                            .next()?,
+                    )
+                    .ok()
                 })
                 .collect::<Vec<_>>();
             for source in sources.iter().filter(|source| source["group_id"] == "g2") {
@@ -2896,4 +2904,38 @@ async fn client_turn_metadata_preserves_proxy_session_and_reviewer_affinity() {
     let forwarded = fixture.requests.lock().await;
     assert_eq!(forwarded[0]["client_metadata"]["turn_id"], "turn-one");
     assert_eq!(forwarded[1]["client_metadata"]["turn_id"], "turn-two");
+}
+
+#[tokio::test]
+async fn reviewer_transport_preserves_encrypted_reasoning_and_native_tool_pairs() {
+    let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
+    let state = tempfile::tempdir().unwrap();
+    let (_proxy, url) = start_proxy_options(
+        state.path(),
+        fixture.address,
+        "audit",
+        &["--classifier-cache-policy", "openai-explicit"],
+        "",
+    )
+    .await;
+    let reasoning = json!({"type":"reasoning","id":"rs_fixture","encrypted_content":"ENCRYPTED_NATIVE_FIXTURE","summary":[]});
+    let call = json!({"type":"function_call","id":"fc_fixture","call_id":"native_pair","name":"inspect","arguments":"{}"});
+    let result = json!({"type":"function_call_output","call_id":"native_pair","output":"native evidence ".repeat(3000)});
+    let request = json!({"model":"gpt-6.1-sol","input":[{"role":"user","content":"goal"},reasoning.clone(),call.clone(),result.clone(),{"role":"user","content":"current"}]});
+    let response = reqwest::Client::new()
+        .post(format!("{url}/v1/responses"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    response.bytes().await.unwrap();
+    let reviews = fixture.reviews.lock().await;
+    assert_eq!(reviews[0]["model"], "gpt-6-luna");
+    let input = reviews[0]["input"].as_array().unwrap();
+    assert!(input.contains(&reasoning));
+    assert!(input.contains(&call));
+    assert!(input.contains(&result));
+    let forwarded = fixture.requests.lock().await;
+    assert_eq!(forwarded[0]["input"], request["input"]);
 }

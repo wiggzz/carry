@@ -170,6 +170,21 @@ stops the attempt without advancing that window or discarding completed windows;
 partially accepted reviews advance while reporting rejected items for correction.
 A rebase/native epoch reset clears this progress. The dashboard distinguishes wholly invalid reviews from partially accepted reviews; legacy invalid-review totals remain historical.
 
+Reviewer requests replay native messages, reasoning (including encrypted content),
+and tool call/result items. Source IDs are appended to the last message text block;
+protocol/ciphertext items stay exact and receive an adjacent small metadata note.
+Primary system/developer source roles become reviewer user evidence, with original
+roles recorded in source metadata. Unknown native types use an opaque fallback.
+The final ledger exposes `eligible_memory_ids` and `current_memories`. Existing
+`m…` memory IDs can be protected or made removable independently of `g…` source
+groups. Protection wins conflicting opinions. Retirement removes the fact from
+both primary/reviewer views and its source anchor; IDs remain monotonic across
+retirement and restart. New memories still cite eligible `g…` sources, never
+memory handles. Invalid items are rejected individually.
+Primary forwarding remains unchanged. Strict structured output is requested on
+both API-key and subscription reviewer paths. Live cross-model encrypted reasoning
+compatibility still requires provider verification; local fixtures verify transport.
+
 Reviewer source observations precede carried memories and the final mutable ledger,
 so newly accepted facts do not rewrite a source window's cache prefix. Per-turn
 client telemetry does not create a new implicit lineage; session/thread identifiers

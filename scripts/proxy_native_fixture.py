@@ -15,6 +15,35 @@ import subprocess
 import threading
 
 
+def review_records(body):
+    """Decode source annotations for fixture grading without wrapping wire items."""
+    records, pending = [], []
+    for item in body.get('input', []):
+        content = item.get('content', '')
+        text = content if isinstance(content, str) else ''.join(
+            block.get('text', '') for block in content if isinstance(block, dict)) if isinstance(content, list) else ''
+        if '\n\n[carry context] ' in text:
+            source, annotation = text.rsplit('\n\n[carry context] ', 1)
+            if source:
+                native = dict(item)
+                native['content'] = source
+                pending.append(native)
+            data = json.loads(annotation)
+            count = len(data['member_ids'])
+            data['items'] = pending[-count:]
+            pending.clear()
+            records.append(data)
+            continue
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            pending.append(item)
+            continue
+        if isinstance(data, dict):
+            records.append(data)
+    return records
+
+
 class Fixture:
     def __init__(self, client, case="off"):
         self.client = client
@@ -69,14 +98,8 @@ class Fixture:
                             self.wfile.write(raw)
                             return
                         targets=set()
-                        records=[]
-                        eligible=set()
-                        for record in body.get('input', []):
-                            try: data=json.loads(record.get('content', ''))
-                            except (ValueError, TypeError): continue
-                            records.append(data)
-                            if 'eligible_group_ids' in data:
-                                eligible=set(data['eligible_group_ids'])
+                        records=review_records(body)
+                        eligible=set(next((record['eligible_group_ids'] for record in reversed(records) if 'eligible_group_ids' in record), []))
                         for data in records:
                             if data.get('group_id') in eligible and 'DROP_COHORT_PAYLOAD' in json.dumps(data.get('items', [])):
                                 targets.add(data['group_id'])
@@ -234,10 +257,7 @@ def compact_evidence(trial, fixture):
     tail_eligible=[]
     cohort_group=None
     for review in fixture.reviews:
-        records=[]
-        for record in review['input']:
-            try: records.append(json.loads(record.get('content','')))
-            except (ValueError,TypeError): continue
+        records=review_records(review)
         blocks=[r for r in records if 'items' in r]
         ids=[member for block in blocks for member in block['member_ids']]
         assert len(ids)==len(set(ids)), 'every immutable main member must occur only once per shadow request'

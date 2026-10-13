@@ -94,13 +94,8 @@ def contract_send(url, body):
 
 
 def wire_data(body):
-    result = []
-    for record in body['input']:
-        try:
-            result.append(json.loads(record.get('content', '')))
-        except (ValueError, TypeError):
-            pass
-    return result
+    from scripts.proxy_native_fixture import review_records
+    return review_records(body)
 
 
 def contract_state(directory):
@@ -190,15 +185,16 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 self.assertNotIn('memory_id', grounding[0][0],
                                  'internal memory handle must not masquerade as an actionable source')
                 self.assertEqual(len(state['memories']), 2)
-                # Keep validation strict: m1 is not a main source; whole mixed batch rejects.
+                # Keep provenance strict while applying the valid removable group independently.
                 provider.advice = lambda review: {'protected': [], 'removable': ['g1'],
                     'memories': [{'source_ids': ['m1'], 'text': 'invalid source'}]}
                 contract_send(url, body)
                 state = contract_state(directory)
-                self.assertEqual(state['invalid_reviews'], 1)
+                self.assertEqual(state['invalid_reviews'], 0)
+                self.assertEqual(state['partial_reviews'], 1)
                 self.assertEqual(len(state['memories']), 2)
-                self.assertEqual(state['compactions'], 0)
-                # Retire original human source only with an accepted original-ID review.
+                self.assertEqual(state['compactions'], 1)
+                # Repeating a retired source action cannot revive its evidence.
                 provider.advice = lambda review: {'protected': [], 'removable': ['g1'], 'memories': []}
                 contract_send(url, body)
                 self.assertNotIn('RETIRE_HUMAN_SOURCE', json.dumps(provider.primary[-1]))

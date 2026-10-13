@@ -74,6 +74,8 @@ pub(super) struct Session {
     pub opinions: BTreeMap<u64, String>,
     pub memories: Vec<Memory>,
     #[serde(default)]
+    pub next_memory_id: u64,
+    #[serde(default)]
     pub memory_anchors: BTreeMap<u64, u64>,
     /// Active reviewer view only. Audit source may persist in history, but is
     /// NEVER used to render the reviewer after paired selection removes it.
@@ -460,7 +462,7 @@ impl Session {
             .iter()
             .filter(|r| r.source_id != 0)
             .chain(self.active_shadow.iter().filter(|r| r.source_id == 0))
-            .map(|r| r.value.clone())
+            .flat_map(|r| reviewer_source_items(&r.value))
             .collect::<Vec<_>>();
         let eligible = groups
             .iter()
@@ -476,6 +478,8 @@ impl Session {
             .collect::<Vec<_>>();
         input.push(json!({"role": "user", "content": json!({
             "eligible_group_ids": eligible, "current_groups": ledger,
+            "eligible_memory_ids": self.memories.iter().map(|m| format!("m{}", m.id)).collect::<Vec<_>>(),
+            "current_memories": self.memories.iter().map(|m| json!({"memory_id":format!("m{}",m.id),"source_ids":m.source_ids.iter().map(|id|format!("g{id}")).collect::<Vec<_>>(),"text":m.text})).collect::<Vec<_>>(),
             "previous_review_feedback": self.review_feedback
         }).to_string()}));
         input
@@ -577,6 +581,16 @@ impl Session {
             }
         };
         let mut updates = BTreeMap::new();
+        let mut memory_updates = BTreeMap::new();
+        let known_memories = self.memories.iter().map(|m| m.id).collect::<HashSet<_>>();
+        self.next_memory_id = self.next_memory_id.max(
+            self.memories
+                .iter()
+                .map(|m| m.id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
         // Protect takes precedence over a conflicting drop, irrespective of order.
         for (field, opinion) in [("protected", "keep"), ("removable", "drop")] {
             let Some(ids) = value[field].as_array().filter(|a| a.len() <= 256) else {
@@ -584,6 +598,29 @@ impl Session {
                 continue;
             };
             for (index, raw) in ids.iter().enumerate() {
+                if let Some(memory_id) = raw.as_str().and_then(|s| s.strip_prefix('m')) {
+                    match memory_id.parse::<u64>() {
+                        Ok(id) if known_memories.contains(&id) => {
+                            if let std::collections::btree_map::Entry::Vacant(entry) =
+                                memory_updates.entry(id)
+                            {
+                                entry.insert(opinion);
+                            } else {
+                                reject(
+                                    field,
+                                    index,
+                                    "duplicate or conflicting memory opinion; protection takes precedence",
+                                );
+                            }
+                        }
+                        _ => reject(
+                            field,
+                            index,
+                            "memory is unknown; use current eligible_memory_ids",
+                        ),
+                    }
+                    continue;
+                }
                 let Ok(id) = parse_group(raw) else {
                     reject(field, index, "expected a group ID such as g1");
                     continue;
@@ -606,6 +643,11 @@ impl Session {
                 }
             }
         }
+        let active_memory_count = self.memories.len()
+            - memory_updates
+                .values()
+                .filter(|opinion| **opinion == "drop")
+                .count();
         let mut memories = Vec::new();
         if let Some(items) = value["memories"].as_array().filter(|a| a.len() <= 64) {
             for (index, memory) in items.iter().enumerate() {
@@ -635,12 +677,12 @@ impl Session {
                 })();
                 match parsed {
                     Ok(memory)
-                        if self
-                            .memories
-                            .iter()
-                            .any(|m| m.source_ids == memory.0 && m.text == memory.1)
-                            || memories.contains(&memory) => {}
-                    Ok(memory) if self.memories.len() + memories.len() < 128 => {
+                        if self.memories.iter().any(|m| {
+                            memory_updates.get(&m.id) != Some(&"drop")
+                                && m.source_ids == memory.0
+                                && m.text == memory.1
+                        }) || memories.contains(&memory) => {}
+                    Ok(memory) if active_memory_count + memories.len() < 128 => {
                         memories.push(memory)
                     }
                     Ok(_) => reject("memories", index, "active memory limit of 128 reached"),
@@ -650,12 +692,46 @@ impl Session {
         } else {
             reject("memories", 0, "expected an array of at most 64 memories");
         }
-        self.review_feedback = json!({"accepted_opinions":updates.len(), "accepted_memories":memories.len(),
+        self.review_feedback = json!({"accepted_opinions":updates.len() + memory_updates.len(), "accepted_memories":memories.len(),
             "rejected_count":rejected_count, "rejected":rejected,
             "guidance":"Accepted items were applied. Correct rejected items in a future review using the current eligible ledger; do not repeat accepted memories."});
         for (id, opinion) in updates {
             self.opinions.insert(id, opinion.into());
         }
+        let retired = memory_updates
+            .into_iter()
+            .filter_map(|(id, opinion)| (opinion == "drop").then_some(id))
+            .collect::<HashSet<_>>();
+        let retired_facts = self
+            .memories
+            .iter()
+            .filter(|m| retired.contains(&m.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.active_shadow.retain(|record| {
+            if record.source_id != 0 {
+                return true;
+            }
+            let Some(data) = record.value["content"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            else {
+                return true;
+            };
+            !retired_facts.iter().any(|m| {
+                data["memory_id"] == format!("m{}", m.id)
+                    || (data["text"] == m.text
+                        && data["source_ids"]
+                            == json!(
+                                m.source_ids
+                                    .iter()
+                                    .map(|id| format!("g{id}"))
+                                    .collect::<Vec<_>>()
+                            ))
+            })
+        });
+        self.memories.retain(|m| !retired.contains(&m.id));
+        self.memory_anchors.retain(|id, _| !retired.contains(id));
         for (sources, text) in memories {
             if self
                 .memories
@@ -664,7 +740,11 @@ impl Session {
             {
                 continue;
             }
-            let id = self.memories.len() as u64 + 1;
+            let id = self.next_memory_id;
+            self.next_memory_id = self
+                .next_memory_id
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("memory ID space exhausted"))?;
             let provenance = sources
                 .iter()
                 .map(|id| format!("g{id}"))
@@ -709,6 +789,71 @@ impl Session {
     }
 }
 
+/// Stored observations retain the original native bytes. Expand them only for
+/// reviewer transport; encrypted reasoning must never become quoted JSON text.
+fn reviewer_source_items(record: &Value) -> Vec<Value> {
+    let Some(mut data) = record["content"]
+        .as_str()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+    else {
+        return vec![record.clone()];
+    };
+    let Some(items) = data
+        .as_object_mut()
+        .and_then(|o| o.remove("items"))
+        .and_then(|v| v.as_array().cloned())
+    else {
+        return vec![record.clone()];
+    };
+    let mut native = Vec::new();
+    let roles = items
+        .iter()
+        .map(|item| item["role"].clone())
+        .collect::<Vec<_>>();
+    for mut item in items {
+        let ty = item["type"].as_str().unwrap_or("message");
+        if matches!(
+            ty,
+            "message"
+                | "reasoning"
+                | "function_call"
+                | "function_call_output"
+                | "custom_tool_call"
+                | "custom_tool_call_output"
+                | "compaction"
+        ) {
+            // Primary system/developer text is evidence, not reviewer authority.
+            if matches!(item["role"].as_str(), Some("system" | "developer")) {
+                item["role"] = json!("user");
+            }
+            native.push(item);
+        } else {
+            native.push(
+                json!({"role":"user","content":json!({"opaque_native_item":item}).to_string()}),
+            );
+        }
+    }
+    data["original_roles"] = json!(roles);
+    let annotation = format!("\n\n[carry context] {data}");
+    if let Some(last) = native.last_mut()
+        && matches!(last["role"].as_str(), Some("user" | "assistant"))
+    {
+        if let Some(text) = last["content"].as_str() {
+            last["content"] = json!(format!("{text}{annotation}"));
+            return native;
+        }
+        let role = last["role"].as_str().unwrap().to_owned();
+        if let Some(blocks) = last["content"].as_array_mut() {
+            blocks.push(json!({"type":if role == "assistant" { "output_text" } else { "input_text" },"text":annotation}));
+            return native;
+        }
+    }
+    // Tool protocol and ciphertext stay untouched. Their small source-ID note
+    // follows the native cohort rather than wrapping its contents.
+    native.push(json!({"role":"user","content":annotation}));
+    native
+}
+
 fn parse_group(value: &Value) -> Result<u64> {
     let s = value
         .as_str()
@@ -723,6 +868,148 @@ fn parse_group(value: &Value) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_retirement_frees_capacity_for_a_replacement_in_the_same_review() {
+        let mut state = Session::default();
+        state
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                json!({"role":"user","content":"current"}),
+            ])
+            .unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        state.memories = (1..=128)
+            .map(|id| Memory {
+                id,
+                source_ids: vec![1],
+                text: format!("fact {id}"),
+            })
+            .collect();
+        state.apply_advice(&state.groups(), &json!({"protected":[],"removable":["m1"],"memories":[{"source_ids":["g1"],"text":"replacement fact"}]})).unwrap();
+        assert_eq!(state.memories.len(), 128);
+        assert_eq!(state.memories.last().unwrap().id, 129);
+        assert_eq!(state.review_feedback["accepted_memories"], 1);
+        assert_eq!(state.review_feedback["rejected_count"], 0);
+    }
+
+    #[test]
+    fn retired_memories_leave_both_views_and_ids_are_not_reused_after_restart() {
+        let mut state = Session::default();
+        state
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                json!({"role":"assistant","content":"evidence"}),
+                json!({"role":"user","content":"current"}),
+            ])
+            .unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        let groups = state.groups();
+        state.observe_groups(&groups);
+        state.apply_advice(&groups, &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g2"],"text":"obsolete fact"}]})).unwrap();
+        state.remove(&[2], &groups);
+        assert!(
+            json!(state.render_primary())
+                .to_string()
+                .contains("obsolete fact")
+        );
+        let ledger: Value = serde_json::from_str(
+            state.shadow_input().last().unwrap()["content"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ledger["eligible_memory_ids"], json!(["m1"]));
+        state
+            .apply_advice(
+                &state.groups(),
+                &json!({"protected":[],"removable":["m1","m999"],"memories":[]}),
+            )
+            .unwrap();
+        assert!(state.memories.is_empty());
+        assert!(
+            !json!(state.render_primary())
+                .to_string()
+                .contains("obsolete fact")
+        );
+        assert!(
+            !json!(state.shadow_input())
+                .to_string()
+                .contains("obsolete fact")
+        );
+        assert!(state.memory_anchors.is_empty());
+        assert_eq!(state.review_feedback["accepted_opinions"], 1);
+        assert_eq!(state.review_feedback["rejected_count"], 1);
+        let mut resumed: Session =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        resumed.apply_advice(&resumed.groups(), &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g1"],"text":"new fact"}]})).unwrap();
+        assert_eq!(resumed.memories[0].id, 2);
+    }
+
+    #[test]
+    fn memory_protection_wins_and_memory_ids_cannot_be_cited_as_sources() {
+        let mut state = Session::default();
+        state
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                json!({"role":"assistant","content":"evidence"}),
+                json!({"role":"user","content":"current"}),
+            ])
+            .unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        let groups = state.groups();
+        state.apply_advice(&groups, &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g2"],"text":"useful fact"}]})).unwrap();
+        state.apply_advice(&groups, &json!({"protected":["m1"],"removable":["m1"],"memories":[{"source_ids":["m1"],"text":"invalid provenance"}]})).unwrap();
+        assert_eq!(state.memories.len(), 1);
+        assert_eq!(state.review_feedback["accepted_opinions"], 1);
+        assert_eq!(state.review_feedback["rejected_count"], 2);
+    }
+
+    #[test]
+    fn reviewer_receives_native_encrypted_reasoning_and_complete_tool_cohorts() {
+        let mut state = Session::default();
+        let reasoning = json!({"id":"rs_native","type":"reasoning","encrypted_content":"OPAQUE_ENCRYPTED_REASONING","summary":[]});
+        let call = json!({"id":"fc_native","type":"function_call","call_id":"call_native","name":"inspect","arguments":"{}"});
+        let output =
+            json!({"type":"function_call_output","call_id":"call_native","output":"native result"});
+        state
+            .ingest(&[
+                json!({"role":"user","content":"task"}),
+                reasoning.clone(),
+                call.clone(),
+                output.clone(),
+                json!({"role":"user","content":"next"}),
+            ])
+            .unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        state.observe_groups(&state.groups());
+        let input = state.shadow_input();
+        assert!(
+            input.contains(&reasoning),
+            "ciphertext must remain a native reasoning item"
+        );
+        assert!(
+            input.contains(&call),
+            "native call IDs and arguments must survive"
+        );
+        assert!(
+            input.contains(&output),
+            "tool outputs must preserve the matched native call"
+        );
+        let reasoning_pos = input.iter().position(|i| i == &reasoning).unwrap();
+        let call_pos = input.iter().position(|i| i == &call).unwrap();
+        let output_pos = input.iter().position(|i| i == &output).unwrap();
+        assert!(reasoning_pos < call_pos && call_pos < output_pos);
+        assert_eq!(state.render_primary()[1], reasoning);
+    }
 
     #[test]
     fn carried_memories_do_not_prepend_to_reconstructed_source_prefix() {
@@ -1091,7 +1378,12 @@ mod tests {
         assert_eq!(resumed.render_primary(), input);
         let data = first
             .iter()
-            .map(|r| serde_json::from_str::<Value>(r["content"].as_str().unwrap()).unwrap())
+            .filter_map(|r| {
+                r["content"].as_str().and_then(|text| {
+                    serde_json::from_str::<Value>(text.rsplit("[carry context] ").next().unwrap())
+                        .ok()
+                })
+            })
             .collect::<Vec<_>>();
         let ids = data
             .iter()
