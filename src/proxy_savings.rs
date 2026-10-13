@@ -119,15 +119,24 @@ impl Trajectory {
     }
 
     pub fn reviewer(&mut self, body: &Value, response: &Value, standard: bool) {
+        self.reviewer_usage(
+            body["model"].as_str().unwrap_or(""),
+            token_units(body),
+            &response["usage"],
+            standard,
+        );
+    }
+
+    pub fn reviewer_usage(&mut self, model: &str, input: u64, usage: &Value, standard: bool) {
         self.result.coverage.reviewer_responses += 1;
-        let cost = response["usage"]["output_tokens"]
+        let cost = usage["output_tokens"]
             .as_u64()
-            .filter(|_| standard && response["usage"]["input_tokens"].as_u64().is_some())
+            .filter(|_| standard && usage["input_tokens"].as_u64().is_some())
             .and_then(|output| {
                 estimated_cost_usd(
-                    body["model"].as_str()?,
+                    model,
                     &Usage {
-                        input_tokens: token_units(body),
+                        input_tokens: input,
                         output_tokens: output,
                         ..Usage::default()
                     },

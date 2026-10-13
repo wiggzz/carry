@@ -23,8 +23,11 @@ Current work is in `feat/proxy-local-client-support` (`~/carry-pr-140`).
   oversized groups stay protected. Ongoing sweep progress survives failed
   primaries/restarts, with newer context deferred to later sweeps.
   `--review-max-calls` bounds both paths; the old bootstrap flag remains an alias.
-- [ ] Background ordinary reviews to remove reviewer round-trip latency from
-  primary requests. Bootstrap behavior should be decided explicitly.
+- [x] Apply valid reviewer items independently and return bounded rejection
+  feedback in the next mutable ledger, persisted across failed primaries/restarts.
+- [x] Opt-in background ordinary reviews (`--background-reviews`) to remove reviewer
+  round-trip latency from primary requests; bootstrap remains synchronous and is
+  deferred while old-lineage review work is still in flight.
   - Dispatch from an immutable snapshot without holding the primary session lock.
   - Reacquire the lock only to merge usage and validated advice; never overwrite a
     newer checkpoint or mutate a request already submitted to the provider.

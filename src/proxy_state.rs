@@ -116,6 +116,10 @@ pub(super) struct Session {
     /// Only bounded item indexes/reasons, never rejected source text or raw advice.
     #[serde(default)]
     pub review_feedback: Value,
+    #[serde(default)]
+    pub review_epoch: u64,
+    #[serde(default)]
+    pub background_review_pending: bool,
     pub failed_primaries: u64,
     pub compactions: u64,
     pub native_compactions: u64,
@@ -269,6 +273,7 @@ impl Session {
     }
 
     pub fn reset_active(&mut self) {
+        self.review_epoch = self.review_epoch.saturating_add(1);
         if let Some(trajectory) = &mut self.cost_trajectory {
             trajectory.reset_epoch();
         }

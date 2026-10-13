@@ -170,6 +170,9 @@ Full-history clients can omit `x-carry-session` and reuse one active matching
 history prefix; explicit session IDs isolate conversations and support validated
 response-ID continuations. Long unseen histories bootstrap in bounded,
 restart-safe reviewer chunks with configurable call and estimated-spend limits.
+Add `--background-reviews` to keep ordinary reviewer round trips off the primary
+request path; bootstrap remains synchronous. Invalid reviewer items are isolated,
+and rejection feedback in the next review lets the model self-correct.
 Interactive startup opens the local, token-free stats dashboard. Reusing the
 state directory preserves committed state across restarts. See the
 [standalone proxy setup](docs/proxy-benchmarking.md#standalone-proxy)

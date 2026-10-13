@@ -1229,7 +1229,7 @@ async fn explicit_replay_reviews_before_first_primary_without_exposing_fresh_too
             state.path(),
             fixture.address,
             mode,
-            &["--review-every-requests", "5"],
+            &["--review-every-requests", "5", "--background-reviews"],
             "",
         )
         .await;
@@ -1528,6 +1528,211 @@ async fn branch_tenant_and_restart_are_explicit_and_credentials_are_not_persiste
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(entry.metadata().unwrap().permissions().mode() & 0o077, 0);
         }
+    }
+}
+
+#[tokio::test]
+async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
+    use axum::{Router, response::IntoResponse, routing::post};
+    use std::sync::Arc;
+    for scenario in [
+        "continuation",
+        "rebase",
+        "failed_primary",
+        "restart",
+        "reviewer_failure",
+    ] {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let reviews = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let (gate, signal, captured) = (release.clone(), started.clone(), reviews.clone());
+        let router = Router::new()
+        .route("/v1/responses", post(|axum::Json(body): axum::Json<serde_json::Value>| async move {
+            if body["metadata"]["fail"] == true {
+                return (axum::http::StatusCode::TOO_MANY_REQUESTS,"failed primary").into_response();
+            }
+            axum::Json(json!({"status":"completed","output":[],"usage":{
+                "input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}})).into_response()
+        }))
+        .route("/review", post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let (gate, signal, captured) = (gate.clone(), signal.clone(), captured.clone());
+            async move {
+                captured.lock().await.push(body);
+                signal.notify_one();
+                gate.notified().await;
+                if scenario == "reviewer_failure" {
+                    return (axum::http::StatusCode::SERVICE_UNAVAILABLE,"review unavailable").into_response();
+                }
+                let advice = json!({"protected":[],"removable":["g2"],"memories":[{"source_ids":["g2"],"text":"background fact"}]});
+                axum::Json(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":advice.to_string()}]}],"usage":{
+                    "input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}})).into_response()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let state = tempfile::tempdir().unwrap();
+        let (proxy, url) = start_proxy_options(
+            state.path(),
+            address,
+            "audit",
+            &[
+                "--background-reviews",
+                "--bootstrap-min-input-bytes",
+                "8388608",
+            ],
+            "",
+        )
+        .await;
+        let mut request = json!({"model":"gpt-6-luna","input":[
+        {"role":"user","content":"goal"},{"role":"assistant","content":"old evidence"},{"role":"user","content":"current"}]});
+        send(&url, &request, "async", "main")
+            .await
+            .bytes()
+            .await
+            .unwrap();
+        let primary = tokio::spawn({
+            let (url, request) = (url.clone(), request.clone());
+            async move {
+                send(&url, &request, "async", "main")
+                    .await
+                    .bytes()
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), primary)
+            .await
+            .expect("primary must complete while the reviewer is still blocked")
+            .unwrap();
+        let stats: serde_json::Value = reqwest::get(format!("{url}/carry/dashboard/stats"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(stats["sessions"][0]["background_review_pending"], true);
+        assert_eq!(
+            stats["sessions"][0]["cost_estimate"]["priced"], false,
+            "pending reviewer spend cannot be reported as savings"
+        );
+        request["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"simultaneous continuation"}));
+        if scenario == "failed_primary" {
+            request["metadata"] = json!({"fail":true});
+        }
+        if scenario == "rebase" {
+            request["input"] = json!([{ "role":"user", "content":"replacement task" }]);
+            reqwest::Client::new()
+                .post(format!("{url}/v1/responses"))
+                .header("x-carry-tenant", "async")
+                .header("x-carry-session", "session")
+                .header("x-carry-branch", "main")
+                .header("x-carry-history-policy", "reset-on-divergence")
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+        } else if scenario == "restart" {
+            drop(proxy);
+            let (_restarted, restarted_url) = start_proxy_options(
+                state.path(),
+                address,
+                "audit",
+                &[
+                    "--background-reviews",
+                    "--bootstrap-min-input-bytes",
+                    "8388608",
+                    "--review-every-requests",
+                    "100",
+                ],
+                "",
+            )
+            .await;
+            send(&restarted_url, &request, "async", "main")
+                .await
+                .bytes()
+                .await
+                .unwrap();
+            let saved = checkpoint_states(state.path()).remove(0);
+            assert_eq!(saved["completed_requests"], 3);
+            assert_eq!(saved["shadow"]["calls"], 1);
+            assert_eq!(saved["shadow"]["unavailable_cost_calls"], 1);
+            assert_eq!(saved["background_review_pending"], false);
+            assert_eq!(saved["memories"], json!([]));
+            server.abort();
+            continue;
+        } else {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                send(&url, &request, "async", "main"),
+            )
+            .await
+            .unwrap();
+            if scenario == "failed_primary" {
+                assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+            }
+            response.bytes().await.unwrap();
+        }
+        assert_eq!(
+            reviews.lock().await.len(),
+            1,
+            "one review in flight per session"
+        );
+        release.notify_one();
+        let saved = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let saved = checkpoint_states(state.path()).remove(0);
+                if saved["shadow"]["calls"] == 1 {
+                    break saved;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            saved["completed_requests"],
+            if scenario == "failed_primary" { 2 } else { 3 },
+            "merge must preserve newer primary counters"
+        );
+        assert_eq!(
+            saved["history"].as_array().unwrap().len(),
+            if scenario == "rebase" { 1 } else { 4 },
+            "merge must preserve the newer continuation"
+        );
+        if scenario == "rebase" {
+            assert_eq!(saved["opinions"], json!({}));
+            assert_eq!(saved["memories"], json!([]));
+            assert!(
+                saved["review_feedback"]["rejected"][0]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("discarded")
+            );
+        } else if scenario == "reviewer_failure" {
+            assert_eq!(saved["opinions"], json!({}));
+            assert_eq!(saved["memories"], json!([]));
+            assert_eq!(saved["shadow"]["unavailable_cost_calls"], 1);
+            assert_eq!(saved["invalid_reviews"], 1);
+            assert_eq!(saved["background_review_pending"], false);
+        } else {
+            assert_eq!(saved["opinions"]["2"], "drop");
+            assert_eq!(saved["memories"][0]["text"], "background fact");
+        }
+        assert_eq!(
+            saved["cost_trajectory"]["result"]["coverage"]["reviewer_responses"],
+            if scenario == "reviewer_failure" { 0 } else { 1 }
+        );
+        server.abort();
     }
 }
 

@@ -129,10 +129,15 @@ Histories with no eligible sources incur no bootstrap reviewer calls.
 Each reviewer requests provider-enforced structured output with
 `text.format.type=json_schema` and `strict:true`, on both API-key and Codex
 routes. The schema enforces the three advice fields and memory shapes. Carry
-still validates eligible IDs, disjoint decisions, provenance and size limits
-before applying the entire batch. Refusals, incomplete output, invalid advice
-or a provider rejecting the schema reject that review; there is no silent
-unconstrained-output fallback. The primary request can continue unchanged.
+still validates eligible IDs, decisions, provenance and size limits per item.
+Valid items are applied even when siblings are invalid; protection takes precedence
+over a conflicting drop. Invalid memories never activate. The next reviewer ledger
+includes bounded `previous_review_feedback` with rejected field/index/reason and
+accepted counts, so the model can correct rejected instructions without repeating
+accepted facts. Feedback is checkpointed and never retains rejected source text.
+Refusals, incomplete output, malformed top-level JSON or a provider rejecting the
+schema reject the review; there is no silent unconstrained-output fallback.
+The primary request can continue unchanged.
 The newest live user group is pinned independently of reviewer advice.
 
 Long histories use the same chronological windowing path for bootstrap imports
@@ -160,8 +165,9 @@ An ongoing sweep freezes the exposed-history frontier when it starts. Newer
 context waits for a later sweep, so a growing conversation cannot prevent the
 current sweep from finishing. Completed members and the frontier are saved;
 unfinished windows resume even before the normal review cadence is due.
-Successful windows survive failed primaries and restarts. Invalid advice stops
-the attempt without advancing that window or discarding completed windows.
+Successful windows survive failed primaries and restarts. A wholly rejected review
+stops the attempt without advancing that window or discarding completed windows;
+partially accepted reviews advance while reporting rejected items for correction.
 A rebase/native epoch reset clears this progress.
 
 `--review-max-calls` defaults to 16 per primary request, for bootstrap and ongoing
@@ -175,9 +181,27 @@ reviewer pricing also prevents dispatch. Restarting does not replenish this
 allowance. These are modeled estimates, **not a hard provider billing limit**;
 subscription estimates are API equivalents, and the subscription adapter does
 not enforce the API output cap. Limits leave unreviewed history intact and never
-block the primary request. Reviews remain synchronous in this version; lower
+block the primary request. By default reviews are synchronous; lower
 `--review-max-calls` to bound paid round trips per primary while backlog windows
 resume later. This call limit does not replenish or extend bootstrap spend.
+
+Use `--background-reviews` to remove ordinary reviewer round-trip latency from
+primary requests. Bootstrap remains synchronous to review imported history before
+its first primary use. Ordinary reviews use an immutable snapshot, with at most
+one review in flight per session; a bootstrap requested during old in-flight work
+is deferred until a later request. The primary session lock is not held during
+reviewer transport. Completion reacquires it and merges reviewer state and usage
+into the newest checkpoint, preserving newer primary history, counters and cache.
+Only already-merged advice can affect the next request, never a submitted request.
+Changed source contents, atomic membership, removals or rebases discard stale
+advice, but its paid usage is still counted. Bounded oversized windows run in the
+same background job and remain governed by `--review-max-calls`.
+
+In-flight background work is not resumed across process shutdown/restart. A durable
+pending marker makes the next access censor an interrupted attempt's unknown usage
+rather than treating it as free. Completed background work checkpoints normally;
+unfinished sweep progress resumes on later requests. Dashboard savings estimates
+are unavailable while a background review is pending.
 
 `off` is unchanged; `audit` reviews without rewriting; `compact` rewrites only
 after valid advice and the ordinary economic admission check. Import does not

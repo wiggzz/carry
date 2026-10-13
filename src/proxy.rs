@@ -108,6 +108,9 @@ pub struct ProxyCli {
     /// Explicit replay declarations override this threshold.
     #[arg(long, default_value_t = 16384)]
     bootstrap_min_input_bytes: usize,
+    /// Run ordinary reviews in the background; bootstrap remains synchronous.
+    #[arg(long)]
+    background_reviews: bool,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=100))]
     review_every_requests: u64,
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
@@ -127,6 +130,7 @@ struct Service {
     classifier_key: Option<String>,
     auth_token: Option<String>,
     locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    background_reviews: Mutex<HashSet<String>>,
     _directory_lock: File,
 }
 
@@ -250,6 +254,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
             .build()?,
         config,
         locks: Mutex::new(HashMap::new()),
+        background_reviews: Mutex::new(HashSet::new()),
         _directory_lock: directory_lock,
     });
     let listener = tokio::net::TcpListener::bind(service.config.listen).await?;
@@ -553,9 +558,19 @@ async fn dashboard_stats(
             continue;
         };
         let retained = session.history.iter().filter(|item| !item.removed).count();
+        let mut estimate = session
+            .cost_trajectory
+            .as_ref()
+            .map(|t| t.snapshot())
+            .unwrap_or_default();
+        if session.background_review_pending {
+            estimate.priced = false;
+            estimate.savings_percent = None;
+        }
         sessions.push(json!({
             "id": id, "primary": session.primary, "shadow": session.shadow,
-            "cost_estimate": session.cost_trajectory.as_ref().map(|t| t.snapshot()).unwrap_or_default(),
+            "cost_estimate": estimate,
+            "background_review_pending": session.background_review_pending,
             "completed_requests": session.completed_requests,
             "compactions": session.compactions, "native_compactions": session.native_compactions,
             "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews,
@@ -571,6 +586,7 @@ async fn dashboard_stats(
         "mode": format!("{:?}", service.config.mode).to_lowercase(),
         "auth": if service.config.codex_login { "codex" } else { "api-key" },
         "classifier_model": service.config.classifier_model,
+        "background_reviews": service.config.background_reviews,
         "classifier_effort": service.config.classifier_reasoning_effort,
         "classifier_cache_policy": match service.config.classifier_cache_policy {
             ClassifierCachePolicy::Auto => "auto",
@@ -617,6 +633,19 @@ async fn native_compact(
     bytes: Bytes,
 ) -> Result<Response, Failure> {
     forward(service, headers, bytes, true).await
+}
+
+#[derive(Default)]
+struct ReviewRun {
+    background: bool,
+    receipts: Vec<ReviewReceipt>,
+}
+
+struct ReviewReceipt {
+    model: String,
+    input: u64,
+    usage: Option<Value>,
+    standard: bool,
 }
 
 struct Commit {
@@ -723,6 +752,18 @@ async fn forward(
             trajectory.prior_untracked(session.primary.calls + session.shadow.calls);
             session.cost_trajectory = Some(trajectory);
         }
+        if session.background_review_pending
+            && !service.background_reviews.lock().await.contains(&id)
+        {
+            // A prior process exited with an unobserved reviewer attempt. Never
+            // resurrect its snapshot or pretend its usage was zero.
+            session.background_review_pending = false;
+            session.shadow.calls += 1;
+            session.shadow.unavailable_cost_calls += 1;
+            if let Some(trajectory) = &mut session.cost_trajectory {
+                trajectory.failed_call();
+            }
+        }
         let new_lineage = session.history.is_empty();
         let prior_rebases = session.history_rebases;
         if let Some(input) = body["input"].as_array() {
@@ -804,7 +845,25 @@ async fn forward(
             // Keep bootstrap review pending across failed primaries/restarts,
             // including imported rebases with prior completed-request counters.
             let bootstrap = session.bootstrap_review_pending;
-            valid = review(&service, &id, &mut session, &body, bootstrap).await;
+            if service.config.background_reviews && !bootstrap {
+                dispatch_review(service.clone(), id.clone(), &mut session, body.clone()).await;
+                // Only previously merged advice can affect this request. A
+                // completion never mutates an already submitted wire.
+                valid = !session.opinions.is_empty();
+            } else if !bootstrap || !service.background_reviews.lock().await.contains(&id) {
+                // A rebase may request bootstrap while the old lineage's
+                // ordinary review is still in flight. Defer it, never dispatch
+                // two paid reviews for the same session concurrently.
+                valid = review(
+                    &service,
+                    &id,
+                    &mut session,
+                    &body,
+                    bootstrap,
+                    &mut ReviewRun::default(),
+                )
+                .await;
+            }
         }
         let reviewed = session.clone();
         if native && service.config.mode != Mode::Off {
@@ -1316,12 +1375,156 @@ fn reviewer_view_costs(
     })
 }
 
+/// Keep receipts numeric and bounded: a provider usage object is untrusted too.
+fn numeric_review_usage(usage: &Value) -> Value {
+    let mut result = json!({});
+    for field in ["input_tokens", "output_tokens"] {
+        if let Some(n) = usage[field].as_u64() {
+            result[field] = json!(n);
+        }
+    }
+    for field in ["input_tokens_details", "output_tokens_details"] {
+        for key in [
+            "cached_tokens",
+            "cache_write_tokens",
+            "cache_creation_tokens",
+            "audio_tokens",
+        ] {
+            if let Some(n) = usage[field][key].as_u64() {
+                result[field][key] = json!(n);
+            }
+        }
+    }
+    result
+}
+
+async fn dispatch_review(service: Arc<Service>, id: String, session: &mut Session, main: Value) {
+    if session.review_end_id == 0
+        && session
+            .completed_requests
+            .saturating_sub(session.last_review_request)
+            < service.config.review_every_requests
+    {
+        return;
+    }
+    if !session.groups().iter().any(|g| g.exposed && !g.pinned) {
+        return;
+    }
+    if !service.background_reviews.lock().await.insert(id.clone()) {
+        return;
+    }
+    session.background_review_pending = true;
+    // Reserve the pending marker before dispatch so a restart censors unknown spend.
+    if save(&service, &id, session).is_err() {
+        session.background_review_pending = false;
+        service.background_reviews.lock().await.remove(&id);
+        return;
+    }
+    let before = session.clone();
+    tokio::spawn(async move {
+        let mut reviewed = before.clone();
+        let mut run = ReviewRun {
+            background: true,
+            receipts: Vec::new(),
+        };
+        review(&service, &id, &mut reviewed, &main, false, &mut run).await;
+        // Primary transport/checkpoint owns this lock until its commit finishes.
+        // Never save the snapshot: merge only reviewer fields into the latest state.
+        let _lock = session_lock(&service, &id).await;
+        if let Ok(mut current) = load(&service, &id) {
+            merge_review(&mut current, &before, &reviewed, &run, &main);
+            if save(&service, &id, &current).is_err() {
+                let _ = trace(
+                    &service,
+                    &id,
+                    "background_review_checkpoint_failed",
+                    &json!({}),
+                );
+            }
+        }
+        service.background_reviews.lock().await.remove(&id);
+    });
+}
+
+fn merge_review(
+    current: &mut Session,
+    before: &Session,
+    reviewed: &Session,
+    run: &ReviewRun,
+    main: &Value,
+) {
+    current.background_review_pending = false;
+    // Spend survives stale advice, rebases and primary failures. Price reviewer
+    // receipts against the current trajectory, never replace its primary history.
+    for receipt in &run.receipts {
+        if let Some(usage) = &receipt.usage {
+            current
+                .shadow
+                .observe(&receipt.model, usage, receipt.standard);
+            if let Some(t) = &mut current.cost_trajectory {
+                t.reviewer_usage(&receipt.model, receipt.input, usage, receipt.standard);
+            }
+        } else {
+            current.shadow.calls += 1;
+            current.shadow.unavailable_cost_calls += 1;
+            if let Some(t) = &mut current.cost_trajectory {
+                t.failed_call();
+            }
+        }
+    }
+    current.invalid_reviews += reviewed
+        .invalid_reviews
+        .saturating_sub(before.invalid_reviews);
+    let groups = current
+        .groups()
+        .into_iter()
+        .map(|g| (g.id, g))
+        .collect::<HashMap<_, _>>();
+    let compatible = current.review_epoch == before.review_epoch
+        && before.history.len() <= current.history.len()
+        && before
+            .history
+            .iter()
+            .zip(&current.history)
+            .all(|(old, new)| {
+                new.id == old.id
+                    && new.cohort == old.cohort
+                    && new.removed == old.removed
+                    && new.value == old.value
+                    && (!old.exposed || new.exposed)
+            })
+        && before.groups().iter().all(|old| {
+            groups.get(&old.id).is_some_and(|new| {
+                new.members == old.members
+                    && (!old.exposed || new.exposed)
+                    && (!new.pinned || old.pinned)
+            })
+        });
+    if !compatible {
+        current.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"background advice discarded: main lineage, source membership or eligibility changed; review current sources again"}]});
+        return;
+    }
+    current.opinions = reviewed.opinions.clone();
+    current.memories = reviewed.memories.clone();
+    current.memory_anchors = reviewed.memory_anchors.clone();
+    current.active_shadow = reviewed.active_shadow.clone();
+    current.observed = reviewed.observed.clone();
+    current.review_feedback = reviewed.review_feedback.clone();
+    current.review_cache_key = reviewed.review_cache_key.clone();
+    current.review_context = cache_base(main);
+    current.reviewer_cache = reviewed.reviewer_cache.clone();
+    current.review_end_id = reviewed.review_end_id;
+    current.reviewed_members = reviewed.reviewed_members.clone();
+    current.last_review_request = reviewed.last_review_request;
+}
+
 async fn review(
     service: &Service,
     id: &str,
     session: &mut Session,
     main: &Value,
     bootstrap: bool,
+    run: &mut ReviewRun,
 ) -> bool {
     if !bootstrap
         && session.review_end_id == 0
@@ -1346,10 +1549,10 @@ async fn review(
         session.observe_groups(&groups);
         let body = review_body(&service.config, session);
         if review_fits(&service.config, &body) {
-            return review_chunk(service, id, session, &body, &groups).await;
+            return review_chunk(service, id, session, &body, &groups, run).await;
         }
     }
-    review_windows(service, id, session, bootstrap).await
+    review_windows(service, id, session, bootstrap, run).await
 }
 
 fn mark_reviewed(session: &mut Session, groups: &[Group], bootstrap: bool) {
@@ -1372,6 +1575,7 @@ async fn review_windows(
     id: &str,
     session: &mut Session,
     bootstrap: bool,
+    run: &mut ReviewRun,
 ) -> bool {
     let frontier = session
         .history
@@ -1470,17 +1674,17 @@ async fn review_windows(
         }
         *session = view;
         // Reserve bootstrap spend before dispatch, including failed attempts.
-        if save(service, id, session).is_err() {
+        if !run.background && save(service, id, session).is_err() {
             return false;
         }
         calls += 1;
-        let valid = review_chunk(service, id, session, &body, &chunk).await;
+        let valid = review_chunk(service, id, session, &body, &chunk, run).await;
         if valid {
             mark_reviewed(session, &chunk, bootstrap);
             reviewed = true;
         }
         // Successful windows survive failed primaries and process restarts.
-        if save(service, id, session).is_err() {
+        if !run.background && save(service, id, session).is_err() {
             return false;
         }
         if !valid {
@@ -1500,6 +1704,7 @@ async fn review_chunk(
     session: &mut Session,
     body: &Value,
     groups: &[Group],
+    run: &mut ReviewRun,
 ) -> bool {
     let mut request = service
         .client
@@ -1568,6 +1773,14 @@ async fn review_chunk(
     session.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"review did not complete with a valid JSON advice object; return the required schema"}]});
     if let Some(value) = value {
         attempt.finish(Some(&value), "observed");
+        if run.background {
+            run.receipts.push(ReviewReceipt {
+                model: service.config.classifier_model.clone(),
+                input: crate::proxy_savings::token_units(body),
+                usage: Some(numeric_review_usage(&value["usage"])),
+                standard: value.get("service_tier").is_none_or(|v| v == "default"),
+            });
+        }
         session.shadow.observe(
             &service.config.classifier_model,
             &value["usage"],
@@ -1621,6 +1834,14 @@ async fn review_chunk(
     } else {
         attempt.finish(None, "review_transport_or_protocol_failure");
         let _ = trace(service, id, "shadow_failed", &diagnostic);
+        if run.background {
+            run.receipts.push(ReviewReceipt {
+                model: String::new(),
+                input: 0,
+                usage: None,
+                standard: false,
+            });
+        }
         session.shadow.calls += 1;
         session.shadow.unavailable_cost_calls += 1;
         if let Some(trajectory) = &mut session.cost_trajectory {
@@ -2267,7 +2488,50 @@ mod tests {
             classifier_key: None,
             auth_token: None,
             locks: Mutex::new(HashMap::new()),
+            background_reviews: Mutex::new(HashSet::new()),
         }
+    }
+
+    #[test]
+    fn background_merge_discards_changed_source_content_but_accounts_for_spend() {
+        let mut before = Session::default();
+        before
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                json!({"role":"assistant","content":"original evidence"}),
+                json!({"role":"user","content":"current"}),
+            ])
+            .unwrap();
+        for item in &mut before.history {
+            item.exposed = true;
+        }
+        let mut reviewed = before.clone();
+        reviewed
+            .apply_advice(
+                &before.groups(),
+                &json!({"protected":[],"removable":["g2"],"memories":[]}),
+            )
+            .unwrap();
+        let mut current = before.clone();
+        current.history[1].value["content"] = json!("changed evidence");
+        let run = ReviewRun {
+            background: true,
+            receipts: vec![ReviewReceipt {
+                model: "gpt-6-luna".into(),
+                input: 100,
+                usage: Some(
+                    json!({"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}),
+                ),
+                standard: true,
+            }],
+        };
+        merge_review(&mut current, &before, &reviewed, &run, &json!({}));
+        assert!(
+            current.opinions.is_empty(),
+            "advice cannot apply to changed source content"
+        );
+        assert_eq!(current.shadow.calls, 1);
+        assert_eq!(current.review_feedback["rejected_count"], 1);
     }
 
     #[test]
@@ -2326,7 +2590,17 @@ mod tests {
         observe_source(&mut session, "current task");
         session.completed_requests = 1;
         let main = json!({"model": "gpt-6-luna"});
-        assert!(!review(&service, "token-overflow", &mut session, &main, false).await);
+        assert!(
+            !review(
+                &service,
+                "token-overflow",
+                &mut session,
+                &main,
+                false,
+                &mut ReviewRun::default()
+            )
+            .await
+        );
         assert_eq!(session.invalid_reviews, 0);
         assert_eq!(session.opinions.get(&1).map(String::as_str), Some("keep"));
         assert_eq!(
@@ -2344,20 +2618,18 @@ mod tests {
         observe_source(&mut session, &"old human request ".repeat(1000));
         observe_source(&mut session, "latest real user request");
         let groups = session.groups();
-        let before = serde_json::to_value(&session).unwrap();
+        session
+            .apply_advice(
+                &groups,
+                &json!({"protected": [], "removable": ["g1", "g2"], "memories": []}),
+            )
+            .unwrap();
+        assert_eq!(session.opinions.get(&1).map(String::as_str), Some("drop"));
         assert!(
-            session
-                .apply_advice(
-                    &groups,
-                    &json!({"protected": [], "removable": ["g1", "g2"], "memories": []})
-                )
-                .is_err()
+            !session.opinions.contains_key(&2),
+            "invalid drop cannot unpin the latest user"
         );
-        assert_eq!(
-            serde_json::to_value(&session).unwrap(),
-            before,
-            "bad batch applies nothing"
-        );
+        assert_eq!(session.review_feedback["rejected_count"], 1);
         session
             .apply_advice(
                 &groups,
@@ -2971,6 +3243,7 @@ mod tests {
             classifier_key: None,
             auth_token: None,
             locks: Mutex::new(HashMap::new()),
+            background_reviews: Mutex::new(HashSet::new()),
         };
         save(&service, "large-missing-usage", &session).unwrap();
         assert_eq!(
