@@ -710,7 +710,8 @@ async fn forward(
         id = Some(
             reviewer_serialized_identity(&json!({
                 "domain": "carry-active-prefix-v1", "owner": owner,
-                "settings": cache_base(&body)
+                "settings": cache_base(&body),
+                "client_scope": stable_client_scope(&body)
             }))
             .1,
         );
@@ -1059,7 +1060,14 @@ fn review_body_for_groups(config: &ProxyCli, session: &Session, groups: &[Group]
             let text = item["content"].as_str().unwrap().to_owned();
             item["content"] = json!([{"type": "input_text", "text": text}]);
         }
-        let stable_end = input.len() - 1; // final mutable ledger is never written
+        // Derived memories and the mutable ledger are suffix data; only
+        // immutable source observations belong to a reusable written prefix.
+        let memory_records = session
+            .active_shadow
+            .iter()
+            .filter(|r| r.source_id == 0)
+            .count();
+        let stable_end = input.len() - 1 - memory_records;
         let canonical = reviewer_input(&body).unwrap();
         let base = reviewer_base(config, &body);
         let mut points = session
@@ -1984,6 +1992,33 @@ async fn bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8
     Ok(bytes)
 }
 
+/// Keep client/thread isolation without turning each telemetry turn into a
+/// new retention lineage. Client metadata is forwarded unchanged to primary.
+fn stable_client_scope(body: &Value) -> Value {
+    let mut metadata = body["client_metadata"].clone();
+    if let Some(object) = metadata.as_object_mut() {
+        for key in ["turn_id", "root_turn_id", "turn_started_at_unix_ms"] {
+            object.remove(key);
+        }
+        if let Some(raw) = object.get("x-codex-turn-metadata").and_then(Value::as_str)
+            && let Ok(mut nested) = serde_json::from_str::<Value>(raw)
+            && let Some(fields) = nested.as_object_mut()
+        {
+            for key in [
+                "turn_id",
+                "root_turn_id",
+                "turn_started_at_unix_ms",
+                "context_window_id",
+                "workspaces",
+            ] {
+                fields.remove(key);
+            }
+            object.insert("x-codex-turn-metadata".into(), nested);
+        }
+    }
+    metadata
+}
+
 fn cache_base(body: &Value) -> Value {
     let mut base = body.clone();
     if let Some(object) = base.as_object_mut() {
@@ -1992,6 +2027,7 @@ fn cache_base(body: &Value) -> Value {
             "stream",
             "store",
             "metadata",
+            "client_metadata",
             "include",
             "max_output_tokens",
         ] {

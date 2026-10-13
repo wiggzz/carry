@@ -168,7 +168,12 @@ unfinished windows resume even before the normal review cadence is due.
 Successful windows survive failed primaries and restarts. A wholly rejected review
 stops the attempt without advancing that window or discarding completed windows;
 partially accepted reviews advance while reporting rejected items for correction.
-A rebase/native epoch reset clears this progress.
+A rebase/native epoch reset clears this progress. The dashboard distinguishes wholly invalid reviews from partially accepted reviews; legacy invalid-review totals remain historical.
+
+Reviewer source observations precede carried memories and the final mutable ledger,
+so newly accepted facts do not rewrite a source window's cache prefix. Per-turn
+client telemetry does not create a new implicit lineage; session/thread identifiers
+still isolate state, and primary client metadata is forwarded unchanged.
 
 `--review-max-calls` defaults to 16 per primary request, for bootstrap and ongoing
 windows alike; `--bootstrap-max-calls` remains a compatible alias. Subsequent

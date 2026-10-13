@@ -2837,3 +2837,63 @@ async fn implicit_unseen_history_can_replace_a_native_checkpoint_epoch() {
     assert_eq!(saved["native_checkpoint"], json!([]));
     server.abort();
 }
+
+#[tokio::test]
+async fn client_turn_metadata_preserves_proxy_session_and_reviewer_affinity() {
+    let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
+    let state = tempfile::tempdir().unwrap();
+    let (_proxy, url) = start_proxy(state.path(), fixture.address, "audit").await;
+    let mut request = json!({"model":"gpt-6-luna","input":[
+        {"role":"user","content":"goal"},
+        {"role":"assistant","content":"evidence ".repeat(3000)},
+        {"role":"user","content":"current"}
+    ]});
+    for turn in ["turn-one", "turn-two"] {
+        request["client_metadata"] = json!({"session_id":"session","thread_id":"thread","turn_id":turn,"root_turn_id":turn,
+            "x-codex-turn-metadata":json!({"session_id":"session","thread_id":"thread","turn_id":turn,"root_turn_id":turn,"turn_started_at_unix_ms":turn}).to_string()});
+        let response: serde_json::Value = reqwest::Client::new()
+            .post(format!("{url}/v1/responses"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        request["input"]
+            .as_array_mut()
+            .unwrap()
+            .extend(response["output"].as_array().unwrap().iter().cloned());
+    }
+    let saved = checkpoint_states(state.path());
+    assert_eq!(
+        saved.len(),
+        1,
+        "turn metadata must not fork durable session state"
+    );
+    assert_eq!(saved[0]["completed_requests"], 2);
+    request["client_metadata"]["thread_id"] = json!("another-thread");
+    reqwest::Client::new()
+        .post(format!("{url}/v1/responses"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        checkpoint_states(state.path()).len(),
+        2,
+        "threads remain isolated"
+    );
+    let reviews = fixture.reviews.lock().await;
+    assert!(reviews.len() >= 2);
+    assert_eq!(
+        reviews[0]["prompt_cache_key"],
+        reviews[1]["prompt_cache_key"]
+    );
+    let forwarded = fixture.requests.lock().await;
+    assert_eq!(forwarded[0]["client_metadata"]["turn_id"], "turn-one");
+    assert_eq!(forwarded[1]["client_metadata"]["turn_id"], "turn-two");
+}

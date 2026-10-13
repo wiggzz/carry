@@ -458,6 +458,8 @@ impl Session {
         let mut input = self
             .active_shadow
             .iter()
+            .filter(|r| r.source_id != 0)
+            .chain(self.active_shadow.iter().filter(|r| r.source_id == 0))
             .map(|r| r.value.clone())
             .collect::<Vec<_>>();
         let eligible = groups
@@ -721,6 +723,34 @@ fn parse_group(value: &Value) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn carried_memories_do_not_prepend_to_reconstructed_source_prefix() {
+        let mut state = Session::default();
+        state
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                json!({"role":"assistant","content":"evidence"}),
+                json!({"role":"user","content":"current"}),
+            ])
+            .unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        let groups = state.groups();
+        state.observe_groups(&groups);
+        let before = state.shadow_input_for_groups(&groups);
+        state.apply_advice(&groups, &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g2"],"text":"fact"}]})).unwrap();
+        state.active_shadow.retain(|record| record.source_id == 0);
+        state.observed.clear();
+        state.observe_groups(&groups);
+        let after = state.shadow_input_for_groups(&groups);
+        assert!(after.starts_with(&before[..before.len() - 1]));
+        let fact: Value =
+            serde_json::from_str(after[after.len() - 2]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(fact["source_ids"], json!(["g2"]));
+        assert_eq!(fact["text"], "fact");
+    }
 
     #[test]
     fn mixed_advice_applies_valid_items_without_invalid_sources() {
@@ -1071,7 +1101,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![json!(1), json!(2), json!(3), json!(4)]);
         assert_eq!(
-            data[0],
+            data[data.len() - 2],
             json!({"source_ids": ["g1"], "text": "grounded fact"})
         );
         assert_eq!(
