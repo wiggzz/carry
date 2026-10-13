@@ -137,6 +137,9 @@ accepted counts, so the model can correct rejected instructions without repeatin
 accepted facts. Feedback is checkpointed and never retains rejected source text.
 Refusals, incomplete output, malformed top-level JSON or a provider rejecting the
 schema reject the review; there is no silent unconstrained-output fallback.
+Only the final assistant message is parsed as JSON advice; progress commentary
+is not concatenated into that answer, and a final refusal does not fall back to
+an earlier message.
 The primary request can continue unchanged.
 The newest live user group is pinned independently of reviewer advice.
 
@@ -228,6 +231,9 @@ is deferred until a later request. The primary session lock is not held during
 reviewer transport. Completion reacquires it and merges reviewer state and usage
 into the newest checkpoint, preserving newer primary history, counters and cache.
 Only already-merged advice can affect the next request, never a submitted request.
+Membership checks cover sources actually replayed to that review. An unrelated
+newer pending tool step may complete without invalidating advice about an older
+window; changed reviewed cohorts or canonical lineage still discard that advice.
 Changed source contents, atomic membership, removals or rebases discard stale
 advice, but its paid usage is still counted. Bounded oversized windows run in the
 same background job and remain governed by `--review-max-calls`.

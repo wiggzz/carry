@@ -652,6 +652,7 @@ async fn native_compact(
 struct ReviewRun {
     background: bool,
     receipts: Vec<ReviewReceipt>,
+    reviewed_sources: Vec<Group>,
 }
 
 struct ReviewReceipt {
@@ -1499,7 +1500,7 @@ async fn dispatch_review(service: Arc<Service>, id: String, session: &mut Sessio
         let mut reviewed = before.clone();
         let mut run = ReviewRun {
             background: true,
-            receipts: Vec::new(),
+            ..ReviewRun::default()
         };
         review(&service, &id, &mut reviewed, &main, false, &mut run).await;
         // Primary transport/checkpoint owns this lock until its commit finishes.
@@ -1570,7 +1571,7 @@ fn merge_review(
                     && new.value == old.value
                     && (!old.exposed || new.exposed)
             })
-        && before.groups().iter().all(|old| {
+        && run.reviewed_sources.iter().all(|old| {
             groups.get(&old.id).is_some_and(|new| {
                 new.members == old.members
                     && (!old.exposed || new.exposed)
@@ -1801,6 +1802,29 @@ async fn review_windows(
     }
 }
 
+fn reviewer_advice(response: &Value) -> Option<Value> {
+    if response["status"] != "completed" {
+        return None;
+    }
+    // Structured output constrains the final answer, not intermediate progress
+    // messages. Never concatenate commentary or fall back after a final refusal.
+    let message = response["output"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|item| item["type"] == "message" && item["role"] == "assistant")?;
+    let content = message["content"].as_array()?;
+    if content.iter().any(|block| block["type"] == "refusal") {
+        return None;
+    }
+    let text = content
+        .iter()
+        .filter(|block| block["type"] == "output_text")
+        .filter_map(|block| block["text"].as_str())
+        .collect::<String>();
+    serde_json::from_str(&text).ok()
+}
+
 async fn review_chunk(
     service: &Service,
     id: &str,
@@ -1809,6 +1833,10 @@ async fn review_chunk(
     groups: &[Group],
     run: &mut ReviewRun,
 ) -> bool {
+    // Membership can grow in a newer unfinished step while a frozen older
+    // window is reviewed. Only native sources sent to this review need match.
+    run.reviewed_sources
+        .extend(groups.iter().filter(|group| group.replayable).cloned());
     let mut request = service
         .client
         .post(
@@ -1909,32 +1937,21 @@ async fn review_chunk(
         if value["status"] != "completed" {
             let _ = trace(service, id, "shadow_failed", &diagnostic);
         }
-        if value["status"] == "completed" {
-            let text = value["output"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|i| i["type"] == "message" && i["role"] == "assistant")
-                .flat_map(|i| i["content"].as_array().into_iter().flatten())
-                .filter(|b| b["type"] == "output_text")
-                .filter_map(|b| b["text"].as_str())
-                .collect::<String>();
-            if let Ok(advice) = serde_json::from_str::<Value>(&text) {
-                match session.apply_advice(groups, &advice) {
-                    Ok(()) => {
-                        valid = session.review_feedback["rejected_count"] == 0
-                            || session.review_feedback["accepted_opinions"]
-                                .as_u64()
-                                .unwrap_or(0)
-                                > 0
-                            || session.review_feedback["accepted_memories"]
-                                .as_u64()
-                                .unwrap_or(0)
-                                > 0;
-                    }
-                    Err(error) => {
-                        session.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":error.to_string()}]})
-                    }
+        if let Some(advice) = reviewer_advice(&value) {
+            match session.apply_advice(groups, &advice) {
+                Ok(()) => {
+                    valid = session.review_feedback["rejected_count"] == 0
+                        || session.review_feedback["accepted_opinions"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            > 0
+                        || session.review_feedback["accepted_memories"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            > 0;
+                }
+                Err(error) => {
+                    session.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":error.to_string()}]});
                 }
             }
         }
@@ -2607,6 +2624,26 @@ mod tests {
     use super::*;
     use carry::core::prefix_compatible;
 
+    #[test]
+    fn reviewer_final_json_is_separate_from_progress_messages() {
+        let advice = json!({"protected":[],"removable":[],"memories":[]});
+        let text = advice.to_string();
+        let mut response = json!({"status":"completed","output":[
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reviewing historical context."}]},
+            {"type":"reasoning","encrypted_content":"OPAQUE_FIXTURE"},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":&text[..20]},{"type":"output_text","text":&text[20..]}]}
+        ]});
+        assert_eq!(reviewer_advice(&response), Some(advice));
+        response["output"].as_array_mut().unwrap().push(json!({"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"fixture refusal"}]}));
+        assert!(
+            reviewer_advice(&response).is_none(),
+            "never accept an earlier JSON message after a final refusal"
+        );
+        response["output"].as_array_mut().unwrap().pop();
+        response["status"] = json!("incomplete");
+        assert!(reviewer_advice(&response).is_none());
+    }
+
     #[tokio::test]
     async fn background_review_can_retire_memory_when_only_pinned_sources_remain() {
         let router = Router::new().route("/review", post(|| async {
@@ -2809,6 +2846,84 @@ mod tests {
     }
 
     #[test]
+    fn background_merge_accepts_older_advice_when_unrelated_pending_step_completes() {
+        let input = vec![
+            json!({"role":"user","content":"goal"}),
+            json!({"role":"assistant","content":"older evidence"}),
+            json!({"role":"user","content":"current"}),
+            json!({"type":"reasoning","encrypted_content":"pending","summary":[]}),
+            json!({"type":"function_call","call_id":"new","name":"inspect","arguments":"{}"}),
+        ];
+        let mut before = Session::default();
+        before.ingest(&input).unwrap();
+        for item in before.history.iter_mut().take(3) {
+            item.exposed = true;
+        }
+        let older = before
+            .groups()
+            .into_iter()
+            .filter(|group| group.id < 3)
+            .collect::<Vec<_>>();
+        let mut reviewed = before.clone();
+        reviewed
+            .apply_advice(
+                &older,
+                &json!({"protected":[],"removable":["g2"],"memories":[]}),
+            )
+            .unwrap();
+        let mut current = before.clone();
+        let mut extended = input;
+        extended.push(json!({"type":"function_call_output","call_id":"new","output":"new result"}));
+        current.ingest(&extended).unwrap();
+        let run = ReviewRun {
+            reviewed_sources: older,
+            ..ReviewRun::default()
+        };
+        merge_review(&mut current, &before, &reviewed, &run, &json!({}));
+        assert_eq!(current.opinions.get(&2).map(String::as_str), Some("drop"));
+        assert_eq!(current.history.len(), 6);
+    }
+
+    #[test]
+    fn background_merge_discards_advice_when_reviewed_tool_membership_changes() {
+        let mut input = vec![
+            json!({"role":"user","content":"goal"}),
+            json!({"type":"function_call","call_id":"a","name":"inspect","arguments":"{}"}),
+            json!({"type":"function_call_output","call_id":"a","output":"original result"}),
+            json!({"role":"user","content":"current"}),
+        ];
+        let mut before = Session::default();
+        before.ingest(&input).unwrap();
+        for item in &mut before.history {
+            item.exposed = true;
+        }
+        let sources = before
+            .groups()
+            .into_iter()
+            .filter(|group| group.id == 2)
+            .collect::<Vec<_>>();
+        let mut reviewed = before.clone();
+        reviewed
+            .apply_advice(
+                &sources,
+                &json!({"protected":[],"removable":["g2"],"memories":[]}),
+            )
+            .unwrap();
+        let mut current = before.clone();
+        input.push(
+            json!({"type":"function_call_output","call_id":"a","output":"additional result"}),
+        );
+        current.ingest(&input).unwrap();
+        let run = ReviewRun {
+            reviewed_sources: sources,
+            ..ReviewRun::default()
+        };
+        merge_review(&mut current, &before, &reviewed, &run, &json!({}));
+        assert!(current.opinions.is_empty());
+        assert_eq!(current.review_feedback["rejected_count"], 1);
+    }
+
+    #[test]
     fn background_merge_discards_changed_source_content_but_accounts_for_spend() {
         let mut before = Session::default();
         before
@@ -2832,6 +2947,7 @@ mod tests {
         current.history[1].value["content"] = json!("changed evidence");
         let run = ReviewRun {
             background: true,
+            reviewed_sources: before.groups(),
             receipts: vec![ReviewReceipt {
                 model: "gpt-6-luna".into(),
                 input: 100,
