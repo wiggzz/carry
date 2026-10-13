@@ -1,6 +1,23 @@
 use std::collections::BTreeMap;
 
-use serde_json::Value;
+use serde_json::{Value, json};
+
+/// Persist identifiers only; provider prose can contain private request data.
+pub(super) fn safe_error(error: &Value) -> Value {
+    let mut safe = serde_json::Map::new();
+    for field in ["type", "code", "param"] {
+        if let Some(token) = error[field].as_str()
+            && !token.is_empty()
+            && token.len() <= 64
+            && token
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_.-[]".contains(&c))
+        {
+            safe.insert(field.into(), json!(token));
+        }
+    }
+    Value::Object(safe)
+}
 
 /// Bounded observation only; the relay forwards the original bytes unchanged.
 #[derive(Default)]
@@ -80,7 +97,17 @@ impl Observer {
                         {
                             self.terminal = true;
                             if value["response"].is_object() {
-                                self.observed = Some(value["response"].clone());
+                                let mut response = value["response"].clone();
+                                response["error"] = safe_error(&response["error"]);
+                                self.observed = Some(response);
+                            } else {
+                                let error = if value["error"].is_object() {
+                                    &value["error"]
+                                } else {
+                                    &value
+                                };
+                                self.observed =
+                                    Some(json!({"status":"failed","error":safe_error(error)}));
                             }
                         }
                         _ => {}
@@ -95,6 +122,19 @@ impl Observer {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stream_error_retains_only_safe_identifiers() {
+        let mut observer = Observer::default();
+        observer.feed(b"data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"bad pair\",\"param\":\"input[2]\",\"message\":\"private provider prose\"}}\n\n");
+        assert_eq!(
+            observer.observed,
+            Some(
+                json!({"status":"failed","error":{"type":"invalid_request_error","param":"input[2]"}})
+            )
+        );
+        assert!(observer.completed.is_none());
+    }
 
     #[test]
     fn completed_items_supply_output_when_terminal_output_is_empty() {

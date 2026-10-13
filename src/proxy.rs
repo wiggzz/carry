@@ -1799,16 +1799,11 @@ async fn review_chunk(
                 if let Ok(bytes) = bounded(response, 16 * 1024).await
                     && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
                 {
-                    for field in ["type", "code", "param"] {
-                        if let Some(token) = value["error"][field].as_str()
-                            && !token.is_empty()
-                            && token.len() <= 64
-                            && token
-                                .bytes()
-                                .all(|c| c.is_ascii_alphanumeric() || b"_.-[]".contains(&c))
-                        {
-                            diagnostic[format!("error_{field}")] = json!(token);
-                        }
+                    for (field, token) in crate::proxy_sse::safe_error(&value["error"])
+                        .as_object()
+                        .unwrap()
+                    {
+                        diagnostic[format!("error_{field}")] = token.clone();
                     }
                 }
                 None
@@ -1819,6 +1814,12 @@ async fn review_chunk(
     let mut valid = false;
     session.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"review did not complete with a valid JSON advice object; return the required schema"}]});
     if let Some(value) = value {
+        for (field, token) in crate::proxy_sse::safe_error(&value["error"])
+            .as_object()
+            .unwrap()
+        {
+            diagnostic[format!("error_{field}")] = token.clone();
+        }
         attempt.finish(Some(&value), "observed");
         if run.background {
             run.receipts.push(ReviewReceipt {
@@ -1849,6 +1850,9 @@ async fn review_chunk(
             );
         }
         let _ = trace(service, id, "shadow_completed", &value);
+        if value["status"] != "completed" {
+            let _ = trace(service, id, "shadow_failed", &diagnostic);
+        }
         if value["status"] == "completed" {
             let text = value["output"]
                 .as_array()
@@ -2515,7 +2519,8 @@ async fn relay(
                     &commit.service,
                     &commit.id,
                     "primary_failed",
-                    &json!({"http_status": status.as_u16(), "complete_transport": complete_transport}),
+                    &json!({"http_status": status.as_u16(), "complete_transport": complete_transport,
+                        "error": crate::proxy_sse::safe_error(&observed.as_ref().map(|v| v["error"].clone()).unwrap_or(Value::Null))}),
                 );
             }
         }
