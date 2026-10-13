@@ -1,7 +1,6 @@
 //! Proxy-specific coverage and lifecycle around the shared savings estimator.
-use crate::openai::{Usage, prompt_cache_capabilities};
+use crate::openai::{Usage, estimated_cost_usd, prompt_cache_capabilities};
 pub(crate) use crate::savings::{Scenario, token_units};
-use carry::core::Rates;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -74,8 +73,10 @@ impl Trajectory {
     pub fn snapshot(&self) -> Estimate {
         let mut estimate = self.result.clone();
         estimate.savings = estimate.traditional_cost - estimate.carry_cost;
-        estimate.priced =
-            self.available && self.scenario.valid() && estimate.coverage.primary_responses > 0;
+        estimate.priced = self.available
+            && self.scenario.valid()
+            && estimate.coverage.primary_responses > 0
+            && estimate.coverage.unknown_cache_requests == 0;
         estimate.savings_percent = estimate
             .priced
             .then(|| crate::savings::savings_percent(estimate.savings, estimate.carry_cost))
@@ -293,21 +294,6 @@ impl Trajectory {
     }
 }
 
-fn estimated_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
-    // Use the proxy's exact model/rate coverage, not the older runner rate card.
-    let rates = Rates::for_model(model, usage.input_tokens as f64)?;
-    let cached = usage.cached_input_tokens.min(usage.input_tokens);
-    let written = usage
-        .cache_write_input_tokens
-        .min(usage.input_tokens - cached);
-    Some(
-        (usage.input_tokens - cached - written) as f64 * rates.input
-            + cached as f64 * rates.cached
-            + written as f64 * rates.write
-            + usage.output_tokens as f64 * rates.output,
-    )
-}
-
 fn scenario_input_cost(model: &str, input: u64, cached: u64, minimum: Option<u64>) -> Option<f64> {
     crate::savings::scenario_input_cost(model, input, cached, minimum, estimated_cost_usd)
 }
@@ -471,7 +457,31 @@ mod tests {
         trajectory.primary(&body, &response(100), "route", 100, true);
         assert!(trajectory.snapshot().priced);
         assert!(trajectory.snapshot().carry_cost > 0.0);
-        assert_eq!(trajectory.snapshot().coverage.unknown_cache_requests, 1);
+        assert_eq!(trajectory.snapshot().coverage.unknown_cache_requests, 0);
+    }
+
+    #[test]
+    fn priced_model_with_unknown_cache_support_excludes_savings() {
+        let mut body = request("task");
+        body["model"] = json!("gpt-6-astra");
+        let mut trajectory = Trajectory::default();
+        trajectory.primary(&body, &response(100), "route", 100, true);
+        let estimate = trajectory.snapshot();
+        assert!(estimate.carry_cost > 0.0);
+        assert_eq!(estimate.coverage.unknown_cache_requests, 1);
+        assert!(!estimate.priced);
+        assert_eq!(estimate.savings_percent, None);
+    }
+
+    #[test]
+    fn restored_unknown_cache_coverage_excludes_scenario_savings() {
+        let mut trajectory = Trajectory::default();
+        trajectory.primary(&request("task"), &response(100), "route", 100, true);
+        let mut checkpoint = serde_json::to_value(&trajectory).unwrap();
+        checkpoint["result"]["coverage"]["unknown_cache_requests"] = json!(1);
+        let restored: Trajectory = serde_json::from_value(checkpoint).unwrap();
+        assert!(!restored.snapshot().priced);
+        assert_eq!(restored.snapshot().savings_percent, None);
     }
 
     #[test]

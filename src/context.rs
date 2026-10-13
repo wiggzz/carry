@@ -8,8 +8,6 @@ use crate::protocol::ContextManagement;
 use carry::core::{horizon_cost, input_cost, prefix_compatible, select_removals};
 
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
-const CACHE_READ_RATE: f64 = 0.10;
-const CACHE_WRITE_RATE: f64 = 1.25;
 pub(crate) const DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT: u8 = 25;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
 #[cfg(test)]
@@ -763,11 +761,12 @@ impl ContextState {
             .checked_div(retained_ids.len())
             .unwrap_or(1)
             .max(1);
-        let initial_compact_cost = compact_request_cost(plan);
+        let initial_compact_cost = compact_request_cost(plan, &policy);
         let direct_next_request_savings_input_units = direct_next_request_savings(
             policy.implicit_cached_tokens,
             self.estimated_tokens(),
             initial_compact_cost,
+            &policy,
         );
         let initial_keep_cost = keep_request_cost(self.estimated_tokens(), &policy);
         let mut total_compact_cost = 0.0;
@@ -907,20 +906,21 @@ impl ContextState {
             .map(|priced| priced.cached_tokens)
             .sum();
 
-        let compact_first_cost =
-            reused_tokens as f64 * CACHE_READ_RATE + rewrite_tokens as f64 * CACHE_WRITE_RATE;
+        let compact_first_cost = reused_tokens as f64 * policy.cache_ratios.0
+            + rewrite_tokens as f64 * policy.cache_ratios.1;
         let payoff_savings = payoff_savings_input_units(
             implicit_cached_tokens,
             current_tokens,
             retained_tokens,
             compact_first_cost,
             policy.payoff_requests,
+            policy,
         );
-        let keep_payoff_cost = implicit_cached_tokens as f64 * CACHE_READ_RATE
-            + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * CACHE_WRITE_RATE
+        let keep_payoff_cost = implicit_cached_tokens as f64 * policy.cache_ratios.0
+            + current_tokens.saturating_sub(implicit_cached_tokens) as f64 * policy.cache_ratios.1
             + policy.payoff_requests.saturating_sub(1) as f64
                 * current_tokens as f64
-                * CACHE_READ_RATE;
+                * policy.cache_ratios.0;
 
         CompactionPlan {
             dropped,
@@ -1098,8 +1098,10 @@ fn direct_next_request_savings(
     implicit_cached_tokens: usize,
     current_tokens: usize,
     compact_first_cost: f64,
+    policy: &CompactionPolicy,
 ) -> f64 {
-    keep_request_cost_with_implicit(implicit_cached_tokens, current_tokens) - compact_first_cost
+    keep_request_cost_with_implicit(implicit_cached_tokens, current_tokens, policy)
+        - compact_first_cost
 }
 
 fn payoff_savings_input_units(
@@ -1108,18 +1110,20 @@ fn payoff_savings_input_units(
     retained_tokens: usize,
     compact_first_cost: f64,
     payoff_requests: u64,
+    policy: &CompactionPolicy,
 ) -> f64 {
-    let keep_first = keep_request_cost_with_implicit(implicit_cached_tokens, current_tokens);
+    let keep_first =
+        keep_request_cost_with_implicit(implicit_cached_tokens, current_tokens, policy);
     let compact_first = compact_first_cost;
     horizon_cost(
         keep_first,
         current_tokens as f64,
-        CACHE_READ_RATE,
+        policy.cache_ratios.0,
         payoff_requests,
     ) - horizon_cost(
         compact_first,
         retained_tokens as f64,
-        CACHE_READ_RATE,
+        policy.cache_ratios.0,
         payoff_requests,
     )
 }
@@ -1128,21 +1132,26 @@ fn keep_request_cost(current_tokens: usize, policy: &CompactionPolicy) -> f64 {
     keep_request_cost_with_implicit(
         policy.implicit_cached_tokens.min(current_tokens),
         current_tokens,
+        policy,
     )
 }
 
-fn keep_request_cost_with_implicit(implicit_cached_tokens: usize, current_tokens: usize) -> f64 {
+fn keep_request_cost_with_implicit(
+    implicit_cached_tokens: usize,
+    current_tokens: usize,
+    policy: &CompactionPolicy,
+) -> f64 {
     input_cost(
         current_tokens as f64,
         implicit_cached_tokens as f64,
-        CACHE_WRITE_RATE,
-        CACHE_READ_RATE,
+        policy.cache_ratios.1,
+        policy.cache_ratios.0,
     )
 }
 
-fn compact_request_cost(plan: &CompactionPlan) -> f64 {
-    plan.retained_tokens.saturating_sub(plan.rewrite_tokens) as f64 * CACHE_READ_RATE
-        + plan.rewrite_tokens as f64 * CACHE_WRITE_RATE
+fn compact_request_cost(plan: &CompactionPlan, policy: &CompactionPolicy) -> f64 {
+    plan.retained_tokens.saturating_sub(plan.rewrite_tokens) as f64 * policy.cache_ratios.0
+        + plan.rewrite_tokens as f64 * policy.cache_ratios.1
 }
 
 fn simulate_rollout_turn(
@@ -1161,6 +1170,7 @@ fn simulate_rollout_turn(
         }
     }
     let policy = CompactionPolicy {
+        cache_ratios: base_policy.cache_ratios,
         implicit_cached_tokens: cached_before_virtual_item,
         breakpoints: state
             .rendered_breakpoints()
@@ -1182,11 +1192,13 @@ fn simulate_rollout_turn(
             neutral_low_watermark_tokens,
         )
         .into_iter()
-        .min_by(|left, right| compact_request_cost(left).total_cmp(&compact_request_cost(right)))
+        .min_by(|left, right| {
+            compact_request_cost(left, &policy).total_cmp(&compact_request_cost(right, &policy))
+        })
     else {
         return keep_cost;
     };
-    let cost = compact_request_cost(&plan);
+    let cost = compact_request_cost(&plan, &policy);
     if cost >= keep_cost {
         return keep_cost;
     }
@@ -1308,6 +1320,7 @@ fn estimated_tokens(items: &[Value]) -> usize {
 
 #[derive(Clone, Debug)]
 pub struct CompactionPolicy {
+    pub cache_ratios: (f64, f64),
     pub implicit_cached_tokens: usize,
     pub breakpoints: Vec<PricedBreakpoint>,
     /// Fixed number of requests over which a rewrite is amortized; must be positive.
@@ -1418,6 +1431,12 @@ pub(crate) struct ContextChange {
 mod tests {
     use super::*;
 
+    fn reference_cache_ratios() -> (f64, f64) {
+        carry::models::Rates::for_model("gpt-6-sol", 0.0)
+            .unwrap()
+            .cache_ratios()
+    }
+
     #[test]
     fn unsupported_cache_capabilities_render_no_explicit_breakpoints() {
         let state = ContextState::new_with_max_read_breakpoints("initial".into(), 0);
@@ -1474,6 +1493,7 @@ mod tests {
             .plan_compaction_with_neutral_budget(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -1491,6 +1511,7 @@ mod tests {
             .plan_compaction_with_neutral_budget(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -1521,6 +1542,7 @@ mod tests {
             .plan_compaction_with_neutral_budget(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -1549,6 +1571,7 @@ mod tests {
             .plan_compaction_with_neutral_budget(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -1569,6 +1592,7 @@ mod tests {
         let newest = add_tool_with_output(&mut state, &"new ".repeat(1_000));
         let budget = state.item_estimated_tokens(middle) + state.item_estimated_tokens(newest);
         let policy = CompactionPolicy {
+            cache_ratios: reference_cache_ratios(),
             implicit_cached_tokens: 0,
             breakpoints: Vec::new(),
             payoff_requests: 5,
@@ -1604,6 +1628,7 @@ mod tests {
         let newest = add_tool_with_output(&mut state, &"new ".repeat(1_000));
         let budget = state.item_estimated_tokens(middle) + state.item_estimated_tokens(newest);
         let policy = CompactionPolicy {
+            cache_ratios: reference_cache_ratios(),
             implicit_cached_tokens: 0,
             breakpoints: Vec::new(),
             payoff_requests: 5,
@@ -1628,7 +1653,10 @@ mod tests {
 
         assert_eq!(estimate.stopped_samples, 4);
         assert_eq!(estimate.average_simulated_followup_turns, 0.0);
-        assert_eq!(estimate.expected_compact_cost, compact_request_cost(&plan));
+        assert_eq!(
+            estimate.expected_compact_cost,
+            compact_request_cost(&plan, &policy)
+        );
         assert_eq!(
             estimate.expected_keep_cost,
             keep_request_cost(state.estimated_tokens(), &policy)
@@ -1647,6 +1675,7 @@ mod tests {
             usize::MAX,
             usize::MAX / 4 * 3,
             &CompactionPolicy {
+                cache_ratios: reference_cache_ratios(),
                 implicit_cached_tokens: 0,
                 breakpoints: Vec::new(),
                 payoff_requests: 5,
@@ -1654,23 +1683,24 @@ mod tests {
             },
         );
         let current_tokens = state.estimated_tokens();
-        let expected = previous_tokens as f64 * CACHE_READ_RATE
-            + current_tokens.saturating_sub(previous_tokens) as f64 * CACHE_WRITE_RATE;
+        let expected = previous_tokens as f64 * reference_cache_ratios().0
+            + current_tokens.saturating_sub(previous_tokens) as f64 * reference_cache_ratios().1;
         assert_eq!(cost, expected);
     }
 
     #[test]
     fn five_request_payoff_accepts_a_rewrite_that_one_request_rejects() {
         let policy = CompactionPolicy {
+            cache_ratios: reference_cache_ratios(),
             implicit_cached_tokens: 0,
             breakpoints: Vec::new(),
             payoff_requests: 5,
             min_payback_percent: DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT,
         };
         assert_eq!(policy.payoff_requests, 5);
-        assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 1) < 0.0);
-        assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 5) > 0.0);
-        assert!(direct_next_request_savings(312_141, 313_063, 54_562.5) < 0.0);
+        assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 1, &policy) < 0.0);
+        assert!(payoff_savings_input_units(312_141, 313_063, 43_650, 54_562.5, 5, &policy) > 0.0);
+        assert!(direct_next_request_savings(312_141, 313_063, 54_562.5, &policy) < 0.0);
     }
 
     #[test]
@@ -1704,6 +1734,7 @@ mod tests {
         let mut state = ContextState::new("initial".into());
         add_tool_with_output(&mut state, &"x".repeat(8_000));
         let no_margin = CompactionPolicy {
+            cache_ratios: reference_cache_ratios(),
             implicit_cached_tokens: 0,
             breakpoints: Vec::new(),
             payoff_requests: 1,
@@ -1718,6 +1749,7 @@ mod tests {
                 .plan_compaction(
                     &[],
                     CompactionPolicy {
+                        cache_ratios: reference_cache_ratios(),
                         min_payback_percent: 100,
                         ..no_margin
                     }
@@ -1746,6 +1778,7 @@ mod tests {
             .plan_compaction_with_neutral_budget(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -1776,6 +1809,7 @@ mod tests {
             .plan_compaction_with_neutral_watermarks(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -1810,6 +1844,7 @@ mod tests {
             .plan_compaction_with_neutral_budget(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -1844,6 +1879,7 @@ mod tests {
             .plan_compaction_with_neutral_budget(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -1875,6 +1911,7 @@ mod tests {
             .plan_compaction_with_neutral_budget(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -1908,6 +1945,7 @@ mod tests {
                 .plan_compaction_with_neutral_budget(
                     &[],
                     CompactionPolicy {
+                        cache_ratios: reference_cache_ratios(),
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
                         payoff_requests: 1,
@@ -1945,6 +1983,7 @@ mod tests {
             .plan_compaction_with_neutral_budget(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -1968,6 +2007,7 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -2008,6 +2048,7 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -2143,6 +2184,7 @@ mod tests {
             .plan_compaction_with_neutral_budget(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -2251,6 +2293,7 @@ mod tests {
             .record_signals(&update(&[], &[], &["keep this fact"]), tool)
             .added[0];
         let policy = CompactionPolicy {
+            cache_ratios: reference_cache_ratios(),
             implicit_cached_tokens: 0,
             breakpoints: Vec::new(),
             payoff_requests: 1,
@@ -2320,6 +2363,7 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -2361,6 +2405,7 @@ mod tests {
                 .plan_compaction(
                     &[],
                     CompactionPolicy {
+                        cache_ratios: reference_cache_ratios(),
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
                         payoff_requests: 1,
@@ -2384,6 +2429,7 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -2453,6 +2499,7 @@ mod tests {
         let short = state.plan_compaction(
             &[],
             CompactionPolicy {
+                cache_ratios: reference_cache_ratios(),
                 implicit_cached_tokens: usize::MAX,
                 breakpoints: Vec::new(),
                 payoff_requests: 1,
@@ -2466,6 +2513,7 @@ mod tests {
                 .plan_compaction(
                     &[],
                     CompactionPolicy {
+                        cache_ratios: reference_cache_ratios(),
                         implicit_cached_tokens: usize::MAX,
                         breakpoints: Vec::new(),
                         payoff_requests: 1,
@@ -2488,6 +2536,7 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: vec![PricedBreakpoint {
                         generation: 0,
@@ -2513,6 +2562,7 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -2528,6 +2578,7 @@ mod tests {
                 .plan_compaction(
                     &[],
                     CompactionPolicy {
+                        cache_ratios: reference_cache_ratios(),
                         implicit_cached_tokens: 0,
                         breakpoints: Vec::new(),
                         payoff_requests: 1,
@@ -2549,6 +2600,7 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -2588,6 +2640,7 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -2615,6 +2668,7 @@ mod tests {
             .plan_compaction_with_neutral_budget(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -2640,6 +2694,7 @@ mod tests {
             .plan_compaction_with_neutral_budget(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: vec![PricedBreakpoint {
                         generation: first_change.generation,
@@ -2693,6 +2748,7 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -2726,6 +2782,7 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,
@@ -2741,6 +2798,7 @@ mod tests {
             .plan_compaction(
                 &[],
                 CompactionPolicy {
+                    cache_ratios: reference_cache_ratios(),
                     implicit_cached_tokens: 0,
                     breakpoints: Vec::new(),
                     payoff_requests: 1,

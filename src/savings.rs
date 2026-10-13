@@ -147,6 +147,7 @@ impl Trajectory {
         e.priced = self.scenario_available
             && self.scenario.valid()
             && e.observed_priced
+            && e.coverage.unknown_cache_requests == 0
             && estimated_cost_usd(model, &Usage::default()).is_some();
         e.savings = e.pi_cost - e.carry_cost;
         e
@@ -580,6 +581,17 @@ mod tests {
         assert_eq!(b.carry_cost, b.pi_cost);
     }
     #[test]
+    fn priced_usage_with_unknown_cache_policy_excludes_savings() {
+        let mut t = Trajectory::default();
+        t.record(&json!({"event":"run_started","data":{"model":"gpt-6-sol","implicit_cache_minimum_prefix_tokens":null}}));
+        request(&mut t, 2000);
+        let estimate = response(&mut t, 1000, 100, 900);
+        assert!(estimate.observed_priced);
+        assert_eq!(estimate.coverage.unknown_cache_requests, 1);
+        assert!(!estimate.priced);
+    }
+
+    #[test]
     fn cache_policy_transition_requires_a_new_write() {
         let mut actual = Vec::new();
         let mut expected = Vec::new();
@@ -598,7 +610,8 @@ mod tests {
                 assert_eq!(t.last_pi_input, prior_pi_input);
                 request(&mut t, 2000);
                 let after = response(&mut t, 10, 0, 0);
-                assert!(after.priced && after.observed_priced);
+                assert!(after.observed_priced);
+                assert_eq!(after.priced, !old_minimum.is_null());
                 assert_eq!(t.last_pi_input, carry_input + 600);
                 assert!((after.observed_cost - 2.0 * before.observed_cost).abs() < 1e-12);
                 let carry_delta = after.carry_cost - before.carry_cost;

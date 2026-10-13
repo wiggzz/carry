@@ -21,33 +21,7 @@ pub fn prefix_compatible<T: PartialEq>(input: &[T], prefix: &[T]) -> bool {
     input.starts_with(prefix)
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
-pub struct Rates {
-    pub input: f64,
-    pub cached: f64,
-    pub write: f64,
-    pub output: f64,
-}
-
-impl Rates {
-    /// Verified standard rates; exact names only, no inferred neighbor aliases.
-    /// Full-request long-context pricing is strictly above 272,000 input tokens.
-    pub fn for_model(model: &str, input_tokens: f64) -> Option<Self> {
-        let (input, cached, write, output) = match model {
-            "gpt-6-luna" => (0.10, 0.01, 0.125, 0.50),
-            "gpt-6-sol" => (2.00, 0.20, 2.50, 10.00),
-            "gpt-6.1-sol" => (2.00, 0.10, 2.50, 10.00),
-            _ => return None,
-        };
-        let long = input_tokens > 272_000.0;
-        Some(Self {
-            input: input * if long { 2.0 } else { 1.0 } / 1_000_000.0,
-            cached: cached * if long { 2.0 } else { 1.0 } / 1_000_000.0,
-            write: write * if long { 2.0 } else { 1.0 } / 1_000_000.0,
-            output: output * if long { 1.5 } else { 1.0 } / 1_000_000.0,
-        })
-    }
-}
+pub use crate::models::Rates;
 
 pub fn input_cost(tokens: f64, cached: f64, uncached_rate: f64, cached_rate: f64) -> f64 {
     let cached = cached.clamp(0.0, tokens);

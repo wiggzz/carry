@@ -1079,8 +1079,10 @@ fn review_body_for_groups(config: &ProxyCli, session: &Session, groups: &[Group]
         // candidates). Keep the latest three compatible previous boundaries,
         // plus the current frontier: never exceed four or rotate out the
         // immediately preceding written prefix when the ledger changes.
-        if points.len() > 3 {
-            points.drain(..points.len() - 3);
+        let previous_slots = crate::openai::prompt_cache_capabilities(&config.classifier_model)
+            .map_or(0, |cap| cap.max_write_breakpoints.saturating_sub(1));
+        if points.len() > previous_slots {
+            points.drain(..points.len() - previous_slots);
         }
         points.push(stable_end);
         for end in points {
@@ -1096,10 +1098,8 @@ fn review_body_for_groups(config: &ProxyCli, session: &Session, groups: &[Group]
 }
 
 fn classifier_cache_enabled(config: &ProxyCli) -> Result<bool> {
-    let supported = matches!(
-        config.classifier_model.as_str(),
-        "gpt-6-luna" | "gpt-6-sol" | "gpt-6.1-sol"
-    );
+    let supported = carry::models::model_spec(&config.classifier_model)
+        .is_some_and(|spec| spec.explicit_reviewer_cache);
     match config.classifier_cache_policy {
         ClassifierCachePolicy::Disabled => Ok(false),
         ClassifierCachePolicy::Auto => Ok(supported
@@ -1359,7 +1359,13 @@ fn reviewer_view_costs(
         // evidence that a prefix meets the provider's cache minimum.
         let future = input_cost(
             tokens,
-            if prefix >= 1024.0 { prefix } else { 0.0 },
+            if crate::openai::prompt_cache_capabilities(&config.classifier_model)
+                .is_some_and(|cap| prefix >= cap.minimum_prefix_tokens as f64)
+            {
+                prefix
+            } else {
+                0.0
+            },
             rates.input,
             rates.cached,
         );
@@ -2061,18 +2067,29 @@ fn view_costs(
     let cr = Rates::for_model(model, ct)?;
     let keep_first = input_cost(kt, reusable(cache, keep), kr.input, kr.cached);
     let compact_first = input_cost(ct, reusable(cache, compact), cr.write, cr.cached);
+    // Native evidence can price the first call even when future cache support is unknown.
+    let minimum =
+        crate::openai::prompt_cache_capabilities(model).map(|cap| cap.minimum_prefix_tokens as f64);
     // Future hits are a fixed-history sensitivity assumption, not guaranteed.
     Some(ViewCosts {
         keep: horizon_cost(
             keep_first,
             kt,
-            if kt >= 1024.0 { kr.cached } else { kr.input },
+            if minimum.is_some_and(|min| kt >= min) {
+                kr.cached
+            } else {
+                kr.input
+            },
             requests,
         ),
         compact: horizon_cost(
             compact_first,
             ct,
-            if ct >= 1024.0 { cr.cached } else { cr.input },
+            if minimum.is_some_and(|min| ct >= min) {
+                cr.cached
+            } else {
+                cr.input
+            },
             requests,
         ),
     })

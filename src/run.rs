@@ -456,6 +456,9 @@ impl CacheTracker {
             breakpoints.drain(..breakpoints.len() - max_read_breakpoints);
         }
         CompactionPolicy {
+            cache_ratios: carry::models::Rates::for_model("gpt-6-sol", 0.0)
+                .unwrap()
+                .cache_ratios(),
             implicit_cached_tokens: if implicit_prefix_compatible
                 && cache_alive(self.implicit_activity, now)
             {
@@ -1132,11 +1135,21 @@ fn select_compaction_plan(
     cache: &CacheTracker,
     config: &RunConfig,
 ) -> Option<(CompactionPlan, Option<FlatRolloutEstimate>)> {
-    let policy = cache.policy_for_history(
+    let mut policy = cache.policy_for_history(
         &state.input_items(),
         config.compaction_payoff_requests,
         config.compaction_min_payback_percent,
     );
+    // Scripted offline runs retain the reference economics used by their fixtures.
+    let priced_model = if config.model == "scripted" {
+        "gpt-6-sol"
+    } else {
+        &config.model
+    };
+    carry::models::model_spec(priced_model)?.cache?;
+    policy.cache_ratios =
+        carry::models::Rates::for_model(priced_model, state.estimated_tokens() as f64)?
+            .cache_ratios();
     if config.compaction_rollout_samples > 0 {
         let rollout_config = FlatRolloutConfig {
             samples: config.compaction_rollout_samples,
