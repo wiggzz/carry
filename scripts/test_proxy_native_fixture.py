@@ -233,14 +233,14 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 provider.advice = lambda review: {'protected': [], 'removable': [], 'memories': []}
                 contract_send(url, body)
             self.assertEqual(len(provider.shadow), 3)
-            self.assertEqual([json.dumps(r).count('RESULT_A') for r in provider.shadow], [500] * 3,
-                             'partial cohort extension must not re-copy earlier member payloads')
+            self.assertEqual([json.dumps(r).count('RESULT_A') for r in provider.shadow], [0, 500, 500],
+                             'incomplete tool cohorts must be withheld until every result arrives')
             self.assertEqual([json.dumps(r).count('RESULT_B') for r in provider.shadow], [0, 500, 500])
             for index, review in enumerate(provider.shadow):
                 records = wire_data(review)
                 blocks = [r for r in records if 'items' in r and r['group_id'] == 'g3']
                 self.assertEqual([r['member_ids'] for r in blocks],
-                                 [[3, 4, 5]] if index == 0 else [[3, 4, 5], [6]])
+                                 [] if index == 0 else [[3, 4, 5, 6]])
                 tail = records[-1]
                 self.assertEqual(tail['eligible_group_ids'], ['g1'] if index < 2 else ['g1', 'g3'])
                 self.assertEqual(tail['current_groups'][0]['opinion'], [None, 'keep', 'drop'][index])

@@ -21,6 +21,7 @@ pub(super) struct Group {
     pub id: u64,
     pub members: Vec<u64>,
     pub pinned: bool,
+    pub replayable: bool,
     pub exposed: bool,
     pub human: bool,
 }
@@ -138,7 +139,7 @@ fn identity(value: &Value) -> Value {
     let mut v = value.clone();
     if matches!(
         v["type"].as_str(),
-        Some("message" | "function_call" | "reasoning")
+        Some("message" | "function_call" | "custom_tool_call" | "reasoning")
     ) {
         if let Some(object) = v.as_object_mut() {
             object.retain(|key, value| {
@@ -226,15 +227,15 @@ impl Session {
         for (offset, value) in suffix.iter().enumerate() {
             self.next_id += 1;
             let id = self.next_id;
-            let assistant = matches!(value["type"].as_str(), Some("function_call" | "reasoning"))
-                || value["role"] == "assistant"
+            let assistant = matches!(
+                value["type"].as_str(),
+                Some("function_call" | "custom_tool_call" | "reasoning")
+            ) || value["role"] == "assistant"
                 || (pending_echoed && offset < pending.len());
             let cohort = if assistant {
                 *assistant_cohort.get_or_insert(id)
             } else {
-                if value["type"] != "function_call_output" {
-                    assistant_cohort = None;
-                }
+                assistant_cohort = None;
                 id
             };
             self.history.push(Item {
@@ -324,17 +325,47 @@ impl Session {
         let mut cohorts = BTreeMap::new();
         let mut calls = BTreeMap::<String, Vec<usize>>::new();
         let mut results = BTreeMap::<String, Vec<usize>>::new();
+        let mut native_assistant = None;
         for (index, item) in live.iter().enumerate() {
             let ty = item.value["type"].as_str().unwrap_or("message");
+            // Reconstruct known native cohorts as well as using persisted ones:
+            // checkpoints written before custom-tool support split those steps.
+            if matches!(ty, "reasoning" | "function_call" | "custom_tool_call")
+                || item.value["role"] == "assistant"
+            {
+                if let Some(prior) = native_assistant {
+                    join(&mut parent, prior, index);
+                }
+                native_assistant = Some(index);
+            } else {
+                native_assistant = None;
+            }
             // Securely echoed provider outputs share a cohort even when a new
             // opaque output type is unknown. Its pin applies to the whole unit.
             if let Some(prior) = cohorts.insert(item.cohort, index) {
-                join(&mut parent, prior, index);
+                let known = |value: &Value| {
+                    matches!(
+                        value["type"].as_str().unwrap_or("message"),
+                        "message"
+                            | "reasoning"
+                            | "function_call"
+                            | "function_call_output"
+                            | "custom_tool_call"
+                            | "custom_tool_call_output"
+                    )
+                };
+                // Legacy cohorts sometimes span several completed steps. Their
+                // known items are grouped by native order and call IDs instead.
+                if !known(&item.value) || !known(&live[prior].value) {
+                    join(&mut parent, prior, index);
+                }
             }
             if let Some(call_id) = item.value["call_id"].as_str() {
                 match ty {
-                    "function_call" => calls.entry(call_id.into()).or_default().push(index),
-                    "function_call_output" => {
+                    "function_call" | "custom_tool_call" => {
+                        calls.entry(call_id.into()).or_default().push(index)
+                    }
+                    "function_call_output" | "custom_tool_call_output" => {
                         results.entry(call_id.into()).or_default().push(index)
                     }
                     _ => {}
@@ -366,6 +397,7 @@ impl Session {
                     id: live[indices[0]].id,
                     members: Vec::new(),
                     pinned: false,
+                    replayable: true,
                     exposed: true,
                     human: false,
                 };
@@ -394,13 +426,24 @@ impl Session {
                                 })
                             });
                         }
-                        "function_call" | "function_call_output" => {
+                        "function_call"
+                        | "function_call_output"
+                        | "custom_tool_call"
+                        | "custom_tool_call_output" => {
                             call = true;
                             let id = v["call_id"].as_str().unwrap_or("");
-                            group.pinned |= id.is_empty()
-                                || calls.get(id).map(Vec::len) != Some(1)
-                                || results.get(id).map(Vec::len) != Some(1);
-                            group.pinned |= v.get("status").is_some_and(|s| s != "completed");
+                            let paired = !id.is_empty()
+                                && calls.get(id).map(Vec::len) == Some(1)
+                                && results.get(id).map(Vec::len) == Some(1)
+                                && calls.get(id).zip(results.get(id)).is_some_and(|(a, b)| {
+                                    let call = &live[a[0]].value;
+                                    let result = &live[b[0]].value;
+                                    result["type"]
+                                        == format!("{}_output", call["type"].as_str().unwrap())
+                                });
+                            group.replayable &=
+                                paired && v.get("status").is_none_or(|s| s == "completed");
+                            group.pinned |= !group.replayable;
                             group.pinned |= v["output"].as_array().is_some_and(|blocks| {
                                 blocks.iter().any(|b| {
                                     !matches!(
@@ -412,6 +455,7 @@ impl Session {
                         }
                         "reasoning" => {
                             reasoning = true;
+                            group.replayable &= v.get("status").is_none_or(|s| s == "completed");
                             group.pinned |= v.get("status").is_some_and(|s| s != "completed");
                         }
                         _ => group.pinned = true,
@@ -457,12 +501,49 @@ impl Session {
     }
 
     pub fn shadow_input_for_groups(&self, groups: &[Group]) -> Vec<Value> {
-        let mut input = self
+        let replayable = self
+            .groups()
+            .into_iter()
+            .filter(|g| g.replayable)
+            .map(|g| g.id)
+            .collect::<HashSet<_>>();
+        // A later observation may finish a previously pending tool step. Merge
+        // its native items before annotating so no user note separates the pair.
+        let mut sources = Vec::<(u64, Value)>::new();
+        for record in self
             .active_shadow
             .iter()
-            .filter(|r| r.source_id != 0)
-            .chain(self.active_shadow.iter().filter(|r| r.source_id == 0))
-            .flat_map(|r| reviewer_source_items(&r.value))
+            .filter(|r| r.source_id != 0 && replayable.contains(&r.source_id))
+        {
+            let data = record.value["content"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok());
+            if let Some(data) = data {
+                if let Some((_, prior)) = sources.iter_mut().find(|(id, _)| *id == record.source_id)
+                {
+                    for field in ["items", "member_ids"] {
+                        if let Some(values) = data[field].as_array()
+                            && let Some(target) = prior[field].as_array_mut()
+                        {
+                            target.extend(values.iter().cloned());
+                        }
+                    }
+                } else {
+                    sources.push((record.source_id, data));
+                }
+            }
+        }
+        let mut input = sources
+            .into_iter()
+            .flat_map(|(_, data)| {
+                reviewer_source_items(&json!({"role":"user","content":data.to_string()}))
+            })
+            .chain(
+                self.active_shadow
+                    .iter()
+                    .filter(|r| r.source_id == 0)
+                    .flat_map(|r| reviewer_source_items(&r.value)),
+            )
             .collect::<Vec<_>>();
         let eligible = groups
             .iter()
@@ -516,6 +597,19 @@ impl Session {
                 json!(json!({"source_ids": sources, "text": memory.text}).to_string());
         }
         for group in groups {
+            // Repairing legacy split cohorts must preserve protection. Consume
+            // the old member opinions so a later review can release the group.
+            let protected = group.members.iter().any(|id| {
+                self.opinions
+                    .get(id)
+                    .is_some_and(|opinion| opinion == "keep")
+            });
+            for id in group.members.iter().filter(|id| **id != group.id) {
+                self.opinions.remove(id);
+            }
+            if protected {
+                self.opinions.insert(group.id, "keep".into());
+            }
             // A growing parallel cohort keeps one coupled selection map. Source
             // observations remain immutable; current membership lives in the tail.
             for record in &mut self.active_shadow {
@@ -868,6 +962,119 @@ fn parse_group(value: &Value) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consecutive_completed_tool_steps_keep_independent_context_ids() {
+        let mut state = Session::default();
+        let mut input = vec![json!({"role":"user","content":"goal"})];
+        for id in ["a", "b"] {
+            input.extend([
+                json!({"type":"reasoning","encrypted_content":id,"summary":[]}),
+                json!({"type":"custom_tool_call","call_id":id,"name":"inspect","input":"source"}),
+                json!({"type":"custom_tool_call_output","call_id":id,"output":"result"}),
+            ]);
+        }
+        input.push(json!({"role":"user","content":"current"}));
+        state.ingest(&input).unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        let groups = state.groups();
+        assert_eq!(
+            groups.iter().map(|g| g.members.clone()).collect::<Vec<_>>(),
+            vec![vec![1], vec![2, 3, 4], vec![5, 6, 7], vec![8]]
+        );
+        state
+            .apply_advice(
+                &groups,
+                &json!({"protected":["g2"],"removable":["g5"],"memories":[]}),
+            )
+            .unwrap();
+        state.remove(&[5], &groups);
+        assert_eq!(
+            state.render_primary(),
+            [input[..4].to_vec(), input[7..].to_vec()].concat()
+        );
+    }
+
+    #[test]
+    fn legacy_custom_tool_cohorts_are_repaired_before_review() {
+        let mut state = Session::default();
+        state
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                json!({"type":"reasoning","encrypted_content":"opaque","summary":[]}),
+                json!({"type":"custom_tool_call","call_id":"a","name":"inspect","input":"source"}),
+                json!({"type":"custom_tool_call_output","call_id":"a","output":"result"}),
+                json!({"role":"user","content":"current"}),
+            ])
+            .unwrap();
+        // Older checkpoints classified custom calls as unknown items.
+        for item in &mut state.history {
+            item.cohort = item.id;
+            item.exposed = true;
+        }
+        state.opinions.insert(2, "drop".into());
+        state.opinions.insert(3, "keep".into());
+        let mut state: Session =
+            serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+        let groups = state.groups();
+        let step = groups.iter().find(|g| g.id == 2).unwrap();
+        assert_eq!(step.members, vec![2, 3, 4]);
+        assert!(!step.pinned);
+        state.observe_groups(&groups);
+        assert_eq!(
+            state.opinions.get(&2).map(String::as_str),
+            Some("keep"),
+            "cohort repair must preserve prior protection on any member"
+        );
+    }
+
+    #[test]
+    fn custom_tool_step_is_atomic_and_an_incomplete_step_is_not_replayed() {
+        let mut state = Session::default();
+        let reasoning = json!({"type":"reasoning","id":"rs_custom","summary":[],"encrypted_content":"CUSTOM_REASONING"});
+        let call = json!({"type":"custom_tool_call","id":"ctc_custom","call_id":"custom-a","name":"inspect","input":"inspect source"});
+        let output =
+            json!({"type":"custom_tool_call_output","call_id":"custom-a","output":"custom result"});
+        let incomplete = vec![
+            json!({"role":"user","content":"goal"}),
+            reasoning.clone(),
+            call.clone(),
+        ];
+        state.ingest(&incomplete).unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        state.observe_groups(&state.groups());
+        assert!(
+            !state.shadow_input().contains(&call),
+            "unmatched calls must never reach native replay"
+        );
+        assert!(
+            !state.shadow_input().contains(&reasoning),
+            "withhold the whole unfinished reasoning/tool cohort"
+        );
+        let mut complete = incomplete;
+        complete.extend([output.clone(), json!({"role":"user","content":"current"})]);
+        state.ingest(&complete).unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        let groups = state.groups();
+        let step = groups.iter().find(|g| g.id == 2).unwrap();
+        assert_eq!(step.members, vec![2, 3, 4]);
+        assert!(!step.pinned);
+        state.observe_groups(&groups);
+        let wire = state.shadow_input();
+        let at = wire.iter().position(|item| item == &reasoning).unwrap();
+        assert_eq!(&wire[at..at + 3], &[reasoning, call, output]);
+        state.remove(&[2], &groups);
+        assert_eq!(
+            state.render_primary(),
+            vec![complete[0].clone(), complete[4].clone()]
+        );
+    }
 
     #[test]
     fn memory_retirement_frees_capacity_for_a_replacement_in_the_same_review() {
