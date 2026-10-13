@@ -140,8 +140,13 @@ schema reject the review; there is no silent unconstrained-output fallback.
 The primary request can continue unchanged.
 The newest live user group is pinned independently of reviewer advice.
 
-Long histories use the same chronological windowing path for bootstrap imports
-and oversized ongoing reviews. Each window contains complete atomic groups.
+Reviewer sweeps advance chronologically through complete atomic groups. Window
+ends are chosen at retention-signal changes, human/tool boundaries, compatible
+previous cache boundaries, or the request capacity frontier. Among those choices,
+the planner minimizes modeled reviewer cost per estimated token of actionable
+source coverage over the configured payoff/cadence horizon, including shared
+instructions, mutable suffix and bounded output. This is a local heuristic, not
+a globally optimal partition or a prediction of future provider cache hits.
 Each rendered reviewer request, including instructions, schema, ledger and
 carried memories, is bounded by `--classifier-max-input-tokens` (default 120,000).
 A simple local `o200k_base` tokenizer over rendered JSON replaces bytes/4 for
@@ -152,14 +157,22 @@ for the observed cost ledger, with cache fractions kept on one local estimate
 basis in the planner. Set the input budget conservatively for the model, leaving
 room for output and provider overhead; it is separate from the output cap.
 `--classifier-max-input-bytes` (default 8 MiB) remains a transport guard.
-Small ongoing views keep their existing single-call, stable-prefix behavior.
-When a full view exceeds either limit, it is reviewed in bounded windows instead
-of being rejected. A single oversized atomic group stays whole and protected;
+Both small and oversized views use this economic selection; the token and byte
+limits are capacity guards rather than the reason to split. There is no fixed
+group-count cutoff. Compatible receipts survive window rotation, including
+observed implicit reads on subscription routes. A cold read or an incompatible
+prefix receives no current cache credit. Future stable-prefix reuse remains an
+explicit sensitivity assumption. Oversized views are reviewed in bounded windows
+instead of being rejected. A single oversized atomic group stays whole and protected;
 it is skipped without a paid call or an invalid-review increment. Pinned-only
 windows likewise make no paid call. Earlier source windows retire from the
 active reviewer projection; canonical history, retention decisions and sourced
 memories remain checkpointed. Source observations stay immutable within an
-active window and are rebuilt from canonical history after retirement.
+active window and are rebuilt from canonical history after retirement. Legacy
+split cohorts are repaired in native source order with corrected annotation IDs.
+Primary cache receipts use bounded exact-prefix fingerprints; older prompt-copy
+checkpoints migrate on load. Memory retirement updates the scenario restoration
+delta separately from source-compaction counts.
 
 An ongoing sweep freezes the exposed-history frontier when it starts. Newer
 context waits for a later sweep, so a growing conversation cannot prevent the
@@ -175,7 +188,9 @@ and tool call/result items. Source IDs are appended to the last message text blo
 protocol/ciphertext items stay exact and receive an adjacent small metadata note.
 Primary system/developer source roles become reviewer user evidence, with original
 roles recorded in source metadata. Unknown native types use an opaque fallback.
-The final ledger exposes `eligible_memory_ids` and `current_memories`. Existing
+The final mutable ledger carries the latest native user task even when reviewing
+an older window, without rewriting the source prefix. It also exposes
+`eligible_memory_ids` and `current_memories`. Existing
 `m…` memory IDs can be protected or made removable independently of `g…` source
 groups. Protection wins conflicting opinions. Retirement removes the fact from
 both primary/reviewer views and its source anchor; IDs remain monotonic across
@@ -432,7 +447,7 @@ The local launcher's `--classifier-effort` maps to the actual Rust frontdoor fla
 - Container networking does not constrain provider-hosted retrieval. The benchmark's fresh/resumed Codex invocation explicitly sets `web_search="disabled"`, including custom command templates. Before creating an upstream request, the trusted gateway accepts only local `function`/`custom` tools and recursively compliant namespaces; hosted, unknown or malformed tool definitions are rejected, never stripped. Accepted native request/response bytes remain unchanged. Its request-body admission matches Carry's existing 16 MiB HTTP limit, separately from the 8 MiB telemetry capture budget. This benchmark policy does not change the generic opaque proxy's forwarding semantics or the convenience local launcher.
 - The evaluator receives no provider key. Exact container/network cleanup is bounded, verified, and fails closed when active-proxy absence cannot be proven.
 
-All six public proxy settings are carried through bootstrap, validated worker exports, runner provenance and immutable attempt-merge identity. Readiness checks the reported effective mode, and the workflow result gate compares every slot with the dispatched mode. `strict` rejects non-prefix native summary replacement with HTTP 409 in review modes. Explicit `reset-on-divergence` retires both active primary and shadow projections and accepts the replacement without inferring ancestry. Use the same policy in matched off/compact arms; off remains forwarding-only even under strict. Historical provenance missing only this setting normalizes to the historical `strict` default, never to reset. This does not authorize a paid dispatch or reuse of an old preparation catalog; candidate preparation and protected approval still belong to the operator.
+All eight public proxy settings are carried through bootstrap, validated worker exports, runner provenance and immutable attempt-merge identity. Readiness checks the reported effective mode, and the workflow result gate compares every slot with the dispatched mode. `strict` rejects non-prefix native summary replacement with HTTP 409 in review modes. Explicit `reset-on-divergence` retires both active primary and shadow projections and accepts the replacement without inferring ancestry. Use the same policy in matched off/compact arms; off remains forwarding-only even under strict. Historical provenance missing only this setting normalizes to the historical `strict` default, never to reset. This does not authorize a paid dispatch or reuse of an old preparation catalog; candidate preparation and protected approval still belong to the operator.
 
 ## Evidence and accounting
 

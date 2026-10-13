@@ -21,14 +21,15 @@ use axum::{
     routing::{get, post},
 };
 use carry::core::{
-    JointDecision, Rates, ViewCosts, horizon_cost, input_cost, joint_decision, prefix_compatible,
-    select_removals,
+    JointDecision, Rates, ViewCosts, horizon_cost, input_cost, joint_decision, select_removals,
 };
 use clap::{Parser, ValueEnum};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
+
+use crate::proxy_cache::serialized_identity as reviewer_serialized_identity;
 
 use crate::{
     proxy_sse::Observer,
@@ -133,6 +134,10 @@ struct Service {
     background_reviews: Mutex<HashSet<String>>,
     _directory_lock: File,
 }
+
+#[path = "proxy_review_window.rs"]
+mod review_window;
+use review_window::{ReviewWindow, select_review_window};
 
 type Failure = (StatusCode, axum::Json<Value>);
 
@@ -384,12 +389,20 @@ fn load(service: &Service, id: &str) -> Result<Session, Failure> {
     let path = service.config.state_dir.join(format!("{id}.json"));
     match std::fs::read(path) {
         Ok(bytes) if bytes.len() <= CHECKPOINT_MAX_BYTES => {
-            serde_json::from_slice(&bytes).map_err(|_| {
-                failure(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "invalid proxy checkpoint",
-                )
-            })
+            serde_json::from_slice::<Session>(&bytes)
+                .map(|mut session| {
+                    for evidence in &mut session.primary_cache {
+                        evidence.compact();
+                    }
+                    session.shadow_cache.clear();
+                    session
+                })
+                .map_err(|_| {
+                    failure(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "invalid proxy checkpoint",
+                    )
+                })
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Session::default()),
         _ => Err(failure(
@@ -1194,35 +1207,6 @@ fn reviewer_input(body: &Value) -> Option<Vec<Value>> {
 
 const REVIEWER_CACHE_MAX_BYTES: usize = 64 * 1024;
 
-// Stream exact serde JSON into SHA-256 instead of allocating a serialized copy
-// of each potentially multi-MiB prefix. The byte count also bounds evidence
-// with operator-supplied settings/destinations without a huge temporary Vec.
-struct ReviewerIdentityWriter {
-    digest: Sha256,
-    bytes: usize,
-}
-
-impl Write for ReviewerIdentityWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.digest.update(bytes);
-        self.bytes += bytes.len();
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn reviewer_serialized_identity<T: serde::Serialize + ?Sized>(value: &T) -> (usize, String) {
-    let mut writer = ReviewerIdentityWriter {
-        digest: Sha256::new(),
-        bytes: 0,
-    };
-    serde_json::to_writer(&mut writer, value).unwrap();
-    (writer.bytes, format!("{:x}", writer.digest.finalize()))
-}
-
 fn reviewer_boundary_matches(input: &[Value], boundary: &ReviewerCacheBoundary) -> bool {
     boundary.format_version == 1
         && boundary.input_len > 0
@@ -1256,6 +1240,31 @@ fn reviewer_markers(body: &Value) -> Vec<usize> {
         .collect()
 }
 
+fn reviewer_stable_end(body: &Value) -> usize {
+    let Some(input) = body["input"].as_array() else {
+        return 0;
+    };
+    let mut end = input.len().saturating_sub(1); // mutable ledger
+    while end > 0 {
+        let item = &input[end - 1];
+        let text = item["content"]
+            .as_str()
+            .or_else(|| item["content"][0]["text"].as_str());
+        let derived = text
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .is_some_and(|data| {
+                data["source_ids"].is_array()
+                    && data["text"].is_string()
+                    && data.get("items").is_none()
+            });
+        if item["role"] != "user" || !derived {
+            break;
+        }
+        end -= 1;
+    }
+    end
+}
+
 fn reviewer_prefix_estimate(body: &Value, end: usize) -> f64 {
     // Same local token basis as the full request, including static settings;
     // only actual input THROUGH the selected wire boundary, never its ledger.
@@ -1264,35 +1273,38 @@ fn reviewer_prefix_estimate(body: &Value, end: usize) -> f64 {
     estimate(&prefix)
 }
 
-fn reviewer_reusable(config: &ProxyCli, cache: &[ReviewerCacheBoundary], body: &Value) -> f64 {
-    if !classifier_cache_enabled(config).unwrap_or(false) {
-        return 0.0;
-    }
+fn reviewer_reusable_credit(
+    config: &ProxyCli,
+    cache: &[ReviewerCacheBoundary],
+    body: &Value,
+) -> f64 {
     let Some(input) = reviewer_input(body) else {
         return 0.0;
     };
     let base = reviewer_base(config, body);
     let points = reviewer_markers(body);
-    let reusable = cache
+    cache
         .iter()
         .filter(|e| {
             e.base == base
-                && points.contains(&e.input_len)
+                && (points.contains(&e.input_len)
+                    || (!classifier_cache_enabled(config).unwrap_or(false)
+                        && e.input_len <= reviewer_stable_end(body)))
                 && e.read_confirmed_at
                     .is_some_and(|at| now().saturating_sub(at) <= 1800)
                 && now().saturating_sub(e.at) <= 1800
                 && reviewer_boundary_matches(&input, e)
         })
-        .map(|e| {
-            e.read_estimated_tokens
-                .min(reviewer_prefix_estimate(body, e.input_len))
-        })
-        // Aggregate reads are never summed or multiplied across boundaries.
-        .fold(0.0, f64::max);
+        .map(|e| e.read_estimated_tokens)
+        .fold(0.0, f64::max)
+}
+
+fn reviewer_reusable(config: &ProxyCli, cache: &[ReviewerCacheBoundary], body: &Value) -> f64 {
+    let reusable = reviewer_reusable_credit(config, cache, body);
     if reusable > 0.0 {
         reusable.min(estimate(body))
     } else {
-        0.0 // No confirmed read: avoid tokenizing a potentially multi-MiB view.
+        0.0
     }
 }
 
@@ -1302,18 +1314,30 @@ fn observe_reviewer_cache(
     body: &Value,
     usage: &Value,
 ) {
-    if !classifier_cache_enabled(config).unwrap_or(false) {
-        return;
-    }
     let Some(input) = reviewer_input(body) else {
         return;
     };
-    let points = reviewer_markers(body);
+    let explicit = classifier_cache_enabled(config).unwrap_or(false);
+    let mut points = if explicit {
+        reviewer_markers(body)
+    } else {
+        vec![reviewer_stable_end(body)]
+    };
     let base = reviewer_base(config, body);
     let at = now();
-    cache.retain(|e| {
-        e.base == base && at.saturating_sub(e.at) <= 1800 && reviewer_boundary_matches(&input, e)
-    });
+    cache.retain(|e| e.base == base && at.saturating_sub(e.at) <= 1800);
+    if !explicit {
+        points.extend(
+            cache
+                .iter()
+                .filter(|e| {
+                    e.input_len <= reviewer_stable_end(body) && reviewer_boundary_matches(&input, e)
+                })
+                .map(|e| e.input_len),
+        );
+        points.sort_unstable();
+        points.dedup();
+    }
     if let (Some(total), Some(cached)) = (
         usage["input_tokens"].as_u64(),
         usage["input_tokens_details"]["cached_tokens"].as_u64(),
@@ -1327,10 +1351,13 @@ fn observe_reviewer_cache(
         let read = cache
             .iter()
             .enumerate()
-            .filter(|(_, e)| points.contains(&e.input_len))
+            .filter(|(_, e)| points.contains(&e.input_len) && reviewer_boundary_matches(&input, e))
             .max_by_key(|(_, e)| e.input_len)
             .map(|(index, _)| index);
-        for e in cache.iter_mut() {
+        for e in cache
+            .iter_mut()
+            .filter(|e| reviewer_boundary_matches(&input, e))
+        {
             e.read_estimated_tokens = 0.0;
             e.read_confirmed_at = None;
         }
@@ -1377,18 +1404,17 @@ fn reviewer_view_costs(
     let cost = |body: &Value| {
         let tokens = estimate(body);
         let rates = Rates::for_model(&config.classifier_model, tokens)?;
-        let prefix = if classifier_cache_enabled(config).unwrap_or(false) {
-            reviewer_input(body)?;
-            reviewer_markers(body)
-                .last()
-                .map_or(0.0, |end| reviewer_prefix_estimate(body, *end))
+        reviewer_input(body)?;
+        let prefix = reviewer_prefix_estimate(body, reviewer_stable_end(body));
+        let uncached = if classifier_cache_enabled(config).unwrap_or(false) {
+            rates.write
         } else {
-            0.0
+            rates.input
         };
         let first = input_cost(
             prefix,
-            reviewer_reusable(config, cache, body).min(prefix),
-            rates.write,
+            reviewer_reusable_credit(config, cache, body).min(prefix),
+            uncached,
             rates.cached,
         ) + (tokens - prefix).max(0.0) * rates.input;
         // Sensitivity only: discount the marked stable prefix, NEVER the
@@ -1412,9 +1438,14 @@ fn reviewer_view_costs(
             first + requests.saturating_sub(1) as f64 * future
         })
     };
+    let keep_cost = cost(keep)?;
     Some(ViewCosts {
-        keep: cost(keep)?,
-        compact: cost(compact)?,
+        keep: keep_cost,
+        compact: if keep == compact {
+            keep_cost
+        } else {
+            cost(compact)?
+        },
     })
 }
 
@@ -1450,7 +1481,7 @@ async fn dispatch_review(service: Arc<Service>, id: String, session: &mut Sessio
     {
         return;
     }
-    if !session.groups().iter().any(|g| g.exposed && !g.pinned) {
+    if !session.groups().iter().any(|g| g.exposed && !g.pinned) && session.memories.is_empty() {
         return;
     }
     if !service.background_reviews.lock().await.insert(id.clone()) {
@@ -1550,10 +1581,20 @@ fn merge_review(
         current.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"background advice discarded: main lineage, source membership or eligibility changed; review current sources again"}]});
         return;
     }
+    let before_memory_input = current.render_primary();
     current.opinions = reviewed.opinions.clone();
     current.memories = reviewed.memories.clone();
-    current.next_memory_id = reviewed.next_memory_id;
     current.memory_anchors = reviewed.memory_anchors.clone();
+    let after_memory_input = current.render_primary();
+    if before_memory_input != after_memory_input
+        && let Some(trajectory) = &mut current.cost_trajectory
+    {
+        trajectory.compacted(
+            estimate(&json!(before_memory_input)) as u64,
+            estimate(&json!(after_memory_input)) as u64,
+        );
+    }
+    current.next_memory_id = reviewed.next_memory_id;
     current.active_shadow = reviewed.active_shadow.clone();
     current.observed = reviewed.observed.clone();
     current.review_feedback = reviewed.review_feedback.clone();
@@ -1590,13 +1631,43 @@ async fn review(
         if !groups.iter().any(|g| g.exposed && !g.pinned) && session.memories.is_empty() {
             return false;
         }
-        // Preserve immutable observations and stable cache prefixes when the
-        // entire current view fits. Retired windows clear their observations,
-        // so this cannot expose a ledger without its corresponding sources.
+        // Preserve the immutable current view when it fits, including fresh
+        // evidence that is not yet eligible for removal. Split a fitting view
+        // only when a confirmed reusable boundary makes that choice cheaper.
         session.observe_groups(&groups);
         let body = review_body(&service.config, session);
         if review_fits(&service.config, &body) {
-            return review_chunk(service, id, session, &body, &groups, run).await;
+            let input = reviewer_input(&body).unwrap();
+            let end = reviewer_stable_end(&body);
+            let warm_cut = session.reviewer_cache.iter().any(|e| {
+                e.input_len < end
+                    && e.read_estimated_tokens > 0.0
+                    && e.read_confirmed_at
+                        .is_some_and(|at| now().saturating_sub(at) <= 1800)
+                    && reviewer_boundary_matches(&input, e)
+            });
+            let split_is_cheaper = warm_cut
+                && select_review_window(&service.config, session, &groups).is_some_and(|window| {
+                    window.groups.len() < groups.len()
+                        && reviewer_reusable(&service.config, &session.reviewer_cache, &window.body)
+                            > 0.0
+                        && review_window::window_score(
+                            &service.config,
+                            session,
+                            &window.body,
+                            &window.groups,
+                        )
+                        .zip(review_window::window_score(
+                            &service.config,
+                            session,
+                            &body,
+                            &groups,
+                        ))
+                        .is_some_and(|(split, whole)| split < whole)
+                });
+            if !split_is_cheaper {
+                return review_chunk(service, id, session, &body, &groups, run).await;
+            }
         }
     }
     review_windows(service, id, session, bootstrap, run).await
@@ -1614,9 +1685,8 @@ fn mark_reviewed(session: &mut Session, groups: &[Group], bootstrap: bool) {
     }
 }
 
-/// Bootstrap imports and oversized ongoing reviews share chronological windows
-/// of complete atomic groups. Canonical source and opinions stay checkpointed;
-/// old reviewer payloads retire, with sourced memories carried forward.
+/// Bootstrap and ongoing reviews share restart-safe sweeps. Window selection
+/// considers retention/cache boundaries; capacity only limits valid requests.
 async fn review_windows(
     service: &Service,
     id: &str,
@@ -1673,34 +1743,20 @@ async fn review_windows(
         if calls >= service.config.review_max_calls {
             break;
         }
-        let mut view = session.clone();
-        view.active_shadow.retain(|record| record.source_id == 0);
-        // Observations belong to the active window. Keep canonical IDs/opinions,
-        // but do not let retired observations suppress source reconstruction.
-        view.observed.clear();
-        let mut chunk = Vec::new();
-        let mut body = None;
-        for group in remaining.into_iter().take(128) {
-            let mut next = view.clone();
-            next.observe_groups(std::slice::from_ref(&group));
-            chunk.push(group.clone());
-            let request = review_body_for_groups(&service.config, &next, &chunk);
-            if !review_fits(&service.config, &request) {
-                chunk.pop();
-                if chunk.is_empty() {
-                    // Never split/truncate an atomic group, or dispatch an
-                    // oversized request. Keep this source and advance past it.
-                    session.opinions.insert(group.id, "keep".into());
-                    mark_reviewed(session, std::slice::from_ref(&group), bootstrap);
-                    session.active_shadow.retain(|record| record.source_id == 0);
-                    session.observed.clear();
-                }
-                break;
-            }
-            view = next;
-            body = Some(request);
-        }
-        let Some(body) = body else { continue };
+        let Some(ReviewWindow {
+            mut view,
+            groups: chunk,
+            body,
+        }) = select_review_window(&service.config, session, &remaining)
+        else {
+            // An indivisible source that exceeds capacity remains protected.
+            let group = &remaining[0];
+            session.opinions.insert(group.id, "keep".into());
+            mark_reviewed(session, std::slice::from_ref(group), bootstrap);
+            session.active_shadow.retain(|record| record.source_id == 0);
+            session.observed.clear();
+            continue;
+        };
         if !chunk.iter().any(|g| g.exposed && !g.pinned) {
             // Pinned-only windows have no actionable sources; no paid call.
             *session = view;
@@ -2088,12 +2144,8 @@ fn reusable(cache: &[CacheEvidence], body: &Value) -> f64 {
     let base = cache_base(body);
     cache
         .iter()
-        .filter(|e| {
-            e.base == base
-                && now().saturating_sub(e.at) <= 1800
-                && prefix_compatible(input, &e.input)
-        })
-        .map(|e| estimate(&json!(e.input)) * e.native_cached_fraction)
+        .filter(|e| now().saturating_sub(e.at) <= 1800 && e.matches(&base, input))
+        .map(|e| e.estimated_tokens() * e.native_cached_fraction)
         .fold(0.0, f64::max)
         .min(estimate(body))
 }
@@ -2113,12 +2165,15 @@ fn observe_cache(cache: &mut Vec<CacheEvidence>, body: &Value, usage: &Value) {
     }
     // Native receipts give a whole-input fraction, not per-item token counts.
     // Transfer that fraction to one consistent local tokenizer basis.
-    cache.push(CacheEvidence {
-        base: cache_base(body),
-        input: input.clone(),
-        at: now(),
-        native_cached_fraction: cached as f64 / total as f64,
-    });
+    for evidence in cache.iter_mut() {
+        evidence.compact();
+    }
+    cache.push(CacheEvidence::new(
+        &cache_base(body),
+        input,
+        now(),
+        cached as f64 / total as f64,
+    ));
     if cache.len() > 8 {
         cache.remove(0);
     }
@@ -2184,17 +2239,16 @@ fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Option<Session>,
         .collect::<HashSet<_>>();
     let mut candidates = vec![HashSet::new()];
     for evidence in &session.primary_cache {
-        if evidence.base == cache_base(body)
-            && now().saturating_sub(evidence.at) <= 1800
+        if now().saturating_sub(evidence.at) <= 1800
             && body["input"]
                 .as_array()
-                .is_some_and(|input| prefix_compatible(input, &evidence.input))
+                .is_some_and(|input| evidence.matches(&cache_base(body), input))
         {
             let frontier_ids = session
                 .history
                 .iter()
                 .filter(|i| !i.removed)
-                .take(evidence.input.len())
+                .take(evidence.input_len())
                 .map(|i| i.id)
                 .collect::<HashSet<_>>();
             candidates.push(
@@ -2424,7 +2478,13 @@ async fn relay(
             );
         }
         if let Some(mut commit) = commit {
-            let complete_transport = complete_transport && (!is_sse || sse_completed);
+            // A terminal SSE completion is authoritative even when the caller
+            // closes before HTTP EOF. Cancellation before it remains censored.
+            let complete_transport = if is_sse {
+                sse_completed
+            } else {
+                complete_transport
+            };
             let completed = observed.as_ref().is_some_and(|v| {
                 if commit.native {
                     // Native V1 may omit status; V2 still requires its real
@@ -2545,6 +2605,170 @@ async fn relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carry::core::prefix_compatible;
+
+    #[tokio::test]
+    async fn background_review_can_retire_memory_when_only_pinned_sources_remain() {
+        let router = Router::new().route("/review", post(|| async {
+            axum::Json(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":json!({"protected":[],"removable":["m1"],"memories":[]}).to_string()}]}],"usage":{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":0}}}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = checkpoint_service(directory.path());
+        service.config.classifier_url = Some(format!("http://{address}/review"));
+        let service = Arc::new(service);
+        let mut session = Session::default();
+        observe_source(&mut session, "obsolete evidence");
+        observe_source(&mut session, "current task");
+        let groups = session.groups();
+        session.apply_advice(&groups, &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g1"],"text":"obsolete memory"}]})).unwrap();
+        session.remove(&[1], &groups);
+        session.completed_requests = 1;
+        dispatch_review(
+            service.clone(),
+            "memory-only".into(),
+            &mut session,
+            json!({}),
+        )
+        .await;
+        assert!(
+            session.background_review_pending,
+            "memory review must dispatch without eligible source groups"
+        );
+        let mut saved = load(&service, "memory-only").unwrap();
+        for _ in 0..100 {
+            if !saved.background_review_pending {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            saved = load(&service, "memory-only").unwrap();
+        }
+        assert!(!saved.background_review_pending);
+        assert!(saved.memories.is_empty());
+        assert_eq!(saved.shadow.calls, 1);
+        provider.abort();
+    }
+
+    #[test]
+    fn implicit_reviewer_reads_credit_stable_sources_without_explicit_markers() {
+        let mut config = reviewer_config();
+        config.classifier_cache_policy = ClassifierCachePolicy::Disabled;
+        let mut session = Session::default();
+        observe_source(&mut session, &"stable source ".repeat(2000));
+        let body = review_body(&config, &session);
+        assert!(reviewer_markers(&body).is_empty());
+        observe_reviewer_cache(&config, &mut session.reviewer_cache, &body, &receipt(0));
+        assert_eq!(
+            reviewer_reusable(&config, &session.reviewer_cache, &body),
+            0.0
+        );
+        observe_reviewer_cache(&config, &mut session.reviewer_cache, &body, &receipt(9000));
+        assert!(reviewer_reusable(&config, &session.reviewer_cache, &body) > 0.0);
+    }
+
+    #[test]
+    fn reviewer_window_rotation_retains_other_exact_prefix_receipts() {
+        let config = reviewer_config();
+        let mut a = Session::default();
+        observe_source(&mut a, &"first window ".repeat(2000));
+        let mut b = Session::default();
+        observe_source(&mut b, &"other window ".repeat(2000));
+        let first = review_body(&config, &a);
+        let other = review_body(&config, &b);
+        let mut cache = Vec::new();
+        observe_reviewer_cache(&config, &mut cache, &first, &receipt(0));
+        observe_reviewer_cache(&config, &mut cache, &first, &receipt(9000));
+        let credit = reviewer_reusable(&config, &cache, &first);
+        observe_reviewer_cache(&config, &mut cache, &other, &receipt(0));
+        assert!(credit > 0.0);
+        assert_eq!(reviewer_reusable(&config, &cache, &first), credit);
+    }
+
+    #[test]
+    fn primary_cache_evidence_is_bounded_and_matches_only_exact_prefixes() {
+        let mut cache = Vec::new();
+        let mut body = json!({"model":"gpt-6-luna", "tools":[{"description":"tool schema ".repeat(2000)}], "input":[]});
+        for _ in 0..8 {
+            body["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":"source evidence ".repeat(2000)}));
+            observe_cache(
+                &mut cache,
+                &body,
+                &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":9000}}),
+            );
+        }
+        let bytes = serde_json::to_vec(&cache).unwrap();
+        assert!(
+            bytes.len() < 4096,
+            "cache evidence retained {} bytes of prompt copies",
+            bytes.len()
+        );
+        let restored: Vec<CacheEvidence> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reusable(&cache, &body), reusable(&restored, &body));
+        assert!(reusable(&restored, &body) > 0.0);
+        body["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"new suffix"}));
+        assert!(reusable(&restored, &body) > 0.0);
+        let mut changed = body.clone();
+        changed["tools"][0]["description"] = json!("changed tool schema");
+        assert_eq!(reusable(&restored, &changed), 0.0);
+        body["input"][0]["content"] = json!("rewritten source");
+        assert_eq!(reusable(&restored, &body), 0.0);
+    }
+
+    #[test]
+    fn primary_cache_migrates_legacy_prompt_copies_without_losing_credit() {
+        let body = json!({"model":"gpt-6-luna", "input":[{"role":"user","content":"large legacy source ".repeat(2000)}]});
+        let mut cache: Vec<CacheEvidence> = serde_json::from_value(json!([{"base":cache_base(&body),"input":body["input"],"at":now(),"native_cached_fraction":0.9}])).unwrap();
+        let prior = reusable(&cache, &body);
+        observe_cache(
+            &mut cache,
+            &body,
+            &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":9000}}),
+        );
+        assert_eq!(reusable(&cache, &body), prior);
+        assert!(serde_json::to_vec(&cache).unwrap().len() < 4096);
+    }
+
+    #[test]
+    fn review_windows_choose_a_cached_retention_boundary_over_a_larger_cold_view() {
+        let mut config = reviewer_config();
+        config.classifier_model = "gpt-6.1-sol".into();
+        config.classifier_max_input_tokens = 300000;
+        let mut session = Session::default();
+        for n in 0..10 {
+            observe_source(
+                &mut session,
+                &format!("source {n} {}", "evidence ".repeat(20000)),
+            );
+        }
+        let groups = session.groups();
+        for (index, group) in groups.iter().enumerate() {
+            session
+                .opinions
+                .insert(group.id, if index < 5 { "keep" } else { "drop" }.into());
+        }
+        let mut first = session.clone();
+        first.active_shadow.clear();
+        first.observed.clear();
+        first.observe_groups(&groups[..5]);
+        let body = review_body_for_groups(&config, &first, &groups[..5]);
+        observe_reviewer_cache(&config, &mut session.reviewer_cache, &body, &receipt(0));
+        observe_reviewer_cache(&config, &mut session.reviewer_cache, &body, &receipt(9000));
+        let selected = select_review_window(&config, &session, &groups).unwrap();
+        assert_eq!(
+            selected.groups.len(),
+            5,
+            "use warm protected-source boundary rather than repay cold released-source input"
+        );
+        assert!(reviewer_reusable(&config, &session.reviewer_cache, &selected.body) > 0.0);
+    }
 
     fn reviewer_config() -> ProxyCli {
         ProxyCli::try_parse_from([
@@ -2928,7 +3152,12 @@ mod tests {
             &plain,
             &receipt(10000),
         );
-        assert!(session.reviewer_cache.is_empty());
+        assert!(
+            session
+                .reviewer_cache
+                .iter()
+                .all(|e| e.read_confirmed_at.is_none())
+        );
         assert_eq!(
             reviewer_reusable(&config, &session.reviewer_cache, &plain),
             0.0
@@ -3210,8 +3439,8 @@ mod tests {
             &receipt(2048),
         );
         assert!(
-            session.reviewer_cache.iter().all(|e| e.input_len == 3),
-            "removed cohort boundaries cannot re-enter the active request"
+            reviewer_markers(&pruned).iter().all(|end| *end == 3),
+            "retained incompatible receipts cannot place marks on removed source"
         );
         session
             .ingest_with_rebase(&[json!({"role": "user", "content": "new branch"})], true)
@@ -3361,12 +3590,12 @@ mod tests {
         let mut session = Session::default();
         observe_source(&mut session, "legacy source");
         let body = review_body(&config, &session);
-        session.shadow_cache.push(CacheEvidence {
-            base: cache_base(&body),
-            input: body["input"].as_array().unwrap().clone(),
-            at: now(),
-            native_cached_fraction: 1.0,
-        });
+        session.shadow_cache.push(CacheEvidence::legacy(
+            cache_base(&body),
+            body["input"].as_array().unwrap().clone(),
+            now(),
+            1.0,
+        ));
         let mut legacy = serde_json::to_value(&session).unwrap();
         legacy.as_object_mut().unwrap().remove("reviewer_cache");
         let resumed: Session = serde_json::from_value(legacy).unwrap();

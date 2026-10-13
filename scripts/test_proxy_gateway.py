@@ -49,6 +49,38 @@ class Provider:
 
 
 class TrustedGatewayTests(unittest.TestCase):
+    def test_tool_telemetry_counts_custom_calls_and_completed_stream_items(self):
+        items = [{'type': 'function_call', 'call_id': 'function-a', 'arguments': CANARY},
+                 {'type': 'custom_tool_call', 'call_id': 'custom-a', 'input': CANARY}]
+        response = {'id': 'tool-telemetry', 'model': 'gpt-6-luna', 'status': 'completed',
+                    'usage': {'input_tokens': 100, 'output_tokens': 10,
+                              'input_tokens_details': {'cached_tokens': 0}}}
+        payloads = [('json', json.dumps({**response, 'output': items}).encode())]
+        for terminal_output in ([], None, items):
+            terminal = dict(response)
+            if terminal_output is not None:
+                terminal['output'] = terminal_output
+            events = [{'type': 'response.output_item.done', 'output_index': index, 'item': item}
+                      for index, item in enumerate(items)]
+            # Duplicate done events and full terminal output must not double-count tools.
+            events.append(events[-1])
+            events.append({'type': 'response.completed', 'response': terminal})
+            payloads.append((f'sse-{terminal_output}', ''.join(
+                'data: ' + json.dumps(event) + '\n\n' for event in events).encode()))
+        for case, reply in payloads:
+            with self.subTest(case=case), Provider(response_bytes=reply) as provider:
+                gateway = Gateway(provider.server.server_port, provider.server.server_port)
+                try:
+                    status, raw = gateway.request(b'{"model":"gpt-6-luna","input":[]}')
+                    self.assertEqual(status, 200)
+                    self.assertEqual(raw, reply)
+                finally:
+                    gateway.close()
+                completed = [event for event in gateway.events if event['event'] == 'completed']
+                self.assertEqual(len(completed), 1)
+                self.assertEqual(completed[0]['tool_calls'], 2)
+                self.assertNotIn(CANARY, gateway.stdout + gateway.stderr)
+
     def request_path(self, gateway, body, path, token='fixture-client'):
         request = urllib.request.Request(gateway.url + path, data=body,
             headers={'Authorization': 'Bearer ' + token})

@@ -39,13 +39,7 @@ pub(super) struct Memory {
     pub text: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(super) struct CacheEvidence {
-    pub base: Value,
-    pub input: Vec<Value>,
-    pub at: u64,
-    pub native_cached_fraction: f64,
-}
+pub(super) use crate::proxy_cache::CacheEvidence;
 
 /// Reviewer-only boundary requested on the actual wire. A requested write is
 /// NOT proof of a provider write; economic credit requires a confirmed read.
@@ -559,6 +553,7 @@ impl Session {
             .collect::<Vec<_>>();
         input.push(json!({"role": "user", "content": json!({
             "eligible_group_ids": eligible, "current_groups": ledger,
+            "current_task": self.history.iter().rev().find(|item| !item.removed && item.value["role"] == "user").map(|item| &item.value),
             "eligible_memory_ids": self.memories.iter().map(|m| format!("m{}", m.id)).collect::<Vec<_>>(),
             "current_memories": self.memories.iter().map(|m| json!({"memory_id":format!("m{}",m.id),"source_ids":m.source_ids.iter().map(|id|format!("g{id}")).collect::<Vec<_>>(),"text":m.text})).collect::<Vec<_>>(),
             "previous_review_feedback": self.review_feedback
@@ -610,13 +605,28 @@ impl Session {
             if protected {
                 self.opinions.insert(group.id, "keep".into());
             }
-            // A growing parallel cohort keeps one coupled selection map. Source
-            // observations remain immutable; current membership lives in the tail.
-            for record in &mut self.active_shadow {
-                if group.members.contains(&record.source_id) {
-                    record.source_id = group.id;
-                }
+            // A legacy split cohort can retain a later member's observation
+            // while its earlier reasoning window has retired. Rebuild that
+            // group in canonical order, including its current annotation ID.
+            let rebuild_at = self
+                .active_shadow
+                .iter()
+                .any(|record| {
+                    record.source_id != group.id && group.members.contains(&record.source_id)
+                })
+                .then(|| {
+                    self.active_shadow
+                        .iter()
+                        .position(|record| group.members.contains(&record.source_id))
+                        .unwrap()
+                });
+            if rebuild_at.is_some() {
+                self.active_shadow
+                    .retain(|record| !group.members.contains(&record.source_id));
+                self.observed.retain(|id, _| !group.members.contains(id));
             }
+            // Ordinary growing cohorts keep immutable observations; current
+            // membership lives in the ledger and new members append below.
             for id in &group.members {
                 if let Some(owner) = self.observed.get_mut(id) {
                     *owner = group.id.to_string();
@@ -637,10 +647,15 @@ impl Session {
                 .collect::<Vec<_>>();
             let data = json!({"group_id": format!("g{}", group.id), "member_ids": member_ids,
                 "items": values, "human": group.human});
-            self.active_shadow.push(ShadowRecord {
+            let record = ShadowRecord {
                 source_id: group.id,
                 value: json!({"role": "user", "content": data.to_string()}),
-            });
+            };
+            if let Some(index) = rebuild_at {
+                self.active_shadow.insert(index, record);
+            } else {
+                self.active_shadow.push(record);
+            }
             for id in member_ids {
                 self.observed.insert(id, group.id.to_string());
             }
@@ -786,6 +801,9 @@ impl Session {
         } else {
             reject("memories", 0, "expected an array of at most 64 memories");
         }
+        let primary_before = (self.cost_trajectory.is_some()
+            && (!memories.is_empty() || memory_updates.values().any(|opinion| *opinion == "drop")))
+        .then(|| self.render_primary());
         self.review_feedback = json!({"accepted_opinions":updates.len() + memory_updates.len(), "accepted_memories":memories.len(),
             "rejected_count":rejected_count, "rejected":rejected,
             "guidance":"Accepted items were applied. Correct rejected items in a future review using the current eligible ledger; do not repeat accepted memories."});
@@ -863,6 +881,18 @@ impl Session {
                 source_id: 0,
                 value: json!({"role": "user", "content": json!({"source_ids": provenance, "text": text}).to_string()}),
             });
+        }
+        if let Some(before) = primary_before {
+            let after = self.render_primary();
+            // Visible memory edits belong to Carry, not the traditional
+            // counterfactual. Even an equal-size edit breaks prefix reuse.
+            if before != after
+                && let Some(trajectory) = &mut self.cost_trajectory
+            {
+                let before = crate::proxy_savings::token_units(&json!(before));
+                let after = crate::proxy_savings::token_units(&json!(after));
+                trajectory.compacted(before, after);
+            }
         }
         Ok(())
     }
@@ -1028,6 +1058,121 @@ mod tests {
             Some("keep"),
             "cohort repair must preserve prior protection on any member"
         );
+    }
+
+    #[test]
+    fn retiring_visible_memory_restores_the_traditional_scenario_input() {
+        let mut state = Session {
+            cost_trajectory: Some(crate::proxy_savings::Trajectory::default()),
+            ..Session::default()
+        };
+        state
+            .ingest(&[
+                json!({"role":"user","content":"old source"}),
+                json!({"role":"user","content":"current task"}),
+            ])
+            .unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        let groups = state.groups();
+        state.apply_advice(&groups, &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g1"],"text":"historical learning"}]})).unwrap();
+        let trajectory = serde_json::to_value(state.cost_trajectory.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            trajectory["carry_edited"], false,
+            "an invisible memory does not alter the primary"
+        );
+        state.remove(&[1], &groups);
+        let before = crate::proxy_savings::token_units(&json!(state.render_primary()));
+        state
+            .apply_advice(
+                &state.groups(),
+                &json!({"protected":[],"removable":["m1"],"memories":[]}),
+            )
+            .unwrap();
+        let after = crate::proxy_savings::token_units(&json!(state.render_primary()));
+        let trajectory = serde_json::to_value(state.cost_trajectory.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            trajectory["restored"],
+            json!(before as i128 - after as i128)
+        );
+        assert_eq!(trajectory["carry_edited"], true);
+        assert_eq!(state.compactions, 0);
+    }
+
+    #[test]
+    fn historical_reviewer_window_receives_latest_task_in_mutable_ledger() {
+        let mut state = Session::default();
+        let task = json!({"type":"message","role":"user","content":[{"type":"input_text","text":"new task"}]});
+        state
+            .ingest(&[
+                json!({"role":"user","content":"original task"}),
+                json!({"role":"assistant","content":"historical finding"}),
+                task.clone(),
+            ])
+            .unwrap();
+        let historical = state
+            .groups()
+            .into_iter()
+            .filter(|group| group.id < 3)
+            .collect::<Vec<_>>();
+        state.observe_groups(&historical);
+        let before = state.shadow_input_for_groups(&historical);
+        let ledger: Value =
+            serde_json::from_str(before.last().unwrap()["content"].as_str().unwrap()).unwrap();
+        assert_eq!(ledger["current_task"], task);
+
+        let replacement = json!({"role":"user","content":"another task"});
+        state.history.last_mut().unwrap().value = replacement.clone();
+        let after = state.shadow_input_for_groups(&historical);
+        assert_eq!(&before[..before.len() - 1], &after[..after.len() - 1]);
+        let ledger: Value =
+            serde_json::from_str(after.last().unwrap()["content"].as_str().unwrap()).unwrap();
+        assert_eq!(ledger["current_task"], replacement);
+    }
+
+    #[test]
+    fn legacy_retained_shadow_repairs_source_order_and_annotation() {
+        let mut state = Session::default();
+        let reasoning = json!({"type":"reasoning","encrypted_content":"opaque","summary":[]});
+        let call =
+            json!({"type":"custom_tool_call","call_id":"a","name":"inspect","input":"source"});
+        let output = json!({"type":"custom_tool_call_output","call_id":"a","output":"result"});
+        state
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                reasoning.clone(),
+                call.clone(),
+                output.clone(),
+                json!({"role":"user","content":"current"}),
+            ])
+            .unwrap();
+        for item in &mut state.history {
+            item.cohort = item.id;
+            item.exposed = true;
+        }
+        // A former reviewer window retained the call and result, but retired
+        // the earlier reasoning window before native cohort repair existed.
+        for (id, item) in [(3, call.clone()), (4, output.clone())] {
+            state.active_shadow.push(ShadowRecord {
+                source_id: id,
+                value: json!({"role":"user","content":json!({"group_id":format!("g{id}"),"member_ids":[id],"items":[item],"human":false}).to_string()}),
+            });
+            state.observed.insert(id, id.to_string());
+        }
+        state.observe_groups(&state.groups());
+        let wire = state.shadow_input();
+        let at = wire.iter().position(|item| item == &reasoning).unwrap();
+        assert_eq!(&wire[at..at + 3], &[reasoning, call, output]);
+        let metadata = wire[at + 3]["content"]
+            .as_str()
+            .unwrap()
+            .split("[carry context] ")
+            .nth(1)
+            .unwrap();
+        let metadata: Value = serde_json::from_str(metadata).unwrap();
+        assert_eq!(metadata["group_id"], "g2");
+        assert_eq!(metadata["member_ids"], json!([2, 3, 4]));
     }
 
     #[test]
@@ -1502,12 +1647,7 @@ mod tests {
         state.observe_groups(&groups);
         state.apply_advice(&groups, &json!({"protected": ["g1"], "removable": ["g2"], "memories": [{"source_ids": ["g2"], "text": "old derived memory"}]})).unwrap();
         state.remove(&[2], &groups);
-        let evidence = CacheEvidence {
-            base: json!({"model": "gpt-6-luna"}),
-            input,
-            at: 1,
-            native_cached_fraction: 1.0,
-        };
+        let evidence = CacheEvidence::legacy(json!({"model": "gpt-6-luna"}), input, 1, 1.0);
         state.primary_cache.push(evidence.clone());
         state.shadow_cache.push(evidence);
         state.review_end_id = state.next_id;

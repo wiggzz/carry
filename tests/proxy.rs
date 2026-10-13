@@ -1147,6 +1147,15 @@ async fn fixture(advice: serde_json::Value) -> Fixture {
                         let chunks = bytes.chunks(3).map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk))).collect::<Vec<_>>();
                         ([ ("content-type", "text/event-stream"), ("x-fixture-native", "unchanged") ], Body::from_stream(tokio_stream::iter(chunks))).into_response()
                     }
+                    Some("completed_sse_open") => {
+                        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+                        tokio::spawn(async move {
+                            let _ = sender.send(Ok(Bytes::from_static(COMPLETED_SSE.as_bytes()))).await;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            drop(sender);
+                        });
+                        ([("content-type", "text/event-stream")], Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver))).into_response()
+                    }
                     Some("cancellable_sse") => {
                         let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
                         tokio::spawn(async move {
@@ -1828,6 +1837,40 @@ async fn unsupported_stateful_review_and_retrieval_fail_explicitly() {
         reqwest::StatusCode::NOT_IMPLEMENTED
     );
     assert!(fixture.requests.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn client_close_after_terminal_completion_commits_exposure_without_http_eof() {
+    let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
+    let state = tempfile::tempdir().unwrap();
+    let (_proxy, url) = start_proxy(state.path(), fixture.address, "off").await;
+    let request = json!({"model": "gpt-6-luna", "input": [{"role": "user", "content": "goal"}],
+        "stream": true, "metadata": {"scenario": "completed_sse_open"}});
+    let mut response = send(&url, &request, "a", "main").await;
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !String::from_utf8_lossy(&received).contains("event: response.completed") {
+            received.extend_from_slice(&response.chunk().await.unwrap().unwrap());
+        }
+    })
+    .await
+    .expect("terminal event must arrive while upstream is still open");
+    assert_eq!(received, COMPLETED_SSE.as_bytes());
+    drop(response);
+    let mut saved = checkpoint_states(state.path()).remove(0);
+    for _ in 0..100 {
+        if saved["completed_requests"] == 1 || saved["failed_primaries"] == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        saved = checkpoint_states(state.path()).remove(0);
+    }
+    assert_eq!(
+        saved["completed_requests"], 1,
+        "native completion survives a post-terminal client close"
+    );
+    assert_eq!(saved["failed_primaries"], 0);
+    assert_eq!(saved["history"][0]["exposed"], true);
 }
 
 #[tokio::test]

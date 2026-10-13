@@ -235,12 +235,21 @@ function serve(options = {}) {
             let nativeUsage = null;
             let toolCalls = null;
             if (!truncated) {
+              const completedItems = new Map();
+              const isToolCall = item => item?.type === 'function_call' || item?.type === 'custom_tool_call';
               const observe = event => {
+                if (event.type === 'response.output_item.done' &&
+                    Number.isSafeInteger(event.output_index) && event.output_index >= 0) {
+                  // Keep only accounting flags; duplicate events share their native index.
+                  completedItems.set(event.output_index, isToolCall(event.item));
+                }
                 const value = event.type === 'response.completed' ? event.response : !event.type ? event : null;
                 if (value?.usage && upstreamResponse.statusCode >= 200 && upstreamResponse.statusCode < 300) {
                   nativeUsage = telemetryUsage(value.usage);
-                  toolCalls = Array.isArray(value.output)
-                    ? value.output.filter(item => item.type === 'function_call').length : null;
+                  toolCalls = Array.isArray(value.output) && value.output.length
+                    ? value.output.filter(isToolCall).length
+                    : completedItems.size ? [...completedItems.values()].filter(Boolean).length
+                    : Array.isArray(value.output) ? 0 : null;
                   if (Object.hasOwn(value, 'model')) model = telemetryModel(value.model);
                   if (Object.hasOwn(value, 'service_tier')) serviceTier = telemetryTier(value.service_tier);
                 }
