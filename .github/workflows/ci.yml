@@ -251,7 +251,7 @@ jobs:
           PY
 
       - name: Unit tests
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast
 
       - name: Terminal editor PTY tests
         run: python3 tests/terminal_editor.py
