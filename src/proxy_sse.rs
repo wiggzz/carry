@@ -70,6 +70,7 @@ impl Observer {
             if self.pending.len() > 4 * 1024 * 1024 {
                 self.invalid = true;
                 self.completed = None;
+                self.observed = None;
                 return;
             }
             if self.pending.ends_with(b"\n\n") || self.pending.ends_with(b"\r\n\r\n") {
@@ -77,6 +78,7 @@ impl Observer {
                 let Ok(text) = std::str::from_utf8(&event) else {
                     self.invalid = true;
                     self.completed = None;
+                    self.observed = None;
                     return;
                 };
                 let data = text

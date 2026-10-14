@@ -602,19 +602,26 @@ pub(crate) fn new_prompt_cache_key() -> String {
 }
 
 pub(crate) fn remove_prompt_cache_breakpoints(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            object.remove("prompt_cache_breakpoint");
-            for value in object.values_mut() {
-                remove_prompt_cache_breakpoints(value);
+    // Cache markers are transport fields, not recursively reserved JSON keys.
+    // In particular schemas, metadata and native tool output belong to callers.
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.remove("prompt_cache_breakpoint");
+    if let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) {
+        for item in input {
+            let Some(item) = item.as_object_mut() else {
+                continue;
+            };
+            item.remove("prompt_cache_breakpoint");
+            if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
+                for block in content {
+                    if let Some(block) = block.as_object_mut() {
+                        block.remove("prompt_cache_breakpoint");
+                    }
+                }
             }
         }
-        Value::Array(values) => {
-            for value in values {
-                remove_prompt_cache_breakpoints(value);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1896,14 +1903,22 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
             "gpt-5.6-luna".into(),
             "medium".into(),
         );
-        let history = vec![json!({
-            "role": "developer",
-            "content": [{
-                "type": "input_text",
-                "text": "checkpoint",
-                "prompt_cache_breakpoint": { "mode": "explicit" }
-            }]
-        })];
+        let native_output = json!({
+            "type": "function_call_output", "call_id": "native",
+            "output": {"prompt_cache_breakpoint": "caller data"}
+        });
+        let history = vec![
+            json!({
+                "role": "developer",
+                "content": [{
+                    "type": "input_text",
+                    "text": "checkpoint",
+                    "prompt_cache_breakpoint": { "mode": "explicit" },
+                    "metadata": {"prompt_cache_breakpoint": "caller metadata"}
+                }]
+            }),
+            native_output.clone(),
+        ];
 
         let body = client.request_body("system", &history);
         assert!(
@@ -1911,6 +1926,11 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
                 .get("prompt_cache_breakpoint")
                 .is_none()
         );
+        assert_eq!(
+            body["input"][1]["content"][0]["metadata"],
+            history[0]["content"][0]["metadata"]
+        );
+        assert_eq!(body["input"][2], native_output);
     }
 
     #[test]

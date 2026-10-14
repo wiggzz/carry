@@ -26,7 +26,7 @@ use carry::core::{
 use clap::{Parser, ValueEnum};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OwnedMutexGuard, mpsc};
+use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::proxy_cache::serialized_identity as reviewer_serialized_identity;
@@ -281,7 +281,8 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
             std::net::Ipv6Addr::LOCALHOST.into()
         });
     }
-    let mut dashboard_url = format!("http://{dashboard_address}/carry/dashboard");
+    let public_dashboard_url = format!("http://{dashboard_address}/carry/dashboard");
+    let mut dashboard_url = public_dashboard_url.clone();
     if !dashboard_address.ip().is_loopback()
         && let Some(token) = &service.auth_token
     {
@@ -296,7 +297,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         private_file(&service.config.state_dir.join("dashboard-url"), false)?,
         "{dashboard_url}"
     )?;
-    println!("CARRY_PROXY_DASHBOARD {dashboard_url}");
+    println!("CARRY_PROXY_DASHBOARD {public_dashboard_url}");
     if !service.config.no_open_dashboard
         && (service.config.open_dashboard || std::io::stdin().is_terminal())
     {
@@ -504,7 +505,7 @@ async fn models(
         .send()
         .await
         .map_err(|_| failure(StatusCode::BAD_GATEWAY, "upstream transport failed"))?;
-    Ok(relay(upstream, None, None, false).await)
+    Ok(relay(upstream, None, None, false, None).await)
 }
 
 async fn metrics(
@@ -687,6 +688,15 @@ async fn forward(
     bytes: Bytes,
     legacy_native: bool,
 ) -> Result<Response, Failure> {
+    // Responses writes are a native-client interface, not a browser API.
+    // This also rejects opaque/null origins and simple text/plain CSRF posts.
+    // The dashboard remains GET-only; no Origin header is forwarded upstream.
+    if headers.contains_key("origin") {
+        return Err(failure(
+            StatusCode::FORBIDDEN,
+            "browser-origin writes are not supported",
+        ));
+    }
     authorize(&service, &headers)?;
     let mut id = identity(&headers)?;
     if service.config.codex_login && legacy_native {
@@ -997,26 +1007,28 @@ async fn forward(
     match response {
         Ok(upstream) => {
             let success = upstream.status().is_success();
+            let (converted, conversion) =
+                if service.config.codex_login && success && body["stream"] != true {
+                    let (sender, receiver) = oneshot::channel();
+                    (Some(sender), Some(receiver))
+                } else {
+                    (None, None)
+                };
             let response = relay(
                 upstream,
                 commit,
                 Some(attempt),
                 service.config.codex_login && success,
+                converted,
             )
             .await;
-            if service.config.codex_login && success && body["stream"] != true {
-                let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            if let Some(conversion) = conversion {
+                // The relay's single Observer supplies both accounting and JSON.
+                // Its frame/output bounds do not count discarded historic deltas.
+                return conversion
                     .await
-                    .map_err(|_| {
-                        failure(
-                            StatusCode::BAD_GATEWAY,
-                            "Codex response limit or transport failure",
-                        )
-                    })?;
-                let mut observer = Observer::default();
-                observer.feed(&bytes);
-                return observer
-                    .completed
+                    .ok()
+                    .flatten()
                     .map(|v| axum::Json(v).into_response())
                     .ok_or_else(|| {
                         failure(StatusCode::BAD_GATEWAY, "Codex stream did not complete")
@@ -2003,18 +2015,14 @@ async fn review_chunk(
             let status = response.status();
             diagnostic["http_status"] = json!(status.as_u16());
             if status.is_success() {
-                bounded(response, 4 * 1024 * 1024)
-                    .await
-                    .ok()
-                    .and_then(|bytes| {
-                        if codex_reviewer {
-                            let mut observer = Observer::default();
-                            observer.feed(&bytes);
-                            observer.observed
-                        } else {
-                            serde_json::from_slice::<Value>(&bytes).ok()
-                        }
-                    })
+                if codex_reviewer {
+                    observed_sse(response).await.ok().flatten()
+                } else {
+                    bounded(response, 4 * 1024 * 1024)
+                        .await
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                }
             } else {
                 // Private trace gets only bounded identifier tokens, never provider prose or raw bodies.
                 if let Ok(bytes) = bounded(response, 16 * 1024).await
@@ -2234,6 +2242,16 @@ async fn send_codex(
             .ok_or_else(|| anyhow::anyhow!("run `carry login`"))?;
     }
     unreachable!()
+}
+
+async fn observed_sse(mut response: reqwest::Response) -> Result<Option<Value>> {
+    let mut observer = Observer::default();
+    // Keep the existing request timeout and EOF/transport-failure policy. Only
+    // a terminal response is retained; ignored deltas never share an aggregate cap.
+    while let Some(chunk) = response.chunk().await? {
+        observer.feed(&chunk);
+    }
+    Ok(observer.observed)
 }
 
 async fn bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
@@ -2526,6 +2544,7 @@ async fn relay(
     commit: Option<Commit>,
     attempt: Option<Attempt>,
     force_sse: bool,
+    mut converted: Option<oneshot::Sender<Option<Value>>>,
 ) -> Response {
     let status = upstream.status();
     let headers = upstream.headers().clone();
@@ -2541,7 +2560,13 @@ async fn relay(
         let mut complete_transport = false;
         loop {
             tokio::select! {
-                _ = sender.closed() => break,
+                _ = async {
+                    if let Some(converted) = &mut converted {
+                        converted.closed().await;
+                    } else {
+                        sender.closed().await;
+                    }
+                } => break,
                 chunk = upstream.chunk() => match chunk {
                     Ok(Some(chunk)) => {
                         if is_sse { observer.feed(&chunk); }
@@ -2549,7 +2574,7 @@ async fn relay(
                         if let Some(commit) = &commit {
                             let _ = trace(&commit.service, &commit.id, "primary_response_chunk", &json!({"bytes": chunk.as_ref()}));
                         }
-                        if sender.send(Ok(chunk)).await.is_err() { break; }
+                        if converted.is_none() && sender.send(Ok(chunk)).await.is_err() { break; }
                     }
                     Ok(None) => { complete_transport = true; break; }
                     Err(_) => {
@@ -2559,7 +2584,8 @@ async fn relay(
                 }
             }
         }
-        let sse_completed = observer.completed.is_some();
+        let mut converted_value = observer.completed;
+        let sse_completed = converted_value.is_some();
         let observed = if is_sse {
             observer.observed
         } else {
@@ -2654,6 +2680,7 @@ async fn relay(
                 }
                 let _ = trace(&commit.service, &commit.id, "primary_completed", &value);
                 if save(&commit.service, &commit.id, &commit.candidate).is_err() {
+                    converted_value = None;
                     let _ = sender
                         .send(Err(std::io::Error::other("proxy checkpoint failed")))
                         .await;
@@ -2682,6 +2709,16 @@ async fn relay(
                         "error": crate::proxy_sse::safe_error(&observed.as_ref().map(|v| v["error"].clone()).unwrap_or(Value::Null))}),
                 );
             }
+        }
+        if let Some(converted) = converted {
+            // Conversion still requires clean HTTP EOF: a timeout/transport
+            // error is a 502 even after a terminal. Accounting above retains
+            // the existing terminal-authoritative streaming commit policy.
+            let _ = converted.send(if complete_transport {
+                converted_value
+            } else {
+                None
+            });
         }
     });
     let mut response = (status, Body::from_stream(ReceiverStream::new(receiver))).into_response();
