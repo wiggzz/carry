@@ -79,6 +79,10 @@ pub(super) struct Session {
     #[serde(default)]
     pub native_checkpoint: Vec<Value>,
     pub opinions: BTreeMap<u64, String>,
+    /// A drop authorizes exactly the native membership actually reviewed.
+    /// Legacy opinions without this provenance remain protective, never drops.
+    #[serde(default)]
+    pub drop_members: BTreeMap<u64, Vec<u64>>,
     pub memories: Vec<Memory>,
     #[serde(default)]
     pub next_memory_id: u64,
@@ -307,6 +311,7 @@ impl Session {
         self.response_frontier = None;
         self.native_checkpoint.clear();
         self.opinions.clear();
+        self.drop_members.clear();
         self.memories.clear();
         self.memory_anchors.clear();
         self.active_shadow.clear();
@@ -595,7 +600,41 @@ impl Session {
         input
     }
 
+    /// Check at every live plan, even while a reviewer owns an older snapshot.
+    pub fn drop_authorized(&self, group: &Group) -> bool {
+        group.exposed
+            && !group.pinned
+            && self.opinions.get(&group.id).is_some_and(|s| s == "drop")
+            && self.drop_members.get(&group.id) == Some(&group.members)
+            && !group
+                .members
+                .iter()
+                .any(|id| self.opinions.get(id).is_some_and(|s| s == "keep"))
+    }
+
+    pub fn reconcile_opinions(&mut self, groups: &[Group]) {
+        for group in groups {
+            let protected = group
+                .members
+                .iter()
+                .any(|id| self.opinions.get(id).is_some_and(|s| s == "keep"));
+            let authorized = self.drop_authorized(group);
+            for id in &group.members {
+                self.opinions.remove(id);
+                if *id != group.id || !authorized {
+                    self.drop_members.remove(id);
+                }
+            }
+            if protected {
+                self.opinions.insert(group.id, "keep".into());
+            } else if authorized {
+                self.opinions.insert(group.id, "drop".into());
+            }
+        }
+    }
+
     pub fn observe_groups(&mut self, groups: &[Group]) {
+        self.reconcile_opinions(groups);
         // v1 checkpoints formerly stored mutable group snapshots. Rebuild only
         // this derived projection once, without changing canonical main history.
         if self.observed.values().any(|value| value.starts_with('{')) {
@@ -626,19 +665,6 @@ impl Session {
                 json!(json!({"source_ids": sources, "text": memory.text}).to_string());
         }
         for group in groups {
-            // Repairing legacy split cohorts must preserve protection. Consume
-            // the old member opinions so a later review can release the group.
-            let protected = group.members.iter().any(|id| {
-                self.opinions
-                    .get(id)
-                    .is_some_and(|opinion| opinion == "keep")
-            });
-            for id in group.members.iter().filter(|id| **id != group.id) {
-                self.opinions.remove(id);
-            }
-            if protected {
-                self.opinions.insert(group.id, "keep".into());
-            }
             // A legacy split cohort can retain a later member's observation
             // while its earlier reasoning window has retired. Rebuild that
             // group in canonical order, including its current annotation ID.
@@ -843,6 +869,12 @@ impl Session {
             "guidance":"Accepted items were applied. Correct rejected items in a future review using the current eligible ledger; do not repeat accepted memories."});
         for (id, opinion) in updates {
             self.opinions.insert(id, opinion.into());
+            self.drop_members.remove(&id);
+            if opinion == "drop"
+                && let Some(group) = groups.iter().find(|group| group.id == id)
+            {
+                self.drop_members.insert(id, group.members.clone());
+            }
         }
         let retired = memory_updates
             .into_iter()
@@ -943,7 +975,8 @@ impl Session {
         self.active_shadow
             .retain(|record| !ids.contains(&record.source_id));
         self.observed.retain(|id, _| !members.contains(id));
-        self.opinions.retain(|id, _| !ids.contains(id));
+        self.opinions.retain(|id, _| !members.contains(id));
+        self.drop_members.retain(|id, _| !members.contains(id));
     }
 }
 

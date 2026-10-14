@@ -354,9 +354,7 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
     let groups = session.groups();
     let eligible = groups
         .iter()
-        .filter(|g| {
-            g.exposed && !g.pinned && session.opinions.get(&g.id).is_some_and(|s| s == "drop")
-        })
+        .filter(|g| session.drop_authorized(g))
         .map(|g| g.id)
         .collect::<HashSet<_>>();
     let mut rendered = session.render_primary_with_ids();

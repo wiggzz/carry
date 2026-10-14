@@ -1607,6 +1607,8 @@ fn merge_review(
     }
     let before_memory_input = current.render_primary();
     current.opinions = reviewed.opinions.clone();
+    current.drop_members = reviewed.drop_members.clone();
+    current.reconcile_opinions(&current.groups());
     current.memories = reviewed.memories.clone();
     current.memory_anchors = reviewed.memory_anchors.clone();
     let after_memory_input = current.render_primary();
