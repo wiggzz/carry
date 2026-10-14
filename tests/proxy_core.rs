@@ -127,6 +127,103 @@ fn missing_or_invalid_cache_partition_never_makes_a_cost_claim() {
     assert_eq!(input_cost(100.0, 50.0, 2.0, 0.1), 105.0);
 }
 
+// These extreme receipts are structurally valid, not a realistic token volume.
+// Exercise observe itself: arithmetic-only witnesses cannot catch partial writes.
+fn assert_usage_aggregate_overflow_is_censored(first: [u64; 4], next: [u64; 4], known_cost: f64) {
+    let receipt = |[input, output, cached, written]: [u64; 4]| {
+        assert!(cached.checked_add(written).is_some_and(|sum| sum <= input));
+        json!({
+            "input_tokens": input,
+            "output_tokens": output,
+            "input_tokens_details": {
+                "cached_tokens": cached,
+                "cache_write_tokens": written
+            }
+        })
+    };
+    let counters = |ledger: &UsageLedger| {
+        [
+            ledger.input_tokens,
+            ledger.output_tokens,
+            ledger.cached_tokens,
+            ledger.cache_write_tokens,
+        ]
+    };
+    let mut ledger = UsageLedger::default();
+    ledger.observe("gpt-6.1-sol", &receipt(first), true);
+    assert_eq!(counters(&ledger), first);
+    assert_eq!(ledger.calls, 1);
+    assert_eq!(ledger.unavailable_cost_calls, 0);
+    // An independent first-receipt rate-card calculation anchors the lower bound.
+    assert!(known_cost.is_finite() && known_cost > 0.0);
+    assert!((ledger.cost_usd - known_cost).abs() <= known_cost * 1e-12);
+    let before = ledger.clone();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ledger.observe("gpt-6.1-sol", &receipt(next), true);
+    }));
+    assert!(result.is_ok(), "valid usage aggregation must not panic");
+    let saturated: [u64; 4] = std::array::from_fn(|i| first[i].saturating_add(next[i]));
+    // Either reject the whole receipt's token update or saturate every counter.
+    // Do not require a new field or choose the production overflow policy here.
+    assert!(
+        counters(&ledger) == first || counters(&ledger) == saturated,
+        "overflow must not wrap or leave only part of the token receipt applied: {:?}",
+        counters(&ledger)
+    );
+    assert_eq!(ledger.calls, 2);
+    assert!(
+        ledger.unavailable_cost_calls > 0,
+        "overflow must censor complete coverage using the existing public marker"
+    );
+    assert!(ledger.cost_usd.is_finite());
+    assert!(ledger.cost_usd >= before.cost_usd);
+    assert!(ledger.cost_usd >= known_cost - known_cost * 1e-12);
+
+    let after_overflow = counters(&ledger);
+    ledger.observe("gpt-6.1-sol", &receipt([0; 4]), true);
+    assert_eq!(ledger.calls, 3);
+    assert_eq!(counters(&ledger), after_overflow);
+    assert!(ledger.unavailable_cost_calls > 0);
+    assert!(ledger.cost_usd >= before.cost_usd);
+}
+
+#[test]
+fn usage_aggregate_input_overflow_censors_without_partial_mutation() {
+    assert_usage_aggregate_overflow_is_censored(
+        [u64::MAX, 7, 0, 0],
+        [1, 11, 0, 0],
+        u64::MAX as f64 * 4.0 / 1_000_000.0 + 7.0 * 15.0 / 1_000_000.0,
+    );
+}
+
+#[test]
+fn usage_aggregate_output_overflow_censors_without_partial_mutation() {
+    assert_usage_aggregate_overflow_is_censored(
+        [9, u64::MAX, 2, 3],
+        [1, 1, 0, 1],
+        (4.0 * 2.0 + 2.0 * 0.1 + 3.0 * 2.5 + u64::MAX as f64 * 10.0) / 1_000_000.0,
+    );
+}
+
+#[test]
+fn usage_aggregate_cached_overflow_censors_without_partial_mutation() {
+    assert_usage_aggregate_overflow_is_censored(
+        [u64::MAX, 7, u64::MAX, 0],
+        [1, 11, 1, 0],
+        u64::MAX as f64 * 0.2 / 1_000_000.0 + 7.0 * 15.0 / 1_000_000.0,
+    );
+}
+
+#[test]
+fn usage_aggregate_cache_write_overflow_censors_without_partial_mutation() {
+    assert_usage_aggregate_overflow_is_censored(
+        [u64::MAX, 7, 0, u64::MAX],
+        [1, 11, 0, 1],
+        u64::MAX as f64 * 5.0 / 1_000_000.0 + 7.0 * 15.0 / 1_000_000.0,
+    );
+}
+
 #[test]
 fn unsupported_billed_input_categories_make_native_cost_unavailable() {
     let mut ledger = UsageLedger::default();

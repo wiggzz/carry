@@ -461,6 +461,79 @@ mod tests {
     }
 
     #[test]
+    fn frozen_output_cost_uses_each_branch_input_tier() {
+        const FROZEN_OUTPUT: u64 = 10_000;
+        const TOLERANCE: f64 = 1e-12;
+        // Exact threshold, one above it, and reversed short/long branches.
+        for (repetitions, traditional_input) in
+            [(2_000, 272_000_u64), (2_000, 272_001), (272_001, 272_000)]
+        {
+            let mut body = request(&"a ".repeat(repetitions));
+            body["model"] = json!("gpt-6.1-sol");
+            let carry_input = projection(&body, "route", 100).unwrap().input;
+            assert!(carry_input >= 1_024);
+            assert_eq!(carry_input > 272_000, repetitions > 272_000);
+            let replay = |output| {
+                let mut trajectory = Trajectory {
+                    scenario: Scenario {
+                        context_window: 1_050_000,
+                        ..Scenario::default()
+                    },
+                    ..Trajectory::default()
+                };
+                // Establish the alternative size through the real compaction path.
+                if traditional_input >= carry_input {
+                    trajectory.compacted(traditional_input - carry_input, 0);
+                } else {
+                    trajectory.compacted(0, carry_input - traditional_input);
+                }
+                let mut completion = response(17);
+                completion["usage"]["output_tokens"] = json!(output);
+                trajectory.primary(&body, &completion, "route", 100, true);
+                let estimate = trajectory.snapshot();
+                assert!(estimate.priced);
+                assert_eq!(estimate.coverage.primary_responses, 1);
+                assert_eq!(estimate.traditional_compactions, 0);
+                assert_eq!(estimate.summary_cost, 0.0);
+                estimate
+            };
+            // Zero-output control isolates output charges from input/write costs.
+            // The actual comparison freezes the same 10,000 outputs in BOTH branches.
+            let zero = replay(0_u64);
+            let frozen = replay(FROZEN_OUTPUT);
+            let input_cost =
+                |input: u64| input as f64 * if input > 272_000 { 5.0 } else { 2.5 } / 1_000_000.0;
+            let output_cost = |input: u64| if input > 272_000 { 0.15 } else { 0.10 };
+            let carry_output = output_cost(carry_input);
+            let traditional_output = output_cost(traditional_input);
+            // Independent published-rate expectations: cold eligible prompts use
+            // cache writes ($2.50/$5.00 per million), output is $10/$15 per million.
+            assert!((zero.carry_cost - input_cost(carry_input)).abs() < TOLERANCE);
+            assert!((zero.traditional_cost - input_cost(traditional_input)).abs() < TOLERANCE);
+            assert!(
+                (frozen.carry_cost - zero.carry_cost - carry_output).abs() < TOLERANCE,
+                "Carry input {carry_input}: frozen output must cost {carry_output} USD"
+            );
+            assert!(
+                (frozen.traditional_cost - zero.traditional_cost - traditional_output).abs()
+                    < TOLERANCE,
+                "traditional input {traditional_input}: frozen output must cost {traditional_output} USD"
+            );
+            assert!(
+                (frozen.savings - zero.savings - (traditional_output - carry_output)).abs()
+                    < TOLERANCE,
+                "cross-tier output contributes exactly +/-0.05 USD, not a common charge"
+            );
+            assert!((frozen.carry_cost - input_cost(carry_input) - carry_output).abs() < TOLERANCE);
+            assert!(
+                (frozen.traditional_cost - input_cost(traditional_input) - traditional_output)
+                    .abs()
+                    < TOLERANCE
+            );
+        }
+    }
+
+    #[test]
     fn priced_model_with_unknown_cache_support_excludes_savings() {
         let mut body = request("task");
         body["model"] = json!("gpt-6-astra");

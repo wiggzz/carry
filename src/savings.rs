@@ -446,6 +446,87 @@ mod tests {
     }
 
     #[test]
+    fn frozen_output_cost_uses_each_branch_input_tier() {
+        const FROZEN_OUTPUT: u64 = 10_000;
+        const TOLERANCE: f64 = 1e-12;
+        for (repetitions, pi_input) in [(2_000, 272_000_u64), (2_000, 272_001), (272_001, 272_000)]
+        {
+            let body = json!({
+                "model": "gpt-6.1-sol",
+                "input": [{"role": "user", "content": "a ".repeat(repetitions)}],
+                "prompt_cache_key": "scenario"
+            });
+            let carry_input = prompt_projection(&body).unwrap().2;
+            assert!(carry_input >= 1_024);
+            assert_eq!(carry_input > 272_000, repetitions > 272_000);
+            let dropped = i64::try_from(pi_input as i128 - carry_input as i128).unwrap();
+            let replay = |output| {
+                let mut trajectory = Trajectory::with_scenario(Scenario {
+                    context_window: 1_050_000,
+                    ..Scenario::default()
+                });
+                trajectory.record(&json!({
+                    "event": "run_started",
+                    "data": {
+                        "model": "gpt-6.1-sol", "cache_ttl_seconds": 1800,
+                        "implicit_cache_minimum_prefix_tokens": 1024
+                    }
+                }));
+                trajectory.record(&json!({
+                    "event": "context_compacted",
+                    "data": {"compaction_token_delta": dropped}
+                }));
+                trajectory.record(&json!({
+                    "event": "model_request", "run_id": "tier-test", "timestamp_ms": 100,
+                    "data": {"step": 1, "route": "route", "request": body}
+                }));
+                let estimate = trajectory
+                    .record(&json!({
+                        "event": "model_response", "run_id": "tier-test", "timestamp_ms": 101,
+                        "data": {
+                            "step": 1, "usage": {"input_tokens": 17, "output_tokens": output},
+                            "raw": {"output": [{"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "done"}]}]}
+                        }
+                    }))
+                    .unwrap();
+                assert!(estimate.priced && estimate.observed_priced);
+                assert_eq!(estimate.coverage.responses, 1);
+                assert_eq!(estimate.pi_compactions, 0);
+                assert_eq!(estimate.summary_cost, 0.0);
+                estimate
+            };
+            // Input telemetry deliberately stays at 17: each scenario branch must
+            // select its own tier from the local projection, not the native ledger.
+            let zero = replay(0_u64);
+            let frozen = replay(FROZEN_OUTPUT);
+            let input_cost =
+                |input: u64| input as f64 * if input > 272_000 { 5.0 } else { 2.5 } / 1_000_000.0;
+            let output_cost = |input: u64| if input > 272_000 { 0.15 } else { 0.10 };
+            let carry_output = output_cost(carry_input);
+            let pi_output = output_cost(pi_input);
+            // Independent rate-card values; do not use the estimator as its oracle.
+            assert!((zero.carry_cost - input_cost(carry_input)).abs() < TOLERANCE);
+            assert!((zero.pi_cost - input_cost(pi_input)).abs() < TOLERANCE);
+            assert!((frozen.observed_cost - zero.observed_cost - 0.10).abs() < TOLERANCE);
+            assert!(
+                (frozen.carry_cost - zero.carry_cost - carry_output).abs() < TOLERANCE,
+                "Carry input {carry_input}: frozen output must cost {carry_output} USD"
+            );
+            assert!(
+                (frozen.pi_cost - zero.pi_cost - pi_output).abs() < TOLERANCE,
+                "Pi input {pi_input}: frozen output must cost {pi_output} USD"
+            );
+            assert!(
+                (frozen.savings - zero.savings - (pi_output - carry_output)).abs() < TOLERANCE,
+                "cross-tier output contributes exactly +/-0.05 USD, not a common charge"
+            );
+            assert!((frozen.carry_cost - input_cost(carry_input) - carry_output).abs() < TOLERANCE);
+            assert!((frozen.pi_cost - input_cost(pi_input) - pi_output).abs() < TOLERANCE);
+        }
+    }
+
+    #[test]
     fn missing_projection_never_uses_provider_input_as_proxy() {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         t.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":40000}}));
