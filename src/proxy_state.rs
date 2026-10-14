@@ -71,6 +71,11 @@ pub(super) struct Session {
     pub pending_output: Vec<Value>,
     #[serde(default)]
     pub last_response_id: Option<String>,
+    /// Canonical input frontier of that successful response, excluding any
+    /// later failed attempt. pending_output belongs to this response until the
+    /// next success, even after an attempted echo has entered history.
+    #[serde(default)]
+    pub response_frontier: Option<u64>,
     #[serde(default)]
     pub native_checkpoint: Vec<Value>,
     pub opinions: BTreeMap<u64, String>,
@@ -251,7 +256,7 @@ impl Session {
                 removed: false,
             });
         }
-        if pending_echoed {
+        if pending_echoed && self.last_response_id.is_none() {
             self.pending_output.clear();
         }
         Ok(())
@@ -299,6 +304,7 @@ impl Session {
         self.history.clear();
         self.pending_output.clear();
         self.last_response_id = None;
+        self.response_frontier = None;
         self.native_checkpoint.clear();
         self.opinions.clear();
         self.memories.clear();

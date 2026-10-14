@@ -823,9 +823,16 @@ async fn forward(
                             "unknown or stale previous_response_id for this explicit session",
                         ));
                     }
+                    let frontier = session.response_frontier.ok_or_else(|| {
+                        failure(
+                            StatusCode::CONFLICT,
+                            "previous_response_id has no successful frontier; send full history",
+                        )
+                    })?;
                     expanded = session
                         .history
                         .iter()
+                        .take_while(|item| item.id <= frontier)
                         .map(|item| item.value.clone())
                         .chain(session.pending_output.iter().cloned())
                         .chain(input.iter().cloned())
@@ -2512,6 +2519,8 @@ async fn relay(
                         }
                     }
                     commit.candidate.last_response_id = value["id"].as_str().map(str::to_owned);
+                    commit.candidate.response_frontier =
+                        commit.candidate.history.last().map(|item| item.id);
                     commit.candidate.pending_output =
                         value["output"].as_array().cloned().unwrap_or_default();
                     observe_cache(
