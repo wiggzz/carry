@@ -95,6 +95,26 @@ fn small_token_budget_memory_admission_preserves_review_progress() {
     state_regression("small_token_budget_memory_admission_preserves_review_progress");
 }
 
+#[test]
+fn pending_cleanup_dispatch_matches_planner_and_restart_controls() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_pending_cleanup.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must run the actual-binary pending cleanup fixture");
+    assert!(
+        output.status.success(),
+        "pending cleanup regression failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn proxy_cli_serves_health_and_forwards_opaque_json() {
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
