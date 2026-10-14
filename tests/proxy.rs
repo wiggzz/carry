@@ -13,6 +13,83 @@ impl Drop for Proxy {
     }
 }
 
+// One stdlib HTTP fixture is shared by CI's built binary and the immutable
+// prebuilt baseline. This lets model-free RED evidence execute the exact tests
+// without compiling a second implementation of the regression locally.
+fn state_regression(selector: &str) {
+    let evidence = tempfile::tempdir().unwrap();
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_state_regressions.py"
+        ))
+        .arg(format!("StateRegressions.test_{selector}"))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .env("CARRY_TEST_EVIDENCE_DIR", evidence.path())
+        .output()
+        .expect("Python 3 must run the loopback-only state regression fixture");
+    assert!(
+        output.status.success(),
+        "state regression {selector} failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if selector.starts_with("small_") {
+        let path = evidence.path().join(format!("test_{selector}.json"));
+        let captured: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let limits = &captured["reviewer_limits"];
+        for body in captured["reviewer_requests"].as_array().unwrap() {
+            let rendered = body.to_string();
+            assert!(rendered.len() as u64 <= limits["bytes"].as_u64().unwrap());
+            let tokens = tiktoken_rs::o200k_base_singleton()
+                .encode_ordinary(&rendered)
+                .len();
+            assert!(
+                tokens as u64 <= limits["tokens"].as_u64().unwrap(),
+                "S3: actual subsequent reviewer dispatch must remain within its configured o200k_base token estimate"
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_429_continuation_retry_once() {
+    state_regression("failed_429_continuation_retry_once");
+}
+
+#[test]
+fn failed_429_continuation_retry_once_after_restart() {
+    state_regression("failed_429_continuation_retry_once_after_restart");
+}
+
+#[test]
+fn transport_failed_continuation_retry_once() {
+    state_regression("transport_failed_continuation_retry_once");
+}
+
+#[test]
+fn transport_failed_continuation_retry_once_after_restart() {
+    state_regression("transport_failed_continuation_retry_once_after_restart");
+}
+
+#[test]
+fn old_drop_does_not_remove_grown_group_during_held_review() {
+    state_regression("old_drop_does_not_remove_grown_group_during_held_review");
+}
+
+#[test]
+fn small_byte_budget_memory_admission_preserves_review_progress() {
+    state_regression("small_byte_budget_memory_admission_preserves_review_progress");
+}
+
+#[test]
+fn small_token_budget_memory_admission_preserves_review_progress() {
+    state_regression("small_token_budget_memory_admission_preserves_review_progress");
+}
+
 #[tokio::test]
 async fn proxy_cli_serves_health_and_forwards_opaque_json() {
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

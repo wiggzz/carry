@@ -2834,6 +2834,88 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn live_planner_preserves_protected_member_when_dropped_roots_merge_during_review() {
+        let held = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (signal, gate) = (held.clone(), release.clone());
+        let router = Router::new().route("/review", post(move || {
+            let (signal, gate) = (signal.clone(), gate.clone());
+            async move {
+                signal.notify_one();
+                gate.notified().await;
+                axum::Json(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":json!({"protected":[],"removable":[],"memories":[]}).to_string()}]}],"usage":{"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = checkpoint_service(directory.path());
+        service.config.classifier_url = Some(format!("http://{address}/review"));
+        service.config.payoff_requests = 1;
+        service.config.min_payback_percent = 0;
+        let service = Arc::new(service);
+        let mut session = Session::default();
+        session
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                json!({"role":"assistant","content":"old drop root"}),
+                json!({"role":"user","content":"obsolete separator"}),
+                json!({"role":"assistant","content":"PROTECTED_DECISION ".repeat(1000)}),
+                json!({"role":"user","content":"current"}),
+            ])
+            .unwrap();
+        for item in &mut session.history {
+            item.exposed = true;
+        }
+        let separate = session.groups();
+        session.observe_groups(&separate);
+        session
+            .apply_advice(
+                &separate,
+                &json!({"protected":["g4"],"removable":["g2","g3"],"memories":[]}),
+            )
+            .unwrap();
+        assert_eq!(session.opinions.get(&2).map(String::as_str), Some("drop"));
+        assert_eq!(session.opinions.get(&4).map(String::as_str), Some("keep"));
+        session.completed_requests = 1;
+        let main = json!({"model":"gpt-6-luna","input":session.render_primary()});
+        dispatch_review(
+            service.clone(),
+            "protected-merge".into(),
+            &mut session,
+            main,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), held.notified())
+            .await
+            .unwrap();
+        assert!(session.background_review_pending);
+
+        // Removing a reviewed separator changes live atomic membership. The
+        // blocked reviewer owns only an older snapshot: it cannot repair the
+        // live planner's protection before this next primary decision.
+        session.remove(&[3], &separate);
+        let merged = session
+            .groups()
+            .into_iter()
+            .find(|group| group.id == 2)
+            .unwrap();
+        assert_eq!(merged.members, vec![2, 4]);
+        assert!(merged.exposed && !merged.pinned);
+        let expected = session.render_primary();
+        let main = json!({"model":"gpt-6-luna","input":expected});
+        let (candidate, _) = plan(&service.config, &session, &main);
+        let submitted = candidate.as_ref().unwrap_or(&session).render_primary();
+        release.notify_one();
+        provider.abort();
+        assert_eq!(
+            submitted, expected,
+            "S2: live planning must preserve the whole merged cohort when any member is protected, even before an in-flight snapshot observes the merge"
+        );
+    }
+
     #[test]
     fn background_merge_accepts_older_advice_when_unrelated_pending_step_completes() {
         let input = vec![
