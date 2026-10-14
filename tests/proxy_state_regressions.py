@@ -348,6 +348,42 @@ class StateRegressions(unittest.TestCase):
         self.assertFalse(any(record["source_id"] == 0 for record in restored["active_shadow"]),
                          "memory retirement must prune the shared reviewer fact projection too")
 
+    def test_small_memory_budget_rejects_large_fact_preserves_small_sibling_and_opinions(self):
+        large = ("a0b1c2d3e4f5g6h7i8j9" * 205)[:4096]
+        small = "The useful result is 42."
+
+        def review(body, n):
+            data = ledger(body)
+            advice = {"protected": ["g1"], "removable": ["g2"], "memories": [
+                {"source_ids": ["g2"], "text": large},
+                {"source_ids": ["g2"], "text": small}]} if n == 1 else {
+                "protected": [], "removable": data["eligible_memory_ids"], "memories": []}
+            return 200, advice_response(advice)
+
+        fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
+        options = ["--classifier-max-input-bytes", "10000",
+                   "--classifier-max-input-tokens", "4000", "--payoff-requests", "1"]
+        proxy = self.proxy(fixture, options)
+        seed = [{"role": "user", "content": "goal"},
+                {"role": "assistant", "content": "small eligible source"},
+                {"role": "user", "content": "current"}]
+        self.assertEqual(proxy.send(seed)[0], 200)
+        self.assertEqual(proxy.send(seed)[0], 200)
+        saved = proxy.saved()
+        self.assertEqual([m["text"] for m in saved["memories"]], [small])
+        self.assertEqual(saved["opinions"].get("1"), "keep")
+        self.assertEqual(saved["opinions"].get("2"), "drop")
+        self.assertEqual(saved["review_feedback"]["rejected_count"], 1)
+        self.assertEqual(saved["review_feedback"]["rejected"][0]["index"], 0)
+        proxy.close()
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(seed)[0], 200)
+        self.assertGreaterEqual(len(fixture.reviews), 2)
+        self.assertEqual(proxy.saved()["memories"], [])
+        self.assertFalse(any(r["source_id"] == 0 for r in proxy.saved()["active_shadow"]))
+        self.evidence.update(reviewer_requests=fixture.reviews,
+                             reviewer_limits={"bytes": 10000, "tokens": 4000})
+
     def test_small_byte_budget_memory_admission_preserves_review_progress(self):
         self.memory_progress("bytes")
 

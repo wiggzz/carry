@@ -722,7 +722,17 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     pub fn apply_advice(&mut self, groups: &[Group], value: &Value) -> Result<()> {
+        self.apply_advice_with_memory_admission(groups, value, |_| true)
+    }
+
+    pub fn apply_advice_with_memory_admission(
+        &mut self,
+        groups: &[Group],
+        value: &Value,
+        admit: impl Fn(&Session) -> bool,
+    ) -> Result<()> {
         self.review_feedback = Value::Null;
         value
             .as_object()
@@ -735,6 +745,7 @@ impl Session {
             .ok_or_else(|| {
                 anyhow::anyhow!("advice must contain exactly protected, removable and memories")
             })?;
+        self.reconcile_opinions(groups);
         let known = groups
             .iter()
             .filter(|g| g.exposed && !g.pinned)
@@ -812,12 +823,8 @@ impl Session {
                 }
             }
         }
-        let active_memory_count = self.memories.len()
-            - memory_updates
-                .values()
-                .filter(|opinion| **opinion == "drop")
-                .count();
         let mut memories = Vec::new();
+        let mut memory_indexes = Vec::new();
         if let Some(items) = value["memories"].as_array().filter(|a| a.len() <= 64) {
             for (index, memory) in items.iter().enumerate() {
                 let parsed = (|| -> Result<(Vec<u64>, String)> {
@@ -851,10 +858,10 @@ impl Session {
                                 && m.source_ids == memory.0
                                 && m.text == memory.1
                         }) || memories.contains(&memory) => {}
-                    Ok(memory) if active_memory_count + memories.len() < 128 => {
-                        memories.push(memory)
+                    Ok(memory) => {
+                        memories.push(memory);
+                        memory_indexes.push(index);
                     }
-                    Ok(_) => reject("memories", index, "active memory limit of 128 reached"),
                     Err(error) => reject("memories", index, &error.to_string()),
                 }
             }
@@ -864,9 +871,8 @@ impl Session {
         let primary_before = (self.cost_trajectory.is_some()
             && (!memories.is_empty() || memory_updates.values().any(|opinion| *opinion == "drop")))
         .then(|| self.render_primary());
-        self.review_feedback = json!({"accepted_opinions":updates.len() + memory_updates.len(), "accepted_memories":memories.len(),
-            "rejected_count":rejected_count, "rejected":rejected,
-            "guidance":"Accepted items were applied. Correct rejected items in a future review using the current eligible ledger; do not repeat accepted memories."});
+        let accepted_opinions = updates.len() + memory_updates.len();
+        let mut accepted_memories = 0;
         for (id, opinion) in updates {
             self.opinions.insert(id, opinion.into());
             self.drop_members.remove(&id);
@@ -910,16 +916,14 @@ impl Session {
         });
         self.memories.retain(|m| !retired.contains(&m.id));
         self.memory_anchors.retain(|id, _| !retired.contains(id));
-        for (sources, text) in memories {
-            if self
-                .memories
-                .iter()
-                .any(|m| m.source_ids == sources && m.text == text)
-            {
+        for ((sources, text), index) in memories.into_iter().zip(memory_indexes) {
+            if self.memories.len() >= 128 {
+                reject("memories", index, "active memory limit of 128 reached");
                 continue;
             }
-            let id = self.next_memory_id;
-            self.next_memory_id = self
+            let mut candidate = self.clone();
+            let id = candidate.next_memory_id;
+            candidate.next_memory_id = candidate
                 .next_memory_id
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("memory ID space exhausted"))?;
@@ -936,18 +940,31 @@ impl Session {
                 .flat_map(|g| &g.members)
                 .max()
             {
-                self.memory_anchors.insert(id, *anchor);
+                candidate.memory_anchors.insert(id, *anchor);
             }
-            self.memories.push(Memory {
+            candidate.memories.push(Memory {
                 id,
                 source_ids: sources,
                 text: text.clone(),
             });
-            self.active_shadow.push(ShadowRecord {
+            candidate.active_shadow.push(ShadowRecord {
                 source_id: 0,
                 value: json!({"role": "user", "content": json!({"source_ids": provenance, "text": text}).to_string()}),
             });
+            if admit(&candidate) {
+                *self = candidate;
+                accepted_memories += 1;
+            } else {
+                reject(
+                    "memories",
+                    index,
+                    "aggregate rendered memory byte or token budget exceeded; cleanup headroom required",
+                );
+            }
         }
+        self.review_feedback = json!({"accepted_opinions":accepted_opinions, "accepted_memories":accepted_memories,
+            "rejected_count":rejected_count, "rejected":rejected,
+            "guidance":"Accepted items were applied. Correct rejected items in a future review using the current eligible ledger; do not repeat accepted memories."});
         if let Some(before) = primary_before {
             let after = self.render_primary();
             // Visible memory edits belong to Carry, not the traditional
@@ -961,6 +978,23 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Rebuild only shared fact records after a background memory delta. Native
+    /// observations are independent; source retirement cannot retire a fact.
+    pub fn refresh_memory_shadow(&mut self) {
+        self.active_shadow.retain(|record| record.source_id != 0);
+        for memory in &self.memories {
+            let sources = memory
+                .source_ids
+                .iter()
+                .map(|id| format!("g{id}"))
+                .collect::<Vec<_>>();
+            self.active_shadow.push(ShadowRecord {
+                source_id: 0,
+                value: json!({"role":"user","content":json!({"source_ids":sources,"text":memory.text}).to_string()}),
+            });
+        }
     }
 
     pub fn remove(&mut self, ids: &[u64], groups: &[Group]) {
@@ -1059,6 +1093,45 @@ fn parse_group(value: &Value) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_drop_needs_fresh_membership_but_protection_can_be_released_by_review() {
+        let mut state = Session::default();
+        state
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                json!({"role":"assistant","content":"evidence"}),
+                json!({"role":"user","content":"current"}),
+            ])
+            .unwrap();
+        for item in &mut state.history {
+            item.exposed = true;
+        }
+        state.opinions.insert(2, "drop".into());
+        let mut state: Session =
+            serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+        let groups = state.groups();
+        let source = groups.iter().find(|group| group.id == 2).unwrap();
+        assert!(!state.drop_authorized(source));
+        state.observe_groups(&groups);
+        assert!(!state.opinions.contains_key(&2));
+        state.opinions.insert(2, "keep".into());
+        state.observe_groups(&groups);
+        assert_eq!(state.opinions.get(&2).map(String::as_str), Some("keep"));
+        state
+            .apply_advice(
+                &groups,
+                &json!({"protected":[],"removable":["g2"],"memories":[]}),
+            )
+            .unwrap();
+        assert!(
+            state.drop_authorized(source),
+            "fresh review can release old protection, not a permanent keep"
+        );
+        let restored: Session =
+            serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+        assert!(restored.drop_authorized(source));
+    }
 
     #[test]
     fn primary_source_ids_keep_memory_slots_aligned_with_native_history() {

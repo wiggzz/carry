@@ -877,6 +877,7 @@ async fn forward(
         trace(&service, &id, "primary_received", &body)
             .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "trace write failed"))?;
         let mut valid = false;
+        session.review_context = cache_base(&body);
         if !native && service.config.mode != Mode::Off && standard(&body) {
             // Keep bootstrap review pending across failed primaries/restarts,
             // including imported rebases with prior completed-request counters.
@@ -1530,7 +1531,7 @@ async fn dispatch_review(service: Arc<Service>, id: String, session: &mut Sessio
         // Never save the snapshot: merge only reviewer fields into the latest state.
         let _lock = session_lock(&service, &id).await;
         if let Ok(mut current) = load(&service, &id) {
-            merge_review(&mut current, &before, &reviewed, &run, &main);
+            merge_review(&service.config, &mut current, &before, &reviewed, &run);
             if save(&service, &id, &current).is_err() {
                 let _ = trace(
                     &service,
@@ -1545,11 +1546,11 @@ async fn dispatch_review(service: Arc<Service>, id: String, session: &mut Sessio
 }
 
 fn merge_review(
+    config: &ProxyCli,
     current: &mut Session,
     before: &Session,
     reviewed: &Session,
     run: &ReviewRun,
-    main: &Value,
 ) {
     current.background_review_pending = false;
     // Spend survives stale advice, rebases and primary failures. Price reviewer
@@ -1606,11 +1607,90 @@ fn merge_review(
         return;
     }
     let before_memory_input = current.render_primary();
-    current.opinions = reviewed.opinions.clone();
-    current.drop_members = reviewed.drop_members.clone();
+    // Apply reviewer deltas only. Never replace a newer live opinion (including
+    // protection reconciled by a newer native cohort) with a snapshot value.
+    let opinion_ids = before
+        .opinions
+        .keys()
+        .chain(reviewed.opinions.keys())
+        .copied()
+        .collect::<HashSet<_>>();
+    for id in opinion_ids {
+        if current.opinions.get(&id) != before.opinions.get(&id) {
+            continue;
+        }
+        if let Some(opinion) = reviewed.opinions.get(&id) {
+            current.opinions.insert(id, opinion.clone());
+        } else {
+            current.opinions.remove(&id);
+        }
+        current.drop_members.remove(&id);
+        if let Some(members) = reviewed.drop_members.get(&id) {
+            current.drop_members.insert(id, members.clone());
+        }
+    }
     current.reconcile_opinions(&current.groups());
-    current.memories = reviewed.memories.clone();
-    current.memory_anchors = reviewed.memory_anchors.clone();
+    current.memories.retain(|memory| {
+        !before.memories.iter().any(|old| {
+            old.id == memory.id && old.text == memory.text && old.source_ids == memory.source_ids
+        }) || reviewed.memories.iter().any(|new| new.id == memory.id)
+    });
+    current
+        .memory_anchors
+        .retain(|id, _| current.memories.iter().any(|memory| memory.id == *id));
+    current.active_shadow = reviewed
+        .active_shadow
+        .iter()
+        .filter(|record| record.source_id != 0)
+        .cloned()
+        .collect();
+    current.refresh_memory_shadow();
+    current.review_feedback = reviewed.review_feedback.clone();
+    let mut budget_rejections = 0;
+    for (index, memory) in reviewed.memories.iter().enumerate() {
+        if before.memories.iter().any(|old| old.id == memory.id)
+            || current.memories.iter().any(|old| old.id == memory.id)
+        {
+            continue;
+        }
+        let mut candidate = current.clone();
+        candidate.memories.push(memory.clone());
+        if let Some(anchor) = reviewed.memory_anchors.get(&memory.id) {
+            candidate.memory_anchors.insert(memory.id, *anchor);
+        }
+        candidate.refresh_memory_shadow();
+        // The latest task/settings, not the dispatched snapshot, own admission.
+        if candidate.memories.len() <= 128 && memory_admission_fits(config, &candidate) {
+            *current = candidate;
+        } else {
+            budget_rejections += 1;
+            let feedback = &mut current.review_feedback;
+            if !feedback["rejected"].is_array() {
+                feedback["rejected"] = json!([]);
+            }
+            let rejected = feedback["rejected"].as_array_mut().unwrap();
+            if rejected.len() < 64 {
+                rejected.push(json!({"field":"memories","index":index,"reason":"background memory rejected: current aggregate byte or token budget exceeded; cleanup headroom required"}));
+            }
+        }
+    }
+    if budget_rejections > 0 {
+        current.review_feedback["rejected_count"] = json!(
+            reviewed.review_feedback["rejected_count"]
+                .as_u64()
+                .unwrap_or(0)
+                + budget_rejections
+        );
+        current.review_feedback["accepted_memories"] = json!(
+            reviewed.review_feedback["accepted_memories"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_sub(budget_rejections)
+        );
+        if reviewed.review_feedback["rejected_count"] == 0 {
+            current.partial_reviews += 1;
+        }
+    }
     let after_memory_input = current.render_primary();
     if before_memory_input != after_memory_input
         && let Some(trajectory) = &mut current.cost_trajectory
@@ -1620,12 +1700,9 @@ fn merge_review(
             estimate(&json!(after_memory_input)) as u64,
         );
     }
-    current.next_memory_id = reviewed.next_memory_id;
-    current.active_shadow = reviewed.active_shadow.clone();
+    current.next_memory_id = current.next_memory_id.max(reviewed.next_memory_id);
     current.observed = reviewed.observed.clone();
-    current.review_feedback = reviewed.review_feedback.clone();
     current.review_cache_key = reviewed.review_cache_key.clone();
-    current.review_context = cache_base(main);
     current.reviewer_cache = reviewed.reviewer_cache.clone();
     current.review_end_id = reviewed.review_end_id;
     current.reviewed_members = reviewed.reviewed_members.clone();
@@ -1703,7 +1780,17 @@ async fn review(
             }
         }
     }
-    review_windows(service, id, session, bootstrap, run).await
+    let calls_before = session.shadow.calls;
+    let valid = review_windows(service, id, session, bootstrap, run).await;
+    if !bootstrap && session.shadow.calls == calls_before && !session.memories.is_empty() {
+        // Oversized/pinned native cohorts must not strand shared facts. This is
+        // an actual bounded reviewer call, not implicit or permanent retirement.
+        let body = memory_review_body(&service.config, session);
+        if review_fits(&service.config, &body) {
+            return review_chunk(service, id, session, &body, &[], run).await || valid;
+        }
+    }
+    valid
 }
 
 fn mark_reviewed(session: &mut Session, groups: &[Group], bootstrap: bool) {
@@ -1988,7 +2075,9 @@ async fn review_chunk(
             let _ = trace(service, id, "shadow_failed", &diagnostic);
         }
         if let Some(advice) = reviewer_advice(&value) {
-            match session.apply_advice(groups, &advice) {
+            match session.apply_advice_with_memory_admission(groups, &advice, |candidate| {
+                memory_admission_fits(&service.config, candidate)
+            }) {
                 Ok(()) => {
                     valid = session.review_feedback["rejected_count"] == 0
                         || session.review_feedback["accepted_opinions"]
@@ -2205,6 +2294,35 @@ fn cache_base(body: &Value) -> Value {
 
 fn estimate(body: &Value) -> f64 {
     crate::proxy_savings::token_units(body) as f64
+}
+
+/// Cleanup needs all accepted facts (including the duplicate ledger rendering),
+/// not canonical native sources or prior source-validation diagnostics.
+fn memory_review_body(config: &ProxyCli, session: &Session) -> Value {
+    let mut view = session.clone();
+    view.active_shadow.retain(|record| record.source_id == 0);
+    view.refresh_memory_shadow();
+    view.observed.clear();
+    view.review_feedback = Value::Null;
+    review_body_for_groups(config, &view, &[])
+}
+
+fn memory_admission_fits(config: &ProxyCli, session: &Session) -> bool {
+    let body = memory_review_body(config, session);
+    if !review_fits(config, &body) {
+        return false;
+    }
+    let mut empty = session.clone();
+    empty.memories.clear();
+    empty.active_shadow.retain(|record| record.source_id != 0);
+    let base = memory_review_body(config, &empty);
+    // Reserve half the remaining capacity for later task/context growth and a
+    // real retirement review. Count the full rendered wire, never raw text or
+    // a per-fact quota; byte and tokenizer limits are independent.
+    let base_bytes = reviewer_serialized_identity(&base).0;
+    let byte_limit = config.classifier_max_input_bytes as usize;
+    reviewer_serialized_identity(&body).0 <= base_bytes + byte_limit.saturating_sub(base_bytes) / 2
+        && estimate(&body) <= (estimate(&base) + config.classifier_max_input_tokens as f64) / 2.0
 }
 
 fn review_fits(config: &ProxyCli, body: &Value) -> bool {
@@ -2521,8 +2639,7 @@ async fn relay(
                         }
                     }
                     commit.candidate.last_response_id = value["id"].as_str().map(str::to_owned);
-                    commit.candidate.response_frontier =
-                        commit.candidate.history.last().map(|item| item.id);
+                    commit.candidate.response_frontier = Some(commit.candidate.next_id);
                     commit.candidate.pending_output =
                         value["output"].as_array().cloned().unwrap_or_default();
                     observe_cache(
@@ -2928,6 +3045,93 @@ mod tests {
     }
 
     #[test]
+    fn background_memory_admission_uses_current_task_without_replacing_frontier_or_spend() {
+        let mut config = reviewer_config();
+        let mut before = Session::default();
+        before
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                json!({"role":"assistant","content":"evidence"}),
+                json!({"role":"user","content":"current"}),
+            ])
+            .unwrap();
+        for item in &mut before.history {
+            item.exposed = true;
+        }
+        before.completed_requests = 1;
+        let sources = before.groups()[..2].to_vec();
+        let mut reviewed = before.clone();
+        reviewed
+            .apply_advice(
+                &sources,
+                &json!({"protected":["g1"],"removable":["g2"],"memories":[
+                    {"source_ids":["g2"],"text":"retained learning ".repeat(25)}
+                ]}),
+            )
+            .unwrap();
+        let mut current = before.clone();
+        let mut input = current
+            .history
+            .iter()
+            .map(|item| item.value.clone())
+            .collect::<Vec<_>>();
+        input.push(json!({"role":"user","content":"new task context ".repeat(200)}));
+        current.ingest(&input).unwrap();
+        current.review_context = json!({"instructions":"current settings"});
+        current.last_response_id = Some("latest-success".into());
+        current.response_frontier = Some(current.next_id);
+        current.completed_requests = 2;
+        current.primary.calls = 3;
+        current.failed_primaries = 1;
+        let context = current.review_context.clone();
+        let base = memory_review_body(&config, &current);
+        config.classifier_max_input_bytes = (reviewer_serialized_identity(&base).0 + 512) as u32;
+        assert!(
+            memory_admission_fits(&config, &reviewed),
+            "snapshot fact must initially fit"
+        );
+        let mut stale = current.clone();
+        stale.memories = reviewed.memories.clone();
+        stale.refresh_memory_shadow();
+        assert!(
+            !memory_admission_fits(&config, &stale),
+            "new task consumes the admission headroom"
+        );
+        let run = ReviewRun {
+            background: true,
+            reviewed_sources: sources,
+            receipts: vec![ReviewReceipt {
+                model: config.classifier_model.clone(),
+                input: 100,
+                usage: Some(
+                    json!({"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}),
+                ),
+                standard: true,
+            }],
+        };
+        merge_review(&config, &mut current, &before, &reviewed, &run);
+        assert!(current.memories.is_empty());
+        assert!(
+            current
+                .active_shadow
+                .iter()
+                .all(|record| record.source_id != 0)
+        );
+        assert_eq!(current.review_feedback["rejected_count"], 1);
+        assert_eq!(current.opinions.get(&1).map(String::as_str), Some("keep"));
+        assert!(
+            current.drop_authorized(&current.groups().into_iter().find(|g| g.id == 2).unwrap())
+        );
+        assert_eq!(current.review_context, context);
+        assert_eq!(current.last_response_id.as_deref(), Some("latest-success"));
+        assert_eq!(current.response_frontier, Some(current.next_id));
+        assert_eq!(current.completed_requests, 2);
+        assert_eq!(current.primary.calls, 3);
+        assert_eq!(current.failed_primaries, 1);
+        assert_eq!(current.shadow.calls, 1);
+    }
+
+    #[test]
     fn background_merge_accepts_older_advice_when_unrelated_pending_step_completes() {
         let input = vec![
             json!({"role":"user","content":"goal"}),
@@ -2961,7 +3165,7 @@ mod tests {
             reviewed_sources: older,
             ..ReviewRun::default()
         };
-        merge_review(&mut current, &before, &reviewed, &run, &json!({}));
+        merge_review(&reviewer_config(), &mut current, &before, &reviewed, &run);
         assert_eq!(current.opinions.get(&2).map(String::as_str), Some("drop"));
         assert_eq!(current.history.len(), 6);
     }
@@ -3000,7 +3204,7 @@ mod tests {
             reviewed_sources: sources,
             ..ReviewRun::default()
         };
-        merge_review(&mut current, &before, &reviewed, &run, &json!({}));
+        merge_review(&reviewer_config(), &mut current, &before, &reviewed, &run);
         assert!(current.opinions.is_empty());
         assert_eq!(current.review_feedback["rejected_count"], 1);
     }
@@ -3039,7 +3243,7 @@ mod tests {
                 standard: true,
             }],
         };
-        merge_review(&mut current, &before, &reviewed, &run, &json!({}));
+        merge_review(&reviewer_config(), &mut current, &before, &reviewed, &run);
         assert!(
             current.opinions.is_empty(),
             "advice cannot apply to changed source content"

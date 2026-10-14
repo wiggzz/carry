@@ -81,6 +81,11 @@ fn old_drop_does_not_remove_grown_group_during_held_review() {
 }
 
 #[test]
+fn small_memory_budget_rejects_large_fact_preserves_small_sibling_and_opinions() {
+    state_regression("small_memory_budget_rejects_large_fact_preserves_small_sibling_and_opinions");
+}
+
+#[test]
 fn small_byte_budget_memory_admission_preserves_review_progress() {
     state_regression("small_byte_budget_memory_admission_preserves_review_progress");
 }
