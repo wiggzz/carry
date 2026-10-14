@@ -13,7 +13,10 @@ import json
 import os
 from pathlib import Path
 import queue
+import socket
+import stat
 import subprocess
+import urllib.parse
 import tempfile
 import threading
 import time
@@ -106,12 +109,14 @@ class Fixture:
                         self.wfile.write(b"\r\n")
 
                     shape = fixture.reviewer if review else fixture.primary
+                    if shape == "terminal_then_oversized":
+                        chunk(frame({"type": "response.completed", "response": value}))
                     if shape == "many":
                         for i in range(FRAME_COUNT):
                             chunk(DELTA)
                             if i % 128 == 0:
                                 chunk(PROGRESS)
-                    elif shape == "oversized":
+                    elif shape in ("oversized", "terminal_then_oversized"):
                         # One valid JSON delta frame exceeds the per-frame bound.
                         # Even a later tiny terminal must not rehabilitate it.
                         chunk(b'data: {"type":"response.output_text.delta","delta":"')
@@ -119,7 +124,26 @@ class Fixture:
                         for _ in range(LIMIT // len(block) + 1):
                             chunk(block)
                         chunk(b'"}\n\n')
-                    chunk(frame({"type": "response.completed", "response": value}))
+                    if shape == "failed_terminal":
+                        chunk(frame({"type": "response.failed", "response": {
+                            "status": "failed", "usage": value["usage"],
+                            "error": {"type": "fixture_error", "code": "fixture_failed"}}}))
+                    if shape == "done_items":
+                        for index, item in enumerate(value["output"]):
+                            chunk(frame({"type": "response.output_item.done",
+                                         "output_index": index, "item": item}))
+                        value["output"] = []
+                    if shape != "no_terminal":
+                        terminal = frame({"type": "response.completed", "response": value})
+                        if shape == "fragmented":
+                            for offset in range(0, len(terminal), 7):
+                                chunk(terminal[offset:offset + 7])
+                        else:
+                            chunk(terminal)
+                    if shape == "truncated":
+                        self.wfile.flush()
+                        self.close_connection = True
+                        return  # No chunked EOF, despite the completed terminal.
                     self.wfile.write(b"0\r\n\r\n")
                     self.close_connection = True
                 except (BrokenPipeError, ConnectionResetError):
@@ -281,6 +305,78 @@ def replay_body():
 
 
 class TransportTests(unittest.TestCase):
+    def test_startup_stdout_redacts_gateway_token_on_mapped_loopback(self):
+        # Mapped IPv6 remains loopback at the OS: no LAN listener is authorized.
+        # Rust's IPv6 is_loopback check nevertheless exercises the token branch.
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::ffff:127.0.0.1", 0))  # IPv6 unavailable is an error, not a skip.
+            port = probe.getsockname()[1]
+        token = "fixture-gateway+/=%:only"
+        escaped = urllib.parse.quote_plus(token)
+        with tempfile.TemporaryDirectory(prefix="carry-startup-") as directory:
+            home = Path(directory)
+            home.chmod(0o700)
+            fixture = Fixture(codex=False)
+            try:
+                env = {"HOME": str(home), "CARRY_HOME": str(home),
+                       "XDG_CONFIG_HOME": str(home / "config"),
+                       "XDG_CACHE_HOME": str(home / "cache"), "TMPDIR": str(home),
+                       "PATH": os.defpath, "NO_PROXY": "127.0.0.1,localhost",
+                       "CARRY_PROXY_AUTH_TOKEN": token}
+                args = [BINARY, "proxy", "--listen", "[::ffff:127.0.0.1]:%s" % port,
+                        "--upstream-url", fixture.endpoint,
+                        "--state-dir", str(home / "state"), "--no-open-dashboard"]
+                with tempfile.TemporaryFile(dir=home) as stderr:
+                    process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL,
+                                               stdout=subprocess.PIPE, stderr=stderr)
+                    lines = queue.Queue()
+
+                    def collect():
+                        for line in process.stdout:
+                            lines.put(line.decode().strip())
+
+                    reader = threading.Thread(target=collect, daemon=True)
+                    reader.start()
+                    stdout = []
+                    try:
+                        deadline = time.monotonic() + 30
+                        while time.monotonic() < deadline:
+                            try:
+                                line = lines.get(timeout=0.1)
+                                stdout.append(line)
+                                if line.startswith("CARRY_PROXY_DASHBOARD "):
+                                    break
+                            except queue.Empty:
+                                if process.poll() is not None:
+                                    stderr.seek(0)
+                                    self.fail("Carry exited before dashboard readiness: " +
+                                              stderr.read(4096).decode(errors="replace"))
+                        else:
+                            self.fail("no CARRY_PROXY_DASHBOARD marker within 30s")
+                        private_url = home / "state" / "dashboard-url"
+                        self.assertEqual(stat.S_IMODE(private_url.stat().st_mode), 0o600)
+                        self.assertIn("#token=" + escaped, private_url.read_text())
+                        self.assertEqual(fixture.captured(), [])
+                    finally:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=3)
+                        reader.join(timeout=2)
+                        process.stdout.close()
+                        while not lines.empty():
+                            stdout.append(lines.get_nowait())
+                    output = "\n".join(stdout)
+                    self.assertNotIn(token, output, "stdout leaked raw gateway token")
+                    self.assertNotIn(escaped, output, "stdout leaked URL-encoded gateway token")
+                    dashboard = next(line for line in stdout
+                                     if line.startswith("CARRY_PROXY_DASHBOARD "))
+                    self.assertNotIn("#", dashboard, "public dashboard marker contains auth fragment")
+            finally:
+                fixture.close()
+
     def start(self, primary="tiny", reviewer="tiny", codex=True, replay=False):
         fixture = Fixture(primary, reviewer, codex)
         self.addCleanup(fixture.close)
@@ -297,6 +393,12 @@ class TransportTests(unittest.TestCase):
         body["prompt_cache_breakpoint"] = True
         body["input"][0]["content"] = [{"type": "input_text", "text": "fixture goal",
                                         "prompt_cache_breakpoint": True}]
+        body["input"][0]["prompt_cache_breakpoint"] = {"mode": "explicit"}
+        body["input"][0]["content"][0]["metadata"] = {
+            "prompt_cache_breakpoint": "native block data"}
+        body["metadata"] = {"prompt_cache_breakpoint": "native request data"}
+        body["input"].append({"type": "function_call_output", "call_id": "opaque",
+                              "output": {"prompt_cache_breakpoint": "native tool data"}})
         body["tools"] = [{"type": "function", "name": "native", "strict": True,
                           "parameters": copy.deepcopy(schema)}]
         body["text"] = {"format": {"type": "json_schema", "name": "result", "strict": True,
@@ -307,6 +409,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         wire = captured[0][1]
         self.assertNotIn("prompt_cache_breakpoint", wire)
+        self.assertNotIn("prompt_cache_breakpoint", wire["input"][0])
         self.assertNotIn("prompt_cache_breakpoint", wire["input"][0]["content"][0])
         self.assertEqual(wire["stream"], True)
         self.assertEqual(wire["store"], False)
@@ -321,6 +424,13 @@ class TransportTests(unittest.TestCase):
         body, wire = self.schema_wire()
         self.assertEqual(wire["text"], body["text"],
                          "Codex wire adapter deleted a legitimate structured output schema property")
+
+    def test_codex_preserves_native_cache_named_data(self):
+        body, wire = self.schema_wire()
+        self.assertEqual(wire["metadata"], body["metadata"])
+        self.assertEqual(wire["input"][0]["content"][0]["metadata"],
+                         body["input"][0]["content"][0]["metadata"])
+        self.assertEqual(wire["input"][1], body["input"][1])
 
     def test_codex_streaming_accepts_many_small_frames(self):
         fixture, proxy = self.start(primary="many")
@@ -347,6 +457,11 @@ class TransportTests(unittest.TestCase):
                          "small terminal after >4MiB small SSE frames must convert, got " + repr(response))
         self.assertEqual(response, completed())
         self.assertEqual(len(fixture.captured()), 1)
+        metrics = proxy.metrics()
+        self.assertEqual((metrics["completed_requests"], metrics["primary"]["calls"],
+                          metrics["primary"]["unavailable_cost_calls"]), (1, 1, 0), metrics)
+        self.assertEqual((metrics["primary"]["input_tokens"], metrics["primary"]["output_tokens"]),
+                         (100, 10), "conversion must not double-observe or double-commit usage")
 
     def test_codex_reviewer_accepts_many_small_frames(self):
         fixture, proxy = self.start(reviewer="many", replay=True)
@@ -357,8 +472,72 @@ class TransportTests(unittest.TestCase):
                          "fixture must exercise a real Codex reviewer request")
         metrics = proxy.metrics()
         self.assertEqual(metrics["shadow"]["calls"], 1, metrics)
+        self.assertEqual((metrics["shadow"]["input_tokens"], metrics["shadow"]["output_tokens"]),
+                         (100, 10), "reviewer must count the terminal usage once")
+        self.assertEqual((metrics["primary"]["calls"], metrics["completed_requests"]), (1, 1))
         self.assertEqual((metrics["invalid_reviews"], metrics["shadow"]["unavailable_cost_calls"]),
                          (0, 0), "valid tiny advice after >4MiB small frames was rejected/censored")
+
+    def test_codex_nonstream_eof_without_terminal_is_censored(self):
+        fixture, proxy = self.start(primary="no_terminal")
+        status, response = proxy.send(request_body())
+        self.assertEqual(status, 502, response)
+        self.assertEqual(len(fixture.captured()), 1)
+        metrics = proxy.metrics()
+        self.assertEqual((metrics["completed_requests"], metrics["failed_primaries"],
+                          metrics["primary"]["calls"], metrics["primary"]["unavailable_cost_calls"]),
+                         (0, 1, 1, 1), metrics)
+
+    def test_codex_nonstream_terminal_then_transport_failure_keeps_one_receipt(self):
+        fixture, proxy = self.start(primary="truncated")
+        status, response = proxy.send(request_body())
+        self.assertEqual(status, 502, response)
+        self.assertEqual(len(fixture.captured()), 1)
+        metrics = proxy.metrics()
+        self.assertEqual((metrics["completed_requests"], metrics["failed_primaries"],
+                          metrics["primary"]["calls"], metrics["primary"]["unavailable_cost_calls"]),
+                         (1, 0, 1, 0), metrics)
+
+    def test_codex_nonstream_failed_terminal_cannot_be_rehabilitated(self):
+        fixture, proxy = self.start(primary="failed_terminal")
+        status, response = proxy.send(request_body())
+        self.assertEqual(status, 502, response)
+        self.assertEqual(len(fixture.captured()), 1)
+        metrics = proxy.metrics()
+        self.assertEqual((metrics["completed_requests"], metrics["failed_primaries"],
+                          metrics["primary"]["calls"], metrics["primary"]["unavailable_cost_calls"]),
+                         (0, 1, 1, 0), metrics)
+
+    def test_codex_nonstream_fragmented_terminal_and_done_item_fallback(self):
+        for shape in ("fragmented", "done_items"):
+            with self.subTest(shape=shape):
+                fixture, proxy = self.start(primary=shape)
+                status, response = proxy.send(request_body())
+                self.assertEqual(status, 200, response)
+                self.assertEqual(response, completed())
+                self.assertEqual(len(fixture.captured()), 1)
+                deadline = time.monotonic() + 3
+                while True:
+                    metrics = proxy.metrics()
+                    if metrics["completed_requests"] == 1 or time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.02)
+                self.assertEqual((metrics["completed_requests"], metrics["primary"]["calls"]),
+                                 (1, 1), metrics)
+
+    def test_codex_oversized_tail_censors_terminal_observation(self):
+        _, proxy = self.start(primary="terminal_then_oversized")
+        status, response = proxy.send(request_body())
+        self.assertEqual(status, 502, response)
+        deadline = time.monotonic() + 3
+        while True:
+            metrics = proxy.metrics()
+            if metrics["failed_primaries"] == 1 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        self.assertEqual((metrics["completed_requests"], metrics["failed_primaries"],
+                          metrics["primary"]["calls"], metrics["primary"]["unavailable_cost_calls"]),
+                         (0, 1, 1, 1), "invalid observation must not retain stale terminal usage")
 
     def test_codex_nonstream_rejects_oversized_single_frame(self):
         _, proxy = self.start(primary="oversized")
@@ -382,6 +561,15 @@ class TransportTests(unittest.TestCase):
         browser_status, browser_response = proxy.send(body, headers={
             "Origin": "http://127.0.0.1:3000", "Content-Type": "text/plain"})
         browser_calls = len(fixture.captured())
+        for origin, content_type in [("null", "application/json"),
+                                     ("https://untrusted.invalid", "application/json")]:
+            status, response = proxy.send(body, headers={"Origin": origin,
+                                                        "Content-Type": content_type})
+            self.assertIn(status, (400, 401, 403, 415), response)
+            self.assertEqual(len(fixture.captured()), browser_calls)
+        dashboard_status, (size, _) = proxy.request("GET", "/carry/dashboard", stream=True)
+        self.assertEqual(dashboard_status, 200)
+        self.assertGreater(size, 0)
         native_status, native_response = proxy.send(body)
         self.assertEqual(native_status, 200, native_response)
         self.assertEqual(native_response, completed())
