@@ -89,7 +89,8 @@ pub struct UsageLedger {
 
 impl UsageLedger {
     pub fn observe(&mut self, model: &str, usage: &Value, standard: bool) {
-        self.calls += 1;
+        let mut complete = self.calls.checked_add(1).is_some();
+        self.calls = self.calls.saturating_add(1);
         let input = usage["input_tokens"].as_u64();
         let output = usage["output_tokens"].as_u64();
         let cached = usage["input_tokens_details"]["cached_tokens"].as_u64();
@@ -97,10 +98,20 @@ impl UsageLedger {
             .as_u64()
             .or_else(|| usage["input_tokens_details"]["cache_creation_tokens"].as_u64())
             .unwrap_or(0);
-        self.input_tokens += input.unwrap_or(0);
-        self.output_tokens += output.unwrap_or(0);
-        self.cached_tokens += cached.unwrap_or(0);
-        self.cache_write_tokens += written;
+        // Commit all token partitions together, or retain the prior receipt totals.
+        if let (Some(input), Some(output), Some(cached), Some(written)) = (
+            self.input_tokens.checked_add(input.unwrap_or(0)),
+            self.output_tokens.checked_add(output.unwrap_or(0)),
+            self.cached_tokens.checked_add(cached.unwrap_or(0)),
+            self.cache_write_tokens.checked_add(written),
+        ) {
+            self.input_tokens = input;
+            self.output_tokens = output;
+            self.cached_tokens = cached;
+            self.cache_write_tokens = written;
+        } else {
+            complete = false;
+        }
         if let (Some(input), Some(output), Some(cached), Some(rates)) = (
             input,
             output,
@@ -116,12 +127,22 @@ impl UsageLedger {
                 })
             && cached.checked_add(written).is_some_and(|v| v <= input)
         {
-            self.cost_usd += (input - cached - written) as f64 * rates.input
+            // Token overflow does not erase an independently priceable receipt.
+            let cost = (input - cached - written) as f64 * rates.input
                 + cached as f64 * rates.cached
                 + written as f64 * rates.write
                 + output as f64 * rates.output;
+            let total = self.cost_usd + cost;
+            if cost.is_finite() && total.is_finite() {
+                self.cost_usd = total;
+            } else {
+                complete = false;
+            }
         } else {
-            self.unavailable_cost_calls += 1;
+            complete = false;
+        }
+        if !complete {
+            self.unavailable_cost_calls = self.unavailable_cost_calls.saturating_add(1);
         }
     }
 }
