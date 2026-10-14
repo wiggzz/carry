@@ -2,7 +2,7 @@
 
 `carry proxy` sits between a native HTTP Responses client and its provider. `off` forwards without review; `audit` performs paid shadow review without selecting a rewritten primary context; `compact` enables the proxy planner. These modes are experiments, not a claim of savings or client compatibility established by unit tests.
 
-The benchmark default is **`disabled`**, which retains the existing direct lanes. `disabled` and proxy `off` are distinct treatments. Compare `off` versus `compact` on the same candidate, tasks, model, effort, client configuration and native-compaction settings. Measure `disabled` versus `off` separately as transport overhead.
+The benchmark default is **`disabled`**, which selects the direct lanes without a Carry sidecar or reviewer. The shared benchmark gateway now validates and buffers POST bodies before forwarding, rejects hosted/malformed tools, and enforces a 16 MiB admission limit in both direct and active-proxy lanes; `disabled` does not preserve the former direct gateway's streaming/admission behavior. `disabled` and proxy `off` are distinct treatments. Compare `off` versus `compact` on the same candidate, tasks, model, effort, client configuration and native-compaction settings. Measure `disabled` versus `off` separately as transport overhead.
 
 ## Local ChatGPT/Codex login
 
@@ -427,7 +427,7 @@ Readiness checks `/health` and authenticated `/carry/metrics`, and rejects an ef
 
 ### Binary artifact
 
-Regular CI builds `target/x86_64-unknown-linux-musl/release/carry` once and uploads `carry-linux-amd64-musl-<exact-head-SHA>` for seven days. Obtain it from the successful regular CI run for your exact candidate, extract it into an isolated directory, and set its executable bit. Artifact upload alone is not a successful compatibility check. Do not compile on a host whose heavy-work guard refuses the build.
+Regular CI builds `target/x86_64-unknown-linux-musl/release/carry` once and uploads `carry-linux-amd64-musl-<github.sha>` for seven days. The suffix identifies the actual built commit; on PR events it can be a synthetic merge SHA, not the PR head. Verify the run's built commit and tracked tree against your candidate, preserving both identities even when their trees are equal. Obtain the artifact from that successful regular CI run, extract it into an isolated directory, and set its executable bit. Artifact upload alone is not a successful compatibility check. Do not compile on a host whose heavy-work guard refuses the build.
 
 ## Benchmark configuration contract
 
@@ -439,6 +439,7 @@ The protected `run-swebench.yml` workflow adds the following opt-in settings:
 | `proxy_history_policy` | `CARRY_PROXY_HISTORY_POLICY` | `strict` |
 | `proxy_classifier_model` | `CARRY_PROXY_CLASSIFIER_MODEL` | `gpt-6-luna` |
 | `proxy_classifier_effort` | `CARRY_PROXY_CLASSIFIER_EFFORT` | `low` |
+| `proxy_classifier_cache_policy` | `CARRY_PROXY_CLASSIFIER_CACHE_POLICY` | `openai-explicit` |
 | `proxy_payoff_requests` | `CARRY_PROXY_PAYOFF_REQUESTS` | `1` |
 | `proxy_min_payback_percent` | `CARRY_PROXY_MIN_PAYBACK_PERCENT` | `25` |
 
@@ -452,6 +453,7 @@ carry proxy --listen 0.0.0.0:8787
   --classifier-url http://openai-proxy:8080/v1/responses
   --state-dir /proxy-state --mode MODE
   --classifier-model MODEL --classifier-reasoning-effort EFFORT
+  --classifier-cache-policy POLICY
   --payoff-requests N --min-payback-percent INTEGER
 ```
 
@@ -464,16 +466,16 @@ The local launcher's `--classifier-effort` maps to the actual Rust frontdoor fla
 - The task receives only `BENCHMARK_CLIENT_TOKEN` through its existing `OPENAI_API_KEY` adapter interface. Codex's existing tmpfs auth flow is preserved. Provider credentials remain in trusted process/container environments, never argv or client config.
 - Gateway routing is fixed: primary requests go to `carry-context-proxy:8787`; the scoped shadow token can only POST `/v1/responses` to the fixed provider. A client cannot pick a provider, classifier endpoint, tenant, branch or session. Trusted per-slot headers replace caller-supplied identity **and history policy**. The runner maps validated `CARRY_PROXY_HISTORY_POLICY` to the gateway-only `BENCHMARK_CONTEXT_HISTORY_POLICY`; the gateway strips every caller `x-carry-*` header and supplies the fixed operator-selected `x-carry-history-policy`. The caller cannot request a reset or choose the policy.
 - A random gateway session ID is stable within a conversation and fresh per slot/arm. Fresh native client homes prevent native cache/session identity reuse across arms; the classifier's cache key derives from the fresh trusted identity. Inspect actual submitted cache keys before making live cache-isolation claims.
-- Container networking does not constrain provider-hosted retrieval. The benchmark's fresh/resumed Codex invocation explicitly sets `web_search="disabled"`, including custom command templates. Before creating an upstream request, the trusted gateway accepts only local `function`/`custom` tools and recursively compliant namespaces; hosted, unknown or malformed tool definitions are rejected, never stripped. Accepted native request/response bytes remain unchanged. Its request-body admission matches Carry's existing 16 MiB HTTP limit, separately from the 8 MiB telemetry capture budget. This benchmark policy does not change the generic opaque proxy's forwarding semantics or the convenience local launcher.
-- The evaluator receives no provider key. Exact container/network cleanup is bounded, verified, and fails closed when active-proxy absence cannot be proven.
+- Container networking does not constrain provider-hosted retrieval. The benchmark's fresh/resumed Codex invocation explicitly sets `web_search="disabled"`, including custom command templates. Before creating an upstream request, the shared Node benchmark gateway accepts only local `function`/`custom` tools and recursively compliant namespaces; hosted, unknown or malformed tool definitions are rejected, never stripped. This applies to direct and active-proxy lanes. Accepted native request/response bytes remain unchanged, but POST bodies are buffered before upstream admission. Its request-body admission matches Carry's existing 16 MiB HTTP limit, separately from the 8 MiB telemetry capture budget. This benchmark policy does not change the generic opaque Carry proxy's forwarding semantics or the convenience local launcher.
+- The evaluator receives no provider key. Exact container/network cleanup is bounded, verified, and fails closed in both direct and active-proxy lanes. Absence requires exit 1 and a known diagnostic naming the exact resource kind and name; daemon/socket failures, other names and unexpected exits do not prove cleanup. Docker's exact `network NAME not found` diagnostic is supported.
 
-All eight public proxy settings are carried through bootstrap, validated worker exports, runner provenance and immutable attempt-merge identity. Readiness checks the reported effective mode, and the workflow result gate compares every slot with the dispatched mode. `strict` rejects non-prefix native summary replacement with HTTP 409 in review modes. Explicit `reset-on-divergence` retires both active primary and shadow projections and accepts the replacement without inferring ancestry. Use the same policy in matched off/compact arms; off remains forwarding-only even under strict. Historical provenance missing only this setting normalizes to the historical `strict` default, never to reset. This does not authorize a paid dispatch or reuse of an old preparation catalog; candidate preparation and protected approval still belong to the operator.
+All seven public proxy settings are carried through bootstrap, validated worker exports, runner provenance and immutable attempt-merge identity. Readiness checks the reported effective mode, and the workflow result gate compares every slot with the dispatched mode. `strict` rejects non-prefix native summary replacement with HTTP 409 in review modes. Explicit `reset-on-divergence` retires both active primary and shadow projections and accepts the replacement without inferring ancestry. Use the same policy in matched off/compact arms; off remains forwarding-only even under strict. Historical provenance missing only this setting normalizes to the historical `strict` default, never to reset. This does not authorize a paid dispatch or reuse of an old preparation catalog; candidate preparation and protected approval still belong to the operator.
 
 ## Evidence and accounting
 
 Each active slot retains trusted gateway `BENCHMARK_CONTEXT_EVENT` records, `benchmark-events.jsonl`, `benchmark-summary.json`, and the integrated proxy's state/trace files in the sibling `attempt-NN-proxy-state` directory. Gateway logs allow only fixed reviewed model identifiers, an enumerated tier, known nonnegative numeric usage fields, bounded counters and fixed event metadata. Request/provider text, error messages, secret values, unknown object keys and arbitrary payloads never enter those events. Unknown model/tier becomes `unrecognized`, and unknown billing becomes a fixed marker; neither is silently default-priced. HTTP errors remain censored even if an error body contains a usage-shaped object. Numeric summaries distinguish primary and shadow calls, ordinary/read/write/output tokens, observed function calls, latency, censored/unpriced requests, proxy rewrites (`compactions` in Rust metrics) and native compactions.
 
-Native provider usage is used directly. Completed but invalid reviews still cost money. Missing, truncated, failed or unanswered usage is censored, not filled with synthetic tokens or zero cost. The total is unavailable if the ledger or required pricing is incomplete; `observed_cost_lower_bound_usd` is only the observed priced subtotal. Original native client usage remains in the record, with its old estimate labeled `client_estimated_cost_usd`; the treatment's primary and total estimates use trusted native accounting. A missing metric is unknown, not zero. Latency is completed-call latency, not total task wall time.
+Native provider usage is used directly. Completed but invalid reviews still cost money. Missing, truncated, failed or unanswered usage is censored, not filled with synthetic tokens or zero cost. Ledger integrity requires one ordered start and terminal per request, with an unambiguous actor; orphan, duplicate, conflicting or malformed records cannot certify a complete ledger. Orphan completions remain counted, and independently known unique receipt costs—including missing-start receipts—remain in `observed_cost_lower_bound_usd`. Duplicate receipts are priced once; conflicting model/tier/usage receipts are not arbitrarily selected. A valid censored terminal can close a lifecycle without providing a price. The total is unavailable if the ledger or required pricing is incomplete; the lower bound is only the observed priced subtotal. Original native client usage remains in the record, with its old estimate labeled `client_estimated_cost_usd`; the treatment's primary and total estimates use trusted native accounting. A missing metric is unknown, not zero. Latency is completed-call latency, not total task wall time. Native-compaction request classification covers the legacy compact path and V2 `input` trigger items; it is separate from the collected Rust `native_compactions` metric.
 
 [The rate table](../benchmarks/proxy-standard-rates.json) records the reviewed exact model IDs, separate cache-write/read rates, and the strictly-greater-than-272000 whole-request surcharge. Unknown aliases, nonstandard tiers and unsupported input billing categories have no estimated price. These are modeled standard API costs, not an invoice or infrastructure bill.
 
@@ -493,7 +495,7 @@ A separate `scripts/proxy_gateway_native_fixture.py` CI step uses the same exact
 
 The optional installed-client test `scripts.test_codex_hosted_tools` runs four additional pinned-Codex fresh/resume/native/custom cases through the actual benchmark entrypoint and production gateway against the scripted loopback provider. Regular CI explicitly enables it using the already installed Codex executable. It checks recursively inspected outbound tool types, real local tool effects, native completion and synthetic-auth removal; handler regressions prove forbidden tools create zero upstream requests. These are protocol/isolation fixtures, not paid benchmark scores.
 
-Both fixtures use fabricated provider responses and usage **only as labeled protocol fixtures**. They do not establish real model quality, paid usage, live cache hits, automatic Pi compaction, arbitrary-length histories, or cost savings. Two-summary RPC coverage proves repeated manual native summary/continuation, not Pi's automatic trigger. Standalone handler canary/HTTP-400 tests additionally verify content-free telemetry and byte-preserving forwarding, but are not a substitute for the complete pinned-Pi gateway path. A live comparison still requires exact-head successful CI plus independent evidence/quality/cost gates. A compact arm that never rewrites proves only forwarding/review overhead, not savings.
+Both fixtures use fabricated provider responses and usage **only as labeled protocol fixtures**. They do not establish real model quality, paid usage, live cache hits, automatic Pi compaction, arbitrary-length histories, or cost savings. Two-summary RPC coverage proves repeated manual native summary/continuation, not Pi's automatic trigger. Standalone handler canary/HTTP-400 tests additionally verify content-free telemetry and byte-preserving forwarding, but are not a substitute for the complete pinned-Pi gateway path. A live comparison still requires successful candidate-source CI with verified built-commit/tree identity plus independent evidence/quality/cost gates. A compact arm that never rewrites proves only forwarding/review overhead, not savings.
 
 ### Local stats dashboard
 
@@ -551,8 +553,8 @@ sessions remain in usage totals and the session list, labeled `Excluded` with
 dashes for scenario values. With no eligible sessions, comparison cards show
 `No eligible sessions` rather than zero savings. Dashboard responses include only numerical
 scenario estimates, never the prior prompt kept privately for cache matching.
-See [the proxy backlog](proxy-backlog.md) for background review and consolidation
-with the shared main savings/report estimator after its merge.
+See [the proxy backlog](proxy-backlog.md) for completed background review and
+consolidation with the shared main savings/report estimator.
 
 Review modes (`compact`/`audit`) accept full-history input or a delta referencing
 the latest completed `previous_response_id` in the explicit session/branch. Unknown

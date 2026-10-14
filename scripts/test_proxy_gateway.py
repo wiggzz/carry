@@ -49,6 +49,35 @@ class Provider:
 
 
 class TrustedGatewayTests(unittest.TestCase):
+    def test_v2_native_compaction_classification_preserves_forwarded_bytes(self):
+        from scripts import proxy_benchmark
+        usage = {'input_tokens': 100, 'output_tokens': 2,
+                 'input_tokens_details': {'cached_tokens': 0}}
+        reply = b' {"status":"completed", "model":"gpt-6-luna", "output":[], "usage":' + json.dumps(usage).encode() + b'} '
+        cases = [
+            (b' {"model":"gpt-6-luna", "input":[{"type":"compaction_trigger"}]} ', '/v1/responses', True),
+            (b'{"input":[null,{"type":"message","content":"compaction_trigger"}]}', '/v1/responses', False),
+            (b'{"input":{"type":"compaction_trigger"}}', '/v1/responses', False),
+            (b'{"compaction_trigger":true,"input":[]}', '/v1/responses', True),
+            (b'{"input":[]}', '/v1/responses/compact', True)]
+        for body, path, native in cases:
+            with self.subTest(body=body, path=path), Provider(response_bytes=reply) as provider:
+                gateway = Gateway(provider.server.server_port, provider.server.server_port)
+                try:
+                    status, raw = self.request_path(gateway, body, path)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(raw, reply)
+                    self.assertEqual(provider.calls[0]['body'], body)
+                    self.assertEqual(provider.calls[0]['path'], path)
+                finally:
+                    gateway.close()
+                completed = [event for event in gateway.events if event['event'] == 'completed']
+                self.assertEqual(len(completed), 1)
+                self.assertEqual(completed[0]['native_compaction'], native)
+                summary = proxy_benchmark.summarize_events(gateway.events)
+                self.assertTrue(summary['ledger_complete'])
+                self.assertEqual(summary['primary']['native_compaction_requests'], int(native))
+
     def test_tool_telemetry_counts_custom_calls_and_completed_stream_items(self):
         items = [{'type': 'function_call', 'call_id': 'function-a', 'arguments': CANARY},
                  {'type': 'custom_tool_call', 'call_id': 'custom-a', 'input': CANARY}]

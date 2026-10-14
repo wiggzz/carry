@@ -12,6 +12,208 @@ spec.loader.exec_module(worker)
 
 
 class ProxyBenchmarkTests(unittest.TestCase):
+    def capture_ledger(self, events):
+        import json
+        def docker(command, **kwargs):
+            if command[1] == 'logs':
+                return subprocess.CompletedProcess(command, 0, ''.join(
+                    'BENCHMARK_CONTEXT_EVENT ' + json.dumps(event) + '\n' for event in events), '')
+            return subprocess.CompletedProcess(command, 0, '{"mode":"compact","compactions":0}', '')
+        with tempfile.TemporaryDirectory() as directory:
+            summary = worker.proxy_benchmark.capture_evidence(
+                {'proxy': 'fixture', 'state_dir': directory}, execute=docker)
+            self.assertEqual(json.loads((pathlib.Path(directory) / 'benchmark-summary.json').read_text()), summary)
+            self.assertEqual([json.loads(line) for line in
+                (pathlib.Path(directory) / 'benchmark-events.jsonl').read_text().splitlines()], events)
+        return summary
+
+    def receipt(self, request_id='p', actor='primary', **fields):
+        return {'actor': actor, 'event': 'completed', 'request_id': request_id,
+                'model': 'gpt-6-luna', 'usage': {'input_tokens': 100, 'output_tokens': 2,
+                    'input_tokens_details': {'cached_tokens': 0}}, **fields}
+
+    def test_orphan_receipt_is_visible_and_priced_only_in_lower_bound(self):
+        paired = self.receipt()
+        orphan = self.receipt('orphan', 'shadow')
+        summary = self.capture_ledger([
+            {'actor': 'primary', 'event': 'started', 'request_id': 'p'}, paired, orphan])
+        self.assertFalse(summary['ledger_complete'])
+        self.assertIsNone(summary['estimated_total_cost_usd'])
+        self.assertIsNone(summary['shadow']['estimated_cost_usd'])
+        self.assertEqual(summary['shadow']['requests'], 0)
+        self.assertEqual(summary['shadow']['completed_requests'], 1)
+        self.assertEqual(summary['shadow']['orphan_completed_requests'], 1)
+        self.assertAlmostEqual(summary['observed_cost_lower_bound_usd'],
+            2 * worker.proxy_benchmark.native_cost(paired['model'], paired['usage']))
+
+    def test_duplicate_lifecycle_records_censor_total_without_double_pricing(self):
+        start = {'actor': 'primary', 'event': 'started', 'request_id': 'p'}
+        completed = self.receipt()
+        orphan = self.receipt('orphan', 'shadow')
+        for events, duplicates, known_receipts in (
+                ([start, start, completed], 1, 1),
+                ([start, completed, completed], 1, 1),
+                ([start, completed, orphan, orphan], 1, 2)):
+            with self.subTest(events=events):
+                summary = self.capture_ledger(events)
+                self.assertFalse(summary['ledger_complete'])
+                self.assertIsNone(summary['estimated_total_cost_usd'])
+                self.assertEqual(sum(summary[actor]['duplicate_records'] for actor in ('primary', 'shadow')), duplicates)
+                self.assertEqual(sum(summary[actor]['completed_requests'] for actor in ('primary', 'shadow')), known_receipts)
+                self.assertAlmostEqual(summary['observed_cost_lower_bound_usd'],
+                    known_receipts * worker.proxy_benchmark.native_cost(completed['model'], completed['usage']))
+
+    def test_conflicting_receipts_never_choose_a_cost_by_record_order(self):
+        import copy
+        start = {'actor': 'primary', 'event': 'started', 'request_id': 'p'}
+        receipt = self.receipt()
+        different = copy.deepcopy(receipt)
+        different['usage']['input_tokens'] = 200
+        wrong_type = copy.deepcopy(receipt)
+        wrong_type['usage']['input_tokens'] = 100.0
+        known = self.receipt('independent')
+        known_start = {**start, 'request_id': 'independent'}
+        for competing in (different, wrong_type, self.receipt('p', 'shadow')):
+            for receipts in ([receipt, competing], [competing, receipt]):
+                with self.subTest(receipts=receipts):
+                    events = [start, known_start, known, *receipts]
+                    if competing['actor'] == 'shadow':
+                        events.insert(1, {**start, 'actor': 'shadow'})
+                    summary = self.capture_ledger(events)
+                    self.assertFalse(summary['ledger_complete'])
+                    self.assertIsNone(summary['estimated_total_cost_usd'])
+                    self.assertAlmostEqual(summary['observed_cost_lower_bound_usd'],
+                        worker.proxy_benchmark.native_cost(known['model'], known['usage']))
+                    self.assertGreater(sum(summary[actor]['conflicting_requests'] for actor in ('primary', 'shadow')), 0)
+                    self.assertEqual(summary['primary']['completed_requests'], 2)
+                    self.assertEqual(summary['primary']['unpriced_requests'], 1)
+                    self.assertEqual(summary['primary']['censored_requests'], 0)
+
+    def test_malformed_event_envelopes_cannot_disappear_into_a_complete_ledger(self):
+        valid = [{'actor': 'primary', 'event': 'started', 'request_id': 'p'}, self.receipt()]
+        bad_records = [None, [], 'record', {},
+            {'actor': 'other', 'event': 'started', 'request_id': 'bad'},
+            {'actor': [], 'event': 'started', 'request_id': 'bad'},
+            {'actor': 'primary', 'event': 'started', 'request_id': ''},
+            {'actor': 'primary', 'event': 'started', 'request_id': []},
+            {'actor': 'primary', 'request_id': 'bad'},
+            {'actor': 'primary', 'event': 'unknown', 'request_id': 'bad'},
+            {'actor': 'primary', 'event': [], 'request_id': 'bad'}]
+        for bad in bad_records:
+            with self.subTest(bad=bad):
+                summary = self.capture_ledger([*valid, bad])
+                self.assertFalse(summary['ledger_complete'])
+                self.assertIsNone(summary['estimated_total_cost_usd'])
+                self.assertEqual(summary['malformed_records'], 1)
+                self.assertAlmostEqual(summary['observed_cost_lower_bound_usd'],
+                    worker.proxy_benchmark.native_cost(valid[1]['model'], valid[1]['usage']))
+                direct = worker.proxy_benchmark.summarize_events([*valid, bad])
+                self.assertFalse(direct['ledger_complete'])
+                self.assertIsNone(direct['estimated_total_cost_usd'])
+
+    def test_ledger_requires_ordered_single_start_and_terminal(self):
+        start = {'actor': 'primary', 'event': 'started', 'request_id': 'p'}
+        completed = self.receipt()
+        censored = {'actor': 'primary', 'event': 'censored', 'request_id': 'p'}
+        cases = [([completed, start], 1),
+                 ([start, completed, censored], 1),
+                 ([start, censored, completed], 1),
+                 ([start, completed, {**censored, 'request_id': 'orphan'}], 1),
+                 ([], 0)]
+        for events, errors in cases:
+            with self.subTest(events=events):
+                summary = self.capture_ledger(events)
+                self.assertFalse(summary['ledger_complete'])
+                self.assertIsNone(summary['estimated_total_cost_usd'])
+                direct = worker.proxy_benchmark.summarize_events(events)
+                self.assertIsNone(direct['estimated_total_cost_usd'])
+                self.assertEqual(summary['primary']['lifecycle_errors'], errors)
+                expected = worker.proxy_benchmark.native_cost(completed['model'], completed['usage']) if completed in events else 0
+                self.assertAlmostEqual(summary['observed_cost_lower_bound_usd'], expected)
+        for terminal, priced in ((completed, True), (censored, False)):
+            with self.subTest(terminal=terminal):
+                summary = self.capture_ledger([start, terminal])
+                self.assertTrue(summary['ledger_complete'])
+                self.assertEqual(summary['primary']['lifecycle_errors'], 0)
+                self.assertEqual(summary['estimated_total_cost_usd'] is not None, priced)
+
+    def test_censored_cross_actor_ids_invalidate_ownership_without_losing_known_costs(self):
+        def censored(actor, request_id):
+            return [{'actor': actor, 'event': event, 'request_id': request_id}
+                    for event in ('started', 'censored')]
+        control = self.capture_ledger(censored('primary', 'one') + censored('shadow', 'two'))
+        self.assertTrue(control['ledger_complete'])
+        self.assertIsNone(control['estimated_total_cost_usd'])
+        self.assertEqual(control['primary']['conflicting_requests'], 0)
+        self.assertEqual(control['shadow']['conflicting_requests'], 0)
+        collision = censored('primary', 'collision') + censored('shadow', 'collision')
+        known = self.receipt('independent')
+        known_events = [{'actor': 'primary', 'event': 'started', 'request_id': 'independent'}, known]
+        for additional in ([], known_events):
+            with self.subTest(known_receipt=bool(additional)):
+                summary = self.capture_ledger(collision + additional)
+                self.assertFalse(summary['ledger_complete'])
+                self.assertIsNone(summary['estimated_total_cost_usd'])
+                self.assertEqual(summary['primary']['conflicting_requests'], 1)
+                self.assertEqual(summary['shadow']['conflicting_requests'], 1)
+                self.assertEqual(summary['primary']['censored_requests'], 1)
+                self.assertEqual(summary['shadow']['censored_requests'], 1)
+                expected = worker.proxy_benchmark.native_cost(known['model'], known['usage']) if additional else 0
+                self.assertAlmostEqual(summary['observed_cost_lower_bound_usd'], expected)
+
+    def test_malformed_receipt_fields_censor_total_without_losing_known_costs(self):
+        start = {'actor': 'primary', 'event': 'started', 'request_id': 'p'}
+        known = self.receipt()
+        fields = [({'latency_ms': 'invalid'}, True), ({'latency_ms': -1}, True),
+                  ({'tool_calls': 'invalid'}, True), ({'tool_calls': True}, True),
+                  ({'native_compaction': 'true'}, True), ({'model': []}, False),
+                  ({'service_tier': []}, False), ({'usage': []}, False),
+                  ({'usage': None}, False)]
+        for changes, priced in fields:
+            with self.subTest(changes=changes):
+                bad = self.receipt('bad', **changes)
+                summary = self.capture_ledger([start, known, {**start, 'request_id': 'bad'}, bad])
+                self.assertFalse(summary['ledger_complete'])
+                self.assertIsNone(summary['estimated_total_cost_usd'])
+                self.assertEqual(summary['malformed_records'], 1)
+                self.assertEqual(summary['primary']['completed_requests'], 2)
+                self.assertAlmostEqual(summary['observed_cost_lower_bound_usd'],
+                    (1 + priced) * worker.proxy_benchmark.native_cost(known['model'], known['usage']))
+
+    def test_conflicting_counters_do_not_erase_an_unambiguous_receipt_cost(self):
+        start = {'actor': 'primary', 'event': 'started', 'request_id': 'p'}
+        first = self.receipt(latency_ms=10, tool_calls=1)
+        second = {**first, 'latency_ms': 20}
+        for receipts in ([first, second], [second, first]):
+            with self.subTest(receipts=receipts):
+                summary = self.capture_ledger([start, *receipts])
+                self.assertFalse(summary['ledger_complete'])
+                self.assertIsNone(summary['estimated_total_cost_usd'])
+                self.assertAlmostEqual(summary['observed_cost_lower_bound_usd'],
+                    worker.proxy_benchmark.native_cost(first['model'], first['usage']))
+                self.assertEqual(summary['primary']['ordinary_input_tokens'], 100)
+                self.assertEqual(summary['primary']['latency_ms'], 0)
+                self.assertEqual(summary['primary']['tool_calls'], 1)
+                self.assertEqual(summary['primary']['conflicting_requests'], 1)
+
+    def test_malformed_usage_cannot_certify_a_complete_ledger(self):
+        valid = [{'actor': 'primary', 'event': 'started', 'request_id': 'p'}, self.receipt()]
+        base = self.receipt()['usage']
+        for usage in ({**base, 'input_tokens': -1}, {**base, 'output_tokens': True},
+                      {**base, 'input_tokens': '100'}, {**base, 'input_tokens_details': []},
+                      {**base, 'output_tokens_details': []},
+                      {**base, 'input_tokens_details': {'cached_tokens': '0'}}):
+            with self.subTest(usage=usage):
+                summary = self.capture_ledger([*valid,
+                    {'actor': 'primary', 'event': 'started', 'request_id': 'bad'},
+                    self.receipt('bad', usage=usage)])
+                self.assertFalse(summary['ledger_complete'])
+                self.assertIsNone(summary['estimated_total_cost_usd'])
+                self.assertEqual(summary['malformed_records'], 1)
+                self.assertEqual(summary['primary']['completed_requests'], 2)
+                self.assertAlmostEqual(summary['observed_cost_lower_bound_usd'],
+                    worker.proxy_benchmark.native_cost(valid[1]['model'], valid[1]['usage']))
+
     def test_classifier_cache_policy_rejects_unsupported_inputs_before_launch(self):
         proxy = worker.proxy_benchmark
         for policy in ('', 'caller-decides', 'OPENAI-EXPLICIT'):
@@ -57,7 +259,8 @@ class ProxyBenchmarkTests(unittest.TestCase):
             if command[1] == 'exec':
                 return subprocess.CompletedProcess(command, 0, '{"mode":"compact"}', '')
             if command[1:4] == ['inspect', '--type', 'container'] or command[1:3] == ['network', 'inspect']:
-                return subprocess.CompletedProcess(command, 1, '', 'No such container')
+                kind = 'network' if command[1] == 'network' else 'container'
+                return subprocess.CompletedProcess(command, 1, '', f'Error: No such {kind}: {command[-1]}')
             return subprocess.CompletedProcess(command, 0, '172.20.0.2\n' if '--format' in command else '', '')
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
                 'CARRY_PROXY_MODE': 'compact', 'CARRY_PROXY_HISTORY_POLICY':'reset-on-divergence', 'BENCHMARK_HARNESS': 'pi',
@@ -272,7 +475,8 @@ upstream.listen(0, '127.0.0.1', () => {
             if command[1] == 'exec':
                 return subprocess.CompletedProcess(command, 0, '{"mode":"off"}', '')
             if command[1:4] == ['inspect','--type','container'] or command[1:3] == ['network','inspect']:
-                return subprocess.CompletedProcess(command, 1, '', 'No such container')
+                kind = 'network' if command[1] == 'network' else 'container'
+                return subprocess.CompletedProcess(command, 1, '', f'Error: No such {kind}: {command[-1]}')
             return subprocess.CompletedProcess(command,0,'172.20.0.2\n' if '--format' in command else '', '')
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
                 'CARRY_PROXY_MODE':'compact','BENCHMARK_HARNESS':'pi','OPENAI_API_KEY':'private'}):

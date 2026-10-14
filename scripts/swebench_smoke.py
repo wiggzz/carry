@@ -686,25 +686,25 @@ def cleanup_agent_network(network: Mapping[str, str], execute: Any = subprocess.
             check=False, capture_output=True, text=True, timeout=30,
         )
         leftovers = []
+        inspections = [("gateway", "container", network["proxy"], proxy),
+                       ("internal network", "network", network["internal"], internal),
+                       ("egress network", "network", network["egress"], egress)]
         if network.get("carry_proxy"):
             carry = execute(["docker", "inspect", "--type", "container", network["carry_proxy"]],
                             check=False, capture_output=True, text=True, timeout=30)
             if carry.returncode == 0:
                 leftovers.append("Carry proxy container remains")
-            for label, result in (("Carry proxy", carry), ("gateway", proxy),
-                                  ("internal network", internal), ("egress network", egress)):
-                stderr = (result.stderr or '').strip()
-                named_network_absent = (
-                    label in ("internal network", "egress network")
-                    and result.returncode == 1
-                    and stderr == (
-                        "Error response from daemon: network "
-                        + network["internal" if label == "internal network" else "egress"]
-                        + " not found"
-                    )
-                )
-                if result.returncode != 0 and 'no such' not in stderr.lower() and not named_network_absent:
-                    leftovers.append(f"{label} absence cannot be proven")
+            inspections.append(("Carry proxy", "container", network["carry_proxy"], carry))
+        # Both direct and sidecar lanes require exact-resource proof, not merely
+        # an unsuccessful inspect (which could be a daemon/socket failure).
+        for label, kind, name, result in inspections:
+            diagnostics = {f"Error: No such {kind}: {name}",
+                           f"Error response from daemon: No such {kind}: {name}"}
+            if kind == "network":
+                diagnostics.add(f"Error response from daemon: network {name} not found")
+            if result.returncode != 0 and not (
+                    result.returncode == 1 and (result.stderr or '').strip() in diagnostics):
+                leftovers.append(f"{label} absence cannot be proven")
         if proxy.returncode == 0:
             leftovers.append("proxy container remains")
         if internal.returncode == 0:

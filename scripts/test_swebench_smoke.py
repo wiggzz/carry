@@ -1684,7 +1684,8 @@ class SmokeWorkerTests(unittest.TestCase):
             if "github.com" in " ".join(command):
                 return mock.Mock(returncode=42, stdout="")
             if command[:2] == ["docker", "inspect"] or command[:3] == ["docker", "network", "inspect"]:
-                return mock.Mock(returncode=1, stdout="")
+                kind = "network" if command[1] == "network" else "container"
+                return mock.Mock(returncode=1, stdout="", stderr=f"Error: No such {kind}: {command[-1]}")
             return mock.Mock(returncode=0, stdout="")
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1695,6 +1696,55 @@ class SmokeWorkerTests(unittest.TestCase):
                     identity="slot-two", proxy_image="node@sha256:" + "a" * 64,
                     proxy_script=proxy_script, execute=execute,
                 )
+
+    def test_cleanup_requires_exact_kind_name_and_exit_for_every_lane(self):
+        base = {"internal": "internal", "egress": "egress", "proxy": "gateway"}
+        for active in (False, True):
+            network = {**base, **({"carry_proxy": "carry"} if active else {})}
+            for target in network.values():
+                kind = "network" if target in ("internal", "egress") else "container"
+                failures = [
+                    (1, "error during connect: dial unix /var/run/docker.sock: connect: no such file or directory"),
+                    (1, "Cannot connect to Docker: socket not found"),
+                    (1, f"Error: No such {kind}: {target}-other"),
+                    (1, f"Error: No such {'container' if kind == 'network' else 'network'}: {target}"),
+                    (1, f"Error: No such {kind}"),
+                    (2, f"Error: No such {kind}: {target}"),
+                    (1, f"Error: No such {kind}: {target}\nadditional failure"),
+                    (1, f"Error response from daemon: network {target}-other not found"),
+                    (2, f"Error response from daemon: network {target} not found"),
+                ]
+                for code, error in failures:
+                    with self.subTest(active=active, target=target, code=code, error=error):
+                        def execute(command, **kwargs):
+                            if command[:2] == ["docker", "inspect"] or command[:3] == ["docker", "network", "inspect"]:
+                                resource_kind = "network" if command[1] == "network" else "container"
+                                if command[-1] == target:
+                                    return subprocess.CompletedProcess(command, code, "", error)
+                                return subprocess.CompletedProcess(command, 1, "", f"Error: No such {resource_kind}: {command[-1]}\n")
+                            return subprocess.CompletedProcess(command, 0, "", "")
+                        with mock.patch.object(self.worker.time, "sleep"), self.assertRaises(self.worker.ContainerCleanupError):
+                            self.worker.cleanup_agent_network(network, execute=execute)
+
+    def test_cleanup_accepts_documented_exact_absence_diagnostics_in_both_lanes(self):
+        for active in (False, True):
+            for prefix in ("Error:", "Error response from daemon:"):
+                for network_form in ("No such network: {name}", "network {name} not found"):
+                    if prefix == "Error:" and network_form.startswith("network"):
+                        continue
+                    with self.subTest(active=active, prefix=prefix, network_form=network_form):
+                        network = {"internal": "internal", "egress": "egress", "proxy": "gateway"}
+                        if active:
+                            network["carry_proxy"] = "carry"
+                        def execute(command, **kwargs):
+                            if command[:2] == ["docker", "inspect"]:
+                                diagnostic = f"No such container: {command[-1]}"
+                            elif command[:3] == ["docker", "network", "inspect"]:
+                                diagnostic = network_form.format(name=command[-1])
+                            else:
+                                return subprocess.CompletedProcess(command, 0, "", "")
+                            return subprocess.CompletedProcess(command, 1, "", f"{prefix} {diagnostic}\n")
+                        self.worker.cleanup_agent_network(network, execute=execute)
 
     def test_active_proxy_cleanup_accepts_exact_named_network_not_found(self):
         network = {"internal": "carry-agent-internal-23cc6606ebf1929e",

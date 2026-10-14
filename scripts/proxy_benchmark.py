@@ -75,8 +75,10 @@ def native_cost(model, usage, *, service_tier='default'):
     import json
     from pathlib import Path
     table = json.loads((Path(__file__).resolve().parents[1] / 'benchmarks/proxy-standard-rates.json').read_text())
+    if not isinstance(model, str) or service_tier not in ('default', 'standard', None):
+        return None
     rates = table['models'].get(model)
-    if rates is None or service_tier not in {'default', 'standard', None}:
+    if rates is None:
         return None
     if not isinstance(usage, dict):
         return None
@@ -109,23 +111,86 @@ def native_cost(model, usage, *, service_tier='default'):
 
 
 def summarize_events(events, *, metrics=None):
+    import json
+    from collections import Counter, defaultdict
+    valid = []
+    malformed = 0
+    for event in events:
+        if (not isinstance(event, dict) or event.get('actor') not in ('primary', 'shadow')
+                or not isinstance(event.get('request_id'), str) or not event['request_id']
+                or event.get('event') not in ('started', 'completed', 'censored')):
+            malformed += 1
+        else:
+            # Keep identifiable receipts even when ancillary counters are bad:
+            # independently known usage still contributes to the lower bound.
+            bad_counter = any(key in event and event[key] is not None
+                and (type(event[key]) is not int or event[key] < 0)
+                for key in ('latency_ms', 'tool_calls', 'http_status'))
+            bad_metadata = (any(event.get(key) is not None and not isinstance(event[key], str)
+                for key in ('model', 'service_tier'))
+                or ('native_compaction' in event and type(event['native_compaction']) is not bool))
+            usage = event.get('usage')
+            bad_usage = event['event'] == 'completed' and not isinstance(usage, dict)
+            if event['event'] == 'completed' and isinstance(usage, dict):
+                for key, value in usage.items():
+                    if key in ('input_tokens_details', 'output_tokens_details'):
+                        bad_usage |= not isinstance(value, dict) or any(
+                            type(part) is not int or part < 0 for part in value.values())
+                    else:
+                        bad_usage |= type(value) is not int or value < 0
+            malformed += int(bad_counter or bad_metadata or bad_usage)
+            valid.append(event)
+    events = valid
+    owners = defaultdict(set)
+    for event in events:
+        owners[event['request_id']].add(event['actor'])
     actors = {}
     for actor in ('primary', 'shadow'):
+        lifecycles = defaultdict(list)
+        for event in events:
+            if event['actor'] == actor:
+                lifecycles[event['request_id']].append(event['event'])
+        lifecycle_errors = sum(sequence not in (['started', 'completed'], ['started', 'censored'])
+                               for sequence in lifecycles.values())
+        counts = Counter((e['request_id'], e.get('event')) for e in events if e.get('actor') == actor)
         starts = {e['request_id'] for e in events if e.get('actor') == actor and e.get('event') == 'started'}
-        completed = {e['request_id']: e for e in events
-                     if e.get('actor') == actor and e.get('event') == 'completed'}
-        summary = dict(requests=len(starts), completed_requests=len(starts & completed.keys()),
-            censored_requests=len(starts - completed.keys()), ordinary_input_tokens=0,
+        receipts = defaultdict(list)
+        for event in events:
+            if event.get('actor') == actor and event.get('event') == 'completed':
+                receipts[event['request_id']].append(event)
+        conflicts = {request for request in lifecycles if len(owners[request]) != 1}
+        conflicts.update(request for request, records in receipts.items()
+                         if any(record != records[0] for record in records[1:]))
+        # Conflicting ancillary counters do not erase an agreed billing receipt.
+        # Conflicting model/tier/usage or actor identity must never be chosen by order.
+        # JSON signatures distinguish billing integers from malformed floats/bools.
+        def billing(record):
+            return json.dumps((record.get('model'), record.get('service_tier', 'default'),
+                               record.get('usage')), sort_keys=True)
+        pricing_conflicts = {request for request, records in receipts.items()
+            if len(owners[request]) != 1 or any(billing(record) != billing(records[0]) for record in records[1:])}
+        conflicts |= pricing_conflicts
+        completed = {request: records[0] for request, records in receipts.items() if request not in pricing_conflicts}
+        summary = dict(requests=len(starts), completed_requests=len(receipts),
+            conflicting_requests=len(conflicts), lifecycle_errors=lifecycle_errors,
+            completion_records=sum(count for (_, event), count in counts.items() if event == 'completed'),
+            duplicate_records=sum(count - 1 for count in counts.values()),
+            orphan_completed_requests=len(receipts.keys() - starts),
+            censored_requests=len(starts - receipts.keys()), ordinary_input_tokens=0,
             cached_input_tokens=0, cache_write_input_tokens=0, output_tokens=0,
             latency_ms=0, tool_calls=0, native_compaction_requests=0, observed_cost_usd=0.0)
-        unavailable = 0
-        for request in starts & completed.keys():
+        unavailable = len(pricing_conflicts)
+        for request in completed:
             event = completed[request]
             usage = event.get('usage', {})
             cost = native_cost(event.get('model'), usage, service_tier=event.get('service_tier', 'default'))
-            summary['latency_ms'] += event.get('latency_ms', 0)
-            summary['tool_calls'] += event.get('tool_calls') or 0
-            summary['native_compaction_requests'] += int(event.get('native_compaction') is True)
+            for key in ('latency_ms', 'tool_calls'):
+                value = event.get(key)
+                if (type(value) is int and value >= 0
+                        and all(record.get(key) == value for record in receipts[request])):
+                    summary[key] += value
+            summary['native_compaction_requests'] += int(all(
+                record.get('native_compaction') is True for record in receipts[request]))
             if cost is None:
                 unavailable += 1
             else:
@@ -142,10 +207,15 @@ def summarize_events(events, *, metrics=None):
             summary['cache_write_input_tokens'] += writes
             summary['output_tokens'] += usage['output_tokens']
         summary['unpriced_requests'] = unavailable
-        summary['estimated_cost_usd'] = None if unavailable or summary['censored_requests'] else summary['observed_cost_usd']
+        summary['estimated_cost_usd'] = None if (malformed or lifecycle_errors or unavailable or summary['censored_requests']
+            or summary['orphan_completed_requests'] or summary['duplicate_records']
+            or summary['conflicting_requests']) else summary['observed_cost_usd']
         actors[actor] = summary
     costs = [s['estimated_cost_usd'] for s in actors.values()]
-    return {**actors, 'estimated_total_cost_usd': None if None in costs else sum(costs),
+    ledger_complete = not malformed and bool(actors['primary']['requests']) and not any(
+        s['lifecycle_errors'] or s['conflicting_requests'] for s in actors.values())
+    return {**actors, 'malformed_records': malformed, 'ledger_complete': ledger_complete,
+        'estimated_total_cost_usd': None if not ledger_complete or None in costs else sum(costs),
         'observed_cost_lower_bound_usd': sum(s['observed_cost_usd'] for s in actors.values()),
         'proxy_rewrites': metrics.get('rewrites') if metrics else None,
         'native_compactions': metrics.get('native_compactions') if metrics else None,
@@ -190,16 +260,14 @@ def capture_evidence(network, *, execute=None):
         for line in result.stdout.splitlines():
             if line.startswith('BENCHMARK_CONTEXT_EVENT '):
                 try:
-                    event = json.loads(line.split(' ', 1)[1])
-                    if event.get('actor') in {'primary', 'shadow'} and isinstance(event.get('request_id'), str):
-                        events.append(event)
+                    events.append(json.loads(line.split(' ', 1)[1]))
                 except (ValueError, AttributeError):
                     complete = False
         metrics = read_metrics(network, execute=execute)
     except (OSError, subprocess.SubprocessError):
         complete, metrics = False, None
     summary = summarize_events(events, metrics=metrics)
-    summary['ledger_complete'] = complete and bool(summary['primary']['requests'])
+    summary['ledger_complete'] = complete and summary['ledger_complete']
     if not summary['ledger_complete']:
         summary['estimated_total_cost_usd'] = None
         for actor in ('primary', 'shadow'):

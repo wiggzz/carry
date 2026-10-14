@@ -1,6 +1,8 @@
 # Proxy follow-up backlog
 
-Current work is in `feat/proxy-local-client-support` (`~/carry-pr-140`).
+This repository-relative backlog tracks the integrated proxy. PR140 was closed
+without merging; its work is included in the PR141 candidate, not a separate
+active worktree or merge prerequisite.
 
 - [x] Request strict provider-enforced reviewer JSON schema, including Codex.
   Keep local semantic validation and fail closed on unsupported providers/refusals.
@@ -13,9 +15,9 @@ Current work is in `feat/proxy-local-client-support` (`~/carry-pr-140`).
 - [x] Dashboard cost comparison using the main estimator's frozen-trajectory
   approach: conventional threshold summaries vs Carry, including reviewer cost,
   separate from observed provider-usage costs and with incomplete coverage visible.
-- [x] Consolidate the proxy estimator with the shared savings/report estimator
-  after `feat/pi-cost-savings-estimate` merges. Both must use the same local token
-  basis; do not add tokenized removals directly to provider input usage.
+- [x] Consolidate the proxy estimator with the shared savings/report estimator.
+  Both use the same local token basis; do not add tokenized removals directly
+  to provider input usage.
 - [x] Shared bounded windows for bootstrap and oversized ongoing reviews.
   The live `0d16e73c823a…` session had ~1.07 MiB / 436,617 estimated tokens in its
   reviewer projection alone, beyond both the old byte cap and the new token cap.

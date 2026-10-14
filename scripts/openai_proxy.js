@@ -313,7 +313,8 @@ function serve(options = {}) {
         }
         model = telemetryModel(value.model);
         serviceTier = telemetryTier(value.service_tier);
-        nativeCompaction ||= Boolean(value.compaction_trigger);
+        nativeCompaction ||= Boolean(value.compaction_trigger) ||
+          (Array.isArray(value.input) && value.input.some(item => item?.type === 'compaction_trigger'));
       } catch (_) { deny(400); return; }
       forward(raw);
     });
