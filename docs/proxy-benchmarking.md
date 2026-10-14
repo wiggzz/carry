@@ -188,9 +188,10 @@ Successful windows survive failed primaries and restarts. A wholly rejected revi
 stops the attempt without advancing that window or discarding completed windows;
 partially accepted reviews advance while reporting rejected items for correction.
 Completed window memberships are checkpointed as source IDs/member snapshots,
-without duplicate payloads. Rewrite economics price the complete frozen sweep,
-including each scheduled call and output cap across the payoff horizon. Cadence,
-per-request call limits and unfinished sweep progress determine those calls.
+without duplicate payloads. For priced ordinary sweeps, rewrite economics price
+the complete frozen sweep, including each scheduled call and output cap across
+the payoff horizon. Cadence, per-request call limits and unfinished sweep
+progress determine those calls.
 New eligible tail context is priced as conservative bounded chronological windows;
 partial-window continuation prices only remaining sources, with no credit from a
 removed prefix. Missing oversized coverage reports `reviewer_partition_unknown`
@@ -198,6 +199,19 @@ instead of pricing only the last active window. These fixed-partition projection
 are conditional assumptions and do not predict provider latency or future changes.
 Reports separate `future_review_events` from `future_reviewer_calls`; reviewer
 input/cache totals are named for the whole sweep, rather than one request.
+With `--payoff-requests > 1`, unfinished bootstrap economics are unknown until
+bootstrap completes. A candidate that empties a pending ordinary sweep while
+retaining memories is also unpriced: the scheduler does not yet price its
+subsequent memory-only cleanup POST. These paths report
+`reviewer_economics_priced:false`/`reviewer_pricing_unknown` and cannot authorize
+that rewrite; unknown candidate costs are not reported as zero. Cleanup still
+runs within the existing review capacity, cadence and call limits. A completed
+sweep, an empty sweep without memories, and the sunk-only payoff of one do not
+trigger these guards. The current paid review remains sunk.
+Primary rewrite payback remains input-only; future reviewer estimates include
+their configured output allowance. Direct Carry retention still uses normalized
+cached/input and write/input ratios. Neither policy is complete dollar-cost
+planning, and neither changes rates or the payback denominator.
 A rebase/native epoch reset clears this progress. The dashboard distinguishes wholly invalid reviews from partially accepted reviews; legacy invalid-review totals remain historical.
 
 Reviewer requests replay native messages, reasoning (including encrypted content),
@@ -561,6 +575,13 @@ the latest completed `previous_response_id` in the explicit session/branch. Unkn
 or stale IDs return 409; an explicit rebase retires the continuation. The proxy
 reconstructs history and sends full retained input upstream, without
 `previous_response_id`. Conversation handles and background requests are rejected.
+The successful response's saved input frontier survives a failed primary;
+retrying the identical delta expands that parent once, including across restart.
+An empty or revised delta after failure is not guaranteed to replace the failed
+suffix in a strict explicit session: retry it identically or choose a new branch.
+Legacy checkpoints with a response ID but no saved frontier reject delta
+continuation; an ordinary compatible full-history request can establish a new
+successful frontier.
 Reviewer memories are small atomic facts: they activate when any source is removed
 and are inserted after the latest source group’s last member, retained or removed. The
 proxy renders the retained primary history, including any previously applied

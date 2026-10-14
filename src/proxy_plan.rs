@@ -305,6 +305,17 @@ pub(super) fn sweep_cost(
     windows: &[PricedReviewWindow],
     schedule: &ReviewSchedule,
 ) -> Option<f64> {
+    // The ordinary scheduler does not price unfinished bootstrap work or the
+    // memory-only POST after an otherwise empty pending sweep. Do not treat
+    // either future dispatch as free. payoff=1 has no future reviewer horizon.
+    if config.payoff_requests > 1
+        && ((session.bootstrap_review_pending && !session.bootstrap_review_complete)
+            || (session.review_end_id != 0
+                && !session.memories.is_empty()
+                && schedule.pending_calls.iter().all(|calls| *calls == 0)))
+    {
+        return None;
+    }
     windows.iter().zip(&schedule.calls).enumerate().try_fold(
         0.0,
         |total, (index, (window, calls))| {
@@ -407,6 +418,7 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         );
     };
     let mut reports = Vec::new();
+    let mut reviewer_economics_priced = true;
     let mut best: Option<(Session, JointDecision)> = None;
     for protected in candidates {
         let removed = select_removals(groups.iter().map(|g| g.id), &eligible, &protected);
@@ -443,6 +455,8 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         let Some(compact_shadow_cost) =
             sweep_cost(config, &candidate, &compact_windows, &compact_schedule)
         else {
+            reviewer_economics_priced = false;
+            reports.push(json!({"removed_groups":removed,"reason":"reviewer_pricing_unknown","reviewer_economics_priced":false}));
             continue;
         };
         let shadow = ViewCosts {
@@ -473,7 +487,7 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         "mode": format!("{:?}", config.mode).to_lowercase(),
         "future_review_events": keep_schedule.events,
         "future_reviewer_calls": keep_schedule.calls.iter().sum::<u64>(),
-        "reviewer_economics_priced": true,
+        "reviewer_economics_priced": reviewer_economics_priced,
         "reviewer_windows": keep_windows.len(),
         "added_tail_windows": keep_windows.iter().filter(|window| window.added_tail).count(),
         "payoff_requests": config.payoff_requests,
