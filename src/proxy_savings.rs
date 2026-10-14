@@ -231,18 +231,16 @@ impl Trajectory {
             traditional_cached,
             minimum,
         );
-        let output_cost = estimated_cost_usd(
-            &prompt.model,
-            &Usage {
-                output_tokens: output,
-                ..Usage::default()
-            },
-        );
-        if let (Some(carry), Some(traditional), Some(output_cost)) =
-            (carry, traditional, output_cost)
+        // Freeze the output count, not its rate: each branch selects its own tier.
+        let carry_output =
+            crate::savings::scenario_output_cost(&prompt.model, prompt.input, output);
+        let traditional_output =
+            crate::savings::scenario_output_cost(&prompt.model, traditional_input, output);
+        if let (Some(carry), Some(traditional), Some(carry_output), Some(traditional_output)) =
+            (carry, traditional, carry_output, traditional_output)
         {
-            self.result.carry_cost += carry + output_cost;
-            self.result.traditional_cost += traditional + output_cost;
+            self.result.carry_cost += carry + carry_output;
+            self.result.traditional_cost += traditional + traditional_output;
         } else {
             self.available = false;
         }

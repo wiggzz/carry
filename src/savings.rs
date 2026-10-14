@@ -254,14 +254,11 @@ impl Trajectory {
                         .saturating_sub(self.removed as i128)
                         .saturating_add(self.summary as i128)
                         .clamp(0, u64::MAX as i128) as u64;
-                    // Frozen provider output is a common charge, independent of input proxy tiers.
-                    let output = estimated_cost_usd(
-                        &prompt.model,
-                        &Usage {
-                            output_tokens: usage.output_tokens,
-                            ..Usage::default()
-                        },
-                    );
+                    // Freeze the output count, not its rate: use each scenario input tier.
+                    let carry_output =
+                        scenario_output_cost(&prompt.model, prompt.input, usage.output_tokens);
+                    let pi_output =
+                        scenario_output_cost(&prompt.model, pi_input, usage.output_tokens);
                     let compatible = self.previous.as_ref().is_some_and(|p| {
                         p.model == prompt.model
                             && p.overhead == prompt.overhead
@@ -294,9 +291,11 @@ impl Trajectory {
                     }
                     let carry = input_cost(&prompt.model, prompt.input, carry_cached, minimum);
                     let pi = input_cost(&prompt.model, pi_input, pi_cached, minimum);
-                    if let (Some(carry), Some(pi), Some(output)) = (carry, pi, output) {
-                        self.result.carry_cost += carry + output;
-                        self.result.pi_cost += pi + output;
+                    if let (Some(carry), Some(pi), Some(carry_output), Some(pi_output)) =
+                        (carry, pi, carry_output, pi_output)
+                    {
+                        self.result.carry_cost += carry + carry_output;
+                        self.result.pi_cost += pi + pi_output;
                     } else {
                         self.scenario_available = false;
                     }
@@ -356,6 +355,11 @@ impl Trajectory {
 }
 fn input_cost(model: &str, input: u64, cached: u64, minimum: Option<u64>) -> Option<f64> {
     scenario_input_cost(model, input, cached, minimum, estimated_cost_usd)
+}
+
+/// Input selects the authoritative output tier but is not charged a second time.
+pub(crate) fn scenario_output_cost(model: &str, input: u64, output: u64) -> Option<f64> {
+    carry::models::Rates::for_model(model, input as f64).map(|rates| output as f64 * rates.output)
 }
 
 /// Shared cache eligibility math; each frontend retains its pricing policy.
