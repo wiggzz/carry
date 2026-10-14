@@ -294,9 +294,9 @@ mod savings_tests {
     fn augmentation_clears_unknown_pricing_and_updates_terminal_summary() {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         let mut request =
-            json!({"event":"model_request","data":{"request":{"input":["x".repeat(960000)]}}});
+            json!({"event":"model_request","data":{"request":{"input":["a ".repeat(240000)]}}});
         augment_event(&mut t, &mut request);
-        let mut response = json!({"event":"model_response","data":{"usage":{"input_tokens":240000,"output_tokens":20000},"raw":{"output":"x".repeat(80000)}}});
+        let mut response = json!({"event":"model_response","data":{"usage":{"input_tokens":240000,"output_tokens":20000},"raw":{"output":"a ".repeat(20000)}}});
         augment_event(&mut t, &mut response);
         assert!(response["data"]["estimated_savings_usd"].is_number());
         let mut finished = json!({"event":"run_finished","data":{}});

@@ -21,38 +21,10 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct PromptCacheCapabilities {
-    pub minimum_prefix_tokens: usize,
-    pub max_read_breakpoints: usize,
-    pub max_write_breakpoints: usize,
-    pub implicit_breakpoint_uses_write_slot: bool,
-}
-
-const OPENAI_GPT_56_PROMPT_CACHE: PromptCacheCapabilities = PromptCacheCapabilities {
-    minimum_prefix_tokens: 1_024,
-    max_read_breakpoints: 50,
-    max_write_breakpoints: 4,
-    implicit_breakpoint_uses_write_slot: true,
-};
+pub(crate) use carry::models::PromptCacheCapabilities;
 
 pub(crate) fn prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabilities> {
-    exact_model_prompt_cache_capabilities(model)
-        .or_else(|| model_family_prompt_cache_capabilities(model))
-}
-
-fn exact_model_prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabilities> {
-    match model {
-        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-astra" | "gpt-6-luna"
-        | "gpt-6-sol" => Some(OPENAI_GPT_56_PROMPT_CACHE),
-        _ => None,
-    }
-}
-
-fn model_family_prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabilities> {
-    model
-        .starts_with("gpt-5.6-")
-        .then_some(OPENAI_GPT_56_PROMPT_CACHE)
+    carry::models::model_spec(model)?.cache
 }
 
 #[derive(Clone, Debug)]
@@ -98,29 +70,17 @@ pub struct Usage {
 
 /// Modeled USD rates from scripts/swebench_smoke.py and published OpenAI pricing, not a billing quote.
 pub(crate) fn estimated_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
-    let (input, cached_input, cache_write_input, output) = match model {
-        "gpt-5.6-luna" => (0.20, 0.02, 0.25, 1.20),
-        "gpt-5.6-sol" => (4.00, 0.40, 5.00, 20.00),
-        "gpt-5.6-terra" => (2.00, 0.20, 2.50, 12.00),
-        "gpt-6-astra" if usage.input_tokens > 272_000 => (20.00, 2.00, 25.00, 75.00),
-        "gpt-6-astra" => (10.00, 1.00, 12.50, 50.00),
-        "gpt-6-luna" if usage.input_tokens > 272_000 => (0.20, 0.02, 0.25, 0.75),
-        "gpt-6-luna" => (0.10, 0.01, 0.125, 0.50),
-        "gpt-6-sol" if usage.input_tokens > 272_000 => (4.00, 0.40, 5.00, 15.00),
-        "gpt-6-sol" => (2.00, 0.20, 2.50, 10.00),
-        _ => return None,
-    };
+    let rates = carry::models::Rates::for_model(model, usage.input_tokens as f64)?;
     let cached = usage.cached_input_tokens.min(usage.input_tokens);
     let written = usage
         .cache_write_input_tokens
         .min(usage.input_tokens - cached);
     let ordinary = usage.input_tokens - cached - written;
     Some(
-        (ordinary as f64 * input
-            + cached as f64 * cached_input
-            + written as f64 * cache_write_input
-            + usage.output_tokens as f64 * output)
-            / 1_000_000.0,
+        ordinary as f64 * rates.input
+            + cached as f64 * rates.cached
+            + written as f64 * rates.write
+            + usage.output_tokens as f64 * rates.output,
     )
 }
 
@@ -361,15 +321,15 @@ impl OpenAiClient {
                     access_token,
                     account_id,
                     ..
-                } => request
-                    .bearer_auth(access_token)
-                    .header("chatgpt-account-id", account_id)
-                    .header("OpenAI-Beta", "responses=experimental")
-                    .header("Accept", "text/event-stream")
-                    .header("session-id", &self.prompt_cache_key)
-                    .header("x-client-request-id", &client_request_id)
-                    .header("originator", "carry")
-                    .header("User-Agent", concat!("carry/", env!("CARGO_PKG_VERSION"))),
+                } => crate::auth::authorize_codex_request(
+                    request,
+                    &crate::auth::CodexAuth {
+                        access_token: access_token.clone(),
+                        account_id: account_id.clone(),
+                    },
+                    &self.prompt_cache_key,
+                    &client_request_id,
+                ),
             };
             let response = match request.send().await {
                 Ok(response) => response,
@@ -641,20 +601,27 @@ pub(crate) fn new_prompt_cache_key() -> String {
     format!("carry-{}-{now}-{sequence}", std::process::id())
 }
 
-fn remove_prompt_cache_breakpoints(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            object.remove("prompt_cache_breakpoint");
-            for value in object.values_mut() {
-                remove_prompt_cache_breakpoints(value);
+pub(crate) fn remove_prompt_cache_breakpoints(value: &mut Value) {
+    // Cache markers are transport fields, not recursively reserved JSON keys.
+    // In particular schemas, metadata and native tool output belong to callers.
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.remove("prompt_cache_breakpoint");
+    if let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) {
+        for item in input {
+            let Some(item) = item.as_object_mut() else {
+                continue;
+            };
+            item.remove("prompt_cache_breakpoint");
+            if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
+                for block in content {
+                    if let Some(block) = block.as_object_mut() {
+                        block.remove("prompt_cache_breakpoint");
+                    }
+                }
             }
         }
-        Value::Array(values) => {
-            for value in values {
-                remove_prompt_cache_breakpoints(value);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -941,6 +908,35 @@ mod tests {
     }
 
     #[test]
+    fn gpt61_sol_usage_and_planner_share_rates_and_cache_support() {
+        let usage = Usage {
+            input_tokens: 100_000,
+            cached_input_tokens: 80_000,
+            cache_write_input_tokens: 10_000,
+            output_tokens: 1_000,
+            ..Usage::default()
+        };
+        let cost = estimated_cost_usd("gpt-6.1-sol", &usage).unwrap();
+        let rates =
+            carry::core::Rates::for_model("gpt-6.1-sol", usage.input_tokens as f64).unwrap();
+        assert!(
+            (cost
+                - (10_000.0 * rates.input
+                    + 80_000.0 * rates.cached
+                    + 10_000.0 * rates.write
+                    + 1_000.0 * rates.output))
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(
+            prompt_cache_capabilities("gpt-6.1-sol")
+                .unwrap()
+                .minimum_prefix_tokens,
+            1024
+        );
+    }
+
+    #[test]
     fn gpt6_luna_cost_uses_per_request_long_context_threshold() {
         let usage = Usage {
             input_tokens: 272_000,
@@ -1032,7 +1028,7 @@ mod tests {
 
     #[test]
     fn astra_is_explicitly_recognized() {
-        assert!(exact_model_prompt_cache_capabilities("gpt-5.6-astra").is_some());
+        assert!(prompt_cache_capabilities("gpt-5.6-astra").is_some());
     }
 
     #[test]
@@ -1907,14 +1903,22 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
             "gpt-5.6-luna".into(),
             "medium".into(),
         );
-        let history = vec![json!({
-            "role": "developer",
-            "content": [{
-                "type": "input_text",
-                "text": "checkpoint",
-                "prompt_cache_breakpoint": { "mode": "explicit" }
-            }]
-        })];
+        let native_output = json!({
+            "type": "function_call_output", "call_id": "native",
+            "output": {"prompt_cache_breakpoint": "caller data"}
+        });
+        let history = vec![
+            json!({
+                "role": "developer",
+                "content": [{
+                    "type": "input_text",
+                    "text": "checkpoint",
+                    "prompt_cache_breakpoint": { "mode": "explicit" },
+                    "metadata": {"prompt_cache_breakpoint": "caller metadata"}
+                }]
+            }),
+            native_output.clone(),
+        ];
 
         let body = client.request_body("system", &history);
         assert!(
@@ -1922,6 +1926,11 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
                 .get("prompt_cache_breakpoint")
                 .is_none()
         );
+        assert_eq!(
+            body["input"][1]["content"][0]["metadata"],
+            history[0]["content"][0]["metadata"]
+        );
+        assert_eq!(body["input"][2], native_output);
     }
 
     #[test]

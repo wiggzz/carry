@@ -1684,7 +1684,8 @@ class SmokeWorkerTests(unittest.TestCase):
             if "github.com" in " ".join(command):
                 return mock.Mock(returncode=42, stdout="")
             if command[:2] == ["docker", "inspect"] or command[:3] == ["docker", "network", "inspect"]:
-                return mock.Mock(returncode=1, stdout="")
+                kind = "network" if command[1] == "network" else "container"
+                return mock.Mock(returncode=1, stdout="", stderr=f"Error: No such {kind}: {command[-1]}")
             return mock.Mock(returncode=0, stdout="")
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1695,6 +1696,82 @@ class SmokeWorkerTests(unittest.TestCase):
                     identity="slot-two", proxy_image="node@sha256:" + "a" * 64,
                     proxy_script=proxy_script, execute=execute,
                 )
+
+    def test_cleanup_requires_exact_kind_name_and_exit_for_every_lane(self):
+        base = {"internal": "internal", "egress": "egress", "proxy": "gateway"}
+        for active in (False, True):
+            network = {**base, **({"carry_proxy": "carry"} if active else {})}
+            for target in network.values():
+                kind = "network" if target in ("internal", "egress") else "container"
+                failures = [
+                    (1, "error during connect: dial unix /var/run/docker.sock: connect: no such file or directory"),
+                    (1, "Cannot connect to Docker: socket not found"),
+                    (1, f"Error: No such {kind}: {target}-other"),
+                    (1, f"Error: No such {'container' if kind == 'network' else 'network'}: {target}"),
+                    (1, f"Error: No such {kind}"),
+                    (2, f"Error: No such {kind}: {target}"),
+                    (1, f"Error: No such {kind}: {target}\nadditional failure"),
+                    (1, f"Error response from daemon: network {target}-other not found"),
+                    (2, f"Error response from daemon: network {target} not found"),
+                ]
+                for code, error in failures:
+                    with self.subTest(active=active, target=target, code=code, error=error):
+                        def execute(command, **kwargs):
+                            if command[:2] == ["docker", "inspect"] or command[:3] == ["docker", "network", "inspect"]:
+                                resource_kind = "network" if command[1] == "network" else "container"
+                                if command[-1] == target:
+                                    return subprocess.CompletedProcess(command, code, "", error)
+                                return subprocess.CompletedProcess(command, 1, "", f"Error: No such {resource_kind}: {command[-1]}\n")
+                            return subprocess.CompletedProcess(command, 0, "", "")
+                        with mock.patch.object(self.worker.time, "sleep"), self.assertRaises(self.worker.ContainerCleanupError):
+                            self.worker.cleanup_agent_network(network, execute=execute)
+
+    def test_cleanup_accepts_documented_exact_absence_diagnostics_in_both_lanes(self):
+        for active in (False, True):
+            for prefix in ("Error:", "Error response from daemon:"):
+                for network_form in ("No such network: {name}", "network {name} not found"):
+                    if prefix == "Error:" and network_form.startswith("network"):
+                        continue
+                    with self.subTest(active=active, prefix=prefix, network_form=network_form):
+                        network = {"internal": "internal", "egress": "egress", "proxy": "gateway"}
+                        if active:
+                            network["carry_proxy"] = "carry"
+                        def execute(command, **kwargs):
+                            if command[:2] == ["docker", "inspect"]:
+                                diagnostic = f"No such container: {command[-1]}"
+                            elif command[:3] == ["docker", "network", "inspect"]:
+                                diagnostic = network_form.format(name=command[-1])
+                            else:
+                                return subprocess.CompletedProcess(command, 0, "", "")
+                            return subprocess.CompletedProcess(command, 1, "", f"{prefix} {diagnostic}\n")
+                        self.worker.cleanup_agent_network(network, execute=execute)
+
+    def test_active_proxy_cleanup_accepts_exact_named_network_not_found(self):
+        network = {"internal": "carry-agent-internal-23cc6606ebf1929e",
+                   "egress": "carry-agent-egress-23cc6606ebf1929e",
+                   "proxy": "gateway", "carry_proxy": "carry"}
+        def execute(command, **kwargs):
+            if command[:3] == ["docker", "network", "inspect"]:
+                return mock.Mock(returncode=1, stderr=f"Error response from daemon: network {command[-1]} not found\n")
+            if command[:2] == ["docker", "inspect"]:
+                return mock.Mock(returncode=1, stderr=f"Error: No such container: {command[-1]}\n")
+            return mock.Mock(returncode=0, stderr="")
+        with mock.patch.object(self.worker.time, "sleep"):
+            self.worker.cleanup_agent_network(network, execute=execute)
+
+    def test_active_proxy_cleanup_rejects_ambiguous_or_other_network_errors(self):
+        network = {"internal": "internal", "egress": "egress", "proxy": "gateway", "carry_proxy": "carry"}
+        for error in ("Cannot connect to Docker: socket not found",
+                      "Error response from daemon: network internal-other not found"):
+            with self.subTest(error=error):
+                def execute(command, **kwargs):
+                    if command[:3] == ["docker", "network", "inspect"]:
+                        return mock.Mock(returncode=1, stderr=error)
+                    if command[:2] == ["docker", "inspect"]:
+                        return mock.Mock(returncode=1, stderr=f"Error: No such container: {command[-1]}\n")
+                    return mock.Mock(returncode=0, stderr="")
+                with mock.patch.object(self.worker.time, "sleep"), self.assertRaises(self.worker.ContainerCleanupError):
+                    self.worker.cleanup_agent_network(network, execute=execute)
 
     def test_agent_network_cleanup_fails_if_proxy_remains(self):
         network = {"internal": "internal", "egress": "egress", "proxy": "proxy"}
@@ -1830,6 +1907,31 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertEqual(report["denominator"], 5)
             self.assertEqual(set(report["harnesses"]), {"carry"})
             self.assertEqual(len(json.loads((output / "records.json").read_text())), 5)
+
+    def test_finalize_keeps_proxy_task_cost_unavailable_when_one_attempt_is_censored(self):
+        tasks = [{"instance_id": f"task-{number}"} for number in range(5)]
+        records = [
+            {"instance_id": task["instance_id"], "harness": "pi", "attempt": attempt,
+             "status": "evaluated", "patch": "", "resolved": True,
+             "estimated_cost_usd": 1.0 if attempt == 1 else None,
+             "proxy_summary": {"estimated_total_cost_usd": 1.0 if attempt == 1 else None,
+                               "observed_cost_lower_bound_usd": 1.0 if attempt == 1 else 0.25}}
+            for task in tasks for attempt in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            self.worker.finalize(tasks=tasks, records=records, output=output,
+                provenance={"proxy": {"mode": "compact"}}, harnesses=("pi",),
+                attempt_numbers=(1, 2))
+            report = json.loads((output / "report.json").read_text())
+            self.assertEqual(report["denominator"], 10)
+            self.assertIsNone(report["harnesses"]["pi"]["estimated_cost_usd"])
+            for task in tasks:
+                summary = report["task_harnesses"][f"{task['instance_id']}/pi"]
+                self.assertEqual(summary["attempts"], 2)
+                self.assertEqual(summary["resolved"], 2)
+                self.assertIsNone(summary["estimated_cost_usd"])
+                self.assertEqual(summary["observed_cost_lower_bound_usd"], 1.25)
 
     def test_finalize_preserves_three_independent_attempts_per_task_and_harness(self):
         tasks = [{"instance_id": f"task-{number}"} for number in range(5)]

@@ -62,6 +62,11 @@ its aggregate output checked against the actual generated HTML report:
   reduction comes from carrying less removed context through repeated requests,
   not avoiding summary calls.
 
+This archived analysis used the former bytes/4 estimator. Current Carry reports
+and proxy comparisons instead share local o200k_base prompt estimates; older
+compactions without `compaction_token_delta` are excluded from those scenarios.
+The numbers below are historical and have not been recomputed.
+
 Both input branches use serialized prompt-bearing UTF-8 bytes divided by four,
 rounded up; frozen metered output tokens are a common charge. The default
 scenario window is 272,000 proxy units, with a 16,384 reserve, 20,000 recent

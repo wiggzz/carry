@@ -456,6 +456,9 @@ impl CacheTracker {
             breakpoints.drain(..breakpoints.len() - max_read_breakpoints);
         }
         CompactionPolicy {
+            cache_ratios: carry::models::Rates::for_model("gpt-6-sol", 0.0)
+                .unwrap()
+                .cache_ratios(),
             implicit_cached_tokens: if implicit_prefix_compatible
                 && cache_alive(self.implicit_activity, now)
             {
@@ -1132,11 +1135,21 @@ fn select_compaction_plan(
     cache: &CacheTracker,
     config: &RunConfig,
 ) -> Option<(CompactionPlan, Option<FlatRolloutEstimate>)> {
-    let policy = cache.policy_for_history(
+    let mut policy = cache.policy_for_history(
         &state.input_items(),
         config.compaction_payoff_requests,
         config.compaction_min_payback_percent,
     );
+    // Scripted offline runs retain the reference economics used by their fixtures.
+    let priced_model = if config.model == "scripted" {
+        "gpt-6-sol"
+    } else {
+        &config.model
+    };
+    carry::models::model_spec(priced_model)?.cache?;
+    policy.cache_ratios =
+        carry::models::Rates::for_model(priced_model, state.estimated_tokens() as f64)?
+            .cache_ratios();
     if config.compaction_rollout_samples > 0 {
         let rollout_config = FlatRolloutConfig {
             samples: config.compaction_rollout_samples,
@@ -1231,7 +1244,9 @@ fn maybe_compact(
     let Some((plan, rollout)) = select_compaction_plan(state, protected, cache, config) else {
         return Ok(false);
     };
+    let before = crate::savings::token_units(&json!(state.input_items()));
     let change = state.compact(plan);
+    let after = crate::savings::token_units(&json!(state.input_items()));
     cache.mark_compaction(&change.invalidated_generations);
     metrics.record_compaction();
     logger.raw_event(
@@ -1239,6 +1254,7 @@ fn maybe_compact(
         json!({
             "trigger": trigger,
             "compaction": &change,
+            "compaction_token_delta": before as i64 - after as i64,
             "retained_context": state.snapshot(),
             "rollout": rollout,
         }),
