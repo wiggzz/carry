@@ -1029,6 +1029,21 @@ async fn forward(
             )
             .await;
         }
+        // This existing rejection cannot be rescued by a plan. Avoid pricing
+        // the whole unfinished import, but let an in-flight reviewer merge first.
+        if active
+            && !session.background_review_pending
+            && !service.background_reviews.lock().await.contains(&id)
+            && session.bootstrap_review_pending
+            && !session.bootstrap_review_complete
+            && !review_fits(&service.config, &review_body(&service.config, &session))
+        {
+            let _ = save(&service, &id, &session);
+            return Err(failure(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "history import is incomplete; protected context exceeds capacity or the bootstrap call/spend limit was reached",
+            ));
+        }
         if active {
             outbound["input"] = json!(session.render_primary());
         }
