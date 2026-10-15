@@ -67,7 +67,7 @@ def contract_proxy(test, provider, state_dir, mode='audit', binary=None):
                '--upstream-url', provider.url + '/v1/responses',
                '--classifier-url', provider.url + '/review', '--mode', mode,
                '--min-payback-percent', '0', '--payoff-requests', '5',
-               '--state-dir', state_dir]
+               '--state-dir', state_dir, '--background-reviews=false']
     process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, text=True)
     assert process.stdout is not None
@@ -193,10 +193,11 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 self.assertEqual(state['invalid_reviews'], 0)
                 self.assertEqual(state['partial_reviews'], 1)
                 self.assertEqual(len(state['memories']), 2)
-                self.assertEqual(state['compactions'], 1)
+                self.assertEqual(state['compactions'], 0, 'new advice is considered by the next request planner')
                 # Repeating a retired source action cannot revive its evidence.
                 provider.advice = lambda review: {'protected': [], 'removable': ['g1'], 'memories': []}
                 contract_send(url, body)
+                contract_send(url, body)  # review the retained view after the planning-only compaction
                 self.assertNotIn('RETIRE_HUMAN_SOURCE', json.dumps(provider.primary[-1]))
                 state = contract_state(directory)
                 self.assertTrue(state['history'][0]['removed'])
@@ -509,6 +510,10 @@ class NativeProviderFixtureTests(unittest.TestCase):
             self.assertEqual(third['output'][0]['type'],'function_call')
             body['input']+=third['output']+[{'type':'function_call_output',
                 'call_id':third['output'][0]['call_id'],'output':'small'}]
+            fourth=call('/v1/responses',body)
+            self.assertEqual(fourth['output'][0]['type'],'function_call')
+            body['input']+=fourth['output']+[{'type':'function_call_output',
+                'call_id':fourth['output'][0]['call_id'],'output':'small'}]
             final=call('/v1/responses',body)
             self.assertEqual(final['output'][0]['content'][0]['text'],'FIXTURE_COMPLETE')
             self.assertFalse(fixture.errors)

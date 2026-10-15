@@ -168,8 +168,12 @@ Run `carry proxy`, then
 connect a separate OpenAI Responses client to `http://127.0.0.1:8787/v1`.
 Full-history clients can omit `x-carry-session` and reuse one active matching
 history prefix; explicit session IDs isolate conversations and support validated
-response-ID continuations. Long unseen histories bootstrap in bounded,
-restart-safe reviewer chunks with configurable call and estimated-spend limits.
+response-ID continuations. The reviewer retains the same sources and memories as the primary, appending new
+material and review updates between compactions. Oversized imports are admitted
+in bounded chunks, pruning approved sources as needed, with restart-safe progress
+and configurable call and estimated-spend limits. Before each primary request,
+Carry checks both context budgets, including incoming material, estimation margin,
+and output reserves; required compaction takes precedence over economics.
 Defaults are `--mode compact --login auto --background-reviews --payoff-requests 5`.
 Auto authentication prefers `CARRY_PROXY_UPSTREAM_KEY` or `OPENAI_API_KEY`, then a
 valid saved Carry subscription. Use `--login codex` or `--login api-key` to choose

@@ -96,20 +96,20 @@ fn small_token_budget_memory_admission_preserves_review_progress() {
 }
 
 #[test]
-fn pending_cleanup_dispatch_matches_planner_and_restart_controls() {
+fn incremental_reviewer_context_regressions() {
     let output = Command::new("python3")
         .arg("-B")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_pending_cleanup.py"
+            "/tests/proxy_incremental.py"
         ))
         .arg("-v")
         .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
-        .expect("Python 3 must run the actual-binary pending cleanup fixture");
+        .expect("Python 3 must run the actual-binary incremental reviewer fixture");
     assert!(
         output.status.success(),
-        "pending cleanup regression failed:\n{}\n{}",
+        "incremental reviewer regression failed:\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1203,7 +1203,22 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     assert!(result.status().is_success());
     let _ = result.bytes().await.unwrap();
     assert_eq!(shadow.lock().await.len(), 1);
-    let sent = primary.lock().await[1].clone();
+    assert!(
+        primary.lock().await[1]
+            .to_string()
+            .contains("DISCARD_SOURCE_PAYLOAD_")
+    );
+    // The reviewer has now emitted advice; the following request plans against it.
+    let third = client
+        .post(format!("{url}/v1/responses"))
+        .header("x-carry-session", "fixture-session")
+        .json(&second)
+        .send()
+        .await
+        .unwrap();
+    assert!(third.status().is_success());
+    third.bytes().await.unwrap();
+    let sent = primary.lock().await[2].clone();
     assert!(!sent.to_string().contains("DISCARD_SOURCE_PAYLOAD_"));
     assert!(!sent.to_string().contains("opaque-reasoning"));
     assert!(sent.to_string().contains("both tools succeeded"));
@@ -1244,7 +1259,7 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         .unwrap();
     let estimate = &cost_stats["sessions"][0]["cost_estimate"];
     assert_eq!(estimate["priced"], true);
-    assert_eq!(estimate["coverage"]["primary_responses"], 2);
+    assert_eq!(estimate["coverage"]["primary_responses"], 3);
     assert_eq!(estimate["coverage"]["reviewer_responses"], 1);
     assert!(estimate["reviewer_cost"].as_f64().unwrap() > 0.0);
     assert_eq!(estimate["traditional_compactions"], 0);
@@ -1274,7 +1289,7 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         "NATIVE_CHECKPOINT"
     );
     assert!(
-        !primary.lock().await[2]
+        !primary.lock().await[3]
             .to_string()
             .contains("DISCARD_SOURCE_PAYLOAD_"),
         "native compaction must operate on the same retained main view, not resurrect removed echo source"
@@ -1301,7 +1316,7 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         .unwrap();
     assert!(response.status().is_success());
     let _ = response.bytes().await.unwrap();
-    assert_eq!(primary.lock().await[3], resumed);
+    assert_eq!(primary.lock().await[4], resumed);
     server.abort();
 }
 
@@ -2464,132 +2479,6 @@ async fn implicit_active_prefix_reuses_removals_and_rebuilds_on_divergence() {
 }
 
 #[tokio::test]
-async fn replay_bootstrap_is_bounded_chronological_and_resumes_successful_chunks() {
-    use axum::{Router, routing::post};
-    use std::sync::Arc;
-    let reviews = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
-    let captured = reviews.clone();
-    let router = Router::new()
-        .route("/v1/responses", post(|| async { axum::Json(json!({"status": "completed", "output": []})) }))
-        .route("/review", post(move |axum::Json(body): axum::Json<serde_json::Value>| {
-            let captured = captured.clone();
-            async move {
-                let mut captured = captured.lock().await;
-                captured.push(body.clone());
-                let ledger: serde_json::Value = serde_json::from_str(body["input"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap()).unwrap();
-                let advice = if captured.len() == 2 { json!({"invalid": true}) } else { json!({"protected": ledger["eligible_group_ids"], "removable": [], "memories": []}) };
-                axum::Json(json!({"status": "completed", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": advice.to_string()}]}], "usage": {"input_tokens": 100, "output_tokens": 10, "input_tokens_details": {"cached_tokens": 0}}}))
-            }
-        }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let state = tempfile::tempdir().unwrap();
-    let (proxy, url) = start_proxy_options(
-        state.path(),
-        address,
-        "compact",
-        &["--classifier-max-input-tokens", "16000"],
-        "",
-    )
-    .await;
-    let mut input = vec![json!({"role": "user", "content": "goal"})];
-    for i in 0..12 {
-        input.push(json!({"role": "assistant", "content": format!("chunk {i}: {}", "evidence ".repeat(7000))}));
-        input.push(json!({"role": "user", "content": format!("next {i}")}));
-    }
-    let request = json!({"model": "gpt-6-luna", "input": input});
-    async fn replay(url: &str, body: &serde_json::Value) {
-        let response = reqwest::Client::new()
-            .post(format!("{url}/v1/responses"))
-            .header("x-carry-session", "bounded")
-            .header("x-carry-replay-history", "before-latest-user")
-            .json(body)
-            .send()
-            .await
-            .unwrap();
-        assert!(response.status().is_success());
-        response.bytes().await.unwrap();
-    }
-    replay(&url, &request).await;
-    assert_eq!(
-        reviews.lock().await.len(),
-        2,
-        "stop on invalid chunk, keeping earlier progress"
-    );
-    let first_saved = checkpoint_states(state.path()).remove(0);
-    assert_eq!(first_saved["bootstrap_review_pending"], true);
-    assert!(!first_saved["opinions"].as_object().unwrap().is_empty());
-    drop(proxy);
-    let (_proxy, url) = start_proxy_options(
-        state.path(),
-        address,
-        "compact",
-        &["--classifier-max-input-tokens", "16000"],
-        "",
-    )
-    .await;
-    replay(&url, &request).await;
-    let captured = reviews.lock().await;
-    assert!(
-        captured.len() > 3,
-        "long histories require multiple bounded calls"
-    );
-    let ids = |body: &serde_json::Value| -> Vec<serde_json::Value> {
-        let ledger: serde_json::Value = serde_json::from_str(
-            body["input"].as_array().unwrap().last().unwrap()["content"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap();
-        ledger["eligible_group_ids"].as_array().unwrap().clone()
-    };
-    let first_ids = ids(&captured[0]);
-    let mut successful = first_ids.clone();
-    for (i, body) in captured.iter().enumerate() {
-        assert!(
-            tiktoken_rs::o200k_base_singleton()
-                .encode_ordinary(&body.to_string())
-                .len()
-                <= 16000,
-            "complete reviewer request must fit the token budget"
-        );
-        assert!(
-            serde_json::to_vec(body).unwrap().len() <= 8 * 1024 * 1024,
-            "reviewer transport must stay bounded"
-        );
-        if i >= 2 {
-            assert!(
-                ids(body).iter().all(|id| !first_ids.contains(id)),
-                "restart must not repay completed chunks"
-            );
-            successful.extend(ids(body));
-        }
-    }
-    assert_eq!(
-        successful.len(),
-        24,
-        "every previously consumed group reviewed once successfully"
-    );
-    let chronological = successful
-        .iter()
-        .map(|id| {
-            id.as_str()
-                .unwrap()
-                .strip_prefix('g')
-                .unwrap()
-                .parse::<u64>()
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    assert!(chronological.windows(2).all(|pair| pair[0] < pair[1]));
-    let saved = checkpoint_states(state.path()).remove(0);
-    assert_eq!(saved["bootstrap_review_pending"], false);
-    assert_eq!(saved["invalid_reviews"], 1);
-    server.abort();
-}
-
-#[tokio::test]
 async fn unseen_explicit_history_bootstraps_but_small_histories_skip_replay() {
     for (size, calls) in [(10, 0), (30_000, 1)] {
         let fixture = fixture(json!({"protected": [], "removable": ["g2"], "memories": []})).await;
@@ -2611,332 +2500,6 @@ async fn unseen_explicit_history_bootstraps_but_small_histories_skip_replay() {
                 .len(),
             if calls == 0 { 3 } else { 2 }
         );
-    }
-}
-
-#[tokio::test]
-async fn bootstrap_call_limit_resumes_and_spend_limit_survives_restart() {
-    for cost_limit in ["1", "0", "0.0017"] {
-        let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
-        let state = tempfile::tempdir().unwrap();
-        let byte_limit = "6000";
-        let options = [
-            "--classifier-max-input-bytes",
-            byte_limit,
-            "--bootstrap-max-calls",
-            "1",
-            "--bootstrap-max-cost-usd",
-            cost_limit,
-        ];
-        let (proxy, url) =
-            start_proxy_options(state.path(), fixture.address, "audit", &options, "").await;
-        let mut input = vec![json!({"role": "user", "content": "goal"})];
-        for i in 0..4 {
-            input.push(
-                json!({"role": "assistant", "content": format!("{i}: {}", "X".repeat(1000))}),
-            );
-            input.push(json!({"role": "user", "content": format!("next {i}")}));
-        }
-        let request = json!({"model": "gpt-6-luna", "input": input});
-        async fn replay(url: &str, request: &serde_json::Value) {
-            let response = reqwest::Client::new()
-                .post(format!("{url}/v1/responses"))
-                .header("x-carry-session", "limits")
-                .header("x-carry-replay-history", "before-latest-user")
-                .json(request)
-                .send()
-                .await
-                .unwrap();
-            assert!(response.status().is_success());
-            response.bytes().await.unwrap();
-        }
-        replay(&url, &request).await;
-        assert_eq!(
-            fixture.reviews.lock().await.len(),
-            if cost_limit == "0" { 0 } else { 1 }
-        );
-        let first = checkpoint_states(state.path()).remove(0);
-        assert_eq!(first["bootstrap_review_pending"], true);
-        let completed = first["bootstrap_reviewed_ids"].as_array().unwrap().clone();
-        let cost = first["bootstrap_estimated_cost_usd"].as_f64().unwrap();
-        assert!(cost <= cost_limit.parse::<f64>().unwrap());
-        drop(proxy);
-        let (_proxy, url) =
-            start_proxy_options(state.path(), fixture.address, "audit", &options, "").await;
-        replay(&url, &request).await;
-        let saved = checkpoint_states(state.path()).remove(0);
-        let reviews = fixture.reviews.lock().await;
-        if cost_limit == "1" {
-            assert_eq!(reviews.len(), 2);
-            let ledger: serde_json::Value = serde_json::from_str(
-                reviews[1]["input"].as_array().unwrap().last().unwrap()["content"]
-                    .as_str()
-                    .unwrap(),
-            )
-            .unwrap();
-            for id in completed {
-                assert!(
-                    !ledger["eligible_group_ids"]
-                        .as_array()
-                        .unwrap()
-                        .contains(&json!(format!("g{}", id.as_u64().unwrap())))
-                );
-            }
-        } else {
-            assert_eq!(
-                reviews.len(),
-                if cost_limit == "0" { 0 } else { 1 },
-                "restart cannot replenish spend allowance"
-            );
-            assert_eq!(
-                saved["bootstrap_estimated_cost_usd"].as_f64().unwrap(),
-                cost
-            );
-        }
-        assert!(
-            reviews
-                .iter()
-                .all(|body| serde_json::to_vec(body).unwrap().len()
-                    <= byte_limit.parse::<usize>().unwrap())
-        );
-        assert_eq!(
-            fixture.requests.lock().await.len(),
-            2,
-            "limits never block the primary"
-        );
-    }
-}
-
-#[tokio::test]
-async fn ongoing_windows_resume_after_failed_primary_restart_and_invalid_advice() {
-    use axum::{Router, response::IntoResponse, routing::post};
-    use std::sync::Arc;
-    for (token_limit, byte_limit) in [("6000", "8388608"), ("120000", "40000")] {
-        let reviews = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
-        let captured = reviews.clone();
-        let router = Router::new()
-        .route("/v1/responses", post(|axum::Json(body): axum::Json<serde_json::Value>| async move {
-            if body["metadata"]["fail_primary"] == true {
-                return (axum::http::StatusCode::TOO_MANY_REQUESTS, "fixture failure").into_response();
-            }
-            axum::Json(json!({"status": "completed", "output": [], "usage": {
-                "input_tokens": 100, "output_tokens": 1, "input_tokens_details": {"cached_tokens": 0}
-            }})).into_response()
-        }))
-        .route("/review", post(move |axum::Json(body): axum::Json<serde_json::Value>| {
-            let captured = captured.clone();
-            async move {
-                let mut captured = captured.lock().await;
-                captured.push(body.clone());
-                let ledger: serde_json::Value = serde_json::from_str(body["input"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap()).unwrap();
-                let eligible = ledger["eligible_group_ids"].as_array().unwrap();
-                let advice = if captured.len() == 2 {
-                    json!({"protected": [], "removable": ["g999"], "memories": []})
-                } else {
-                    json!({"protected": eligible, "removable": [], "memories": [{"source_ids": [eligible[0]], "text": "durable window fact"}]})
-                };
-                axum::Json(json!({"status": "completed", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": advice.to_string()}]}],
-                    "usage": {"input_tokens": 100, "output_tokens": 1, "input_tokens_details": {"cached_tokens": 0}}}))
-            }
-        }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let state = tempfile::tempdir().unwrap();
-        let options = [
-            "--bootstrap-min-input-bytes",
-            "8388608",
-            "--classifier-max-input-tokens",
-            token_limit,
-            "--classifier-max-input-bytes",
-            byte_limit,
-            if token_limit == "6000" {
-                "--bootstrap-max-calls"
-            } else {
-                "--review-max-calls"
-            },
-            "1",
-        ];
-        let (proxy, url) = start_proxy_options(state.path(), address, "audit", &options, "").await;
-        let mut input = vec![
-            json!({"role": "user", "content": "original goal"}),
-            json!({"type": "function_call", "call_id": "pair", "name": "native", "arguments": "{}"}),
-            json!({"type": "function_call_output", "call_id": "pair", "output": "evidence ".repeat(3500)}),
-            json!({"role": "user", "content": "next"}),
-        ];
-        for i in 0..4 {
-            input.push(json!({"role": "assistant", "content": format!("window {i}: {}", "evidence ".repeat(3500))}));
-            input.push(json!({"role": "user", "content": format!("next {i}")}));
-        }
-        let mut request = json!({"model": "gpt-6-luna", "input": input});
-        assert!(
-            send(&url, &request, "window", "main")
-                .await
-                .bytes()
-                .await
-                .is_ok()
-        );
-        assert!(
-            reviews.lock().await.is_empty(),
-            "fresh history is not reviewable yet"
-        );
-        request["input"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"role": "user", "content": "current task stays pinned"}));
-        request["metadata"] = json!({"fail_primary": true});
-        let response = send(&url, &request, "window", "main").await;
-        assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-        response.bytes().await.unwrap();
-        assert_eq!(
-            reviews.lock().await.len(),
-            1,
-            "oversized ongoing input must dispatch a bounded window"
-        );
-        let first = checkpoint_states(state.path()).remove(0);
-        assert_eq!(first["bootstrap_review_pending"], false);
-        assert!(first["review_end_id"].as_u64().unwrap() > 0);
-        assert_eq!(first["memories"].as_array().unwrap().len(), 1);
-        assert_eq!(first["invalid_reviews"], 0);
-        drop(proxy);
-        let (_proxy, url) = start_proxy_options(state.path(), address, "audit", &options, "").await;
-        request.as_object_mut().unwrap().remove("metadata");
-        let response = send(&url, &request, "window", "main").await;
-        assert!(response.status().is_success());
-        response.bytes().await.unwrap();
-        assert_eq!(
-            reviews.lock().await.len(),
-            2,
-            "unfinished windows bypass cadence after restart/failed primary"
-        );
-        let invalid = checkpoint_states(state.path()).remove(0);
-        assert_eq!(invalid["invalid_reviews"], 1);
-        assert_eq!(
-            invalid["reviewed_members"], first["reviewed_members"],
-            "invalid window advances no progress"
-        );
-        assert_eq!(invalid["opinions"], first["opinions"]);
-        assert_eq!(invalid["memories"], first["memories"]);
-        // g13 becomes eligible after this append, but belongs to a later sweep.
-        request["input"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"role": "user", "content": "newer task waits for the next sweep"}));
-        for _ in 0..10 {
-            let response = send(&url, &request, "window", "main").await;
-            assert!(response.status().is_success());
-            response.bytes().await.unwrap();
-            if checkpoint_states(state.path()).remove(0)["review_end_id"] == 0 {
-                break;
-            }
-        }
-        let finished = checkpoint_states(state.path()).remove(0);
-        assert_eq!(
-            finished["review_end_id"], 0,
-            "bounded sweep eventually finishes"
-        );
-        assert_eq!(
-            finished["invalid_reviews"], 1,
-            "size overflow is not invalid provider advice"
-        );
-        let captured = reviews.lock().await;
-        let ids = |body: &serde_json::Value| {
-            let ledger: serde_json::Value = serde_json::from_str(
-                body["input"].as_array().unwrap().last().unwrap()["content"]
-                    .as_str()
-                    .unwrap(),
-            )
-            .unwrap();
-            ledger["eligible_group_ids"].as_array().unwrap().clone()
-        };
-        assert_eq!(
-            ids(&captured[1]),
-            ids(&captured[2]),
-            "retry the invalid window, not completed windows"
-        );
-        let retry_ledger: serde_json::Value = serde_json::from_str(
-            captured[2]["input"].as_array().unwrap().last().unwrap()["content"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            retry_ledger["previous_review_feedback"]["rejected_count"],
-            1
-        );
-        assert!(
-            retry_ledger["previous_review_feedback"]["rejected"][0]["reason"]
-                .as_str()
-                .unwrap()
-                .contains("unknown")
-        );
-        let first_ids = ids(&captured[0]);
-        let mut successful = first_ids.clone();
-        for (i, body) in captured.iter().enumerate() {
-            assert!(
-                tiktoken_rs::o200k_base_singleton()
-                    .encode_ordinary(&body.to_string())
-                    .len()
-                    <= token_limit.parse::<usize>().unwrap()
-            );
-            assert!(
-                serde_json::to_vec(body).unwrap().len() <= byte_limit.parse::<usize>().unwrap()
-            );
-            if i > 0 {
-                assert!(
-                    ids(body).iter().all(|id| !first_ids.contains(id)),
-                    "restart must not repay completed windows"
-                );
-                assert!(
-                    body.to_string().contains("durable window fact"),
-                    "carried memories survive window retirement"
-                );
-            }
-            if i != 1 && i > 0 {
-                successful.extend(ids(body));
-            }
-            let sources = body["input"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|item| {
-                    serde_json::from_str::<serde_json::Value>(
-                        item["content"]
-                            .as_str()?
-                            .rsplit("[carry context] ")
-                            .next()?,
-                    )
-                    .ok()
-                })
-                .collect::<Vec<_>>();
-            for source in sources.iter().filter(|source| source["group_id"] == "g2") {
-                assert_eq!(
-                    source["member_ids"],
-                    json!([2, 3]),
-                    "tool cohorts never split across windows"
-                );
-            }
-        }
-        let mut expected = (1..=12)
-            .filter(|id| *id != 3)
-            .map(|id| json!(format!("g{id}")))
-            .collect::<Vec<_>>();
-        expected.sort_by_key(|id| id.as_str().unwrap()[1..].parse::<u64>().unwrap());
-        assert_eq!(
-            successful, expected,
-            "every eligible source is reviewed chronologically once per sweep"
-        );
-        assert_eq!(
-            finished["history"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|item| item["removed"] == true)
-                .count(),
-            0,
-            "audit never rewrites canonical input"
-        );
-        server.abort();
     }
 }
 
@@ -2966,9 +2529,9 @@ async fn oversized_replay_groups_are_kept_whole_without_reviewer_dispatch() {
         .send()
         .await
         .unwrap();
-    assert!(response.status().is_success());
+    assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
     response.bytes().await.unwrap();
-    assert_eq!(fixture.requests.lock().await[0], request);
+    assert!(fixture.requests.lock().await.is_empty());
     let reviews = fixture.reviews.lock().await;
     assert!(
         reviews
@@ -2982,8 +2545,14 @@ async fn oversized_replay_groups_are_kept_whole_without_reviewer_dispatch() {
         "never review a partial oversized tool group"
     );
     let saved = checkpoint_states(state.path()).remove(0);
-    assert_eq!(saved["opinions"]["2"], "keep");
-    assert_eq!(saved["bootstrap_review_pending"], false);
+    assert!(
+        saved["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["removed"] == false)
+    );
+    assert_eq!(saved["bootstrap_review_pending"], true);
 }
 
 #[tokio::test]

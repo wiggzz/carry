@@ -170,7 +170,7 @@ class Provider:
         self.thread.join(timeout=3)
 
 
-def grade(reviews, receipts, enabled=True, missing_usage=False):
+def grade(reviews, receipts, enabled=True, missing_usage=False, append_only=False):
     assert len(reviews) >= 8, 'at least eight actual reviews required'
     if not enabled:
         assert all(not boundaries(b) and 'prompt_cache_options' not in b for b in reviews)
@@ -188,7 +188,14 @@ def grade(reviews, receipts, enabled=True, missing_usage=False):
         assert previous_end in boundaries(current), 'latest prior WRITE must remain a lookup candidate'
         if not missing_usage or index > 0:
             assert receipt['synthetic_cached_tokens'] > 0, 'simulator failed to reuse preserved stable boundary'
-    assert canonical(reviews[-1]['input'][:-1]) == canonical(reviews[-2]['input'][:-1]), 'ledger-only review required'
+    if append_only:
+        previous = reviews[-2]['input']
+        current = reviews[-1]['input']
+        assert canonical(current[:len(previous)]) == canonical(previous), 'prior review input must remain an exact prefix'
+        assert current[len(previous)]['role'] == 'assistant', 'prior reviewer answer must precede the new nudge'
+        assert len(current) == len(previous) + 2, 'no new source items expected on the final ledger-only update'
+    else:
+        assert canonical(reviews[-1]['input'][:-1]) == canonical(reviews[-2]['input'][:-1]), 'ledger-only review required'
     assert text(reviews[-1]['input'][-1]) != text(reviews[-2]['input'][-1]), 'ledger really must change'
 
 
@@ -198,8 +205,9 @@ def grade_coupled(provider, sent, state, enabled):
         return [i for i in body['input'] if i.get('call_id') in ('native-a', 'native-b') or i.get('type') == 'reasoning']
     assert len(native(sent[2])) == 5, 'actual native parallel cohort must be supplied'
     assert native(provider.primary[2]) == native(sent[2]), 'new native bytes must first receive exposure intact'
-    assert not native(provider.primary[3]), 'complete exposed cohort must be removed together'
-    assert not any(native(b) for b in provider.primary[3:]), 'removed native source must never resurrect'
+    assert native(provider.primary[3]) == native(sent[3]), 'new review advice affects the following request'
+    assert not native(provider.primary[4]), 'complete exposed cohort must be removed together'
+    assert not any(native(b) for b in provider.primary[4:]), 'removed native source must never resurrect'
     before_reset = [b for b in provider.reviews if 'NEW_RESET_DIRECTION' not in json.dumps(b)]
     after_reset = [b for b in provider.reviews if 'NEW_RESET_DIRECTION' in json.dumps(b)]
     assert before_reset and after_reset
@@ -256,7 +264,7 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
             cmd = [str(Path(binary).resolve()), 'proxy', '--listen', f'127.0.0.1:{port}',
                    '--upstream-url', provider.url + '/v1/responses', '--classifier-url', provider.url + '/classifier',
                    '--classifier-model', model, '--state-dir', str(directory / 'state'),
-                   '--mode', 'compact' if case == 'coupled' else 'audit']
+                   '--mode', 'compact' if case == 'coupled' else 'audit', '--background-reviews=false']
             if case == 'coupled':
                 cmd += ['--payoff-requests', '1', '--min-payback-percent', '0']
             if policy_arg != 'none':
@@ -337,7 +345,7 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
         else:
             assert provider.primary == sent, 'reviewer repair must leave primary bodies unchanged'
             assert provider.primary_raw_hashes == sent_hashes, 'audit primary raw JSON bytes must remain identical'
-            grade(provider.reviews, provider.receipts, enabled, case == 'missing-usage')
+            grade(provider.reviews, provider.receipts, enabled, case == 'missing-usage', append_only=True)
         if case == 'missing-usage':
             assert credit_snapshots[1]['read_credit'] == credit_snapshots[2]['read_credit'] == 0
             assert credit_snapshots[3]['read_credit'] > 0, 'only an explicit cached-read receipt may grant credit'

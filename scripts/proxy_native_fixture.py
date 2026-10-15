@@ -41,7 +41,20 @@ def review_records(body):
             continue
         if isinstance(data, dict):
             records.append(data)
-    return records
+    # Reviewer nudges/answers now remain in the append-only transcript. Grade
+    # source observations against the current ledger rather than treating old
+    # state snapshots as additional live sources.
+    ledgers = [record for record in records if 'eligible_group_ids' in record]
+    if not ledgers:
+        return records
+    current = ledgers[-1]
+    sources = [record for record in records if 'eligible_group_ids' not in record
+               and not {'protected', 'removable', 'memories'}.issubset(record)]
+    for memory in current.get('current_memories', []):
+        fact = {'source_ids': memory['source_ids'], 'text': memory['text']}
+        if fact not in sources:
+            sources.append(fact)
+    return sources + [current]
 
 
 class Fixture:
@@ -161,7 +174,7 @@ class Fixture:
                                        for item in body.get('input', []) if isinstance(item,dict)) and not (
                                            outer.case=='pi-checkpoint' and 'FIXTURE_PI_CHECKPOINT' in json.dumps(body['input'])):
                                 raise ValueError('native full-history tool-result echo missing')
-                            if outer.case == 'compact' and count < 4:
+                            if outer.case == 'compact' and count < 5:
                                 command='printf SMALL_COHORT_'+str(count)
                                 args=({'cmd':command,'yield_time_ms':1000,'max_output_tokens':128}
                                       if outer.client == 'codex' else {'command':command})
@@ -243,10 +256,11 @@ def compact_evidence(trial, fixture):
     cohort={'call_fixture_1_a','call_fixture_1_b'}
     def members(body):
         return [i for i in body['input'] if i.get('call_id') in cohort]
-    assert len(received)==len(submitted)==4, 'four actual native coding turns required'
+    assert len(received)==len(submitted)==5, 'five actual native coding turns required'
     assert len(members(received[2]))==4, 'caller must echo both calls and both outputs'
     assert len(members(submitted[1]))==4, 'cohort must receive completed exposure before removal'
-    assert not members(submitted[2]) and not members(submitted[3]), 'atomic cohort must stay removed'
+    assert len(members(submitted[2]))==4, 'advice emitted this turn applies to the next request'
+    assert not members(submitted[3]) and not members(submitted[4]), 'atomic cohort must stay removed'
     assert len(fixture.reviews)>=2, 'later shadow request required, not a source-only check'
     cache_keys=[r.get('prompt_cache_key') for r in fixture.reviews]
     assert all(isinstance(k,str) and 0 < len(k) <= 64 for k in cache_keys), 'classifier cache key exceeds provider limit'
@@ -320,6 +334,7 @@ def main():
                 '--codex-sandbox','danger-full-access',
                 '--codex-native-compaction',case if case in ('v1','v2') else 'disabled',
                 '--payoff-requests','5','--min-payback-percent','0',
+                '--synchronous-reviews',
                 '--listen',f'127.0.0.1:{port}','--upstream-url',fixture.url+'/v1/responses',
                 '--classifier-url',fixture.url+'/classifier','--timeout','60',
                 '--prompt','Run the supplied tool once and finish. This is a scripted offline fixture.']

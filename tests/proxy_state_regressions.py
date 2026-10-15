@@ -381,7 +381,12 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(saved["review_feedback"]["rejected"][0]["index"], 0)
         proxy.close()
         proxy = self.proxy(fixture, options)
-        self.assertEqual(proxy.send(seed)[0], 200)
+        # A next-request plan may first prune source/control history. The next
+        # incremental update can then retire the shared fact within the budget.
+        for _ in range(2):
+            self.assertEqual(proxy.send(seed)[0], 200)
+            if len(fixture.reviews) >= 2:
+                break
         self.assertGreaterEqual(len(fixture.reviews), 2)
         self.assertEqual(proxy.saved()["memories"], [])
         self.assertFalse(any(r["source_id"] == 0 for r in proxy.saved()["active_shadow"]))

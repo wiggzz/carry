@@ -100,7 +100,7 @@ async function refresh(){
    const el=document.createElement('article');el.className='session';
    const heading=document.createElement('h3');heading.textContent=s.title||'Session '+s.id.slice(0,12);heading.title=s.id;
    const status=document.createElement('p');status.textContent=activity;
-   const requests=document.createElement('p');requests.textContent=fmt(s.completed_requests||0)+' completed requests · '+fmt(s.compactions||0)+' rewrites';
+   const requests=document.createElement('p');requests.textContent=fmt(s.completed_requests||0)+' completed requests · '+fmt(s.compactions||0)+' rewrites · '+fmt(s.reviewer_compactions||0)+' reviewer cleanups';
    const saved=document.createElement('p');saved.textContent='Estimated savings: '+savings;
    el.append(heading,status,requests,saved);
    const c=s.context||{},counts=[c.removable_items||0,c.protected_items||0,c.unreviewed_items||0];
@@ -110,8 +110,14 @@ async function refresh(){
    el.append(bar,legend);
    const p=s.planner||{},section=document.createElement('div');section.className='planner';
    const decision=document.createElement('p');
-   decision.textContent=p.selected?(p.mode==='audit'?'Last plan: would compact (audit)':'Last plan: compaction selected'):p.reason?({reviewer_partition_unknown:'Waiting for a complete review sweep',reviewer_pricing_unknown:'Waiting for reviewer cost estimates',unsupported_model_or_tier:'Compaction unavailable for this model or service tier'}[p.reason]||p.reason.replaceAll('_',' ')):p.candidate?'Waiting for compaction payoff':'Waiting for removable context';
+   decision.textContent=p.forced&&p.selected?(p.mode==='audit'?'Would require compaction (audit)':'Compacted to fit the next requests'):p.selected?(p.mode==='audit'?'Last plan: would compact (audit)':'Last plan: compaction selected'):p.reason?({context_capacity_exceeded:'Protected context exceeds the available budget',unsupported_model_or_tier:'Compaction unavailable for this model or service tier'}[p.reason]||p.reason.replaceAll('_',' ')):p.candidate?'Waiting for compaction payoff':'Waiting for removable context';
    section.append(decision);
+   for(const [name,required,limit] of [['Primary',p.primary_required_tokens,p.primary_context_tokens],['Reviewer',p.reviewer_required_tokens,p.reviewer_context_tokens]]){
+    if(required==null||!limit)continue;
+    const label=document.createElement('p');label.className='legend';label.textContent=name+' last capacity check: '+fmt(Math.ceil(required))+' / '+fmt(limit)+' tokens (margin and output reserve included)';
+    const capacity=document.createElement('progress');capacity.max=limit;capacity.value=Math.min(required,limit);capacity.setAttribute('aria-label',name+' context budget');section.append(label,capacity);
+   }
+
    if(p.candidate){
     const j=p.candidate,percent=j.keep>0?100*j.savings/j.keep:0,threshold=p.min_payback_percent,targetKnown=threshold!=null;
     const meter=document.createElement('progress');meter.max=100;meter.value=Math.max(0,Math.min(100,threshold>0?percent/threshold*100:percent>0?100:0));meter.setAttribute('aria-label','Progress toward compaction payoff threshold');
