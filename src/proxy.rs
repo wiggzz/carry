@@ -2541,7 +2541,11 @@ fn primary_required_tokens(config: &ProxyCli, body: &Value) -> f64 {
     let reserve = body["max_output_tokens"]
         .as_u64()
         .unwrap_or(config.primary_output_reserve_tokens as u64);
-    estimate(body) * (1.0 + f64::from(config.context_margin_percent) / 100.0) + reserve as f64
+    // Count the adapted input, but reserve the client's allowance even when
+    // subscription transport must remove its unsupported output-cap field.
+    estimate(&primary_wire_body(config, body))
+        * (1.0 + f64::from(config.context_margin_percent) / 100.0)
+        + reserve as f64
 }
 
 fn primary_fits(config: &ProxyCli, body: &Value) -> bool {
@@ -2611,24 +2615,27 @@ fn view_costs(
     let ct = estimate(compact);
     let kr = Rates::for_model(model, kt)?;
     let cr = Rates::for_model(model, ct)?;
-    let keep_first = input_cost(kt, reusable(cache, keep), kr.input, kr.cached);
-    let explicit_write = compact["input"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|item| {
+    let first = |body: &Value, tokens: f64, rates: Rates| {
+        let explicit_write = body["input"].as_array().into_iter().flatten().any(|item| {
             item["content"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .any(|block| block.get("prompt_cache_breakpoint").is_some())
+                .any(|block| block["prompt_cache_breakpoint"]["mode"] == "explicit")
         });
-    let compact_first = input_cost(
-        ct,
-        reusable(cache, compact),
-        if explicit_write { cr.write } else { cr.input },
-        cr.cached,
-    );
+        input_cost(
+            tokens,
+            reusable(cache, body),
+            if explicit_write {
+                rates.write
+            } else {
+                rates.input
+            },
+            rates.cached,
+        )
+    };
+    let keep_first = first(keep, kt, kr);
+    let compact_first = first(compact, ct, cr);
     // Native evidence can price the first call even when future cache support is unknown.
     let minimum =
         crate::openai::prompt_cache_capabilities(model).map(|cap| cap.minimum_prefix_tokens as f64);

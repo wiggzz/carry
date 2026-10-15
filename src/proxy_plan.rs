@@ -1,15 +1,74 @@
 //! Plan the actual next primary and reviewer requests, not historical windows.
 use super::{
-    HashSet, ProxyCli, Session, Value, cache_base, estimate, joint_decision, json, now,
+    HashSet, ProxyCli, Session, Value, ViewCosts, cache_base, estimate, joint_decision, json, now,
     primary_fits, primary_required_tokens, primary_wire_body, review_body, review_fits,
     reviewer_required_tokens, reviewer_reusable, reviewer_view_costs, select_removals, standard,
     view_costs,
 };
 
+/// Frozen-source sensitivity: advance actual cadence and exposure, not an
+/// invented ceil(horizon/cadence) schedule. Unfinished work is unknown, not free.
+fn review_calls(config: &ProxyCli, session: &Session, body: &Value, changed: bool) -> Option<u64> {
+    if !standard(body)
+        || carry::core::Rates::for_model(body["model"].as_str().unwrap_or(""), 0.0).is_none()
+    {
+        return Some(0);
+    }
+    if session.background_review_pending
+        || (session.bootstrap_review_pending && !session.bootstrap_review_complete)
+    {
+        return None;
+    }
+    let eligible = |state: &Session| {
+        !state.memories.is_empty() || state.groups().iter().any(|g| g.exposed && !g.pinned)
+    };
+    let mut exposed = session.clone();
+    for item in &mut exposed.history {
+        if !item.removed {
+            item.exposed = true;
+        }
+    }
+    let eligible_now = eligible(session);
+    let eligible_later = eligible(&exposed);
+    let mut age = session
+        .completed_requests
+        .saturating_sub(session.last_review_request);
+    let mut calls = 0;
+    for request in 0..config.payoff_requests {
+        // A source rewrite skips this request's ordinary dispatch. A completed
+        // bootstrap is already paid and ordinary dispatch resumes next request.
+        let dispatch = if request == 0 {
+            eligible_now && !changed && !session.bootstrap_review_pending
+        } else {
+            eligible_later
+        };
+        if dispatch && age >= config.review_every_requests {
+            // Once a background update starts, whether it has completed before
+            // another dispatch point is not known from this snapshot.
+            if config.background_reviews && calls > 0 {
+                return None;
+            }
+            calls += 1;
+            age = 0;
+        }
+        age = age.saturating_add(1);
+    }
+    Some(calls)
+}
+
+fn review_cost(config: &ProxyCli, session: &Session, body: &Value, calls: u64) -> Option<f64> {
+    if calls == 0 {
+        return Some(0.0);
+    }
+    let inputs = reviewer_view_costs(config, &session.reviewer_cache, body, body, calls)?.keep;
+    let rates = carry::core::Rates::for_model(&config.classifier_model, estimate(body))?;
+    Some(inputs + calls as f64 * config.classifier_max_output_tokens as f64 * rates.output)
+}
+
 pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Option<Session>, Value) {
     let wire = primary_wire_body(config, body);
     let reviewer = review_body(config, session);
-    let primary_ok = primary_fits(config, &wire);
+    let primary_ok = primary_fits(config, body);
     let reviewer_ok = review_fits(config, &reviewer);
     let forced = !primary_ok || !reviewer_ok;
     let groups = session.groups();
@@ -51,9 +110,12 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
             );
         }
     }
-    let review_calls = config
-        .payoff_requests
-        .div_ceil(config.review_every_requests);
+    let keep_calls = if reviewer_ok {
+        review_calls(config, session, body, false)
+    } else {
+        None // capacity rescue/cleanup must finish before ordinary dispatch
+    };
+    let keep_cost = keep_calls.and_then(|calls| review_cost(config, session, &reviewer, calls));
     let mut reports = Vec::new();
     let mut best: Option<(Session, f64)> = None;
     // Cleaning only disposable reviewer turns is a real candidate. It can make
@@ -66,28 +128,19 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         }
         let mut candidate = session.clone();
         candidate.remove(&removed, &groups);
+        let changed = candidate.render_primary() != session.render_primary();
         let mut compact = body.clone();
         compact["input"] = json!(candidate.render_primary());
-        let compact = primary_wire_body(config, &compact);
         let compact_review = review_body(config, &candidate);
         let feasible = primary_fits(config, &compact) && review_fits(config, &compact_review);
-        let shadow = reviewer_view_costs(
-            config,
-            &session.reviewer_cache,
-            &reviewer,
-            &compact_review,
-            review_calls,
-        )
-        .and_then(|mut cost| {
-            let keep_rate =
-                carry::core::Rates::for_model(&config.classifier_model, estimate(&reviewer))?;
-            let compact_rate =
-                carry::core::Rates::for_model(&config.classifier_model, estimate(&compact_review))?;
-            let outputs = review_calls as f64 * config.classifier_max_output_tokens as f64;
-            cost.keep += outputs * keep_rate.output;
-            cost.compact += outputs * compact_rate.output;
-            Some(cost)
-        });
+        let compact = primary_wire_body(config, &compact);
+        let compact_calls = review_calls(config, &candidate, body, changed);
+        let shadow = keep_cost
+            .zip(
+                compact_calls
+                    .and_then(|calls| review_cost(config, &candidate, &compact_review, calls)),
+            )
+            .map(|(keep, compact)| ViewCosts { keep, compact });
         let joint = if standard(body) {
             view_costs(
                 &wire,
@@ -102,6 +155,7 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
             None
         };
         reports.push(json!({"removed_groups":removed,"feasible":feasible,"joint":joint,
+            "future_reviewer_keep_calls":keep_calls,"future_reviewer_compact_calls":compact_calls,
             "primary_retained_estimated_tokens":estimate(&compact),
             "reviewer_retained_estimated_tokens":estimate(&compact_review),
             "reviewer_cached_estimated_tokens":reviewer_reusable(config,&session.reviewer_cache,&compact_review)}));
@@ -126,6 +180,8 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
             .is_none()
     {
         Some("unsupported_model_or_tier")
+    } else if keep_calls.is_none() {
+        Some("future_reviewer_schedule_unknown")
     } else {
         None
     };
@@ -133,15 +189,17 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         "mode":format!("{:?}",config.mode).to_lowercase(),
         "primary_fits":primary_ok,"reviewer_fits":reviewer_ok,
         "primary_estimated_tokens":estimate(&wire),"reviewer_estimated_tokens":estimate(&reviewer),
-        "primary_required_tokens":primary_required_tokens(config,&wire),
+        "primary_required_tokens":primary_required_tokens(config,body),
         "reviewer_required_tokens":reviewer_required_tokens(config,&reviewer),
         "primary_context_tokens":config.primary_context_tokens,
         "reviewer_context_tokens":config.classifier_max_input_tokens,
         "context_margin_percent":config.context_margin_percent,
         "payoff_requests":config.payoff_requests,"min_payback_percent":config.min_payback_percent,
-        "future_review_events":review_calls,"future_reviewer_calls":review_calls,
-        "current_review_cost_is_sunk":false,
-        "estimate_basis":"next_rendered_requests_with_margin_and_output_reserve",
+        "future_review_events":keep_calls,"future_reviewer_calls":keep_calls,
+        "current_review_cost_is_sunk":session.shadow.calls > 0 &&
+            (session.last_review_request == session.completed_requests ||
+             (session.bootstrap_review_pending && session.bootstrap_review_complete)),
+        "estimate_basis":"frozen_source_dispatch_schedule_with_margin_and_output_reserve",
         "cache_basis":"exact_compatible_prefix_receipts_expire_after_30_minutes",
         "candidates":reports});
     (best.map(|(state, _)| state), report)
