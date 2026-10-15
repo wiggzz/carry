@@ -59,7 +59,7 @@ pub enum Login {
 #[command(name = "carry proxy", about = "Opaque native Responses HTTP proxy")]
 pub struct ProxyCli {
     /// Auto prefers a configured API key, then Carry's saved subscription.
-    /// API-key mode also supports credentials supplied by the client.
+    /// API-key mode requires a configured upstream environment key.
     #[arg(long, value_enum, default_value = "auto")]
     login: Login,
     /// Use Carry's saved ChatGPT/Codex subscription (alias for --login codex).
@@ -1017,6 +1017,7 @@ async fn forward(
             && !session.bootstrap_review_complete
             && !service.background_reviews.lock().await.contains(&id)
             && primary_priced
+            && standard(&body)
         {
             review(
                 &service,
@@ -1073,7 +1074,10 @@ async fn forward(
             // Capacity may require a blocking update even with background reviews.
             // Drop only disposable control turns before asking for new advice.
             session.compact_reviewer();
-            if review_fits(&service.config, &review_body(&service.config, &session)) {
+            if standard(&body)
+                && primary_priced
+                && review_fits(&service.config, &review_body(&service.config, &session))
+            {
                 review(
                     &service,
                     &id,
