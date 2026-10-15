@@ -133,7 +133,8 @@ def main():
     token, session = secrets.token_urlsafe(32), uuid.uuid4().hex
     env = os.environ.copy()
     env['CARRY_PROXY_AUTH_TOKEN'] = token
-    command = [args.carry_binary,'proxy','--listen',args.listen,'--upstream-url',args.upstream_url,
+    command = [args.carry_binary,'proxy','--login','api-key',
+        '--listen',args.listen,'--upstream-url',args.upstream_url,
         '--classifier-url',args.classifier_url,'--state-dir',str(root / 'state'), '--mode',args.mode,
         '--classifier-model',args.classifier_model,'--classifier-reasoning-effort',args.classifier_effort,
         '--classifier-cache-policy',args.classifier_cache_policy,
