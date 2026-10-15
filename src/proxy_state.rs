@@ -1144,7 +1144,8 @@ impl Session {
         if self.review_history.take().is_some() {
             self.reviewer_compactions += 1;
         }
-        self.reviewer_cache.clear();
+        // Keep historical receipt evidence: exact base/prefix/TTL checks admit
+        // only boundaries still present in the rebuilt live request.
         self.review_epoch = self.review_epoch.saturating_add(1);
     }
 }
