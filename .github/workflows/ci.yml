@@ -13,6 +13,11 @@ on:
         type: boolean
         required: false
         default: false
+      bootstrap_cpu_profile:
+        description: 'Extra single-case user CPU symbols; requires bootstrap_latency_diagnostic; permission denial is BLOCKED'
+        type: boolean
+        required: false
+        default: false
       preparation_solver_probe:
         description: 'Probe only: bounded preparation/evaluator diagnostics (no model or cloud worker)'
         type: boolean
@@ -283,6 +288,46 @@ jobs:
         with:
           name: bootstrap-latency-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/bootstrap-latency/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Install hosted software CPU sampler (default off)
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.bootstrap_latency_diagnostic && inputs.bootstrap_cpu_profile && !inputs.preparation_solver_probe
+        timeout-minutes: 3
+        run: |
+          # Sudo is confined to bounded package setup, NEVER the profiler/fixture.
+          # Preserve its numeric result even on failure; no install/profile retry.
+          set +e
+          sudo -n /usr/bin/timeout --kill-after=5s 60s /usr/bin/apt-get \
+            -o Acquire::Retries=0 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
+          rc=$?
+          if [[ "$rc" == 0 ]]; then
+            sudo -n /usr/bin/timeout --kill-after=5s 90s /usr/bin/apt-get \
+              -o Acquire::Retries=0 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 \
+              install -y --no-install-recommends linux-tools-generic
+            rc=$?
+          fi
+          printf '%s\n' "$rc" > "$RUNNER_TEMP/bootstrap-perf-install-exit"
+          exit "$rc"
+
+      - name: Sample original bootstrap once with same emitted debug binary
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.bootstrap_latency_diagnostic && inputs.bootstrap_cpu_profile && !inputs.preparation_solver_probe
+        timeout-minutes: 3
+        run: >-
+          python3 -B scripts/bootstrap_cpu_profile.py hosted
+          --root "$GITHUB_WORKSPACE"
+          --manifest "$RUNNER_TEMP/bootstrap-latency/manifest.json"
+          --private "$RUNNER_TEMP/bootstrap-cpu-private"
+          --report "$RUNNER_TEMP/bootstrap-cpu-symbols.json"
+          --install-status "$RUNNER_TEMP/bootstrap-perf-install-exit"
+
+      - name: Retain only allowlisted public CPU symbols and numeric receipts
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.bootstrap_latency_diagnostic && inputs.bootstrap_cpu_profile && !inputs.preparation_solver_probe
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: bootstrap-cpu-symbols-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Never widen this to a directory: raw perf.data/output stays private.
+          path: ${{ runner.temp }}/bootstrap-cpu-symbols.json
           if-no-files-found: error
           retention-days: 7
 
