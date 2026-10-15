@@ -181,6 +181,56 @@ fn planner01_completed_bootstrap_receipts_are_sunk_not_future_calls() {
     assert_eq!(session.shadow.calls, 2);
 }
 
+#[test]
+fn planner_final_default_background_prices_future_completion_sensitivity() {
+    let mut config = config();
+    config.background_reviews = true;
+    config.payoff_requests = 5;
+    config.review_every_requests = 1;
+    let (mut session, main) = session_with_review();
+    session.completed_requests = 0;
+    session.last_review_request = 0;
+    let (_, asynchronous) = plan(&config, &session, &main);
+    assert_eq!(
+        asynchronous["future_reviewer_calls"], 4,
+        "no current pending work: future completion sensitivity must remain priced at default cadence"
+    );
+    config.background_reviews = false;
+    let (_, synchronous) = plan(&config, &session, &main);
+    assert_eq!(synchronous["future_reviewer_calls"], 4);
+    let async_rows = asynchronous["candidates"].as_array().unwrap();
+    let sync_rows = synchronous["candidates"].as_array().unwrap();
+    assert!(!async_rows.is_empty());
+    assert_eq!(async_rows.len(), sync_rows.len());
+    for (asynchronous, synchronous) in async_rows.iter().zip(sync_rows) {
+        assert!(synchronous["joint"].is_object());
+        assert_eq!(
+            asynchronous["removed_groups"],
+            synchronous["removed_groups"]
+        );
+        assert_eq!(asynchronous["joint"], synchronous["joint"]);
+    }
+}
+
+#[test]
+fn planner_final_existing_pending_work_remains_unknown_not_free() {
+    let mut config = config();
+    config.background_reviews = true;
+    config.payoff_requests = 5;
+    config.review_every_requests = 1;
+    for background in [true, false] {
+        let (mut session, main) = session_with_review();
+        session.background_review_pending = background;
+        session.bootstrap_review_pending = !background;
+        session.bootstrap_review_complete = false;
+        let (_, report) = plan(&config, &session, &main);
+        assert!(report["future_reviewer_calls"].is_null());
+        let rows = report["candidates"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row["joint"].is_null()));
+    }
+}
+
 fn primary(marker: Option<Value>) -> Value {
     let mut body = json!({"model":"gpt-6-sol","input":[{"role":"user","content":[
         {"type":"input_text","text":"actual rendered primary payload ".repeat(200)}]}]});

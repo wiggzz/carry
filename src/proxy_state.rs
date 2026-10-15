@@ -1508,6 +1508,30 @@ mod tests {
         let metadata: Value = serde_json::from_str(metadata).unwrap();
         assert_eq!(metadata["group_id"], "g2");
         assert_eq!(metadata["member_ids"], json!([2, 3, 4]));
+        assert_eq!(
+            wire[0]["role"], "user",
+            "canonical task must precede its historical tools"
+        );
+        assert_eq!(
+            wire[0]["content"]
+                .as_str()
+                .unwrap()
+                .split("\n\n[carry context]")
+                .next(),
+            Some("goal")
+        );
+        assert_eq!(
+            at, 1,
+            "legacy reconstruction must preserve complete source chronology"
+        );
+        let mut restored: Session =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        restored.observe_groups(&restored.groups());
+        assert_eq!(
+            restored.shadow_input(),
+            wire,
+            "save/resume cannot duplicate or reorder repaired native items"
+        );
     }
 
     #[test]
