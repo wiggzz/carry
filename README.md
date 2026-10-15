@@ -182,7 +182,7 @@ and rejection feedback in the next review lets the model self-correct.
 Carry skips paid reviews when the primary model has no known rate, since its
 economic planner cannot select a compaction for that model.
 Interactive startup opens the local, token-free stats dashboard. Reusing the
-state directory (by default `CARRY_HOME` or `~/.carry`) preserves committed state
+state directory (by default `$CARRY_HOME/proxy` or `~/.carry/proxy`) preserves committed state
 and cumulative dashboard totals across restarts and working directories. See the
 [standalone proxy setup](docs/proxy-benchmarking.md#standalone-proxy)
 for API-key authentication, client configuration, and replay-import boundaries.

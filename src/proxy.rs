@@ -81,8 +81,8 @@ pub struct ProxyCli {
     /// Full upstream Responses endpoint, not an API base URL.
     #[arg(long, default_value = "https://api.openai.com/v1/responses")]
     upstream_url: String,
-    /// Persistent sessions and lifetime stats; defaults to CARRY_HOME or ~/.carry.
-    #[arg(long, default_value_os_t = crate::auth::carry_home().unwrap_or_else(|_| PathBuf::from(".carry-proxy")))]
+    /// Persistent sessions and lifetime stats; defaults to $CARRY_HOME/proxy or ~/.carry/proxy.
+    #[arg(long, default_value_os_t = crate::auth::carry_home().map(|home| home.join("proxy")).unwrap_or_else(|_| PathBuf::from(".carry-proxy")))]
     state_dir: PathBuf,
     #[arg(long, value_enum, default_value = "compact")]
     mode: Mode,
@@ -2898,7 +2898,10 @@ mod tests {
     #[test]
     fn proxy_defaults_compact_in_background_with_five_request_payoff() {
         let config = ProxyCli::try_parse_from(["carry proxy"]).unwrap();
-        assert_eq!(config.state_dir, crate::auth::carry_home().unwrap());
+        assert_eq!(
+            config.state_dir,
+            crate::auth::carry_home().unwrap().join("proxy")
+        );
         assert_eq!(config.mode, Mode::Compact);
         assert!(config.background_reviews);
         assert_eq!(config.payoff_requests, 5);

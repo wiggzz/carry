@@ -110,7 +110,7 @@ async function refresh(){
    el.append(bar,legend);
    const p=s.planner||{},section=document.createElement('div');section.className='planner';
    const decision=document.createElement('p');
-   decision.textContent=p.selected?(p.mode==='audit'?'Last plan: would compact (audit)':'Last plan: compaction selected'):p.reason?p.reason.replaceAll('_',' '):p.candidate?'Waiting for compaction payoff':'Waiting for removable context';
+   decision.textContent=p.selected?(p.mode==='audit'?'Last plan: would compact (audit)':'Last plan: compaction selected'):p.reason?({reviewer_partition_unknown:'Waiting for a complete review sweep',reviewer_pricing_unknown:'Waiting for reviewer cost estimates',unsupported_model_or_tier:'Compaction unavailable for this model or service tier'}[p.reason]||p.reason.replaceAll('_',' ')):p.candidate?'Waiting for compaction payoff':'Waiting for removable context';
    section.append(decision);
    if(p.candidate){
     const j=p.candidate,percent=j.keep>0?100*j.savings/j.keep:0,threshold=p.min_payback_percent,targetKnown=threshold!=null;
