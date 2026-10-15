@@ -4482,6 +4482,9 @@ mod tests {
         assert_eq!(report["future_reviewer_calls"], 4);
         let mut expensive_future_reviews = config;
         expensive_future_reviews.min_payback_percent = 25;
+        // The default 2,048-token allowance already fails this stricter margin.
+        // Pin a qualifying low-output arm, then vary only the allowance below.
+        expensive_future_reviews.classifier_max_output_tokens = 256;
         let (baseline, baseline_report) = plan(&expensive_future_reviews, &session, &main);
         assert!(
             baseline.is_some(),
@@ -4489,6 +4492,13 @@ mod tests {
         );
         expensive_future_reviews.classifier_max_output_tokens = 16_384;
         let (candidate, output_report) = plan(&expensive_future_reviews, &session, &main);
+        assert_eq!(output_report["candidates"][0]["feasible"], true);
+        let output_joint = &output_report["candidates"][0]["joint"];
+        assert!(output_joint["savings"].as_f64().unwrap() > 0.0);
+        assert!(
+            output_joint["savings"].as_f64().unwrap()
+                <= output_joint["keep"].as_f64().unwrap() * 0.25
+        );
         assert!(
             candidate.is_none(),
             "future review output cap belongs to both payoff costs and the minimum joint payback margin: {output_report}"
