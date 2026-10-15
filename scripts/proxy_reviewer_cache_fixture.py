@@ -45,29 +45,36 @@ def canonical(items):
     return result
 
 
-def prefix_identity(body, end):
-    # Exact renderer JSON identity: preserve wrappers, roles, text and other
-    # fields; remove ONLY the owned content-block marker, not quoted source.
-    items = copy.deepcopy(body['input'][:end])
+def without_markers(items):
+    # Preserve native wrappers, IDs, reasoning and phase; remove ONLY our marks.
+    items = copy.deepcopy(items)
     for item in items:
         for block in item.get('content', []) if isinstance(item.get('content'), list) else []:
             marker = block.pop('prompt_cache_breakpoint', None)
             assert marker is None or marker == {'mode': 'explicit'}
+    return items
+
+
+def prefix_identity(body, end):
+    items = without_markers(body['input'][:end])
     wire = json.dumps(items, separators=(',', ':'), ensure_ascii=False).encode()
     return hashlib.sha256(wire).hexdigest()
 
 
-def grade_cache_records(records, body):
+def grade_cache_records(records, body, explicit=True, history=()):
     assert records and len(records) <= 8
     assert len(json.dumps(records, separators=(',', ':'), ensure_ascii=False).encode()) <= 64 * 1024
-    stable_end = len(body['input']) - 1
+    stable_end = len(body['input']) - (1 if explicit else 0)
     settings = {key: value for key, value in body.items() if key != 'input'}
     for record in records:
         assert set(record) == {'format_version', 'base', 'input_len', 'input_sha256', 'at',
                                'read_estimated_tokens', 'read_confirmed_at'}
         assert record['format_version'] == 1
         assert 0 < record['input_len'] <= stable_end, 'cache evidence includes ledger or out-of-bounds input'
-        assert record['input_sha256'] == prefix_identity(body, record['input_len']), 'cache prefix identity mismatch'
+        candidates = [body] if explicit else [*history, body]
+        assert any(record['input_len'] <= len(sent['input'])
+                   and record['input_sha256'] == prefix_identity(sent, record['input_len'])
+                   for sent in candidates), 'cache prefix identity mismatch'
         assert record['base']['settings'] == settings, 'cache non-input settings mismatch'
 
 
@@ -81,6 +88,7 @@ class Provider:
     def __init__(self, case='rotation'):
         self.case = case
         self.reviews = []
+        self.review_outputs = []
         self.primary = []
         self.primary_raw_hashes = []
         self.receipts = []
@@ -108,17 +116,22 @@ class Provider:
                         ledger = json.loads(data[-1]['content'])
                         assert 'eligible_group_ids' in ledger
                         base = {k: v for k, v in body.items() if k != 'input'}
-                        key = lambda n: json.dumps([base, data[:n]], sort_keys=True)
-                        matched = [n for n in points if key(n) in owner.cache]
-                        # Explicit simulator: bounded synthetic native read, never tokenization.
+                        key = lambda n: json.dumps([base, n, prefix_identity(body, n)], sort_keys=True)
+                        # Explicit mode writes marked slots; the synthetic implicit
+                        # provider remembers only actually transmitted full/stable
+                        # prefixes. Wrappers and every non-input setting are exact.
+                        explicit = bool(points)
+                        candidates = points if explicit else range(1, len(data) + 1)
+                        matched = [n for n in candidates if key(n) in owner.cache]
                         cached = 2048 if matched else 0
                         if owner.case == 'missing-usage' and len(owner.reviews) <= 2:
                             cached = 0
-                        for point in points:
+                        for point in points if explicit else (len(data) - 1, len(data)):
                             owner.cache.add(key(point))
                         owner.receipts.append({'synthetic_cached_tokens': cached,
                                                'matched_boundaries': matched,
-                                               'transmitted_boundaries': points})
+                                               'transmitted_boundaries': points,
+                                               'synthetic_cache_mode': 'explicit' if explicit else 'implicit'})
                         ids = ledger['eligible_group_ids']
                         targets = [record['group_id'] for record in review_records(body)
                                    if record.get('group_id') in ids
@@ -129,8 +142,19 @@ class Provider:
                         advice = {'protected': ids[:1] if owner.case == 'coupled' or len(owner.reviews) % 2 else [],
                                   'removable': sorted(set(targets)) if owner.case == 'coupled' else
                                                ([] if len(owner.reviews) % 2 else ids[:1]), 'memories': []}
-                        output = [{'type': 'message', 'role': 'assistant',
-                                   'content': [{'type': 'output_text', 'text': json.dumps(advice)}]}]
+                        sequence = len(owner.reviews)
+                        output = [
+                            {'type': 'reasoning', 'id': f'review-reasoning-{sequence}',
+                             'summary': [{'type': 'summary_text', 'text': f'Synthetic reasoning {sequence}'}],
+                             'encrypted_content': f'FIXTURE_ONLY_OPAQUE_REVIEW_REASONING_{sequence}'},
+                            {'type': 'message', 'id': f'review-commentary-{sequence}',
+                             'role': 'assistant', 'phase': 'commentary',
+                             'content': [{'type': 'output_text', 'text': f'Synthetic progress {sequence}'}]},
+                            {'type': 'message', 'id': f'review-final-{sequence}',
+                             'role': 'assistant', 'phase': 'final_answer',
+                             'content': [{'type': 'output_text', 'text': json.dumps(advice)}]},
+                        ]
+                        owner.review_outputs.append(copy.deepcopy(output))
                     else:
                         assert self.path == '/v1/responses'
                         owner.primary.append(body)
@@ -170,10 +194,49 @@ class Provider:
         self.thread.join(timeout=3)
 
 
-def grade(reviews, receipts, enabled=True, missing_usage=False, append_only=False):
+def grade_replay(reviews, outputs, allow_pruning=False):
+    assert len(reviews) == len(outputs), 'each actual reviewer result must be captured'
+    for index, current in enumerate(reviews[1:], 1):
+        previous = reviews[index - 1]['input']
+        items = without_markers(current['input'])
+        if (canonical(items[:len(previous)]) == canonical(previous)
+                and (not allow_pruning or len(items) >= len(previous) + len(outputs[index - 1]) + 1)):
+            assert items[len(previous):len(previous) + len(outputs[index - 1])] == outputs[index - 1], \
+                'native reviewer output must replay exactly before new source/ledger'
+        else:
+            assert allow_pruning, 'prior review input must remain an exact prefix'
+            old_ids = {item['id'] for output in outputs[:index] for item in output}
+            assert not any(item.get('id') in old_ids for item in items), 'pruned reviewer output must disappear'
+        for output in outputs[:index]:
+            for expected in output:
+                matches = [item for item in items if item.get('id') == expected['id']]
+                if matches:
+                    assert matches == [expected], 'native reviewer output must replay exactly once'
+
+
+def grade(reviews, receipts, enabled=True, missing_usage=False, append_only=False, outputs=None):
     assert len(reviews) >= 8, 'at least eight actual reviews required'
+    for body in reviews:
+        assert json.loads(text(body['input'][-1])).get('current_groups'), 'missing current ledger groups'
+    if outputs is not None:
+        grade_replay(reviews, outputs)
+    if append_only:
+        previous = reviews[-2]['input']
+        current = reviews[-1]['input']
+        assert canonical(current[:len(previous)]) == canonical(previous), 'prior review input must remain an exact prefix'
+        if outputs is None:
+            assert current[len(previous)]['role'] == 'assistant', 'prior reviewer answer must precede the new nudge'
+        output_length = len(outputs[-2]) if outputs is not None else 1
+        assert len(current) == len(previous) + output_length + 1, 'no new source items expected on the final ledger-only update'
+    else:
+        assert canonical(reviews[-1]['input'][:-1]) == canonical(reviews[-2]['input'][:-1]), 'ledger-only review required'
+    assert text(reviews[-1]['input'][-1]) != text(reviews[-2]['input'][-1]), 'ledger really must change'
     if not enabled:
         assert all(not boundaries(b) and 'prompt_cache_options' not in b for b in reviews)
+        if outputs is not None:
+            for index, receipt in enumerate(receipts[1:]):
+                if not missing_usage or index > 0:
+                    assert receipt['synthetic_cached_tokens'] > 0, 'implicit simulator must reuse an exact historical prefix'
         return
     for body in reviews:
         points = boundaries(body)
@@ -188,15 +251,6 @@ def grade(reviews, receipts, enabled=True, missing_usage=False, append_only=Fals
         assert previous_end in boundaries(current), 'latest prior WRITE must remain a lookup candidate'
         if not missing_usage or index > 0:
             assert receipt['synthetic_cached_tokens'] > 0, 'simulator failed to reuse preserved stable boundary'
-    if append_only:
-        previous = reviews[-2]['input']
-        current = reviews[-1]['input']
-        assert canonical(current[:len(previous)]) == canonical(previous), 'prior review input must remain an exact prefix'
-        assert current[len(previous)]['role'] == 'assistant', 'prior reviewer answer must precede the new nudge'
-        assert len(current) == len(previous) + 2, 'no new source items expected on the final ledger-only update'
-    else:
-        assert canonical(reviews[-1]['input'][:-1]) == canonical(reviews[-2]['input'][:-1]), 'ledger-only review required'
-    assert text(reviews[-1]['input'][-1]) != text(reviews[-2]['input'][-1]), 'ledger really must change'
 
 
 def grade_coupled(provider, sent, state, enabled):
@@ -216,15 +270,18 @@ def grade_coupled(provider, sent, state, enabled):
     assert all('DISCARD_NATIVE_BYTES' not in json.dumps(b) for b in after_reset)
     assert state['compactions'] >= 1 and state['history_rebases'] == 1
     assert len(state['active_shadow']) == 2 and len(state['history']) == 2
+    grade_replay(provider.reviews, provider.review_outputs, allow_pruning=True)
     if enabled:
         assert all(0 < len(boundaries(b)) <= 4 and max(boundaries(b)) == len(b['input']) - 1 for b in provider.reviews)
-        # A compatible smaller pre-cohort generation survives the shared trim.
-        assert provider.receipts[3]['synthetic_cached_tokens'] > 0, 'post-prune stable prefix must remain a lookup candidate'
-        reset_index = provider.reviews.index(after_reset[0])
-        assert provider.receipts[reset_index]['synthetic_cached_tokens'] == 0, 'divergent reset must start cold'
-        # Hash/length matching the actual post-reset render proves no stale
-        # pre-reset prefix evidence survives, without storing source copies.
-        grade_cache_records(state['reviewer_cache'], after_reset[-1])
+    else:
+        assert all(not boundaries(b) and 'prompt_cache_options' not in b for b in provider.reviews)
+    # A compatible smaller pre-cohort generation survives the shared trim.
+    assert provider.receipts[3]['synthetic_cached_tokens'] > 0, 'post-prune stable prefix must remain a lookup candidate'
+    reset_index = provider.reviews.index(after_reset[0])
+    assert provider.receipts[reset_index]['synthetic_cached_tokens'] == 0, 'divergent reset must start cold'
+    # Hash/length matching the actual post-reset render proves no stale
+    # pre-reset prefix evidence survives, without storing source copies.
+    grade_cache_records(state['reviewer_cache'], after_reset[-1], enabled, history=after_reset)
 
 
 def fixture_environment():
@@ -251,6 +308,8 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     env = fixture_environment()
+    home = directory / 'home'; home.mkdir(exist_ok=True)
+    env.update(HOME=str(home), CARRY_HOME=str(home / '.carry'), XDG_CONFIG_HOME=str(home / '.config'))
     inputs: list[dict] = []
     sent = []
     sent_hashes = []
@@ -261,7 +320,7 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
             with socket.socket() as sock:
                 sock.bind(('127.0.0.1', 0))
                 port = sock.getsockname()[1]
-            cmd = [str(Path(binary).resolve()), 'proxy', '--listen', f'127.0.0.1:{port}',
+            cmd = [str(Path(binary).resolve()), 'proxy', '--login', 'api-key', '--listen', f'127.0.0.1:{port}',
                    '--upstream-url', provider.url + '/v1/responses', '--classifier-url', provider.url + '/classifier',
                    '--classifier-model', model, '--state-dir', str(directory / 'state'),
                    '--mode', 'compact' if case == 'coupled' else 'audit', '--background-reviews=false']
@@ -331,7 +390,8 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
                     process.wait(timeout=5)
         evidence = {'basis': 'credential-free loopback provider cache simulator; synthetic usage, NOT live inference',
                     'binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
-                    'process_count': 2, 'reviews': provider.reviews, 'receipts': provider.receipts,
+                    'process_count': 2, 'reviews': provider.reviews, 'review_outputs': provider.review_outputs,
+                    'receipts': provider.receipts,
                     'primary_requests': provider.primary, 'primary_raw_sha256': provider.primary_raw_hashes,
                     'credit_snapshots': credit_snapshots, 'errors': provider.errors}
         (directory / 'evidence.json').write_text(json.dumps(evidence, indent=2) + '\n')
@@ -345,19 +405,19 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
         else:
             assert provider.primary == sent, 'reviewer repair must leave primary bodies unchanged'
             assert provider.primary_raw_hashes == sent_hashes, 'audit primary raw JSON bytes must remain identical'
-            grade(provider.reviews, provider.receipts, enabled, case == 'missing-usage', append_only=True)
+            grade(provider.reviews, provider.receipts, enabled, case == 'missing-usage',
+                  append_only=True, outputs=provider.review_outputs)
         if case == 'missing-usage':
             assert credit_snapshots[1]['read_credit'] == credit_snapshots[2]['read_credit'] == 0
             assert credit_snapshots[3]['read_credit'] > 0, 'only an explicit cached-read receipt may grant credit'
             assert state['shadow']['unavailable_cost_calls'] >= 1, 'missing usage must remain unknown in metering'
-        if enabled:
-            records = state['reviewer_cache']
-            assert records and any(e['read_estimated_tokens'] > 0 for e in records)
-            assert sum(e['read_confirmed_at'] is not None for e in records) == 1, 'aggregate read must credit only one boundary'
-            latest = provider.reviews[-1]
-            total_estimate = len(json.dumps(latest, separators=(',', ':'), ensure_ascii=False).encode()) / 4
-            assert sum(e['read_estimated_tokens'] for e in records) <= total_estimate * 2048 / 10000 + 1e-9
-            grade_cache_records(records, latest)
+        records = state['reviewer_cache']
+        assert records and any(e['read_estimated_tokens'] > 0 for e in records)
+        assert sum(e['read_confirmed_at'] is not None for e in records) == 1, 'aggregate read must credit only one boundary'
+        latest = provider.reviews[-1]
+        total_estimate = len(json.dumps(latest, separators=(',', ':'), ensure_ascii=False).encode()) / 4
+        assert sum(e['read_estimated_tokens'] for e in records) <= total_estimate * 2048 / 10000 + 1e-9
+        grade_cache_records(records, latest, enabled, history=provider.reviews)
         return {'reviews': len(provider.reviews), 'processes': 2, 'case': case, 'basis': evidence['basis'],
                 'classifier_cache_policy': policy_arg, 'classifier_model': model, 'explicit_enabled': enabled}
 
@@ -384,6 +444,11 @@ def main():
                                        ('auto-generic', 'auto', args.model),
                                        ('auto-unknown', 'auto', 'unknown-fixture-model')]:
                 result = run(args.binary, directory / name, policy, False, model)
+                result['case'] = name
+                cases.append(result)
+            for case in ('coupled', 'missing-usage'):
+                name = 'implicit-' + case
+                result = run(args.binary, directory / name, 'disabled', False, args.model, case)
                 result['case'] = name
                 cases.append(result)
             cases.append(reject_unknown(args.binary, directory / 'explicit-unknown-rejected'))

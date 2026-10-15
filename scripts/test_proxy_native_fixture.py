@@ -344,15 +344,30 @@ class NativeProviderFixtureTests(unittest.TestCase):
         if not binary.is_file():
             self.skipTest('requires an existing Carry binary; never builds locally')
         with Fixture('pi') as fixture, tempfile.TemporaryDirectory() as directory:
+            # Hold the actual reviewer HTTP result: protocol assertions below
+            # must observe completed/persisted work, not a pending background job.
+            review_started, review_release = threading.Event(), threading.Event()
+            handler = fixture.server.RequestHandlerClass
+            original_post = getattr(handler, 'do_POST')
+            def held_post(request):
+                if request.path == '/classifier':
+                    review_started.set()
+                    if not review_release.wait(5):
+                        raise TimeoutError('owned reviewer was not released')
+                return original_post(request)
+            setattr(handler, 'do_POST', held_post)
             env = {k: v for k, v in os.environ.items()
                    if not k.startswith(('OPENAI_', 'CARRY_PROXY_'))}
-            env.update(CARRY_PROXY_UPSTREAM_KEY='synthetic-fixture-key',
+            home = Path(directory) / 'home'; home.mkdir()
+            env.update(HOME=str(home), CARRY_HOME=str(home / '.carry'),
+                       XDG_CONFIG_HOME=str(home / '.config'),
+                       CARRY_PROXY_UPSTREAM_KEY='synthetic-fixture-key',
                        CARRY_PROXY_CLASSIFIER_KEY='synthetic-fixture-key')
             command = [str(binary), 'proxy', '--listen', '127.0.0.1:0',
                        '--upstream-url', fixture.url + '/v1/responses',
                        '--classifier-url', fixture.url + '/classifier',
                        '--classifier-model', 'gpt-6-luna', '--mode', 'audit',
-                       '--state-dir', directory]
+                       '--state-dir', directory, '--background-reviews=false']
             process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                        stderr=subprocess.DEVNULL, text=True)
             assert process.stdout is not None
@@ -375,13 +390,30 @@ class NativeProviderFixtureTests(unittest.TestCase):
                     req = urllib.request.Request(url + '/v1/responses',
                         data=json.dumps(body).encode(), headers={'content-type': 'application/json',
                                                                'x-carry-session': 'plain-conversation'})
-                    try:
-                        with urllib.request.urlopen(req, timeout=5) as response:
-                            raw = response.read().decode()
-                    except urllib.error.HTTPError as error:
-                        detail = error.read().decode()
-                        error.close()
-                        self.fail(f'primary request {turn} failed: {detail}; {fixture.errors}')
+                    from concurrent.futures import ThreadPoolExecutor
+                    def send():
+                        try:
+                            with urllib.request.urlopen(req, timeout=5) as response:
+                                return response.read().decode()
+                        except urllib.error.HTTPError as error:
+                            detail = error.read().decode()
+                            error.close()
+                            self.fail(f'primary request {turn} failed: {detail}; {fixture.errors}')
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        pending = pool.submit(send)
+                        try:
+                            if turn == 1:
+                                self.assertTrue(review_started.wait(3), 'real reviewer must start')
+                                from concurrent.futures import TimeoutError as FutureTimeout
+                                with self.assertRaises(FutureTimeout,
+                                        msg='primary must await the held synchronous review'):
+                                    pending.result(timeout=0.25)
+                                self.assertEqual(len(fixture.calls), 1,
+                                                 'second primary must follow the review result')
+                        finally:
+                            if turn == 1:
+                                review_release.set()
+                        raw = pending.result(timeout=5)
                     self.assertEqual(fixture.calls[-1], body, 'review must not alter primary/tool data')
                     result = [json.loads(line[6:]) for line in raw.splitlines()
                               if line.startswith('data: ')][-1]['response']
@@ -400,6 +432,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                         'shadow_failures': [e['data'] for e in events if e['event'] == 'shadow_failed']
                     }, indent=2) + '\n')
                 self.assertEqual(len(fixture.reviews), 1, 'must execute a real classifier HTTP request')
+                self.assertEqual(state['shadow']['calls'], 1, 'completed review receipt must be persisted')
                 self.assertEqual(fixture.reviews[0]['text']['format']['type'], 'json_schema')
                 self.assertTrue(fixture.reviews[0]['text']['format']['strict'])
                 self.assertEqual(len(fixture.reviews[0]['prompt_cache_key']), 64)
