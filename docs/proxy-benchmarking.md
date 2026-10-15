@@ -177,9 +177,13 @@ configured payoff horizon (five requests by default), including upcoming reviewe
 calls and their configured output allowance. Fresh compatible receipts can credit
 cache reads; evidence expires after 30 minutes. Implicit fills use ordinary input
 rates, while explicit cache writes use the modeled write rate. No cache markers
-are required for implicit-prefix evidence. Token counts are local `o200k_base`
-estimates over rendered JSON, not provider token counts or guarantees of cache
-hits. There is no dependency on a historical reviewer-window partition.
+are required for implicit-prefix evidence. Capacity and planner input counts are
+local `o200k_base` estimates over rendered JSON; configured budgets, estimation
+margin and output reserves are operator planning assumptions, not native provider
+counts or enforced provider limits.
+The usage ledger separately records native input/output/cache counts from actual
+receipts (or reports them unavailable). Local estimates do not guarantee a cache
+hit. There is no dependency on a historical reviewer-window partition.
 
 Reviewer requests replay native messages, reasoning (including encrypted content),
 and tool call/result items. Source IDs are appended to the last message text block;
@@ -380,9 +384,9 @@ python3 scripts/proxy_trial.py \
   --prompt 'Inspect this disposable repository and summarize one useful improvement.'
 ```
 
-Choose a new trial directory for every arm. It must not exist and must be outside the workspace. For a transport control, use `--mode off` with a different fresh directory; omission of `--mode` defaults to compact. Do not reuse a modified workspace between compared arms.
+Choose a new trial directory for every arm. It must not exist and must be outside the workspace. For a transport control, use `--mode off` with a different fresh directory; omission of `--mode` defaults to **off** in this launcher (unlike direct `carry proxy`). Do not reuse a modified workspace between compared arms.
 
-The launcher creates separate `HOME`, `CODEX_HOME` or `PI_CODING_AGENT_DIR`, a scoped gateway token, and a random session ID. Codex uses a custom Responses provider with `supports_websockets = false`; Pi uses `openai-responses`. Both send stable `x-carry-session`, `x-carry-tenant: local-trial`, and `x-carry-branch: main` headers for one conversation. Native compaction is not disabled or fed fictional usage. `proxy.log`, `client-events.jsonl`, `trial.json`, and private proxy state are retained under the trial directory. Protect these artifacts: they may contain your task contents.
+The launcher explicitly selects `--login api-key` for Carry: set upstream/reviewer provider keys in its environment; it does not auto-discover a saved Carry subscription or forward the client gateway token as a provider key. It creates a separate client `HOME`, `CODEX_HOME` or `PI_CODING_AGENT_DIR`, a scoped gateway token, and a random session ID. Codex uses a custom Responses provider with `supports_websockets = false`; Pi uses `openai-responses`. Both send stable `x-carry-session`, `x-carry-tenant: local-trial`, and `x-carry-branch: main` headers for one conversation. Native compaction is not disabled or fed fictional usage. `proxy.log`, `client-events.jsonl`, `trial.json`, and private proxy state are retained under the trial directory. Protect these artifacts: they may contain your task contents.
 
 Readiness checks `/health` and authenticated `/carry/metrics`, and rejects an effective-mode mismatch before launching the client. The launcher stops its exact proxy and client process groups, including tool descendants, after completion or timeout. `--timeout` defaults to 300 seconds. It returns the client status and does not interpret a final response as a benchmark grade.
 
@@ -458,6 +462,15 @@ The optional installed-client test `scripts.test_codex_hosted_tools` runs four a
 
 Both fixtures use fabricated provider responses and usage **only as labeled protocol fixtures**. They do not establish real model quality, paid usage, live cache hits, automatic Pi compaction, arbitrary-length histories, or cost savings. Two-summary RPC coverage proves repeated manual native summary/continuation, not Pi's automatic trigger. Standalone handler canary/HTTP-400 tests additionally verify content-free telemetry and byte-preserving forwarding, but are not a substitute for the complete pinned-Pi gateway path. A live comparison still requires successful candidate-source CI with verified built-commit/tree identity plus independent evidence/quality/cost gates. A compact arm that never rewrites proves only forwarding/review overhead, not savings.
 
+The integrated reviewer-cache fixture (`scripts/proxy_reviewer_cache_fixture.py`)
+adds nine model-free cases: explicit rotation/pruning/missing-usage, disabled and
+auto-generic/unknown implicit-prefix cases, implicit pruning/missing-usage, and
+unsupported explicit-model rejection. Both modes check actual raw primary parity,
+durable restart state, and native multi-item reviewer reasoning/phase replay.
+Positive, zero and missing cache receipts are **synthetic**, based on exact
+historical prefixes and settings; they do not establish live cache hits or
+provider acceptance of generated reasoning items.
+
 ### Local stats dashboard
 
 Open `/carry/dashboard` on the proxy (normally
@@ -473,16 +486,25 @@ claim local access. A local reverse proxy counts as a local peer, so it must
 enforce its own authentication before exposing these routes remotely.
 On a shared/non-loopback listener, configure a gateway token: dashboard stats
 are gateway-wide, not restricted to a single session.
-The endpoint only returns counters, hashes, ledger totals, and context sizes,
-not conversation text, reviewer memory, or credentials. All responses are
-`Cache-Control: no-store`.
+The endpoint returns counters, hashes, ledger totals, context sizes, and short
+session titles containing up to 80 characters from the first user message. These
+title excerpts can contain sensitive task text and are persisted in checkpoints.
+It does not return full messages, reviewer memory contents, or credentials.
+Stats cover every saved session in this proxy's state directory, not just the
+authenticated caller's session or tenant; anyone granted stats access can read
+those titles and totals. All responses are `Cache-Control: no-store`.
 
-The dashboard refreshes every two seconds while visible. It shows primary and
-reviewer usage separately, native cached-read share, cache writes, rewrites,
-failures, explicit history rebases, and retained/removed item counts. Retained
-input bytes are serialized bytes, **not** tokens. State is checkpoint-based,
-not a live stream of tokens. Unreadable checkpoints are flagged and totals are
-marked incomplete. Cost values are standard API equivalents, not subscription
+The dashboard refreshes every two seconds while visible. Session cards show
+title, activity, completed requests, rewrites/reviewer cleanups, estimated savings,
+removable/protected/unreviewed item counts, memory count, and the last planner
+capacity/payoff check. Expand a card's diagnostics for failures or incomplete
+coverage. The **Costs, coverage & diagnostics** section shows primary and reviewer
+native usage separately, cached-read share, cache writes and API-equivalent costs.
+**Inspect stats JSON** retains the detailed native-compaction, history-rebase,
+retained/removed item and serialized-byte counters; these are not all dedicated
+visible card fields. Retained input bytes are **not** tokens. State is
+checkpoint-based, not a live stream of tokens. Unreadable checkpoints are flagged
+and totals are marked incomplete. Cost values are standard API equivalents, not subscription
 charges, invoices, or measured savings; unpriced calls make the total unavailable
 while the known priced subtotal remains visible.
 
@@ -510,10 +532,12 @@ history mark the comparison
 unavailable, with coverage counters in stats JSON. This change does not backfill
 older checkpoints from raw traces. Dashboard comparison cards sum only sessions
 with complete estimates and display the included/total session count. Excluded
-sessions remain in usage totals and the session list, labeled `Excluded` with
-dashes for scenario values. With no eligible sessions, comparison cards show
-`No eligible sessions` rather than zero savings. Dashboard responses include only numerical
-scenario estimates, never the prior prompt kept privately for cache matching.
+sessions remain in usage totals and the session list; their savings read
+`Incomplete`, with diagnostics explaining missing coverage. With no eligible
+sessions, the top estimated-savings card shows `Not enough data`; the expanded
+Carry/traditional scenario cards show `No eligible sessions`, not zero savings.
+Scenario fields contain numerical estimates and coverage, never the prior prompt
+kept privately for cache matching; session title excerpts are disclosed above.
 See [the proxy backlog](proxy-backlog.md) for completed background review and
 consolidation with the shared main savings/report estimator.
 

@@ -194,7 +194,10 @@ Session identity uses stable client/thread/agent identifiers; per-turn telemetry
 is forwarded unchanged without splitting Carry state or reviewer cache affinity.
 The dashboard shows short first-user-message titles and orders sessions by their
 latest checkpoint update. Session titles are the only message excerpts returned
-by dashboard stats; memory contents remain private.
+by dashboard stats; memory contents remain private. Stats are gateway-wide across
+the proxy's state directory, not scoped to the caller's session or tenant. Titles
+can contain sensitive task text; protect remote stats access with the proxy token
+and authenticate any reverse proxy that presents itself as a loopback peer.
 
 ### Terminal input and formatting
 
