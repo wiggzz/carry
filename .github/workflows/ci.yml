@@ -182,6 +182,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: ${{ github.event_name == 'workflow_dispatch' && inputs.bootstrap_latency_diagnostic && inputs.bootstrap_cpu_profile && !inputs.preparation_solver_probe && '0' || '1' }}
 
       - name: Validate pull request title
         if: github.event_name == 'pull_request'
