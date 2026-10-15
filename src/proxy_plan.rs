@@ -6,8 +6,9 @@ use super::{
     view_costs,
 };
 
-/// Frozen-source sensitivity: advance actual cadence and exposure, not an
-/// invented ceil(horizon/cadence) schedule. Unfinished work is unknown, not free.
+/// Frozen-source sensitivity: advance cadence and exposure, assuming future
+/// reviews complete/merge before their next due dispatch. This is not a latency
+/// guarantee. Already unfinished work is unknown, not free.
 fn review_calls(config: &ProxyCli, session: &Session, body: &Value, changed: bool) -> Option<u64> {
     if !standard(body)
         || carry::core::Rates::for_model(body["model"].as_str().unwrap_or(""), 0.0).is_none()
@@ -43,11 +44,6 @@ fn review_calls(config: &ProxyCli, session: &Session, body: &Value, changed: boo
             eligible_later
         };
         if dispatch && age >= config.review_every_requests {
-            // Once a background update starts, whether it has completed before
-            // another dispatch point is not known from this snapshot.
-            if config.background_reviews && calls > 0 {
-                return None;
-            }
             calls += 1;
             age = 0;
         }
@@ -199,7 +195,8 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         "current_review_cost_is_sunk":session.shadow.calls > 0 &&
             (session.last_review_request == session.completed_requests ||
              (session.bootstrap_review_pending && session.bootstrap_review_complete)),
-        "estimate_basis":"frozen_source_dispatch_schedule_with_margin_and_output_reserve",
+        "estimate_basis":"frozen_source_and_timely_completion_sensitivity",
+        "review_completion_basis":"future_reviews_complete_and_merge_before_next_due_dispatch",
         "cache_basis":"exact_compatible_prefix_receipts_expire_after_30_minutes",
         "candidates":reports});
     (best.map(|(state, _)| state), report)

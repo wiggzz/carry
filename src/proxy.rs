@@ -4436,7 +4436,30 @@ mod tests {
             &json!({"input_tokens": 10000, "input_tokens_details": {"cached_tokens": 10000}}),
         );
         let (candidate, report) = plan(&config, &session, &main);
-        let joint = &report["candidates"][0]["joint"];
+        let row = &report["candidates"][0];
+        assert_eq!(row["future_reviewer_keep_calls"], 4);
+        assert_eq!(row["future_reviewer_compact_calls"], 4);
+        let joint = &row["joint"];
+        assert!(joint.is_object(), "paired costs must be priced: {report}");
+        let mut compact_branch = session.clone();
+        compact_branch.remove(&[2], &groups);
+        let reviewer_cost = |branch: &Session| {
+            let rendered = review_body(&config, branch);
+            let input =
+                reviewer_view_costs(&config, &branch.reviewer_cache, &rendered, &rendered, 4)
+                    .unwrap()
+                    .keep;
+            let rates = Rates::for_model(&config.classifier_model, estimate(&rendered)).unwrap();
+            input + 4.0 * config.classifier_max_output_tokens as f64 * rates.output
+        };
+        assert!(
+            (joint["future_shadow_keep"].as_f64().unwrap() - reviewer_cost(&session)).abs() < 1e-12
+        );
+        assert!(
+            (joint["future_shadow_compact"].as_f64().unwrap() - reviewer_cost(&compact_branch))
+                .abs()
+                < 1e-12
+        );
         assert!(
             joint["primary_keep"].as_f64().unwrap() > joint["primary_compact"].as_f64().unwrap()
         );
@@ -4455,15 +4478,20 @@ mod tests {
             "cold actual reviewer view repays the same coupled rewrite"
         );
         assert_eq!(report["current_review_cost_is_sunk"], false);
-        assert_eq!(report["future_review_events"], 5);
-        assert_eq!(report["future_reviewer_calls"], 5);
+        assert_eq!(report["future_review_events"], 4);
+        assert_eq!(report["future_reviewer_calls"], 4);
         let mut expensive_future_reviews = config;
         expensive_future_reviews.min_payback_percent = 25;
+        let (baseline, baseline_report) = plan(&expensive_future_reviews, &session, &main);
+        assert!(
+            baseline.is_some(),
+            "low-output baseline must pass the same payback margin: {baseline_report}"
+        );
         expensive_future_reviews.classifier_max_output_tokens = 16_384;
-        let (candidate, _) = plan(&expensive_future_reviews, &session, &main);
+        let (candidate, output_report) = plan(&expensive_future_reviews, &session, &main);
         assert!(
             candidate.is_none(),
-            "future review output cap belongs to both payoff costs and the minimum joint payback margin"
+            "future review output cap belongs to both payoff costs and the minimum joint payback margin: {output_report}"
         );
     }
 }

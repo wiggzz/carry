@@ -780,6 +780,7 @@ impl Session {
             record.value["content"] =
                 json!(json!({"source_ids": sources, "text": memory.text}).to_string());
         }
+        let mut rebuilt_legacy = false;
         for group in groups {
             // Observe a native reasoning/call/result delta only once complete.
             if !group.replayable {
@@ -801,6 +802,7 @@ impl Session {
                         .unwrap()
                 });
             if rebuild_at.is_some() {
+                rebuilt_legacy = true;
                 self.active_shadow
                     .retain(|record| !group.members.contains(&record.source_id));
                 self.observed.retain(|id, _| !group.members.contains(id));
@@ -839,6 +841,13 @@ impl Session {
             for id in member_ids {
                 self.observed.insert(id, group.id.to_string());
             }
+        }
+        if rebuilt_legacy {
+            // A partial legacy cohort may precede an earlier missing task that
+            // was just reconstructed. Canonicalize only this structural repair;
+            // prepare_review_history accounts for any incompatible replay.
+            // Ordinary complete observations retain immutable append order.
+            self.active_shadow.sort_by_key(|record| record.source_id);
         }
     }
 

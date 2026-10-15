@@ -174,7 +174,15 @@ capacity problem without making removals.
 
 When both requests fit, the planner compares both retained histories over the
 configured payoff horizon (five requests by default), including upcoming reviewer
-calls and their configured output allowance. Fresh compatible receipts can credit
+calls and their configured output allowance. Each candidate advances its own
+review age, cadence, eligibility and completed-primary exposure; a source rewrite
+skips an immediate ordinary review, while a reviewer-only cleanup does not. This
+is a **frozen-source, timely-completion sensitivity**: hypothetical future reviews
+are assumed to complete and merge before their next due dispatch, not guaranteed
+to do so. Already-pending background work and unfinished imports remain unknown,
+not free; completed bootstrap receipts are sunk. Primary generation-output cost
+is not separately forecast (the primary output reserve is a capacity allowance).
+Fresh compatible receipts can credit
 cache reads; evidence expires after 30 minutes. Implicit fills use ordinary input
 rates, while explicit cache writes use the modeled write rate. No cache markers
 are required for implicit-prefix evidence. Capacity and planner input counts are
