@@ -8,6 +8,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      bootstrap_latency_diagnostic:
+        description: 'One bounded debug bootstrap latency diagnostic; no model/cloud calls'
+        type: boolean
+        required: false
+        default: false
       preparation_solver_probe:
         description: 'Probe only: bounded preparation/evaluator diagnostics (no model or cloud worker)'
         type: boolean
@@ -251,7 +256,35 @@ jobs:
           PY
 
       - name: Unit tests
-        run: cargo test --locked --no-fail-fast
+        env:
+          BOOTSTRAP_LATENCY_DIAGNOSTIC: ${{ github.event_name == 'workflow_dispatch' && inputs.bootstrap_latency_diagnostic && !inputs.preparation_solver_probe }}
+        run: |
+          set -euo pipefail
+          if [[ "$BOOTSTRAP_LATENCY_DIAGNOSTIC" == true ]]; then
+            # Same ordinary tests. Cargo's own JSON binds the existing debug
+            # executables; do not rebuild or select a release artifact afterward.
+            cargo test --locked --no-fail-fast --message-format=json | tee "$RUNNER_TEMP/bootstrap-cargo.jsonl"
+          else
+            cargo test --locked --no-fail-fast
+          fi
+
+      - name: Diagnose original bootstrap case once, serial and integration-concurrent
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.bootstrap_latency_diagnostic && !inputs.preparation_solver_probe
+        timeout-minutes: 5
+        run: >-
+          python3 -B scripts/bootstrap_diagnostic.py hosted
+          --root "$GITHUB_WORKSPACE"
+          --cargo-log "$RUNNER_TEMP/bootstrap-cargo.jsonl"
+          --out "$RUNNER_TEMP/bootstrap-latency"
+
+      - name: Retain bounded bootstrap diagnostic, including failed arms
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.bootstrap_latency_diagnostic && !inputs.preparation_solver_probe
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: bootstrap-latency-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bootstrap-latency/
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Terminal editor PTY tests
         run: python3 tests/terminal_editor.py
