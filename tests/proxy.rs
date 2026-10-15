@@ -765,7 +765,7 @@ async fn dashboard_is_public_locally_and_reports_stats_without_conversation_cont
     for session in ["one", "two"] {
         let response = client.post(format!("{url}/v1/responses"))
             .bearer_auth("dashboard-token").header("x-carry-session",session)
-            .json(&json!({"model":"gpt-6-luna", "input":[{"role":"user","content":"PRIVATE_TASK_DO_NOT_EXPOSE"}]}))
+            .json(&json!({"model":"gpt-6-luna", "input":[{"role":"user","content":format!("{} PRIVATE_TASK_DO_NOT_EXPOSE", "Session title ".repeat(10))}]}))
             .send().await.unwrap();
         assert!(response.status().is_success());
         response.bytes().await.unwrap();
@@ -780,6 +780,13 @@ async fn dashboard_is_public_locally_and_reports_stats_without_conversation_cont
     assert_eq!(data["classifier_explicit_cache"], false);
     assert_eq!(data["sessions"].as_array().unwrap().len(), 2);
     for session in data["sessions"].as_array().unwrap() {
+        assert!(
+            session["title"]
+                .as_str()
+                .unwrap()
+                .starts_with("Session title")
+        );
+        assert!(session["title"].as_str().unwrap().chars().count() <= 81);
         assert_eq!(session["completed_requests"], 1);
         assert_eq!(session["primary"]["input_tokens"], 100);
         assert_eq!(session["primary"]["cached_tokens"], 40);
@@ -840,6 +847,22 @@ async fn start_proxy_options_env(
                     "--classifier-url".to_owned(),
                     format!("http://{upstream}/review"),
                 ]
+            })
+            // These fixtures exercise synchronous review with a five-request horizon.
+            .args(
+                if extra
+                    .iter()
+                    .any(|arg| arg.starts_with("--background-reviews"))
+                {
+                    vec![]
+                } else {
+                    vec!["--background-reviews=false"]
+                },
+            )
+            .args(if extra.contains(&"--payoff-requests") {
+                vec![]
+            } else {
+                vec!["--payoff-requests", "5"]
             })
             .args(extra)
             .env_remove("OPENAI_API_KEY")
@@ -1228,7 +1251,14 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     let carry = estimate["carry_cost"].as_f64().unwrap();
     let traditional = estimate["traditional_cost"].as_f64().unwrap();
     assert!((estimate["savings"].as_f64().unwrap() - (traditional - carry)).abs() < 1e-12);
-    assert!(!cost_stats.to_string().contains("preserve requirement"));
+    assert_eq!(cost_stats["sessions"][0]["title"], "preserve requirement");
+    let mut diagnostics = cost_stats.clone();
+    diagnostics["sessions"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("title");
+    assert!(!diagnostics.to_string().contains("preserve requirement"));
+    assert!(!diagnostics.to_string().contains("both tools succeeded"));
     let checkpoint: serde_json::Value = client
         .post(format!("{url}/v1/responses/compact"))
         .header("x-carry-session", "fixture-session")
@@ -3071,7 +3101,7 @@ async fn client_turn_metadata_preserves_proxy_session_and_reviewer_affinity() {
     ]});
     for turn in ["turn-one", "turn-two"] {
         request["client_metadata"] = json!({"session_id":"session","thread_id":"thread","turn_id":turn,"root_turn_id":turn,
-            "x-codex-turn-metadata":json!({"session_id":"session","thread_id":"thread","turn_id":turn,"root_turn_id":turn,"turn_started_at_unix_ms":turn}).to_string()});
+            "x-codex-turn-metadata":json!({"session_id":"session","thread_id":"thread","turn_id":turn,"root_turn_id":turn,"turn_started_at_unix_ms":turn,"turn_trigger":turn,"source":turn,"client_type":turn}).to_string()});
         let response: serde_json::Value = reqwest::Client::new()
             .post(format!("{url}/v1/responses"))
             .json(&request)
@@ -3151,4 +3181,42 @@ async fn reviewer_transport_preserves_encrypted_reasoning_and_native_tool_pairs(
     assert!(input.contains(&result));
     let forwarded = fixture.requests.lock().await;
     assert_eq!(forwarded[0]["input"], request["input"]);
+}
+
+#[tokio::test]
+async fn unknown_primary_pricing_skips_reviews_that_cannot_produce_a_plan() {
+    let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
+    let state = tempfile::tempdir().unwrap();
+    let (_proxy, url) = start_proxy_options(
+        state.path(),
+        fixture.address,
+        "compact",
+        &["--review-replayed-history"],
+        "",
+    )
+    .await;
+    let request = json!({"model":"unpriced-model", "input":[
+        {"role":"user","content":"previous task"},
+        {"role":"assistant","content":"historical output ".repeat(2000)},
+        {"role":"user","content":"current request"}
+    ]});
+    reqwest::Client::new()
+        .post(format!("{url}/v1/responses"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.reviews.lock().await.len(),
+        0,
+        "unknown primary pricing cannot repay any reviewer spend"
+    );
+    assert_eq!(fixture.requests.lock().await[0]["input"], request["input"]);
+    let saved = checkpoint_states(state.path());
+    assert_eq!(saved[0]["primary"]["calls"], 1);
+    assert_eq!(saved[0]["primary"]["unavailable_cost_calls"], 1);
+    assert_eq!(saved[0]["compactions"], 0);
 }

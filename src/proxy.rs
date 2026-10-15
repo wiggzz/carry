@@ -50,14 +50,25 @@ pub enum ClassifierCachePolicy {
     OpenaiExplicit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Login {
+    Auto,
+    ApiKey,
+    Codex,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "carry proxy", about = "Opaque native Responses HTTP proxy")]
 pub struct ProxyCli {
-    /// Use Carry's saved ChatGPT/Codex subscription (including refresh).
+    /// Auto prefers a configured API key, then Carry's saved subscription.
+    /// API-key mode also supports credentials supplied by the client.
+    #[arg(long, value_enum, default_value = "auto")]
+    login: Login,
+    /// Use Carry's saved ChatGPT/Codex subscription (alias for --login codex).
     #[arg(long)]
     codex_login: bool,
     /// Credential directory; defaults to CARRY_HOME or ~/.carry.
-    #[arg(long, requires = "codex_login")]
+    #[arg(long)]
     codex_home: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:8787")]
     listen: SocketAddr,
@@ -70,9 +81,10 @@ pub struct ProxyCli {
     /// Full upstream Responses endpoint, not an API base URL.
     #[arg(long, default_value = "https://api.openai.com/v1/responses")]
     upstream_url: String,
-    #[arg(long, default_value = ".carry-proxy")]
+    /// Persistent sessions and lifetime stats; defaults to CARRY_HOME or ~/.carry.
+    #[arg(long, default_value_os_t = crate::auth::carry_home().unwrap_or_else(|_| PathBuf::from(".carry-proxy")))]
     state_dir: PathBuf,
-    #[arg(long, value_enum, default_value = "off")]
+    #[arg(long, value_enum, default_value = "compact")]
     mode: Mode,
     #[arg(long, default_value = "gpt-6-luna")]
     classifier_model: String,
@@ -110,7 +122,7 @@ pub struct ProxyCli {
     #[arg(long, default_value_t = 16384)]
     bootstrap_min_input_bytes: usize,
     /// Run ordinary reviews in the background; bootstrap remains synchronous.
-    #[arg(long)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     background_reviews: bool,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=100))]
     review_every_requests: u64,
@@ -182,6 +194,34 @@ fn private_file(path: &Path, append: bool) -> std::io::Result<File> {
 }
 
 pub async fn serve(mut config: ProxyCli) -> Result<()> {
+    if config.codex_login && config.login == Login::ApiKey {
+        bail!("--codex-login conflicts with --login api-key");
+    }
+    let has_api_key = ["CARRY_PROXY_UPSTREAM_KEY", "OPENAI_API_KEY"]
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|key| !key.trim().is_empty()));
+    let auto_subscription = config.login == Login::Auto
+        && !has_api_key
+        && config.upstream_url == "https://api.openai.com/v1/responses";
+    if !config.codex_login && (config.login == Login::Codex || auto_subscription) {
+        let home = config
+            .codex_home
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(crate::auth::carry_home)?;
+        match crate::auth::load_auth(&home).await {
+            Ok(Some(_)) => {
+                config.codex_login = true;
+                config.codex_home = Some(home);
+            }
+            Ok(None) if config.login == Login::Auto => {}
+            Err(error) if config.login == Login::Auto => {
+                eprintln!("Saved subscription unavailable: {error}; using API-key authentication");
+            }
+            Ok(None) => bail!("run `carry login` before using --login codex"),
+            Err(error) => return Err(error),
+        }
+    }
     if config.codex_login {
         if config.upstream_url == "https://api.openai.com/v1/responses" {
             config.upstream_url = format!("{}/responses", crate::auth::codex_responses_url());
@@ -255,10 +295,20 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
     let service = Arc::new(Service {
         upstream_key: std::env::var("CARRY_PROXY_UPSTREAM_KEY")
             .ok()
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok()),
+            .filter(|key| !key.trim().is_empty())
+            .or_else(|| {
+                std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .filter(|key| !key.trim().is_empty())
+            }),
         classifier_key: std::env::var("CARRY_PROXY_CLASSIFIER_KEY")
             .ok()
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok()),
+            .filter(|key| !key.trim().is_empty())
+            .or_else(|| {
+                std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .filter(|key| !key.trim().is_empty())
+            }),
         auth_token,
         client: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -580,6 +630,49 @@ async fn dashboard_stats(
             continue;
         };
         let retained = session.history.iter().filter(|item| !item.removed).count();
+        let groups = session.groups();
+        let removable = groups
+            .iter()
+            .filter(|g| session.drop_authorized(g))
+            .map(|g| g.members.len())
+            .sum::<usize>();
+        let protected = groups
+            .iter()
+            .filter(|g| {
+                g.pinned
+                    || g.members.iter().any(|id| {
+                        session
+                            .opinions
+                            .get(id)
+                            .is_some_and(|opinion| opinion == "keep")
+                    })
+            })
+            .map(|g| g.members.len())
+            .sum::<usize>();
+        let last_plan = &session.last_plan;
+        let best_candidate = last_plan["candidates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|candidate| candidate.get("joint"))
+            .filter(|joint| joint["savings"].as_f64().is_some())
+            .max_by(|a, b| {
+                a["savings"]
+                    .as_f64()
+                    .partial_cmp(&b["savings"].as_f64())
+                    .unwrap()
+            });
+        let planner = json!({
+            "selected": last_plan["selected"].as_bool().unwrap_or(false),
+            "mode": last_plan["mode"].as_str().unwrap_or("unknown"),
+            "reason": last_plan["reason"].as_str(),
+            "payoff_requests": last_plan["payoff_requests"].as_u64(),
+            "min_payback_percent": last_plan["min_payback_percent"].as_u64(),
+            "candidate": best_candidate.map(|joint| json!({
+                "keep": joint["keep"].as_f64(), "compact": joint["compact"].as_f64(),
+                "savings": joint["savings"].as_f64(),
+            })),
+        });
         let mut estimate = session
             .cost_trajectory
             .as_ref()
@@ -589,8 +682,23 @@ async fn dashboard_stats(
             estimate.priced = false;
             estimate.savings_percent = None;
         }
+        let updated_at = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+            .map(|age| age.as_secs());
+        let processing = service
+            .locks
+            .lock()
+            .await
+            .get(id)
+            .and_then(Weak::upgrade)
+            .is_some_and(|lock| lock.try_lock().is_err());
         sessions.push(json!({
-            "id": id, "primary": session.primary, "shadow": session.shadow,
+            "updated_at": updated_at, "processing": processing,
+            "last_failure": session.last_failure, "planner": planner,
+            "id": id, "title": session.title(), "primary": session.primary, "shadow": session.shadow,
             "cost_estimate": estimate,
             "background_review_pending": session.background_review_pending,
             "completed_requests": session.completed_requests,
@@ -598,12 +706,20 @@ async fn dashboard_stats(
             "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews, "partial_reviews": session.partial_reviews,
             "failed_primaries": session.failed_primaries,
             "context": {"retained_items": retained,
+                "removable_items": removable, "protected_items": protected,
+                "unreviewed_items": retained.saturating_sub(removable + protected),
+                "memories": session.memories.len(),
                 "removed_items": session.history.len() - retained,
                 "retained_input_bytes": serde_json::to_vec(&session.render_primary()).unwrap().len(),
                 "shadow_records": session.active_shadow.len()}
         }));
     }
-    sessions.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    sessions.sort_by(|a, b| {
+        b["updated_at"]
+            .as_u64()
+            .cmp(&a["updated_at"].as_u64())
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+    });
     let mut response = axum::Json(json!({
         "mode": format!("{:?}", service.config.mode).to_lowercase(),
         "auth": if service.config.codex_login { "codex" } else { "api-key" },
@@ -888,7 +1004,11 @@ async fn forward(
             .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "trace write failed"))?;
         let mut valid = false;
         session.review_context = cache_base(&body);
-        if !native && service.config.mode != Mode::Off && standard(&body) {
+        let primary_priced = Rates::for_model(body["model"].as_str().unwrap_or(""), 0.0).is_some();
+        if !primary_priced {
+            session.last_plan = json!({"selected": false, "reason": "unsupported_model_or_tier"});
+        }
+        if !native && service.config.mode != Mode::Off && standard(&body) && primary_priced {
             // Keep bootstrap review pending across failed primaries/restarts,
             // including imported rebases with prior completed-request counters.
             let bootstrap = session.bootstrap_review_pending;
@@ -1038,6 +1158,8 @@ async fn forward(
         }
         Err(_) => {
             if let Some(mut commit) = commit {
+                commit.reviewed.last_failure =
+                    Some(json!({"at": now(), "reason": "upstream transport or timeout"}));
                 commit.reviewed.failed_primaries += 1;
                 if let Some(trajectory) = &mut commit.reviewed.cost_trajectory {
                     trajectory.failed_call();
@@ -2265,31 +2387,32 @@ async fn bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8
     Ok(bytes)
 }
 
-/// Keep client/thread isolation without turning each telemetry turn into a
-/// new retention lineage. Client metadata is forwarded unchanged to primary.
+/// Identity is a small set of stable client IDs. Telemetry is forwarded upstream
+/// unchanged, but cannot fork Carry state or reviewer affinity between turns.
 fn stable_client_scope(body: &Value) -> Value {
-    let mut metadata = body["client_metadata"].clone();
-    if let Some(object) = metadata.as_object_mut() {
-        for key in ["turn_id", "root_turn_id", "turn_started_at_unix_ms"] {
-            object.remove(key);
-        }
-        if let Some(raw) = object.get("x-codex-turn-metadata").and_then(Value::as_str)
-            && let Ok(mut nested) = serde_json::from_str::<Value>(raw)
-            && let Some(fields) = nested.as_object_mut()
+    let metadata = &body["client_metadata"];
+    let nested = metadata["x-codex-turn-metadata"]
+        .as_str()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or(Value::Null);
+    let mut scope = serde_json::Map::new();
+    for key in [
+        "session_id",
+        "thread_id",
+        "conversation_id",
+        "agent_id",
+        "agent_name",
+        "branch_id",
+        "workspace_id",
+        "tenant_id",
+    ] {
+        if let Some(value) = metadata.get(key).or_else(|| nested.get(key))
+            && value.as_str().is_some_and(|id| !id.is_empty())
         {
-            for key in [
-                "turn_id",
-                "root_turn_id",
-                "turn_started_at_unix_ms",
-                "context_window_id",
-                "workspaces",
-            ] {
-                fields.remove(key);
-            }
-            object.insert("x-codex-turn-metadata".into(), nested);
+            scope.insert(key.into(), value.clone());
         }
     }
-    metadata
+    Value::Object(scope)
 }
 
 fn cache_base(body: &Value) -> Value {
@@ -2558,6 +2681,7 @@ async fn relay(
         let mut observer = Observer::default();
         let mut json_observer = JsonObserver::default();
         let mut complete_transport = false;
+        let mut stream_end = "upstream stream ended before completion";
         loop {
             tokio::select! {
                 _ = async {
@@ -2566,7 +2690,7 @@ async fn relay(
                     } else {
                         sender.closed().await;
                     }
-                } => break,
+                } => { stream_end = "client disconnected before completion"; break; },
                 chunk = upstream.chunk() => match chunk {
                     Ok(Some(chunk)) => {
                         if is_sse { observer.feed(&chunk); }
@@ -2574,10 +2698,11 @@ async fn relay(
                         if let Some(commit) = &commit {
                             let _ = trace(&commit.service, &commit.id, "primary_response_chunk", &json!({"bytes": chunk.as_ref()}));
                         }
-                        if converted.is_none() && sender.send(Ok(chunk)).await.is_err() { break; }
+                        if converted.is_none() && sender.send(Ok(chunk)).await.is_err() { stream_end = "client disconnected before completion"; break; }
                     }
                     Ok(None) => { complete_transport = true; break; }
                     Err(_) => {
+                        stream_end = "upstream stream error or timeout";
                         let _ = sender.send(Err(std::io::Error::other("upstream stream failed"))).await;
                         break;
                     }
@@ -2686,6 +2811,18 @@ async fn relay(
                         .await;
                 }
             } else {
+                let reason = if !status.is_success() {
+                    "upstream HTTP error"
+                } else if observed
+                    .as_ref()
+                    .is_some_and(|value| value["status"] == "failed")
+                {
+                    "upstream response failed"
+                } else {
+                    stream_end
+                };
+                commit.reviewed.last_failure = Some(json!({"at": now(), "reason": reason,
+                    "http_status": status.as_u16(), "complete_transport": complete_transport}));
                 commit.reviewed.failed_primaries += 1;
                 if let Some(trajectory) = &mut commit.reviewed.cost_trajectory {
                     trajectory.failed_call();
@@ -2705,7 +2842,7 @@ async fn relay(
                     &commit.service,
                     &commit.id,
                     "primary_failed",
-                    &json!({"http_status": status.as_u16(), "complete_transport": complete_transport,
+                    &json!({"reason": reason, "http_status": status.as_u16(), "complete_transport": complete_transport,
                         "error": crate::proxy_sse::safe_error(&observed.as_ref().map(|v| v["error"].clone()).unwrap_or(Value::Null))}),
                 );
             }
@@ -2742,6 +2879,30 @@ async fn relay(
 mod tests {
     use super::*;
     use carry::core::prefix_compatible;
+
+    #[test]
+    fn proxy_login_and_review_defaults_can_be_overridden() {
+        let config = ProxyCli::try_parse_from([
+            "carry proxy",
+            "--login",
+            "api-key",
+            "--background-reviews=false",
+            "--mode",
+            "off",
+        ])
+        .expect("explicit authentication and synchronous review must be selectable");
+        assert!(!config.background_reviews);
+        assert_eq!(config.mode, Mode::Off);
+    }
+
+    #[test]
+    fn proxy_defaults_compact_in_background_with_five_request_payoff() {
+        let config = ProxyCli::try_parse_from(["carry proxy"]).unwrap();
+        assert_eq!(config.state_dir, crate::auth::carry_home().unwrap());
+        assert_eq!(config.mode, Mode::Compact);
+        assert!(config.background_reviews);
+        assert_eq!(config.payoff_requests, 5);
+    }
 
     #[test]
     fn primary_wire_adapter_keeps_default_instructions_and_append_prefix_stable() {
@@ -2966,6 +3127,9 @@ mod tests {
             "carry proxy",
             "--classifier-cache-policy",
             "openai-explicit",
+            "--payoff-requests",
+            "5",
+            "--background-reviews=false",
         ])
         .unwrap()
     }
@@ -3415,6 +3579,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let service = Arc::new(checkpoint_service(directory.path()));
         let mut value = serde_json::to_value(Session::default()).unwrap();
+        value["history"] = json!([
+            {"id":0,"value":{"role":"user","content":"# AGENTS.md instructions for /workspace\n<INSTRUCTIONS>setup</INSTRUCTIONS>"},"cohort":0,"exposed":true,"removed":true},
+            {"id":1,"value":{"role":"user","content":[{"type":"input_text","text":"First task\nwith details"}]},"cohort":1,"exposed":true,"removed":true}
+        ]);
         value["cost_trajectory"] =
             serde_json::to_value(crate::proxy_savings::Trajectory::default()).unwrap();
         value["cost_trajectory"]["previous"] = json!({
@@ -3446,6 +3614,11 @@ mod tests {
             stats["sessions"][0]["cost_estimate"]["priced"], false,
             "no observations are not zero-cost evidence"
         );
+        assert_eq!(stats["sessions"][0]["title"], "First task with details");
+        assert_eq!(stats["sessions"][0]["context"]["removable_items"], 0);
+        assert_eq!(stats["sessions"][0]["context"]["protected_items"], 0);
+        assert_eq!(stats["sessions"][0]["context"]["memories"], 0);
+        assert!(stats["sessions"][0]["planner"].is_object());
         assert!(!String::from_utf8_lossy(&bytes).contains("must not leak"));
     }
 
@@ -4358,6 +4531,8 @@ mod tests {
             "compact",
             "--classifier-model",
             "gpt-6-sol",
+            "--payoff-requests",
+            "5",
             "--min-payback-percent",
             "0",
         ])

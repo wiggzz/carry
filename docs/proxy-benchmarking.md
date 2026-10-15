@@ -247,12 +247,12 @@ reviewer pricing also prevents dispatch. Restarting does not replenish this
 allowance. These are modeled estimates, **not a hard provider billing limit**;
 subscription estimates are API equivalents, and the subscription adapter does
 not enforce the API output cap. Limits leave unreviewed history intact and never
-block the primary request. By default reviews are synchronous; lower
+block the primary request. Ordinary reviews default to background execution; lower
 `--review-max-calls` to bound paid round trips per primary while backlog windows
 resume later. This call limit does not replenish or extend bootstrap spend.
 
-Use `--background-reviews` to remove ordinary reviewer round-trip latency from
-primary requests. Bootstrap remains synchronous to review imported history before
+Background reviews remove ordinary reviewer round-trip latency from
+primary requests; use `--background-reviews=false` for synchronous reviews. Bootstrap remains synchronous to review imported history before
 its first primary use. Ordinary reviews use an immutable snapshot, with at most
 one review in flight per session; a bootstrap requested during old in-flight work
 is deferred until a later request. The primary session lock is not held during
@@ -433,7 +433,7 @@ python3 scripts/proxy_trial.py \
   --prompt 'Inspect this disposable repository and summarize one useful improvement.'
 ```
 
-Choose a new trial directory for every arm. It must not exist and must be outside the workspace. For a transport control, use `--mode off` with a different fresh directory; omission of `--mode` also defaults to off. Do not reuse a modified workspace between compared arms.
+Choose a new trial directory for every arm. It must not exist and must be outside the workspace. For a transport control, use `--mode off` with a different fresh directory; omission of `--mode` defaults to compact. Do not reuse a modified workspace between compared arms.
 
 The launcher creates separate `HOME`, `CODEX_HOME` or `PI_CODING_AGENT_DIR`, a scoped gateway token, and a random session ID. Codex uses a custom Responses provider with `supports_websockets = false`; Pi uses `openai-responses`. Both send stable `x-carry-session`, `x-carry-tenant: local-trial`, and `x-carry-branch: main` headers for one conversation. Native compaction is not disabled or fed fictional usage. `proxy.log`, `client-events.jsonl`, `trial.json`, and private proxy state are retained under the trial directory. Protect these artifacts: they may contain your task contents.
 

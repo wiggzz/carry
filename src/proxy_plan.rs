@@ -491,6 +491,7 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         "reviewer_windows": keep_windows.len(),
         "added_tail_windows": keep_windows.iter().filter(|window| window.added_tail).count(),
         "payoff_requests": config.payoff_requests,
+        "min_payback_percent": config.min_payback_percent,
         "current_review_cost_is_sunk": true,
         "estimate_basis": "o200k_base_rendered_json_estimate_not_provider_tokens_or_overflow_evidence",
         "cache_basis": "exact_prefix_native_cached_fraction_not_guarantee",

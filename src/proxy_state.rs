@@ -66,6 +66,8 @@ pub(super) struct ReviewerCacheBoundary {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(super) struct Session {
     pub version: u32,
+    #[serde(default)]
+    pub title: Option<String>,
     pub next_id: u64,
     pub history: Vec<Item>,
     pub pending_output: Vec<Value>,
@@ -139,6 +141,8 @@ pub(super) struct Session {
     pub review_epoch: u64,
     #[serde(default)]
     pub background_review_pending: bool,
+    #[serde(default)]
+    pub last_failure: Option<Value>,
     pub failed_primaries: u64,
     pub compactions: u64,
     pub native_compactions: u64,
@@ -177,11 +181,56 @@ fn identity(value: &Value) -> Value {
 }
 
 impl Session {
+    /// Only a bounded first-user excerpt is exposed by the dashboard.
+    pub fn title(&self) -> Option<String> {
+        if let Some(title) = &self.title {
+            return Some(title.clone());
+        }
+        let user = self
+            .history
+            .iter()
+            .filter(|item| item.value["role"] == "user")
+            .find(|item| {
+                let content = &item.value["content"];
+                let first = content.as_str().or_else(|| {
+                    content
+                        .as_array()
+                        .and_then(|parts| parts.iter().find_map(|part| part["text"].as_str()))
+                });
+                // Client-injected workspace setup is not the user's task title.
+                first.is_none_or(|text| {
+                    !(text.starts_with("# AGENTS.md instructions for ")
+                        || text.starts_with("<environment_context>"))
+                })
+            })?;
+        let content = &user.value["content"];
+        let text = if let Some(text) = content.as_str() {
+            text.to_owned()
+        } else {
+            content
+                .as_array()?
+                .iter()
+                .filter(|part| part["type"] == "input_text" || part["type"] == "text")
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            return None;
+        }
+        let mut title = normalized.chars().take(80).collect::<String>();
+        if normalized.chars().count() > 80 {
+            title.push('…');
+        }
+        Some(title)
+    }
     pub fn ingest(&mut self, input: &[Value]) -> Result<()> {
         self.ingest_with_rebase(input, false)
     }
 
     pub fn ingest_with_rebase(&mut self, input: &[Value], reset_divergence: bool) -> Result<()> {
+        let original_title = self.title();
         if self.version != 0 && self.version != 1 {
             bail!("unsupported proxy checkpoint version");
         }
@@ -263,6 +312,7 @@ impl Session {
         if pending_echoed && self.last_response_id.is_none() {
             self.pending_output.clear();
         }
+        self.title = original_title.or_else(|| self.title());
         Ok(())
     }
 

@@ -127,6 +127,10 @@ class Proxy:
                 "--bootstrap-min-input-bytes", "8388608",
                 "--request-timeout-secs", "5", "--classifier-timeout-secs", "10",
                 *extra]
+        if not any(arg.startswith("--background-reviews") for arg in args):
+            args += ["--background-reviews=false"]
+        if "--payoff-requests" not in args:
+            args += ["--payoff-requests", "5"]
         self.process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if not select.select([self.process.stdout], [], [], 5)[0]:
