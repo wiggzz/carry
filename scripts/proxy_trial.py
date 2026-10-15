@@ -112,6 +112,8 @@ def main():
         default='auto', help='Reviewer-only stable cache writes; explicit attests a trusted OpenAI gateway')
     parser.add_argument('--payoff-requests', default='1')
     parser.add_argument('--min-payback-percent', default='25')
+    parser.add_argument('--synchronous-reviews', action='store_true',
+                        help='Run ordinary reviews synchronously for reproducible local trials')
     parser.add_argument('--timeout', type=int, default=300)
     parser.add_argument('--prompt', required=True)
     args = parser.parse_args()
@@ -131,11 +133,14 @@ def main():
     token, session = secrets.token_urlsafe(32), uuid.uuid4().hex
     env = os.environ.copy()
     env['CARRY_PROXY_AUTH_TOKEN'] = token
-    command = [args.carry_binary,'proxy','--listen',args.listen,'--upstream-url',args.upstream_url,
+    command = [args.carry_binary,'proxy','--login','api-key',
+        '--listen',args.listen,'--upstream-url',args.upstream_url,
         '--classifier-url',args.classifier_url,'--state-dir',str(root / 'state'), '--mode',args.mode,
         '--classifier-model',args.classifier_model,'--classifier-reasoning-effort',args.classifier_effort,
         '--classifier-cache-policy',args.classifier_cache_policy,
         '--payoff-requests',args.payoff_requests,'--min-payback-percent',args.min_payback_percent]
+    if args.synchronous_reviews:
+        command.append('--background-reviews=false')
     proxy = None
     try:
         with (root / 'proxy.log').open('w') as log:
@@ -189,6 +194,7 @@ def main():
                 'codex_native_compaction':args.codex_native_compaction,
                 'classifier_model':args.classifier_model,'classifier_effort':args.classifier_effort,
                 'classifier_cache_policy':args.classifier_cache_policy,
+                'background_reviews':not args.synchronous_reviews,
                 'payoff_requests':args.payoff_requests,'min_payback_percent':args.min_payback_percent}, indent=2)+'\n')
             with (root / 'client-events.jsonl').open('w') as output:
                 if args.pi_checkpoint_fixture:

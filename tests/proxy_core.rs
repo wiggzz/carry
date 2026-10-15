@@ -238,3 +238,23 @@ fn unsupported_billed_input_categories_make_native_cost_unavailable() {
     assert_eq!(ledger.unavailable_cost_calls, 1);
     assert_eq!(ledger.cost_usd, 0.0);
 }
+
+#[test]
+fn unknown_model_receipts_explain_unpriced_calls_without_guessing_rates() {
+    let mut ledger = carry::core::UsageLedger::default();
+    ledger.observe(
+        "codex-auto-review",
+        &serde_json::json!({
+            "input_tokens": 100, "output_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 0}
+        }),
+        true,
+    );
+    assert_eq!(ledger.unavailable_cost_calls, 1);
+    assert_eq!(ledger.cost_usd, 0.0);
+    let value = serde_json::to_value(&ledger).unwrap();
+    assert_eq!(
+        value["unpriced_models"],
+        serde_json::json!(["codex-auto-review"])
+    );
+}

@@ -164,19 +164,40 @@ printf 'explain the failing tests' | carry --print
 
 ### Use Carry as a standalone context proxy
 
-Run `carry proxy --codex-login --mode compact --review-replayed-history`, then
+Run `carry proxy`, then
 connect a separate OpenAI Responses client to `http://127.0.0.1:8787/v1`.
 Full-history clients can omit `x-carry-session` and reuse one active matching
 history prefix; explicit session IDs isolate conversations and support validated
-response-ID continuations. Long unseen histories bootstrap in bounded,
-restart-safe reviewer chunks with configurable call and estimated-spend limits.
-Add `--background-reviews` to keep ordinary reviewer round trips off the primary
-request path; bootstrap remains synchronous. Invalid reviewer items are isolated,
+response-ID continuations. The reviewer retains the same sources and memories as the primary, appending new
+material and review updates between compactions. Oversized imports are admitted
+in bounded chunks, pruning approved sources as needed, with restart-safe progress
+and configurable call and estimated-spend limits. Before each primary request,
+Carry checks both context budgets, including incoming material, estimation margin,
+and output reserves; required compaction takes precedence over economics.
+Defaults are `--mode compact --login auto --background-reviews --payoff-requests 5`.
+Auto authentication prefers `CARRY_PROXY_UPSTREAM_KEY` or `OPENAI_API_KEY`, then a
+valid saved Carry subscription. Use `--login codex` or `--login api-key` to choose
+explicitly. Ordinary reviews run in the background; use `--background-reviews=false`
+for synchronous reviews. Bootstrap remains synchronous.
+`--review-replayed-history` explicitly declares that history before the latest user
+message has already been consumed, allowing review before the first request; large
+unseen histories bootstrap automatically without this flag. Invalid reviewer items are isolated,
 and rejection feedback in the next review lets the model self-correct.
+Carry skips paid reviews when the primary model has no known rate, since its
+economic planner cannot select a compaction for that model.
 Interactive startup opens the local, token-free stats dashboard. Reusing the
-state directory preserves committed state across restarts. See the
+state directory (by default `$CARRY_HOME/proxy` or `~/.carry/proxy`) preserves committed state
+and cumulative dashboard totals across restarts and working directories. See the
 [standalone proxy setup](docs/proxy-benchmarking.md#standalone-proxy)
 for API-key authentication, client configuration, and replay-import boundaries.
+Session identity uses stable client/thread/agent identifiers; per-turn telemetry
+is forwarded unchanged without splitting Carry state or reviewer cache affinity.
+The dashboard shows short first-user-message titles and orders sessions by their
+latest checkpoint update. Session titles are the only message excerpts returned
+by dashboard stats; memory contents remain private. Stats are gateway-wide across
+the proxy's state directory, not scoped to the caller's session or tenant. Titles
+can contain sensitive task text; protect remote stats access with the proxy token
+and authenticate any reverse proxy that presents itself as a loopback peer.
 
 ### Terminal input and formatting
 

@@ -83,12 +83,17 @@ pub struct UsageLedger {
     pub output_tokens: u64,
     pub cached_tokens: u64,
     pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub unpriced_models: std::collections::BTreeSet<String>,
     pub unavailable_cost_calls: u64,
     pub cost_usd: f64,
 }
 
 impl UsageLedger {
     pub fn observe(&mut self, model: &str, usage: &Value, standard: bool) {
+        if Rates::for_model(model, 0.0).is_none() {
+            self.unpriced_models.insert(model.to_owned());
+        }
         let mut complete = self.calls.checked_add(1).is_some();
         self.calls = self.calls.saturating_add(1);
         let input = usage["input_tokens"].as_u64();

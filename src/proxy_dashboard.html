@@ -5,25 +5,32 @@
 <title>Carry Proxy</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#10151d;color:#e4eaf3}body{max-width:1200px;margin:auto;padding:24px}h1{margin-bottom:4px}p{color:#9eabc0}button,input{padding:10px;border:1px solid #39465a;border-radius:6px;background:#182231;color:inherit}button{cursor:pointer}input{width:min(65vw,480px)}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:24px 0}.card{background:#1a2432;border:1px solid #2c3b50;border-radius:8px;padding:16px}.value{font-size:26px;font-weight:600;margin-top:6px}.label{color:#aebbd0;font-size:13px}.scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;white-space:nowrap;font-size:14px}th,td{text-align:left;padding:12px;border-bottom:1px solid #2b3748}th{color:#acbdd4}#status{padding:10px 0;color:#b1c4dc}.warning{color:#edc887}summary{cursor:pointer}a{color:#a1caff}small{color:#9eabc0}
+
+.session-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:16px;margin:20px 0}.session{background:#17212e;border:1px solid #2c3b50;border-radius:12px;padding:20px}.session h3{margin:0 0 8px;font-size:16px}.session p{margin:8px 0;line-height:1.5}.context-bar{display:flex;height:12px;border-radius:6px;overflow:hidden;background:#39465a;margin:14px 0}.removable{background:#65c9a3}.protected{background:#79a9f5}.unreviewed{background:#6d788a}.legend{font-size:13px}.legend b{font-weight:500}.planner{border-top:1px solid #334154;margin-top:16px;padding-top:12px}.planner progress{width:100%;height:9px;accent-color:#65c9a3}.diagnostics{margin-top:14px;color:#edc887;font-size:13px}.scope{font-size:13px}
 </style>
 </head>
 <body>
 <h1>Carry Proxy</h1><p id="config">Live usage &amp; retained-context stats</p>
 <form id="login" hidden><input id="token" type="password" placeholder="Scoped proxy token (not your provider credential)" autocomplete="off" aria-label="Proxy token"> <button>Connect</button></form>
 <div id="status" role="status">Connecting…</div>
-<div class="cards" id="cards"></div>
-<h2>Usage</h2><div class="scroll"><table><thead><tr><th>Lane</th><th>Calls</th><th>Input tokens</th><th>Cached reads</th><th>Read share</th><th>Cache writes</th><th>Output tokens</th><th>API-equivalent cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
-<p><small>Costs are standard API-rate estimates, not subscription charges or an invoice. Unknown/unpriced calls make the total unavailable; the observed priced subtotal is shown separately. Counters update after observations/checkpoints, not token by token.</small></p>
-<h2>Cost comparison scenario</h2><p id="estimate-coverage"></p><p id="assumptions"></p>
-<p><small>A best-effort frozen-trajectory comparison, not billed or measured savings. Both branches use local o200k_base token estimates for rendered JSON input and the same recorded output tokens. Carry includes paid reviewer calls. Conventional summaries, cache reuse and their effects on future behavior are hypothetical. Missing usage, failed/unmodeled calls or older untracked history make savings unavailable.</small></p>
-<h2>Sessions</h2><div class="scroll"><table><thead><tr><th>Session hash</th><th>Carry scenario</th><th>Traditional scenario</th><th>Estimated saving</th><th>Simulated summaries</th><th>Completed</th><th>Rewrites</th><th>Native compactions</th><th>Rebases</th><th>Retained items</th><th>Removed items</th><th>Retained input bytes</th><th>Shadow records</th><th>Failed primaries</th><th>Invalid reviews</th><th>Partially accepted reviews</th></tr></thead><tbody id="sessions"></tbody></table></div>
-<p><small>Scope: this proxy's state directory only. Retained bytes are serialized input bytes, not token counts or measured savings. Conversation text and credentials are never returned by this stats endpoint.</small></p>
+<div class="cards" id="cards"></div><p id="estimate-coverage"></p>
+<h2>Sessions</h2><p>Recent activity across this proxy’s saved sessions. “Recent” means updated in the last five minutes.</p>
+<div id="sessions" class="session-grid"></div>
+
+<details><summary>Costs, coverage &amp; diagnostics</summary>
+<div class="cards" id="cost-cards"></div>
+<p id="assumptions"></p>
+<p><small>Savings compare the same recorded trajectory with a simulated conventional compaction policy, including reviewer costs. They are estimates, not measured savings or subscription charges. Incomplete sessions are excluded from savings; the priced cost subtotal includes all available receipts.</small></p>
+<div class="scroll"><table><thead><tr><th>Lane</th><th>Calls</th><th>Input tokens</th><th>Cached reads</th><th>Read share</th><th>Cache writes</th><th>Output tokens</th><th>API-equivalent cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
+</details>
+<p><small>Scope: this proxy's state directory only. Retained bytes are serialized input bytes, not token counts or measured savings. Session names show up to 80 characters from the first user message. Full messages, memory contents and credentials stay private.</small></p>
 <details><summary>Inspect stats JSON</summary><pre id="raw"></pre></details>
 <script>
 'use strict';
 let token = new URLSearchParams(location.hash.slice(1)).get('token') || '';
 if(location.hash) history.replaceState(null,'',location.pathname + location.search);
 let busy=false;
+const expandedDiagnostics=new Set();
 const $=id=>document.getElementById(id);
 const fmt=n=>Number(n).toLocaleString();
 const sum=(xs,key)=>xs.reduce((a,x)=>a+(Number(x?.[key])||0),0);
@@ -52,24 +59,77 @@ async function refresh(){
   const savingText=money(saving)+(traditionalScenario>0?' ('+(100*saving/traditionalScenario).toFixed(1)+'%)':'');
   const scenario=data.cost_scenario;
   $('assumptions').textContent=scenario?'Traditional scenario: '+fmt(scenario.context_window)+'-token assumed window, '+fmt(scenario.reserve)+' reserve; after each completed non-tool response crossing the threshold, keep '+fmt(scenario.keep_recent)+' recent tokens plus a '+fmt(scenario.summary)+'-token summary. Cache assumes same route/key, append-compatible prefixes and 30-minute expiry; reviewer inputs priced uncached.':'';
+  const recent=sessions.filter(s=>s.updated_at && Date.now()/1000-s.updated_at<300).length;
   $('cards').replaceChildren(...[
-   ['Sessions',fmt(sessions.length)],['Completed requests',fmt(sum(sessions,'completed_requests'))],
-   ['Proxy rewrites',fmt(sum(sessions,'compactions'))],['Failed primaries',fmt(sum(sessions,'failed_primaries'))],
-   ['Invalid reviews',fmt(sum(sessions,'invalid_reviews'))],['Partially accepted reviews',fmt(sum(sessions,'partial_reviews'))],['API-equivalent total',unavailable?'Unavailable':money(subtotal)],
+   ['Estimated savings · all time',hasEstimates?savingText:'Not enough data'],
+   ['Recently active sessions',fmt(recent)],
+   ['Completed requests',fmt(sum(sessions,'completed_requests'))]
+  ].map(([label,value])=>card(label,value)));
+  $('cost-cards').replaceChildren(...[
+   ['API-equivalent total',unavailable?'Incomplete':money(subtotal)],
    ['Observed priced subtotal',money(subtotal)],
    ['Carry scenario',hasEstimates?money(carryScenario):'No eligible sessions'],
-   ['Traditional scenario',hasEstimates?money(traditionalScenario):'No eligible sessions'],
-   ['Estimated scenario saving',hasEstimates?savingText:'No eligible sessions']
+   ['Traditional scenario',hasEstimates?money(traditionalScenario):'No eligible sessions']
   ].map(([label,value])=>card(label,value)));
   $('usage').replaceChildren(...[['Primary',primary],['Reviewer',shadow]].map(([name,ledgers])=>{
    const input=sum(ledgers,'input_tokens'),cached=sum(ledgers,'cached_tokens'),missing=sum(ledgers,'unavailable_cost_calls');
    return row([name,fmt(sum(ledgers,'calls')),fmt(input),fmt(cached),input?(100*cached/input).toFixed(1)+'%':'—',fmt(sum(ledgers,'cache_write_tokens')),fmt(sum(ledgers,'output_tokens')),missing?'Unavailable (subtotal '+money(sum(ledgers,'cost_usd'))+')':money(sum(ledgers,'cost_usd')),fmt(missing)]);
   }));
-  $('sessions').replaceChildren(...sessions.map(s=>{
+  const sorted=[...sessions].sort((a,b)=>(b.updated_at||0)-(a.updated_at||0));
+  const rendered=sorted.map(s=>{
    const e=s.cost_estimate;
-   const savings=e?.priced?money(e.savings)+(e.savings_percent!==null?' ('+e.savings_percent.toFixed(1)+'%)':''):'Excluded';
-   return row([s.id.slice(0,12),e?.priced?money(e.carry_cost):'—',e?.priced?money(e.traditional_cost):'—',savings,e?.priced?e.traditional_compactions:'—',s.completed_requests,s.compactions,s.native_compactions,s.history_rebases,s.context.retained_items,s.context.removed_items,fmt(s.context.retained_input_bytes),s.context.shadow_records,s.failed_primaries,s.invalid_reviews,s.partial_reviews??0]);
-  }));
+   const savings=e?.priced?money(e.savings)+(e.savings_percent!==null?' ('+e.savings_percent.toFixed(1)+'%)':''):'Incomplete';
+   const issues=[];
+   const unknown=[...new Set([...(s.primary.unpriced_models||[]),...(s.shadow.unpriced_models||[])])];
+   if(unknown.length)issues.push('No rate: '+unknown.join(', '));
+   if(!e?.priced){
+    const coverage=e?.coverage||{};
+    if(coverage.failed_calls)issues.push('Savings exclude this session: interrupted or failed call');
+    else if(coverage.unknown_cache_requests)issues.push('Savings exclude this session: unknown model or cache behavior');
+    else if(coverage.missing_usage)issues.push('Savings exclude this session: missing usage');
+    else if(coverage.prior_untracked_calls)issues.push('Savings exclude this session: earlier calls were not tracked');
+    else if(s.background_review_pending)issues.push('Savings pending reviewer completion');
+    else issues.push('Savings estimate incomplete');
+   }
+   const missing=(s.primary.unavailable_cost_calls||0)+(s.shadow.unavailable_cost_calls||0);
+   if(missing)issues.push(fmt(missing)+' unpriced calls');
+   if(s.failed_primaries)issues.push(fmt(s.failed_primaries)+' incomplete requests'+(s.last_failure?' · '+s.last_failure.reason:' (cancellation or failure; older details unavailable)'));
+   if(s.invalid_reviews)issues.push(fmt(s.invalid_reviews)+' invalid reviews');
+   if(s.partial_reviews)issues.push(fmt(s.partial_reviews)+' partial reviews');
+   const activity=s.processing?'Processing request':s.background_review_pending?'Reviewing':s.updated_at?(Date.now()/1000-s.updated_at<300?'Recent · ':'Idle · ')+new Date(s.updated_at*1000).toLocaleTimeString():'No recent activity';
+   const el=document.createElement('article');el.className='session';
+   const heading=document.createElement('h3');heading.textContent=s.title||'Session '+s.id.slice(0,12);heading.title=s.id;
+   const status=document.createElement('p');status.textContent=activity;
+   const requests=document.createElement('p');requests.textContent=fmt(s.completed_requests||0)+' completed requests · '+fmt(s.compactions||0)+' rewrites · '+fmt(s.reviewer_compactions||0)+' reviewer cleanups';
+   const saved=document.createElement('p');saved.textContent='Estimated savings: '+savings;
+   el.append(heading,status,requests,saved);
+   const c=s.context||{},counts=[c.removable_items||0,c.protected_items||0,c.unreviewed_items||0];
+   const total=counts.reduce((a,b)=>a+b,0),bar=document.createElement('div');bar.className='context-bar';
+   ['removable','protected','unreviewed'].forEach((name,i)=>{const part=document.createElement('span');part.className=name;part.style.width=(total?100*counts[i]/total:0)+'%';part.title=fmt(counts[i])+' '+name+' items';bar.append(part)});
+   const legend=document.createElement('p');legend.className='legend';legend.textContent=fmt(counts[0])+' removable · '+fmt(counts[1])+' protected · '+fmt(counts[2])+' unreviewed · '+fmt(c.memories||0)+' memories';
+   el.append(bar,legend);
+   const p=s.planner||{},section=document.createElement('div');section.className='planner';
+   const decision=document.createElement('p');
+   decision.textContent=p.forced&&p.selected?(p.mode==='audit'?'Would require compaction (audit)':'Compacted to fit the next requests'):p.selected?(p.mode==='audit'?'Last plan: would compact (audit)':'Last plan: compaction selected'):p.reason?({context_capacity_exceeded:'Protected context exceeds the available budget',unsupported_model_or_tier:'Compaction unavailable for this model or service tier'}[p.reason]||p.reason.replaceAll('_',' ')):p.candidate?'Waiting for compaction payoff':'Waiting for removable context';
+   section.append(decision);
+   for(const [name,required,limit] of [['Primary',p.primary_required_tokens,p.primary_context_tokens],['Reviewer',p.reviewer_required_tokens,p.reviewer_context_tokens]]){
+    if(required==null||!limit)continue;
+    const label=document.createElement('p');label.className='legend';label.textContent=name+' last capacity check: '+fmt(Math.ceil(required))+' / '+fmt(limit)+' tokens (margin and output reserve included)';
+    const capacity=document.createElement('progress');capacity.max=limit;capacity.value=Math.min(required,limit);capacity.setAttribute('aria-label',name+' context budget');section.append(label,capacity);
+   }
+
+   if(p.candidate){
+    const j=p.candidate,percent=j.keep>0?100*j.savings/j.keep:0,threshold=p.min_payback_percent,targetKnown=threshold!=null;
+    const meter=document.createElement('progress');meter.max=100;meter.value=Math.max(0,Math.min(100,threshold>0?percent/threshold*100:percent>0?100:0));meter.setAttribute('aria-label','Progress toward compaction payoff threshold');
+    const economics=document.createElement('p');economics.className='legend';economics.textContent='Projected payoff '+percent.toFixed(1)+'%'+(targetKnown?' / >'+threshold+'% required':' · threshold not recorded in older plan')+(p.payoff_requests?' over '+p.payoff_requests+' requests':'')+' · Keep '+money(j.keep)+' → Compact '+money(j.compact);
+    if(targetKnown)section.append(meter);
+    section.append(economics);
+   }
+   el.append(section);
+   if(issues.length){const detail=document.createElement('details');detail.className='diagnostics';detail.open=expandedDiagnostics.has(s.id);detail.addEventListener('toggle',()=>{if(detail.isConnected){if(detail.open)expandedDiagnostics.add(s.id);else expandedDiagnostics.delete(s.id)}});const summary=document.createElement('summary');summary.textContent=fmt(issues.length)+' diagnostics';const text=document.createElement('p');text.textContent=issues.join('; ');detail.append(summary,text);el.append(detail)}
+   return el;
+  });
+  $('sessions').replaceChildren(...rendered);
   $('raw').textContent=JSON.stringify(data,null,2);
  }catch(err){$('status').textContent=err.message+' Previous stats may be stale.';$('login').hidden=false}
  finally{busy=false}

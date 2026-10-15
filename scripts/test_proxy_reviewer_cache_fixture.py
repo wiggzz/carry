@@ -44,13 +44,100 @@ def send(provider, body):
 
 
 class SimulatorTests(unittest.TestCase):
+    def test_disabled_grader_rejects_missing_replay_and_unchanged_ledger(self):
+        def unmarked(body):
+            body = copy.deepcopy(body)
+            body.pop('prompt_cache_options')
+            body['input'] = canonical(body['input'])
+            return body
+        invalid = [unmarked(body_for(1, turn, [])) for turn in range(8)]
+        receipts = [{'synthetic_cached_tokens': 0} for _ in invalid]
+        with self.assertRaisesRegex(AssertionError, 'prior review input'):
+            grade(invalid, receipts, enabled=False, append_only=True)
+        bodies = [invalid[0]]
+        for turn in range(1, 8):
+            current = unmarked(body_for(1, turn, []))
+            current['input'] = copy.deepcopy(bodies[-1]['input']) + [
+                {'role': 'assistant', 'content': 'synthetic prior answer'}, current['input'][-1]]
+            bodies.append(current)
+        grade(bodies, receipts, enabled=False, append_only=True)
+        bodies[-1]['input'][-1] = copy.deepcopy(bodies[-2]['input'][-1])
+        with self.assertRaisesRegex(AssertionError, 'ledger really must change'):
+            grade(bodies, receipts, enabled=False, append_only=True)
+
+    def test_implicit_receipts_require_exact_historical_prefix_and_settings(self):
+        body = body_for(1, 0, [])
+        body.pop('prompt_cache_options')
+        body['input'] = canonical(body['input'])
+        with Provider() as provider:
+            self.assertEqual(send(provider, body)['usage']['input_tokens_details']['cached_tokens'], 0)
+            extended = copy.deepcopy(body)
+            extended['input'] += [{'role': 'assistant', 'content': 'synthetic answer'},
+                                  {'role': 'user', 'content': json.dumps({'eligible_group_ids': ['g1']})}]
+            self.assertEqual(send(provider, extended)['usage']['input_tokens_details']['cached_tokens'], 2048)
+            self.assertIn(len(body['input']), provider.receipts[-1]['matched_boundaries'])
+            for mutation in ('text', 'role', 'wrapper', 'settings'):
+                with self.subTest(mutation=mutation):
+                    changed = copy.deepcopy(extended)
+                    if mutation == 'settings':
+                        changed['reasoning'] = {'effort': 'different-fixture-setting'}
+                    elif mutation == 'wrapper':
+                        changed['input'][0]['content'] = [{'type': 'input_text', 'text': body['input'][0]['content']}]
+                    else:
+                        changed['input'][0][mutation if mutation == 'role' else 'content'] = 'changed'
+                    self.assertEqual(send(provider, changed)['usage']['input_tokens_details']['cached_tokens'], 0)
+            self.assertTrue(all(not boundaries(b) for b in provider.reviews))
+
+    def test_http_multiitem_output_replays_exactly_once_before_each_new_ledger(self):
+        bodies, outputs = [], []
+        with Provider() as provider:
+            for turn in range(8):
+                body = body_for(1, turn, [])
+                body.pop('prompt_cache_options')
+                body['input'] = canonical(body['input'])
+                if bodies:
+                    body['input'] = copy.deepcopy(bodies[-1]['input'] + outputs[-1]) + [body['input'][-1]]
+                response = send(provider, body)
+                self.assertEqual(len(response['output']), 3, 'reviewer must emit native reasoning and both phases')
+                self.assertEqual([i.get('phase') for i in response['output']], [None, 'commentary', 'final_answer'])
+                self.assertIn('encrypted_content', response['output'][0])
+                bodies.append(body)
+                outputs.append(response['output'])
+            grade(bodies, provider.receipts, enabled=False, append_only=True, outputs=outputs)
+            # Execute the same grader used by the integrated binary fixture.
+            for mutation in ('omit', 'duplicate', 'phase', 'encrypted_content'):
+                with self.subTest(mutation=mutation):
+                    bad = copy.deepcopy(bodies)
+                    at = len(bodies[-2]['input'])
+                    if mutation == 'omit':
+                        bad[-1]['input'].pop(at)
+                    elif mutation == 'duplicate':
+                        bad[-1]['input'].insert(at, copy.deepcopy(outputs[-2][0]))
+                    elif mutation == 'phase':
+                        bad[-1]['input'][at + 1]['phase'] = 'final_answer'
+                    else:
+                        bad[-1]['input'][at]['encrypted_content'] = 'changed'
+                    with self.assertRaisesRegex(AssertionError, 'reviewer output'):
+                        grade(bad, provider.receipts, enabled=False, append_only=True, outputs=outputs)
+            # Reviewer-only cleanup can rebuild the same retained source view;
+            # even then no disposable output from before that rebuild may survive.
+            rebuilt = [bodies[0], copy.deepcopy(bodies[0])]
+            fixture.grade_replay(rebuilt, outputs[:2], allow_pruning=True)
+            rebuilt[-1]['input'].insert(-1, copy.deepcopy(outputs[0][0]))
+            with self.assertRaisesRegex(AssertionError, 'pruned reviewer output'):
+                fixture.grade_replay(rebuilt, outputs[:2], allow_pruning=True)
+            bad = copy.deepcopy(bodies)
+            bad[3]['input'][-1] = {'role': 'user', 'content': '{}'}
+            with self.assertRaisesRegex(AssertionError, 'current ledger'):
+                grade(bad, provider.receipts, enabled=False, append_only=True, outputs=outputs)
+
     def test_http_advice_explicitly_replaces_same_eligible_opinion_on_ledger_only_reviews(self):
         # Inspect real HTTP responses, not fabricated ledger revisions: Rust
         # apply_advice preserves omitted IDs, so both directions need an update.
         with Provider() as provider:
             body = body_for(1, 0, [])
             responses = [send(provider, body) for _ in range(10)]
-            advice = [json.loads(r['output'][0]['content'][0]['text']) for r in responses]
+            advice = [json.loads(r['output'][-1]['content'][0]['text']) for r in responses]
             self.assertEqual(advice[-2], {'protected': ['g1'], 'removable': [], 'memories': []})
             self.assertEqual(advice[-1], {'protected': [], 'removable': ['g1'], 'memories': []})
             self.assertTrue(all(a['protected'] + a['removable'] == ['g1'] for a in advice))
@@ -65,10 +152,10 @@ class SimulatorTests(unittest.TestCase):
             body['input'][3]['content'][0]['text'] = json.dumps({'group_id': 'g2', 'items': ['DISCARD_NATIVE_BYTES']})
             for _ in range(2):
                 response = send(provider, body)
-                self.assertEqual(json.loads(response['output'][0]['content'][0]['text']),
+                self.assertEqual(json.loads(response['output'][-1]['content'][0]['text']),
                     {'protected': ['g1'], 'removable': ['g2'], 'memories': []})
 
-    def test_default_dispatcher_labels_seven_distinct_conditions(self):
+    def test_default_dispatcher_labels_nine_distinct_conditions(self):
         import contextlib
         import io
         from pathlib import Path
@@ -85,11 +172,13 @@ class SimulatorTests(unittest.TestCase):
                  contextlib.redirect_stdout(io.StringIO()):
                 fixture.main()
             result=json.loads((Path(directory)/'results.json').read_text())
-        self.assertEqual(result['case_count'],7)
+        self.assertEqual(result['case_count'],9)
         self.assertEqual({r['case'] for r in result['cases']},
-            {'rotation','coupled','missing-usage','disabled','auto-generic','auto-unknown','explicit-unknown-rejected'})
-        self.assertEqual(conditions[-3:],[('disabled',False,'gpt-6-luna','rotation'),
-            ('auto',False,'gpt-6-luna','rotation'),('auto',False,'unknown-fixture-model','rotation')])
+            {'rotation','coupled','missing-usage','disabled','auto-generic','auto-unknown',
+             'implicit-coupled','implicit-missing-usage','explicit-unknown-rejected'})
+        self.assertEqual(conditions[-5:],[('disabled',False,'gpt-6-luna','rotation'),
+            ('auto',False,'gpt-6-luna','rotation'),('auto',False,'unknown-fixture-model','rotation'),
+            ('disabled',False,'gpt-6-luna','coupled'),('disabled',False,'gpt-6-luna','missing-usage')])
 
     def sequence(self):
         bodies = []

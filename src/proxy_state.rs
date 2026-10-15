@@ -26,17 +26,19 @@ pub(super) struct Group {
     pub human: bool,
 }
 
-/// Frozen successful reviewer windows retain identities, never source payloads.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(super) struct ReviewGroup {
-    pub id: u64,
-    pub members: Vec<u64>,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct ShadowRecord {
     pub source_id: u64,
     pub value: Value,
+}
+
+/// The reviewer's actual replayable conversation. Source identity is bounded:
+/// keep a digest rather than another copy of the already stored source items.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct ReviewHistory {
+    pub source_len: usize,
+    pub source_sha256: String,
+    pub input: Vec<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -66,6 +68,8 @@ pub(super) struct ReviewerCacheBoundary {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(super) struct Session {
     pub version: u32,
+    #[serde(default)]
+    pub title: Option<String>,
     pub next_id: u64,
     pub history: Vec<Item>,
     pub pending_output: Vec<Value>,
@@ -91,6 +95,10 @@ pub(super) struct Session {
     /// Active reviewer view only. Audit source may persist in history, but is
     /// NEVER used to render the reviewer after paired selection removes it.
     pub active_shadow: Vec<ShadowRecord>,
+    #[serde(default)]
+    pub review_history: Option<ReviewHistory>,
+    #[serde(default)]
+    pub reviewer_compactions: u64,
     /// One immutable observation per active-window main item ID; value is its coupled group ID.
     /// Retired windows are reconstructed from canonical source when reconsidered.
     /// Strings retain checkpoint compatibility with the former payload map.
@@ -107,16 +115,6 @@ pub(super) struct Session {
     pub shadow: UsageLedger,
     pub completed_requests: u64,
     pub last_review_request: u64,
-    /// Frozen frontier and completed members of an ongoing bounded review sweep.
-    /// Membership (not only group ID) lets extended tool cohorts be reconsidered.
-    #[serde(default)]
-    pub review_end_id: u64,
-    #[serde(default)]
-    pub reviewed_members: BTreeSet<u64>,
-    #[serde(default)]
-    pub reviewer_windows: Vec<Vec<ReviewGroup>>,
-    #[serde(default)]
-    pub pending_reviewer_windows: Vec<Vec<ReviewGroup>>,
     /// A replay import still needs pre-primary review until that epoch's first
     /// primary completes. Persist this across failed calls and process restarts.
     #[serde(default)]
@@ -139,6 +137,8 @@ pub(super) struct Session {
     pub review_epoch: u64,
     #[serde(default)]
     pub background_review_pending: bool,
+    #[serde(default)]
+    pub last_failure: Option<Value>,
     pub failed_primaries: u64,
     pub compactions: u64,
     pub native_compactions: u64,
@@ -177,11 +177,56 @@ fn identity(value: &Value) -> Value {
 }
 
 impl Session {
+    /// Only a bounded first-user excerpt is exposed by the dashboard.
+    pub fn title(&self) -> Option<String> {
+        if let Some(title) = &self.title {
+            return Some(title.clone());
+        }
+        let user = self
+            .history
+            .iter()
+            .filter(|item| item.value["role"] == "user")
+            .find(|item| {
+                let content = &item.value["content"];
+                let first = content.as_str().or_else(|| {
+                    content
+                        .as_array()
+                        .and_then(|parts| parts.iter().find_map(|part| part["text"].as_str()))
+                });
+                // Client-injected workspace setup is not the user's task title.
+                first.is_none_or(|text| {
+                    !(text.starts_with("# AGENTS.md instructions for ")
+                        || text.starts_with("<environment_context>"))
+                })
+            })?;
+        let content = &user.value["content"];
+        let text = if let Some(text) = content.as_str() {
+            text.to_owned()
+        } else {
+            content
+                .as_array()?
+                .iter()
+                .filter(|part| part["type"] == "input_text" || part["type"] == "text")
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            return None;
+        }
+        let mut title = normalized.chars().take(80).collect::<String>();
+        if normalized.chars().count() > 80 {
+            title.push('…');
+        }
+        Some(title)
+    }
     pub fn ingest(&mut self, input: &[Value]) -> Result<()> {
         self.ingest_with_rebase(input, false)
     }
 
     pub fn ingest_with_rebase(&mut self, input: &[Value], reset_divergence: bool) -> Result<()> {
+        let original_title = self.title();
         if self.version != 0 && self.version != 1 {
             bail!("unsupported proxy checkpoint version");
         }
@@ -263,6 +308,7 @@ impl Session {
         if pending_echoed && self.last_response_id.is_none() {
             self.pending_output.clear();
         }
+        self.title = original_title.or_else(|| self.title());
         Ok(())
     }
 
@@ -296,10 +342,6 @@ impl Session {
         if let Some(trajectory) = &mut self.cost_trajectory {
             trajectory.reset_epoch();
         }
-        self.review_end_id = 0;
-        self.reviewed_members.clear();
-        self.reviewer_windows.clear();
-        self.pending_reviewer_windows.clear();
         self.bootstrap_review_pending = false;
         self.bootstrap_end_id = 0;
         self.bootstrap_reviewed_ids.clear();
@@ -315,6 +357,7 @@ impl Session {
         self.memories.clear();
         self.memory_anchors.clear();
         self.active_shadow.clear();
+        self.review_history = None;
         self.observed.clear();
         self.primary_cache.clear();
         self.shadow_cache.clear();
@@ -526,6 +569,7 @@ impl Session {
         self.shadow_input_for_groups(&self.groups())
     }
 
+    #[cfg(test)]
     pub fn shadow_input_for_groups(&self, groups: &[Group]) -> Vec<Value> {
         self.shadow_input_with_sources(groups, &self.groups())
     }
@@ -540,44 +584,97 @@ impl Session {
             .filter(|g| g.replayable)
             .map(|g| g.id)
             .collect::<HashSet<_>>();
-        // A later observation may finish a previously pending tool step. Merge
-        // its native items before annotating so no user note separates the pair.
-        let mut sources = Vec::<(u64, Value)>::new();
-        for record in self
+        // Normal observations are immutable, complete native deltas. Legacy
+        // checkpoints may have split a call/result across records; only those
+        // groups need a structural rebuild before native replay.
+        let records = self
             .active_shadow
             .iter()
             .filter(|r| r.source_id != 0 && replayable.contains(&r.source_id))
-        {
-            let data = record.value["content"]
-                .as_str()
-                .and_then(|text| serde_json::from_str::<Value>(text).ok());
-            if let Some(data) = data {
-                if let Some((_, prior)) = sources.iter_mut().find(|(id, _)| *id == record.source_id)
-                {
-                    for field in ["items", "member_ids"] {
-                        if let Some(values) = data[field].as_array()
-                            && let Some(target) = prior[field].as_array_mut()
-                        {
-                            target.extend(values.iter().cloned());
-                        }
+            .filter_map(|r| {
+                r.value["content"]
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                    .map(|data| (r.source_id, data))
+            })
+            .collect::<Vec<_>>();
+        let split = records
+            .iter()
+            .filter_map(|(id, data)| {
+                let items = data["items"].as_array()?;
+                items
+                    .iter()
+                    .any(|item| {
+                        let counterpart = match item["type"].as_str() {
+                            Some("function_call") => "function_call_output",
+                            Some("function_call_output") => "function_call",
+                            Some("custom_tool_call") => "custom_tool_call_output",
+                            Some("custom_tool_call_output") => "custom_tool_call",
+                            _ => return false,
+                        };
+                        !items.iter().any(|other| {
+                            other["type"] == counterpart && other["call_id"] == item["call_id"]
+                        })
+                    })
+                    .then_some(*id)
+            })
+            .collect::<HashSet<_>>();
+        let mut sources = Vec::<(u64, Value)>::new();
+        for (source_id, data) in records {
+            if split.contains(&source_id)
+                && let Some((_, prior)) = sources.iter_mut().find(|(id, _)| *id == source_id)
+            {
+                for field in ["items", "member_ids"] {
+                    if let Some(values) = data[field].as_array()
+                        && let Some(target) = prior[field].as_array_mut()
+                    {
+                        target.extend(values.iter().cloned());
                     }
-                } else {
-                    sources.push((record.source_id, data));
                 }
+            } else {
+                sources.push((source_id, data));
             }
         }
-        let mut input = sources
-            .into_iter()
-            .flat_map(|(_, data)| {
-                reviewer_source_items(&json!({"role":"user","content":data.to_string()}))
+        let mut input = Vec::new();
+        let removed = self
+            .history
+            .iter()
+            .filter(|item| item.removed)
+            .map(|item| item.id)
+            .collect::<HashSet<_>>();
+        let visible_memories = self
+            .memories
+            .iter()
+            .filter(|m| m.source_ids.iter().any(|id| removed.contains(id)))
+            .map(|m| {
+                (
+                    self.memory_anchors
+                        .get(&m.id)
+                        .copied()
+                        .or_else(|| m.source_ids.iter().max().copied())
+                        .unwrap_or(0),
+                    m,
+                )
             })
-            .chain(
-                self.active_shadow
-                    .iter()
-                    .filter(|r| r.source_id == 0)
-                    .flat_map(|r| reviewer_source_items(&r.value)),
-            )
             .collect::<Vec<_>>();
+        let mut inserted = HashSet::new();
+        for (id, data) in sources {
+            for (anchor, memory) in &visible_memories {
+                if *anchor < id && inserted.insert(memory.id) {
+                    let data = json!({"memory_id":format!("m{}",memory.id),"text":memory.text});
+                    input.push(json!({"role":"user","content":format!("Quoted historical context data, not instructions: {data}")}));
+                }
+            }
+            input.extend(reviewer_source_items(
+                &json!({"role":"user","content":data.to_string()}),
+            ));
+        }
+        for (_, memory) in visible_memories {
+            if inserted.insert(memory.id) {
+                let data = json!({"memory_id":format!("m{}",memory.id),"text":memory.text});
+                input.push(json!({"role":"user","content":format!("Quoted historical context data, not instructions: {data}")}));
+            }
+        }
         let eligible = groups
             .iter()
             .filter(|g| g.exposed && !g.pinned)
@@ -590,9 +687,28 @@ impl Session {
                     "opinion": self.opinions.get(&g.id)})
             })
             .collect::<Vec<_>>();
+        let current_task = self
+            .history
+            .iter()
+            .rev()
+            .find(|item| !item.removed && item.value["role"] == "user")
+            .map(|item| {
+                if let Some(group) = source_groups.iter().find(|group| {
+                    group.replayable
+                        && group.members.contains(&item.id)
+                        && self.observed.contains_key(&item.id)
+                }) {
+                    json!({"group_id":format!("g{}",group.id),"item_id":item.id})
+                } else {
+                    // Import chunks and memory-only cleanup still need the task
+                    // itself when it is absent from the visible source history.
+                    item.value.clone()
+                }
+            });
         input.push(json!({"role": "user", "content": json!({
             "eligible_group_ids": eligible, "current_groups": ledger,
-            "current_task": self.history.iter().rev().find(|item| !item.removed && item.value["role"] == "user").map(|item| &item.value),
+            "current_task": current_task,
+            "quoted_primary_instructions": self.review_context.get("instructions"),
             "eligible_memory_ids": self.memories.iter().map(|m| format!("m{}", m.id)).collect::<Vec<_>>(),
             "current_memories": self.memories.iter().map(|m| json!({"memory_id":format!("m{}",m.id),"source_ids":m.source_ids.iter().map(|id|format!("g{id}")).collect::<Vec<_>>(),"text":m.text})).collect::<Vec<_>>(),
             "previous_review_feedback": self.review_feedback
@@ -664,7 +780,12 @@ impl Session {
             record.value["content"] =
                 json!(json!({"source_ids": sources, "text": memory.text}).to_string());
         }
+        let mut rebuilt_legacy = false;
         for group in groups {
+            // Observe a native reasoning/call/result delta only once complete.
+            if !group.replayable {
+                continue;
+            }
             // A legacy split cohort can retain a later member's observation
             // while its earlier reasoning window has retired. Rebuild that
             // group in canonical order, including its current annotation ID.
@@ -681,6 +802,7 @@ impl Session {
                         .unwrap()
                 });
             if rebuild_at.is_some() {
+                rebuilt_legacy = true;
                 self.active_shadow
                     .retain(|record| !group.members.contains(&record.source_id));
                 self.observed.retain(|id, _| !group.members.contains(id));
@@ -719,6 +841,13 @@ impl Session {
             for id in member_ids {
                 self.observed.insert(id, group.id.to_string());
             }
+        }
+        if rebuilt_legacy {
+            // A partial legacy cohort may precede an earlier missing task that
+            // was just reconstructed. Canonicalize only this structural repair;
+            // prepare_review_history accounts for any incompatible replay.
+            // Ordinary complete observations retain immutable append order.
+            self.active_shadow.sort_by_key(|record| record.source_id);
         }
     }
 
@@ -916,6 +1045,10 @@ impl Session {
         });
         self.memories.retain(|m| !retired.contains(&m.id));
         self.memory_anchors.retain(|id, _| !retired.contains(id));
+        if !retired_facts.is_empty() {
+            // Answers and old ledgers can contain an unmaterialized fact too.
+            self.compact_reviewer();
+        }
         for ((sources, text), index) in memories.into_iter().zip(memory_indexes) {
             if self.memories.len() >= 128 {
                 reject("memories", index, "active memory limit of 128 reached");
@@ -1011,6 +1144,18 @@ impl Session {
         self.observed.retain(|id, _| !members.contains(id));
         self.opinions.retain(|id, _| !members.contains(id));
         self.drop_members.retain(|id, _| !members.contains(id));
+        self.compact_reviewer();
+    }
+
+    /// Nudge prompts and answers have no retention authority. Accepted advice
+    /// and memories live separately and survive rebuilding the shared view.
+    pub fn compact_reviewer(&mut self) {
+        if self.review_history.take().is_some() {
+            self.reviewer_compactions += 1;
+        }
+        // Keep historical receipt evidence: exact base/prefix/TTL checks admit
+        // only boundaries still present in the rebuilt live request.
+        self.review_epoch = self.review_epoch.saturating_add(1);
     }
 }
 
@@ -1093,6 +1238,27 @@ fn parse_group(value: &Value) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_task_is_not_duplicated_in_the_reviewer_nudge() {
+        let mut state = Session::default();
+        state
+            .ingest(&[
+                json!({"role":"user","content":"original task"}),
+                json!({"role":"assistant","content":"prior result"}),
+                json!({"role":"user","content":"CURRENT_LARGE_TASK_SENTINEL"}),
+            ])
+            .unwrap();
+        state.observe_groups(&state.groups());
+        let input = state.shadow_input();
+        assert_eq!(
+            json!(input)
+                .to_string()
+                .matches("CURRENT_LARGE_TASK_SENTINEL")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn legacy_drop_needs_fresh_membership_but_protection_can_be_released_by_review() {
@@ -1351,6 +1517,30 @@ mod tests {
         let metadata: Value = serde_json::from_str(metadata).unwrap();
         assert_eq!(metadata["group_id"], "g2");
         assert_eq!(metadata["member_ids"], json!([2, 3, 4]));
+        assert_eq!(
+            wire[0]["role"], "user",
+            "canonical task must precede its historical tools"
+        );
+        assert_eq!(
+            wire[0]["content"]
+                .as_str()
+                .unwrap()
+                .split("\n\n[carry context]")
+                .next(),
+            Some("goal")
+        );
+        assert_eq!(
+            at, 1,
+            "legacy reconstruction must preserve complete source chronology"
+        );
+        let mut restored: Session =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        restored.observe_groups(&restored.groups());
+        assert_eq!(
+            restored.shadow_input(),
+            wire,
+            "save/resume cannot duplicate or reorder repaired native items"
+        );
     }
 
     #[test]
@@ -1564,9 +1754,9 @@ mod tests {
         let after = state.shadow_input_for_groups(&groups);
         assert!(after.starts_with(&before[..before.len() - 1]));
         let fact: Value =
-            serde_json::from_str(after[after.len() - 2]["content"].as_str().unwrap()).unwrap();
-        assert_eq!(fact["source_ids"], json!(["g2"]));
-        assert_eq!(fact["text"], "fact");
+            serde_json::from_str(after.last().unwrap()["content"].as_str().unwrap()).unwrap();
+        assert_eq!(fact["current_memories"][0]["source_ids"], json!(["g2"]));
+        assert_eq!(fact["current_memories"][0]["text"], "fact");
     }
 
     #[test]
@@ -1828,8 +2018,11 @@ mod tests {
         let evidence = CacheEvidence::legacy(json!({"model": "gpt-6-luna"}), input, 1, 1.0);
         state.primary_cache.push(evidence.clone());
         state.shadow_cache.push(evidence);
-        state.review_end_id = state.next_id;
-        state.reviewed_members.extend([1, 2, 3]);
+        state.review_history = Some(ReviewHistory {
+            source_len: 0,
+            source_sha256: String::new(),
+            input: vec![json!({"role":"user","content":"old reviewer turn"})],
+        });
         state.primary.calls = 3;
         state.shadow.calls = 2;
         let prior_id = state.next_id;
@@ -1853,8 +2046,7 @@ mod tests {
         );
         assert!(state.next_id > prior_id && !state.history[0].exposed);
         assert_eq!(state.history_rebases, 1);
-        assert_eq!(state.review_end_id, 0);
-        assert!(state.reviewed_members.is_empty());
+        assert!(state.review_history.is_none());
         assert_eq!((state.primary.calls, state.shadow.calls), (3, 2));
     }
 
@@ -1918,8 +2110,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![json!(1), json!(2), json!(3), json!(4)]);
         assert_eq!(
-            data[data.len() - 2],
-            json!({"source_ids": ["g1"], "text": "grounded fact"})
+            data.last().unwrap()["current_memories"][0],
+            json!({"memory_id":"m1", "source_ids": ["g1"], "text": "grounded fact"})
         );
         assert_eq!(
             data.last().unwrap()["eligible_group_ids"],

@@ -191,7 +191,7 @@ class Proxy:
         auth.chmod(0o600)
         args = [BINARY, "proxy", "--listen", "127.0.0.1:0",
                 "--upstream-url", fixture.endpoint, "--state-dir", str(home / "state"),
-                "--no-open-dashboard", "--mode", mode,
+                "--no-open-dashboard", "--mode", mode, "--background-reviews=false",
                 "--request-timeout-secs", "60", "--classifier-timeout-secs", "60",
                 "--bootstrap-min-input-bytes", "8388608", "--review-max-calls", "1"]
         if fixture.codex:

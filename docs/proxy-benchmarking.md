@@ -143,76 +143,55 @@ an earlier message.
 The primary request can continue unchanged.
 The newest live user group is pinned independently of reviewer advice.
 
-Reviewer sweeps advance chronologically through complete atomic groups. Window
-ends are chosen at retention-signal changes, human/tool boundaries, compatible
-previous cache boundaries, or the request capacity frontier. Among those choices,
-the planner minimizes modeled reviewer cost per estimated token of actionable
-source coverage over the configured payoff/cadence horizon, including shared
-instructions, mutable suffix and bounded output. This is a local heuristic, not
-a globally optimal partition or a prediction of future provider cache hits.
-Each rendered reviewer request, including instructions, schema, ledger and
-carried memories, is bounded by `--classifier-max-input-tokens` (default 120,000).
-A simple local `o200k_base` tokenizer over rendered JSON replaces bytes/4 for
-input estimates and planner economics. These estimates include JSON wrappers;
-they are not provider token counts, and native whole-request usage cannot assign
-exact costs to individual quoted context items. Native usage remains the source
-for the observed cost ledger, with cache fractions kept on one local estimate
-basis in the planner. Set the input budget conservatively for the model, leaving
-room for output and provider overhead; it is separate from the output cap.
-`--classifier-max-input-bytes` (default 8 MiB) remains a transport guard.
-Both small and oversized views use this economic selection; the token and byte
-limits are capacity guards rather than the reason to split. There is no fixed
-group-count cutoff. Compatible receipts survive window rotation, including
-observed implicit reads on subscription routes. A cold read or an incompatible
-prefix receives no current cache credit. Future stable-prefix reuse remains an
-explicit sensitivity assumption. Oversized views are reviewed in bounded windows
-instead of being rejected. A single oversized atomic group stays whole and protected;
-it is skipped without a paid call or an invalid-review increment. Pinned-only
-windows likewise make no paid call. Earlier source windows retire from the
-active reviewer projection; canonical history, retention decisions and sourced
-memories remain checkpointed. Source observations stay immutable within an
-active window and are rebuilt from canonical history after retirement. Legacy
-split cohorts are repaired in native source order with corrected annotation IDs.
-Subscription cache comparisons use the same adapted wire shape as submission,
-including folded instructions and inserted memory slots. A missing client cache
-key gets a stable session key; caller-provided keys remain intact.
-Primary cache receipts use bounded exact-prefix fingerprints; older prompt-copy
-checkpoints migrate on load. Memory retirement updates the scenario restoration
-delta separately from source-compaction counts.
+The reviewer maintains one conversation aligned with the primary's retained
+sources and shared memories. New source items append after the prior reviewer's
+request and replayable response, including reasoning and phase fields. Each
+ordinary review is one brief state update, not a sweep of independent source
+windows. Accepted retention decisions and memories are durable state. Nudge
+prompts and previous reviewer answers are disposable: compaction rebuilds both
+views and removes that bookkeeping. Facts become part of both rendered histories
+when their sources are removed; unmaterialized facts remain in the current ledger.
+Primary tool descriptions are not duplicated into the reviewer instructions.
 
-An ongoing sweep freezes the exposed-history frontier when it starts. Newer
-context waits for a later sweep, so a growing conversation cannot prevent the
-current sweep from finishing. Completed members and the frontier are saved;
-unfinished windows resume even before the normal review cadence is due.
-Successful windows survive failed primaries and restarts. A wholly rejected review
-stops the attempt without advancing that window or discarding completed windows;
-partially accepted reviews advance while reporting rejected items for correction.
-Completed window memberships are checkpointed as source IDs/member snapshots,
-without duplicate payloads. For priced ordinary sweeps, rewrite economics price
-the complete frozen sweep, including each scheduled call and output cap across
-the payoff horizon. Cadence, per-request call limits and unfinished sweep
-progress determine those calls.
-New eligible tail context is priced as conservative bounded chronological windows;
-partial-window continuation prices only remaining sources, with no credit from a
-removed prefix. Missing oversized coverage reports `reviewer_partition_unknown`
-instead of pricing only the last active window. These fixed-partition projections
-are conditional assumptions and do not predict provider latency or future changes.
-Reports separate `future_review_events` from `future_reviewer_calls`; reviewer
-input/cache totals are named for the whole sweep, rather than one request.
-With `--payoff-requests > 1`, unfinished bootstrap economics are unknown until
-bootstrap completes. A candidate that empties a pending ordinary sweep while
-retaining memories is also unpriced: the scheduler does not yet price its
-subsequent memory-only cleanup POST. These paths report
-`reviewer_economics_priced:false`/`reviewer_pricing_unknown` and cannot authorize
-that rewrite; unknown candidate costs are not reported as zero. Cleanup still
-runs within the existing review capacity, cadence and call limits. A completed
-sweep, an empty sweep without memories, and the sunk-only payoff of one do not
-trigger these guards. The current paid review remains sunk.
-Primary rewrite payback remains input-only; future reviewer estimates include
-their configured output allowance. Direct Carry retention still uses normalized
-cached/input and write/input ratios. Neither policy is complete dollar-cost
-planning, and neither changes rates or the payback denominator.
-A rebase/native epoch reset clears this progress. The dashboard distinguishes wholly invalid reviews from partially accepted reviews; legacy invalid-review totals remain historical.
+Before dispatch, the planner checks the actual rendered next primary and reviewer
+requests, including incoming material. Defaults are a 272,000-token primary
+budget and a 300,000-token reviewer budget. Configure these with
+`--primary-context-tokens` and `--classifier-max-input-tokens` (also named
+`--reviewer-context-tokens`). These are configurable planning budgets, not a
+claim about the provider's model limits. The default 10% `--context-margin-percent`
+margin is added to estimated inputs, with an output reserve: the client's
+`max_output_tokens` or `--primary-output-reserve-tokens` (16,384) for primary,
+and `--classifier-max-output-tokens` (2,048) for reviewer. Serialized reviewer
+requests are also capped by `--classifier-max-input-bytes` (8 MiB).
+
+Capacity takes precedence over economics in compact mode. If either next request
+cannot fit, the planner removes only authorized atomic source groups and rebuilds
+the reviewer without disposable control turns. It can also clean only reviewer
+bookkeeping while preserving the primary's cached prefix. If protected material,
+an indivisible tool group, or incoming material still cannot fit, Carry returns
+HTTP 413 without sending an oversized primary request. Audit mode reports the
+capacity problem without making removals.
+
+When both requests fit, the planner compares both retained histories over the
+configured payoff horizon (five requests by default), including upcoming reviewer
+calls and their configured output allowance. Each candidate advances its own
+review age, cadence, eligibility and completed-primary exposure; a source rewrite
+skips an immediate ordinary review, while a reviewer-only cleanup does not. This
+is a **frozen-source, timely-completion sensitivity**: hypothetical future reviews
+are assumed to complete and merge before their next due dispatch, not guaranteed
+to do so. Already-pending background work and unfinished imports remain unknown,
+not free; completed bootstrap receipts are sunk. Primary generation-output cost
+is not separately forecast (the primary output reserve is a capacity allowance).
+Fresh compatible receipts can credit
+cache reads; evidence expires after 30 minutes. Implicit fills use ordinary input
+rates, while explicit cache writes use the modeled write rate. No cache markers
+are required for implicit-prefix evidence. Capacity and planner input counts are
+local `o200k_base` estimates over rendered JSON; configured budgets, estimation
+margin and output reserves are operator planning assumptions, not native provider
+counts or enforced provider limits.
+The usage ledger separately records native input/output/cache counts from actual
+receipts (or reports them unavailable). Local estimates do not guarantee a cache
+hit. There is no dependency on a historical reviewer-window partition.
 
 Reviewer requests replay native messages, reasoning (including encrypted content),
 and tool call/result items. Source IDs are appended to the last message text block;
@@ -231,49 +210,29 @@ Primary forwarding remains unchanged. Strict structured output is requested on
 both API-key and subscription reviewer paths. Live cross-model encrypted reasoning
 compatibility still requires provider verification; local fixtures verify transport.
 
-Reviewer source observations precede carried memories and the final mutable ledger,
-so newly accepted facts do not rewrite a source window's cache prefix. Per-turn
-client telemetry does not create a new implicit lineage; session/thread identifiers
-still isolate state, and primary client metadata is forwarded unchanged.
+Oversized imports are admitted chronologically into the retained reviewer history.
+Carry fills the next request up to its budget, obtains advice, and retains the
+protected sources and shared facts. When the next chunk cannot fit, disposable
+reviewer turns and authorized sources are removed before admitting more material.
+The primary is dispatched only once its requests fit; an incomplete oversized
+import returns a capacity error while preserving successful import progress.
+`--review-max-calls` (default 16) bounds each import attempt, and
+`--bootstrap-max-cost-usd` (default $1 of modeled API-equivalent spend) is reserved
+before each call and persists across restart. Raising limits or retrying can
+resume incomplete imports; restarting does not replenish the cumulative allowance.
+These modeled amounts are not provider billing limits. Subscription transport does
+not enforce the API output cap, so configure conservative budgets for that route.
 
-`--review-max-calls` defaults to 16 per primary request, for bootstrap and ongoing
-windows alike; `--bootstrap-max-calls` remains a compatible alias. Subsequent
-requests resume unfinished windows. `--bootstrap-max-cost-usd` is still
-bootstrap-only and defaults to $1 of cumulative
-estimated spend per active history. Spend is reserved durably before dispatch,
-including failed attempts, using conservative input/cache-write pricing and the
-configured reviewer output cap. Zero disables paid bootstrap calls; unknown
-reviewer pricing also prevents dispatch. Restarting does not replenish this
-allowance. These are modeled estimates, **not a hard provider billing limit**;
-subscription estimates are API equivalents, and the subscription adapter does
-not enforce the API output cap. Limits leave unreviewed history intact and never
-block the primary request. By default reviews are synchronous; lower
-`--review-max-calls` to bound paid round trips per primary while backlog windows
-resume later. This call limit does not replenish or extend bootstrap spend.
+Ordinary updates run in the background by default, with one review in flight per
+session. Only compatible advice is merged into the latest checkpoint. Capacity
+pressure waits for an in-flight update without holding its merge lock, then
+replans, and can require a synchronous update. Failed/stale work still counts as
+spent usage. Restart does not resume an in-flight model call; its durable pending
+marker censors unknown usage. Successful transcript and import progress survive
+restart. Dashboard savings remain incomplete while a background review is pending.
 
-Use `--background-reviews` to remove ordinary reviewer round-trip latency from
-primary requests. Bootstrap remains synchronous to review imported history before
-its first primary use. Ordinary reviews use an immutable snapshot, with at most
-one review in flight per session; a bootstrap requested during old in-flight work
-is deferred until a later request. The primary session lock is not held during
-reviewer transport. Completion reacquires it and merges reviewer state and usage
-into the newest checkpoint, preserving newer primary history, counters and cache.
-Only already-merged advice can affect the next request, never a submitted request.
-Membership checks cover sources actually replayed to that review. An unrelated
-newer pending tool step may complete without invalidating advice about an older
-window; changed reviewed cohorts or canonical lineage still discard that advice.
-Changed source contents, atomic membership, removals or rebases discard stale
-advice, but its paid usage is still counted. Bounded oversized windows run in the
-same background job and remain governed by `--review-max-calls`.
-
-In-flight background work is not resumed across process shutdown/restart. A durable
-pending marker makes the next access censor an interrupted attempt's unknown usage
-rather than treating it as free. Completed background work checkpoints normally;
-unfinished sweep progress resumes on later requests. Dashboard savings estimates
-are unavailable while a background review is pending.
-
-`off` is unchanged; `audit` reviews without rewriting; `compact` rewrites only
-after valid advice and the ordinary economic admission check. Import does not
+`off` is unchanged; `audit` reviews without rewriting; `compact` removes sources only after valid advice, either to satisfy capacity or
+after the economic admission check. Import does not
 fabricate completed requests or native usage. Failed primaries do not grant
 exposure to fresh input or commit speculative removals. Previously committed
 removals remain applied to matching echoed histories after restart.
@@ -433,9 +392,9 @@ python3 scripts/proxy_trial.py \
   --prompt 'Inspect this disposable repository and summarize one useful improvement.'
 ```
 
-Choose a new trial directory for every arm. It must not exist and must be outside the workspace. For a transport control, use `--mode off` with a different fresh directory; omission of `--mode` also defaults to off. Do not reuse a modified workspace between compared arms.
+Choose a new trial directory for every arm. It must not exist and must be outside the workspace. For a transport control, use `--mode off` with a different fresh directory; omission of `--mode` defaults to **off** in this launcher (unlike direct `carry proxy`). Do not reuse a modified workspace between compared arms.
 
-The launcher creates separate `HOME`, `CODEX_HOME` or `PI_CODING_AGENT_DIR`, a scoped gateway token, and a random session ID. Codex uses a custom Responses provider with `supports_websockets = false`; Pi uses `openai-responses`. Both send stable `x-carry-session`, `x-carry-tenant: local-trial`, and `x-carry-branch: main` headers for one conversation. Native compaction is not disabled or fed fictional usage. `proxy.log`, `client-events.jsonl`, `trial.json`, and private proxy state are retained under the trial directory. Protect these artifacts: they may contain your task contents.
+The launcher explicitly selects `--login api-key` for Carry: set upstream/reviewer provider keys in its environment; it does not auto-discover a saved Carry subscription or forward the client gateway token as a provider key. It creates a separate client `HOME`, `CODEX_HOME` or `PI_CODING_AGENT_DIR`, a scoped gateway token, and a random session ID. Codex uses a custom Responses provider with `supports_websockets = false`; Pi uses `openai-responses`. Both send stable `x-carry-session`, `x-carry-tenant: local-trial`, and `x-carry-branch: main` headers for one conversation. Native compaction is not disabled or fed fictional usage. `proxy.log`, `client-events.jsonl`, `trial.json`, and private proxy state are retained under the trial directory. Protect these artifacts: they may contain your task contents.
 
 Readiness checks `/health` and authenticated `/carry/metrics`, and rejects an effective-mode mismatch before launching the client. The launcher stops its exact proxy and client process groups, including tool descendants, after completion or timeout. `--timeout` defaults to 300 seconds. It returns the client status and does not interpret a final response as a benchmark grade.
 
@@ -511,6 +470,15 @@ The optional installed-client test `scripts.test_codex_hosted_tools` runs four a
 
 Both fixtures use fabricated provider responses and usage **only as labeled protocol fixtures**. They do not establish real model quality, paid usage, live cache hits, automatic Pi compaction, arbitrary-length histories, or cost savings. Two-summary RPC coverage proves repeated manual native summary/continuation, not Pi's automatic trigger. Standalone handler canary/HTTP-400 tests additionally verify content-free telemetry and byte-preserving forwarding, but are not a substitute for the complete pinned-Pi gateway path. A live comparison still requires successful candidate-source CI with verified built-commit/tree identity plus independent evidence/quality/cost gates. A compact arm that never rewrites proves only forwarding/review overhead, not savings.
 
+The integrated reviewer-cache fixture (`scripts/proxy_reviewer_cache_fixture.py`)
+adds nine model-free cases: explicit rotation/pruning/missing-usage, disabled and
+auto-generic/unknown implicit-prefix cases, implicit pruning/missing-usage, and
+unsupported explicit-model rejection. Both modes check actual raw primary parity,
+durable restart state, and native multi-item reviewer reasoning/phase replay.
+Positive, zero and missing cache receipts are **synthetic**, based on exact
+historical prefixes and settings; they do not establish live cache hits or
+provider acceptance of generated reasoning items.
+
 ### Local stats dashboard
 
 Open `/carry/dashboard` on the proxy (normally
@@ -526,16 +494,25 @@ claim local access. A local reverse proxy counts as a local peer, so it must
 enforce its own authentication before exposing these routes remotely.
 On a shared/non-loopback listener, configure a gateway token: dashboard stats
 are gateway-wide, not restricted to a single session.
-The endpoint only returns counters, hashes, ledger totals, and context sizes,
-not conversation text, reviewer memory, or credentials. All responses are
-`Cache-Control: no-store`.
+The endpoint returns counters, hashes, ledger totals, context sizes, and short
+session titles containing up to 80 characters from the first user message. These
+title excerpts can contain sensitive task text and are persisted in checkpoints.
+It does not return full messages, reviewer memory contents, or credentials.
+Stats cover every saved session in this proxy's state directory, not just the
+authenticated caller's session or tenant; anyone granted stats access can read
+those titles and totals. All responses are `Cache-Control: no-store`.
 
-The dashboard refreshes every two seconds while visible. It shows primary and
-reviewer usage separately, native cached-read share, cache writes, rewrites,
-failures, explicit history rebases, and retained/removed item counts. Retained
-input bytes are serialized bytes, **not** tokens. State is checkpoint-based,
-not a live stream of tokens. Unreadable checkpoints are flagged and totals are
-marked incomplete. Cost values are standard API equivalents, not subscription
+The dashboard refreshes every two seconds while visible. Session cards show
+title, activity, completed requests, rewrites/reviewer cleanups, estimated savings,
+removable/protected/unreviewed item counts, memory count, and the last planner
+capacity/payoff check. Expand a card's diagnostics for failures or incomplete
+coverage. The **Costs, coverage & diagnostics** section shows primary and reviewer
+native usage separately, cached-read share, cache writes and API-equivalent costs.
+**Inspect stats JSON** retains the detailed native-compaction, history-rebase,
+retained/removed item and serialized-byte counters; these are not all dedicated
+visible card fields. Retained input bytes are **not** tokens. State is
+checkpoint-based, not a live stream of tokens. Unreadable checkpoints are flagged
+and totals are marked incomplete. Cost values are standard API equivalents, not subscription
 charges, invoices, or measured savings; unpriced calls make the total unavailable
 while the known priced subtotal remains visible.
 
@@ -563,10 +540,12 @@ history mark the comparison
 unavailable, with coverage counters in stats JSON. This change does not backfill
 older checkpoints from raw traces. Dashboard comparison cards sum only sessions
 with complete estimates and display the included/total session count. Excluded
-sessions remain in usage totals and the session list, labeled `Excluded` with
-dashes for scenario values. With no eligible sessions, comparison cards show
-`No eligible sessions` rather than zero savings. Dashboard responses include only numerical
-scenario estimates, never the prior prompt kept privately for cache matching.
+sessions remain in usage totals and the session list; their savings read
+`Incomplete`, with diagnostics explaining missing coverage. With no eligible
+sessions, the top estimated-savings card shows `Not enough data`; the expanded
+Carry/traditional scenario cards show `No eligible sessions`, not zero savings.
+Scenario fields contain numerical estimates and coverage, never the prior prompt
+kept privately for cache matching; session title excerpts are disclosed above.
 See [the proxy backlog](proxy-backlog.md) for completed background review and
 consolidation with the shared main savings/report estimator.
 

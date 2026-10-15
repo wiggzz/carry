@@ -81,9 +81,11 @@ class Fixture:
                         self.close_connection = True
                         return
                     status, value = result
-                    raw = wire(value)
+                    # Subscription fixtures return actual terminal SSE frames.
+                    raw = value if isinstance(value, bytes) else wire(value)
                     self.send_response(status)
-                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Type", "text/event-stream" if isinstance(value, bytes)
+                                     else "application/json")
                     self.send_header("Content-Length", str(len(raw)))
                     self.send_header("Connection", "close")
                     self.end_headers()
@@ -127,6 +129,10 @@ class Proxy:
                 "--bootstrap-min-input-bytes", "8388608",
                 "--request-timeout-secs", "5", "--classifier-timeout-secs", "10",
                 *extra]
+        if not any(arg.startswith("--background-reviews") for arg in args):
+            args += ["--background-reviews=false"]
+        if "--payoff-requests" not in args:
+            args += ["--payoff-requests", "5"]
         self.process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if not select.select([self.process.stdout], [], [], 5)[0]:
@@ -377,7 +383,12 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(saved["review_feedback"]["rejected"][0]["index"], 0)
         proxy.close()
         proxy = self.proxy(fixture, options)
-        self.assertEqual(proxy.send(seed)[0], 200)
+        # A next-request plan may first prune source/control history. The next
+        # incremental update can then retire the shared fact within the budget.
+        for _ in range(2):
+            self.assertEqual(proxy.send(seed)[0], 200)
+            if len(fixture.reviews) >= 2:
+                break
         self.assertGreaterEqual(len(fixture.reviews), 2)
         self.assertEqual(proxy.saved()["memories"], [])
         self.assertFalse(any(r["source_id"] == 0 for r in proxy.saved()["active_shadow"]))
