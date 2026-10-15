@@ -115,6 +115,28 @@ fn incremental_reviewer_context_regressions() {
     );
 }
 
+// Source-bound PR144 behavior, separate from the unchanged incremental/5s
+// timeout regression. The same file runs against the provenance-bound baseline.
+#[test]
+fn pr144_review_behavior_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_review_regressions.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute source-bound PR144 loopback regressions");
+    assert!(
+        output.status.success(),
+        "PR144 behavioral regression failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn proxy_cli_serves_health_and_forwards_opaque_json() {
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

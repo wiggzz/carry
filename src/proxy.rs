@@ -2953,6 +2953,10 @@ async fn relay(
 }
 
 #[cfg(test)]
+#[path = "proxy_pr144_tests.rs"]
+mod pr144_regressions;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use carry::core::prefix_compatible;

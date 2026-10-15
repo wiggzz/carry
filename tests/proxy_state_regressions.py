@@ -81,9 +81,11 @@ class Fixture:
                         self.close_connection = True
                         return
                     status, value = result
-                    raw = wire(value)
+                    # Subscription fixtures return actual terminal SSE frames.
+                    raw = value if isinstance(value, bytes) else wire(value)
                     self.send_response(status)
-                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Type", "text/event-stream" if isinstance(value, bytes)
+                                     else "application/json")
                     self.send_header("Content-Length", str(len(raw)))
                     self.send_header("Connection", "close")
                     self.end_headers()
