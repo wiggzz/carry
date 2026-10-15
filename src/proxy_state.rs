@@ -584,33 +584,57 @@ impl Session {
             .filter(|g| g.replayable)
             .map(|g| g.id)
             .collect::<HashSet<_>>();
-        // A later observation may finish a previously pending tool step. Merge
-        // its native items before annotating so no user note separates the pair.
-        let mut sources = Vec::<(u64, Value)>::new();
-        for record in self
+        // Normal observations are immutable, complete native deltas. Legacy
+        // checkpoints may have split a call/result across records; only those
+        // groups need a structural rebuild before native replay.
+        let records = self
             .active_shadow
             .iter()
             .filter(|r| r.source_id != 0 && replayable.contains(&r.source_id))
-        {
-            let data = record.value["content"]
-                .as_str()
-                .and_then(|text| serde_json::from_str::<Value>(text).ok());
-            if let Some(data) = data {
-                if let Some((_, prior)) = sources.iter_mut().find(|(id, _)| *id == record.source_id)
-                {
-                    for field in ["items", "member_ids"] {
-                        if let Some(values) = data[field].as_array()
-                            && let Some(target) = prior[field].as_array_mut()
-                        {
-                            target.extend(values.iter().cloned());
-                        }
+            .filter_map(|r| {
+                r.value["content"]
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                    .map(|data| (r.source_id, data))
+            })
+            .collect::<Vec<_>>();
+        let split = records
+            .iter()
+            .filter_map(|(id, data)| {
+                let items = data["items"].as_array()?;
+                items
+                    .iter()
+                    .any(|item| {
+                        let counterpart = match item["type"].as_str() {
+                            Some("function_call") => "function_call_output",
+                            Some("function_call_output") => "function_call",
+                            Some("custom_tool_call") => "custom_tool_call_output",
+                            Some("custom_tool_call_output") => "custom_tool_call",
+                            _ => return false,
+                        };
+                        !items.iter().any(|other| {
+                            other["type"] == counterpart && other["call_id"] == item["call_id"]
+                        })
+                    })
+                    .then_some(*id)
+            })
+            .collect::<HashSet<_>>();
+        let mut sources = Vec::<(u64, Value)>::new();
+        for (source_id, data) in records {
+            if split.contains(&source_id)
+                && let Some((_, prior)) = sources.iter_mut().find(|(id, _)| *id == source_id)
+            {
+                for field in ["items", "member_ids"] {
+                    if let Some(values) = data[field].as_array()
+                        && let Some(target) = prior[field].as_array_mut()
+                    {
+                        target.extend(values.iter().cloned());
                     }
-                } else {
-                    sources.push((record.source_id, data));
                 }
+            } else {
+                sources.push((source_id, data));
             }
         }
-        sources.sort_by_key(|(id, _)| *id);
         let mut input = Vec::new();
         let removed = self
             .history
@@ -684,6 +708,7 @@ impl Session {
         input.push(json!({"role": "user", "content": json!({
             "eligible_group_ids": eligible, "current_groups": ledger,
             "current_task": current_task,
+            "quoted_primary_instructions": self.review_context.get("instructions"),
             "eligible_memory_ids": self.memories.iter().map(|m| format!("m{}", m.id)).collect::<Vec<_>>(),
             "current_memories": self.memories.iter().map(|m| json!({"memory_id":format!("m{}",m.id),"source_ids":m.source_ids.iter().map(|id|format!("g{id}")).collect::<Vec<_>>(),"text":m.text})).collect::<Vec<_>>(),
             "previous_review_feedback": self.review_feedback
@@ -756,6 +781,10 @@ impl Session {
                 json!(json!({"source_ids": sources, "text": memory.text}).to_string());
         }
         for group in groups {
+            // Observe a native reasoning/call/result delta only once complete.
+            if !group.replayable {
+                continue;
+            }
             // A legacy split cohort can retain a later member's observation
             // while its earlier reasoning window has retired. Rebuild that
             // group in canonical order, including its current annotation ID.
@@ -1007,6 +1036,10 @@ impl Session {
         });
         self.memories.retain(|m| !retired.contains(&m.id));
         self.memory_anchors.retain(|id, _| !retired.contains(id));
+        if !retired_facts.is_empty() {
+            // Answers and old ledgers can contain an unmaterialized fact too.
+            self.compact_reviewer();
+        }
         for ((sources, text), index) in memories.into_iter().zip(memory_indexes) {
             if self.memories.len() >= 128 {
                 reject("memories", index, "active memory limit of 128 reached");
@@ -1111,6 +1144,8 @@ impl Session {
         if self.review_history.take().is_some() {
             self.reviewer_compactions += 1;
         }
+        self.reviewer_cache.clear();
+        self.review_epoch = self.review_epoch.saturating_add(1);
     }
 }
 

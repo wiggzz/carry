@@ -1309,6 +1309,21 @@ fn review_source_input(session: &Session, groups: &[Group]) -> Vec<Value> {
     view.shadow_input_with_sources(groups, groups)
 }
 
+fn prepare_review_history(session: &mut Session, groups: &[Group]) {
+    session.observe_groups(groups);
+    let mut sources = review_source_input(session, groups);
+    sources.pop();
+    if session.review_history.as_ref().is_some_and(|history| {
+        sources.len() < history.source_len
+            || reviewer_serialized_identity(&sources[..history.source_len]).1
+                != history.source_sha256
+    }) {
+        // Legacy/native structural repairs are explicit reviewer rewrites,
+        // never a silent second retention policy. Opinions and facts survive.
+        session.compact_reviewer();
+    }
+}
+
 fn review_body_for_groups(config: &ProxyCli, session: &Session, groups: &[Group]) -> Value {
     let mut sources = review_source_input(session, groups);
     let nudge = sources.pop().expect("review state ledger");
@@ -1957,6 +1972,10 @@ fn merge_review(
     current.review_cache_key = reviewed.review_cache_key.clone();
     current.reviewer_cache = reviewed.reviewer_cache.clone();
     current.review_history = reviewed.review_history.clone();
+    current.reviewer_compactions += reviewed
+        .reviewer_compactions
+        .saturating_sub(before.reviewer_compactions);
+    current.review_epoch = reviewed.review_epoch;
     current.last_review_request = reviewed.last_review_request;
 }
 
@@ -1985,6 +2004,7 @@ async fn review(
     if !groups.iter().any(|g| g.exposed && !g.pinned) && session.memories.is_empty() {
         return false;
     }
+    prepare_review_history(session, &groups);
     let body = review_body_for_groups(&service.config, session, &groups);
     // Ordinary reviews are one incremental update. The live planner makes room
     // first; only oversized imports use multiple bounded admission rounds.
@@ -2074,6 +2094,7 @@ async fn review_import(
             }
             continue;
         }
+        prepare_review_history(session, &admitted);
         let body = review_body_for_groups(&service.config, session, &admitted);
         let Some(rates) = Rates::for_model(&service.config.classifier_model, estimate(&body))
         else {
@@ -2137,6 +2158,7 @@ async fn review_chunk(
     groups: &[Group],
     run: &mut ReviewRun,
 ) -> bool {
+    let replay_epoch = session.review_epoch;
     let mut admitted_sources = review_source_input(session, groups);
     admitted_sources.pop();
     // Membership can grow in a newer unfinished step while a frozen older
@@ -2278,7 +2300,10 @@ async fn review_chunk(
             trajectory.failed_call();
         }
     }
-    if valid && let Some(mut input) = reviewer_input(body) {
+    if valid
+        && session.review_epoch == replay_epoch
+        && let Some(mut input) = reviewer_input(body)
+    {
         input.remove(0); // static preamble is regenerated once per request
         input.extend(replay_output);
         session.review_history = Some(crate::proxy_state::ReviewHistory {
