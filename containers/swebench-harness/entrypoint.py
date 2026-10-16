@@ -44,7 +44,7 @@ payoff_requests = os.environ.get("CARRY_COMPACTION_PAYOFF_REQUESTS", "1")
 if (not payoff_requests.isascii() or not payoff_requests.isdecimal()
         or int(payoff_requests) < 1):
     parser.error("CARRY_COMPACTION_PAYOFF_REQUESTS must be a positive ASCII decimal integer")
-min_payback_percent = os.environ.get("CARRY_COMPACTION_MIN_PAYBACK_PERCENT", "25")
+min_payback_percent = os.environ.get("CARRY_COMPACTION_MIN_PAYBACK_PERCENT", "10")
 if (not min_payback_percent.isascii() or not min_payback_percent.isdecimal()
         or int(min_payback_percent) > 100):
     parser.error("CARRY_COMPACTION_MIN_PAYBACK_PERCENT must be an ASCII decimal integer from 0 through 100")

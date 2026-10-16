@@ -414,7 +414,7 @@ The protected `run-swebench.yml` workflow adds the following opt-in settings:
 | `proxy_classifier_effort` | `CARRY_PROXY_CLASSIFIER_EFFORT` | `low` |
 | `proxy_classifier_cache_policy` | `CARRY_PROXY_CLASSIFIER_CACHE_POLICY` | `openai-explicit` |
 | `proxy_payoff_requests` | `CARRY_PROXY_PAYOFF_REQUESTS` | `1` |
-| `proxy_min_payback_percent` | `CARRY_PROXY_MIN_PAYBACK_PERCENT` | `25` |
+| `proxy_min_payback_percent` | `CARRY_PROXY_MIN_PAYBACK_PERCENT` | `10` |
 
 Modes are `disabled`, `off`, `audit`, `compact`. Active modes require exactly one selected `codex` or `pi` harness. Retained cross-task session modes are explicitly rejected: this integration creates one fresh trusted sidecar per ordinary task slot, not a persistent sidecar across tasks. Payoff requests are integers 1–100; minimum payback is an integer 0–100. Classifier efforts are `minimal`, `low`, `medium`, `high`.
 

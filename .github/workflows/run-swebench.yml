@@ -55,7 +55,7 @@ on:
       carry_compaction_min_payback_percent:
         description: Carry minimum projected payoff saving as a percentage of the retained-path cost (0-100)
         required: true
-        default: "25"
+        default: "10"
         type: string
       carry_compaction_rollout_samples:
         description: Carry-only deterministic flat-drop rollout samples; zero disables the treatment
@@ -115,7 +115,7 @@ on:
       proxy_min_payback_percent:
         description: Proxy minimum joint saving percentage (integer 0-100)
         required: true
-        default: "25"
+        default: "10"
         type: string
       catalog_digest:
         description: Immutable prepare-50 catalog digest (sha256:... or 64 lowercase hex); required for model-bearing modes

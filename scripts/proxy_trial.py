@@ -111,7 +111,7 @@ def main():
     parser.add_argument('--classifier-cache-policy', choices=['auto','disabled','openai-explicit'],
         default='auto', help='Reviewer-only stable cache writes; explicit attests a trusted OpenAI gateway')
     parser.add_argument('--payoff-requests', default='1')
-    parser.add_argument('--min-payback-percent', default='25')
+    parser.add_argument('--min-payback-percent', default='10')
     parser.add_argument('--synchronous-reviews', action='store_true',
                         help='Run ordinary reviews synchronously for reproducible local trials')
     parser.add_argument('--timeout', type=int, default=300)

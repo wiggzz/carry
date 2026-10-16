@@ -96,7 +96,7 @@ pub struct ProxyCli {
     classifier_cache_policy: ClassifierCachePolicy,
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=100))]
     payoff_requests: u64,
-    #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u8).range(0..=100))]
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=100))]
     min_payback_percent: u8,
     /// Declare full-history turns before the latest user message as previously
     /// consumed context on a new lineage. Allows review before request one.
@@ -3109,6 +3109,7 @@ mod tests {
         assert_eq!(config.mode, Mode::Compact);
         assert!(config.background_reviews);
         assert_eq!(config.payoff_requests, 5);
+        assert_eq!(config.min_payback_percent, 10);
     }
 
     #[test]

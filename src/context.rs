@@ -8,7 +8,7 @@ use crate::protocol::ContextManagement;
 use carry::core::{horizon_cost, input_cost, prefix_compatible, select_removals};
 
 const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
-pub(crate) const DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT: u8 = 25;
+pub(crate) const DEFAULT_COMPACTION_MIN_PAYBACK_PERCENT: u8 = 10;
 const NEUTRAL_RECENCY_SCORE_SCALE: u64 = 1_000_000;
 #[cfg(test)]
 const NEUTRAL_TARGET_NUMERATOR: usize = 3;

@@ -9,7 +9,7 @@ DEFAULTS = {
     # This trusted lane has a fixed OpenAI upstream even behind the local gateway.
     'CARRY_PROXY_CLASSIFIER_CACHE_POLICY': 'openai-explicit',
     'CARRY_PROXY_PAYOFF_REQUESTS': '1',
-    'CARRY_PROXY_MIN_PAYBACK_PERCENT': '25',
+    'CARRY_PROXY_MIN_PAYBACK_PERCENT': '10',
 }
 
 
