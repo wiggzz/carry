@@ -95,7 +95,7 @@ model behavior; its inputs and branch costs are recorded in the compaction
 trace event.
 
 The deterministic fallback likewise requires projected savings to exceed the
-configured minimum-payback percentage (25% by default) of retained-path payoff
+configured minimum-payback percentage (10% by default) of retained-path payoff
 cost. This deliberately avoids rewrites that only barely repay their cache
 invalidation. A compaction still begins a new cache
 generation; the model-visible history is otherwise prefix-continuous.

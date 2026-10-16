@@ -463,7 +463,7 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
         "CARRY_COMPACTION_PAYOFF_REQUESTS", "1"
     )
     config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"] = values.get(
-        "CARRY_COMPACTION_MIN_PAYBACK_PERCENT", "25"
+        "CARRY_COMPACTION_MIN_PAYBACK_PERCENT", "10"
     )
     config["CARRY_COMPACTION_ROLLOUT_SAMPLES"] = values.get(
         "CARRY_COMPACTION_ROLLOUT_SAMPLES", "0"

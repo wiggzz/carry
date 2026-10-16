@@ -837,9 +837,9 @@ mod tests {
     }
 
     #[test]
-    fn compaction_min_payback_percent_defaults_to_twenty_five_and_is_bounded() {
+    fn compaction_min_payback_percent_defaults_to_ten_and_is_bounded() {
         let defaulted = Cli::try_parse_from(["carry", "continue"]).unwrap();
-        assert_eq!(defaulted.compaction_min_payback_percent, 25);
+        assert_eq!(defaulted.compaction_min_payback_percent, 10);
         let configured = Cli::try_parse_from([
             "carry",
             "--compaction-min-payback-percent",

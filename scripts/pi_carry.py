@@ -38,7 +38,7 @@ command = [carry_binary, 'proxy', '--listen', '127.0.0.1:8787',
            '--state-dir', str(run_dir / 'state'), '--mode', mode,
            '--classifier-model', reviewer_model, '--classifier-reasoning-effort', 'low',
            '--classifier-cache-policy', 'auto', '--review-replayed-history', '--payoff-requests', '1',
-           '--min-payback-percent', '25']
+           '--min-payback-percent', '10']
 if auth == 'codex':
     command.append('--codex-login')
 proxy = None

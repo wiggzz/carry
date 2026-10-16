@@ -64,7 +64,7 @@ class SmokeWorkerTests(unittest.TestCase):
         self.assertEqual(config["PI_VERSION"], "0.84.2")
         self.assertEqual(config["CARRY_COMPACTION_POLICY"], "economic")
         self.assertEqual(config["CARRY_COMPACTION_PAYOFF_REQUESTS"], "1")
-        self.assertEqual(config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"], "25")
+        self.assertEqual(config["CARRY_COMPACTION_MIN_PAYBACK_PERCENT"], "10")
         self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_SAMPLES"], "0")
         self.assertEqual(config["CARRY_COMPACTION_ROLLOUT_STOP_PROBABILITY_PERCENT"], "10")
         self.assertEqual(config["CARRY_COMPACTION_NEUTRAL_HIGH_WATERMARK_TOKENS"], "0")
@@ -98,7 +98,7 @@ class SmokeWorkerTests(unittest.TestCase):
         inputs = contents[True]["workflow_dispatch"]["inputs"]
         self.assertEqual(inputs["carry_compaction_neutral_high_watermark_tokens"]["default"], "0")
         self.assertEqual(inputs["carry_compaction_neutral_low_watermark_tokens"]["default"], "0")
-        self.assertEqual(inputs["carry_compaction_min_payback_percent"]["default"], "25")
+        self.assertEqual(inputs["carry_compaction_min_payback_percent"]["default"], "10")
 
     def test_workflow_benchmark_model_input_controls_protected_worker(self):
         workflow = pathlib.Path(__file__).parents[1] / ".github" / "workflows" / "run-swebench.yml"
