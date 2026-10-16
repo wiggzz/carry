@@ -63,9 +63,8 @@ with retaining the current history over the same projected cost model.
 `--compaction-min-payback-percent P` (or
 `CARRY_COMPACTION_MIN_PAYBACK_PERCENT=P`) makes that admission margin explicit:
 Carry compacts only when modeled savings exceed `P%` of the retain-path payoff cost.
-It accepts integer values from 0 through 100 and defaults to **25**. Carry previously
-used a hard-coded 10% gate; the new default more deliberately filters marginal
-rewrites. `0` means any strictly positive modeled saving; lower the value if
+It accepts integer values from 0 through 100 and defaults to **10**.
+`0` means any strictly positive modeled saving; lower the value if
 you need to admit more speculative rewrites.
 
 Without rollout sampling, the planner uses
@@ -127,10 +126,10 @@ and `trace.jsonl`.
 
 ## Experimental keep leases
 
-`--keep-lease-turns N` (or `CARRY_KEEP_LEASE_TURNS=N`) is disabled by default.
-When enabled, a model `protected` signal is a lease for `N` later model turns,
-not a permanent lock. Once one or more leases are due, Carry first asks the
-ordinary planner a metadata-only counterfactual: whether releasing **all** due,
+`--keep-lease-turns N` (or `CARRY_KEEP_LEASE_TURNS=N`) defaults to **8** in the
+native CLI and requires a positive value. A model `protected` signal arms a lease
+for `N` later model turns; becoming due does not itself release the item. Once one
+or more leases are due, Carry first asks the ordinary planner a metadata-only counterfactual: whether releasing **all** due,
 non-human leases could make a normal rewrite worthwhile. It emits no review
 unless that full release set qualifies, and it never emits a review when
 compaction is disabled.
