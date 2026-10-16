@@ -1,26 +1,28 @@
 # Context policy
 
-Carry keeps one chronological context ledger. It is designed to make a context
-rewrite an explicit, inspectable decision instead of a periodic summary.
+The native Carry agent keeps one chronological context ledger. It makes a context
+rewrite an explicit, inspectable decision instead of a periodic summary. For the
+standalone proxy, see the [proxy overview](../README.md#use-carry-as-a-standalone-context-proxy).
 
 ## Item lifecycle
 
-- Human messages and saved memories enter stable retention.
-- Tool interactions begin volatile.
-- Stable items stay retained by default.
-- Neutral volatile items remain in a recent working window and can be removed
-  when the planner needs room.
+- Human messages and saved memories enter protected retention.
+- Tool interactions begin eligible.
+- Protected items stay retained by default.
+- Neutral eligible items can be removed by a qualifying compaction. The neutral
+  working-set budget defaults to zero; configurable watermarks can retain a recent
+  working window.
 - The model can mark visible item IDs as `protected` or `removable`.
 
-Carry preserves the original order. A later stable message does not force an
-earlier volatile tool result to become stable. The stable cache frontier is the
-longest chronological prefix made entirely of stable items.
+Carry preserves the original order. A later protected message does not force an
+earlier eligible tool result to become protected. The protected cache frontier is
+the longest chronological prefix made entirely of protected items.
 
-Tool rounds end with one immutable marker such as `[context 2 volatile]`. A
+Tool rounds carry an ID-only marker such as `[context 2]`. A
 round atomically contains the provider-native assistant tool call and its matching
 function result, so compaction never leaves an orphaned tool result or tool call.
-The marker records the block's creation class; later retention changes never
-rewrite a historical marker.
+The marker does not expose the block's retention class or current signal; later
+retention changes do not change the marker text.
 
 ## Model signals
 
@@ -113,10 +115,10 @@ not bypass ordinary economic admission, cache-safety, human retention, or
 explicit model protection; it only removes the neutral-budget reason to retain
 an item.
 
-A compaction can remove explicitly removable items and selected neutral volatile
+A compaction can remove explicitly removable items and selected neutral eligible
 items, retain protected evidence, preserve chronology, and establish a new
-explicit cache frontier. After the first rewrite that removes history, Carry
-adds one stable status item stating that earlier context was removed.
+explicit cache frontier. When a rewrite leaves no status item, Carry appends an
+eligible status item stating that earlier context was removed.
 
 Use `--compaction-policy disabled` when you need a no-compaction control. Carry
 still records the session, but it never asks the planner to rewrite history.
