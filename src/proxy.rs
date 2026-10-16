@@ -705,6 +705,7 @@ async fn dashboard_stats(
             "updated_at": updated_at, "processing": processing,
             "last_failure": session.last_failure, "planner": planner,
             "id": id, "title": session.title(), "primary": session.primary, "shadow": session.shadow,
+            "client": session.client,
             "cost_estimate": estimate,
             "background_review_pending": session.background_review_pending,
             "completed_requests": session.completed_requests,
@@ -909,6 +910,10 @@ async fn forward(
         }
         let lock = session_lock(&service, &id).await;
         let mut session = load(&service, &id)?;
+        let (kind, agent_name) = client_provenance(&body);
+        if kind.is_some() || agent_name.is_some() {
+            session.client = Some(crate::proxy_state::ClientProvenance { kind, agent_name });
+        }
         if session.cost_trajectory.is_none() {
             let mut trajectory = crate::proxy_savings::Trajectory::default();
             trajectory.prior_untracked(session.primary.calls + session.shadow.calls);
@@ -2477,6 +2482,44 @@ async fn bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8
     Ok(bytes)
 }
 
+/// Bounded display-only metadata; never used to merge or identify histories.
+fn client_provenance(body: &Value) -> (Option<String>, Option<String>) {
+    let metadata = &body["client_metadata"];
+    let nested = metadata["x-codex-turn-metadata"]
+        .as_str()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or(Value::Null);
+    let field = |key: &str| {
+        metadata
+            .get(key)
+            .or_else(|| nested.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let session_type = metadata["session_kind"]
+        .as_str()
+        .filter(|kind| matches!(*kind, "conversation" | "agent" | "background"))
+        .map(str::to_owned)
+        .or_else(|| {
+            field("thread_source").and_then(|source| match source.as_str() {
+                "user" => Some("conversation".into()),
+                "subagent" => Some("agent".into()),
+                "thread_title" | "guardian_review" | "guardian_classifier" => {
+                    Some("background".into())
+                }
+                _ => None,
+            })
+        });
+    let agent_name = field("agent_name").filter(|name| {
+        !name.is_empty()
+            && name.len() <= 96
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/_-.".contains(&b))
+    });
+    (session_type, agent_name)
+}
+
 /// Identity is a small set of stable client IDs. Telemetry is forwarded upstream
 /// unchanged, but cannot fork Carry state or reviewer affinity between turns.
 fn stable_client_scope(body: &Value) -> Value {
@@ -3051,6 +3094,43 @@ mod tests {
             locks: Mutex::new(HashMap::new()),
             background_reviews: Mutex::new(HashSet::new()),
         }
+    }
+
+    #[test]
+    fn dashboard_client_provenance_is_bounded_and_optional() {
+        let body = json!({"client_metadata": {"x-codex-turn-metadata":
+            json!({"agent_name":"/root/worker", "thread_source":"subagent", "subagent_kind":"thread_spawn"}).to_string()}});
+        let (kind, agent) = client_provenance(&body);
+        assert_eq!(kind.as_deref(), Some("agent"));
+        assert_eq!(client_provenance(&json!({"client_metadata":{"session_kind":"conversation", "thread_source":"subagent"}})).0.as_deref(), Some("conversation"));
+        for source in ["thread_title", "guardian_review", "guardian_classifier"] {
+            assert_eq!(
+                client_provenance(&json!({"client_metadata":{"thread_source":source}}))
+                    .0
+                    .as_deref(),
+                Some("background")
+            );
+        }
+        for kind in ["conversation", "agent", "background"] {
+            assert_eq!(
+                client_provenance(&json!({"client_metadata":{"session_kind":kind}}))
+                    .0
+                    .as_deref(),
+                Some(kind)
+            );
+        }
+        assert_eq!(agent.as_deref(), Some("/root/worker"));
+        assert_eq!(client_provenance(&json!({})), (None, None));
+        assert_eq!(
+            client_provenance(
+                &json!({"client_metadata":{"agent_name":"<script>", "thread_source":"arbitrary"}})
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            client_provenance(&json!({"client_metadata":{"agent_name":"a".repeat(97)}})),
+            (None, None)
+        );
     }
 
     #[test]
