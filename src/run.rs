@@ -136,9 +136,9 @@ pub fn load_resume_state(session_dir: &Path) -> Result<ResumeState> {
             path.display()
         );
     }
-    ContextState::decode(&checkpoint.context.encode()?)?;
+    let context = ContextState::decode(&checkpoint.context.encode()?)?;
     Ok(ResumeState {
-        context: checkpoint.context,
+        context,
         model: checkpoint.model,
         prompt_cache_key: checkpoint.prompt_cache_key,
     })
@@ -2591,6 +2591,73 @@ mod tests {
                     .as_str()
                     .is_some_and(|output| output.contains("answer was delivered"))
         }));
+    }
+
+    #[test]
+    fn resume_checkpoint_preserves_memory_migration() {
+        for signal in ["neutral", "keep", "drop"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut context = ContextState::new("first task".into());
+            let source = context
+                .add_tool(
+                    vec![json!({"type": "function_call", "call_id": "call-1",
+                        "name": "shell", "arguments": "{}"})],
+                    json!({"type": "function_call_output", "call_id": "call-1",
+                        "output": "durable outcome"}),
+                )
+                .unwrap();
+            context.record_signals(
+                &crate::protocol::ContextManagement {
+                    remember: vec!["durable outcome".into()],
+                    ..Default::default()
+                },
+                source,
+            );
+            let mut checkpoint = serde_json::to_value(ContextCheckpoint {
+                version: CONTEXT_CHECKPOINT_VERSION,
+                model: "scripted".into(),
+                context,
+                prompt_cache_key: Some("resume-cache-key".into()),
+            })
+            .unwrap();
+            let memory = checkpoint["context"]["items"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|item| item["kind"] == "memory")
+                .unwrap();
+            memory["retention"] = json!("eligible");
+            memory["signal"] = json!(signal);
+            std::fs::write(
+                temp.path().join(CONTEXT_CHECKPOINT_FILE),
+                serde_json::to_vec(&checkpoint).unwrap(),
+            )
+            .unwrap();
+
+            let resumed = load_resume_state(temp.path()).unwrap();
+            let restored = serde_json::to_value(&resumed.context).unwrap();
+            let memory = restored["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["kind"] == "memory")
+                .unwrap();
+            assert_eq!(
+                memory["retention"],
+                if signal == "drop" {
+                    "eligible"
+                } else {
+                    "protected"
+                },
+                "resumed memory with {signal} signal"
+            );
+            assert_eq!(memory["signal"], signal);
+            assert_eq!(resumed.model, "scripted");
+            assert_eq!(
+                resumed.prompt_cache_key.as_deref(),
+                Some("resume-cache-key")
+            );
+        }
     }
 
     #[test]
