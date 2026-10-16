@@ -66,10 +66,18 @@ pub(super) struct ReviewerCacheBoundary {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(super) struct ClientProvenance {
+    pub kind: Option<String>,
+    pub agent_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(super) struct Session {
     pub version: u32,
     #[serde(default)]
     pub title: Option<String>,
+    #[serde(default)]
+    pub client: Option<ClientProvenance>,
     pub next_id: u64,
     pub history: Vec<Item>,
     pub pending_output: Vec<Value>,

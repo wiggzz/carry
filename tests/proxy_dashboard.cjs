@@ -1,7 +1,8 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const element = () => ({
+const element = (tagName = '') => ({
+  tagName,
   children: [], textContent: '', style: {}, setAttribute() {},
   replaceChildren(...items) { this.children = items; },
   append(...items) { this.children.push(...items); },
@@ -64,6 +65,30 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     assert.equal(cards().get(label), label==='Estimated savings · all time'?'Not enough data':'No eligible sessions');
   }
   assert.ok(elements.get('estimate-coverage').textContent.includes('Includes 0 of 2 sessions'));
+  data.sessions = [
+    {...session(1,2), id:'root', title:'Shared task', completed_requests:4, client:{kind:'conversation',agent_name:'/root'},
+      planner:{candidate:{keep:1,compact:0.8,savings:0.2},min_payback_percent:10,reviewer_estimated_tokens:120000, reviewer_required_tokens:153160, reviewer_context_tokens:300000}},
+    {...session(1,2), id:'child', title:'Shared task', completed_requests:2, client:{kind:'agent',agent_name:'/root/diagnosis'}},
+    {...session(1,2), id:'guardian', title:'Internal transcript', completed_requests:3, client:{kind:'background'}}
+  ];
+  await vm.runInContext('refresh()', sandbox);
+  assert.equal(elements.get('sessions').children.length, 1, 'same-title conversation histories share a visual group, not accounting');
+  assert.equal(elements.get('background-sessions').children.length, 1, 'client background traffic is kept separate');
+  assert.equal(cards().get('Completed requests'), '9', 'all histories still count toward totals');
+  assert.equal(cards().get('Carry scenario'), '$3.000000', 'grouping must not drop or duplicate receipts');
+  const walk = el => [el, ...(el.children || []).flatMap(walk)];
+  const nodes = walk(elements.get('sessions'));
+  assert.equal(nodes.filter(n=>n.tagName==='progress').length, 1, 'keep context budget bars, but no duplicate-looking payoff progress bar');
+  assert.ok(nodes.some(n=>n.textContent.includes('Agent · diagnosis')), 'agent role is client-reported, not guessed from titles');
+  assert.ok(nodes.some(n=>n.textContent==='120k'), 'display estimated input separately from capacity');
+  assert.ok(nodes.some(n=>n.textContent.includes('153.2k reserved of 300k budget')), '300k is a budget, not token usage');
+  assert.ok(nodes.some(n=>n.textContent.includes('diagnosis')), 'distinguish inherited subagent histories');
+  data.sessions[1].client=null;
+  await vm.runInContext('refresh()', sandbox);
+  assert.ok(walk(elements.get('sessions')).some(n=>n.textContent.includes('Unclassified · child')), 'a shared title alone must never imply an agent role');
+  data.sessions[1].title='Unrelated task';
+  await vm.runInContext('refresh()', sandbox);
+  assert.equal(elements.get('sessions').children.length, 2, 'different titles remain separate');
   data.sessions = [];
   await vm.runInContext('refresh()', sandbox);
   assert.equal(cards().get('Estimated savings · all time'), 'Not enough data');

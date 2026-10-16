@@ -787,7 +787,7 @@ async fn dashboard_is_public_locally_and_reports_stats_without_conversation_cont
     for session in ["one", "two"] {
         let response = client.post(format!("{url}/v1/responses"))
             .bearer_auth("dashboard-token").header("x-carry-session",session)
-            .json(&json!({"model":"gpt-6-luna", "input":[{"role":"user","content":format!("{} PRIVATE_TASK_DO_NOT_EXPOSE", "Session title ".repeat(10))}]}))
+            .json(&json!({"model":"gpt-6-luna", "client_metadata":if session=="one" {json!({"x-codex-turn-metadata":json!({"thread_source":"subagent","agent_name":"/root/worker","parent_thread_id":"PRIVATE_PARENT_DO_NOT_EXPOSE"}).to_string()})}else{json!({"session_kind":"conversation","agent_name":"generic-client"})}, "input":[{"role":"user","content":format!("{} PRIVATE_TASK_DO_NOT_EXPOSE", "Session title ".repeat(10))}]}))
             .send().await.unwrap();
         assert!(response.status().is_success());
         response.bytes().await.unwrap();
@@ -801,6 +801,27 @@ async fn dashboard_is_public_locally_and_reports_stats_without_conversation_cont
     assert_eq!(data["reviewer_cache_mode"], "provider-implicit");
     assert_eq!(data["classifier_explicit_cache"], false);
     assert_eq!(data["sessions"].as_array().unwrap().len(), 2);
+    let histories = data["sessions"].as_array().unwrap();
+    assert_eq!(
+        histories
+            .iter()
+            .filter(|s| s["client"]["kind"] == "agent")
+            .count(),
+        1
+    );
+    assert_eq!(
+        histories
+            .iter()
+            .filter(|s| s["client"]["kind"] == "conversation")
+            .count(),
+        1
+    );
+    let subagent = histories
+        .iter()
+        .find(|s| s["client"]["kind"] == "agent")
+        .unwrap();
+    assert_eq!(subagent["client"]["agent_name"], "/root/worker");
+    assert!(!data.to_string().contains("PRIVATE_PARENT_DO_NOT_EXPOSE"));
     for session in data["sessions"].as_array().unwrap() {
         assert!(
             session["title"]
