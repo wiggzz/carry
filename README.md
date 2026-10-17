@@ -192,8 +192,15 @@ Interactive startup opens the local, token-free stats dashboard. Reusing the
 state directory (by default `$CARRY_HOME/proxy` or `~/.carry/proxy`) preserves committed state
 and cumulative dashboard totals across restarts and working directories. Full per-session
 `.jsonl` request/response/plan logs are disabled by default; enable them explicitly
-with `carry proxy --verbose` for debugging. These logs contain sensitive task content,
-grow without rotation, and should be protected and removed when no longer needed. See the
+with `carry proxy --verbose` for debugging. They contain sensitive task content and
+use bounded whole-file retention (64 KiB per record, 256 KiB per lane, 1 MiB total).
+A separate default operational journal in `STATE_DIR/diagnostics/*.jsonl` records
+sanitized, correlated review/compaction decisions (16 KiB per record, 64 KiB per
+lane, 256 KiB total). Oversized records are dropped, never truncated JSON. Logging
+is best-effort and independent of checkpoints and lifetime accounting. Dormant raw
+logs remain untouched on a default restart; enabling verbose capture brings legacy
+raw logs into retention. Export needed evidence before eviction and protect raw
+traces. See [diagnostic semantics](docs/proxy-benchmarking.md#bounded-proxy-diagnostics) and the
 [standalone proxy setup](docs/proxy-benchmarking.md#standalone-proxy)
 for API-key authentication, client configuration, and replay-import boundaries.
 Session identity uses stable client/thread/agent identifiers; per-turn telemetry
