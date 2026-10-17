@@ -3387,7 +3387,7 @@ async fn relay(
                     &commit.id,
                     &commit.request_id,
                     "primary_failed",
-                    &json!({"http_status":status.as_u16(),"complete_transport":complete_transport,"candidate_discarded":true,"error":observed.as_ref().map(|v| crate::proxy_sse::safe_error(&v["error"])).unwrap_or_else(|| json!({}))}),
+                    &json!({"reason":reason,"http_status":status.as_u16(),"complete_transport":complete_transport,"candidate_discarded":true,"error":observed.as_ref().map(|v| crate::proxy_sse::safe_error(&v["error"])).unwrap_or_else(|| json!({}))}),
                 );
             }
         }

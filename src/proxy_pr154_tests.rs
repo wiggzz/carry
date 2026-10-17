@@ -4,6 +4,13 @@ const PR154_RAW_RECORD_MAX: usize = 64 * 1024;
 const PR154_RAW_SESSION_MAX: u64 = 256 * 1024;
 const PR154_RAW_GLOBAL_MAX: u64 = 1024 * 1024;
 
+// Exercise the same hashed filenames as real explicit-session requests.
+fn pr154_session_id(session: &str) -> String {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-carry-session", session.parse().unwrap());
+    identity(&headers).unwrap().unwrap()
+}
+
 fn pr154_log_files(directory: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(directory).unwrap() {
@@ -35,7 +42,7 @@ fn pr154_verbose_oversized_record_is_bounded() {
     service.config.verbose = true;
     trace(
         &service,
-        "small",
+        &pr154_session_id("small"),
         "primary_received",
         &json!({"fixture": "small-raw-control"}),
     )
@@ -50,7 +57,7 @@ fn pr154_verbose_oversized_record_is_bounded() {
     );
     trace(
         &service,
-        "large",
+        &pr154_session_id("large"),
         "primary_received",
         &json!({"input": "x".repeat(PR154_RAW_RECORD_MAX * 2)}),
     )
@@ -72,27 +79,28 @@ fn pr154_verbose_oversized_record_is_bounded() {
 #[test]
 fn pr154_verbose_session_retention_survives_restart_without_evicting_checkpoint() {
     let directory = tempfile::tempdir().unwrap();
+    let id = pr154_session_id("lane");
     let payload = json!({"input": "x".repeat(16 * 1024)});
     let checkpoint;
     {
         let mut service = checkpoint_service(directory.path());
         service.config.verbose = true;
-        save(&service, "lane", &Session::default()).unwrap();
-        checkpoint = std::fs::read(directory.path().join("lane.json")).unwrap();
+        save(&service, &id, &Session::default()).unwrap();
+        checkpoint = std::fs::read(directory.path().join(format!("{id}.json"))).unwrap();
         for _ in 0..10 {
-            trace(&service, "lane", "primary_received", &payload).unwrap();
+            trace(&service, &id, "primary_received", &payload).unwrap();
         }
     }
     let mut restarted = checkpoint_service(directory.path());
     restarted.config.verbose = true;
     for _ in 0..10 {
-        trace(&restarted, "lane", "primary_received", &payload).unwrap();
+        trace(&restarted, &id, "primary_received", &payload).unwrap();
     }
     assert_eq!(
-        std::fs::read(directory.path().join("lane.json")).unwrap(),
+        std::fs::read(directory.path().join(format!("{id}.json"))).unwrap(),
         checkpoint
     );
-    assert_eq!(load(&restarted, "lane").unwrap().completed_requests, 0);
+    assert_eq!(load(&restarted, &id).unwrap().completed_requests, 0);
     let bytes = pr154_log_bytes(directory.path());
     assert!(
         bytes > 0,
@@ -114,7 +122,7 @@ fn pr154_verbose_global_retention_bounds_many_sessions_across_restart() {
         for lane in 0..40 {
             trace(
                 &service,
-                &format!("lane-{}", batch * 40 + lane),
+                &pr154_session_id(&format!("lane-{}", batch * 40 + lane)),
                 "primary_received",
                 &payload,
             )

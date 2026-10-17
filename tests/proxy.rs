@@ -1912,20 +1912,26 @@ async fn branch_tenant_and_restart_are_explicit_and_credentials_are_not_persiste
         .await
         .unwrap();
     assert_eq!(models["data"][0]["id"], "gpt-6-luna");
-    for entry in std::fs::read_dir(state.path())
-        .unwrap()
-        .filter_map(Result::ok)
-    {
-        let data = std::fs::read(entry.path()).unwrap();
-        let text = String::from_utf8_lossy(&data);
-        assert!(!text.contains("fixture-primary"));
-        assert!(!text.contains("fixture-shadow"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(entry.metadata().unwrap().permissions().mode() & 0o077, 0);
+    fn assert_private_state(directory: &std::path::Path) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(entry.metadata().unwrap().permissions().mode() & 0o077, 0);
+            }
+            if entry.file_type().unwrap().is_dir() {
+                assert_private_state(&entry.path());
+            } else {
+                let data = std::fs::read(entry.path()).unwrap();
+                let text = String::from_utf8_lossy(&data);
+                assert!(!text.contains("fixture-primary"));
+                assert!(!text.contains("fixture-shadow"));
+            }
         }
     }
+    // Cover every persisted file, including the nested operational journal.
+    assert_private_state(state.path());
 }
 
 #[tokio::test]

@@ -84,7 +84,20 @@ fn files(directory: &Path) -> std::io::Result<Vec<(PathBuf, u64, SystemTime)>> {
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "jsonl") && entry.file_type()?.is_file() {
+        // identity() has always named session logs with a lowercase SHA-256.
+        // Raw logs share the root with independent benchmark/export artifacts;
+        // neither eviction nor restart validation owns arbitrary JSONL files.
+        let owned = path.extension().is_some_and(|ext| ext == "jsonl")
+            && path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|id| {
+                    id.len() == 64
+                        && id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                });
+        if owned && entry.file_type()?.is_file() {
             let meta = entry.metadata()?;
             files.push((path, meta.len(), meta.modified().unwrap_or(UNIX_EPOCH)));
         }
@@ -222,7 +235,10 @@ fn append(
             (
                 config.mode,
                 config.classifier_cache_policy,
-                config.background_reviews
+                config.background_reviews,
+                &config.classifier_reasoning_effort,
+                config.review_replayed_history,
+                config.bootstrap_min_input_bytes
             )
         ));
         policy.update(format!(

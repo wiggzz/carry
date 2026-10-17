@@ -10,11 +10,12 @@ fn pr154_journal(directory: &Path, id: &str) -> Vec<Value> {
 #[test]
 fn pr154_journal_caps_are_independent_concurrent_and_restart_safe() {
     let directory = tempfile::tempdir().unwrap();
-    let raw = directory.path().join("untouched.jsonl");
+    let id = pr154_session_id("checkpoint");
+    let raw = directory.path().join(format!("{id}.jsonl"));
     std::fs::write(&raw, b"old opted-in evidence\n").unwrap();
     let service = checkpoint_service(directory.path());
-    save(&service, "checkpoint", &Session::default()).unwrap();
-    let checkpoint = std::fs::read(directory.path().join("checkpoint.json")).unwrap();
+    save(&service, &id, &Session::default()).unwrap();
+    let checkpoint = std::fs::read(directory.path().join(format!("{id}.json"))).unwrap();
     for _ in 0..2 {
         let service = checkpoint_service(directory.path());
         logging::maintain(&service);
@@ -26,7 +27,7 @@ fn pr154_journal_caps_are_independent_concurrent_and_restart_safe() {
                     for _ in 0..40 {
                         journal(
                             service,
-                            &format!("lane-{lane}"),
+                            &pr154_session_id(&format!("lane-{lane}")),
                             "request",
                             "fixture",
                             &data,
@@ -52,7 +53,7 @@ fn pr154_journal_caps_are_independent_concurrent_and_restart_safe() {
     }
     assert_eq!(std::fs::read(&raw).unwrap(), b"old opted-in evidence\n");
     assert_eq!(
-        std::fs::read(directory.path().join("checkpoint.json")).unwrap(),
+        std::fs::read(directory.path().join(format!("{id}.json"))).unwrap(),
         checkpoint
     );
 }
@@ -60,13 +61,17 @@ fn pr154_journal_caps_are_independent_concurrent_and_restart_safe() {
 #[test]
 fn pr154_journal_oversize_io_and_partial_restart_are_fail_open() {
     let directory = tempfile::tempdir().unwrap();
+    let id = pr154_session_id("lane");
     let service = checkpoint_service(directory.path());
-    journal(&service, "lane", "request", "small", &json!({"count":1}));
-    let path = directory.path().join("diagnostics/lane.jsonl");
+    journal(&service, &id, "request", "small", &json!({"count":1}));
+    let path = directory
+        .path()
+        .join("diagnostics")
+        .join(format!("{id}.jsonl"));
     let before = std::fs::read(&path).unwrap();
     journal(
         &service,
-        "lane",
+        &id,
         "request",
         "large",
         &json!({"counts":vec![123u64; 10000]}),
@@ -82,34 +87,38 @@ fn pr154_journal_oversize_io_and_partial_restart_are_fail_open() {
         .write_all(b"{\"partial\":")
         .unwrap();
     logging::maintain(&service);
-    journal(&service, "lane", "request", "restarted", &json!({}));
-    let events = pr154_journal(directory.path(), "lane");
+    journal(&service, &id, "request", "restarted", &json!({}));
+    let events = pr154_journal(directory.path(), &id);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["event"], "restarted");
     assert!(events[0]["dropped_before"].as_u64().unwrap() > 0);
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
-    journal(&service, "lane", "request", "io_failure", &json!({}));
-    save(&service, "lane", &Session::default()).unwrap();
-    assert_eq!(load(&service, "lane").unwrap().completed_requests, 0);
+    journal(&service, &id, "request", "io_failure", &json!({}));
+    save(&service, &id, &Session::default()).unwrap();
+    assert_eq!(load(&service, &id).unwrap().completed_requests, 0);
     assert!(path.is_dir());
 }
 
 #[test]
 fn pr154_verbose_legacy_maintenance_never_touches_checkpoint_or_symlink() {
     let directory = tempfile::tempdir().unwrap();
+    let id = pr154_session_id("lane");
+    let link_id = pr154_session_id("link");
     let mut service = checkpoint_service(directory.path());
-    save(&service, "lane", &Session::default()).unwrap();
-    let checkpoint = std::fs::read(directory.path().join("lane.json")).unwrap();
-    let raw = directory.path().join("legacy.jsonl");
+    save(&service, &id, &Session::default()).unwrap();
+    let checkpoint = std::fs::read(directory.path().join(format!("{id}.json"))).unwrap();
+    // Legacy production traces already used identity() hashes; legacy.jsonl
+    // would instead represent an unrelated artifact outside raw ownership.
+    let raw = directory.path().join(format!("{id}.jsonl"));
     let oversized = json!({"input":"x".repeat(100 * 1024)}).to_string() + "\n";
     std::fs::write(&raw, oversized.as_bytes()).unwrap();
-    let temporary = directory.path().join(".lane.tmp");
+    let temporary = directory.path().join(format!(".{id}.tmp"));
     std::fs::write(&temporary, b"checkpoint temporary").unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(
-        directory.path().join("lane.json"),
-        directory.path().join("link.jsonl"),
+        directory.path().join(format!("{id}.json")),
+        directory.path().join(format!("{link_id}.jsonl")),
     )
     .unwrap();
     logging::maintain(&service);
@@ -121,13 +130,13 @@ fn pr154_verbose_legacy_maintenance_never_touches_checkpoint_or_symlink() {
         "legacy oversized record must enter the opt-in cap"
     );
     assert_eq!(
-        std::fs::read(directory.path().join("lane.json")).unwrap(),
+        std::fs::read(directory.path().join(format!("{id}.json"))).unwrap(),
         checkpoint
     );
     assert_eq!(std::fs::read(temporary).unwrap(), b"checkpoint temporary");
     #[cfg(unix)]
     assert!(
-        std::fs::symlink_metadata(directory.path().join("link.jsonl"))
+        std::fs::symlink_metadata(directory.path().join(format!("{link_id}.jsonl")))
             .unwrap()
             .file_type()
             .is_symlink()
@@ -137,21 +146,32 @@ fn pr154_verbose_legacy_maintenance_never_touches_checkpoint_or_symlink() {
 #[test]
 fn pr154_raw_retention_and_verbose_restart_preserve_independent_jsonl() {
     let directory = tempfile::tempdir().unwrap();
-    let legacy_id = format!("{:x}", Sha256::digest(b"pr154-legacy-trace"));
-    let active_id = format!("{:x}", Sha256::digest(b"pr154-active-trace"));
+    let legacy_id = pr154_session_id("pr154-legacy-trace");
+    let active_id = pr154_session_id("pr154-active-trace");
     let legacy = directory.path().join(format!("{legacy_id}.jsonl"));
     let active = directory.path().join(format!("{active_id}.jsonl"));
     // Valid, small JSON records exceed the raw lane budget only in aggregate.
     let record = json!({"padding":"x".repeat(1024)}).to_string() + "\n";
     let bytes = record.repeat(300).into_bytes();
     assert!(bytes.len() > 256 * 1024);
-    let artifacts =
-        ["benchmark-events.jsonl", "unrelated.jsonl"].map(|name| directory.path().join(name));
+    let artifacts = [
+        ("benchmark-events.jsonl".to_owned(), bytes.as_slice()),
+        ("unrelated.jsonl".to_owned(), bytes.as_slice()),
+        (format!("{}.jsonl", "a".repeat(63)), bytes.as_slice()),
+        (format!("{}.jsonl", "a".repeat(65)), bytes.as_slice()),
+        (format!("{}.jsonl", "A".repeat(64)), bytes.as_slice()),
+        (format!("{}.jsonl", "g".repeat(64)), bytes.as_slice()),
+        // Below all byte caps: only restart's JSON/partial-line validation
+        // could destroy these independently owned artifacts.
+        ("partial.jsonl".to_owned(), b"{\"partial\":".as_slice()),
+        ("invalid.jsonl".to_owned(), b"not JSON\n".as_slice()),
+    ]
+    .map(|(name, expected)| (directory.path().join(name), expected));
     let mut observations = Vec::new();
     for restart in [false, true] {
-        // Reseed both paths so restart is exercised even when append deletes them.
-        for path in &artifacts {
-            std::fs::write(path, &bytes).unwrap();
+        // Reseed every artifact so restart runs even if append deletes one.
+        for (path, expected) in &artifacts {
+            std::fs::write(path, expected).unwrap();
         }
         std::fs::write(&legacy, &bytes).unwrap();
         let mut service = checkpoint_service(directory.path());
@@ -165,13 +185,15 @@ fn pr154_raw_retention_and_verbose_restart_preserve_independent_jsonl() {
         assert!(!legacy.exists(), "owned hash-named traces must still evict");
         observations.push((
             restart,
-            artifacts.each_ref().map(|path| std::fs::read(path).ok()),
+            artifacts
+                .each_ref()
+                .map(|(path, _)| std::fs::read(path).ok()),
         ));
     }
     for (restart, observed) in observations {
-        for (path, actual) in artifacts.iter().zip(observed) {
+        for ((path, expected), actual) in artifacts.iter().zip(observed) {
             assert!(
-                actual.as_deref() == Some(bytes.as_slice()),
+                actual.as_deref() == Some(*expected),
                 "independent artifact {} must be byte-preserved (restart={restart})",
                 path.display()
             );
@@ -180,8 +202,40 @@ fn pr154_raw_retention_and_verbose_restart_preserve_independent_jsonl() {
 }
 
 #[test]
+fn pr154_policy_identity_tracks_reasoning_and_replay_bootstrap_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let id = pr154_session_id("lane");
+    let mut service = checkpoint_service(directory.path());
+    journal(&service, &id, "request", "policy", &json!({}));
+    service.config.classifier_reasoning_effort = "PRIVATE_REASONING".into();
+    journal(&service, &id, "request", "policy", &json!({}));
+    service.config.review_replayed_history = !service.config.review_replayed_history;
+    journal(&service, &id, "request", "policy", &json!({}));
+    service.config.bootstrap_min_input_bytes += 1;
+    journal(&service, &id, "request", "policy", &json!({}));
+    let events = pr154_journal(directory.path(), &id);
+    assert_eq!(events.len(), 4);
+    let policies: HashSet<_> = events
+        .iter()
+        .map(|event| event["policy_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        policies.len(),
+        4,
+        "each effective policy change needs a distinct identity"
+    );
+    assert!(policies.iter().all(|policy| policy.len() == 64));
+    assert!(
+        !serde_json::to_string(&events)
+            .unwrap()
+            .contains("PRIVATE_REASONING")
+    );
+}
+
+#[test]
 fn pr154_usage_diagnostics_are_numeric_and_preserve_censoring() {
     let directory = tempfile::tempdir().unwrap();
+    let id = pr154_session_id("lane");
     let service = checkpoint_service(directory.path());
     for response in [
         json!({"status":"PRIVATE_STATUS","service_tier":"PRIVATE_TIER","usage":{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cached_tokens":0,"private":"PRIVATE_USAGE"},"private":"PRIVATE_USAGE"},"output":[{"name":"PRIVATE_TOOL"}]}),
@@ -191,7 +245,7 @@ fn pr154_usage_diagnostics_are_numeric_and_preserve_censoring() {
     ] {
         logging::usage(
             &service,
-            "lane",
+            &id,
             "request",
             "primary",
             Some(&response),
@@ -199,7 +253,7 @@ fn pr154_usage_diagnostics_are_numeric_and_preserve_censoring() {
             true,
         );
     }
-    let events = pr154_journal(directory.path(), "lane");
+    let events = pr154_journal(directory.path(), &id);
     assert_eq!(events.len(), 4);
     let data: Vec<_> = events.iter().map(|event| &event["data"]).collect();
     assert_eq!(data[0]["usage_available"], true);
@@ -215,6 +269,7 @@ fn pr154_usage_diagnostics_are_numeric_and_preserve_censoring() {
 #[tokio::test]
 async fn pr154_skip_reasons_execute_real_review_gates_without_provider_calls() {
     let directory = tempfile::tempdir().unwrap();
+    let id = pr154_session_id("lane");
     let mut service = checkpoint_service(directory.path());
     service.config.classifier_url = Some("http://127.0.0.1:1/review".into());
     let mut session = Session::default();
@@ -222,15 +277,15 @@ async fn pr154_skip_reasons_execute_real_review_gates_without_provider_calls() {
         request_id: "request".into(),
         ..ReviewRun::default()
     };
-    assert!(!review(&service, "lane", &mut session, &json!({}), false, &mut run).await);
+    assert!(!review(&service, &id, &mut session, &json!({}), false, &mut run).await);
     session.completed_requests = 1;
-    assert!(!review(&service, "lane", &mut session, &json!({}), false, &mut run).await);
+    assert!(!review(&service, &id, &mut session, &json!({}), false, &mut run).await);
     observe_source(&mut session, "goal");
     observe_source(&mut session, "PRIVATE_EVIDENCE");
     observe_source(&mut session, "current");
     service.config.classifier_max_input_bytes = 1;
-    assert!(!review(&service, "lane", &mut session, &json!({}), false, &mut run).await);
-    let reasons: Vec<_> = pr154_journal(directory.path(), "lane")
+    assert!(!review(&service, &id, &mut session, &json!({}), false, &mut run).await);
+    let reasons: Vec<_> = pr154_journal(directory.path(), &id)
         .iter()
         .map(|event| event["data"]["reason"].clone())
         .collect();
@@ -247,6 +302,7 @@ async fn pr154_skip_reasons_execute_real_review_gates_without_provider_calls() {
 
 #[tokio::test]
 async fn pr154_background_timeline_keeps_trigger_id_and_stale_spend() {
+    let id = pr154_session_id("lane");
     for stale in [false, true] {
         let release = Arc::new(tokio::sync::Notify::new());
         let started = Arc::new(tokio::sync::Notify::new());
@@ -273,7 +329,7 @@ async fn pr154_background_timeline_keeps_trigger_id_and_stale_spend() {
         session.completed_requests = 1;
         dispatch_review_for(
             service.clone(),
-            "lane".into(),
+            id.clone(),
             &mut session,
             json!({}),
             "trigger".into(),
@@ -284,32 +340,32 @@ async fn pr154_background_timeline_keeps_trigger_id_and_stale_spend() {
             .unwrap();
         dispatch_review_for(
             service.clone(),
-            "lane".into(),
+            id.clone(),
             &mut session,
             json!({}),
             "later".into(),
         )
         .await;
         if stale {
-            let _lock = session_lock(&service, "lane").await;
-            let mut current = load(&service, "lane").unwrap();
+            let _lock = session_lock(&service, &id).await;
+            let mut current = load(&service, &id).unwrap();
             current.reset_active();
-            save(&service, "lane", &current).unwrap();
+            save(&service, &id, &current).unwrap();
         }
         release.notify_one();
         tokio::time::timeout(Duration::from_secs(3), async {
-            while service.background_reviews.lock().await.contains("lane") {
+            while service.background_reviews.lock().await.contains(&id) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
-        let saved = load(&service, "lane").unwrap();
+        let saved = load(&service, &id).unwrap();
         assert_eq!(saved.shadow.calls, 1);
         assert_eq!(saved.shadow.unavailable_cost_calls, 0);
         assert!(!saved.background_review_pending);
         assert_eq!(saved.opinions.is_empty(), stale);
-        let entries = pr154_journal(directory.path(), "lane");
+        let entries = pr154_journal(directory.path(), &id);
         let expected = if stale {
             "background_review_discarded"
         } else {
@@ -451,7 +507,8 @@ async fn pr154_selected_main_audit_rollback_and_reviewer_only_use_real_forwardin
                     .any(|event| event["event"] == "primary_committed")
             );
             assert!(events.iter().any(|event| event["event"] == "primary_failed"
-                && event["data"]["candidate_discarded"] == true));
+                && event["data"]["candidate_discarded"] == true
+                && event["data"]["reason"] == "upstream HTTP error"));
         } else {
             let committed = events
                 .iter()
