@@ -63,7 +63,7 @@ def contract_proxy(test, provider, state_dir, mode='audit', binary=None):
         test.skipTest('requires an existing Carry binary; never builds locally')
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('OPENAI_', 'CARRY_PROXY_'))}
-    command = [str(binary), 'proxy', '--listen', '127.0.0.1:0',
+    command = [str(binary), 'proxy', '--verbose', '--listen', '127.0.0.1:0',
                '--upstream-url', provider.url + '/v1/responses',
                '--classifier-url', provider.url + '/review', '--mode', mode,
                '--min-payback-percent', '0', '--payoff-requests', '5',
@@ -363,7 +363,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                        XDG_CONFIG_HOME=str(home / '.config'),
                        CARRY_PROXY_UPSTREAM_KEY='synthetic-fixture-key',
                        CARRY_PROXY_CLASSIFIER_KEY='synthetic-fixture-key')
-            command = [str(binary), 'proxy', '--listen', '127.0.0.1:0',
+            command = [str(binary), 'proxy', '--verbose', '--listen', '127.0.0.1:0',
                        '--upstream-url', fixture.url + '/v1/responses',
                        '--classifier-url', fixture.url + '/classifier',
                        '--classifier-model', 'gpt-6-luna', '--mode', 'audit',

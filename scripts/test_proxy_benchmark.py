@@ -236,6 +236,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
         self.assertEqual(proxy.provenance(values).get('classifier_cache_policy'), 'openai-explicit')
         command = proxy.sidecar_command(image='fixed-image', name='fixture', network='fixed',
             state_dir=pathlib.Path('/nonsecret-fixture'), config=config)
+        self.assertIn('--verbose', command)
         self.assertIn('--classifier-cache-policy', command)
         self.assertEqual(command[command.index('--classifier-cache-policy') + 1], 'openai-explicit')
 

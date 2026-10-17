@@ -105,7 +105,7 @@ def run_case(args,case):
         gateway=Gateway(port,fixture.server.server_port,policy)
         proxy=None
         try:
-            command=[args.carry,'proxy','--listen',f'127.0.0.1:{port}',
+            command=[args.carry,'proxy','--verbose','--listen',f'127.0.0.1:{port}',
                 '--upstream-url',fixture.url+'/v1/responses','--classifier-url',gateway.url+'/v1/responses',
                 '--state-dir',str(state_dir),'--mode',mode,'--payoff-requests','5','--min-payback-percent','0',
                 '--background-reviews=false']

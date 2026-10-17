@@ -60,7 +60,7 @@ def sidecar_command(*, image, name, network, state_dir, config):
         '--mount', f'type=bind,src={state_dir.resolve()},dst=/proxy-state',
         '--env', 'CARRY_PROXY_UPSTREAM_KEY', '--env', 'CARRY_PROXY_CLASSIFIER_KEY',
         '--env', 'CARRY_PROXY_AUTH_TOKEN', '--entrypoint', '/opt/swebench-harness/bin/carry',
-        image, 'proxy', '--listen', '0.0.0.0:8787',
+        image, 'proxy', '--verbose', '--listen', '0.0.0.0:8787',
         '--upstream-url', 'https://api.openai.com/v1/responses',
         '--classifier-url', 'http://openai-proxy:8080/v1/responses',
         '--state-dir', '/proxy-state', '--mode', config['CARRY_PROXY_MODE'],
