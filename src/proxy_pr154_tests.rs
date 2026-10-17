@@ -66,7 +66,7 @@ fn pr154_verbose_oversized_record_is_bounded() {
         let text = std::fs::read_to_string(path).unwrap();
         for line in text.lines() {
             assert!(
-                line.len() + 1 <= PR154_RAW_RECORD_MAX,
+                line.len() < PR154_RAW_RECORD_MAX,
                 "PR154: one verbose record must not exceed 64 KiB (including newline); got {}",
                 line.len() + 1
             );

@@ -90,7 +90,7 @@ async fn default_failure_journal(mode: &str) {
         }
         for line in text.lines() {
             assert!(
-                line.len() + 1 <= 16 * 1024,
+                line.len() < 16 * 1024,
                 "default diagnostic record must be bounded"
             );
             entries.push(serde_json::from_str::<Value>(line).unwrap());

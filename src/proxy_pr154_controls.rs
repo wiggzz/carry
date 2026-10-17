@@ -46,7 +46,7 @@ fn pr154_journal_caps_are_independent_concurrent_and_restart_safe() {
         for path in files {
             assert!(std::fs::metadata(&path).unwrap().len() <= 64 * 1024);
             for line in std::fs::read_to_string(path).unwrap().lines() {
-                assert!(line.len() + 1 <= 16 * 1024);
+                assert!(line.len() < 16 * 1024);
                 serde_json::from_str::<Value>(line).unwrap();
             }
         }
