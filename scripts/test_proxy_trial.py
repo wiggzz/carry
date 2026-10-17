@@ -48,6 +48,7 @@ class ProxyTrialTests(unittest.TestCase):
                     self.assertEqual(proxy_trial.main(), 0)
                 self.assertEqual(len(launches), 2)
                 proxy_argv, proxy_env = launches[0]
+                self.assertIn('--verbose', proxy_argv)
                 self.assertIn('--login', proxy_argv)
                 self.assertEqual(proxy_argv[proxy_argv.index('--login') + 1], 'api-key')
                 self.assertEqual(proxy_argv[proxy_argv.index('--mode') + 1], 'off')

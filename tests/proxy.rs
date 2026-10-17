@@ -222,6 +222,132 @@ async fn proxy_cli_serves_health_and_forwards_opaque_json() {
 }
 
 #[tokio::test]
+async fn proxy_does_not_write_session_traces_by_default() {
+    use axum::{Router, routing::post};
+    let router = Router::new().route(
+        "/v1/responses",
+        post(|| async {
+            axum::Json(
+                json!({"id": "resp_trace", "status": "completed", "output": [],
+            "usage": {"input_tokens": 7, "output_tokens": 3}}),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let state = tempfile::tempdir().unwrap();
+    for completed in 1..=2 {
+        let (_proxy, url) = start_proxy(state.path(), address, "off").await;
+        let response = send(
+            &url,
+            &json!({"model": "fixture-model", "input": [
+                {"role": "user", "content": "hello"}
+            ]}),
+            "trace-test",
+            "main",
+        )
+        .await;
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["id"],
+            "resp_trace"
+        );
+        let saved = checkpoint_states(state.path()).remove(0);
+        assert_eq!(saved["completed_requests"], completed);
+        assert_eq!(saved["primary"]["input_tokens"], completed * 7);
+        assert!(
+            std::fs::read_dir(state.path()).unwrap().all(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_none_or(|ext| ext != "jsonl")
+            }),
+            "default proxy must not create verbose session traces"
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn proxy_verbose_traces_streams_and_default_restart_leaves_them_untouched() {
+    use axum::{Router, routing::post};
+    let terminal = json!({"id": "resp_trace", "status": "completed", "output": [],
+        "usage": {"input_tokens": 7, "output_tokens": 3}});
+    let wire = format!(
+        "event: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"type": "response.completed", "response": terminal})
+    );
+    let expected = wire.clone();
+    let router = Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let wire = wire.clone();
+            async move { ([("content-type", "text/event-stream")], wire) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let state = tempfile::tempdir().unwrap();
+    let mut previous_trace = None;
+    // A default restart must neither append to nor delete an existing verbose trace.
+    for verbose in [true, false] {
+        let extra = if verbose { vec!["--verbose"] } else { vec![] };
+        let (_proxy, url) = start_proxy_options(state.path(), address, "off", &extra, "").await;
+        let response = send(
+            &url,
+            &json!({"model": "fixture-model", "stream": true, "input": [
+                {"role": "user", "content": "hello"}
+            ]}),
+            "trace-test",
+            "main",
+        )
+        .await;
+        assert!(response.status().is_success());
+        assert_eq!(response.text().await.unwrap(), expected);
+        let saved = checkpoint_states(state.path()).remove(0);
+        assert_eq!(saved["completed_requests"], if verbose { 1 } else { 2 });
+        let trace_path = std::fs::read_dir(state.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .unwrap();
+        let trace = std::fs::read_to_string(trace_path).unwrap();
+        if let Some(previous) = &previous_trace {
+            assert_eq!(
+                &trace, previous,
+                "default mode must leave existing logs untouched"
+            );
+        } else {
+            let events: Vec<serde_json::Value> = trace
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            for event in [
+                "primary_received",
+                "primary_submitted",
+                "primary_response_chunk",
+                "primary_completed",
+            ] {
+                assert!(
+                    events.iter().any(|entry| entry["event"] == event),
+                    "missing {event}"
+                );
+            }
+            let received = events
+                .iter()
+                .find(|entry| entry["event"] == "primary_received")
+                .unwrap();
+            assert_eq!(received["data"]["input"][0]["content"], "hello");
+            previous_trace = Some(trace);
+        }
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn v2_trigger_is_a_native_checkpoint_not_an_ordinary_generation() {
     use axum::{Router, routing::post};
     let checkpoint =
@@ -1081,7 +1207,8 @@ async fn failed_classifier_records_only_bounded_content_free_provider_fields() {
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let state = tempfile::tempdir().unwrap();
-    let (_proxy, url) = start_proxy(state.path(), address, "compact").await;
+    let (_proxy, url) =
+        start_proxy_options(state.path(), address, "compact", &["--verbose"], "").await;
     let request = json!({"model": "gpt-6-luna", "input": [
         {"role": "user", "content": "goal"},
         {"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"},

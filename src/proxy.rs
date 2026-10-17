@@ -82,6 +82,9 @@ pub struct ProxyCli {
     /// Persistent sessions and lifetime stats; defaults to $CARRY_HOME/proxy or ~/.carry/proxy.
     #[arg(long, default_value_os_t = crate::auth::carry_home().map(|home| home.join("proxy")).unwrap_or_else(|_| PathBuf::from(".carry-proxy")))]
     state_dir: PathBuf,
+    /// Write verbose per-session JSONL traces (may contain sensitive request/response data).
+    #[arg(long)]
+    verbose: bool,
     #[arg(long, value_enum, default_value = "compact")]
     mode: Mode,
     #[arg(long, default_value = "gpt-6-luna")]
@@ -499,6 +502,9 @@ fn save_with_limit(
 }
 
 fn trace(service: &Service, id: &str, event: &str, data: &Value) -> std::io::Result<()> {
+    if !service.config.verbose {
+        return Ok(());
+    }
     let mut file = private_file(&service.config.state_dir.join(format!("{id}.jsonl")), true)?;
     serde_json::to_writer(
         &mut file,
@@ -2866,7 +2872,8 @@ async fn relay(
                     Ok(Some(chunk)) => {
                         if is_sse { observer.feed(&chunk); }
                         else { json_observer.feed(&chunk); }
-                        if let Some(commit) = &commit {
+                        if let Some(commit) = &commit
+                            && commit.service.config.verbose {
                             let _ = trace(&commit.service, &commit.id, "primary_response_chunk", &json!({"bytes": chunk.as_ref()}));
                         }
                         if converted.is_none() && sender.send(Ok(chunk)).await.is_err() { stream_end = "client disconnected before completion"; break; }
