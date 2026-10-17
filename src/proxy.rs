@@ -3103,6 +3103,9 @@ mod tests {
         }
     }
 
+    // PR154 tests only: use the current trace/checkpoint seam, not new APIs.
+    include!("proxy_pr154_tests.rs");
+
     #[test]
     fn dashboard_client_provenance_is_bounded_and_optional() {
         let body = json!({"client_metadata": {"x-codex-turn-metadata":

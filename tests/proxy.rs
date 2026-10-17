@@ -4,6 +4,9 @@ use std::time::Duration;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[path = "support/pr154.rs"]
+mod pr154;
+
 struct Proxy(Child);
 
 impl Drop for Proxy {
