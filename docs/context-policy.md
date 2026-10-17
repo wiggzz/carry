@@ -1,26 +1,28 @@
 # Context policy
 
-Carry keeps one chronological context ledger. It is designed to make a context
-rewrite an explicit, inspectable decision instead of a periodic summary.
+The native Carry agent keeps one chronological context ledger. It makes a context
+rewrite an explicit, inspectable decision instead of a periodic summary. For the
+standalone proxy, see the [proxy overview](../README.md#use-carry-as-a-standalone-context-proxy).
 
 ## Item lifecycle
 
-- Human messages and saved memories enter stable retention.
-- Tool interactions begin volatile.
-- Stable items stay retained by default.
-- Neutral volatile items remain in a recent working window and can be removed
-  when the planner needs room.
+- Human messages and saved memories enter protected retention.
+- Tool interactions begin eligible.
+- Protected items stay retained by default.
+- Neutral eligible items can be removed by a qualifying compaction. The neutral
+  working-set budget defaults to zero; configurable watermarks can retain a recent
+  working window.
 - The model can mark visible item IDs as `protected` or `removable`.
 
-Carry preserves the original order. A later stable message does not force an
-earlier volatile tool result to become stable. The stable cache frontier is the
-longest chronological prefix made entirely of stable items.
+Carry preserves the original order. A later protected message does not force an
+earlier eligible tool result to become protected. The protected cache frontier is
+the longest chronological prefix made entirely of protected items.
 
-Tool rounds end with one immutable marker such as `[context 2 volatile]`. A
+Tool rounds carry an ID-only marker such as `[context 2]`. A
 round atomically contains the provider-native assistant tool call and its matching
 function result, so compaction never leaves an orphaned tool result or tool call.
-The marker records the block's creation class; later retention changes never
-rewrite a historical marker.
+The marker does not expose the block's retention class or current signal; later
+retention changes do not change the marker text.
 
 ## Model signals
 
@@ -61,9 +63,8 @@ with retaining the current history over the same projected cost model.
 `--compaction-min-payback-percent P` (or
 `CARRY_COMPACTION_MIN_PAYBACK_PERCENT=P`) makes that admission margin explicit:
 Carry compacts only when modeled savings exceed `P%` of the retain-path payoff cost.
-It accepts integer values from 0 through 100 and defaults to **25**. Carry previously
-used a hard-coded 10% gate; the new default more deliberately filters marginal
-rewrites. `0` means any strictly positive modeled saving; lower the value if
+It accepts integer values from 0 through 100 and defaults to **10**.
+`0` means any strictly positive modeled saving; lower the value if
 you need to admit more speculative rewrites.
 
 Without rollout sampling, the planner uses
@@ -113,10 +114,10 @@ not bypass ordinary economic admission, cache-safety, human retention, or
 explicit model protection; it only removes the neutral-budget reason to retain
 an item.
 
-A compaction can remove explicitly removable items and selected neutral volatile
+A compaction can remove explicitly removable items and selected neutral eligible
 items, retain protected evidence, preserve chronology, and establish a new
-explicit cache frontier. After the first rewrite that removes history, Carry
-adds one stable status item stating that earlier context was removed.
+explicit cache frontier. When a rewrite leaves no status item, Carry appends an
+eligible status item stating that earlier context was removed.
 
 Use `--compaction-policy disabled` when you need a no-compaction control. Carry
 still records the session, but it never asks the planner to rewrite history.
@@ -125,10 +126,10 @@ and `trace.jsonl`.
 
 ## Experimental keep leases
 
-`--keep-lease-turns N` (or `CARRY_KEEP_LEASE_TURNS=N`) is disabled by default.
-When enabled, a model `protected` signal is a lease for `N` later model turns,
-not a permanent lock. Once one or more leases are due, Carry first asks the
-ordinary planner a metadata-only counterfactual: whether releasing **all** due,
+`--keep-lease-turns N` (or `CARRY_KEEP_LEASE_TURNS=N`) defaults to **8** in the
+native CLI and requires a positive value. A model `protected` signal arms a lease
+for `N` later model turns; becoming due does not itself release the item. Once one
+or more leases are due, Carry first asks the ordinary planner a metadata-only counterfactual: whether releasing **all** due,
 non-human leases could make a normal rewrite worthwhile. It emits no review
 unless that full release set qualifies, and it never emits a review when
 compaction is disabled.

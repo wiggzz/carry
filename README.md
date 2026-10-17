@@ -13,14 +13,17 @@ records its work, and saves the resulting patch, trace, and usage record.
 - **Model-directed context management.** Human-authored content is kept by
 default. The model can protect evidence, mark stale tool output removable, or
 save a concise learning from it. Model-protected items now receive keep leases by
-default: after eight later model turns they become due for a batched review.
-The model can renew protection; unrenewed items become eligible for compaction,
-not immediately deleted. Configure the positive lease length with
+default: after eight later model turns non-human items become due for a batched
+review, issued when releasing due leases could make a rewrite worthwhile.
+The model can renew protection; reviewed, unrenewed items become eligible for
+compaction, not immediately deleted. Configure the positive lease length with
 `--keep-lease-turns N` or `CARRY_KEEP_LEASE_TURNS`. Human content remains kept by
 default unless its retention is explicitly changed.
-- **Cost-optimized compaction planning.** The default `economic` policy estimates
-whether the next request becomes cheaper before rewriting context; otherwise it
-keeps the existing history and its prompt-cache reuse.
+- **Cost-optimized compaction planning.** The default `economic` policy compares
+rewriting with retaining history over five requests, including the immediate next
+request. It rewrites only when modeled savings exceed 10% of the retain-path
+cost over that horizon; otherwise it keeps the existing history and prompt-cache
+reuse. The immediate next request need not be cheaper on its own.
 - **Inspectable results.** Each session retains `final.patch`, `result.json`,
 `trace.jsonl`, and shell output. The trace has no API headers or keys.
 
