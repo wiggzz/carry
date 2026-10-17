@@ -136,9 +136,9 @@ pub fn load_resume_state(session_dir: &Path) -> Result<ResumeState> {
             path.display()
         );
     }
-    ContextState::decode(&checkpoint.context.encode()?)?;
+    let context = ContextState::decode(&checkpoint.context.encode()?)?;
     Ok(ResumeState {
-        context: checkpoint.context,
+        context,
         model: checkpoint.model,
         prompt_cache_key: checkpoint.prompt_cache_key,
     })
@@ -2591,6 +2591,179 @@ mod tests {
                     .as_str()
                     .is_some_and(|output| output.contains("answer was delivered"))
         }));
+    }
+
+    #[test]
+    fn resume_checkpoint_preserves_memory_migration() {
+        for signal in ["neutral", "keep", "drop"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut context = ContextState::new("first task".into());
+            let source = context
+                .add_tool(
+                    vec![json!({"type": "function_call", "call_id": "call-1",
+                        "name": "shell", "arguments": "{}"})],
+                    json!({"type": "function_call_output", "call_id": "call-1",
+                        "output": "durable outcome"}),
+                )
+                .unwrap();
+            context.record_signals(
+                &crate::protocol::ContextManagement {
+                    remember: vec!["durable outcome".into()],
+                    ..Default::default()
+                },
+                source,
+            );
+            let mut checkpoint = serde_json::to_value(ContextCheckpoint {
+                version: CONTEXT_CHECKPOINT_VERSION,
+                model: "scripted".into(),
+                context,
+                prompt_cache_key: Some("resume-cache-key".into()),
+            })
+            .unwrap();
+            let memory = checkpoint["context"]["items"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|item| item["kind"] == "memory")
+                .unwrap();
+            memory["retention"] = json!("eligible");
+            memory["signal"] = json!(signal);
+            // Legacy checkpoints predate lease bookkeeping.
+            for field in [
+                "keep_lease_expires_at_turn",
+                "keep_lease_expired",
+                "keep_lease_review",
+            ] {
+                memory.as_object_mut().unwrap().remove(field);
+            }
+            std::fs::write(
+                temp.path().join(CONTEXT_CHECKPOINT_FILE),
+                serde_json::to_vec(&checkpoint).unwrap(),
+            )
+            .unwrap();
+
+            let resumed = load_resume_state(temp.path()).unwrap();
+            let restored = serde_json::to_value(&resumed.context).unwrap();
+            let memory = restored["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["kind"] == "memory")
+                .unwrap();
+            assert_eq!(
+                memory["retention"],
+                if signal == "drop" {
+                    "eligible"
+                } else {
+                    "protected"
+                },
+                "resumed memory with {signal} signal"
+            );
+            assert_eq!(memory["signal"], signal);
+            assert_eq!(resumed.model, "scripted");
+            assert_eq!(
+                resumed.prompt_cache_key.as_deref(),
+                Some("resume-cache-key")
+            );
+        }
+    }
+
+    #[test]
+    fn resume_checkpoint_preserves_expired_memory_lease() {
+        use crate::protocol::ContextManagement;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut context = ContextState::new("first task".into());
+        let source = context
+            .add_tool(
+                vec![json!({"type": "function_call", "call_id": "source",
+                    "name": "shell", "arguments": "{}"})],
+                json!({"type": "function_call_output", "call_id": "source",
+                    "output": "source evidence"}),
+            )
+            .unwrap();
+        let memory = context
+            .record_signals(
+                &ContextManagement {
+                    remember: vec!["remembered evidence ".repeat(1000)],
+                    ..Default::default()
+                },
+                source,
+            )
+            .added[0];
+        let protected = context.record_signals(
+            &ContextManagement {
+                keep: vec![memory],
+                ..Default::default()
+            },
+            source,
+        );
+        context.arm_keep_leases(&protected.keep, 1);
+        context.advance_retention_turn();
+        let host = context
+            .add_tool(
+                vec![json!({"type": "function_call", "call_id": "review",
+                    "name": "shell", "arguments": "{}"})],
+                json!({"type": "function_call_output", "call_id": "review",
+                    "output": "next result"}),
+            )
+            .unwrap();
+        assert_eq!(
+            context.attach_due_keep_lease_review_to(host).item_ids,
+            vec![memory]
+        );
+        context.advance_retention_turn();
+        assert_eq!(context.resolve_keep_lease_review(&[]), vec![memory]);
+        let uninterrupted = serde_json::to_value(&context).unwrap();
+        let released = uninterrupted["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == memory)
+            .unwrap();
+        assert_eq!(released["retention"], "eligible");
+        assert_eq!(released["signal"], "neutral");
+        assert_eq!(released["keep_lease_expired"], true);
+        assert!(released["keep_lease_expires_at_turn"].is_null());
+
+        let policy = CompactionPolicy {
+            cache_ratios: (0.1, 1.0),
+            implicit_cached_tokens: 0,
+            breakpoints: Vec::new(),
+            payoff_requests: 5,
+            min_payback_percent: 10,
+        };
+        let expected = context.plan_compaction(&[], policy.clone()).unwrap();
+        assert!(expected.dropped.contains(&memory));
+        std::fs::write(
+            temp.path().join(CONTEXT_CHECKPOINT_FILE),
+            serde_json::to_vec(&ContextCheckpoint {
+                version: CONTEXT_CHECKPOINT_VERSION,
+                model: "scripted".into(),
+                context,
+                prompt_cache_key: Some("resume-cache-key".into()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let resumed = load_resume_state(temp.path()).unwrap();
+        let actual = resumed.context.plan_compaction(&[], policy).expect(
+            "resumed released memory must remain eligible for the uninterrupted compaction",
+        );
+        assert_eq!(
+            actual.dropped, expected.dropped,
+            "resume must retain the uninterrupted removal candidates"
+        );
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&resumed.context).unwrap(),
+            uninterrupted,
+            "resume must preserve retention, lease metadata, and pending-review state"
+        );
     }
 
     #[test]

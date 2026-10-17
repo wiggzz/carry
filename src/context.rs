@@ -221,9 +221,12 @@ impl ContextState {
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut state: Self = serde_json::from_slice(bytes)?;
-        // Upgrade memories written before they were protected by default.
+        // Upgrade legacy memories, preserving explicit drops and recorded lease releases.
         for item in &mut state.items {
-            if item.kind == ContextItemKind::Memory && item.signal != RetentionSignal::Drop {
+            if item.kind == ContextItemKind::Memory
+                && item.signal != RetentionSignal::Drop
+                && !item.keep_lease_expired
+            {
                 item.retention = Retention::Protected;
             }
         }
