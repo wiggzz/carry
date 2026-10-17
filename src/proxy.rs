@@ -531,10 +531,7 @@ async fn models(
 ) -> Result<Response, Failure> {
     authorize(&service, &headers)?;
     if service.config.codex_login {
-        return Err(failure(
-            StatusCode::NOT_IMPLEMENTED,
-            "Codex model discovery is not supported; configure models explicitly",
-        ));
+        return codex_models(&service).await;
     }
     let endpoint = service
         .config
@@ -555,6 +552,83 @@ async fn models(
         .await
         .map_err(|_| failure(StatusCode::BAD_GATEWAY, "upstream transport failed"))?;
     Ok(relay(upstream, None, None, false, None).await)
+}
+
+// Discovery contract used by the pinned Codex client in our HTTP fixtures:
+// openai/codex rust-v0.147.0, codex-api/src/endpoint/models.rs.
+const CODEX_MODELS_CLIENT_VERSION: &str = "0.147.0";
+
+async fn codex_models(service: &Service) -> Result<Response, Failure> {
+    let unavailable = || {
+        failure(
+            StatusCode::BAD_GATEWAY,
+            "Codex model discovery unavailable; configure models explicitly",
+        )
+    };
+    // serve() validates this destination before loading subscription credentials.
+    // The shared client refuses redirects, including for this derived endpoint.
+    let endpoint = service
+        .config
+        .upstream_url
+        .strip_suffix("/responses")
+        .ok_or_else(unavailable)?;
+    let credential = {
+        let _guard = session_lock(service, "codex-auth").await;
+        crate::auth::load_auth(
+            service
+                .config
+                .codex_home
+                .as_ref()
+                .expect("resolved Codex home"),
+        )
+        .await
+        .map_err(|_| unavailable())?
+        .ok_or_else(unavailable)?
+    };
+    let response = service
+        .client
+        .get(format!("{endpoint}/models"))
+        .query(&[("client_version", CODEX_MODELS_CLIENT_VERSION)])
+        .bearer_auth(&credential.access_token)
+        .header("chatgpt-account-id", &credential.account_id)
+        .header("accept", "application/json")
+        .header("originator", "carry")
+        .header("user-agent", concat!("carry/", env!("CARGO_PKG_VERSION")))
+        .send()
+        .await
+        .map_err(|_| unavailable())?;
+    if !response.status().is_success() {
+        return Err(unavailable());
+    }
+    // Catalogs may include large instructions. Bound the input and expose only
+    // discovery fields, never relay provider diagnostics or instruction bodies.
+    let bytes = bounded(response, 8 * 1024 * 1024)
+        .await
+        .map_err(|_| unavailable())?;
+    let catalog: Value = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
+    let models = catalog["models"].as_array().ok_or_else(unavailable)?;
+    let mut seen = HashSet::new();
+    let mut data = Vec::new();
+    for model in models {
+        let id = model["slug"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(unavailable)?;
+        match model["visibility"].as_str() {
+            Some("list") => {
+                if seen.insert(id) {
+                    // The subscription catalog has no creation timestamp; zero
+                    // denotes unknown, not a claim about the model's release date.
+                    data.push(
+                        json!({"id": id, "object": "model", "created": 0, "owned_by": "openai"}),
+                    );
+                }
+            }
+            Some("hide" | "none") => {}
+            _ => return Err(unavailable()),
+        }
+    }
+    Ok(axum::Json(json!({"object": "list", "data": data})).into_response())
 }
 
 async fn metrics(
