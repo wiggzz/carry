@@ -19,16 +19,16 @@ import urllib.error
 import urllib.request
 
 try:
-    from proxy_native_fixture import Fixture
+    from proxy_native_fixture import Fixture, ClientObserver
     from proxy_trial import client_configuration, stop_process_group
     from proxy_gateway_fixture_support import Gateway
 except ModuleNotFoundError:
-    from scripts.proxy_native_fixture import Fixture
+    from scripts.proxy_native_fixture import Fixture, ClientObserver
     from scripts.proxy_trial import client_configuration, stop_process_group
     from scripts.proxy_gateway_fixture_support import Gateway
 
 
-def grade_case(case, *, exit_code, rpc, fixture, state, events):
+def grade_case(case, *, exit_code, rpc, fixture, state, received):
     assert not fixture.errors, 'scripted provider contract failed'
     compact=[e for e in rpc if e.get('type')=='response' and e.get('id') in ('c1','c2')]
     if case=='compact-strict':
@@ -40,9 +40,8 @@ def grade_case(case, *, exit_code, rpc, fixture, state, events):
     assert len(compact)==2 and all(e.get('success') is True for e in compact)
     assert sum(e.get('type')=='agent_settled' for e in rpc)>=3
     assert state['history_rebases']>=2 and not state['active_shadow']
-    received=[e['data'] for e in events if e['event']=='primary_received']
-    submitted=[e['data'] for e in events if e['event']=='primary_submitted']
-    assert received and submitted and received[-1]==submitted[-1]
+    submitted=fixture.calls
+    assert len(received)==len(submitted) and received and received[-1]==submitted[-1]
     assert 'FIXTURE_PI_CHECKPOINT' in json.dumps(submitted[-1]['input'])
     return {'two_summary_continuation_verified':True,'checkpoint_wire_preserved':True,
         'summary_calls':len(fixture.summary_calls),'history_rebases':state['history_rebases']}
@@ -98,11 +97,14 @@ def run_case(args,case):
     env={k:v for k,v in os.environ.items() if not k.startswith(('OPENAI_','CARRY_PROXY_','BENCHMARK_','PI_','CODEX_'))}
     env.update(CARRY_PROXY_UPSTREAM_KEY='fixture-primary-provider',
         CARRY_PROXY_CLASSIFIER_KEY='fixture-shadow',CARRY_PROXY_AUTH_TOKEN='fixture-trusted')
+    env.update(HOME=str(home), CARRY_HOME=str(home/'.carry'), XDG_CONFIG_HOME=str(home/'.config'))
     mode='off' if case=='off-strict' else 'compact'
     policy='reset-on-divergence' if case=='compact-reset' else 'strict'
-    with Fixture('pi','pi-checkpoint') as fixture, (root/'carry.log').open('w') as log:
+    with Fixture('pi','pi-checkpoint') as fixture, (root/'carry.log').open('w') as log, \
+            ClientObserver(port, root/'client-wire.jsonl') as observer:
         # Start gateway first so the integrated classifier traverses the production shadow handler.
-        gateway=Gateway(port,fixture.server.server_port,policy)
+        # Observe AFTER the real gateway: grade its exact trusted header/body projection.
+        gateway=Gateway(observer.port,fixture.server.server_port,policy)
         proxy=None
         try:
             command=[args.carry,'proxy','--verbose','--listen',f'127.0.0.1:{port}',
@@ -114,6 +116,8 @@ def run_case(args,case):
             while True:
                 if proxy.poll() is not None: raise RuntimeError('integrated proxy exited before readiness')
                 try:
+                    # Avoid asking the relay to connect before its owned target is ready.
+                    urllib.request.urlopen(f'http://127.0.0.1:{port}/health',timeout=1).close()
                     with urllib.request.urlopen(gateway.url+'/healthz',timeout=1) as response:
                         if response.status==200: break
                 except (OSError,urllib.error.URLError): pass
@@ -140,7 +144,9 @@ def run_case(args,case):
     files=list(state_dir.glob('*.json'))
     assert len(files)==1, 'one operator-owned session required'
     state=json.loads(files[0].read_text())
-    events=[json.loads(line) for line in files[0].with_suffix('.jsonl').read_text().splitlines()]
+    received=observer.bodies()
+    (root/'provider-wire.json').write_text(json.dumps({'fixture_only':True,
+        'calls':fixture.calls,'reviews':fixture.reviews})+'\n')
     # If caller identity had leaked, its tenant/session would have created a different state file.
     expected=hashlib.sha256(json.dumps(['benchmark','fixture-session','main'],separators=(',',':')).encode()).hexdigest()
     assert files[0].stem==expected, 'caller identity leaked across trusted gateway'
@@ -152,7 +158,7 @@ def run_case(args,case):
         'native_requests':len(fixture.calls),'operator_identity_verified':True,
         'tool_effect_verified':True,'production_gateway_verified':True,
         'automatic_compaction_certified':False, 'summary_driver':'two native RPC compact commands'}
-    result.update(grade_case(case,exit_code=exit_code,rpc=rpc,fixture=fixture,state=state,events=events))
+    result.update(grade_case(case,exit_code=exit_code,rpc=rpc,fixture=fixture,state=state,received=received))
     if case!='compact-strict':
         assert 'FIXTURE_COMPLETE' in (root/'client-events.jsonl').read_text()
     (root/'result.json').write_text(json.dumps(result,indent=2)+'\n')
