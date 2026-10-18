@@ -59,6 +59,36 @@ fn state_regression(selector: &str) {
 }
 
 #[test]
+fn successful_request_savings_after_failure_and_restart() {
+    state_regression("successful_request_savings_after_failure_and_restart");
+}
+
+#[test]
+fn legacy_checkpoint_keeps_fail_closed_savings_policy() {
+    state_regression("legacy_checkpoint_keeps_fail_closed_savings_policy");
+}
+
+#[test]
+fn failed_primary_terminals_do_not_mutate_successful_scenario() {
+    state_regression("failed_primary_terminals_do_not_mutate_successful_scenario");
+}
+
+#[test]
+fn reviewer_completion_classification_survives_background_merge_and_restart() {
+    state_regression("reviewer_completion_classification_survives_background_merge_and_restart");
+}
+
+#[test]
+fn successful_reviewer_spend_survives_failed_primary_exactly_once() {
+    state_regression("successful_reviewer_spend_survives_failed_primary_exactly_once");
+}
+
+#[test]
+fn restart_orphan_reviewer_is_untracked_not_proven_failed() {
+    state_regression("restart_orphan_reviewer_is_untracked_not_proven_failed");
+}
+
+#[test]
 fn failed_429_continuation_retry_once() {
     state_regression("failed_429_continuation_retry_once");
 }

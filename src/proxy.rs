@@ -797,6 +797,9 @@ struct ReviewReceipt {
     input: u64,
     usage: Option<Value>,
     standard: bool,
+    // Usage can be present on failed/incomplete terminals, or absent on a
+    // completed one. Keep this independent from both usage and advice validity.
+    completed: bool,
 }
 
 struct Commit {
@@ -958,7 +961,7 @@ async fn forward_request(
             session.shadow.calls += 1;
             session.shadow.unavailable_cost_calls += 1;
             if let Some(trajectory) = &mut session.cost_trajectory {
-                trajectory.failed_call();
+                trajectory.prior_untracked(1);
             }
         }
         let new_lineage = session.history.is_empty();
@@ -2070,13 +2073,19 @@ fn merge_review(
             current
                 .shadow
                 .observe(&receipt.model, usage, receipt.standard);
-            if let Some(t) = &mut current.cost_trajectory {
-                t.reviewer_usage(&receipt.model, receipt.input, usage, receipt.standard);
-            }
         } else {
             current.shadow.calls += 1;
             current.shadow.unavailable_cost_calls += 1;
-            if let Some(t) = &mut current.cost_trajectory {
+        }
+        if let Some(t) = &mut current.cost_trajectory {
+            if receipt.completed {
+                t.reviewer_usage(
+                    &receipt.model,
+                    receipt.input,
+                    receipt.usage.as_ref().unwrap_or(&Value::Null),
+                    receipt.standard,
+                );
+            } else {
                 t.failed_call();
             }
         }
@@ -2555,6 +2564,7 @@ async fn review_chunk(
                 input: crate::proxy_savings::token_units(body),
                 usage: Some(numeric_review_usage(&value["usage"])),
                 standard: value.get("service_tier").is_none_or(|v| v == "default"),
+                completed: value["status"] == "completed",
             });
         }
         session.shadow.observe(
@@ -2648,6 +2658,7 @@ async fn review_chunk(
                 input: 0,
                 usage: None,
                 standard: false,
+                completed: false,
             });
         }
         session.shadow.calls += 1;
@@ -3899,6 +3910,7 @@ mod tests {
                     json!({"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}),
                 ),
                 standard: true,
+                completed: true,
             }],
         };
         merge_review(&config, &mut current, &before, &reviewed, &run);
@@ -4002,6 +4014,72 @@ mod tests {
     }
 
     #[test]
+    fn stale_background_receipts_classify_completion_independently_of_observed_usage() {
+        for (completed, usage) in [
+            (
+                false,
+                Some(
+                    json!({"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}),
+                ),
+            ),
+            (false, None),
+            (
+                true,
+                Some(
+                    json!({"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}),
+                ),
+            ),
+            (true, Some(json!({}))),
+        ] {
+            let mut before = Session::default();
+            let mut trajectory = crate::proxy_savings::Trajectory::default();
+            trajectory.primary(
+                &json!({"model":"gpt-6-luna","input":[{"role":"user","content":"task"}]}),
+                &json!({"status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":1}}),
+                "route", 100, true,
+            );
+            before.cost_trajectory = Some(trajectory);
+            let reviewed = before.clone();
+            let mut current = before.clone();
+            current.review_epoch += 1; // rejected stale advice must still be billed
+            current.failed_primaries += 1;
+            current.cost_trajectory.as_mut().unwrap().failed_call();
+            let metered = usage
+                .as_ref()
+                .is_some_and(|value| value["output_tokens"].is_number());
+            let run = ReviewRun {
+                background: true,
+                receipts: vec![ReviewReceipt {
+                    model: "gpt-6-luna".into(),
+                    input: 100,
+                    usage,
+                    standard: true,
+                    completed,
+                }],
+                ..ReviewRun::default()
+            };
+            assert!(!merge_review(
+                &reviewer_config(),
+                &mut current,
+                &before,
+                &reviewed,
+                &run
+            ));
+            let estimate = current.cost_trajectory.as_ref().unwrap().snapshot();
+            assert_eq!(current.shadow.calls, 1);
+            assert_eq!(current.shadow.unavailable_cost_calls, u64::from(!metered));
+            assert_eq!(estimate.coverage.reviewer_responses, u64::from(completed));
+            assert_eq!(estimate.coverage.failed_calls, 1 + u64::from(!completed));
+            assert_eq!(estimate.reviewer_cost > 0.0, completed && metered);
+            assert_eq!(estimate.priced, !completed || metered);
+            assert_eq!(
+                estimate.coverage.missing_usage,
+                u64::from(completed && !metered)
+            );
+        }
+    }
+
+    #[test]
     fn background_merge_discards_changed_source_content_but_accounts_for_spend() {
         let mut before = Session::default();
         before
@@ -4034,6 +4112,7 @@ mod tests {
                     json!({"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}),
                 ),
                 standard: true,
+                completed: true,
             }],
         };
         merge_review(&reviewer_config(), &mut current, &before, &reviewed, &run);

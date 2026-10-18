@@ -25,7 +25,7 @@
 <details><summary>Costs, coverage &amp; diagnostics</summary>
 <div class="cards" id="cost-cards"></div>
 <p id="assumptions"></p>
-<p><small>Savings compare the same recorded trajectory with a simulated conventional compaction policy, including reviewer costs. They are estimates, not measured savings or subscription charges. Incomplete sessions are excluded from savings; the priced cost subtotal includes all available receipts.</small></p>
+<p><small>Savings compare the same recorded trajectory with a simulated conventional compaction policy, including completed reviewer costs. Where marked “successful requests only”, failed calls are excluded from both scenarios, including calls before later successes. Estimates with other missing data or irrecoverable legacy accounting remain excluded. They are estimates, not measured savings or subscription charges; the observed priced subtotal includes all available receipts.</small></p>
 <div class="scroll"><table><thead><tr><th>Lane</th><th>Calls</th><th>Input tokens</th><th>Cached reads</th><th>Read share</th><th>Cache writes</th><th>Output tokens</th><th>API-equivalent cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
 </details>
 <p><small>Scope: this proxy's state directory only. Retained bytes are serialized input bytes, not token counts or measured savings. Session names show up to 80 characters from the first user message. Full messages, memory contents and credentials stay private. Roles are optional client-reported metadata; titles never determine roles. Histories without role metadata remain unclassified.</small></p>
@@ -64,7 +64,8 @@ async function refresh(){
   const estimates=sessions.map(s=>s.cost_estimate).filter(e=>e?.priced);
   const hasEstimates=estimates.length>0;
   const totalSessions=sessions.length+data.unavailable_sessions;
-  $('estimate-coverage').textContent='Includes '+fmt(estimates.length)+' of '+fmt(totalSessions)+' sessions; '+fmt(totalSessions-estimates.length)+' excluded because complete estimates are unavailable. Totals include conversation histories and client background requests.';
+  const excludedFailed=sum(estimates,'excluded_failed_calls');
+  $('estimate-coverage').textContent='Includes '+fmt(estimates.length)+' of '+fmt(totalSessions)+' sessions; '+fmt(totalSessions-estimates.length)+' excluded because comparable estimates are unavailable.'+(excludedFailed?' Successful requests only: '+fmt(excludedFailed)+' failed calls excluded.':'')+' Totals include conversation histories and client background requests.';
   const carryScenario=sum(estimates,'carry_cost'),traditionalScenario=sum(estimates,'traditional_cost');
   const saving=traditionalScenario-carryScenario;
   const savingText=money(saving)+(traditionalScenario>0?' ('+(100*saving/traditionalScenario).toFixed(1)+'%)':'');
@@ -89,7 +90,7 @@ async function refresh(){
   const sorted=[...sessions].sort((a,b)=>(b.updated_at||0)-(a.updated_at||0));
   const renderSession=(s,grouped=false)=>{
    const e=s.cost_estimate;
-   const savings=e?.priced?money(e.savings)+(e.savings_percent!==null?' ('+e.savings_percent.toFixed(1)+'%)':''):'Incomplete';
+   const savings=e?.priced?money(e.savings)+(e.savings_percent!==null?' ('+e.savings_percent.toFixed(1)+'%)':'')+(e.excluded_failed_calls?' · successful requests only ('+fmt(e.excluded_failed_calls)+' failed calls excluded)':''):'Incomplete';
    const issues=[];
    const unknown=[...new Set([...(s.primary.unpriced_models||[]),...(s.shadow.unpriced_models||[])])];
    if(unknown.length)issues.push('No rate: '+unknown.join(', '));
