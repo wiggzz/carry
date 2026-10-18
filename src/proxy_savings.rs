@@ -25,6 +25,8 @@ pub struct Estimate {
     pub savings: f64,
     pub savings_percent: Option<f64>,
     pub priced: bool,
+    #[serde(default)]
+    pub excluded_failed_calls: u64,
     pub coverage: Coverage,
 }
 
@@ -52,6 +54,10 @@ pub struct Trajectory {
     carry_edited: bool,
     traditional_edited: bool,
     available: bool,
+    // Old checkpoints retain their fail-closed accounting contract. Only new
+    // trajectories explicitly opt into excluding proven unsuccessful attempts.
+    #[serde(default)]
+    successful_requests_only: bool,
 }
 impl Default for Trajectory {
     fn default() -> Self {
@@ -66,6 +72,7 @@ impl Default for Trajectory {
             carry_edited: false,
             traditional_edited: false,
             available: true,
+            successful_requests_only: true,
         }
     }
 }
@@ -93,7 +100,11 @@ impl Trajectory {
 
     pub fn failed_call(&mut self) {
         self.result.coverage.failed_calls += 1;
-        self.available = false;
+        if self.successful_requests_only {
+            self.result.excluded_failed_calls += 1;
+        } else {
+            self.available = false;
+        }
     }
 
     pub fn unmodeled_call(&mut self) {
@@ -120,6 +131,10 @@ impl Trajectory {
     }
 
     pub fn reviewer(&mut self, body: &Value, response: &Value, standard: bool) {
+        if response["status"] != "completed" {
+            self.failed_call();
+            return;
+        }
         self.reviewer_usage(
             body["model"].as_str().unwrap_or(""),
             token_units(body),
@@ -378,6 +393,134 @@ mod tests {
     }
 
     #[test]
+    fn excluded_failures_leave_successful_prompt_and_summary_state_unchanged() {
+        let mut trajectory = Trajectory::default();
+        trajectory.primary(
+            &request(&"prefix ".repeat(3000)),
+            &response(100),
+            "route",
+            100,
+            true,
+        );
+        trajectory.compacted(2000, 100);
+        let before = serde_json::to_value(&trajectory).unwrap();
+        trajectory.failed_call();
+        let after = serde_json::to_value(&trajectory).unwrap();
+        for field in [
+            "previous",
+            "restored",
+            "retired",
+            "summary",
+            "last_traditional_input",
+            "carry_edited",
+            "traditional_edited",
+            "available",
+        ] {
+            assert_eq!(after[field], before[field], "failure changed {field}");
+        }
+        let estimate = trajectory.snapshot();
+        assert!(estimate.priced);
+        assert_eq!(
+            serde_json::to_value(estimate).unwrap()["excluded_failed_calls"],
+            1
+        );
+    }
+
+    #[test]
+    fn failed_reviewer_terminals_with_usage_are_excluded_but_completed_invalid_advice_is_charged() {
+        let mut trajectory = Trajectory::default();
+        trajectory.primary(&request("task"), &response(100), "route", 100, true);
+        let before = trajectory.snapshot();
+        for status in ["failed", "incomplete"] {
+            let mut terminal = response(100);
+            terminal["status"] = json!(status);
+            trajectory.reviewer(&request("review"), &terminal, true);
+        }
+        let estimate = trajectory.snapshot();
+        assert!(estimate.priced);
+        assert_eq!(estimate.coverage.failed_calls, 2);
+        assert_eq!(estimate.coverage.reviewer_responses, 0);
+        assert_eq!(estimate.carry_cost, before.carry_cost);
+        // Advice validity/refusal is not the completion classification.
+        let mut refused = response(100);
+        refused["output"] =
+            json!([{"type":"message","content":[{"type":"refusal","refusal":"no"}]}]);
+        trajectory.reviewer(&request("review"), &refused, true);
+        assert_eq!(trajectory.snapshot().coverage.reviewer_responses, 1);
+        assert!(trajectory.snapshot().reviewer_cost > 0.0);
+        trajectory.reviewer(
+            &request("review"),
+            &json!({"status":"completed","output":[]}),
+            true,
+        );
+        assert_eq!(trajectory.snapshot().coverage.missing_usage, 1);
+        assert!(!trajectory.snapshot().priced);
+    }
+
+    #[test]
+    fn legacy_checkpoints_keep_fail_closed_policy_across_epoch_and_restart() {
+        let mut initial = Trajectory::default();
+        initial.primary(&request("task"), &response(100), "route", 100, true);
+        let mut checkpoint = serde_json::to_value(initial).unwrap();
+        checkpoint
+            .as_object_mut()
+            .unwrap()
+            .remove("successful_requests_only");
+        checkpoint["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("excluded_failed_calls");
+        let mut legacy: Trajectory = serde_json::from_value(checkpoint).unwrap();
+        assert!(
+            legacy.snapshot().priced,
+            "old complete trajectories remain readable"
+        );
+        legacy.failed_call();
+        legacy.reset_epoch();
+        let mut resumed: Trajectory =
+            serde_json::from_value(serde_json::to_value(legacy).unwrap()).unwrap();
+        resumed.primary(&request("new epoch"), &response(100), "route", 101, true);
+        assert!(!resumed.snapshot().priced);
+        assert_eq!(
+            serde_json::to_value(resumed.snapshot()).unwrap()["excluded_failed_calls"],
+            0
+        );
+    }
+
+    #[test]
+    fn exclusions_never_resurrect_unknown_successful_spend() {
+        for variant in 0..4 {
+            let mut trajectory = Trajectory::default();
+            match variant {
+                0 => trajectory.prior_untracked(1),
+                1 => trajectory.unmodeled_call(),
+                2 => trajectory.primary(
+                    &request("task"),
+                    &json!({"status":"completed","output":[]}),
+                    "route",
+                    100,
+                    true,
+                ),
+                _ => {
+                    let mut unknown = request("task");
+                    unknown["model"] = json!("gpt-6-astra");
+                    trajectory.primary(&unknown, &response(100), "route", 100, true);
+                }
+            }
+            trajectory.failed_call();
+            trajectory.reset_epoch();
+            trajectory.primary(
+                &request("known success"),
+                &response(100),
+                "route",
+                101,
+                true,
+            );
+            assert!(!trajectory.snapshot().priced);
+        }
+    }
+
+    #[test]
     fn scenario_input_is_independent_of_native_input_metering() {
         let replay = |metered| {
             let mut trajectory = Trajectory::default();
@@ -614,7 +757,13 @@ mod tests {
     #[test]
     fn missing_usage_failure_unknown_pricing_and_old_history_make_savings_unavailable() {
         let body = request("task");
-        let mut initial = Trajectory::default();
+        let mut checkpoint = serde_json::to_value(Trajectory::default()).unwrap();
+        checkpoint
+            .as_object_mut()
+            .unwrap()
+            .remove("successful_requests_only");
+        // Preserve the historical fail-closed contract for legacy checkpoints.
+        let mut initial: Trajectory = serde_json::from_value(checkpoint).unwrap();
         initial.primary(&body, &response(100), "route", 100, true);
         for variant in 0..5 {
             let mut trajectory = initial.clone();

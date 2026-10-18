@@ -294,6 +294,218 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(session["primary"]["unavailable_cost_calls"], 1,
                          "failed-call spend remains unknown, not a zero-cost success")
 
+    def test_legacy_checkpoint_keeps_fail_closed_savings_policy(self):
+        fixture = self.fixture(lambda _body, n: (429, {"error": "fixture rate limit"})
+                               if n == 2 else (200, completed(response_id=f"resp_{n}")))
+        options = ["--review-every-requests", "100"]
+        proxy = self.proxy(fixture, options)
+        seed = [{"role": "user", "content": "legacy successful task"}]
+        self.assertEqual(proxy.send(seed)[0], 200)
+        proxy.close()
+        path = next(self.state.glob("*.json"))
+        saved = json.loads(path.read_text())
+        saved["cost_trajectory"].pop("successful_requests_only", None)
+        saved["cost_trajectory"]["result"].pop("excluded_failed_calls", None)
+        path.write_text(json.dumps(saved))
+        proxy = self.proxy(fixture, options)
+        self.assertTrue(proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]["priced"])
+        self.assertEqual(proxy.send(seed)[0], 429)
+        proxy.close()
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(seed)[0], 200)
+        session = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
+        self.evidence.update(session=session, checkpoint=proxy.saved())
+        estimate = session["cost_estimate"]
+        self.assertFalse(estimate["priced"], "legacy failures cannot be retroactively reinterpreted")
+        self.assertEqual(estimate["coverage"]["primary_responses"], 2)
+        self.assertEqual(estimate["coverage"]["failed_calls"], 1)
+        self.assertEqual(estimate.get("excluded_failed_calls", 0), 0)
+        self.assertFalse(proxy.saved()["cost_trajectory"].get("successful_requests_only", False))
+
+    def test_failed_primary_terminals_do_not_mutate_successful_scenario(self):
+        self.evidence["cases"] = []
+        for terminal in ("failed", "incomplete", "transport", "http_error"):
+            with self.subTest(terminal=terminal):
+                self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+
+                def primary(_body, n):
+                    if n != 2:
+                        return 200, completed(response_id=f"resp_{n}")
+                    if terminal == "transport":
+                        return None
+                    if terminal == "http_error":
+                        return 429, {"error": "fixture rate limit"}
+                    value = completed(response_id="resp_failed")
+                    value["status"] = terminal
+                    return 200, value
+
+                fixture = self.fixture(primary)
+                options = ["--review-every-requests", "100"]
+                proxy = self.proxy(fixture, options)
+                seed = [{"role": "user", "content": "successful prefix " * 1500}]
+                self.assertEqual(proxy.send(seed)[0], 200)
+                before = proxy.saved()["cost_trajectory"]
+                retry = seed + [{"role": "user", "content": "retry delta"}]
+                status, _ = proxy.send(retry)
+                self.assertEqual(status, 502 if terminal == "transport" else
+                                 429 if terminal == "http_error" else 200)
+                after = proxy.saved()["cost_trajectory"]
+                proxy.close()
+                proxy = self.proxy(fixture, options)
+                self.assertEqual(proxy.send(retry)[0], 200)
+                stats = proxy.request("GET", "/carry/dashboard/stats")[1]
+                session = stats["sessions"][0]
+                self.evidence["cases"].append({"terminal": terminal, "before": before,
+                                               "after": after, "session": session})
+                proxy.close()
+                fixture.close()
+                self.assertEqual(fixture.errors, [])
+                for field in ("previous", "restored", "retired", "summary", "last_traditional_input",
+                              "carry_edited", "traditional_edited"):
+                    self.assertEqual(before[field], after[field], f"failed primary changed {field}")
+                estimate = session["cost_estimate"]
+                self.assertEqual(estimate["coverage"]["primary_responses"], 2)
+                self.assertEqual(estimate["coverage"]["failed_calls"], 1)
+                self.assertTrue(estimate["priced"], "failed primary terminal must not poison successful scenario")
+                self.assertEqual(estimate["excluded_failed_calls"], 1)
+                self.assertEqual(session["primary"]["calls"], 3)
+                self.assertEqual(session["primary"]["unavailable_cost_calls"],
+                                 1 if terminal in ("transport", "http_error") else 0)
+
+    def test_reviewer_completion_classification_survives_background_merge_and_restart(self):
+        self.evidence["cases"] = []
+        for background in (False, True):
+            for terminal in ("failed", "incomplete", "transport", "http_error",
+                             "invalid_advice", "refusal", "missing_usage"):
+                with self.subTest(background=background, terminal=terminal):
+                    self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+
+                    def review(_body, _n):
+                        if terminal == "transport":
+                            return None
+                        if terminal == "http_error":
+                            return 429, {"error": "fixture rate limit"}
+                        value = completed([{"type": "message", "role": "assistant", "content": [
+                            {"type": "output_text", "text": "not advice JSON"}]}])
+                        if terminal in ("failed", "incomplete"):
+                            value["status"] = terminal
+                        elif terminal == "refusal":
+                            value["output"][0]["content"] = [{"type": "refusal", "refusal": "fixture refusal"}]
+                        elif terminal == "missing_usage":
+                            value.pop("usage")
+                        return 200, value
+
+                    fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
+                    options = [f"--background-reviews={'true' if background else 'false'}"]
+                    proxy = self.proxy(fixture, options)
+                    seed = [{"role": "user", "content": "goal"},
+                            {"role": "assistant", "content": "eligible evidence"},
+                            {"role": "user", "content": "current"}]
+                    self.assertEqual(proxy.send(seed)[0], 200)
+                    self.assertEqual(proxy.send(seed)[0], 200)
+                    saved = self.wait_saved(proxy, lambda s: s["shadow"]["calls"] == 1
+                                            and not s.get("background_review_pending", False))
+                    proxy.close()
+                    proxy = self.proxy(fixture, options)
+                    stats = proxy.request("GET", "/carry/dashboard/stats")[1]
+                    session = stats["sessions"][0]
+                    self.evidence["cases"].append({"background": background, "terminal": terminal,
+                                                   "saved": saved, "session": session,
+                                                   "review_requests": fixture.reviews})
+                    proxy.close()
+                    fixture.close()
+                    self.assertEqual(fixture.errors, [])
+                    self.assertEqual(len(fixture.reviews), 1)
+                    self.assertEqual(session["shadow"]["calls"], 1, "review spend merges exactly once")
+                    estimate = session["cost_estimate"]
+                    excluded = terminal in ("failed", "incomplete", "transport", "http_error")
+                    self.assertEqual(estimate["coverage"]["reviewer_responses"], 0 if excluded else 1,
+                                     "failed reviewer terminal with usage is not a successful response")
+                    self.assertEqual(estimate["coverage"]["failed_calls"], 1 if excluded else 0)
+                    self.assertEqual(estimate["coverage"]["missing_usage"], 1 if terminal == "missing_usage" else 0)
+                    self.assertEqual(estimate["priced"], terminal != "missing_usage",
+                                     "exclude proven reviewer failures, not completed missing-usage spend")
+                    self.assertEqual(estimate["reviewer_cost"] > 0,
+                                     terminal in ("invalid_advice", "refusal"))
+                    # Observed metering remains independent, including metered failures.
+                    self.assertEqual(session["shadow"]["unavailable_cost_calls"],
+                                     1 if terminal in ("transport", "http_error", "missing_usage") else 0)
+
+    def test_successful_reviewer_spend_survives_failed_primary_exactly_once(self):
+        self.evidence["cases"] = []
+        for background in (False, True):
+            with self.subTest(background=background):
+                self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+
+                def review(_body, _n):
+                    if background:
+                        fixture.held.set()
+                        if not fixture.release.wait(8):
+                            raise AssertionError("successful reviewer was not released")
+                    return 200, advice_response({"protected": [], "removable": [], "memories": []})
+
+                fixture = self.fixture(lambda _body, n: (429, {"error": "fixture rate limit"})
+                                       if n == 2 else (200, completed(response_id=f"resp_{n}")), review)
+                proxy = self.proxy(fixture, [f"--background-reviews={'true' if background else 'false'}"])
+                seed = [{"role": "user", "content": "goal"},
+                        {"role": "assistant", "content": "eligible evidence"},
+                        {"role": "user", "content": "current"}]
+                self.assertEqual(proxy.send(seed)[0], 200)
+                self.assertEqual(proxy.send(seed)[0], 429)
+                if background:
+                    self.assertTrue(fixture.held.wait(3))
+                    fixture.release.set()
+                saved = self.wait_saved(proxy, lambda s: s["shadow"]["calls"] == 1
+                                        and not s.get("background_review_pending", False))
+                proxy.close()
+                proxy = self.proxy(fixture, ["--review-every-requests", "100"])
+                self.assertEqual(proxy.send(seed)[0], 200)
+                session = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
+                self.evidence["cases"].append({"background": background, "saved": saved, "session": session})
+                proxy.close()
+                fixture.close()
+                self.assertEqual(fixture.errors, [])
+                estimate = session["cost_estimate"]
+                self.assertEqual(len(fixture.reviews), 1)
+                self.assertEqual(session["shadow"]["calls"], 1)
+                self.assertEqual(estimate["coverage"]["reviewer_responses"], 1)
+                self.assertEqual(estimate["coverage"]["primary_responses"], 2)
+                self.assertGreater(estimate["reviewer_cost"], 0)
+                self.assertEqual(estimate["reviewer_cost"], saved["cost_trajectory"]["result"]["reviewer_cost"])
+                self.assertTrue(estimate["priced"], "successful reviewer spend must survive a failed primary")
+
+    def test_restart_orphan_reviewer_is_untracked_not_proven_failed(self):
+        def review(_body, _n):
+            fixture.held.set()
+            if not fixture.release.wait(8):
+                raise AssertionError("held reviewer was not released")
+            return 200, advice_response({"protected": [], "removable": [], "memories": []})
+
+        fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
+        options = ["--background-reviews=true"]
+        proxy = self.proxy(fixture, options)
+        seed = [{"role": "user", "content": "goal"},
+                {"role": "assistant", "content": "eligible evidence"},
+                {"role": "user", "content": "current"}]
+        self.assertEqual(proxy.send(seed)[0], 200)
+        self.assertEqual(proxy.send(seed)[0], 200)
+        self.assertTrue(fixture.held.wait(3))
+        pending = proxy.saved()
+        self.assertTrue(pending["background_review_pending"])
+        self.assertFalse(proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]["priced"])
+        proxy.close()
+        fixture.release.set()
+        proxy = self.proxy(fixture, ["--review-every-requests", "100"])
+        self.assertEqual(proxy.send(seed)[0], 200)
+        session = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
+        self.evidence.update(pending=pending, session=session, checkpoint=proxy.saved())
+        estimate = session["cost_estimate"]
+        self.assertFalse(estimate["priced"], "unobserved reviewer may have completed with spend")
+        self.assertEqual(estimate["coverage"]["prior_untracked_calls"], 1,
+                         "restart orphan is censored, not a proven failed call")
+        self.assertEqual(estimate["coverage"]["failed_calls"], 0)
+        self.assertEqual(session["shadow"]["unavailable_cost_calls"], 1)
+
     def test_failed_429_continuation_retry_once(self):
         self.continuation("429", False)
 
