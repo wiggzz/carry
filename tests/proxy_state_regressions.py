@@ -149,7 +149,10 @@ class Proxy:
         assert status == 200, "real Carry health route is required"
 
     def request(self, method, path, body=None):
-        connection = http.client.HTTPConnection(*self.address, timeout=5)
+        # Bootstrap import runs a dozen sequential review round-trips before
+        # answering (~4s on fast hardware); a 5s client timeout flakes on
+        # loaded runners. The proxy itself has no inbound request deadline.
+        connection = http.client.HTTPConnection(*self.address, timeout=30)
         try:
             connection.request(method, path, body=None if body is None else wire(body),
                                headers={"Content-Type": "application/json",
