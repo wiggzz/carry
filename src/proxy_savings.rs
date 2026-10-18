@@ -30,6 +30,68 @@ pub struct Estimate {
     pub coverage: Coverage,
 }
 
+/// Public dashboard projection: unavailable accounting is null, never a
+/// plausible partial subtotal. Persisted Estimate retains its legacy shape.
+#[derive(Debug, Serialize)]
+pub struct DashboardEstimate {
+    carry_cost: Option<f64>,
+    traditional_cost: Option<f64>,
+    reviewer_cost: Option<f64>,
+    summary_cost: Option<f64>,
+    traditional_compactions: u64,
+    savings: Option<f64>,
+    savings_percent: Option<f64>,
+    excluded_failed_calls: u64,
+    coverage: Coverage,
+}
+
+impl Estimate {
+    pub fn dashboard(self, pending: bool) -> DashboardEstimate {
+        let available = self.priced && !pending;
+        DashboardEstimate {
+            carry_cost: available.then_some(self.carry_cost),
+            traditional_cost: available.then_some(self.traditional_cost),
+            reviewer_cost: available.then_some(self.reviewer_cost),
+            summary_cost: available.then_some(self.summary_cost),
+            traditional_compactions: self.traditional_compactions,
+            savings: available.then_some(self.savings),
+            savings_percent: self.savings_percent.filter(|_| available),
+            excluded_failed_calls: self.excluded_failed_calls,
+            coverage: self.coverage,
+        }
+    }
+}
+
+#[derive(Default, Debug, Serialize)]
+pub struct DashboardTotals {
+    carry_cost: Option<f64>,
+    traditional_cost: Option<f64>,
+    savings: Option<f64>,
+    savings_percent: Option<f64>,
+    included_sessions: u64,
+    pub excluded_sessions: u64,
+    excluded_failed_calls: u64,
+}
+
+impl DashboardTotals {
+    pub fn observe(&mut self, estimate: &DashboardEstimate) {
+        let (Some(carry), Some(traditional)) = (estimate.carry_cost, estimate.traditional_cost)
+        else {
+            self.excluded_sessions += 1;
+            return;
+        };
+        self.included_sessions += 1;
+        self.excluded_failed_calls += estimate.excluded_failed_calls;
+        let carry = self.carry_cost.unwrap_or(0.0) + carry;
+        let traditional = self.traditional_cost.unwrap_or(0.0) + traditional;
+        let savings = traditional - carry;
+        self.carry_cost = Some(carry);
+        self.traditional_cost = Some(traditional);
+        self.savings = Some(savings);
+        self.savings_percent = (traditional > 0.0).then_some(100.0 * savings / traditional);
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Prompt {
     model: String,
@@ -352,6 +414,141 @@ mod tests {
     fn response(input: u64) -> Value {
         json!({"status": "completed", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}],
             "usage": {"input_tokens": input, "output_tokens": 3, "input_tokens_details": {"cached_tokens": 0}}})
+    }
+
+    #[test]
+    fn dashboard_projection_suppresses_all_money_without_changing_persisted_estimate() {
+        let mut trajectory = Trajectory::default();
+        trajectory.primary(&request("task"), &response(100), "route", 100, true);
+        trajectory.failed_call();
+        let snapshot = trajectory.snapshot();
+        let persisted = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            persisted["priced"], true,
+            "internal checkpoint compatibility stays intact"
+        );
+        for pending in [false, true] {
+            let dashboard = serde_json::to_value(snapshot.clone().dashboard(pending)).unwrap();
+            assert!(dashboard.get("priced").is_none());
+            for field in [
+                "carry_cost",
+                "traditional_cost",
+                "reviewer_cost",
+                "summary_cost",
+                "savings",
+                "savings_percent",
+            ] {
+                if pending {
+                    assert!(
+                        dashboard[field].is_null(),
+                        "pending {field} must not expose partial sums"
+                    );
+                } else {
+                    assert_eq!(dashboard[field], persisted[field]);
+                }
+            }
+            for field in [
+                "coverage",
+                "excluded_failed_calls",
+                "traditional_compactions",
+            ] {
+                assert_eq!(dashboard[field], persisted[field]);
+            }
+        }
+        trajectory.prior_untracked(1);
+        let invalid = trajectory.snapshot();
+        assert!(
+            invalid.carry_cost > 0.0,
+            "invalid checkpoints retain internal accounting"
+        );
+        let dashboard = serde_json::to_value(invalid.dashboard(false)).unwrap();
+        for field in [
+            "carry_cost",
+            "traditional_cost",
+            "reviewer_cost",
+            "summary_cost",
+            "savings",
+            "savings_percent",
+        ] {
+            assert!(dashboard[field].is_null());
+        }
+        assert_eq!(serde_json::to_value(snapshot).unwrap(), persisted);
+    }
+
+    #[test]
+    fn dashboard_totals_accept_only_complete_estimates_and_use_traditional_denominator() {
+        let mut totals = DashboardTotals::default();
+        assert!(totals.carry_cost.is_none());
+        assert!(totals.traditional_cost.is_none());
+        assert!(totals.savings.is_none());
+        assert!(totals.savings_percent.is_none());
+        for (carry, traditional, expected_savings, expected_percent) in [
+            (2.0, 10.0, 8.0, 80.0),
+            (8.0, 2.0, 2.0, 100.0 / 6.0),
+            (4.0, 2.0, 0.0, 0.0),
+            (6.0, 2.0, -4.0, -25.0),
+        ] {
+            let estimate = Estimate {
+                carry_cost: carry,
+                traditional_cost: traditional,
+                savings: traditional - carry,
+                priced: true,
+                excluded_failed_calls: 1,
+                ..Estimate::default()
+            }
+            .dashboard(false);
+            totals.observe(&estimate);
+            assert_eq!(totals.savings, Some(expected_savings));
+            assert!((totals.savings_percent.unwrap() - expected_percent).abs() < 1e-12);
+        }
+        for pending in [false, true] {
+            totals.observe(
+                &Estimate {
+                    carry_cost: 999.0,
+                    traditional_cost: 1000.0,
+                    priced: pending,
+                    excluded_failed_calls: 2,
+                    ..Estimate::default()
+                }
+                .dashboard(pending),
+            );
+        }
+        assert_eq!(totals.carry_cost, Some(20.0));
+        assert_eq!(totals.traditional_cost, Some(16.0));
+        assert_eq!(totals.savings, Some(-4.0));
+        assert_eq!(totals.included_sessions, 4);
+        assert_eq!(totals.excluded_sessions, 2);
+        assert_eq!(totals.excluded_failed_calls, 4);
+    }
+
+    #[test]
+    fn dashboard_zero_cost_is_not_missing_evidence() {
+        let estimate = Estimate {
+            priced: true,
+            ..Estimate::default()
+        }
+        .dashboard(false);
+        let public = serde_json::to_value(&estimate).unwrap();
+        for field in [
+            "carry_cost",
+            "traditional_cost",
+            "reviewer_cost",
+            "summary_cost",
+            "savings",
+        ] {
+            assert_eq!(public[field], 0.0);
+        }
+        let mut totals = DashboardTotals::default();
+        totals.observe(&estimate);
+        assert_eq!(totals.carry_cost, Some(0.0));
+        assert_eq!(totals.traditional_cost, Some(0.0));
+        assert_eq!(totals.savings, Some(0.0));
+        assert_eq!(
+            totals.savings_percent, None,
+            "zero denominator has no percentage"
+        );
+        assert_eq!(totals.included_sessions, 1);
+        assert_eq!(totals.excluded_sessions, 0);
     }
 
     #[test]

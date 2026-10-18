@@ -553,18 +553,28 @@ reconstructed client/provider compaction or cache guarantees. Summaries could
 change subsequent actions, quality or rereads; the scenario does not model that.
 Both scenario totals remain separate from the observed native-usage ledger.
 
-Scenario state survives restart. Failed calls, missing usage, unknown pricing,
-explicit native compaction, native image/audio/video requests, or older untracked
-history mark the comparison
-unavailable, with coverage counters in stats JSON. This change does not backfill
-older checkpoints from raw traces. Dashboard comparison cards sum only sessions
-with complete estimates and display the included/total session count. Excluded
-sessions remain in usage totals and the session list; their savings read
-`Incomplete`, with diagnostics explaining missing coverage. With no eligible
-sessions, the top estimated-savings card shows `Not enough data`; the expanded
-Carry/traditional scenario cards show `No eligible sessions`, not zero savings.
-Scenario fields contain numerical estimates and coverage, never the prior prompt
-kept privately for cache matching; session title excerpts are disclosed above.
+Scenario state survives restart. New trajectories exclude unsuccessful primary
+and reviewer attempts from both comparison branches; later successful requests
+continue the simulation. Missing usage on a completed response, unknown pricing,
+native image/audio/video requests, or older untracked history still make the
+comparison unavailable. A pending background review temporarily withholds the
+comparison until its outcome is recorded. Legacy trajectories retain their old
+failure policy: the upgrade does not reconstruct their historical comparisons
+from raw traces, and later successes do not repair invalid old totals.
+
+The backend owns savings eligibility and aggregation. Session `cost_estimate`
+objects contain numeric monetary fields for available comparisons and `null`
+monetary fields otherwise, with coverage counters retained for diagnostics; there
+is no public `priced` flag. Top-level `cost_estimate` contains the aggregate
+`carry_cost`, `traditional_cost`, `savings`, `savings_percent`, `included_sessions`,
+`excluded_sessions`, and `excluded_failed_calls`. Only available session comparisons
+contribute to these totals; exclusions also count unreadable checkpoints. With
+no available comparisons, amounts are `null`, not zero. Valid zero and negative
+savings remain numeric. The UI formats these backend values without filtering or
+recalculating savings; null amounts display `Unavailable`. Excluded sessions
+remain in usage totals and the session list. Scenario fields never disclose the
+prior prompt kept privately for cache matching; session title excerpts are
+disclosed above.
 See [the proxy backlog](proxy-backlog.md) for completed background review and
 consolidation with the shared main savings/report estimator.
 
