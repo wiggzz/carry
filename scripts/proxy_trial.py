@@ -102,6 +102,8 @@ def main():
     parser.add_argument('--codex-native-compaction',choices=['disabled','v1','v2'],default='disabled',
         help='Fixture-only forced 20000-token native compaction threshold')
     parser.add_argument('--listen', default='127.0.0.1:8787')
+    parser.add_argument('--fixture-client-base-url',
+                        help='Fixture-only loopback observer in front of the owned proxy')
     parser.add_argument('--upstream-url', default='https://api.openai.com/v1/responses')
     parser.add_argument('--classifier-url', default='https://api.openai.com/v1/responses')
     parser.add_argument('--model', default='gpt-6-luna')
@@ -120,6 +122,13 @@ def main():
     host, port = args.listen.rsplit(':',1)
     if not ipaddress.ip_address(host).is_loopback or not 1 <= int(port) <= 65535:
         parser.error('local trials require an explicit loopback listen address')
+    if args.fixture_client_base_url:
+        from urllib.parse import urlsplit
+        observer = urlsplit(args.fixture_client_base_url)
+        if (observer.scheme != 'http' or observer.hostname != '127.0.0.1' or not observer.port
+                or observer.path != '/v1' or observer.query or observer.fragment
+                or observer.username or observer.password):
+            parser.error('fixture client observer must be an explicit 127.0.0.1 HTTP /v1 URL')
     workspace = args.workspace.resolve(strict=True)
     root = args.trial_dir.resolve()
     if root == workspace or root.is_relative_to(workspace):
@@ -133,7 +142,7 @@ def main():
     token, session = secrets.token_urlsafe(32), uuid.uuid4().hex
     env = os.environ.copy()
     env['CARRY_PROXY_AUTH_TOKEN'] = token
-    command = [args.carry_binary,'proxy','--login','api-key',
+    command = [args.carry_binary,'proxy','--verbose','--login','api-key',
         '--listen',args.listen,'--upstream-url',args.upstream_url,
         '--classifier-url',args.classifier_url,'--state-dir',str(root / 'state'), '--mode',args.mode,
         '--classifier-model',args.classifier_model,'--classifier-reasoning-effort',args.classifier_effort,
@@ -170,7 +179,7 @@ def main():
             client_env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'),
                               CARRY_TRIAL_GATEWAY_TOKEN=token)
             client_env.update(client_configuration(root, client=args.client,
-                base_url=f'http://{args.listen}/v1', model=args.model, session_id=session,
+                base_url=args.fixture_client_base_url or f'http://{args.listen}/v1', model=args.model, session_id=session,
                 history_policy=args.history_policy,native_compaction=args.codex_native_compaction))
             binary = args.client_binary or args.client
             if args.client == 'codex':

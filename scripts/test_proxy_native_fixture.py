@@ -57,15 +57,17 @@ class ShadowContractProvider:
 
 
 @contextmanager
-def contract_proxy(test, provider, state_dir, mode='audit', binary=None):
+def contract_proxy(test, provider, state_dir, mode='audit', binary=None, classifier_path='/review'):
     binary = Path(binary or os.environ.get('CARRY_TEST_BINARY', 'target/debug/carry')).resolve()
     if not binary.is_file():
         test.skipTest('requires an existing Carry binary; never builds locally')
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('OPENAI_', 'CARRY_PROXY_'))}
-    command = [str(binary), 'proxy', '--listen', '127.0.0.1:0',
+    home = Path(state_dir) / 'home'; home.mkdir(parents=True, exist_ok=True)
+    env.update(HOME=str(home), CARRY_HOME=str(home/'.carry'), XDG_CONFIG_HOME=str(home/'.config'))
+    command = [str(binary), 'proxy', '--verbose', '--listen', '127.0.0.1:0',
                '--upstream-url', provider.url + '/v1/responses',
-               '--classifier-url', provider.url + '/review', '--mode', mode,
+               '--classifier-url', provider.url + classifier_path, '--mode', mode,
                '--min-payback-percent', '0', '--payoff-requests', '5',
                '--state-dir', state_dir, '--background-reviews=false']
     process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
@@ -103,6 +105,311 @@ def contract_state(directory):
 
 
 class NativeProviderFixtureTests(unittest.TestCase):
+    def test_observer_preserves_delayed_response_after_client_write_eof(self):
+        from scripts.proxy_native_fixture import ClientObserver
+        import base64
+        import socket
+        import time
+        request = b'POST /v1/responses HTTP/1.1\r\nHost: fixture\r\nContent-Length: 2\r\n\r\n{}'
+        response = b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'
+        seen, eof, failures = [], [], []
+        with socket.socket() as server:
+            server.bind(('127.0.0.1', 0)); server.listen(); server.settimeout(3)
+            def target():
+                try:
+                    for _ in range(2):
+                        conn, _ = server.accept()
+                        with conn:
+                            conn.settimeout(3)
+                            raw = b''
+                            while len(raw) < len(request):
+                                part = conn.recv(4096)
+                                if not part: break
+                                raw += part
+                            seen.append(raw)
+                            time.sleep(.15)
+                            conn.sendall(response)
+                            # Both directions must propagate EOF, not just drain a response.
+                            eof.append(conn.recv(1))
+                except OSError as error:
+                    failures.append(str(error))
+            thread = threading.Thread(target=target, daemon=True); thread.start()
+            def exchange(port):
+                with socket.create_connection(('127.0.0.1', port), timeout=3) as client:
+                    client.sendall(request); client.shutdown(socket.SHUT_WR)
+                    raw = b''
+                    while True:
+                        part = client.recv(4096)
+                        if not part: return raw
+                        raw += part
+            try:
+                direct = exchange(server.getsockname()[1])
+                with tempfile.TemporaryDirectory() as directory, ClientObserver(
+                        server.getsockname()[1], Path(directory)/'wire.jsonl') as observer:
+                    relayed = exchange(observer.port)
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(failures, [])
+                self.assertEqual(seen, [request, request])
+                self.assertEqual(eof, [b'', b''])
+                self.assertEqual(direct, response)
+                self.assertEqual(relayed, direct)
+                self.assertEqual(observer.errors, [])
+                self.assertEqual(observer.bodies(), [{}])
+                self.assertEqual(base64.b64decode(observer.records[0]['wire_base64']), request)
+            finally:
+                thread.join(3)
+
+    def test_observer_shutdown_interrupts_stalled_response_reader(self):
+        from scripts.proxy_native_fixture import ClientObserver
+        import socket
+        accepted, stalled = threading.Event(), threading.Event()
+        sockets, failures = [], []
+        with tempfile.TemporaryDirectory() as directory, socket.socket() as server:
+            server.bind(('127.0.0.1', 0)); server.listen(); server.settimeout(3)
+            def target():
+                try:
+                    conn, _ = server.accept()
+                    with conn:
+                        conn.settimeout(.2)
+                        while b'\r\n\r\n' not in conn.recv(4096): pass
+                        # Bounded real traffic, more than the loopback buffers can retain.
+                        for _ in range(128):
+                            conn.sendall(b'x' * 65536)
+                except socket.timeout:
+                    stalled.set()
+                except OSError as error:
+                    failures.append(str(error))
+            thread = threading.Thread(target=target, daemon=True); thread.start()
+            observer = ClientObserver(server.getsockname()[1], Path(directory)/'wire.jsonl')
+            get_request = observer.server.get_request
+            def accept_small_buffer():
+                conn, address = get_request()
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+                sockets.append(conn); accepted.set()
+                return conn, address
+            observer.server.get_request = accept_small_buffer
+            observer.__enter__()
+            closer = threading.Thread(target=observer.__exit__, args=(None, None, None), daemon=True)
+            client = socket.socket()
+            try:
+                client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                client.settimeout(3); client.connect(('127.0.0.1', observer.port))
+                client.sendall(b'GET / HTTP/1.1\r\nHost: fixture\r\n\r\n')
+                self.assertTrue(accepted.wait(3))
+                self.assertTrue(stalled.wait(3), 'upstream must really hit response backpressure')
+                self.assertEqual(select.select([], sockets, [], .1)[1], [],
+                                 'accepted socket must really be blocked by the non-reading client')
+                closer.start(); closer.join(3)
+                self.assertFalse(closer.is_alive(), 'observer shutdown blocked on accepted-socket send')
+                self.assertEqual(observer.errors, [])
+            finally:
+                client.close()
+                if closer.ident is None: closer.start()
+                closer.join(3); thread.join(3)
+            self.assertFalse(closer.is_alive())
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, [])
+
+    def test_observer_rejects_incomplete_request_at_client_eof(self):
+        from scripts.proxy_native_fixture import ClientObserver
+        import socket
+        requests = (
+            b'POST /v1/responses HTTP/1.1\r\nHost: fixture',
+            b'POST /v1/responses HTTP/1.1\r\nContent-Length: 2\r\n\r\n{',
+            b'POST /v1/responses HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n',
+        )
+        for request in requests:
+            with self.subTest(request=request), tempfile.TemporaryDirectory() as directory, socket.socket() as server:
+                server.bind(('127.0.0.1', 0)); server.listen(); server.settimeout(3)
+                def drain():
+                    conn, _ = server.accept()
+                    with conn:
+                        conn.settimeout(3)
+                        while conn.recv(4096): pass
+                thread = threading.Thread(target=drain, daemon=True); thread.start()
+                with ClientObserver(server.getsockname()[1], Path(directory)/'wire.jsonl') as observer:
+                    with socket.create_connection(('127.0.0.1', observer.port), timeout=3) as client:
+                        client.sendall(request); client.shutdown(socket.SHUT_WR)
+                        self.assertEqual(client.recv(4096), b'')
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(observer.errors, ['incomplete observed HTTP request'])
+                self.assertEqual(observer.records, [])
+                with self.assertRaises(AssertionError): observer.bodies()
+
+    def test_observer_upstream_write_eof_still_drains_client_request(self):
+        from scripts.proxy_native_fixture import ClientObserver
+        import socket
+        request = b'POST /v1/responses HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}'
+        seen, failures = [], []
+        with tempfile.TemporaryDirectory() as directory, socket.socket() as server:
+            server.bind(('127.0.0.1', 0)); server.listen(); server.settimeout(3)
+            def target():
+                try:
+                    conn, _ = server.accept()
+                    with conn:
+                        conn.settimeout(3)
+                        raw = conn.recv(4096)
+                        conn.shutdown(socket.SHUT_WR)
+                        while True:
+                            part = conn.recv(4096)
+                            if not part: break
+                            raw += part
+                        seen.append(raw)
+                except OSError as error:
+                    failures.append(str(error))
+            thread = threading.Thread(target=target, daemon=True); thread.start()
+            with ClientObserver(server.getsockname()[1], Path(directory)/'wire.jsonl') as observer:
+                with socket.create_connection(('127.0.0.1', observer.port), timeout=3) as client:
+                    client.sendall(request[:-1])
+                    self.assertEqual(client.recv(4096), b'')
+                    self.assertEqual(observer.errors, [],
+                                     'upstream EOF must not reject a still-open client request')
+                    client.sendall(request[-1:]); client.shutdown(socket.SHUT_WR)
+                thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(seen, [request])
+            self.assertEqual(observer.errors, [])
+            self.assertEqual(observer.bodies(), [{}])
+
+    def test_compact_grading_uses_complete_executed_wire_not_bounded_raw_logs(self):
+        from scripts.proxy_native_fixture import Fixture, ClientObserver, compact_evidence
+        import copy
+        with tempfile.TemporaryDirectory() as directory, Fixture('pi', 'compact') as fixture:
+            root = Path(directory)
+            trial = root/'pi-compact-trial'; trial.mkdir()
+            workspace = root/'pi-compact-workspace'; workspace.mkdir()
+            with contract_proxy(self, fixture, str(trial/'state'), mode='compact',
+                                classifier_path='/classifier') as url:
+                with ClientObserver(int(url.rsplit(':',1)[1]), root/'wire.jsonl') as observer:
+                    body = {'model':'gpt-6-luna', 'prompt_cache_key':'synthetic-native',
+                            'instructions':'fixture context ' * 5000,
+                            'tools':[{'name':'bash'}], 'input':[
+                            {'role':'developer','content':'Run the fixture tools.'},
+                            {'role':'user','content':'old fixture direction'},
+                            {'role':'user','content':'current fixture task'}]}
+                    for _ in range(5):
+                        req = urllib.request.Request(observer.url+'/v1/responses',
+                            data=json.dumps(body).encode(), headers={'content-type':'application/json',
+                            'x-carry-session':'contract'})
+                        with urllib.request.urlopen(req, timeout=10) as response:
+                            events=[json.loads(line[6:]) for line in response.read().decode().splitlines()
+                                    if line.startswith('data: ')]
+                        output=events[-1]['response']['output']
+                        body['input'].extend(output)
+                        for item in output:
+                            if item['type']=='function_call':
+                                run=subprocess.run(json.loads(item['arguments'])['command'],
+                                    shell=True,cwd=workspace,capture_output=True,text=True,check=True)
+                                body['input'].append({'type':'function_call_output',
+                                    'call_id':item['call_id'],'output':run.stdout})
+                    received=observer.bodies()
+            self.assertFalse(fixture.errors)
+            state_file=next((trial/'state').glob('*.json'))
+            raw=[json.loads(line) for line in state_file.with_suffix('.jsonl').read_text().splitlines()]
+            self.assertLess(sum(e['event']=='primary_received' for e in raw),5,
+                            'control must really exceed bounded production raw logging')
+            # Grade even with no operational raw trace at all.
+            state_file.with_suffix('.jsonl').unlink()
+            self.assertTrue(compact_evidence(trial,fixture,received=received)['compact_verified'])
+            original=copy.deepcopy(fixture.calls)
+            for mutation in ('missing-in','extra-in','missing-out','extra-out','corrupt-output','cohort'):
+                before=copy.deepcopy(received); fixture.calls=copy.deepcopy(original)
+                if mutation=='missing-in': before.pop()
+                if mutation=='extra-in': before.append(before[-1])
+                if mutation=='missing-out': fixture.calls.pop()
+                if mutation=='extra-out': fixture.calls.append(fixture.calls[-1])
+                if mutation=='corrupt-output':
+                    next(i for i in fixture.calls[-1]['input'] if i.get('type')=='function_call_output')['output']='CORRUPT'
+                if mutation=='cohort':
+                    fixture.calls[3]['input'] += [i for i in before[3]['input']
+                        if i.get('call_id')=='call_fixture_1_a']
+                with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
+                    compact_evidence(trial,fixture,received=before)
+            fixture.calls=original
+
+    def test_observer_captures_post_gateway_wire_and_operator_headers(self):
+        from scripts.proxy_native_fixture import ClientObserver
+        from scripts.proxy_gateway_fixture_support import Gateway
+        from scripts.test_proxy_gateway import Provider
+        import base64
+        with tempfile.TemporaryDirectory() as directory, Provider(status=409) as provider:
+            with ClientObserver(provider.server.server_port, Path(directory)/'wire.jsonl') as observer:
+                gateway=Gateway(observer.port,provider.server.server_port,'strict')
+                try:
+                    body=b' { "model":"gpt-6-luna", "input":[] } '
+                    status, raw=gateway.request(iter((body[:5],body[5:])), {'x-carry-session':'spoof',
+                        'x-carry-history-policy':'reset-on-divergence','x-carry-secret':'spoof'})
+                    self.assertEqual(status,409)
+                    self.assertEqual(provider.calls[0]['body'],body)
+                    self.assertEqual(observer.bodies(),[json.loads(body)])
+                    wire=base64.b64decode(observer.records[0]['wire_base64'])
+
+                    self.assertIn(b'x-carry-session: fixture-session',wire.lower())
+                    self.assertIn(b'x-carry-history-policy: strict',wire.lower())
+                    self.assertNotIn(b'spoof',wire)
+                finally:
+                    gateway.close()
+
+    def test_observer_decodes_chunked_requests_without_changing_the_wire(self):
+        from scripts.proxy_native_fixture import ClientObserver
+        from scripts.test_proxy_gateway import Provider
+        import base64
+        with tempfile.TemporaryDirectory() as directory, Provider() as provider:
+            with ClientObserver(provider.server.server_port,Path(directory)/'wire.jsonl') as observer:
+                body=b'{"input":[], "escaped":"\\u00e9"}'
+                request=urllib.request.Request(observer.url+'/v1/responses',
+                    data=iter((body[:3],body[3:])), headers={'content-type':'application/json'})
+                with urllib.request.urlopen(request,timeout=3) as response: response.read()
+                self.assertEqual(provider.calls[0]['body'],body)
+                self.assertEqual(observer.bodies(),[json.loads(body)])
+                wire=base64.b64decode(observer.records[0]['wire_base64'])
+                self.assertIn(b'transfer-encoding: chunked',wire.lower())
+
+    def test_observer_preserves_exact_http_and_streams_before_response_finishes(self):
+        from scripts.proxy_native_fixture import ClientObserver
+        import socket
+        release = threading.Event()
+        seen = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_POST(self):
+                seen.append((self.path, list(self.headers.raw_items()),
+                             self.rfile.read(int(self.headers['content-length']))))
+                self.send_response(409)
+                self.send_header('content-type', 'text/event-stream')
+                self.send_header('content-length', '12')
+                self.end_headers()
+                self.wfile.write(b'data: first\n'); self.wfile.flush()
+                release.wait(3)
+                self.wfile.write(b'\n')
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, ClientObserver(
+                    server.server_port, Path(directory) / 'wire.jsonl') as observer:
+                body = b'{ "input": [], "text": "\\u00e9" }'
+                with socket.create_connection(('127.0.0.1', observer.port), timeout=3) as sock:
+                    sock.sendall(b'POST /v1/responses?native=1 HTTP/1.1\r\nHost: original\r\n'
+                        b'X-Native: one\r\nX-Native: two\r\nContent-Length: '+str(len(body)).encode()+
+                        b'\r\nConnection: close\r\n\r\n'+body)
+                    raw = b''
+                    while b'data: first\n' not in raw: raw += sock.recv(4096)
+                    self.assertIn(b'409 Conflict', raw)
+                    self.assertFalse(release.is_set(), 'SSE must not be buffered until EOF')
+                    release.set()
+                    while sock.recv(4096): pass
+                self.assertEqual(seen[0][0], '/v1/responses?native=1')
+                self.assertEqual(seen[0][2], body)
+                self.assertEqual([v for k,v in seen[0][1] if k.lower()=='x-native'], ['one','two'])
+                self.assertEqual(dict(seen[0][1])['Host'], 'original')
+                self.assertEqual(observer.bodies(), [json.loads(body)])
+                self.assertEqual(json.loads((Path(directory)/'wire.jsonl').read_text())['body'], body.decode())
+        finally:
+            release.set(); server.shutdown(); server.server_close(); thread.join(3)
+
     def test_proxy_observes_bulk_once_across_exposure_metadata_failed_primary_and_restart(self):
         with ShadowContractProvider() as provider, tempfile.TemporaryDirectory() as directory:
             body = {'model': 'gpt-6-luna', 'input': [
@@ -363,7 +670,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                        XDG_CONFIG_HOME=str(home / '.config'),
                        CARRY_PROXY_UPSTREAM_KEY='synthetic-fixture-key',
                        CARRY_PROXY_CLASSIFIER_KEY='synthetic-fixture-key')
-            command = [str(binary), 'proxy', '--listen', '127.0.0.1:0',
+            command = [str(binary), 'proxy', '--verbose', '--listen', '127.0.0.1:0',
                        '--upstream-url', fixture.url + '/v1/responses',
                        '--classifier-url', fixture.url + '/classifier',
                        '--classifier-model', 'gpt-6-luna', '--mode', 'audit',

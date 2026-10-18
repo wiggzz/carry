@@ -13,6 +13,129 @@ from pathlib import Path
 import socket
 import subprocess
 import threading
+import base64
+import io
+import http.client
+import select
+import socketserver
+import time
+
+
+class ClientObserver:
+    """Synthetic-fixture ONLY: byte-transparent loopback TCP relay + HTTP capture.
+
+    Complete grading evidence is separate from bounded production diagnostics.
+    The relay never rebuilds requests/responses or buffers an SSE response.
+    Captures contain synthetic auth/payloads; never use this on a live trial.
+    """
+    def __init__(self, target_port, output):
+        self.records, self.errors = [], []
+        self.output = Path(output)
+        self.lock = threading.Lock()
+        self.stopping = threading.Event()
+        outer = self
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                pending = b''
+                try:
+                    with socket.create_connection(('127.0.0.1', target_port), timeout=10) as upstream:
+                        peers = [self.request, upstream]
+                        for peer in peers:
+                            peer.settimeout(.1)
+                        while peers and not outer.stopping.is_set():
+                            ready, _, _ = select.select(peers, [], [], .1)
+                            for source in ready:
+                                destination = upstream if source is self.request else self.request
+                                data = source.recv(65536)
+                                if not data:
+                                    if source is self.request and pending:
+                                        raise ValueError('incomplete observed HTTP request')
+                                    peers.remove(source)
+                                    destination.shutdown(socket.SHUT_WR)
+                                    continue
+                                if source is self.request:
+                                    pending += data
+                                    pending = outer.capture(pending)
+                                # Poll shutdown even when an accepted client stops reading.
+                                # Preserve the existing ten-second per-write upper bound.
+                                remaining = memoryview(data)
+                                deadline = time.monotonic() + 10
+                                while remaining:
+                                    if outer.stopping.is_set(): return
+                                    if time.monotonic() >= deadline:
+                                        raise TimeoutError('observed socket send timed out')
+                                    try:
+                                        sent = destination.send(remaining)
+                                    except socket.timeout:
+                                        continue
+                                    if not sent:
+                                        raise ConnectionError('observed socket closed during send')
+                                    remaining = remaining[sent:]
+                except (OSError, ValueError) as error:
+                    with outer.lock:
+                        outer.errors.append(str(error))
+        self.server = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Handler)
+        self.port = self.server.server_address[1]
+        self.url = f'http://127.0.0.1:{self.port}'
+
+    def capture(self, pending):
+        while b'\r\n\r\n' in pending:
+            head, rest = pending.split(b'\r\n\r\n', 1)
+            line, headers = head.split(b'\r\n', 1)
+            method, path, _ = line.decode('ascii').split(' ')
+            parsed = http.client.parse_headers(io.BytesIO(headers + b'\r\n\r\n'))
+            if parsed.get('transfer-encoding'):
+                # Passive decoding only; chunk framing is forwarded unchanged.
+                if parsed['transfer-encoding'].lower() != 'chunked':
+                    raise ValueError('unsupported observed transfer encoding')
+                offset, chunks = 0, []
+                while True:
+                    end = rest.find(b'\r\n', offset)
+                    if end < 0: return pending
+                    size = int(rest[offset:end].split(b';', 1)[0], 16)
+                    offset = end + 2
+                    if size == 0:
+                        if rest[offset:offset+2] == b'\r\n':
+                            length = offset + 2
+                        else:
+                            end = rest.find(b'\r\n\r\n', offset)
+                            if end < 0: return pending
+                            length = end + 4
+                        break
+                    if len(rest) < offset + size + 2: return pending
+                    if rest[offset+size:offset+size+2] != b'\r\n':
+                        raise ValueError('invalid observed chunk framing')
+                    chunks.append(rest[offset:offset+size]); offset += size + 2
+                body = b''.join(chunks)
+            else:
+                length = int(parsed.get('content-length', '0'))
+                if length < 0: raise ValueError('negative observed content length')
+                if len(rest) < length: return pending
+                body = rest[:length]
+            end = len(head) + 4 + length
+            record = {'method': method, 'path': path, 'body': body.decode('utf-8'),
+                      'wire_base64': base64.b64encode(pending[:end]).decode('ascii')}
+            with self.lock:
+                self.records.append(record)
+                with self.output.open('a') as output:
+                    output.write(json.dumps(record) + '\n')
+            pending = pending[end:]
+        return pending
+
+    def bodies(self):
+        assert not self.errors, f'client wire capture failed: {self.errors}'
+        return [json.loads(r['body']) for r in self.records
+                if r['method'] == 'POST' and r['path'].split('?', 1)[0]
+                in ('/v1/responses', '/v1/responses/compact')]
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stopping.set()
+        self.server.shutdown(); self.server.server_close(); self.thread.join(timeout=3)
 
 
 def review_records(body):
@@ -245,14 +368,12 @@ class Fixture:
         self.server.shutdown(); self.server.server_close(); self.thread.join(timeout=3)
 
 
-def compact_evidence(trial, fixture):
-    """Grade the executed native caller, wire projection and durable paired state."""
+def compact_evidence(trial, fixture, *, received):
+    """Grade complete fixture-owned inbound/outbound wire and durable paired state."""
     files=list((trial / 'state').glob('*.json'))
     if len(files) != 1: raise AssertionError('exactly one owned session required')
     state=json.loads(files[0].read_text())
-    events=[json.loads(line) for line in files[0].with_suffix('.jsonl').read_text().splitlines()]
-    received=[e['data'] for e in events if e['event']=='primary_received']
-    submitted=[e['data'] for e in events if e['event']=='primary_submitted']
+    submitted=fixture.calls
     cohort={'call_fixture_1_a','call_fixture_1_b'}
     def members(body):
         return [i for i in body['input'] if i.get('call_id') in cohort]
@@ -311,20 +432,26 @@ def compact_evidence(trial, fixture):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--carry', required=True)
-    parser.add_argument('--codex', required=True)
-    parser.add_argument('--pi', required=True)
+    parser.add_argument('--codex')
+    parser.add_argument('--pi')
+    parser.add_argument('--client', choices=('codex','pi'), help='Run only one installed pinned client')
     parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args()
+    for client in ([args.client] if args.client else ['codex','pi']):
+        if not getattr(args,client): parser.error('--'+client+' is required for the selected cases')
     if args.output.exists():
         parser.error('fixture output must be fresh')
     args.output.mkdir(parents=True)
     results=[]
     for client,case in [('codex','off'),('codex','compact'),('pi','off'),('pi','compact'),('codex','v1'),('codex','v2'),('pi','pi-checkpoint-strict'),('pi','pi-checkpoint'),('pi','pi-checkpoint-off')]:
+        if args.client and client != args.client: continue
         label=client+'-'+case
         workspace=args.output / (label+'-workspace'); workspace.mkdir()
         subprocess.run(['git','init','-q',str(workspace)],check=True)
         env={k:v for k,v in os.environ.items() if not k.startswith(('OPENAI_','CARRY_PROXY_'))}
         env.update(CARRY_PROXY_UPSTREAM_KEY='synthetic-fixture-key', CARRY_PROXY_CLASSIFIER_KEY='synthetic-fixture-key')
+        home=args.output/(label+'-home'); home.mkdir()
+        env.update(HOME=str(home), CARRY_HOME=str(home/'.carry'), XDG_CONFIG_HOME=str(home/'.config'))
         with Fixture(client,'pi-checkpoint' if case.startswith('pi-checkpoint') else case) as fixture, socket.socket() as sock:
             sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]; sock.close()
             trial=args.output / (label+'-trial')
@@ -341,7 +468,14 @@ def main():
             if case.startswith('pi-checkpoint'):
                 command+=['--pi-checkpoint-fixture','--history-policy',
                     'reset-on-divergence' if case=='pi-checkpoint' else 'strict']
-            run=subprocess.run(command,env=env,text=True,capture_output=True,timeout=85)
+            with ClientObserver(port, args.output/(label+'-client-wire.jsonl')) as observer:
+                command += ['--fixture-client-base-url', observer.url+'/v1']
+                run=subprocess.run(command,env=env,text=True,capture_output=True,timeout=85)
+            received=observer.bodies()
+            (args.output/(label+'-provider-wire.json')).write_text(json.dumps({
+                'fixture_only':True, 'calls':fixture.calls, 'reviews':fixture.reviews})+'\n')
+            if not run.returncode:
+                assert len(received)==len(fixture.calls), 'each executed native request must have complete wire evidence'
             trace=(trial / 'client-events.jsonl').read_text() if (trial / 'client-events.jsonl').exists() else ''
             marker=workspace / 'proxy-fixture.txt'
             cache_key=fixture.calls[0].get('prompt_cache_key') if fixture.calls else None
@@ -362,10 +496,8 @@ def main():
                 elif not run.returncode:
                     states=list((trial/'state').glob('*.json'))
                     state=json.loads(states[0].read_text())
-                    events=[json.loads(line) for line in states[0].with_suffix('.jsonl').read_text().splitlines()]
-                    received=[e['data'] for e in events if e['event']=='primary_received']
-                    submitted=[e['data'] for e in events if e['event']=='primary_submitted']
-                    result['pi_checkpoint_verified']=bool(len(fixture.calls)-len(fixture.summary_calls)==3 and fixture.calls[-1].get('prompt_cache_key') and fixture.summary_calls and compact and compact[0].get('success') is True and
+                    submitted=fixture.calls
+                    result['pi_checkpoint_verified']=bool(len(received)==len(submitted) and received and len(fixture.calls)-len(fixture.summary_calls)==3 and fixture.calls[-1].get('prompt_cache_key') and fixture.summary_calls and compact and compact[0].get('success') is True and
                         'FIXTURE_PI_CHECKPOINT' in json.dumps(fixture.calls[-1]['input']) and
                         received[-1]==submitted[-1] and state['history_rebases']>=1 and
                         not state['active_shadow'] and sum(e.get('type')=='agent_settled' for e in rpc)>=2)
@@ -380,7 +512,7 @@ def main():
                     not any(i.get('type')=='function_call' for i in fixture.calls[-1]['input']))
                 if not result['native_checkpoint_verified']: result['acceptance_failure']='native checkpoint continuation failed'
             if case == 'compact' and not run.returncode:
-                try: result.update(compact_evidence(trial,fixture))
+                try: result.update(compact_evidence(trial,fixture,received=received))
                 except AssertionError as error: result['acceptance_failure']=str(error)
             results.append(result)
             (args.output / 'results.json').write_text(json.dumps(results,indent=2)+'\n')

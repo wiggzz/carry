@@ -10,6 +10,19 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ProxyTrialTests(unittest.TestCase):
+    def test_fixture_observer_rejects_remote_tls_and_credential_urls_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); workspace=root/'workspace'; workspace.mkdir()
+            for url in ('http://example.com/v1','https://127.0.0.1:123/v1',
+                        'http://user:secret@127.0.0.1:123/v1','http://127.0.0.1:123/wrong'):
+                run=subprocess.run(['python3',str(ROOT/'scripts/proxy_trial.py'),
+                    '--client','codex','--workspace',str(workspace),'--trial-dir',str(root/'trial'),
+                    '--prompt','fixture','--fixture-client-base-url',url],
+                    capture_output=True,text=True,timeout=5)
+                self.assertNotEqual(run.returncode,0)
+                self.assertIn('fixture client observer must be',run.stderr)
+                self.assertFalse((root/'trial').exists())
+
     def test_launcher_explicit_api_key_auth_even_with_saved_subscription_and_no_key(self):
         # Execute main through its subprocess/HTTP boundaries, never real auth or HTTP.
         import io
@@ -38,7 +51,8 @@ class ProxyTrialTests(unittest.TestCase):
                 env = {'HOME': str(ordinary), 'CARRY_HOME': str(carry_home),
                        'XDG_CONFIG_HOME': str(ordinary / '.config')}
                 argv = ['trial', '--client', 'codex', '--workspace', str(workspace),
-                        '--trial-dir', str(trial), '--prompt', 'synthetic task']
+                        '--trial-dir', str(trial), '--prompt', 'synthetic task',
+                        '--fixture-client-base-url', 'http://127.0.0.1:12345/v1']
                 if synchronous:
                     argv.append('--synchronous-reviews')
                 with patch.dict(os.environ, env, clear=True), patch('sys.argv', argv), \
@@ -47,7 +61,12 @@ class ProxyTrialTests(unittest.TestCase):
                      patch.object(proxy_trial, 'stop_process_group'):
                     self.assertEqual(proxy_trial.main(), 0)
                 self.assertEqual(len(launches), 2)
+                import tomllib
+                config = tomllib.loads((trial/'codex/config.toml').read_text())
+                self.assertEqual(config['model_providers']['carry-trial']['base_url'],
+                                 'http://127.0.0.1:12345/v1')
                 proxy_argv, proxy_env = launches[0]
+                self.assertIn('--verbose', proxy_argv)
                 self.assertIn('--login', proxy_argv)
                 self.assertEqual(proxy_argv[proxy_argv.index('--login') + 1], 'api-key')
                 self.assertEqual(proxy_argv[proxy_argv.index('--mode') + 1], 'off')

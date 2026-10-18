@@ -82,6 +82,9 @@ pub struct ProxyCli {
     /// Persistent sessions and lifetime stats; defaults to $CARRY_HOME/proxy or ~/.carry/proxy.
     #[arg(long, default_value_os_t = crate::auth::carry_home().map(|home| home.join("proxy")).unwrap_or_else(|_| PathBuf::from(".carry-proxy")))]
     state_dir: PathBuf,
+    /// Write verbose per-session JSONL traces (may contain sensitive request/response data).
+    #[arg(long)]
+    verbose: bool,
     #[arg(long, value_enum, default_value = "compact")]
     mode: Mode,
     #[arg(long, default_value = "gpt-6-luna")]
@@ -157,6 +160,9 @@ struct Service {
 #[path = "proxy_plan.rs"]
 mod planning;
 use planning::plan;
+#[path = "proxy_log.rs"]
+mod logging;
+use logging::journal;
 
 type Failure = (StatusCode, axum::Json<Value>);
 
@@ -319,6 +325,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         background_reviews: Mutex::new(HashSet::new()),
         _directory_lock: directory_lock,
     });
+    logging::maintain(&service);
     let listener = tokio::net::TcpListener::bind(service.config.listen).await?;
     let address = listener.local_addr()?;
     println!("CARRY_PROXY_LISTEN {address}");
@@ -499,12 +506,8 @@ fn save_with_limit(
 }
 
 fn trace(service: &Service, id: &str, event: &str, data: &Value) -> std::io::Result<()> {
-    let mut file = private_file(&service.config.state_dir.join(format!("{id}.jsonl")), true)?;
-    serde_json::to_writer(
-        &mut file,
-        &json!({"event": event, "at": now(), "data": data}),
-    )?;
-    file.write_all(b"\n")
+    logging::raw(service, id, event, data);
+    Ok(())
 }
 
 fn now() -> u64 {
@@ -784,6 +787,7 @@ async fn native_compact(
 #[derive(Default)]
 struct ReviewRun {
     background: bool,
+    request_id: String,
     receipts: Vec<ReviewReceipt>,
     reviewed_sources: Vec<Group>,
 }
@@ -798,6 +802,7 @@ struct ReviewReceipt {
 struct Commit {
     service: Arc<Service>,
     id: String,
+    request_id: String,
     candidate: Session,
     reviewed: Session,
     submitted_ids: Vec<u64>,
@@ -811,6 +816,23 @@ async fn forward(
     headers: HeaderMap,
     bytes: Bytes,
     legacy_native: bool,
+) -> Result<Response, Failure> {
+    forward_request(
+        service,
+        headers,
+        bytes,
+        legacy_native,
+        logging::request_id(),
+    )
+    .await
+}
+
+async fn forward_request(
+    service: Arc<Service>,
+    headers: HeaderMap,
+    bytes: Bytes,
+    legacy_native: bool,
+    request_id: String,
 ) -> Result<Response, Failure> {
     // Responses writes are a native-client interface, not a browser API.
     // This also rejects opaque/null origins and simple text/plain CSRF posts.
@@ -910,6 +932,7 @@ async fn forward(
         }
         let lock = session_lock(&service, &id).await;
         let mut session = load(&service, &id)?;
+        let prior_reviewer_compactions = session.reviewer_compactions;
         let (kind, agent_name) = client_provenance(&body);
         if kind.is_some() || agent_name.is_some() {
             session.client = Some(crate::proxy_state::ClientProvenance { kind, agent_name });
@@ -925,6 +948,13 @@ async fn forward(
             // A prior process exited with an unobserved reviewer attempt. Never
             // resurrect its snapshot or pretend its usage was zero.
             session.background_review_pending = false;
+            journal(
+                &service,
+                &id,
+                &request_id,
+                "background_review_censored",
+                &json!({"reason":"restart_with_pending_review","cost_censored":true}),
+            );
             session.shadow.calls += 1;
             session.shadow.unavailable_cost_calls += 1;
             if let Some(trajectory) = &mut session.cost_trajectory {
@@ -1012,8 +1042,14 @@ async fn forward(
         {
             session.import_replayed_prefix();
         }
-        trace(&service, &id, "primary_received", &body)
-            .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "trace write failed"))?;
+        let _ = trace(&service, &id, "primary_received", &body);
+        journal(
+            &service,
+            &id,
+            &request_id,
+            "primary_received",
+            &json!({"native_compaction":native}),
+        );
         session.review_context = cache_base(&body);
         let active = !native && service.config.mode != Mode::Off;
         let primary_priced = Rates::for_model(body["model"].as_str().unwrap_or(""), 0.0).is_some();
@@ -1030,7 +1066,10 @@ async fn forward(
                 &mut session,
                 &body,
                 true,
-                &mut ReviewRun::default(),
+                &mut ReviewRun {
+                    request_id: request_id.clone(),
+                    ..ReviewRun::default()
+                },
             )
             .await;
         }
@@ -1058,6 +1097,13 @@ async fn forward(
             (None, Value::Null)
         };
         if active && report["forced"] == true && session.background_review_pending {
+            journal(
+                &service,
+                &id,
+                &request_id,
+                "review_waiting",
+                &json!({"reason":"background_capacity"}),
+            );
             // Let the in-flight snapshot merge before deciding capacity. Never
             // wait while holding the lock its completion needs.
             drop(lock);
@@ -1077,7 +1123,14 @@ async fn forward(
                     "waiting for reviewer capacity advice timed out",
                 )
             })?;
-            return Box::pin(forward(service, headers, bytes, legacy_native)).await;
+            return Box::pin(forward_request(
+                service,
+                headers,
+                bytes,
+                legacy_native,
+                request_id,
+            ))
+            .await;
         }
         if active
             && session.bootstrap_review_pending
@@ -1104,7 +1157,10 @@ async fn forward(
                     &mut session,
                     &body,
                     false,
-                    &mut ReviewRun::default(),
+                    &mut ReviewRun {
+                        request_id: request_id.clone(),
+                        ..ReviewRun::default()
+                    },
                 )
                 .await;
             }
@@ -1113,8 +1169,20 @@ async fn forward(
         let reviewed = session.clone();
         if active {
             session.last_plan = report.clone();
-            trace(&service, &id, "paired_plan", &report)
-                .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "plan trace failed"))?;
+            let _ = trace(&service, &id, "paired_plan", &report);
+            logging::planned(&service, &id, &request_id, &report);
+            if let Some(selected) = &candidate {
+                journal(
+                    &service,
+                    &id,
+                    &request_id,
+                    "compaction_selected",
+                    &json!({
+                    "main_changed":session.history.iter().zip(&selected.history).any(|(before,after)| before.removed != after.removed),
+                    "reviewer_compactions":selected.reviewer_compactions.saturating_sub(session.reviewer_compactions),
+                    "apply_enabled":service.config.mode == Mode::Compact}),
+                );
+            }
             if service.config.mode == Mode::Compact
                 && let Some(mut compacted) = candidate
             {
@@ -1132,14 +1200,29 @@ async fn forward(
                 compacted.last_plan = report;
                 session = compacted;
                 outbound["input"] = json!(session.render_primary());
+                if before != after {
+                    journal(
+                        &service,
+                        &id,
+                        &request_id,
+                        "review_skipped",
+                        &json!({"reason":"main_rewrite_selected"}),
+                    );
+                }
                 if before == after
                     && standard(&body)
                     && primary_priced
                     && !session.bootstrap_review_pending
                 {
                     if service.config.background_reviews {
-                        dispatch_review(service.clone(), id.clone(), &mut session, body.clone())
-                            .await;
+                        dispatch_review_for(
+                            service.clone(),
+                            id.clone(),
+                            &mut session,
+                            body.clone(),
+                            request_id.clone(),
+                        )
+                        .await;
                     } else {
                         review(
                             &service,
@@ -1147,7 +1230,10 @@ async fn forward(
                             &mut session,
                             &body,
                             false,
-                            &mut ReviewRun::default(),
+                            &mut ReviewRun {
+                                request_id: request_id.clone(),
+                                ..ReviewRun::default()
+                            },
                         )
                         .await;
                     }
@@ -1162,7 +1248,14 @@ async fn forward(
                 return Err(failure(StatusCode::PAYLOAD_TOO_LARGE, message));
             } else if standard(&body) && primary_priced && !session.bootstrap_review_pending {
                 if service.config.background_reviews {
-                    dispatch_review(service.clone(), id.clone(), &mut session, body.clone()).await;
+                    dispatch_review_for(
+                        service.clone(),
+                        id.clone(),
+                        &mut session,
+                        body.clone(),
+                        request_id.clone(),
+                    )
+                    .await;
                 } else {
                     review(
                         &service,
@@ -1170,7 +1263,10 @@ async fn forward(
                         &mut session,
                         &body,
                         false,
-                        &mut ReviewRun::default(),
+                        &mut ReviewRun {
+                            request_id: request_id.clone(),
+                            ..ReviewRun::default()
+                        },
                     )
                     .await;
                 }
@@ -1191,6 +1287,32 @@ async fn forward(
         // input remains unexposed even when the reviewer already observed it.
         save(&service, &id, &reviewed)
             .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "checkpoint write failed"))?;
+        journal(
+            &service,
+            &id,
+            &request_id,
+            "reviewer_state_committed",
+            &json!({
+            "reviewer_compactions":reviewed.reviewer_compactions.saturating_sub(prior_reviewer_compactions),
+            "main_compaction_pending":session.compactions > reviewed.compactions}),
+        );
+        if !active {
+            journal(
+                &service,
+                &id,
+                &request_id,
+                "review_skipped",
+                &json!({"reason":if native {"native_compaction"} else {"mode_off"}}),
+            );
+        } else if !standard(&body) || !primary_priced {
+            journal(
+                &service,
+                &id,
+                &request_id,
+                "review_skipped",
+                &json!({"reason":"unsupported_model_or_tier"}),
+            );
+        }
         let submitted_ids = session
             .history
             .iter()
@@ -1198,11 +1320,18 @@ async fn forward(
             .map(|i| i.id)
             .collect();
         outbound = primary_wire_body(&service.config, &outbound);
-        trace(&service, &id, "primary_submitted", &outbound)
-            .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "submission trace failed"))?;
+        let _ = trace(&service, &id, "primary_submitted", &outbound);
+        journal(
+            &service,
+            &id,
+            &request_id,
+            "primary_submitted",
+            &json!({"native_compaction":native}),
+        );
         commit = Some(Commit {
             service: service.clone(),
             id,
+            request_id,
             candidate: session,
             reviewed,
             submitted_ids,
@@ -1293,6 +1422,22 @@ async fn forward(
                 commit.reviewed.primary.calls += 1;
                 commit.reviewed.primary.unavailable_cost_calls += 1;
                 let _ = save(&service, &commit.id, &commit.reviewed);
+                logging::usage(
+                    &service,
+                    &commit.id,
+                    &commit.request_id,
+                    "primary",
+                    None,
+                    commit.outbound["model"].as_str().unwrap_or(""),
+                    standard(&commit.outbound),
+                );
+                journal(
+                    &service,
+                    &commit.id,
+                    &commit.request_id,
+                    "primary_failed",
+                    &json!({"reason":"transport","candidate_discarded":true}),
+                );
                 let _ = trace(
                     &service,
                     &commit.id,
@@ -1789,18 +1934,50 @@ fn numeric_review_usage(usage: &Value) -> Value {
     result
 }
 
+#[cfg(test)]
 async fn dispatch_review(service: Arc<Service>, id: String, session: &mut Session, main: Value) {
+    dispatch_review_for(service, id, session, main, logging::request_id()).await;
+}
+
+async fn dispatch_review_for(
+    service: Arc<Service>,
+    id: String,
+    session: &mut Session,
+    main: Value,
+    request_id: String,
+) {
     if session
         .completed_requests
         .saturating_sub(session.last_review_request)
         < service.config.review_every_requests
     {
+        journal(
+            &service,
+            &id,
+            &request_id,
+            "review_skipped",
+            &json!({"reason":"cadence","background":true}),
+        );
         return;
     }
     if !session.groups().iter().any(|g| g.exposed && !g.pinned) && session.memories.is_empty() {
+        journal(
+            &service,
+            &id,
+            &request_id,
+            "review_skipped",
+            &json!({"reason":"no_eligible_sources","background":true}),
+        );
         return;
     }
     if !service.background_reviews.lock().await.insert(id.clone()) {
+        journal(
+            &service,
+            &id,
+            &request_id,
+            "review_skipped",
+            &json!({"reason":"background_running","background":true}),
+        );
         return;
     }
     session.background_review_pending = true;
@@ -1808,13 +1985,28 @@ async fn dispatch_review(service: Arc<Service>, id: String, session: &mut Sessio
     if save(&service, &id, session).is_err() {
         session.background_review_pending = false;
         service.background_reviews.lock().await.remove(&id);
+        journal(
+            &service,
+            &id,
+            &request_id,
+            "review_skipped",
+            &json!({"reason":"checkpoint_unavailable","background":true}),
+        );
         return;
     }
     let before = session.clone();
+    journal(
+        &service,
+        &id,
+        &request_id,
+        "background_review_dispatched",
+        &json!({}),
+    );
     tokio::spawn(async move {
         let mut reviewed = before.clone();
         let mut run = ReviewRun {
             background: true,
+            request_id,
             ..ReviewRun::default()
         };
         review(&service, &id, &mut reviewed, &main, false, &mut run).await;
@@ -1822,15 +2014,42 @@ async fn dispatch_review(service: Arc<Service>, id: String, session: &mut Sessio
         // Never save the snapshot: merge only reviewer fields into the latest state.
         let _lock = session_lock(&service, &id).await;
         if let Ok(mut current) = load(&service, &id) {
-            merge_review(&service.config, &mut current, &before, &reviewed, &run);
+            let merged = merge_review(&service.config, &mut current, &before, &reviewed, &run);
             if save(&service, &id, &current).is_err() {
+                journal(
+                    &service,
+                    &id,
+                    &run.request_id,
+                    "background_review_checkpoint_failed",
+                    &json!({}),
+                );
                 let _ = trace(
                     &service,
                     &id,
                     "background_review_checkpoint_failed",
                     &json!({}),
                 );
+            } else {
+                journal(
+                    &service,
+                    &id,
+                    &run.request_id,
+                    if merged {
+                        "background_review_merged"
+                    } else {
+                        "background_review_discarded"
+                    },
+                    &json!({"reason":if merged {"compatible_snapshot"} else {"stale_snapshot"}, "receipt_count":run.receipts.len(),"unavailable_cost_calls":current.shadow.unavailable_cost_calls,"reviewer_compactions":current.reviewer_compactions.saturating_sub(before.reviewer_compactions)}),
+                );
             }
+        } else {
+            journal(
+                &service,
+                &id,
+                &run.request_id,
+                "background_review_checkpoint_failed",
+                &json!({}),
+            );
         }
         service.background_reviews.lock().await.remove(&id);
     });
@@ -1842,7 +2061,7 @@ fn merge_review(
     before: &Session,
     reviewed: &Session,
     run: &ReviewRun,
-) {
+) -> bool {
     current.background_review_pending = false;
     // Spend survives stale advice, rebases and primary failures. Price reviewer
     // receipts against the current trajectory, never replace its primary history.
@@ -1895,7 +2114,7 @@ fn merge_review(
         });
     if !compatible {
         current.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"background advice discarded: main lineage, source membership or eligibility changed; review current sources again"}]});
-        return;
+        return false;
     }
     let before_memory_input = current.render_primary();
     // Apply reviewer deltas only. Never replace a newer live opinion (including
@@ -2001,6 +2220,7 @@ fn merge_review(
         .saturating_sub(before.reviewer_compactions);
     current.review_epoch = reviewed.review_epoch;
     current.last_review_request = reviewed.last_review_request;
+    true
 }
 
 async fn review(
@@ -2011,12 +2231,22 @@ async fn review(
     bootstrap: bool,
     run: &mut ReviewRun,
 ) -> bool {
+    if run.request_id.is_empty() {
+        run.request_id = logging::request_id();
+    }
     if !bootstrap
         && session
             .completed_requests
             .saturating_sub(session.last_review_request)
             < service.config.review_every_requests
     {
+        journal(
+            service,
+            id,
+            &run.request_id,
+            "review_skipped",
+            &json!({"reason":"cadence","background":run.background}),
+        );
         return false;
     }
     session.review_cache_key = format!("{:x}", Sha256::digest(format!("carry-review-{id}")));
@@ -2026,6 +2256,13 @@ async fn review(
     }
     let groups = session.groups();
     if !groups.iter().any(|g| g.exposed && !g.pinned) && session.memories.is_empty() {
+        journal(
+            service,
+            id,
+            &run.request_id,
+            "review_skipped",
+            &json!({"reason":"no_eligible_sources","background":run.background}),
+        );
         return false;
     }
     prepare_review_history(session, &groups);
@@ -2033,6 +2270,13 @@ async fn review(
     // Ordinary reviews are one incremental update. The live planner makes room
     // first; only oversized imports use multiple bounded admission rounds.
     if !review_fits(&service.config, &body) {
+        journal(
+            service,
+            id,
+            &run.request_id,
+            "review_skipped",
+            &json!({"reason":"reviewer_capacity","background":run.background,"required_tokens":reviewer_required_tokens(&service.config,&body),"context_tokens":service.config.classifier_max_input_tokens}),
+        );
         for group in &groups {
             let mut clean = session.clone();
             clean.compact_reviewer();
@@ -2073,6 +2317,13 @@ async fn review_import(
             return true;
         }
         if calls >= service.config.review_max_calls {
+            journal(
+                service,
+                id,
+                &run.request_id,
+                "review_skipped",
+                &json!({"reason":"bootstrap_call_limit","calls":calls}),
+            );
             return false;
         }
         let mut admitted = groups
@@ -2095,6 +2346,13 @@ async fn review_import(
         if added.is_empty() {
             if session.review_history.is_some() {
                 session.compact_reviewer();
+                journal(
+                    service,
+                    id,
+                    &run.request_id,
+                    "reviewer_cleanup_selected",
+                    &json!({"reason":"bootstrap_capacity","main_changed":false}),
+                );
                 continue;
             }
             let removed = admitted
@@ -2106,6 +2364,13 @@ async fn review_import(
                 session.opinions.insert(remaining[0].id, "keep".into());
                 session.review_feedback = json!({"reason":"import_capacity_exceeded","rejected_count":1,
                     "rejected":[{"field":"capacity","reason":"protected or indivisible source cannot fit the reviewer context budget"}]});
+                journal(
+                    service,
+                    id,
+                    &run.request_id,
+                    "review_skipped",
+                    &json!({"reason":"import_capacity_exceeded"}),
+                );
                 return false;
             }
             let before = session.render_primary();
@@ -2116,12 +2381,26 @@ async fn review_import(
             if save(service, id, session).is_err() {
                 return false;
             }
+            journal(
+                service,
+                id,
+                &run.request_id,
+                "compaction_committed",
+                &json!({"reason":"bootstrap_capacity","main_changed":session.render_primary() != before,"removed_group_count":removed.len()}),
+            );
             continue;
         }
         prepare_review_history(session, &admitted);
         let body = review_body_for_groups(&service.config, session, &admitted);
         let Some(rates) = Rates::for_model(&service.config.classifier_model, estimate(&body))
         else {
+            journal(
+                service,
+                id,
+                &run.request_id,
+                "review_skipped",
+                &json!({"reason":"unsupported_reviewer_pricing"}),
+            );
             return false;
         };
         let input_rate = if classifier_cache_enabled(&service.config).unwrap_or(false) {
@@ -2132,6 +2411,13 @@ async fn review_import(
         let cost = estimate(&body) * input_rate
             + service.config.classifier_max_output_tokens as f64 * rates.output;
         if session.bootstrap_estimated_cost_usd + cost > service.config.bootstrap_max_cost_usd {
+            journal(
+                service,
+                id,
+                &run.request_id,
+                "review_skipped",
+                &json!({"reason":"bootstrap_spend_limit","estimated_cost_usd":cost,"spent_estimate_usd":session.bootstrap_estimated_cost_usd,"limit_usd":service.config.bootstrap_max_cost_usd}),
+            );
             return false;
         }
         session.bootstrap_estimated_cost_usd += cost;
@@ -2203,6 +2489,15 @@ async fn review_chunk(
     if let Some(key) = &service.classifier_key {
         request = request.bearer_auth(key);
     }
+    let review_attempt_id = logging::request_id();
+    logging::journal_attempt(
+        service,
+        id,
+        &run.request_id,
+        &review_attempt_id,
+        "review_started",
+        &json!({"background":run.background,"source_group_count":groups.len(),"estimated_tokens":estimate(body),"required_tokens":reviewer_required_tokens(&service.config,body),"context_tokens":service.config.classifier_max_input_tokens}),
+    );
     let _ = trace(service, id, "shadow_submitted", body);
     session.last_review_request = session.completed_requests;
     let attempt = Attempt::start("shadow", &service.config.classifier_model, false, true);
@@ -2283,8 +2578,29 @@ async fn review_chunk(
             );
         }
         let _ = trace(service, id, "shadow_completed", &value);
+        logging::journal_attempt(
+            service,
+            id,
+            &run.request_id,
+            &review_attempt_id,
+            "usage",
+            &logging::usage_data(
+                "shadow",
+                Some(&value),
+                &service.config.classifier_model,
+                true,
+            ),
+        );
         if value["status"] != "completed" {
             let _ = trace(service, id, "shadow_failed", &diagnostic);
+            logging::journal_attempt(
+                service,
+                id,
+                &run.request_id,
+                &review_attempt_id,
+                "shadow_failed",
+                &diagnostic,
+            );
         }
         if let Some(advice) = reviewer_advice(&value) {
             replay_output = value["output"].as_array().cloned().unwrap_or_default();
@@ -2310,6 +2626,22 @@ async fn review_chunk(
     } else {
         attempt.finish(None, "review_transport_or_protocol_failure");
         let _ = trace(service, id, "shadow_failed", &diagnostic);
+        logging::journal_attempt(
+            service,
+            id,
+            &run.request_id,
+            &review_attempt_id,
+            "shadow_failed",
+            &diagnostic,
+        );
+        logging::journal_attempt(
+            service,
+            id,
+            &run.request_id,
+            &review_attempt_id,
+            "usage",
+            &logging::usage_data("shadow", None, &service.config.classifier_model, true),
+        );
         if run.background {
             run.receipts.push(ReviewReceipt {
                 model: String::new(),
@@ -2346,6 +2678,14 @@ async fn review_chunk(
         session.partial_reviews += 1;
     }
     let _ = trace(service, id, "shadow_feedback", &session.review_feedback);
+    logging::journal_attempt(
+        service,
+        id,
+        &run.request_id,
+        &review_attempt_id,
+        "review_finished",
+        &json!({"background":run.background,"valid":valid,"accepted_opinions":session.review_feedback["accepted_opinions"].as_u64(),"accepted_memories":session.review_feedback["accepted_memories"].as_u64(),"rejected_count":session.review_feedback["rejected_count"].as_u64()}),
+    );
     valid
 }
 
@@ -2866,8 +3206,9 @@ async fn relay(
                     Ok(Some(chunk)) => {
                         if is_sse { observer.feed(&chunk); }
                         else { json_observer.feed(&chunk); }
-                        if let Some(commit) = &commit {
-                            let _ = trace(&commit.service, &commit.id, "primary_response_chunk", &json!({"bytes": chunk.as_ref()}));
+                        if let Some(commit) = &commit
+                            && commit.service.config.verbose {
+                            logging::raw_chunk(&commit.service, &commit.id, chunk.as_ref());
                         }
                         if converted.is_none() && sender.send(Ok(chunk)).await.is_err() { stream_end = "client disconnected before completion"; break; }
                     }
@@ -2905,6 +3246,15 @@ async fn relay(
             } else {
                 complete_transport
             };
+            logging::usage(
+                &commit.service,
+                &commit.id,
+                &commit.request_id,
+                "primary",
+                observed.as_ref(),
+                commit.outbound["model"].as_str().unwrap_or(""),
+                status.is_success() && complete_transport && standard(&commit.outbound),
+            );
             let completed = observed.as_ref().is_some_and(|v| {
                 if commit.native {
                     // Native V1 may omit status; V2 still requires its real
@@ -2976,10 +3326,26 @@ async fn relay(
                 }
                 let _ = trace(&commit.service, &commit.id, "primary_completed", &value);
                 if save(&commit.service, &commit.id, &commit.candidate).is_err() {
+                    journal(
+                        &commit.service,
+                        &commit.id,
+                        &commit.request_id,
+                        "primary_checkpoint_failed",
+                        &json!({"candidate_committed":false}),
+                    );
                     converted_value = None;
                     let _ = sender
                         .send(Err(std::io::Error::other("proxy checkpoint failed")))
                         .await;
+                } else {
+                    logging::changes(
+                        &commit.service,
+                        &commit.id,
+                        &commit.request_id,
+                        "primary_committed",
+                        &commit.reviewed,
+                        &commit.candidate,
+                    );
                 }
             } else {
                 let reason = if !status.is_success() {
@@ -3014,7 +3380,14 @@ async fn relay(
                     &commit.id,
                     "primary_failed",
                     &json!({"reason": reason, "http_status": status.as_u16(), "complete_transport": complete_transport,
-                        "error": crate::proxy_sse::safe_error(&observed.as_ref().map(|v| v["error"].clone()).unwrap_or(Value::Null))}),
+                        "error": observed.as_ref().map(|v| crate::proxy_sse::safe_error(&v["error"])).unwrap_or_else(|| json!({}))}),
+                );
+                journal(
+                    &commit.service,
+                    &commit.id,
+                    &commit.request_id,
+                    "primary_failed",
+                    &json!({"reason":reason,"http_status":status.as_u16(),"complete_transport":complete_transport,"candidate_discarded":true,"error":observed.as_ref().map(|v| crate::proxy_sse::safe_error(&v["error"])).unwrap_or_else(|| json!({}))}),
                 );
             }
         }
@@ -3095,6 +3468,10 @@ mod tests {
             background_reviews: Mutex::new(HashSet::new()),
         }
     }
+
+    // PR154 tests only: use the current trace/checkpoint seam, not new APIs.
+    include!("proxy_pr154_tests.rs");
+    include!("proxy_pr154_controls.rs");
 
     #[test]
     fn dashboard_client_provenance_is_bounded_and_optional() {
@@ -3513,6 +3890,7 @@ mod tests {
         );
         let run = ReviewRun {
             background: true,
+            request_id: String::new(),
             reviewed_sources: sources,
             receipts: vec![ReviewReceipt {
                 model: config.classifier_model.clone(),
@@ -3647,6 +4025,7 @@ mod tests {
         current.history[1].value["content"] = json!("changed evidence");
         let run = ReviewRun {
             background: true,
+            request_id: String::new(),
             reviewed_sources: before.groups(),
             receipts: vec![ReviewReceipt {
                 model: "gpt-6-luna".into(),
