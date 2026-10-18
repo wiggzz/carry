@@ -59,6 +59,11 @@ fn state_regression(selector: &str) {
 }
 
 #[test]
+fn successful_request_savings_after_failure_and_restart() {
+    state_regression("successful_request_savings_after_failure_and_restart");
+}
+
+#[test]
 fn failed_429_continuation_retry_once() {
     state_regression("failed_429_continuation_retry_once");
 }

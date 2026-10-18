@@ -255,6 +255,45 @@ class StateRegressions(unittest.TestCase):
                          "successful retry must advance the frontier once, not retain speculative duplicates")
         self.assertTrue(all("previous_response_id" not in body for body in fixture.primaries))
 
+    def test_successful_request_savings_after_failure_and_restart(self):
+        fixture = self.fixture(lambda _body, n: (429, {"error": "fixture rate limit"})
+                               if n == 2 else (200, completed(response_id=f"resp_{n}")))
+        options = ["--review-every-requests", "100"]
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send([{"role": "user", "content": "initial task"}])[0], 200)
+        proxy.close()
+        # Small owned scenario forces a later threshold crossing without large
+        # requests. Real provider endpoints are all loopback fixtures.
+        path = next(self.state.glob("*.json"))
+        saved = json.loads(path.read_text())
+        saved["cost_trajectory"]["scenario"] = {
+            "context_window": 2000, "reserve": 100, "keep_recent": 200, "summary": 50}
+        path.write_text(json.dumps(saved))
+        proxy = self.proxy(fixture, options)
+        delta = [{"role": "user", "content": "evidence " * 3000}]
+        self.assertEqual(proxy.send(delta, previous_response_id="resp_1")[0], 429)
+        self.assertEqual(proxy.send(delta, previous_response_id="resp_1")[0], 200)
+        proxy.close()
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send([{"role": "user", "content": "after restart"}],
+                                    previous_response_id="resp_3")[0], 200)
+        status, stats = proxy.request("GET", "/carry/dashboard/stats")
+        self.assertEqual(status, 200)
+        session = stats["sessions"][0]
+        self.evidence.update(stats=stats, checkpoint=proxy.saved())
+        estimate = session["cost_estimate"]
+        self.assertEqual(session["completed_requests"], 3)
+        self.assertEqual(estimate["coverage"]["primary_responses"], 3)
+        self.assertEqual(estimate["coverage"]["failed_calls"], 1)
+        self.assertTrue(estimate["priced"], "one failure must not hide later successful-request savings")
+        self.assertEqual(estimate["traditional_compactions"], 1,
+                         "the successful-only conventional scenario must keep advancing after a failure")
+        self.assertGreater(estimate["summary_cost"], 0)
+        self.assertEqual(len(fixture.primaries), 4)
+        self.assertEqual(fixture.reviews, [])
+        self.assertEqual(session["primary"]["unavailable_cost_calls"], 1,
+                         "failed-call spend remains unknown, not a zero-cost success")
+
     def test_failed_429_continuation_retry_once(self):
         self.continuation("429", False)
 

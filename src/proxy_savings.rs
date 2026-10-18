@@ -340,6 +340,44 @@ mod tests {
     }
 
     #[test]
+    fn successful_requests_continue_summaries_after_failures_and_restart() {
+        let mut trajectory = Trajectory {
+            scenario: Scenario {
+                context_window: 2000,
+                reserve: 100,
+                keep_recent: 200,
+                summary: 50,
+            },
+            ..Trajectory::default()
+        };
+        trajectory.primary(&request("task"), &response(100), "route", 100, true);
+        let mut control = trajectory.clone();
+        trajectory.failed_call();
+        let mut resumed: Trajectory =
+            serde_json::from_value(serde_json::to_value(&trajectory).unwrap()).unwrap();
+        let body = request(&"evidence ".repeat(3000));
+        for candidate in [&mut resumed, &mut control] {
+            candidate.primary(&body, &response(100), "route", 101, true);
+            candidate.reviewer(&request("priced review"), &response(100), true);
+            candidate.primary(&body, &response(100), "route", 102, true);
+        }
+        let estimate = resumed.snapshot();
+        let expected = control.snapshot();
+        assert_eq!(estimate.coverage.primary_responses, 3);
+        assert_eq!(estimate.coverage.failed_calls, 1);
+        assert!(
+            estimate.priced,
+            "failed requests must not suppress priced successes"
+        );
+        assert_eq!(estimate.traditional_compactions, 1);
+        assert!(estimate.summary_cost > 0.0);
+        assert!(estimate.reviewer_cost > 0.0);
+        assert_eq!(estimate.carry_cost, expected.carry_cost);
+        assert_eq!(estimate.traditional_cost, expected.traditional_cost);
+        assert_eq!(estimate.savings_percent, expected.savings_percent);
+    }
+
+    #[test]
     fn scenario_input_is_independent_of_native_input_metering() {
         let replay = |metered| {
             let mut trajectory = Trajectory::default();
