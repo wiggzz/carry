@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.1](https://github.com/wiggzz/carry/compare/v0.12.0...v0.12.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* **proxy:** bound traces and preserve safe operational diagnostics ([#154](https://github.com/wiggzz/carry/issues/154)) ([279dc3b](https://github.com/wiggzz/carry/commit/279dc3be9753902972f68b09b2d67030dc29412b))
+* **proxy:** preserve successful-request dashboard savings ([#157](https://github.com/wiggzz/carry/issues/157)) ([65c177e](https://github.com/wiggzz/carry/commit/65c177e52600f30d177f953d65c5b94a9af1507d))
+
 ## [0.12.0](https://github.com/wiggzz/carry/compare/v0.11.0...v0.12.0) (2026-10-17)
 
 
