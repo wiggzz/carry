@@ -119,7 +119,11 @@ class Proxy:
                "HOME": str(state), "XDG_CONFIG_HOME": str(state),
                "CARRY_HOME": str(state), "NO_PROXY": "127.0.0.1,localhost",
                "CARRY_PROXY_UPSTREAM_KEY": "fixture-primary",
-               "CARRY_PROXY_CLASSIFIER_KEY": "fixture-shadow"}
+               "CARRY_PROXY_CLASSIFIER_KEY": "fixture-shadow",
+               "CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "0",
+               "CARRY_PROXY_REVIEW_MIN_NEW_TOKENS": "0",
+               "CARRY_PROXY_REVIEW_BACKOFF_FACTOR": "1",
+               "CARRY_PROXY_REVIEW_EVERY_REQUESTS": "1"}
         args = [binary, "proxy", "--listen", "127.0.0.1:0", "--no-open-dashboard",
                 "--state-dir", str(state), "--mode", "compact",
                 "--upstream-url", fixture.url + "/v1/responses",

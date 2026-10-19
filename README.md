@@ -181,7 +181,12 @@ Defaults are `--mode compact --login auto --background-reviews --payoff-requests
 Auto authentication prefers `CARRY_PROXY_UPSTREAM_KEY` or `OPENAI_API_KEY`, then a
 valid saved Carry subscription. Use `--login codex` or `--login api-key` to choose
 explicitly. Ordinary reviews run in the background; use `--background-reviews=false`
-for synchronous reviews. Bootstrap remains synchronous.
+for synchronous reviews. Bootstrap remains synchronous. Ordinary review defaults
+require a 150,000-token retained-primary estimate, four completed requests **and**
+25,000 newly reviewable native-source tokens, with capped no-yield backoff.
+These experimental defaults are configurable; see
+[admission and batching](docs/proxy-benchmarking.md#ordinary-review-admission-and-batching).
+They do not guarantee savings or a reviewer cache-hit percentage.
 `--review-replayed-history` explicitly declares that history before the latest user
 message has already been consumed, allowing review before the first request; large
 unseen histories bootstrap automatically without this flag. Invalid reviewer items are isolated,

@@ -223,6 +223,76 @@ resume incomplete imports; restarting does not replenish the cumulative allowanc
 These modeled amounts are not provider billing limits. Subscription transport does
 not enforce the API output cap, so configure conservative budgets for that route.
 
+## Ordinary review admission and batching
+
+Ordinary review is admitted only when **all three** conditions hold: the currently
+retained primary wire-prompt estimate reaches its floor, enough primary requests
+have completed since the last attempt, and enough previously uncovered native
+source has become reviewable. Equality admits. A large tool result can satisfy
+the token batch, but cannot replace the completed-request batch. Unexposed,
+pinned or incomplete tool cohorts are not reviewable growth. Reviewer ledgers,
+answers, memories, cache-window rebuilding and repeated old source do not count.
+The primary estimate includes retained instructions/tools and is reevaluated after
+selection/rebase; it is not cumulative billing usage or reviewer-prompt size.
+
+| CLI option | Environment variable | Default | Range |
+| --- | --- | ---: | --- |
+| `--review-min-primary-tokens` | `CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS` | 150000 | 0–2000000 |
+| `--review-every-requests` | `CARRY_PROXY_REVIEW_EVERY_REQUESTS` | 4 | 1–100 |
+| `--review-min-new-tokens` | `CARRY_PROXY_REVIEW_MIN_NEW_TOKENS` | 25000 | 0–2000000 |
+| `--review-backoff-factor` | `CARRY_PROXY_REVIEW_BACKOFF_FACTOR` | 2 | 1–16 |
+| `--review-backoff-max` | `CARRY_PROXY_REVIEW_BACKOFF_MAX` | 8 | 1–64 |
+
+CLI overrides environment; environment overrides defaults. Empty/malformed or
+out-of-range values fail at startup before state creation. Zero disables either
+token gate; factor 1 (or maximum 1) disables adaptive backoff. To restore the old
+per-request policy explicitly, use:
+
+```sh
+carry proxy --review-min-primary-tokens 0 --review-min-new-tokens 0 \
+  --review-every-requests 1 --review-backoff-factor 1
+```
+
+A valid review with no actual decision/material delta multiplies **both** request
+and native-token batches by the factor, up to the configured maximum multiplier
+(default sequence 1, 2, 4, 8, 8). The primary floor is not multiplied. Newly
+authorized atomic removals, unique accepted memories, or retired existing memories
+reset backoff. A new protection is progress, not removal yield: it holds the
+current multiplier without resetting it. Repeated protections, removability
+opinions and duplicate memories are no-yield. A transport/protocol failure or
+wholly invalid advice consumes request cadence but neither increases no-yield
+backoff nor consumes the native-source batch; retry still requires ordinary
+cadence and eligibility. Partial valid advice is classified by committed deltas.
+This does not equate accepted-opinion counts, or a lack of physical rewrites,
+with useful removal. Existing safety constraints retain authority over any advice.
+
+Coverage and no-yield state persist across process restarts separately from
+reviewer replay/cache windows. Legacy checkpoints seed coverage from existing
+native observations rather than counting old source as growth. Native ancestry
+rebases retire coverage/backoff and restart cadence at the current completed
+request count. Compatible background merges classify only the applied deltas;
+stale lineage work cannot reset backoff or cover a new lineage's source.
+Bootstrap/import and blocking real-capacity recovery bypass ordinary admission,
+not exposure, pinning, tool atomicity, request-size limits or import spend bounds.
+
+The planner uses this same admission predicate per retained candidate and consumes
+a frozen native-source batch once. It does not invent future source growth or
+successful removal yield; current backoff is held constant in this sensitivity.
+Pending/incomplete work remains unknown. Operational journals expose bounded
+numeric admission inputs, reason, multiplier and outcome; policy fingerprints,
+`/carry/metrics.review_policy`, plan reports and trial provenance record effective
+settings. No prompt contents or native source IDs are added to admission logs.
+
+These defaults are **hypotheses, not a measured optimum**. They aim to avoid early
+paid reviews and batch low-yield histories, but may delay useful advice. Fewer
+reviews do not establish lower whole-session cost or maintained task quality.
+Batching does not guarantee an 80–95% cache-hit ratio or any savings: removing cold
+calls can change the denominator, and longer backoff can expire provider caches.
+Evaluate native cached/input counts, total reviewer expense, whole-session cost
+and task quality together before promoting a treatment. Small protocol fixtures
+explicitly select the legacy policy so they continue exercising review behavior;
+they are not admission-economics measurements.
+
 Ordinary updates run in the background by default, with one review in flight per
 session. Only compatible advice is merged into the latest checkpoint. Capacity
 pressure waits for an in-flight update without holding its merge lock, then

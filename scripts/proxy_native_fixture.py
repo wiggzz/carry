@@ -450,6 +450,9 @@ def main():
         subprocess.run(['git','init','-q',str(workspace)],check=True)
         env={k:v for k,v in os.environ.items() if not k.startswith(('OPENAI_','CARRY_PROXY_'))}
         env.update(CARRY_PROXY_UPSTREAM_KEY='synthetic-fixture-key', CARRY_PROXY_CLASSIFIER_KEY='synthetic-fixture-key')
+        # Force the legacy cadence for the tiny native-client protocol fixture.
+        env.update(CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS='0', CARRY_PROXY_REVIEW_MIN_NEW_TOKENS='0',
+               CARRY_PROXY_REVIEW_BACKOFF_FACTOR='1', CARRY_PROXY_REVIEW_EVERY_REQUESTS='1')
         home=args.output/(label+'-home'); home.mkdir()
         env.update(HOME=str(home), CARRY_HOME=str(home/'.carry'), XDG_CONFIG_HOME=str(home/'.config'))
         with Fixture(client,'pi-checkpoint' if case.startswith('pi-checkpoint') else case) as fixture, socket.socket() as sock:

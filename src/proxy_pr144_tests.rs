@@ -5,6 +5,12 @@ use super::*;
 fn config() -> ProxyCli {
     ProxyCli::try_parse_from([
         "carry proxy",
+        "--review-min-primary-tokens",
+        "0",
+        "--review-min-new-tokens",
+        "0",
+        "--review-backoff-factor",
+        "1",
         "--mode",
         "compact",
         "--classifier-model",

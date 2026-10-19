@@ -65,6 +65,9 @@ def contract_proxy(test, provider, state_dir, mode='audit', binary=None, classif
            if not k.startswith(('OPENAI_', 'CARRY_PROXY_'))}
     home = Path(state_dir) / 'home'; home.mkdir(parents=True, exist_ok=True)
     env.update(HOME=str(home), CARRY_HOME=str(home/'.carry'), XDG_CONFIG_HOME=str(home/'.config'))
+    # Explicit legacy treatment: exercise review mechanics on tiny synthetic inputs.
+    env.update(CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS='0', CARRY_PROXY_REVIEW_MIN_NEW_TOKENS='0',
+               CARRY_PROXY_REVIEW_BACKOFF_FACTOR='1', CARRY_PROXY_REVIEW_EVERY_REQUESTS='1')
     command = [str(binary), 'proxy', '--verbose', '--listen', '127.0.0.1:0',
                '--upstream-url', provider.url + '/v1/responses',
                '--classifier-url', provider.url + classifier_path, '--mode', mode,

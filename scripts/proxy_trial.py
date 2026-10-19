@@ -204,6 +204,7 @@ def main():
                 'classifier_model':args.classifier_model,'classifier_effort':args.classifier_effort,
                 'classifier_cache_policy':args.classifier_cache_policy,
                 'background_reviews':not args.synchronous_reviews,
+                'review_policy':metrics.get('review_policy'),
                 'payoff_requests':args.payoff_requests,'min_payback_percent':args.min_payback_percent}, indent=2)+'\n')
             with (root / 'client-events.jsonl').open('w') as output:
                 if args.pi_checkpoint_fixture:

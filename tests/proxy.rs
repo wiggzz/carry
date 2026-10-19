@@ -4,6 +4,8 @@ use std::time::Duration;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[path = "support/admission.rs"]
+mod admission;
 #[path = "support/pr154.rs"]
 mod pr154;
 
@@ -1086,6 +1088,10 @@ async fn start_proxy_options_env(
             .env("CARRY_PROXY_AUTH_TOKEN", gateway)
             .env("CARRY_PROXY_UPSTREAM_KEY", "fixture-primary")
             .env("CARRY_PROXY_CLASSIFIER_KEY", "fixture-shadow")
+            .env("CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS", "0")
+            .env("CARRY_PROXY_REVIEW_MIN_NEW_TOKENS", "0")
+            .env("CARRY_PROXY_REVIEW_BACKOFF_FACTOR", "1")
+            .env("CARRY_PROXY_REVIEW_EVERY_REQUESTS", "1")
             .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
