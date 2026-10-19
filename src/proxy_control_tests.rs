@@ -47,6 +47,19 @@ fn ledger(body: &Value) -> Value {
 }
 
 #[test]
+fn initial_empty_direction_has_no_moving_control_suffix() {
+    let (config, mut session) = fixture();
+    for instructions in [Value::Null, json!("")] {
+        session.review_context = json!({"instructions": instructions});
+        assert!(review_control_observations(&session).is_empty());
+        assert_eq!(
+            ledger(&review_body(&config, &session))["primary_instruction_version"],
+            0
+        );
+    }
+}
+
+#[test]
 fn control_versions_append_clear_restart_and_preserve_native_replay() {
     let (config, mut session) = fixture();
     let first = review_body(&config, &session);
@@ -138,6 +151,65 @@ fn accepted_memory_text_is_not_repeated_and_retirement_purges_history() {
     assert!(!retired.to_string().contains("UNIQUE_ACCEPTED_FACT"));
     assert_eq!(session.opinions.get(&2).map(String::as_str), Some("keep"));
     assert_eq!(session.reviewer_compactions, 1);
+}
+
+#[test]
+fn replacement_memory_uses_new_handle_and_purges_obsolete_replay() {
+    let (config, mut session) = fixture();
+    let groups = session.groups();
+    session.apply_advice(&groups, &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g2"],"text":"OBSOLETE_FACT"}]})).unwrap();
+    let body = review_body(&config, &session);
+    commit(&mut session, &body);
+    session.apply_advice(&groups, &json!({"protected":[],"removable":["m1"],"memories":[{"source_ids":["g2"],"text":"CORRECTED_FACT"}]})).unwrap();
+    assert_eq!(session.memories.len(), 1);
+    assert_eq!(session.memories[0].id, 2);
+    let replacement = review_body(&config, &session);
+    assert!(!replacement.to_string().contains("OBSOLETE_FACT"));
+    assert_eq!(replacement.to_string().matches("CORRECTED_FACT").count(), 1);
+    assert_eq!(
+        ledger(&replacement)["current_memories"][0]["memory_id"],
+        "m2"
+    );
+    assert_eq!(
+        ledger(&replacement)["current_memories"][0]["source_ids"],
+        json!(["g2"])
+    );
+}
+
+#[test]
+fn background_merge_preserves_latest_direction_and_stale_replay_cannot_return() {
+    let (config, mut current) = fixture();
+    let body = review_body(&config, &current);
+    commit(&mut current, &body);
+    let before = current.clone();
+    let mut reviewed = before.clone();
+    let body = review_body(&config, &reviewed);
+    commit(&mut reviewed, &body);
+    current.review_context["instructions"] = json!("LATEST_DIRECTION");
+    assert!(merge_review(
+        &config,
+        &mut current,
+        &before,
+        &reviewed,
+        &ReviewRun::default()
+    ));
+    let latest = review_body(&config, &current);
+    assert_eq!(latest.to_string().matches("FIRST_DIRECTION").count(), 1);
+    assert_eq!(latest.to_string().matches("LATEST_DIRECTION").count(), 1);
+    assert_eq!(ledger(&latest)["primary_instruction_version"], 2);
+    current.compact_reviewer();
+    assert!(!merge_review(
+        &config,
+        &mut current,
+        &before,
+        &reviewed,
+        &ReviewRun::default()
+    ));
+    assert!(current.review_history.is_none());
+    assert!(current.reviewer_controls.is_none());
+    let clean = review_body(&config, &current);
+    assert!(!clean.to_string().contains("FIRST_DIRECTION"));
+    assert_eq!(clean.to_string().matches("LATEST_DIRECTION").count(), 1);
 }
 
 #[test]
