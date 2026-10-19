@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.13.0](https://github.com/wiggzz/carry/compare/v0.12.1...v0.13.0) (2026-10-19)
+
+
+### Features
+
+* batch ordinary reviews with adaptive admission and backoff ([#161](https://github.com/wiggzz/carry/issues/161)) ([39422d7](https://github.com/wiggzz/carry/commit/39422d704c2b34fbe5dfdfcfa6606bdb12527e76))
+* **proxy:** discover subscription models ([#153](https://github.com/wiggzz/carry/issues/153)) ([d63e50f](https://github.com/wiggzz/carry/commit/d63e50fe00e4a48327b08d71ed58281f563d5021))
+
+
+### Bug Fixes
+
+* compact conventional scenarios between tool requests ([#162](https://github.com/wiggzz/carry/issues/162)) ([d23580e](https://github.com/wiggzz/carry/commit/d23580e6d18343e2fee8fc67fbe9bd7b5bc7f7c5))
+* **savings:** compare priced calls without discarding the whole estimate ([#159](https://github.com/wiggzz/carry/issues/159)) ([fbc6645](https://github.com/wiggzz/carry/commit/fbc664597ba7e2cd2a471728bbcbfe4082d8e75e))
+
 ## [0.12.1](https://github.com/wiggzz/carry/compare/v0.12.0...v0.12.1) (2026-10-18)
 
 
