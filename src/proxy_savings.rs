@@ -325,8 +325,7 @@ impl Trajectory {
             return;
         }
         self.result.coverage.primary_responses += 1;
-        let (Some(prompt), Some(out)) =
-            (projection(body, route, at), response["output"].as_array())
+        let (Some(prompt), Some(_)) = (projection(body, route, at), response["output"].as_array())
         else {
             // Without a structural projection, omit the entire matched pair
             // before touching money and restart cache/summary assumptions.
@@ -400,14 +399,10 @@ impl Trajectory {
         });
         // Advance the conventional text scenario even when usage/rates are
         // missing. Opaque modalities instead reset the structural epoch above.
-        let tool_turn = out.iter().any(|item| {
-            item["type"]
-                .as_str()
-                .is_some_and(|ty| ty.ends_with("_call"))
-        });
+        // Every completed request is a summary opportunity, including tool calls.
+        // Waiting for an agent turn to finish can overshoot the scenario window.
         let total = traditional_input.saturating_add(token_units(&response["output"]));
-        let summarize = !tool_turn
-            && self.available
+        let summarize = self.available
             && self.scenario.valid()
             && total > self.scenario.context_window - self.scenario.reserve;
         let discarded = total.saturating_sub(self.scenario.keep_recent);
@@ -498,6 +493,74 @@ mod tests {
     fn response(input: u64) -> Value {
         json!({"status": "completed", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}],
             "usage": {"input_tokens": input, "output_tokens": 3, "input_tokens_details": {"cached_tokens": 0}}})
+    }
+
+    #[test]
+    fn traditional_summary_checks_every_response_boundary() {
+        for kind in [
+            "message",
+            "function_call",
+            "custom_tool_call",
+            "computer_call",
+        ] {
+            for crossing in [false, true] {
+                let body = request(&"evidence ".repeat(2000));
+                let mut terminal = response(100);
+                terminal["output"] = json!([{"type": kind, "call_id": "call_1"}]);
+                let total = projection(&body, "route", 100).unwrap().input
+                    + token_units(&terminal["output"]);
+                let mut trajectory = Trajectory {
+                    scenario: Scenario {
+                        context_window: total + 100 - u64::from(crossing),
+                        reserve: 100,
+                        keep_recent: 1500,
+                        summary: 100,
+                    },
+                    ..Trajectory::default()
+                };
+                trajectory.primary(&body, &terminal, "route", 100, true);
+                let before = trajectory.snapshot();
+                assert!(before.priced);
+                assert_eq!(
+                    before.traditional_compactions,
+                    u64::from(crossing),
+                    "{kind}"
+                );
+                assert_eq!(before.summary_cost > 0.0, crossing, "{kind}");
+                if !crossing {
+                    continue;
+                }
+                assert_eq!(trajectory.last_traditional_input, 1600);
+                assert!(trajectory.traditional_edited);
+                let mut resumed: Trajectory =
+                    serde_json::from_value(serde_json::to_value(&trajectory).unwrap()).unwrap();
+                let mut next = body.clone();
+                next["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(terminal["output"].as_array().unwrap().iter().cloned());
+                next["input"].as_array_mut().unwrap().push(
+                    json!({"type": "function_call_output", "call_id": "call_1", "output": "ok"}),
+                );
+                let next_input = (projection(&next, "route", 101).unwrap().input as i128
+                    - resumed.retired as i128
+                    + resumed.summary as i128) as u64;
+                let expected = scenario_input_cost("gpt-6-luna", next_input, 0, Some(1024))
+                    .unwrap()
+                    + crate::savings::scenario_output_cost("gpt-6-luna", next_input, 3).unwrap();
+                resumed.primary(&next, &response(100), "route", 101, true);
+                let after = resumed.snapshot();
+                assert_eq!(
+                    after.traditional_compactions, 1,
+                    "{kind}: no duplicate summary"
+                );
+                assert_eq!(after.summary_cost, before.summary_cost);
+                assert!(
+                    (after.traditional_cost - before.traditional_cost - expected).abs() < 1e-12,
+                    "{kind}: the first post-summary request must be cold after restart"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1220,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn conventional_summary_occurs_only_after_a_non_tool_boundary_and_survives_restart() {
+    fn conventional_summary_occurs_after_a_tool_response_and_survives_restart() {
         let mut trajectory = Trajectory {
             scenario: Scenario {
                 context_window: 2000,
@@ -1235,10 +1298,12 @@ mod tests {
         tool_response["output"] =
             json!([{"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"}]);
         trajectory.primary(&body, &tool_response, "route", 100, true);
-        assert_eq!(trajectory.snapshot().traditional_compactions, 0);
+        assert_eq!(trajectory.snapshot().traditional_compactions, 1);
+        let first_summary = trajectory.snapshot().summary_cost;
         trajectory.primary(&body, &response(3000), "route", 101, true);
         let before = trajectory.snapshot();
         assert_eq!(before.traditional_compactions, 1);
+        assert_eq!(before.summary_cost, first_summary);
         assert!(before.summary_cost > 0.0);
         let mut resumed: Trajectory =
             serde_json::from_value(serde_json::to_value(&trajectory).unwrap()).unwrap();

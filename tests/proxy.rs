@@ -81,6 +81,11 @@ fn successful_request_savings_after_failure_and_restart() {
 }
 
 #[test]
+fn traditional_summary_between_tool_requests_survives_restart() {
+    state_regression("traditional_summary_between_tool_requests_survives_restart");
+}
+
+#[test]
 fn legacy_checkpoint_keeps_fail_closed_savings_policy() {
     state_regression("legacy_checkpoint_keeps_fail_closed_savings_policy");
 }
