@@ -9,6 +9,7 @@ import contextlib
 import http.client
 import http.server
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -748,11 +749,12 @@ class StateRegressions(unittest.TestCase):
                 self.assertEqual(estimate["coverage"]["reviewer_responses"], 1)
                 self.assertEqual(estimate["coverage"]["primary_responses"], 2)
                 self.assertGreater(estimate["reviewer_cost"], 0)
-                # Checkpoint JSON decode can differ by one IEEE-754 ULP;
-                # retain accounting equality at sub-femtodollar precision.
-                self.assertAlmostEqual(estimate["reviewer_cost"],
-                                       saved["cost_trajectory"]["result"]["reviewer_cost"],
-                                       delta=1e-15)
+                # Rust/Python JSON roundtrip can differ by one IEEE-754 ULP;
+                # permit only that representation error, not a money tolerance.
+                saved_cost = saved["cost_trajectory"]["result"]["reviewer_cost"]
+                self.assertAlmostEqual(estimate["reviewer_cost"], saved_cost,
+                                       delta=max(math.ulp(estimate["reviewer_cost"]),
+                                                 math.ulp(saved_cost)))
                 self.assert_estimate_available(estimate, True, "successful reviewer spend must survive a failed primary")
 
     def test_restart_orphan_reviewer_is_untracked_not_proven_failed(self):
