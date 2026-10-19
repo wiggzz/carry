@@ -485,6 +485,25 @@ mod tests {
                     assert_eq!(after.pi_compactions, estimate.pi_compactions);
                     assert_eq!(after.summary_cost, estimate.summary_cost);
                 }
+                if crossing {
+                    let mut next = body.clone();
+                    next["input"].as_array_mut().unwrap().push(output.clone());
+                    t.record(&json!({"event": "model_request", "data": {"request": next}}));
+                    let next_input = (t.pending.as_ref().unwrap().input as i128 - t.removed as i128
+                        + t.summary as i128) as u64;
+                    let cold = input_cost("gpt-6-luna", next_input, 0, Some(1024)).unwrap()
+                        + scenario_output_cost("gpt-6-luna", next_input, 3).unwrap();
+                    let after = t.record(&json!({"event": "model_response", "data": {
+                        "usage": {"input_tokens": 100, "output_tokens": 3}, "raw": {"output": []}
+                    }})).unwrap();
+                    assert!(after.priced);
+                    assert_eq!(after.pi_compactions, 1);
+                    assert_eq!(after.summary_cost, estimate.summary_cost);
+                    assert!(
+                        (after.pi_cost - estimate.pi_cost - cold).abs() < 1e-12,
+                        "{kind}: first request after a summary must be priced cold"
+                    );
+                }
             }
         }
     }
@@ -625,16 +644,20 @@ mod tests {
         assert_ne!(b.carry_cost, b.observed_cost);
     }
     #[test]
-    fn terminal_boundary_charges_summary_not_model_requests() {
+    fn response_boundary_charges_summary_without_duplicate_terminal_charge() {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         request(&mut t, 240000);
-        assert_eq!(response(&mut t, 240000, 20000, 20000).pi_compactions, 0);
+        let after_response = response(&mut t, 240000, 20000, 20000);
+        assert_eq!(after_response.pi_compactions, 1);
+        assert!(after_response.summary_cost > 0.0);
         let e = t
             .record(&json!({"event":"run_finished","data":{}}))
             .unwrap();
         assert_eq!(e.pi_compactions, 1);
         assert!(e.summary_cost > 0.0);
         assert!(e.pi_cost > e.carry_cost);
+        assert_eq!(e.summary_cost, after_response.summary_cost);
+        assert_eq!(e.pi_cost, after_response.pi_cost);
         assert_eq!(
             t.record(&json!({"event":"run_finished","data":{}}))
                 .unwrap()
@@ -646,8 +669,10 @@ mod tests {
     fn summary_is_retained_once_in_the_next_prompt() {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         request(&mut t, 240000);
-        response(&mut t, 240000, 20000, 20000);
-        let prior_total = t.last_pi_input + t.last_output_proxy;
+        let prior_total =
+            t.pending.as_ref().unwrap().input + token_units(&json!("a ".repeat(20000)));
+        let after_response = response(&mut t, 240000, 20000, 20000);
+        assert_eq!(after_response.pi_compactions, 1);
         t.record(&json!({"event":"run_finished","data":{}}));
         request(&mut t, 261000);
         let raw_input = t.pending.as_ref().unwrap().input;

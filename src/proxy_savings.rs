@@ -1283,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn conventional_summary_occurs_only_after_a_non_tool_boundary_and_survives_restart() {
+    fn conventional_summary_occurs_after_a_tool_response_and_survives_restart() {
         let mut trajectory = Trajectory {
             scenario: Scenario {
                 context_window: 2000,
@@ -1298,10 +1298,12 @@ mod tests {
         tool_response["output"] =
             json!([{"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"}]);
         trajectory.primary(&body, &tool_response, "route", 100, true);
-        assert_eq!(trajectory.snapshot().traditional_compactions, 0);
+        assert_eq!(trajectory.snapshot().traditional_compactions, 1);
+        let first_summary = trajectory.snapshot().summary_cost;
         trajectory.primary(&body, &response(3000), "route", 101, true);
         let before = trajectory.snapshot();
         assert_eq!(before.traditional_compactions, 1);
+        assert_eq!(before.summary_cost, first_summary);
         assert!(before.summary_cost > 0.0);
         let mut resumed: Trajectory =
             serde_json::from_value(serde_json::to_value(&trajectory).unwrap()).unwrap();
