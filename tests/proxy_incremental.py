@@ -44,7 +44,13 @@ class IncrementalReviewer(unittest.TestCase):
             history += [{"role": "assistant", "content": (f"old output {n} " * 300)},
                         {"role": "user", "content": f"old task {n}"}]
         history += [{"role": "user", "content": "current task"}]
-        self.assertEqual(proxy.send(history)[0], 200)
+        result = proxy.send(history)
+        self.assertEqual(result[0], 200, {
+            "response": result[1], "review_count": len(fixture.reviews),
+            "review_wire_bytes": [len(support.wire(b)) for b in fixture.reviews],
+            "eligible_ids": [ledger(b)["eligible_group_ids"] for b in fixture.reviews],
+            "feedback": proxy.saved().get("review_feedback"),
+        })
         self.assertGreater(len(fixture.reviews), 1)
         self.assertTrue(all("DURABLE_IMPORT_REQUIREMENT" in json.dumps(b["input"])
                             for b in fixture.reviews), "protected source survives every admission chunk")
