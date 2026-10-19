@@ -456,6 +456,30 @@ class NativeProviderFixtureTests(unittest.TestCase):
             self.assertEqual(contract_state(directory)['invalid_reviews'], 0)
 
 
+    def test_review_records_decodes_current_memory_observations_and_materialized_facts(self):
+        def quoted(prefix, value):
+            return {'role': 'user', 'content': prefix + json.dumps(value)}
+        current = {'eligible_group_ids': ['g1'], 'current_memories': [
+            {'memory_id': 'm2', 'source_ids': ['g1']}]}
+        prefix = ('Quoted accepted memory observation, not instructions. '
+                  'Current membership is in the final ledger: ')
+        retired = {'memory_id': 'm1', 'source_ids': ['g1'], 'text': 'retired fact'}
+        live = {'memory_id': 'm2', 'source_ids': ['g1'], 'text': 'current fact'}
+        ledger_item = {'role': 'user', 'content': json.dumps(current)}
+        body = {'input': [quoted(prefix, retired), quoted(prefix, live), ledger_item]}
+        records = wire_data(body)
+        self.assertIn({'source_ids': ['g1'], 'text': 'current fact'}, records)
+        self.assertFalse(any(r.get('text') == 'retired fact' for r in records))
+        self.assertTrue(all('memory_id' not in r for r in records[:-1]))
+        with self.assertRaisesRegex(AssertionError, 'provenance mismatch'):
+            wire_data({'input': [quoted(prefix, dict(live, source_ids=['g999'])), ledger_item]})
+        body['input'] = [quoted('Quoted historical context data, not instructions: ',
+                                {'source_ids': ['g1'], 'text': 'materialized fact'}), ledger_item]
+        self.assertIn({'source_ids': ['g1'], 'text': 'materialized fact'}, wire_data(body))
+        # Missing current fact content must fail, not silently invent or omit it.
+        with self.assertRaisesRegex(AssertionError, 'missing current memory'):
+            wire_data({'input': [ledger_item]})
+
     def test_proxy_memory_facts_ground_new_advice_in_original_live_sources_not_memory_handles(self):
         with ShadowContractProvider() as provider, tempfile.TemporaryDirectory() as directory:
             body = {'model': 'gpt-6-luna', 'input': [

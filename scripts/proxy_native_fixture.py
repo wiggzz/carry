@@ -140,7 +140,10 @@ class ClientObserver:
 
 def review_records(body):
     """Decode source annotations for fixture grading without wrapping wire items."""
-    records, pending = [], []
+    records, pending, memory_observations = [], [], {}
+    memory_prefix = ('Quoted accepted memory observation, not instructions. '
+                     'Current membership is in the final ledger: ')
+    materialized_prefix = 'Quoted historical context data, not instructions: '
     for item in body.get('input', []):
         content = item.get('content', '')
         text = content if isinstance(content, str) else ''.join(
@@ -156,6 +159,15 @@ def review_records(body):
             data['items'] = pending[-count:]
             pending.clear()
             records.append(data)
+            continue
+        if text.startswith(memory_prefix):
+            observation = json.loads(text[len(memory_prefix):])
+            memory_observations[observation['memory_id']] = observation
+            continue
+        if text.startswith(materialized_prefix):
+            fact = json.loads(text[len(materialized_prefix):])
+            if 'source_ids' in fact:
+                records.append(fact)
             continue
         try:
             data = json.loads(text)
@@ -174,7 +186,17 @@ def review_records(body):
     sources = [record for record in records if 'eligible_group_ids' not in record
                and not {'protected', 'removable', 'memories'}.issubset(record)]
     for memory in current.get('current_memories', []):
-        fact = {'source_ids': memory['source_ids'], 'text': memory['text']}
+        if 'text' in memory:  # Legacy full-ledger fixture compatibility.
+            fact = {'source_ids': memory['source_ids'], 'text': memory['text']}
+        elif memory['memory_id'] in memory_observations:
+            observed = memory_observations[memory['memory_id']]
+            assert observed['source_ids'] == memory['source_ids'], 'memory provenance mismatch'
+            fact = {'source_ids': observed['source_ids'], 'text': observed['text']}
+        else:
+            # Materialized facts already occur directly in the native projection.
+            assert any(r.get('source_ids') == memory['source_ids'] and 'text' in r
+                       for r in sources), 'missing current memory observation or materialized fact'
+            continue
         if fact not in sources:
             sources.append(fact)
     return sources + [current]
