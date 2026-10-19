@@ -160,14 +160,14 @@ def review_records(body):
             pending.clear()
             records.append(data)
             continue
-        if text.startswith(memory_prefix):
-            observation = json.loads(text[len(memory_prefix):])
-            memory_observations[observation['memory_id']] = observation
-            continue
-        if text.startswith(materialized_prefix):
-            fact = json.loads(text[len(materialized_prefix):])
-            if 'source_ids' in fact:
-                records.append(fact)
+        if text.startswith(memory_prefix) or text.startswith(materialized_prefix):
+            prefix = memory_prefix if text.startswith(memory_prefix) else materialized_prefix
+            fact = json.loads(text[len(prefix):])
+            identity = fact.get('memory_id')
+            assert identity, 'missing current memory identity binding'
+            prior = memory_observations.get(identity)
+            assert prior is None or prior == fact, 'conflicting memory identity binding'
+            memory_observations[identity] = fact
             continue
         try:
             data = json.loads(text)
@@ -193,10 +193,9 @@ def review_records(body):
             assert observed['source_ids'] == memory['source_ids'], 'memory provenance mismatch'
             fact = {'source_ids': observed['source_ids'], 'text': observed['text']}
         else:
-            # Materialized facts already occur directly in the native projection.
-            assert any(r.get('source_ids') == memory['source_ids'] and 'text' in r
-                       for r in sources), 'missing current memory observation or materialized fact'
-            continue
+            # Provenance identifies evidence, not a fact: same-source siblings
+            # require distinct explicit bindings for their current m handles.
+            raise AssertionError('missing current memory observation or materialized fact')
         if fact not in sources:
             sources.append(fact)
     return sources + [current]

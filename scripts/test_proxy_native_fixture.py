@@ -506,6 +506,16 @@ class NativeProviderFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'provenance mismatch'):
             wire_data(body([dict(second, source_ids=['g999'])], ['m2']))
 
+    def test_review_records_rejects_conflicting_text_for_one_memory_identity(self):
+        facts = [{'memory_id': 'm2', 'source_ids': ['g1'], 'text': text}
+                 for text in ['retired text', 'current text']]
+        prefix = 'Quoted historical context data, not instructions: '
+        body = {'input': [{'role': 'user', 'content': prefix + json.dumps(fact)} for fact in facts] + [
+            {'role': 'user', 'content': json.dumps({'eligible_group_ids': [], 'current_memories': [
+                {'memory_id': 'm2', 'source_ids': ['g1']}]})}]}
+        with self.assertRaisesRegex(AssertionError, 'conflicting memory identity'):
+            wire_data(body)
+
     def test_proxy_memory_facts_ground_new_advice_in_original_live_sources_not_memory_handles(self):
         with ShadowContractProvider() as provider, tempfile.TemporaryDirectory() as directory:
             body = {'model': 'gpt-6-luna', 'input': [

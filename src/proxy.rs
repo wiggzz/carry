@@ -3016,10 +3016,14 @@ fn estimate(body: &Value) -> f64 {
     crate::proxy_savings::token_units(body) as f64
 }
 
-/// Cleanup needs all accepted facts (including the duplicate ledger rendering),
-/// not canonical native sources or prior source-validation diagnostics.
+/// Cleanup needs every accepted fact, independently of committed replay/control
+/// frontiers, not canonical native sources or prior validation diagnostics.
 fn memory_review_body(config: &ProxyCli, session: &Session) -> Value {
     let mut view = session.clone();
+    // This is a fresh cleanup projection, not an incremental transport. Reset
+    // both frontiers together so committed, unmaterialized facts are re-emitted.
+    // Only the disposable view is compacted; ordinary replay stays unchanged.
+    view.compact_reviewer();
     view.active_shadow.retain(|record| record.source_id == 0);
     view.refresh_memory_shadow();
     view.observed.clear();
