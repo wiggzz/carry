@@ -722,12 +722,12 @@ impl Session {
                 }
             });
         if include_controls {
-            input.extend(super::review_control_observations(self));
+            input.extend(super::proxy::review_control_observations(self));
         }
         input.push(json!({"role": "user", "content": json!({
             "eligible_group_ids": eligible, "current_groups": ledger,
             "current_task": current_task,
-            "primary_instruction_version": super::review_control_state(self)["instruction_version"],
+            "primary_instruction_version": super::proxy::review_control_state(self)["instruction_version"],
             "eligible_memory_ids": self.memories.iter().map(|m| format!("m{}", m.id)).collect::<Vec<_>>(),
             "current_memories": self.memories.iter().map(|m| json!({"memory_id":format!("m{}",m.id),"source_ids":m.source_ids.iter().map(|id|format!("g{id}")).collect::<Vec<_>>() })).collect::<Vec<_>>(),
             "previous_review_feedback": self.review_feedback

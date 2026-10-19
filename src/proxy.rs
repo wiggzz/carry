@@ -1476,7 +1476,7 @@ fn review_body(config: &ProxyCli, session: &Session) -> Value {
     review_body_for_groups(config, session, &session.groups())
 }
 
-fn review_control_state(session: &Session) -> Value {
+pub(super) fn review_control_state(session: &Session) -> Value {
     let instructions = session
         .review_context
         .get("instructions")
@@ -1491,7 +1491,7 @@ fn review_control_state(session: &Session) -> Value {
 
 /// Immutable, non-authoritative observations, appended only on actual change.
 /// The live ledger selects the current instruction version and memory membership.
-fn review_control_observations(session: &Session) -> Vec<Value> {
+pub(super) fn review_control_observations(session: &Session) -> Vec<Value> {
     let state = review_control_state(session);
     let prior = session.reviewer_controls.as_ref();
     let mut observations = Vec::new();
