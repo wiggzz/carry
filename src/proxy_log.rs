@@ -16,6 +16,10 @@ static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static RAW_DROPPED: AtomicU64 = AtomicU64::new(0);
 static JOURNAL_DROPPED: AtomicU64 = AtomicU64::new(0);
 
+#[path = "proxy_fingerprint.rs"]
+mod fingerprints;
+pub(super) use fingerprints::{ReviewWire, review_wire};
+
 #[derive(Serialize)]
 struct Record<'a> {
     event: &'a str,
