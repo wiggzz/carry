@@ -485,6 +485,44 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(session["primary"]["unavailable_cost_calls"], 1,
                          "failed-call spend remains unknown, not a zero-cost success")
 
+    def test_traditional_summary_between_tool_requests_survives_restart(self):
+        tool = {"type": "function_call", "name": "lookup", "call_id": "call_2",
+                "arguments": "{}"}
+        fixture = self.fixture(lambda _body, n: (200, completed(
+            [tool] if n == 2 else [], response_id=f"resp_{n}")))
+        options = ["--review-every-requests", "100"]
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send([{"role": "user", "content": "initial task"}])[0], 200)
+        proxy.close()
+        # Owned checkpoint only; force the modeled threshold, not live policy.
+        path = next(self.state.glob("*.json"))
+        saved = json.loads(path.read_text())
+        saved["cost_trajectory"]["scenario"] = {
+            "context_window": 2000, "reserve": 100, "keep_recent": 1500, "summary": 100}
+        path.write_text(json.dumps(saved))
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send([{"role": "user", "content": "evidence " * 2000}],
+                                    previous_response_id="resp_1")[0], 200)
+        estimate = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
+        self.evidence["after_tool_call"] = estimate
+        self.assertEqual(estimate["traditional_compactions"], 1,
+                         "compact the scenario before the tool-result request, not at turn end")
+        self.assertGreater(estimate["summary_cost"], 0)
+        self.assertEqual(proxy.saved()["cost_trajectory"]["last_traditional_input"], 1600)
+        proxy.close()
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send([{"type": "function_call_output", "call_id": "call_2", "output": "ok"}],
+                                    previous_response_id="resp_2")[0], 200)
+        after = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
+        self.evidence["after_restart"] = after
+        self.assertEqual(after["traditional_compactions"], 1)
+        self.assertEqual(after["summary_cost"], estimate["summary_cost"])
+        self.assertEqual(len(fixture.primaries), 3)
+        self.assertEqual(fixture.reviews, [])
+        self.assertEqual(fixture.primaries[2]["input"][-2:], [tool, {
+            "type": "function_call_output", "call_id": "call_2", "output": "ok"}],
+            "hypothetical summary must not modify real Carry tool continuation")
+
     def test_legacy_checkpoint_keeps_fail_closed_savings_policy(self):
         fixture = self.fixture(lambda _body, n: (429, {"error": "fixture rate limit"})
                                if n == 2 else (200, completed(response_id=f"resp_{n}")))

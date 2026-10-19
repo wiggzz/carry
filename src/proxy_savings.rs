@@ -501,6 +501,74 @@ mod tests {
     }
 
     #[test]
+    fn traditional_summary_checks_every_response_boundary() {
+        for kind in [
+            "message",
+            "function_call",
+            "custom_tool_call",
+            "computer_call",
+        ] {
+            for crossing in [false, true] {
+                let body = request(&"evidence ".repeat(2000));
+                let mut terminal = response(100);
+                terminal["output"] = json!([{"type": kind, "call_id": "call_1"}]);
+                let total = projection(&body, "route", 100).unwrap().input
+                    + token_units(&terminal["output"]);
+                let mut trajectory = Trajectory {
+                    scenario: Scenario {
+                        context_window: total + 100 - u64::from(crossing),
+                        reserve: 100,
+                        keep_recent: 1500,
+                        summary: 100,
+                    },
+                    ..Trajectory::default()
+                };
+                trajectory.primary(&body, &terminal, "route", 100, true);
+                let before = trajectory.snapshot();
+                assert!(before.priced);
+                assert_eq!(
+                    before.traditional_compactions,
+                    u64::from(crossing),
+                    "{kind}"
+                );
+                assert_eq!(before.summary_cost > 0.0, crossing, "{kind}");
+                if !crossing {
+                    continue;
+                }
+                assert_eq!(trajectory.last_traditional_input, 1600);
+                assert!(trajectory.traditional_edited);
+                let mut resumed: Trajectory =
+                    serde_json::from_value(serde_json::to_value(&trajectory).unwrap()).unwrap();
+                let mut next = body.clone();
+                next["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(terminal["output"].as_array().unwrap().iter().cloned());
+                next["input"].as_array_mut().unwrap().push(
+                    json!({"type": "function_call_output", "call_id": "call_1", "output": "ok"}),
+                );
+                let next_input = (projection(&next, "route", 101).unwrap().input as i128
+                    - resumed.retired as i128
+                    + resumed.summary as i128) as u64;
+                let expected = scenario_input_cost("gpt-6-luna", next_input, 0, Some(1024))
+                    .unwrap()
+                    + crate::savings::scenario_output_cost("gpt-6-luna", next_input, 3).unwrap();
+                resumed.primary(&next, &response(100), "route", 101, true);
+                let after = resumed.snapshot();
+                assert_eq!(
+                    after.traditional_compactions, 1,
+                    "{kind}: no duplicate summary"
+                );
+                assert_eq!(after.summary_cost, before.summary_cost);
+                assert!(
+                    (after.traditional_cost - before.traditional_cost - expected).abs() < 1e-12,
+                    "{kind}: the first post-summary request must be cold after restart"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn priced_subset_omits_primary_atomically_and_resumes_after_restart() {
         for variant in [
             "missing_usage",

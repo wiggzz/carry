@@ -450,6 +450,45 @@ mod tests {
     }
 
     #[test]
+    fn traditional_summary_checks_every_response_boundary() {
+        for kind in [
+            "message",
+            "function_call",
+            "custom_tool_call",
+            "computer_call",
+        ] {
+            for crossing in [false, true] {
+                let body = json!({"model": "gpt-6-luna", "input": ["evidence ".repeat(2000)]});
+                let output = json!([{"type": kind, "call_id": "call_1"}]);
+                let total = prompt_projection(&body).unwrap().2 + token_units(&output);
+                let mut t = Trajectory::with_scenario(Scenario {
+                    context_window: total + 100 - u64::from(crossing),
+                    reserve: 100,
+                    keep_recent: 1500,
+                    summary: 100,
+                });
+                t.record(&json!({"event": "model_request", "data": {"request": body}}));
+                let estimate = t.record(&json!({"event": "model_response", "data": {
+                    "usage": {"input_tokens": 100, "output_tokens": 3}, "raw": {"output": output}
+                }})).unwrap();
+                assert!(estimate.priced);
+                assert_eq!(estimate.pi_compactions, usize::from(crossing), "{kind}");
+                assert_eq!(estimate.summary_cost > 0.0, crossing);
+                if crossing {
+                    assert_eq!(t.last_pi_input, 1600);
+                    assert_eq!(t.last_output_proxy, 0);
+                    assert!(t.pi_edited);
+                }
+                for event in ["turn_finished", "run_finished"] {
+                    let after = t.record(&json!({"event": event, "data": {}})).unwrap();
+                    assert_eq!(after.pi_compactions, estimate.pi_compactions);
+                    assert_eq!(after.summary_cost, estimate.summary_cost);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn frozen_output_cost_uses_each_branch_input_tier() {
         const FROZEN_OUTPUT: u64 = 10_000;
         const TOLERANCE: f64 = 1e-12;
