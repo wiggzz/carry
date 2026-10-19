@@ -425,8 +425,9 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(proxy.send(seed)[0], 200)
         partial = proxy.saved()
         proxy.close()
-        # Actual producer snapshots plus unavailable/pending variants verify
+        # Actual producer snapshots plus unavailable/orphan variants verify
         # omission counts do not disappear when the monetary scope is excluded.
+        # No reviewer is registered in the fresh process for the pending marker.
         entries = [unpriced, partial, json.loads(json.dumps(partial)), json.loads(json.dumps(partial))]
         entries[2]["background_review_pending"] = True
         entries[3]["cost_trajectory"]["available"] = False
@@ -442,11 +443,16 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(estimate.get("excluded_unpriced_calls"), 1)
         self.assertIsNone(null_stats["cost_estimate"]["carry_cost"])
         aggregate = stats["cost_estimate"]
-        self.assertEqual(aggregate["included_sessions"], 2)
-        self.assertEqual(aggregate["excluded_sessions"], 2)
+        self.assertEqual(aggregate["included_sessions"], 1)
+        self.assertEqual(aggregate["excluded_sessions"], 3)
         self.assertEqual(aggregate["excluded_unpriced_calls"], 4)
         self.assertEqual(aggregate["excluded_unpriced_reviewer_calls"], 0)
-        self.assertEqual(aggregate["carry_cost"], 2 * partial["cost_trajectory"]["result"]["carry_cost"])
+        self.assertEqual(aggregate["carry_cost"], partial["cost_trajectory"]["result"]["carry_cost"])
+        orphan = next(s for s in stats["sessions"] if s["id"] == f"{3:064x}")
+        self.assert_estimate_available(orphan["cost_estimate"], False)
+        self.assertFalse(orphan["background_review_pending"])
+        self.assertEqual(orphan["cost_estimate"]["coverage"]["prior_untracked_calls"], 1)
+        self.assertEqual(orphan["cost_estimate"]["excluded_unpriced_calls"], 1)
         self.assertEqual(len(fixture.primaries), 2)
         self.assertEqual(fixture.reviews, [])
 
