@@ -284,8 +284,10 @@ class StateRegressions(unittest.TestCase):
                                   (999, 1000, "legacy"), (888, 1000, "missing_usage"),
                                   (777, 1000, "pending"), (666, 1000, "no_trajectory"),
                                   (555, 1000, "unknown_cache"), (444, 1000, "untracked")],
-             1, (789, 1012, 223, 100 * 223 / 1012)),
-            ("pending_only", [(888, 1000, "pending")], 0, (888, 1000, 112, 11.2)),
+             1, (12, 12, 0, 0)),
+            # A fresh process has no registered reviewer: persisted pending is
+            # orphaned work, not a live-review numeric control.
+            ("orphan_only", [(888, 1000, "pending")], 0, None),
             ("no_eligible", [(999, 1000, "legacy"), (888, 1000, "untracked")], 1, None),
         ]
         for name, entries, unreadable, expected in cases:
@@ -329,7 +331,7 @@ class StateRegressions(unittest.TestCase):
                 self.assertEqual(len(stats["sessions"]), len(entries))
                 self.assertIn("cost_estimate", stats, "backend must supply dashboard totals")
                 aggregate = stats["cost_estimate"]
-                included = sum(invalid in (None, "pending") for _, _, invalid in entries)
+                included = sum(invalid is None for _, _, invalid in entries)
                 self.assertEqual(aggregate["included_sessions"], included)
                 self.assertEqual(aggregate["excluded_sessions"], len(entries) - included + unreadable)
                 self.assertEqual(aggregate["excluded_failed_calls"], included,
@@ -339,9 +341,14 @@ class StateRegressions(unittest.TestCase):
                     self.assertEqual(aggregate[field], value, field)
                 by_id = {session["id"]: session for session in stats["sessions"]}
                 for index, (carry, traditional, invalid) in enumerate(entries, 1):
-                    estimate = by_id[f"{index:064x}"]["cost_estimate"]
-                    self.assert_estimate_available(estimate, invalid in (None, "pending"))
-                    if invalid in (None, "pending"):
+                    projected = by_id[f"{index:064x}"]
+                    estimate = projected["cost_estimate"]
+                    self.assert_estimate_available(estimate, invalid is None)
+                    if invalid == "pending":
+                        self.assertFalse(projected["background_review_pending"],
+                                         "orphan must not advertise a running reviewer")
+                        self.assertEqual(estimate["coverage"]["prior_untracked_calls"], 1)
+                    if invalid is None:
                         self.assertEqual(estimate["carry_cost"], carry)
                         self.assertEqual(estimate["traditional_cost"], traditional)
                         self.assertEqual(estimate["savings"], traditional - carry)
@@ -769,15 +776,47 @@ class StateRegressions(unittest.TestCase):
         proxy.close()
         fixture.release.set()
         proxy = self.proxy(fixture, ["--review-every-requests", "100"])
+        checkpoint_bytes = {path.name: path.read_bytes() for path in self.state.glob("*.json")}
+        orphan_stats = []
+        for _ in range(3):
+            status, stats = proxy.request("GET", "/carry/dashboard/stats")
+            self.assertEqual(status, 200)
+            orphan_stats.append(stats)
+            self.assertEqual({path.name: path.read_bytes() for path in self.state.glob("*.json")},
+                             checkpoint_bytes, "GET must leave orphan accounting and pending marker untouched")
+        self.evidence.update(pending=pending, immediate_orphan_stats=orphan_stats)
+        self.assertEqual(len(fixture.primaries), 2, "orphan projection must precede any new primary")
+        self.assertEqual(len(fixture.reviews), 1, "restart GET must not dispatch a reviewer")
+        for stats in orphan_stats:
+            orphan = stats["sessions"][0]
+            estimate = orphan["cost_estimate"]
+            self.assert_estimate_available(estimate, False,
+                                           "orphaned reviewer expense is unknown immediately after restart")
+            self.assertEqual(stats["cost_estimate"]["included_sessions"], 0)
+            self.assertEqual(stats["cost_estimate"]["excluded_sessions"], 1)
+            for field in ("carry_cost", "traditional_cost", "savings", "savings_percent"):
+                self.assertIsNone(stats["cost_estimate"][field])
+            self.assertFalse(orphan["background_review_pending"], "no live task: must not say Reviewing")
+            self.assertFalse(orphan["processing"])
+            self.assertEqual(estimate["coverage"]["prior_untracked_calls"], 1)
+            self.assertEqual(estimate["coverage"]["failed_calls"], 0)
+            self.assertEqual(orphan["shadow"], pending["shadow"], "GET must not invent an observed receipt")
+        self.assertTrue(proxy.saved()["background_review_pending"], "GET is projection, not orphan recovery")
         self.assertEqual(proxy.send(seed)[0], 200)
         session = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
-        self.evidence.update(pending=pending, session=session, checkpoint=proxy.saved())
+        self.evidence.update(session=session, checkpoint=proxy.saved())
         estimate = session["cost_estimate"]
         self.assert_estimate_available(estimate, False, "unobserved reviewer may have completed with spend")
         self.assertEqual(estimate["coverage"]["prior_untracked_calls"], 1,
                          "restart orphan is censored, not a proven failed call")
         self.assertEqual(estimate["coverage"]["failed_calls"], 0)
         self.assertEqual(session["shadow"]["unavailable_cost_calls"], 1)
+        self.assertFalse(proxy.saved()["background_review_pending"])
+        self.assertEqual(proxy.send(seed)[0], 200)
+        again = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
+        self.assertEqual(again["cost_estimate"]["coverage"]["prior_untracked_calls"], 1,
+                         "subsequent primaries must censor the orphan exactly once")
+        self.assertEqual(again["shadow"], session["shadow"])
 
     def test_failed_429_continuation_retry_once(self):
         self.continuation("429", False)

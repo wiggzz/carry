@@ -172,6 +172,19 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     assert.ok(article.children[3].textContent.includes(expected === null ? 'Unavailable' : '$' + expected));
     assert.ok(!noteTexts(article).join('\n').includes('Savings pending reviewer completion'));
   }
+  // The backend projects a persisted orphan as unavailable and not running;
+  // its existing untracked-coverage diagnostic must not imply in-flight work.
+  const orphan = {...session(0, 0, false), background_review_pending: false};
+  orphan.cost_estimate.coverage.prior_untracked_calls = 1;
+  data.sessions = [orphan];
+  data.cost_estimate = total(null, null, null, null, 0, 1);
+  await vm.runInContext('refresh()', sandbox);
+  const orphanArticle = elements.get('sessions').children[0];
+  assert.notEqual(orphanArticle.children[1].textContent, 'Reviewing');
+  assert.match(noteTexts(orphanArticle).join('\n'), /earlier calls were not tracked/i);
+  assert.doesNotMatch(noteTexts(orphanArticle).join('\n'), /in-flight reviewer cost/i);
+  assert.doesNotMatch(elements.get('estimate-coverage').textContent, /in-flight reviewer cost/i);
+  assert.equal(cards().get('Estimated savings · all time'), 'Unavailable');
   data.sessions = [];
   data.cost_estimate = total(null, null, null, null, 0);
   await vm.runInContext('refresh()', sandbox);
