@@ -893,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_projection_suppresses_all_money_without_changing_persisted_estimate() {
+    fn dashboard_projection_preserves_completed_money_without_changing_persisted_estimate() {
         let mut trajectory = Trajectory::default();
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
         trajectory.failed_call();
@@ -903,8 +903,8 @@ mod tests {
             persisted["priced"], true,
             "internal checkpoint compatibility stays intact"
         );
-        for pending in [false, true] {
-            let dashboard = serde_json::to_value(snapshot.clone().dashboard(pending)).unwrap();
+        {
+            let dashboard = serde_json::to_value(snapshot.clone().dashboard()).unwrap();
             assert!(dashboard.get("priced").is_none());
             for field in [
                 "carry_cost",
@@ -914,14 +914,7 @@ mod tests {
                 "savings",
                 "savings_percent",
             ] {
-                if pending {
-                    assert!(
-                        dashboard[field].is_null(),
-                        "pending {field} must not expose partial sums"
-                    );
-                } else {
-                    assert_eq!(dashboard[field], persisted[field]);
-                }
+                assert_eq!(dashboard[field], persisted[field]);
             }
             for field in [
                 "coverage",
@@ -952,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_totals_accept_only_complete_estimates_and_use_traditional_denominator() {
+    fn dashboard_totals_accept_only_priced_estimates_and_use_traditional_denominator() {
         let mut totals = DashboardTotals::default();
         assert!(totals.carry_cost.is_none());
         assert!(totals.traditional_cost.is_none());
@@ -977,24 +970,24 @@ mod tests {
             assert_eq!(totals.savings, Some(expected_savings));
             assert!((totals.savings_percent.unwrap() - expected_percent).abs() < 1e-12);
         }
-        for pending in [false, true] {
+        for priced in [false, true] {
             totals.observe(
                 &Estimate {
                     carry_cost: 999.0,
                     traditional_cost: 1000.0,
-                    priced: pending,
+                    priced,
                     excluded_failed_calls: 2,
                     ..Estimate::default()
                 }
-                .dashboard(pending),
+                .dashboard(),
             );
         }
-        assert_eq!(totals.carry_cost, Some(20.0));
-        assert_eq!(totals.traditional_cost, Some(16.0));
-        assert_eq!(totals.savings, Some(-4.0));
-        assert_eq!(totals.included_sessions, 4);
-        assert_eq!(totals.excluded_sessions, 2);
-        assert_eq!(totals.excluded_failed_calls, 4);
+        assert_eq!(totals.carry_cost, Some(20.0 + 999.0));
+        assert_eq!(totals.traditional_cost, Some(16.0 + 1000.0));
+        assert_eq!(totals.savings, Some(-4.0 + 1.0));
+        assert_eq!(totals.included_sessions, 5);
+        assert_eq!(totals.excluded_sessions, 1);
+        assert_eq!(totals.excluded_failed_calls, 6);
     }
 
     #[test]
