@@ -257,6 +257,15 @@ fn append(
                 config.classifier_max_output_tokens
             )
         ));
+        policy.update(format!(
+            "{:?}",
+            (
+                config.review_min_primary_tokens,
+                config.review_min_new_tokens,
+                config.review_backoff_factor,
+                config.review_backoff_max
+            )
+        ));
         let record = Record {
             event,
             at: now(),

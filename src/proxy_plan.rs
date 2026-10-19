@@ -20,34 +20,26 @@ fn review_calls(config: &ProxyCli, session: &Session, body: &Value, changed: boo
     {
         return None;
     }
-    let eligible = |state: &Session| {
-        !state.memories.is_empty() || state.groups().iter().any(|g| g.exposed && !g.pinned)
-    };
-    let mut exposed = session.clone();
-    for item in &mut exposed.history {
-        if !item.removed {
-            item.exposed = true;
-        }
-    }
-    let eligible_now = eligible(session);
-    let eligible_later = eligible(&exposed);
-    let mut age = session
-        .completed_requests
-        .saturating_sub(session.last_review_request);
+    let mut future = session.clone();
+    super::admission::initialize(&mut future);
     let mut calls = 0;
     for request in 0..config.payoff_requests {
-        // A source rewrite skips this request's ordinary dispatch. A completed
-        // bootstrap is already paid and ordinary dispatch resumes next request.
-        let dispatch = if request == 0 {
-            eligible_now && !changed && !session.bootstrap_review_pending
-        } else {
-            eligible_later
-        };
-        if dispatch && age >= config.review_every_requests {
+        // A source rewrite skips this request's ordinary dispatch. Bootstrap
+        // already paid for its source; no hypothetical native growth is added.
+        let dispatch = request > 0 || (!changed && !session.bootstrap_review_pending);
+        if dispatch && super::admission::decision(config, &future, body, false)["admitted"] == true
+        {
             calls += 1;
-            age = 0;
+            future.last_review_request = future.completed_requests;
+            let groups = future.groups();
+            super::admission::cover(&mut future, &groups);
         }
-        age = age.saturating_add(1);
+        future.completed_requests = future.completed_requests.saturating_add(1);
+        for item in &mut future.history {
+            if !item.removed {
+                item.exposed = true;
+            }
+        }
     }
     Some(calls)
 }
@@ -195,7 +187,13 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         "current_review_cost_is_sunk":session.shadow.calls > 0 &&
             (session.last_review_request == session.completed_requests ||
              (session.bootstrap_review_pending && session.bootstrap_review_complete)),
+        "ordinary_review_admission":super::admission::decision(config,session,body,false),
+        "review_min_primary_tokens":config.review_min_primary_tokens,
+        "review_min_new_tokens":config.review_min_new_tokens,
+        "review_every_requests":config.review_every_requests,
+        "review_backoff_factor":config.review_backoff_factor,"review_backoff_max":config.review_backoff_max,
         "estimate_basis":"frozen_source_and_timely_completion_sensitivity",
+        "future_review_outcome_basis":"hold_current_backoff_no_invented_native_growth",
         "review_completion_basis":"future_reviews_complete_and_merge_before_next_due_dispatch",
         "cache_basis":"exact_compatible_prefix_receipts_expire_after_30_minutes",
         "candidates":reports});

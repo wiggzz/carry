@@ -277,7 +277,11 @@ async fn pr154_skip_reasons_execute_real_review_gates_without_provider_calls() {
         request_id: "request".into(),
         ..ReviewRun::default()
     };
+    observe_source(&mut session, "goal");
+    observe_source(&mut session, "PRIVATE_EVIDENCE");
+    observe_source(&mut session, "current");
     assert!(!review(&service, &id, &mut session, &json!({}), false, &mut run).await);
+    session = Session::default();
     session.completed_requests = 1;
     assert!(!review(&service, &id, &mut session, &json!({}), false, &mut run).await);
     observe_source(&mut session, "goal");
@@ -287,6 +291,7 @@ async fn pr154_skip_reasons_execute_real_review_gates_without_provider_calls() {
     assert!(!review(&service, &id, &mut session, &json!({}), false, &mut run).await);
     let reasons: Vec<_> = pr154_journal(directory.path(), &id)
         .iter()
+        .filter(|event| event["event"] == "review_skipped")
         .map(|event| event["data"]["reason"].clone())
         .collect();
     assert_eq!(

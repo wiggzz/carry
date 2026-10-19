@@ -308,6 +308,9 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     env = fixture_environment()
+    # Cache protocol fixture, not a production-admission benchmark.
+    env.update(CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS='0', CARRY_PROXY_REVIEW_MIN_NEW_TOKENS='0',
+               CARRY_PROXY_REVIEW_BACKOFF_FACTOR='1', CARRY_PROXY_REVIEW_EVERY_REQUESTS='1')
     home = directory / 'home'; home.mkdir(exist_ok=True)
     env.update(HOME=str(home), CARRY_HOME=str(home / '.carry'), XDG_CONFIG_HOME=str(home / '.config'))
     inputs: list[dict] = []

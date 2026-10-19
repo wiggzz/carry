@@ -98,6 +98,9 @@ def run_case(args,case):
     env.update(CARRY_PROXY_UPSTREAM_KEY='fixture-primary-provider',
         CARRY_PROXY_CLASSIFIER_KEY='fixture-shadow',CARRY_PROXY_AUTH_TOKEN='fixture-trusted')
     env.update(HOME=str(home), CARRY_HOME=str(home/'.carry'), XDG_CONFIG_HOME=str(home/'.config'))
+    # Explicit legacy treatment: exercise review mechanics on tiny synthetic inputs.
+    env.update(CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS='0', CARRY_PROXY_REVIEW_MIN_NEW_TOKENS='0',
+               CARRY_PROXY_REVIEW_BACKOFF_FACTOR='1', CARRY_PROXY_REVIEW_EVERY_REQUESTS='1')
     mode='off' if case=='off-strict' else 'compact'
     policy='reset-on-divergence' if case=='compact-reset' else 'strict'
     with Fixture('pi','pi-checkpoint') as fixture, (root/'carry.log').open('w') as log, \

@@ -71,6 +71,14 @@ pub(super) struct ClientProvenance {
     pub agent_name: Option<String>,
 }
 
+/// Ordinary scheduler coverage is separate from replay/cache windows. Native
+/// IDs survive reviewer cleanup and selection; rebasing explicitly retires them.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(super) struct ReviewAdmission {
+    pub source_ids: BTreeSet<u64>,
+    pub no_yield_streak: u32,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(super) struct Session {
     pub version: u32,
@@ -123,6 +131,8 @@ pub(super) struct Session {
     pub shadow: UsageLedger,
     pub completed_requests: u64,
     pub last_review_request: u64,
+    #[serde(default)]
+    pub review_admission: Option<ReviewAdmission>,
     /// A replay import still needs pre-primary review until that epoch's first
     /// primary completes. Persist this across failed calls and process restarts.
     #[serde(default)]
@@ -355,6 +365,8 @@ impl Session {
         self.bootstrap_reviewed_ids.clear();
         self.bootstrap_review_complete = false;
         self.bootstrap_estimated_cost_usd = 0.0;
+        self.review_admission = Some(ReviewAdmission::default());
+        self.last_review_request = self.completed_requests;
         self.history.clear();
         self.pending_output.clear();
         self.last_response_id = None;

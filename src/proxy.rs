@@ -134,8 +134,21 @@ pub struct ProxyCli {
     /// Run ordinary reviews in the background; bootstrap remains synchronous.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     background_reviews: bool,
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=100))]
+    /// Ordinary reviews require this many completed primary requests AND native-source growth.
+    #[arg(long, env = "CARRY_PROXY_REVIEW_EVERY_REQUESTS", default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=100))]
     review_every_requests: u64,
+    /// Minimum retained primary wire-prompt estimate for ordinary review (0 disables).
+    #[arg(long, env = "CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS", default_value_t = 150000, value_parser = clap::value_parser!(u32).range(0..=2000000))]
+    review_min_primary_tokens: u32,
+    /// Newly reviewable native-source token estimate since successful admission (0 disables).
+    #[arg(long, env = "CARRY_PROXY_REVIEW_MIN_NEW_TOKENS", default_value_t = 25000, value_parser = clap::value_parser!(u32).range(0..=2000000))]
+    review_min_new_tokens: u32,
+    /// Multiply both batches after valid no-yield reviews (1 disables backoff).
+    #[arg(long, env = "CARRY_PROXY_REVIEW_BACKOFF_FACTOR", default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=16))]
+    review_backoff_factor: u32,
+    /// Maximum batch multiplier; the primary-size floor never grows.
+    #[arg(long, env = "CARRY_PROXY_REVIEW_BACKOFF_MAX", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=64))]
+    review_backoff_max: u32,
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
     request_timeout_secs: u64,
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=600))]
@@ -157,6 +170,8 @@ struct Service {
     _directory_lock: File,
 }
 
+#[path = "proxy_admission.rs"]
+mod admission;
 #[path = "proxy_plan.rs"]
 mod planning;
 use planning::plan;
@@ -573,6 +588,13 @@ async fn metrics(
     };
     Ok(axum::Json(json!({
         "mode": format!("{:?}", service.config.mode).to_lowercase(),
+        "review_policy": {
+            "min_primary_tokens":service.config.review_min_primary_tokens,
+            "min_new_tokens":service.config.review_min_new_tokens,
+            "every_requests":service.config.review_every_requests,
+            "backoff_factor":service.config.review_backoff_factor,
+            "backoff_max":service.config.review_backoff_max
+        },
         "scope": "explicit_session", "primary": session.primary, "shadow": session.shadow,
         "completed_requests": session.completed_requests, "compactions": session.compactions,
         "native_compactions": session.native_compactions, "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews, "partial_reviews": session.partial_reviews,
@@ -788,6 +810,9 @@ async fn native_compact(
 #[derive(Default)]
 struct ReviewRun {
     background: bool,
+    pressure: bool,
+    valid_admission: bool,
+    successful_sources: Vec<Group>,
     request_id: String,
     receipts: Vec<ReviewReceipt>,
     reviewed_sources: Vec<Group>,
@@ -1163,6 +1188,7 @@ async fn forward_request(
                     false,
                     &mut ReviewRun {
                         request_id: request_id.clone(),
+                        pressure: true,
                         ..ReviewRun::default()
                     },
                 )
@@ -1950,18 +1976,10 @@ async fn dispatch_review_for(
     main: Value,
     request_id: String,
 ) {
-    if session
-        .completed_requests
-        .saturating_sub(session.last_review_request)
-        < service.config.review_every_requests
-    {
-        journal(
-            &service,
-            &id,
-            &request_id,
-            "review_skipped",
-            &json!({"reason":"cadence","background":true}),
-        );
+    let decision = admission::decision(&service.config, session, &main, false);
+    journal(&service, &id, &request_id, "review_admission", &decision);
+    if decision["admitted"] != true {
+        journal(&service, &id, &request_id, "review_skipped", &decision);
         return;
     }
     if !session.groups().iter().any(|g| g.exposed && !g.pinned) && session.memories.is_empty() {
@@ -2126,6 +2144,8 @@ fn merge_review(
         current.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"background advice discarded: main lineage, source membership or eligibility changed; review current sources again"}]});
         return false;
     }
+    admission::initialize(current);
+    let before_admission = current.clone();
     let before_memory_input = current.render_primary();
     // Apply reviewer deltas only. Never replace a newer live opinion (including
     // protection reconciled by a newer native cohort) with a snapshot value.
@@ -2230,6 +2250,25 @@ fn merge_review(
         .saturating_sub(before.reviewer_compactions);
     current.review_epoch = reviewed.review_epoch;
     current.last_review_request = reviewed.last_review_request;
+    // Snapshot validity is insufficient: current-budget revalidation can reject
+    // every accepted memory. Only committed valid advice may cover sources or
+    // update no-yield backoff; valid-empty and partially accepted batches count.
+    let committed_valid = run.valid_admission
+        && (current.review_feedback["rejected_count"] == 0
+            || current.review_feedback["accepted_opinions"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+            || current.review_feedback["accepted_memories"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0);
+    admission::complete(
+        &before_admission,
+        current,
+        committed_valid,
+        &run.successful_sources,
+    );
     true
 }
 
@@ -2244,21 +2283,15 @@ async fn review(
     if run.request_id.is_empty() {
         run.request_id = logging::request_id();
     }
-    if !bootstrap
-        && session
-            .completed_requests
-            .saturating_sub(session.last_review_request)
-            < service.config.review_every_requests
-    {
-        journal(
-            service,
-            id,
-            &run.request_id,
-            "review_skipped",
-            &json!({"reason":"cadence","background":run.background}),
-        );
-        return false;
+    if !bootstrap {
+        let decision = admission::decision(&service.config, session, main, run.pressure);
+        journal(service, id, &run.request_id, "review_admission", &decision);
+        if decision["admitted"] != true {
+            journal(service, id, &run.request_id, "review_skipped", &decision);
+            return false;
+        }
     }
+    admission::initialize(session);
     session.review_cache_key = format!("{:x}", Sha256::digest(format!("carry-review-{id}")));
     session.review_context = cache_base(main);
     if bootstrap {
@@ -2478,6 +2511,7 @@ async fn review_chunk(
     groups: &[Group],
     run: &mut ReviewRun,
 ) -> bool {
+    let before_admission = session.clone();
     let replay_epoch = session.review_epoch;
     let mut admitted_sources = review_source_input(session, groups);
     admitted_sources.pop();
@@ -2689,6 +2723,21 @@ async fn review_chunk(
     {
         session.partial_reviews += 1;
     }
+    run.valid_admission |= valid;
+    if valid {
+        run.successful_sources.extend(groups.iter().cloned());
+    }
+    let outcome = admission::complete(&before_admission, session, valid, groups);
+    journal(
+        service,
+        id,
+        &run.request_id,
+        "review_outcome",
+        &json!({
+        "outcome":outcome,"multiplier":admission::multiplier(&service.config,session),
+        "pressure":run.pressure,"background":run.background,
+        "scope":if run.background {"review_snapshot"} else {"committed_review"}}),
+    );
     let _ = trace(service, id, "shadow_feedback", &session.review_feedback);
     logging::journal_attempt(
         service,
@@ -3443,6 +3492,14 @@ mod tests {
     fn reviewer_config() -> ProxyCli {
         ProxyCli::try_parse_from([
             "carry proxy",
+            "--review-min-primary-tokens",
+            "0",
+            "--review-min-new-tokens",
+            "0",
+            "--review-backoff-factor",
+            "1",
+            "--review-every-requests",
+            "1",
             "--classifier-cache-policy",
             "openai-explicit",
             "--payoff-requests",
@@ -3484,6 +3541,11 @@ mod tests {
     // PR154 tests only: use the current trace/checkpoint seam, not new APIs.
     include!("proxy_pr154_tests.rs");
     include!("proxy_pr154_controls.rs");
+    mod admission_tests {
+        include!("proxy_admission_tests.rs");
+        include!("proxy_admission_controls.rs");
+        include!("proxy_admission_merge_tests.rs");
+    }
 
     #[test]
     fn dashboard_client_provenance_is_bounded_and_optional() {
@@ -3913,6 +3975,7 @@ mod tests {
                 standard: true,
                 completed: true,
             }],
+            ..ReviewRun::default()
         };
         merge_review(&config, &mut current, &before, &reviewed, &run);
         assert!(current.memories.is_empty());
@@ -4126,6 +4189,7 @@ mod tests {
                 standard: true,
                 completed: true,
             }],
+            ..ReviewRun::default()
         };
         merge_review(&reviewer_config(), &mut current, &before, &reviewed, &run);
         assert!(
@@ -4955,6 +5019,14 @@ mod tests {
     fn actual_paired_rendering_and_separate_cache_evidence_can_veto_main_savings() {
         let config = ProxyCli::try_parse_from([
             "carry proxy",
+            "--review-min-primary-tokens",
+            "0",
+            "--review-min-new-tokens",
+            "0",
+            "--review-every-requests",
+            "1",
+            "--review-backoff-factor",
+            "1",
             "--mode",
             "compact",
             "--classifier-model",
