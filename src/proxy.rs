@@ -1989,7 +1989,11 @@ async fn dispatch_review_for(
         );
         return;
     }
-    if !service.background_reviews.lock().await.insert(id.clone()) {
+    // Publish registration and its pending checkpoint together to dashboard
+    // readers, including when this primary has just censored an older orphan.
+    let mut reviews = service.background_reviews.lock().await;
+    if !reviews.insert(id.clone()) {
+        drop(reviews);
         journal(
             &service,
             &id,
@@ -2003,7 +2007,8 @@ async fn dispatch_review_for(
     // Reserve the pending marker before dispatch so a restart censors unknown spend.
     if save(&service, &id, session).is_err() {
         session.background_review_pending = false;
-        service.background_reviews.lock().await.remove(&id);
+        reviews.remove(&id);
+        drop(reviews);
         journal(
             &service,
             &id,
@@ -2013,6 +2018,7 @@ async fn dispatch_review_for(
         );
         return;
     }
+    drop(reviews);
     let before = session.clone();
     journal(
         &service,
