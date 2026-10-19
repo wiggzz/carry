@@ -553,22 +553,44 @@ reconstructed client/provider compaction or cache guarantees. Summaries could
 change subsequent actions, quality or rereads; the scenario does not model that.
 Both scenario totals remain separate from the observed native-usage ledger.
 
-Scenario state survives restart. New trajectories exclude unsuccessful primary
-and reviewer attempts from both comparison branches; later successful requests
-continue the simulation. Missing usage on a completed response, unknown pricing,
-native image/audio/video requests, or older untracked history still make the
-comparison unavailable. A pending background review temporarily withholds the
-comparison until its outcome is recorded. Legacy trajectories retain their old
-failure policy: the upgrade does not reconstruct their historical comparisons
-from raw traces, and later successes do not repair invalid old totals.
+Scenario state survives restart. Unsuccessful primary and reviewer attempts are
+excluded under the successful-request policy; later successful requests continue
+the simulation. Completed calls without comparable pricing—missing usage, unknown
+rates/cache behavior, or native image/audio/video content—are omitted from the
+comparison rather than invalidating the whole session. An omitted primary adds
+neither its Carry cost nor its traditional cost. Known reviewer expense remains
+charged to Carry; an unpriced reviewer is omitted and counted separately because
+it has **no traditional counterpart**, so its missing cost does not cancel.
+
+These are **priced-subset estimates**, not claims that missing costs are zero or
+that the full-trajectory saving is exact. Omitted primary costs are assumed to
+roughly offset; context-dependent prices and caches can differ, and percentages
+use a smaller denominator. Omitted reviewer costs can overstate savings. The
+dashboard labels partial comparisons and separately counts omitted calls so
+pricing/usage coverage can be improved without hiding the available comparison.
+No comparable priced primary observations still means `Unavailable`, not zero.
+Older untracked history, an invalid scenario, or unreconstructable legacy failure
+accounting can still make a comparison unavailable. A pending background review
+temporarily withholds the monetary comparison until its outcome is recorded;
+its coverage counters remain visible. The upgrade does not replay raw traces or
+invent missing receipts to reconstruct historical comparisons.
 
 The backend owns savings eligibility and aggregation. Session `cost_estimate`
 objects contain numeric monetary fields for available comparisons and `null`
 monetary fields otherwise, with coverage counters retained for diagnostics; there
 is no public `priced` flag. Top-level `cost_estimate` contains the aggregate
 `carry_cost`, `traditional_cost`, `savings`, `savings_percent`, `included_sessions`,
-`excluded_sessions`, and `excluded_failed_calls`. Only available session comparisons
-contribute to these totals; exclusions also count unreadable checkpoints. With
+`excluded_sessions`, and `excluded_failed_calls`. `excluded_unpriced_calls` counts
+omitted completed primary/reviewer calls; `excluded_unpriced_reviewer_calls` is
+the reviewer-only subset, not an additional count. These omission counters include
+unavailable/pending sessions as well, so coverage problems do not disappear when
+a session cannot contribute money. Historical checkpoints that predate these
+counters expose only a conservative lower bound from overlapping coverage reasons;
+exact historical reviewer attribution is unavailable. New omissions are counted
+exactly. Existing coverage reasons and native usage ledgers remain separately
+available for diagnosis. Only available session
+comparisons contribute to monetary totals; excluded sessions also count unreadable
+checkpoints. With
 no available comparisons, amounts are `null`, not zero. Valid zero and negative
 savings remain numeric. The UI formats these backend values without filtering or
 recalculating savings; null amounts display `Unavailable`. Excluded sessions

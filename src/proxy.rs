@@ -4072,7 +4072,18 @@ mod tests {
             assert_eq!(estimate.coverage.reviewer_responses, u64::from(completed));
             assert_eq!(estimate.coverage.failed_calls, 1 + u64::from(!completed));
             assert_eq!(estimate.reviewer_cost > 0.0, completed && metered);
-            assert_eq!(estimate.priced, !completed || metered);
+            assert!(
+                estimate.priced,
+                "unpriced reviewer expense does not hide priced primary pairs"
+            );
+            assert_eq!(
+                estimate.excluded_unpriced_calls,
+                u64::from(completed && !metered)
+            );
+            assert_eq!(
+                estimate.excluded_unpriced_reviewer_calls,
+                u64::from(completed && !metered)
+            );
             assert_eq!(
                 estimate.coverage.missing_usage,
                 u64::from(completed && !metered)

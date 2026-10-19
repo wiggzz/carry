@@ -306,6 +306,9 @@ class StateRegressions(unittest.TestCase):
                         result["coverage"]["missing_usage" if invalid == "missing_usage"
                                            else "prior_untracked_calls"] = 1
                     elif invalid == "unknown_cache":
+                        # Old unknown-cache costs were accumulated but were not
+                        # comparable; they have no trustworthy priced-pair count.
+                        trajectory.pop("priced_primary_responses", None)
                         result["coverage"]["unknown_cache_requests"] = 1
                     elif invalid == "pending":
                         saved["background_review_pending"] = True
@@ -612,8 +615,8 @@ class StateRegressions(unittest.TestCase):
                     aggregate = stats["cost_estimate"]
                     self.assertEqual(aggregate["included_sessions"], 1)
                     self.assertEqual(aggregate["excluded_sessions"], 0)
-                    self.assertEqual(estimate["excluded_unpriced_calls"], int(terminal == "missing_usage"))
-                    self.assertEqual(estimate["excluded_unpriced_reviewer_calls"], int(terminal == "missing_usage"))
+                    self.assertEqual(estimate.get("excluded_unpriced_calls"), int(terminal == "missing_usage"))
+                    self.assertEqual(estimate.get("excluded_unpriced_reviewer_calls"), int(terminal == "missing_usage"))
                     self.assertEqual(aggregate["excluded_unpriced_calls"], int(terminal == "missing_usage"))
                     for field in ("carry_cost", "traditional_cost", "savings", "savings_percent"):
                         if estimate[field] is None:

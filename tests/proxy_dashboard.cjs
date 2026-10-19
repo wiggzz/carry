@@ -80,6 +80,22 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   await vm.runInContext('refresh()', sandbox);
   assert.equal(cards().get('Carry scenario'), '$3.000000');
   assert.ok(!elements.get('sessions').children[0].children[3].textContent.includes('successful requests only'), 'unavailable estimates never display partial savings');
+  const unpriced = session(1, 2);
+  unpriced.cost_estimate.excluded_unpriced_calls = 3;
+  unpriced.cost_estimate.excluded_unpriced_reviewer_calls = 1;
+  unpriced.cost_estimate.coverage.unmodeled_calls = 2;
+  unpriced.primary.unavailable_cost_calls = 2;
+  data.sessions = [unpriced];
+  // Different from the session counts: the browser must not recompute coverage.
+  data.cost_estimate = {...total(1, 2, 1, 50, 1), excluded_unpriced_calls: 5,
+    excluded_unpriced_reviewer_calls: 1};
+  await vm.runInContext('refresh()', sandbox);
+  assert.equal(cards().get('Estimated savings · all time'), '$1.000000 (50.0%)', 'show the backend priced subset despite omitted calls');
+  assert.equal(cards().get('Unpriced calls excluded'), '5 (1 reviewer-only)');
+  assert.match(elements.get('estimate-coverage').textContent, /5 unpriced calls excluded.*1 reviewer-only/i);
+  assert.match(elements.get('estimate-coverage').textContent, /approximate/i);
+  assert.match(elements.get('sessions').children[0].children[3].textContent, /priced calls only.*3 unpriced calls excluded.*1 reviewer-only/i);
+  assert.equal(cards().get('API-equivalent total'), 'Incomplete', 'estimated comparison coverage must not hide unavailable observed usage');
   data.sessions = [session(3, 2)];
   data.cost_estimate = total(3, 2, -1, -50, 1);
   await vm.runInContext('refresh()', sandbox);
@@ -98,6 +114,16 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     assert.equal(cards().get(label), 'Unavailable', 'null amounts never become zero');
   }
   assert.ok(elements.get('estimate-coverage').textContent.includes('Includes 0 of 2 sessions'));
+  const allUnpriced = session(0, 0, false);
+  allUnpriced.cost_estimate.excluded_unpriced_calls = 2;
+  allUnpriced.cost_estimate.coverage.unmodeled_calls = 2;
+  data.sessions = [allUnpriced];
+  data.cost_estimate = {...total(null, null, null, null, 0, 1), excluded_unpriced_calls: 2};
+  await vm.runInContext('refresh()', sandbox);
+  assert.equal(cards().get('Estimated savings · all time'), 'Unavailable', 'no priced primary observations must not become zero savings');
+  assert.equal(cards().get('Unpriced calls excluded'), '2', 'track exclusions even if the entire estimate is unavailable');
+  const noteTexts = el => [el.textContent, ...(el.children || []).flatMap(noteTexts)];
+  assert.match(noteTexts(elements.get('sessions')).join('\n'), /2 unpriced calls excluded/i, 'unavailable session diagnostics retain omission counts');
   data.sessions = [session(0, 0)];
   data.cost_estimate = total(0, 0, 0, null, 1);
   await vm.runInContext('refresh()', sandbox);
