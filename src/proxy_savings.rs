@@ -629,6 +629,39 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_completed_observations_survive_pending_review() {
+        for savings in [0.0, -2.0, 2.0] {
+            let estimate = Estimate {
+                priced: true,
+                carry_cost: 4.0,
+                traditional_cost: 4.0 + savings,
+                reviewer_cost: 1.0,
+                savings,
+                savings_percent: Some(savings * 25.0),
+                excluded_unpriced_calls: 2,
+                excluded_unpriced_reviewer_calls: 1,
+                ..Estimate::default()
+            };
+            let completed = serde_json::to_value(estimate.clone().dashboard(false)).unwrap();
+            let pending = serde_json::to_value(estimate.dashboard(true)).unwrap();
+            assert_eq!(pending, completed, "pending work is not a recorded expense");
+            assert_eq!(pending["savings"], savings);
+            assert_eq!(pending["reviewer_cost"], 1.0);
+        }
+        let empty = Trajectory::default();
+        let mut untracked = Trajectory::default();
+        untracked.primary(&request("task"), &response(100), "route", 100, true);
+        untracked.prior_untracked(1);
+        for trajectory in [empty, untracked] {
+            let pending = serde_json::to_value(trajectory.snapshot().dashboard(true)).unwrap();
+            assert!(
+                pending["savings"].is_null(),
+                "unknown observations stay unavailable"
+            );
+        }
+    }
+
+    #[test]
     fn priced_subset_counters_aggregate_even_when_pending_or_ineligible() {
         let mut trajectory = Trajectory::default();
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
@@ -639,8 +672,8 @@ mod tests {
         trajectory.prior_untracked(1);
         totals.observe(&trajectory.snapshot().dashboard(false));
         let public = serde_json::to_value(totals).unwrap();
-        assert_eq!(public["included_sessions"], 1);
-        assert_eq!(public["excluded_sessions"], 2);
+        assert_eq!(public["included_sessions"], 2);
+        assert_eq!(public["excluded_sessions"], 1);
         assert_eq!(public["excluded_unpriced_calls"], 3);
         assert_eq!(public["excluded_unpriced_reviewer_calls"], 3);
         assert!(public["carry_cost"].is_number());

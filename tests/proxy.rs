@@ -99,6 +99,11 @@ fn successful_reviewer_spend_survives_failed_primary_exactly_once() {
 }
 
 #[test]
+fn completed_savings_during_background_review() {
+    state_regression("completed_savings_during_background_review");
+}
+
+#[test]
 fn restart_orphan_reviewer_is_untracked_not_proven_failed() {
     state_regression("restart_orphan_reviewer_is_untracked_not_proven_failed");
 }
@@ -2075,12 +2080,16 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
             "savings_percent",
         ] {
             assert!(
-                estimate[field].is_null(),
-                "pending reviewer spend cannot be reported as {field}"
+                estimate[field].is_number(),
+                "completed-call {field} must remain visible while reviewing"
             );
         }
-        assert!(stats["cost_estimate"]["savings"].is_null());
-        assert_eq!(stats["cost_estimate"]["excluded_sessions"], 1);
+        assert_eq!(estimate["reviewer_cost"], 0.0);
+        assert_eq!(estimate["coverage"]["reviewer_responses"], 0);
+        assert_eq!(stats["sessions"][0]["shadow"]["calls"], 0);
+        assert_eq!(stats["cost_estimate"]["savings"], estimate["savings"]);
+        assert_eq!(stats["cost_estimate"]["included_sessions"], 1);
+        assert_eq!(stats["cost_estimate"]["excluded_sessions"], 0);
         request["input"]
             .as_array_mut()
             .unwrap()

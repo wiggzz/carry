@@ -154,6 +154,24 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   data.sessions[1].title='Unrelated task';
   await vm.runInContext('refresh()', sandbox);
   assert.equal(elements.get('sessions').children.length, 2, 'different titles remain separate');
+  // Reviewing is activity, not loss of completed comparison coverage.
+  for (const [carry, traditional, available] of [[1, 2, true], [3, 2, true], [0, 0, true], [0, 0, false]]) {
+    const pending = {...session(carry, traditional, available), background_review_pending: true};
+    pending.cost_estimate.excluded_unpriced_calls = 2;
+    pending.cost_estimate.excluded_unpriced_reviewer_calls = 1;
+    data.sessions = [pending];
+    data.cost_estimate = total(7, 10, 3, 30, 4, 2);
+    await vm.runInContext('refresh()', sandbox);
+    const article = elements.get('sessions').children[0];
+    assert.equal(article.children[1].textContent, 'Reviewing');
+    assert.equal(cards().get('Estimated savings · all time'), '$3.000000 (30.0%)', 'pending sessions cannot replace backend totals');
+    assert.match(elements.get('estimate-coverage').textContent, /completed calls.*in-flight reviewer cost excluded/i);
+    assert.match(noteTexts(article).join('\n'), /in-flight reviewer cost excluded/i);
+    assert.match(noteTexts(article).join('\n'), /2 unpriced calls excluded/i);
+    const expected = available ? (traditional - carry).toFixed(6) : null;
+    assert.ok(article.children[3].textContent.includes(expected === null ? 'Unavailable' : '$' + expected));
+    assert.ok(!noteTexts(article).join('\n').includes('Savings pending reviewer completion'));
+  }
   data.sessions = [];
   data.cost_estimate = total(null, null, null, null, 0);
   await vm.runInContext('refresh()', sandbox);
