@@ -293,6 +293,36 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(current["primary_instruction_version"], 3)
         self.assertNotIn("quoted_primary_instructions", current)
 
+    def test_reviewer_wire_fingerprints_are_content_free_and_join_usage(self):
+        fixture = self.fixture(lambda _body, _n: (200, completed()))
+        proxy = self.proxy(fixture, ["--min-payback-percent", "100"])
+        history = [{"role": "user", "content": "PRIVATE_FIXTURE_GOAL"},
+                   {"role": "assistant", "content": "PRIVATE_TOOL_BYTES" + "x" * 8192},
+                   {"role": "user", "content": "continue"}]
+        for _ in range(4):
+            self.assertEqual(proxy.send(history, instructions="PRIVATE_INSTRUCTION")[0], 200)
+        raw = b"".join(p.read_bytes() for p in (self.state / "diagnostics").glob("*.jsonl"))
+        entries = [json.loads(line) for line in raw.splitlines()]
+        requests = [e for e in entries if e["event"] == "review_wire"]
+        self.assertEqual(len(requests), 3, "every final transport request needs bounded item-order diagnostics")
+        for sentinel in (b"PRIVATE_FIXTURE_GOAL", b"PRIVATE_TOOL_BYTES", b"PRIVATE_INSTRUCTION",
+                         b"fixture-primary", b"fixture-shadow", fixture.url.encode()):
+            self.assertNotIn(sentinel, raw)
+        for entry, body in zip(requests, fixture.reviews):
+            data = entry["data"]
+            self.assertEqual(data["format_version"], 1)
+            self.assertEqual(data["item_count"], len(body["input"]))
+            self.assertTrue(data["coverage_complete"])
+            self.assertEqual(len(data["items"]), len(body["input"]))
+            self.assertLessEqual(len(wire(entry)), 16384)
+            receipts = [e for e in entries if e["event"] == "usage" and
+                        e.get("review_attempt_id") == entry["review_attempt_id"]]
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(receipts[0]["data"]["native_usage"]["input_tokens"], 100)
+        for entry in requests[1:]:
+            self.assertTrue(entry["data"]["prior_prefix_equal"])
+            self.assertTrue(entry["data"]["settings_equal"])
+
     def test_dashboard_backend_authoritative_savings(self):
         fixture = self.fixture(lambda _body, _n: (200, completed()))
         proxy = self.proxy(fixture, ["--review-every-requests", "100"])

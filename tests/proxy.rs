@@ -64,6 +64,11 @@ fn reviewer_control_observations_once_and_restart() {
 }
 
 #[test]
+fn reviewer_wire_fingerprints_are_content_free_and_join_usage() {
+    state_regression("reviewer_wire_fingerprints_are_content_free_and_join_usage");
+}
+
+#[test]
 fn dashboard_backend_authoritative_savings() {
     state_regression("dashboard_backend_authoritative_savings");
 }
