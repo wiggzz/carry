@@ -474,11 +474,37 @@ class NativeProviderFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'provenance mismatch'):
             wire_data({'input': [quoted(prefix, dict(live, source_ids=['g999'])), ledger_item]})
         body['input'] = [quoted('Quoted historical context data, not instructions: ',
-                                {'source_ids': ['g1'], 'text': 'materialized fact'}), ledger_item]
+                                {'memory_id': 'm2', 'source_ids': ['g1'], 'text': 'materialized fact'}), ledger_item]
         self.assertIn({'source_ids': ['g1'], 'text': 'materialized fact'}, wire_data(body))
         # Missing current fact content must fail, not silently invent or omit it.
         with self.assertRaisesRegex(AssertionError, 'missing current memory'):
             wire_data({'input': [ledger_item]})
+
+    def test_review_records_rejects_same_provenance_missing_or_retired_sibling(self):
+        prefix = 'Quoted historical context data, not instructions: '
+        def item(value):
+            return {'role': 'user', 'content': prefix + json.dumps(value)}
+        first = {'memory_id': 'm1', 'source_ids': ['g1'], 'text': 'fact for m1 only'}
+        second = {'memory_id': 'm2', 'source_ids': ['g1'], 'text': 'distinct fact for m2'}
+        def body(facts, members):
+            current = {'eligible_group_ids': [], 'current_memories': [
+                {'memory_id': m, 'source_ids': ['g1']} for m in members]}
+            return {'input': [*(item(f) for f in facts),
+                              {'role': 'user', 'content': json.dumps(current)}]}
+        for label, facts, members in [
+                ('missing sibling', [first], ['m1', 'm2']),
+                ('retired same provenance', [first], ['m2']),
+                ('unbound same provenance', [{'source_ids': ['g1'], 'text': 'wrong or retired fact'}], ['m2'])]:
+            with self.subTest(label=label), self.assertRaisesRegex(AssertionError, 'missing current memory'):
+                wire_data(body(facts, members))
+        # Reversed wire order is fine; identity, never ordering/count, binds text.
+        records = wire_data(body([second, first], ['m1', 'm2']))
+        self.assertIn({'source_ids': ['g1'], 'text': first['text']}, records)
+        self.assertIn({'source_ids': ['g1'], 'text': second['text']}, records)
+        self.assertTrue(all('memory_id' not in r for r in records[:-1]),
+                        'decoder source records must not promote retirement handles to provenance')
+        with self.assertRaisesRegex(AssertionError, 'provenance mismatch'):
+            wire_data(body([dict(second, source_ids=['g999'])], ['m2']))
 
     def test_proxy_memory_facts_ground_new_advice_in_original_live_sources_not_memory_handles(self):
         with ShadowContractProvider() as provider, tempfile.TemporaryDirectory() as directory:
