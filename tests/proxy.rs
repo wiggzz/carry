@@ -59,6 +59,21 @@ fn state_regression(selector: &str) {
 }
 
 #[test]
+fn dashboard_backend_authoritative_savings() {
+    state_regression("dashboard_backend_authoritative_savings");
+}
+
+#[test]
+fn priced_subset_primary_omissions_and_restart() {
+    state_regression("priced_subset_primary_omissions_and_restart");
+}
+
+#[test]
+fn priced_subset_all_unpriced_and_aggregate_counters() {
+    state_regression("priced_subset_all_unpriced_and_aggregate_counters");
+}
+
+#[test]
 fn successful_request_savings_after_failure_and_restart() {
     state_regression("successful_request_savings_after_failure_and_restart");
 }
@@ -1461,7 +1476,8 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         .await
         .unwrap();
     let estimate = &cost_stats["sessions"][0]["cost_estimate"];
-    assert_eq!(estimate["priced"], true);
+    assert!(estimate.get("priced").is_none());
+    assert!(estimate["carry_cost"].is_number());
     assert_eq!(estimate["coverage"]["primary_responses"], 3);
     assert_eq!(estimate["coverage"]["reviewer_responses"], 1);
     assert!(estimate["reviewer_cost"].as_f64().unwrap() > 0.0);
@@ -2048,10 +2064,23 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
             .await
             .unwrap();
         assert_eq!(stats["sessions"][0]["background_review_pending"], true);
-        assert_eq!(
-            stats["sessions"][0]["cost_estimate"]["priced"], false,
-            "pending reviewer spend cannot be reported as savings"
-        );
+        let estimate = &stats["sessions"][0]["cost_estimate"];
+        assert!(estimate.get("priced").is_none());
+        for field in [
+            "carry_cost",
+            "traditional_cost",
+            "reviewer_cost",
+            "summary_cost",
+            "savings",
+            "savings_percent",
+        ] {
+            assert!(
+                estimate[field].is_null(),
+                "pending reviewer spend cannot be reported as {field}"
+            );
+        }
+        assert!(stats["cost_estimate"]["savings"].is_null());
+        assert_eq!(stats["cost_estimate"]["excluded_sessions"], 1);
         request["input"]
             .as_array_mut()
             .unwrap()

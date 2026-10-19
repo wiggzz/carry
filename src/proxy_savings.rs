@@ -13,6 +13,8 @@ pub struct Coverage {
     pub unmodeled_calls: u64,
     pub prior_untracked_calls: u64,
     pub unknown_cache_requests: u64,
+    #[serde(default)]
+    pub unknown_rate_calls: u64,
 }
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
@@ -27,7 +29,82 @@ pub struct Estimate {
     pub priced: bool,
     #[serde(default)]
     pub excluded_failed_calls: u64,
+    #[serde(default)]
+    pub excluded_unpriced_calls: u64,
+    #[serde(default)]
+    pub excluded_unpriced_reviewer_calls: u64,
     pub coverage: Coverage,
+}
+
+/// Public dashboard projection: a priced matched subset, or null when no
+/// comparable primary observations exist. Omitted reviewer expense is carry-only.
+#[derive(Debug, Serialize)]
+pub struct DashboardEstimate {
+    carry_cost: Option<f64>,
+    traditional_cost: Option<f64>,
+    reviewer_cost: Option<f64>,
+    summary_cost: Option<f64>,
+    traditional_compactions: u64,
+    savings: Option<f64>,
+    savings_percent: Option<f64>,
+    excluded_failed_calls: u64,
+    excluded_unpriced_calls: u64,
+    excluded_unpriced_reviewer_calls: u64,
+    coverage: Coverage,
+}
+
+impl Estimate {
+    pub fn dashboard(self, pending: bool) -> DashboardEstimate {
+        let available = self.priced && !pending;
+        DashboardEstimate {
+            carry_cost: available.then_some(self.carry_cost),
+            traditional_cost: available.then_some(self.traditional_cost),
+            reviewer_cost: available.then_some(self.reviewer_cost),
+            summary_cost: available.then_some(self.summary_cost),
+            traditional_compactions: self.traditional_compactions,
+            savings: available.then_some(self.savings),
+            savings_percent: self.savings_percent.filter(|_| available),
+            excluded_failed_calls: self.excluded_failed_calls,
+            excluded_unpriced_calls: self.excluded_unpriced_calls,
+            excluded_unpriced_reviewer_calls: self.excluded_unpriced_reviewer_calls,
+            coverage: self.coverage,
+        }
+    }
+}
+
+#[derive(Default, Debug, Serialize)]
+pub struct DashboardTotals {
+    carry_cost: Option<f64>,
+    traditional_cost: Option<f64>,
+    savings: Option<f64>,
+    savings_percent: Option<f64>,
+    included_sessions: u64,
+    pub excluded_sessions: u64,
+    excluded_failed_calls: u64,
+    excluded_unpriced_calls: u64,
+    excluded_unpriced_reviewer_calls: u64,
+}
+
+impl DashboardTotals {
+    pub fn observe(&mut self, estimate: &DashboardEstimate) {
+        // Diagnostics cover all sessions, even pending/ineligible comparisons.
+        self.excluded_unpriced_calls += estimate.excluded_unpriced_calls;
+        self.excluded_unpriced_reviewer_calls += estimate.excluded_unpriced_reviewer_calls;
+        let (Some(carry), Some(traditional)) = (estimate.carry_cost, estimate.traditional_cost)
+        else {
+            self.excluded_sessions += 1;
+            return;
+        };
+        self.included_sessions += 1;
+        self.excluded_failed_calls += estimate.excluded_failed_calls;
+        let carry = self.carry_cost.unwrap_or(0.0) + carry;
+        let traditional = self.traditional_cost.unwrap_or(0.0) + traditional;
+        let savings = traditional - carry;
+        self.carry_cost = Some(carry);
+        self.traditional_cost = Some(traditional);
+        self.savings = Some(savings);
+        self.savings_percent = (traditional > 0.0).then_some(100.0 * savings / traditional);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -58,6 +135,10 @@ pub struct Trajectory {
     // trajectories explicitly opt into excluding proven unsuccessful attempts.
     #[serde(default)]
     successful_requests_only: bool,
+    // A count, not a policy/version flag. None identifies old sums whose
+    // comparable primary count must be checked before extending them.
+    #[serde(default)]
+    priced_primary_responses: Option<u64>,
 }
 impl Default for Trajectory {
     fn default() -> Self {
@@ -73,6 +154,7 @@ impl Default for Trajectory {
             traditional_edited: false,
             available: true,
             successful_requests_only: true,
+            priced_primary_responses: Some(0),
         }
     }
 }
@@ -82,13 +164,51 @@ impl Trajectory {
         estimate.savings = estimate.traditional_cost - estimate.carry_cost;
         estimate.priced = self.available
             && self.scenario.valid()
-            && estimate.coverage.primary_responses > 0
-            && estimate.coverage.unknown_cache_requests == 0;
+            && self.priced_primary_responses.unwrap_or_else(|| {
+                if self.legacy_subset_reconstructable() {
+                    estimate.coverage.primary_responses
+                } else {
+                    0
+                }
+            }) > 0;
+        // Legacy reason counters can overlap on one call, so their maximum is
+        // only a lower bound. Reviewer attribution is unavailable; retain any
+        // larger explicit count rather than inventing omissions by summing.
+        if self.priced_primary_responses.is_none() {
+            estimate.excluded_unpriced_calls = estimate
+                .excluded_unpriced_calls
+                .max(estimate.coverage.missing_usage)
+                .max(estimate.coverage.unmodeled_calls)
+                .max(estimate.coverage.unknown_cache_requests);
+        }
         estimate.savings_percent = estimate
             .priced
             .then(|| crate::savings::savings_percent(estimate.savings, estimate.carry_cost))
             .flatten();
         estimate
+    }
+
+    fn legacy_subset_reconstructable(&self) -> bool {
+        self.available
+            && self.result.coverage.missing_usage == 0
+            && self.result.coverage.unmodeled_calls == 0
+            && self.result.coverage.unknown_cache_requests == 0
+            && self.result.coverage.prior_untracked_calls == 0
+    }
+
+    fn start_priced_subset(&mut self) {
+        if self.priced_primary_responses.is_none() {
+            // Never resurrect historical sums accumulated while summaries were
+            // disabled or unknown-cache costs were already included. No replay.
+            self.available &= self.legacy_subset_reconstructable();
+            let snapshot = self.snapshot();
+            self.result.excluded_unpriced_calls = snapshot.excluded_unpriced_calls;
+            self.priced_primary_responses = Some(if self.available {
+                self.result.coverage.primary_responses
+            } else {
+                0
+            });
+        }
     }
 
     pub fn prior_untracked(&mut self, calls: u64) {
@@ -108,8 +228,12 @@ impl Trajectory {
     }
 
     pub fn unmodeled_call(&mut self) {
+        self.start_priced_subset();
+        self.result.coverage.primary_responses += 1;
         self.result.coverage.unmodeled_calls += 1;
-        self.available = false;
+        self.result.excluded_unpriced_calls += 1;
+        // Opaque/native boundaries cannot supply a trustworthy text projection.
+        self.reset_epoch();
     }
 
     pub fn reset_epoch(&mut self) {
@@ -144,29 +268,37 @@ impl Trajectory {
     }
 
     pub fn reviewer_usage(&mut self, model: &str, input: u64, usage: &Value, standard: bool) {
+        self.start_priced_subset();
         self.result.coverage.reviewer_responses += 1;
-        let cost = usage["output_tokens"]
+        let output = usage["output_tokens"]
             .as_u64()
-            .filter(|_| standard && usage["input_tokens"].as_u64().is_some())
-            .and_then(|output| {
-                estimated_cost_usd(
-                    model,
-                    &Usage {
-                        input_tokens: input,
-                        output_tokens: output,
-                        ..Usage::default()
-                    },
-                )
-            });
+            .filter(|_| usage["input_tokens"].as_u64().is_some());
+        if output.is_none() {
+            self.result.coverage.missing_usage += 1;
+        } else if !standard {
+            self.result.coverage.unmodeled_calls += 1;
+        }
+        let cost = output.filter(|_| standard).and_then(|output| {
+            estimated_cost_usd(
+                model,
+                &Usage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    ..Usage::default()
+                },
+            )
+        });
         if let Some(cost) = cost {
-            // Reviewer has no traditional counterpart. No hypothetical cache
-            // discount here: native cached tokens cannot be subtracted from a
-            // local input estimate. Priced reviewer subtotal is also itemized.
+            // Reviewer has no traditional counterpart. Preserve known expense;
+            // omitted reviewer expense is NOT an equal-cost cancellation.
             self.result.reviewer_cost += cost;
             self.result.carry_cost += cost;
         } else {
-            self.result.coverage.missing_usage += 1;
-            self.available = false;
+            if output.is_some() && standard {
+                self.result.coverage.unknown_rate_calls += 1;
+            }
+            self.result.excluded_unpriced_calls += 1;
+            self.result.excluded_unpriced_reviewer_calls += 1;
         }
     }
 
@@ -178,7 +310,7 @@ impl Trajectory {
         at: u64,
         standard: bool,
     ) {
-        self.result.coverage.primary_responses += 1;
+        self.start_priced_subset();
         if has_native_modalities(body)
             || has_native_modalities(&response["output"])
             || ["input_tokens_details", "output_tokens_details"]
@@ -192,19 +324,25 @@ impl Trajectory {
             self.unmodeled_call();
             return;
         }
-        let Some(prompt) = projection(body, route, at) else {
-            self.result.coverage.missing_usage += 1;
-            self.available = false;
-            return;
-        };
-        let Some(output) = response["usage"]["output_tokens"]
-            .as_u64()
-            .filter(|_| standard && response["usage"]["input_tokens"].as_u64().is_some())
+        self.result.coverage.primary_responses += 1;
+        let (Some(prompt), Some(out)) =
+            (projection(body, route, at), response["output"].as_array())
         else {
+            // Without a structural projection, omit the entire matched pair
+            // before touching money and restart cache/summary assumptions.
             self.result.coverage.missing_usage += 1;
-            self.available = false;
+            self.result.excluded_unpriced_calls += 1;
+            self.reset_epoch();
             return;
         };
+        let output = response["usage"]["output_tokens"]
+            .as_u64()
+            .filter(|_| response["usage"]["input_tokens"].as_u64().is_some());
+        if output.is_none() {
+            self.result.coverage.missing_usage += 1;
+        } else if !standard {
+            self.result.coverage.unmodeled_calls += 1;
+        }
         let traditional_input = (prompt.input as i128)
             .saturating_add(self.restored)
             .saturating_sub(self.retired as i128)
@@ -239,71 +377,79 @@ impl Trajectory {
         if minimum.is_none() {
             self.result.coverage.unknown_cache_requests += 1;
         }
-        let carry = scenario_input_cost(&prompt.model, prompt.input, carry_cached, minimum);
-        let traditional = scenario_input_cost(
-            &prompt.model,
-            traditional_input,
-            traditional_cached,
-            minimum,
-        );
-        // Freeze the output count, not its rate: each branch selects its own tier.
-        let carry_output =
-            crate::savings::scenario_output_cost(&prompt.model, prompt.input, output);
-        let traditional_output =
-            crate::savings::scenario_output_cost(&prompt.model, traditional_input, output);
-        if let (Some(carry), Some(traditional), Some(carry_output), Some(traditional_output)) =
-            (carry, traditional, carry_output, traditional_output)
-        {
-            self.result.carry_cost += carry + carry_output;
-            self.result.traditional_cost += traditional + traditional_output;
-        } else {
-            self.available = false;
+        if estimated_cost_usd(&prompt.model, &Usage::default()).is_none() {
+            self.result.coverage.unknown_rate_calls += 1;
         }
-        self.last_traditional_input = traditional_input;
-        self.carry_edited = false;
-        self.traditional_edited = false;
-        // Like the shared estimator, summarize at a completed turn boundary,
-        // not between an assistant tool call and its result.
-        let Some(out) = response["output"].as_array() else {
-            self.result.coverage.missing_usage += 1;
-            self.available = false;
-            return;
-        };
+        // Freeze the output count, not its rate: each branch selects its own tier.
+        let pair = output.filter(|_| standard).and_then(|output| {
+            minimum?;
+            Some((
+                scenario_input_cost(&prompt.model, prompt.input, carry_cached, minimum)?
+                    + crate::savings::scenario_output_cost(&prompt.model, prompt.input, output)?,
+                scenario_input_cost(
+                    &prompt.model,
+                    traditional_input,
+                    traditional_cached,
+                    minimum,
+                )? + crate::savings::scenario_output_cost(
+                    &prompt.model,
+                    traditional_input,
+                    output,
+                )?,
+            ))
+        });
+        // Advance the conventional text scenario even when usage/rates are
+        // missing. Opaque modalities instead reset the structural epoch above.
         let tool_turn = out.iter().any(|item| {
             item["type"]
                 .as_str()
                 .is_some_and(|ty| ty.ends_with("_call"))
         });
         let total = traditional_input.saturating_add(token_units(&response["output"]));
-        if !tool_turn
+        let summarize = !tool_turn
             && self.available
             && self.scenario.valid()
-            && total > self.scenario.context_window - self.scenario.reserve
-        {
-            let discarded = total.saturating_sub(self.scenario.keep_recent);
-            if let Some(cost) = estimated_cost_usd(
+            && total > self.scenario.context_window - self.scenario.reserve;
+        let discarded = total.saturating_sub(self.scenario.keep_recent);
+        let summary_cost = if summarize {
+            estimated_cost_usd(
                 &prompt.model,
                 &Usage {
                     input_tokens: discarded,
                     output_tokens: self.scenario.summary,
                     ..Usage::default()
                 },
-            ) {
-                self.result.summary_cost += cost;
-                self.result.traditional_cost += cost;
-                self.result.traditional_compactions += 1;
-                self.retired = self
-                    .retired
-                    .saturating_add(discarded.saturating_sub(self.summary));
-                self.summary = self.scenario.summary;
-                self.last_traditional_input =
-                    self.scenario.keep_recent.saturating_add(self.summary);
-                self.traditional_edited = true;
-            } else {
-                self.available = false;
-            }
+            )
+        } else {
+            Some(0.0)
+        };
+        // A completed primary (including its hypothetical boundary summary) is
+        // one atomic matched pair. Never add only one branch or half a call.
+        let priced = if let (Some((carry, traditional)), Some(summary_cost)) = (pair, summary_cost)
+        {
+            self.result.carry_cost += carry;
+            self.result.traditional_cost += traditional + summary_cost;
+            self.result.summary_cost += summary_cost;
+            *self.priced_primary_responses.as_mut().unwrap() += 1;
+            true
+        } else {
+            self.result.excluded_unpriced_calls += 1;
+            false
+        };
+        self.last_traditional_input = traditional_input;
+        self.carry_edited = false;
+        self.traditional_edited = false;
+        if summarize {
+            self.result.traditional_compactions += 1;
+            self.retired = self
+                .retired
+                .saturating_add(discarded.saturating_sub(self.summary));
+            self.summary = self.scenario.summary;
+            self.last_traditional_input = self.scenario.keep_recent.saturating_add(self.summary);
+            self.traditional_edited = true;
         }
-        self.previous = Some(prompt);
+        // An unknown intervening primary must never leave a stale cache hit.
+        self.previous = priced.then_some(prompt);
     }
 }
 
@@ -352,6 +498,497 @@ mod tests {
     fn response(input: u64) -> Value {
         json!({"status": "completed", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}],
             "usage": {"input_tokens": input, "output_tokens": 3, "input_tokens_details": {"cached_tokens": 0}}})
+    }
+
+    #[test]
+    fn priced_subset_omits_primary_atomically_and_resumes_after_restart() {
+        for variant in [
+            "missing_usage",
+            "unknown_model",
+            "unknown_cache",
+            "image",
+            "audio",
+            "missing_output",
+            "nonstandard",
+        ] {
+            let mut trajectory = Trajectory::default();
+            let body = request(&"prefix ".repeat(3000));
+            trajectory.primary(&body, &response(100), "route", 100, true);
+            trajectory.reviewer(&request("known review"), &response(100), true);
+            let before = trajectory.snapshot();
+            let mut omitted = body.clone();
+            let mut terminal = response(100);
+            match variant {
+                "missing_usage" => {
+                    terminal.as_object_mut().unwrap().remove("usage");
+                }
+                "unknown_model" => omitted["model"] = json!("unknown-model"),
+                "unknown_cache" => omitted["model"] = json!("gpt-6-astra"),
+                "image" => {
+                    omitted["input"][0]["content"] =
+                        json!([{"type":"input_image", "image_url":"opaque"}])
+                }
+                "audio" => terminal["usage"]["output_tokens_details"]["audio_tokens"] = json!(1),
+                "missing_output" => {
+                    terminal.as_object_mut().unwrap().remove("output");
+                }
+                _ => (),
+            }
+            trajectory.primary(&omitted, &terminal, "route", 101, variant != "nonstandard");
+            let partial = trajectory.snapshot();
+            assert!(partial.priced, "{variant}: retain the known matched prefix");
+            assert_eq!(
+                partial.carry_cost, before.carry_cost,
+                "{variant}: no half-pair Carry charge"
+            );
+            assert_eq!(
+                partial.traditional_cost, before.traditional_cost,
+                "{variant}: no half-pair traditional charge"
+            );
+            let public = serde_json::to_value(partial.dashboard(false)).unwrap();
+            assert_eq!(public["excluded_unpriced_calls"], 1, "{variant}");
+            assert_eq!(public["excluded_unpriced_reviewer_calls"], 0);
+            assert!(
+                public["savings"].as_f64().unwrap() < 0.0,
+                "known reviewer overhead stays real"
+            );
+            assert!(
+                trajectory.previous.is_none(),
+                "{variant}: omitted primary invalidates the cache predecessor"
+            );
+            let mut resumed: Trajectory =
+                serde_json::from_value(serde_json::to_value(&trajectory).unwrap()).unwrap();
+            let mut cold = Trajectory::default();
+            cold.primary(&body, &response(100), "route", 102, true);
+            resumed.primary(&body, &response(100), "route", 102, true);
+            let after = resumed.snapshot();
+            assert!(
+                after.priced,
+                "{variant}: a later priced primary remains comparable"
+            );
+            assert!(
+                (after.carry_cost - before.carry_cost - cold.snapshot().carry_cost).abs() < 1e-12,
+                "{variant}: do not reuse a stale cache across the omission"
+            );
+            assert_eq!(
+                serde_json::to_value(after).unwrap()["excluded_unpriced_calls"],
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn priced_subset_unpriced_only_is_null_even_with_known_reviewer_expense() {
+        for variant in ["missing_usage", "unknown_model", "unknown_cache", "native"] {
+            let mut trajectory = Trajectory::default();
+            let mut body = request("task");
+            let mut terminal = response(100);
+            match variant {
+                "missing_usage" => {
+                    terminal.as_object_mut().unwrap().remove("usage");
+                }
+                "unknown_model" => body["model"] = json!("unknown-model"),
+                "unknown_cache" => body["model"] = json!("gpt-6-astra"),
+                _ => {
+                    body["input"][0]["content"] =
+                        json!([{"type":"input_image", "image_url":"opaque"}])
+                }
+            }
+            trajectory.primary(&body, &terminal, "route", 100, true);
+            trajectory.reviewer(&request("known review"), &response(100), true);
+            let public = serde_json::to_value(trajectory.snapshot().dashboard(false)).unwrap();
+            assert!(
+                public["carry_cost"].is_null(),
+                "{variant}: no comparable primary, not a false zero"
+            );
+            assert_eq!(public["excluded_unpriced_calls"], 1);
+        }
+    }
+
+    #[test]
+    fn priced_subset_reviewer_omissions_preserve_known_expense_without_touching_primary_cache() {
+        let mut trajectory = Trajectory::default();
+        trajectory.primary(&request("task"), &response(100), "route", 100, true);
+        trajectory.reviewer(&request("known review"), &response(100), true);
+        let before = serde_json::to_value(&trajectory).unwrap();
+        trajectory.reviewer_usage("unknown-model", 100, &response(100)["usage"], true);
+        trajectory.reviewer_usage("gpt-6-luna", 100, &Value::Null, true);
+        let after = serde_json::to_value(&trajectory).unwrap();
+        assert_eq!(after["previous"], before["previous"]);
+        let public = serde_json::to_value(trajectory.snapshot().dashboard(false)).unwrap();
+        assert_eq!(public["excluded_unpriced_calls"], 2);
+        assert_eq!(public["excluded_unpriced_reviewer_calls"], 2);
+        assert_eq!(public["reviewer_cost"], before["result"]["reviewer_cost"]);
+        assert!(public["savings"].as_f64().unwrap() < 0.0);
+        let coverage = &public["coverage"];
+        assert_eq!(
+            coverage["missing_usage"], 1,
+            "unknown rates are not missing usage"
+        );
+        assert_eq!(coverage["unknown_rate_calls"], 1);
+    }
+
+    #[test]
+    fn priced_subset_counters_aggregate_even_when_pending_or_ineligible() {
+        let mut trajectory = Trajectory::default();
+        trajectory.primary(&request("task"), &response(100), "route", 100, true);
+        trajectory.reviewer_usage("unknown-model", 100, &response(100)["usage"], true);
+        let mut totals = DashboardTotals::default();
+        totals.observe(&trajectory.snapshot().dashboard(false));
+        totals.observe(&trajectory.snapshot().dashboard(true));
+        trajectory.prior_untracked(1);
+        totals.observe(&trajectory.snapshot().dashboard(false));
+        let public = serde_json::to_value(totals).unwrap();
+        assert_eq!(public["included_sessions"], 1);
+        assert_eq!(public["excluded_sessions"], 2);
+        assert_eq!(public["excluded_unpriced_calls"], 3);
+        assert_eq!(public["excluded_unpriced_reviewer_calls"], 3);
+        assert!(public["carry_cost"].is_number());
+    }
+
+    #[test]
+    fn priced_subset_later_summaries_keep_advancing_through_omissions() {
+        for variant in ["missing_usage", "unknown_model", "image"] {
+            let mut trajectory = Trajectory {
+                scenario: Scenario {
+                    context_window: 2000,
+                    reserve: 100,
+                    keep_recent: 200,
+                    summary: 50,
+                },
+                ..Trajectory::default()
+            };
+            trajectory.primary(&request("task"), &response(100), "route", 100, true);
+            let mut body = request("omitted");
+            let mut terminal = response(100);
+            match variant {
+                "missing_usage" => {
+                    terminal.as_object_mut().unwrap().remove("usage");
+                }
+                "unknown_model" => body["model"] = json!("unknown-model"),
+                _ => {
+                    body["input"][0]["content"] =
+                        json!([{"type":"input_image", "image_url":"opaque"}])
+                }
+            }
+            trajectory.primary(&body, &terminal, "route", 101, true);
+            let mut resumed: Trajectory =
+                serde_json::from_value(serde_json::to_value(&trajectory).unwrap()).unwrap();
+            let large = request(&"evidence ".repeat(3000));
+            resumed.primary(&large, &response(100), "route", 102, true);
+            let summary = resumed.snapshot();
+            assert!(summary.priced, "{variant}");
+            assert_eq!(
+                summary.traditional_compactions, 1,
+                "{variant}: summaries must not stop forever"
+            );
+            assert!(summary.summary_cost > 0.0);
+            resumed.primary(&large, &response(100), "route", 103, true);
+            assert_eq!(resumed.snapshot().traditional_compactions, 1);
+            assert_eq!(resumed.snapshot().summary_cost, summary.summary_cost);
+        }
+    }
+
+    #[test]
+    fn priced_subset_omitted_threshold_crossing_updates_summary_structure_not_money() {
+        let mut trajectory = Trajectory {
+            scenario: Scenario {
+                context_window: 2000,
+                reserve: 100,
+                keep_recent: 200,
+                summary: 50,
+            },
+            ..Trajectory::default()
+        };
+        trajectory.primary(&request("task"), &response(100), "route", 100, true);
+        let before = trajectory.snapshot();
+        let large = request(&"evidence ".repeat(3000));
+        trajectory.primary(
+            &large,
+            &json!({"status":"completed","output":[]}),
+            "route",
+            101,
+            true,
+        );
+        assert_eq!(trajectory.snapshot().carry_cost, before.carry_cost);
+        assert_eq!(
+            trajectory.snapshot().traditional_cost,
+            before.traditional_cost
+        );
+        assert_eq!(trajectory.snapshot().traditional_compactions, 1);
+        trajectory.primary(&large, &response(100), "route", 102, true);
+        assert_eq!(
+            trajectory.snapshot().traditional_compactions,
+            1,
+            "do not invent a delayed duplicate summary charge"
+        );
+        assert_eq!(
+            trajectory.snapshot().summary_cost,
+            0.0,
+            "omitted boundary's summary is excluded with its call"
+        );
+        assert!(trajectory.snapshot().priced);
+    }
+
+    #[test]
+    fn priced_subset_legacy_poisoned_sums_remain_unavailable_without_replay() {
+        let mut trajectory = Trajectory::default();
+        trajectory.primary(&request("task"), &response(100), "route", 100, true);
+        let mut checkpoint = serde_json::to_value(trajectory).unwrap();
+        checkpoint
+            .as_object_mut()
+            .unwrap()
+            .remove("priced_primary_responses");
+        checkpoint["available"] = json!(false);
+        checkpoint["result"]["coverage"]["unmodeled_calls"] = json!(1);
+        checkpoint["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("excluded_unpriced_calls");
+        checkpoint["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("excluded_unpriced_reviewer_calls");
+        let mut resumed: Trajectory = serde_json::from_value(checkpoint).unwrap();
+        resumed.primary(&request("later task"), &response(100), "route", 101, true);
+        assert!(
+            !resumed.snapshot().priced,
+            "old accounting may have skipped conventional summaries; never flip available"
+        );
+        let public = serde_json::to_value(resumed.snapshot().dashboard(false)).unwrap();
+        assert_eq!(
+            public["excluded_unpriced_calls"], 1,
+            "historical omissions stay visible even when sums cannot be repaired"
+        );
+    }
+
+    #[test]
+    fn legacy_overlapping_omission_reasons_remain_a_lower_bound_across_restart() {
+        for (extra_unmodeled, keep_explicit_count, expected) in
+            [(0, false, 1), (2, false, 2), (2, true, 3)]
+        {
+            let mut trajectory = Trajectory::default();
+            let mut body = request("one request with overlapping omission reasons");
+            body["model"] = json!("gpt-6-astra");
+            trajectory.primary(
+                &body,
+                &json!({"status": "completed", "output": []}),
+                "route",
+                100,
+                true,
+            );
+            let single = trajectory.snapshot();
+            assert_eq!(single.coverage.primary_responses, 1);
+            assert_eq!(single.coverage.missing_usage, 1);
+            assert_eq!(single.coverage.unknown_cache_requests, 1);
+            assert_eq!(single.excluded_unpriced_calls, 1);
+            for _ in 0..extra_unmodeled {
+                trajectory.unmodeled_call();
+            }
+            assert_eq!(
+                trajectory.snapshot().excluded_unpriced_calls,
+                1 + extra_unmodeled
+            );
+
+            // Reproduce the legacy checkpoint shape, not a second accounting path.
+            let mut checkpoint = serde_json::to_value(trajectory).unwrap();
+            let object = checkpoint.as_object_mut().unwrap();
+            object.remove("priced_primary_responses");
+            object.remove("successful_requests_only");
+            checkpoint["available"] = json!(false);
+            if !keep_explicit_count {
+                checkpoint["result"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("excluded_unpriced_calls");
+            }
+            checkpoint["result"]
+                .as_object_mut()
+                .unwrap()
+                .remove("excluded_unpriced_reviewer_calls");
+            let mut legacy: Trajectory = serde_json::from_value(checkpoint).unwrap();
+            let projected = serde_json::to_value(legacy.snapshot().dashboard(false)).unwrap();
+            assert_eq!(projected["excluded_unpriced_calls"], expected);
+            assert_eq!(projected["excluded_unpriced_reviewer_calls"], 0);
+            assert!(projected["carry_cost"].is_null());
+            assert_eq!(legacy.priced_primary_responses, None);
+
+            // A later observation migrates the lower bound without repairing old sums.
+            legacy.primary(&request("later task"), &response(100), "route", 101, true);
+            assert_eq!(legacy.priced_primary_responses, Some(1));
+            assert_eq!(legacy.result.excluded_unpriced_calls, expected);
+            let mut resumed: Trajectory =
+                serde_json::from_value(serde_json::to_value(legacy).unwrap()).unwrap();
+            assert_eq!(resumed.snapshot().excluded_unpriced_calls, expected);
+            assert!(!resumed.snapshot().priced);
+            resumed.primary(
+                &request("new omission after migration"),
+                &json!({"status": "completed", "output": []}),
+                "route",
+                102,
+                true,
+            );
+            let restarted: Trajectory =
+                serde_json::from_value(serde_json::to_value(resumed).unwrap()).unwrap();
+            let dashboard = restarted.snapshot().dashboard(false);
+            let public = serde_json::to_value(&dashboard).unwrap();
+            assert_eq!(public["excluded_unpriced_calls"], expected + 1);
+            assert_eq!(public["excluded_unpriced_reviewer_calls"], 0);
+            assert!(public["carry_cost"].is_null());
+
+            let mut clean = Trajectory::default();
+            clean.primary(
+                &request("priced control"),
+                &response(100),
+                "route",
+                100,
+                true,
+            );
+            let mut totals = DashboardTotals::default();
+            totals.observe(&clean.snapshot().dashboard(false));
+            totals.observe(&dashboard);
+            let aggregate = serde_json::to_value(totals).unwrap();
+            assert_eq!(aggregate["excluded_unpriced_calls"], expected + 1);
+            assert_eq!(aggregate["excluded_unpriced_reviewer_calls"], 0);
+            assert_eq!(aggregate["included_sessions"], 1);
+            assert_eq!(aggregate["excluded_sessions"], 1);
+            assert!(aggregate["carry_cost"].is_number());
+        }
+    }
+
+    #[test]
+    fn dashboard_projection_suppresses_all_money_without_changing_persisted_estimate() {
+        let mut trajectory = Trajectory::default();
+        trajectory.primary(&request("task"), &response(100), "route", 100, true);
+        trajectory.failed_call();
+        let snapshot = trajectory.snapshot();
+        let persisted = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            persisted["priced"], true,
+            "internal checkpoint compatibility stays intact"
+        );
+        for pending in [false, true] {
+            let dashboard = serde_json::to_value(snapshot.clone().dashboard(pending)).unwrap();
+            assert!(dashboard.get("priced").is_none());
+            for field in [
+                "carry_cost",
+                "traditional_cost",
+                "reviewer_cost",
+                "summary_cost",
+                "savings",
+                "savings_percent",
+            ] {
+                if pending {
+                    assert!(
+                        dashboard[field].is_null(),
+                        "pending {field} must not expose partial sums"
+                    );
+                } else {
+                    assert_eq!(dashboard[field], persisted[field]);
+                }
+            }
+            for field in [
+                "coverage",
+                "excluded_failed_calls",
+                "traditional_compactions",
+            ] {
+                assert_eq!(dashboard[field], persisted[field]);
+            }
+        }
+        trajectory.prior_untracked(1);
+        let invalid = trajectory.snapshot();
+        assert!(
+            invalid.carry_cost > 0.0,
+            "invalid checkpoints retain internal accounting"
+        );
+        let dashboard = serde_json::to_value(invalid.dashboard(false)).unwrap();
+        for field in [
+            "carry_cost",
+            "traditional_cost",
+            "reviewer_cost",
+            "summary_cost",
+            "savings",
+            "savings_percent",
+        ] {
+            assert!(dashboard[field].is_null());
+        }
+        assert_eq!(serde_json::to_value(snapshot).unwrap(), persisted);
+    }
+
+    #[test]
+    fn dashboard_totals_accept_only_complete_estimates_and_use_traditional_denominator() {
+        let mut totals = DashboardTotals::default();
+        assert!(totals.carry_cost.is_none());
+        assert!(totals.traditional_cost.is_none());
+        assert!(totals.savings.is_none());
+        assert!(totals.savings_percent.is_none());
+        for (carry, traditional, expected_savings, expected_percent) in [
+            (2.0, 10.0, 8.0, 80.0),
+            (8.0, 2.0, 2.0, 100.0 / 6.0),
+            (4.0, 2.0, 0.0, 0.0),
+            (6.0, 2.0, -4.0, -25.0),
+        ] {
+            let estimate = Estimate {
+                carry_cost: carry,
+                traditional_cost: traditional,
+                savings: traditional - carry,
+                priced: true,
+                excluded_failed_calls: 1,
+                ..Estimate::default()
+            }
+            .dashboard(false);
+            totals.observe(&estimate);
+            assert_eq!(totals.savings, Some(expected_savings));
+            assert!((totals.savings_percent.unwrap() - expected_percent).abs() < 1e-12);
+        }
+        for pending in [false, true] {
+            totals.observe(
+                &Estimate {
+                    carry_cost: 999.0,
+                    traditional_cost: 1000.0,
+                    priced: pending,
+                    excluded_failed_calls: 2,
+                    ..Estimate::default()
+                }
+                .dashboard(pending),
+            );
+        }
+        assert_eq!(totals.carry_cost, Some(20.0));
+        assert_eq!(totals.traditional_cost, Some(16.0));
+        assert_eq!(totals.savings, Some(-4.0));
+        assert_eq!(totals.included_sessions, 4);
+        assert_eq!(totals.excluded_sessions, 2);
+        assert_eq!(totals.excluded_failed_calls, 4);
+    }
+
+    #[test]
+    fn dashboard_zero_cost_is_not_missing_evidence() {
+        let estimate = Estimate {
+            priced: true,
+            ..Estimate::default()
+        }
+        .dashboard(false);
+        let public = serde_json::to_value(&estimate).unwrap();
+        for field in [
+            "carry_cost",
+            "traditional_cost",
+            "reviewer_cost",
+            "summary_cost",
+            "savings",
+        ] {
+            assert_eq!(public[field], 0.0);
+        }
+        let mut totals = DashboardTotals::default();
+        totals.observe(&estimate);
+        assert_eq!(totals.carry_cost, Some(0.0));
+        assert_eq!(totals.traditional_cost, Some(0.0));
+        assert_eq!(totals.savings, Some(0.0));
+        assert_eq!(
+            totals.savings_percent, None,
+            "zero denominator has no percentage"
+        );
+        assert_eq!(totals.included_sessions, 1);
+        assert_eq!(totals.excluded_sessions, 0);
     }
 
     #[test]
@@ -454,7 +1091,10 @@ mod tests {
             true,
         );
         assert_eq!(trajectory.snapshot().coverage.missing_usage, 1);
-        assert!(!trajectory.snapshot().priced);
+        assert!(
+            trajectory.snapshot().priced,
+            "omit completed reviewer without usage, retain priced primary"
+        );
     }
 
     #[test]
@@ -516,7 +1156,11 @@ mod tests {
                 101,
                 true,
             );
-            assert!(!trajectory.snapshot().priced);
+            assert_eq!(
+                trajectory.snapshot().priced,
+                variant != 0,
+                "only unknown ancestry remains unavailable"
+            );
         }
     }
 
@@ -719,7 +1363,11 @@ mod tests {
         let mut trajectory = Trajectory::default();
         trajectory.primary(&body, &response(100), "route", 100, true);
         let estimate = trajectory.snapshot();
-        assert!(estimate.carry_cost > 0.0);
+        assert_eq!(
+            estimate.carry_cost, 0.0,
+            "unknown-cache primary is omitted atomically"
+        );
+        assert_eq!(estimate.traditional_cost, 0.0);
         assert_eq!(estimate.coverage.unknown_cache_requests, 1);
         assert!(!estimate.priced);
         assert_eq!(estimate.savings_percent, None);
@@ -730,10 +1378,24 @@ mod tests {
         let mut trajectory = Trajectory::default();
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
         let mut checkpoint = serde_json::to_value(&trajectory).unwrap();
+        checkpoint
+            .as_object_mut()
+            .unwrap()
+            .remove("priced_primary_responses");
+        let mut clean_legacy: Trajectory = serde_json::from_value(checkpoint.clone()).unwrap();
+        assert!(clean_legacy.snapshot().priced);
+        clean_legacy.primary(&request("later task"), &response(100), "route", 101, true);
+        assert!(clean_legacy.snapshot().priced);
+        assert_eq!(clean_legacy.priced_primary_responses, Some(2));
         checkpoint["result"]["coverage"]["unknown_cache_requests"] = json!(1);
-        let restored: Trajectory = serde_json::from_value(checkpoint).unwrap();
+        let mut restored: Trajectory = serde_json::from_value(checkpoint).unwrap();
         assert!(!restored.snapshot().priced);
         assert_eq!(restored.snapshot().savings_percent, None);
+        restored.primary(&request("later task"), &response(100), "route", 101, true);
+        assert!(
+            !restored.snapshot().priced,
+            "new calls cannot repair old unknown-cache sums"
+        );
     }
 
     #[test]
@@ -784,8 +1446,9 @@ mod tests {
                     trajectory.primary(&unknown, &response(100), "route", 101, true);
                 }
             }
-            assert!(!trajectory.snapshot().priced);
-            assert!(trajectory.snapshot().savings_percent.is_none());
+            let unavailable = variant == 1 || variant == 2;
+            assert_eq!(trajectory.snapshot().priced, !unavailable);
+            assert_eq!(trajectory.snapshot().savings_percent.is_none(), unavailable);
         }
     }
 }

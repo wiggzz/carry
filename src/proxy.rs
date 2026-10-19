@@ -607,7 +607,8 @@ async fn dashboard_stats(
         )
     })?;
     let mut sessions = Vec::new();
-    let mut unavailable_sessions = 0;
+    let mut unavailable_sessions = 0u64;
+    let mut cost_estimate = crate::proxy_savings::DashboardTotals::default();
     for entry in entries {
         let Ok(entry) = entry else {
             unavailable_sessions += 1;
@@ -682,15 +683,13 @@ async fn dashboard_stats(
                 "savings": joint["savings"].as_f64(),
             })),
         });
-        let mut estimate = session
+        let estimate = session
             .cost_trajectory
             .as_ref()
             .map(|t| t.snapshot())
-            .unwrap_or_default();
-        if session.background_review_pending {
-            estimate.priced = false;
-            estimate.savings_percent = None;
-        }
+            .unwrap_or_default()
+            .dashboard(session.background_review_pending);
+        cost_estimate.observe(&estimate);
         let updated_at = entry
             .metadata()
             .ok()
@@ -731,7 +730,9 @@ async fn dashboard_stats(
             .cmp(&a["updated_at"].as_u64())
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
+    cost_estimate.excluded_sessions += unavailable_sessions;
     let mut response = axum::Json(json!({
+        "cost_estimate": cost_estimate,
         "mode": format!("{:?}", service.config.mode).to_lowercase(),
         "auth": if service.config.codex_login { "codex" } else { "api-key" },
         "classifier_model": service.config.classifier_model,
@@ -4071,7 +4072,18 @@ mod tests {
             assert_eq!(estimate.coverage.reviewer_responses, u64::from(completed));
             assert_eq!(estimate.coverage.failed_calls, 1 + u64::from(!completed));
             assert_eq!(estimate.reviewer_cost > 0.0, completed && metered);
-            assert_eq!(estimate.priced, !completed || metered);
+            assert!(
+                estimate.priced,
+                "unpriced reviewer expense does not hide priced primary pairs"
+            );
+            assert_eq!(
+                estimate.excluded_unpriced_calls,
+                u64::from(completed && !metered)
+            );
+            assert_eq!(
+                estimate.excluded_unpriced_reviewer_calls,
+                u64::from(completed && !metered)
+            );
             assert_eq!(
                 estimate.coverage.missing_usage,
                 u64::from(completed && !metered)
@@ -4281,10 +4293,24 @@ mod tests {
             stats["sessions"][0]["cost_estimate"].is_object(),
             "dashboard must expose a scenario estimate"
         );
-        assert_eq!(
-            stats["sessions"][0]["cost_estimate"]["priced"], false,
-            "no observations are not zero-cost evidence"
-        );
+        let estimate = &stats["sessions"][0]["cost_estimate"];
+        assert!(estimate.get("priced").is_none());
+        for field in [
+            "carry_cost",
+            "traditional_cost",
+            "reviewer_cost",
+            "summary_cost",
+            "savings",
+            "savings_percent",
+        ] {
+            assert!(
+                estimate[field].is_null(),
+                "no observations are not zero-cost evidence for {field}"
+            );
+        }
+        assert!(stats["cost_estimate"]["savings"].is_null());
+        assert_eq!(stats["cost_estimate"]["included_sessions"], 0);
+        assert_eq!(stats["cost_estimate"]["excluded_sessions"], 1);
         assert_eq!(stats["sessions"][0]["title"], "First task with details");
         assert_eq!(stats["sessions"][0]["context"]["removable_items"], 0);
         assert_eq!(stats["sessions"][0]["context"]["protected_items"], 0);

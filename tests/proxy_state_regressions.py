@@ -255,6 +255,193 @@ class StateRegressions(unittest.TestCase):
                          "successful retry must advance the frontier once, not retain speculative duplicates")
         self.assertTrue(all("previous_response_id" not in body for body in fixture.primaries))
 
+    def assert_estimate_available(self, estimate, available, message=None):
+        self.assertNotIn("priced", estimate, "public estimates have no eligibility flag")
+        for field in ("carry_cost", "traditional_cost", "reviewer_cost", "summary_cost", "savings"):
+            if available:
+                self.assertIsInstance(estimate[field], (int, float), message or field)
+            else:
+                self.assertIsNone(estimate[field], message or field)
+        if not available:
+            self.assertIsNone(estimate["savings_percent"], message)
+
+    def test_dashboard_backend_authoritative_savings(self):
+        fixture = self.fixture(lambda _body, _n: (200, completed()))
+        proxy = self.proxy(fixture, ["--review-every-requests", "100"])
+        self.assertEqual(proxy.send([{"role": "user", "content": "synthetic accounting seed"}])[0], 200)
+        template = proxy.saved()
+        proxy.close()
+        self.evidence["cases"] = []
+        # Exercise the real HTTP endpoint with owned, serialized checkpoints.
+        # Subtests keep every semantic boundary visible on a prebuilt baseline.
+        cases = [
+            ("empty", [], 0, None),
+            ("positive", [(2, 10, None)], 0, (2, 10, 8, 80)),
+            ("negative", [(10, 2, None)], 0, (10, 2, -8, -400)),
+            ("zero_savings", [(4, 4, None)], 0, (4, 4, 0, 0)),
+            ("zero_costs", [(0, 0, None)], 0, (0, 0, 0, None)),
+            ("mixed_background", [(2, 10, None), (10, 2, None),
+                                  (999, 1000, "legacy"), (888, 1000, "missing_usage"),
+                                  (777, 1000, "pending"), (666, 1000, "no_trajectory"),
+                                  (555, 1000, "unknown_cache"), (444, 1000, "untracked")],
+             1, (12, 12, 0, 0)),
+            ("no_eligible", [(999, 1000, "legacy"), (888, 1000, "pending")], 1, None),
+        ]
+        for name, entries, unreadable, expected in cases:
+            with self.subTest(case=name):
+                self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+                for index, (carry, traditional, invalid) in enumerate(entries, 1):
+                    saved = json.loads(json.dumps(template))
+                    trajectory = saved["cost_trajectory"]
+                    result = trajectory["result"]
+                    result.update(carry_cost=carry, traditional_cost=traditional,
+                                  reviewer_cost=0, summary_cost=0, excluded_failed_calls=1)
+                    result["coverage"]["failed_calls"] = 1
+                    if invalid == "legacy":
+                        trajectory.pop("successful_requests_only", None)
+                        trajectory["available"] = False
+                        result["excluded_failed_calls"] = 0
+                    elif invalid in ("missing_usage", "untracked"):
+                        trajectory["available"] = False
+                        result["coverage"]["missing_usage" if invalid == "missing_usage"
+                                           else "prior_untracked_calls"] = 1
+                    elif invalid == "unknown_cache":
+                        # Old unknown-cache costs were accumulated but were not
+                        # comparable; they have no trustworthy priced-pair count.
+                        trajectory.pop("priced_primary_responses", None)
+                        result["coverage"]["unknown_cache_requests"] = 1
+                    elif invalid == "pending":
+                        saved["background_review_pending"] = True
+                    elif invalid == "no_trajectory":
+                        saved.pop("cost_trajectory")
+                    (self.state / (f"{index:064x}.json")).write_text(json.dumps(saved))
+                if unreadable:
+                    (self.state / ("f" * 64 + ".json")).write_text("not a checkpoint")
+                checkpoint_bytes = {path.name: path.read_bytes() for path in self.state.glob("*.json")}
+                proxy = self.proxy(fixture, ["--background-reviews=true"])
+                status, stats = proxy.request("GET", "/carry/dashboard/stats")
+                proxy.close()
+                self.evidence["cases"].append({"case": name, "status": status, "stats": stats})
+                self.assertEqual(status, 200)
+                self.assertTrue(stats["background_reviews"])
+                self.assertEqual(stats["unavailable_sessions"], unreadable)
+                self.assertEqual(len(stats["sessions"]), len(entries))
+                self.assertIn("cost_estimate", stats, "backend must supply dashboard totals")
+                aggregate = stats["cost_estimate"]
+                included = sum(invalid is None for _, _, invalid in entries)
+                self.assertEqual(aggregate["included_sessions"], included)
+                self.assertEqual(aggregate["excluded_sessions"], len(entries) - included + unreadable)
+                self.assertEqual(aggregate["excluded_failed_calls"], included,
+                                 "failed-call scope belongs only to included comparisons")
+                for field, value in zip(("carry_cost", "traditional_cost", "savings", "savings_percent"),
+                                        expected or (None, None, None, None)):
+                    self.assertEqual(aggregate[field], value, field)
+                by_id = {session["id"]: session for session in stats["sessions"]}
+                for index, (carry, traditional, invalid) in enumerate(entries, 1):
+                    estimate = by_id[f"{index:064x}"]["cost_estimate"]
+                    self.assert_estimate_available(estimate, invalid is None)
+                    if invalid is None:
+                        self.assertEqual(estimate["carry_cost"], carry)
+                        self.assertEqual(estimate["traditional_cost"], traditional)
+                        self.assertEqual(estimate["savings"], traditional - carry)
+                    self.assertIn("coverage", estimate)
+                    self.assertIn("traditional_compactions", estimate)
+                # GET-only projection cannot migrate/rewrite saved accounting.
+                self.assertEqual({path.name: path.read_bytes() for path in self.state.glob("*.json")},
+                                 checkpoint_bytes)
+        self.assertEqual(len(fixture.primaries), 1)
+        self.assertEqual(fixture.reviews, [])
+
+    def test_priced_subset_primary_omissions_and_restart(self):
+        self.evidence["cases"] = []
+        for variant in ("missing_usage", "unknown_model", "unknown_cache", "audio", "nonstandard"):
+            with self.subTest(variant=variant):
+                self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+
+                def primary(_body, n):
+                    value = completed(response_id=f"resp_{n}")
+                    if n == 2:
+                        if variant == "missing_usage":
+                            value.pop("usage")
+                        elif variant == "audio":
+                            value["usage"]["output_tokens_details"] = {"audio_tokens": 1}
+                        elif variant == "nonstandard":
+                            value["service_tier"] = "priority"
+                    return 200, value
+
+                fixture = self.fixture(primary)
+                options = ["--review-every-requests", "100"]
+                proxy = self.proxy(fixture, options)
+                seed = [{"role": "user", "content": "priced prefix " * 600}]
+                self.assertEqual(proxy.send(seed)[0], 200)
+                before = proxy.saved()["cost_trajectory"]["result"]
+                fields = {"model": "unknown-model" if variant == "unknown_model" else "gpt-6-astra"} if variant in ("unknown_model", "unknown_cache") else {}
+                self.assertEqual(proxy.send(seed, **fields)[0], 200)
+                omitted = proxy.saved()["cost_trajectory"]
+                proxy.close()
+                proxy = self.proxy(fixture, options)
+                self.assertEqual(proxy.send(seed)[0], 200)
+                stats = proxy.request("GET", "/carry/dashboard/stats")[1]
+                self.evidence["cases"].append({"variant": variant, "before": before,
+                                               "omitted": omitted, "stats": stats,
+                                               "checkpoint": proxy.saved()})
+                proxy.close()
+                fixture.close()
+                self.assertEqual(fixture.errors, [])
+                self.assertEqual(len(fixture.primaries), 3)
+                self.assertEqual(omitted["result"]["carry_cost"], before["carry_cost"], "omit both branches, never a partial pair")
+                self.assertEqual(omitted["result"]["traditional_cost"], before["traditional_cost"])
+                self.assertTrue(omitted["previous"] is None, "an omitted primary cannot preserve a stale cache predecessor")
+                estimate = stats["sessions"][0]["cost_estimate"]
+                self.assert_estimate_available(estimate, True, "unpriced calls must not hide priced comparisons")
+                self.assertEqual(estimate.get("excluded_unpriced_calls"), 1)
+                self.assertEqual(estimate.get("excluded_unpriced_reviewer_calls"), 0)
+                self.assertAlmostEqual(estimate["carry_cost"], 2 * before["carry_cost"], delta=1e-12,
+                                       msg="post-omission primary is cold, not a stale-prefix cache hit")
+                self.assertEqual(stats["cost_estimate"]["included_sessions"], 1)
+                self.assertEqual(stats["cost_estimate"]["excluded_unpriced_calls"], 1)
+
+    def test_priced_subset_all_unpriced_and_aggregate_counters(self):
+        def primary(_body, n):
+            value = completed(response_id=f"resp_{n}")
+            if n == 1:
+                value.pop("usage")
+            return 200, value
+
+        fixture = self.fixture(primary)
+        proxy = self.proxy(fixture, ["--review-every-requests", "100"])
+        seed = [{"role": "user", "content": "synthetic task"}]
+        self.assertEqual(proxy.send(seed)[0], 200)
+        unpriced = proxy.saved()
+        null_stats = proxy.request("GET", "/carry/dashboard/stats")[1]
+        self.assertEqual(proxy.send(seed)[0], 200)
+        partial = proxy.saved()
+        proxy.close()
+        # Actual producer snapshots plus unavailable/pending variants verify
+        # omission counts do not disappear when the monetary scope is excluded.
+        entries = [unpriced, partial, json.loads(json.dumps(partial)), json.loads(json.dumps(partial))]
+        entries[2]["background_review_pending"] = True
+        entries[3]["cost_trajectory"]["available"] = False
+        entries[3]["cost_trajectory"]["result"]["coverage"]["prior_untracked_calls"] = 1
+        self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        for n, saved in enumerate(entries, 1):
+            (self.state / f"{n:064x}.json").write_text(json.dumps(saved))
+        proxy = self.proxy(fixture, ["--background-reviews=true"])
+        stats = proxy.request("GET", "/carry/dashboard/stats")[1]
+        self.evidence.update(all_unpriced=null_stats, aggregate=stats, partial=partial)
+        estimate = null_stats["sessions"][0]["cost_estimate"]
+        self.assert_estimate_available(estimate, False, "all-unpriced must remain null, not zero")
+        self.assertEqual(estimate.get("excluded_unpriced_calls"), 1)
+        self.assertIsNone(null_stats["cost_estimate"]["carry_cost"])
+        aggregate = stats["cost_estimate"]
+        self.assertEqual(aggregate["included_sessions"], 1)
+        self.assertEqual(aggregate["excluded_sessions"], 3)
+        self.assertEqual(aggregate["excluded_unpriced_calls"], 4)
+        self.assertEqual(aggregate["excluded_unpriced_reviewer_calls"], 0)
+        self.assertEqual(aggregate["carry_cost"], partial["cost_trajectory"]["result"]["carry_cost"])
+        self.assertEqual(len(fixture.primaries), 2)
+        self.assertEqual(fixture.reviews, [])
+
     def test_successful_request_savings_after_failure_and_restart(self):
         fixture = self.fixture(lambda _body, n: (429, {"error": "fixture rate limit"})
                                if n == 2 else (200, completed(response_id=f"resp_{n}")))
@@ -285,7 +472,7 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(session["completed_requests"], 3)
         self.assertEqual(estimate["coverage"]["primary_responses"], 3)
         self.assertEqual(estimate["coverage"]["failed_calls"], 1)
-        self.assertTrue(estimate["priced"], "one failure must not hide later successful-request savings")
+        self.assert_estimate_available(estimate, True, "one failure must not hide later successful-request savings")
         self.assertEqual(estimate["traditional_compactions"], 1,
                          "the successful-only conventional scenario must keep advancing after a failure")
         self.assertGreater(estimate["summary_cost"], 0)
@@ -308,7 +495,7 @@ class StateRegressions(unittest.TestCase):
         saved["cost_trajectory"]["result"].pop("excluded_failed_calls", None)
         path.write_text(json.dumps(saved))
         proxy = self.proxy(fixture, options)
-        self.assertTrue(proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]["priced"])
+        self.assert_estimate_available(proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"], True)
         self.assertEqual(proxy.send(seed)[0], 429)
         proxy.close()
         proxy = self.proxy(fixture, options)
@@ -316,7 +503,7 @@ class StateRegressions(unittest.TestCase):
         session = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
         self.evidence.update(session=session, checkpoint=proxy.saved())
         estimate = session["cost_estimate"]
-        self.assertFalse(estimate["priced"], "legacy failures cannot be retroactively reinterpreted")
+        self.assert_estimate_available(estimate, False, "legacy failures cannot be retroactively reinterpreted")
         self.assertEqual(estimate["coverage"]["primary_responses"], 2)
         self.assertEqual(estimate["coverage"]["failed_calls"], 1)
         self.assertEqual(estimate.get("excluded_failed_calls", 0), 0)
@@ -366,7 +553,7 @@ class StateRegressions(unittest.TestCase):
                 estimate = session["cost_estimate"]
                 self.assertEqual(estimate["coverage"]["primary_responses"], 2)
                 self.assertEqual(estimate["coverage"]["failed_calls"], 1)
-                self.assertTrue(estimate["priced"], "failed primary terminal must not poison successful scenario")
+                self.assert_estimate_available(estimate, True, "failed primary terminal must not poison successful scenario")
                 self.assertEqual(estimate["excluded_failed_calls"], 1)
                 self.assertEqual(session["primary"]["calls"], 3)
                 self.assertEqual(session["primary"]["unavailable_cost_calls"],
@@ -423,10 +610,25 @@ class StateRegressions(unittest.TestCase):
                                      "failed reviewer terminal with usage is not a successful response")
                     self.assertEqual(estimate["coverage"]["failed_calls"], 1 if excluded else 0)
                     self.assertEqual(estimate["coverage"]["missing_usage"], 1 if terminal == "missing_usage" else 0)
-                    self.assertEqual(estimate["priced"], terminal != "missing_usage",
-                                     "exclude proven reviewer failures, not completed missing-usage spend")
-                    self.assertEqual(estimate["reviewer_cost"] > 0,
-                                     terminal in ("invalid_advice", "refusal"))
+                    self.assert_estimate_available(estimate, True,
+                                     "omit failed or unpriced reviewer calls without hiding priced primary pairs")
+                    aggregate = stats["cost_estimate"]
+                    self.assertEqual(aggregate["included_sessions"], 1)
+                    self.assertEqual(aggregate["excluded_sessions"], 0)
+                    self.assertEqual(estimate.get("excluded_unpriced_calls"), int(terminal == "missing_usage"))
+                    self.assertEqual(estimate.get("excluded_unpriced_reviewer_calls"), int(terminal == "missing_usage"))
+                    self.assertEqual(aggregate["excluded_unpriced_calls"], int(terminal == "missing_usage"))
+                    for field in ("carry_cost", "traditional_cost", "savings", "savings_percent"):
+                        if estimate[field] is None:
+                            self.assertIsNone(aggregate[field])
+                        else:
+                            self.assertAlmostEqual(aggregate[field], estimate[field], delta=1e-12,
+                                                   msg="real completed background reviewer spend belongs in backend totals")
+                    if terminal == "missing_usage":
+                        self.assertEqual(estimate["reviewer_cost"], 0, "known reviewer expense only; missing expense is separately counted")
+                    else:
+                        self.assertEqual(estimate["reviewer_cost"] > 0,
+                                         terminal in ("invalid_advice", "refusal"))
                     # Observed metering remains independent, including metered failures.
                     self.assertEqual(session["shadow"]["unavailable_cost_calls"],
                                      1 if terminal in ("transport", "http_error", "missing_usage") else 0)
@@ -472,7 +674,7 @@ class StateRegressions(unittest.TestCase):
                 self.assertEqual(estimate["coverage"]["primary_responses"], 2)
                 self.assertGreater(estimate["reviewer_cost"], 0)
                 self.assertEqual(estimate["reviewer_cost"], saved["cost_trajectory"]["result"]["reviewer_cost"])
-                self.assertTrue(estimate["priced"], "successful reviewer spend must survive a failed primary")
+                self.assert_estimate_available(estimate, True, "successful reviewer spend must survive a failed primary")
 
     def test_restart_orphan_reviewer_is_untracked_not_proven_failed(self):
         def review(_body, _n):
@@ -492,7 +694,7 @@ class StateRegressions(unittest.TestCase):
         self.assertTrue(fixture.held.wait(3))
         pending = proxy.saved()
         self.assertTrue(pending["background_review_pending"])
-        self.assertFalse(proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]["priced"])
+        self.assert_estimate_available(proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"], False)
         proxy.close()
         fixture.release.set()
         proxy = self.proxy(fixture, ["--review-every-requests", "100"])
@@ -500,7 +702,7 @@ class StateRegressions(unittest.TestCase):
         session = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
         self.evidence.update(pending=pending, session=session, checkpoint=proxy.saved())
         estimate = session["cost_estimate"]
-        self.assertFalse(estimate["priced"], "unobserved reviewer may have completed with spend")
+        self.assert_estimate_available(estimate, False, "unobserved reviewer may have completed with spend")
         self.assertEqual(estimate["coverage"]["prior_untracked_calls"], 1,
                          "restart orphan is censored, not a proven failed call")
         self.assertEqual(estimate["coverage"]["failed_calls"], 0)

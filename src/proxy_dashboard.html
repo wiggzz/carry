@@ -25,7 +25,7 @@
 <details><summary>Costs, coverage &amp; diagnostics</summary>
 <div class="cards" id="cost-cards"></div>
 <p id="assumptions"></p>
-<p><small>Savings compare the same recorded trajectory with a simulated conventional compaction policy, including completed reviewer costs. Where marked “successful requests only”, failed calls are excluded from both scenarios, including calls before later successes. Estimates with other missing data or irrecoverable legacy accounting remain excluded. They are estimates, not measured savings or subscription charges; the observed priced subtotal includes all available receipts.</small></p>
+<p><small>Savings compare the same recorded trajectory with a simulated conventional compaction policy, including completed reviewer costs. Where marked “successful requests only”, failed calls are excluded from both scenarios, including calls before later successes. The backend supplies session estimates and totals; unavailable comparisons have null amounts in the stats JSON and are excluded from totals. They are estimates, not measured savings or subscription charges; the observed priced subtotal includes all available receipts.</small></p>
 <div class="scroll"><table><thead><tr><th>Lane</th><th>Calls</th><th>Input tokens</th><th>Cached reads</th><th>Read share</th><th>Cache writes</th><th>Output tokens</th><th>API-equivalent cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
 </details>
 <p><small>Scope: this proxy's state directory only. Retained bytes are serialized input bytes, not token counts or measured savings. Session names show up to 80 characters from the first user message. Full messages, memory contents and credentials stay private. Roles are optional client-reported metadata; titles never determine roles. Histories without role metadata remain unclassified.</small></p>
@@ -40,7 +40,10 @@ const expandedGroups=new Map();
 const $=id=>document.getElementById(id);
 const fmt=n=>Number(n).toLocaleString();
 const sum=(xs,key)=>xs.reduce((a,x)=>a+(Number(x?.[key])||0),0);
-const money=n=>'$'+Number(n).toFixed(6);
+const money=n=>n==null?'Unavailable':'$'+Number(n).toFixed(6);
+const savingsText=e=>e?.savings==null?'Unavailable':money(e.savings)+(e.savings_percent!=null?' ('+Number(e.savings_percent).toFixed(1)+'%)':'');
+const unpricedText=e=>fmt(e?.excluded_unpriced_calls||0)+(e?.excluded_unpriced_reviewer_calls?' ('+fmt(e.excluded_unpriced_reviewer_calls)+' reviewer-only)':'');
+const unpricedNote=e=>e?.excluded_unpriced_calls?' Priced calls only: '+fmt(e.excluded_unpriced_calls)+' unpriced calls excluded'+(e.excluded_unpriced_reviewer_calls?' ('+fmt(e.excluded_unpriced_reviewer_calls)+' reviewer-only)':'')+'; amounts and percentages are approximate.':'';
 const compact=n=>Number(n)>=1000?(Number(n)/1000).toLocaleString(undefined,{maximumFractionDigits:1})+'k':fmt(Math.ceil(Number(n)));
 const backgroundTypes=new Set(['background']);
 const sourceNames={conversation:'Conversation',agent:'Agent',background:'Client background request'};
@@ -61,27 +64,24 @@ async function refresh(){
   const primary=sessions.map(s=>s.primary),shadow=sessions.map(s=>s.shadow);
   const unavailable=sum(primary,'unavailable_cost_calls')+sum(shadow,'unavailable_cost_calls')+data.unavailable_sessions;
   const subtotal=sum(primary,'cost_usd')+sum(shadow,'cost_usd');
-  const estimates=sessions.map(s=>s.cost_estimate).filter(e=>e?.priced);
-  const hasEstimates=estimates.length>0;
-  const totalSessions=sessions.length+data.unavailable_sessions;
-  const excludedFailed=sum(estimates,'excluded_failed_calls');
-  $('estimate-coverage').textContent='Includes '+fmt(estimates.length)+' of '+fmt(totalSessions)+' sessions; '+fmt(totalSessions-estimates.length)+' excluded because comparable estimates are unavailable.'+(excludedFailed?' Successful requests only: '+fmt(excludedFailed)+' failed calls excluded.':'')+' Totals include conversation histories and client background requests.';
-  const carryScenario=sum(estimates,'carry_cost'),traditionalScenario=sum(estimates,'traditional_cost');
-  const saving=traditionalScenario-carryScenario;
-  const savingText=money(saving)+(traditionalScenario>0?' ('+(100*saving/traditionalScenario).toFixed(1)+'%)':'');
+  const estimate=data.cost_estimate||{};
+  const included=estimate.included_sessions||0,excluded=estimate.excluded_sessions||0;
+  const excludedFailed=estimate.excluded_failed_calls||0;
+  $('estimate-coverage').textContent='Includes '+fmt(included)+' of '+fmt(included+excluded)+' sessions; '+fmt(excluded)+' excluded because comparable estimates are unavailable.'+(excludedFailed?' Successful requests only: '+fmt(excludedFailed)+' failed calls excluded.':'')+unpricedNote(estimate)+' Totals include conversation histories and client background requests.';
   const scenario=data.cost_scenario;
   $('assumptions').textContent=scenario?'Traditional scenario: '+fmt(scenario.context_window)+'-token assumed window, '+fmt(scenario.reserve)+' reserve; after each completed non-tool response crossing the threshold, keep '+fmt(scenario.keep_recent)+' recent tokens plus a '+fmt(scenario.summary)+'-token summary. Cache assumes same route/key, append-compatible prefixes and 30-minute expiry; reviewer inputs priced uncached.':'';
   const recent=sessions.filter(s=>s.updated_at && Date.now()/1000-s.updated_at<300).length;
   $('cards').replaceChildren(...[
-   ['Estimated savings · all time',hasEstimates?savingText:'Not enough data'],
+   ['Estimated savings · all time',savingsText(estimate)],
    ['Recently active histories',fmt(recent)],
    ['Completed requests',fmt(sum(sessions,'completed_requests'))]
   ].map(([label,value])=>card(label,value)));
   $('cost-cards').replaceChildren(...[
    ['API-equivalent total',unavailable?'Incomplete':money(subtotal)],
    ['Observed priced subtotal',money(subtotal)],
-   ['Carry scenario',hasEstimates?money(carryScenario):'No eligible sessions'],
-   ['Traditional scenario',hasEstimates?money(traditionalScenario):'No eligible sessions']
+   ['Unpriced calls excluded',unpricedText(estimate)],
+   ['Carry scenario',money(estimate.carry_cost)],
+   ['Traditional scenario',money(estimate.traditional_cost)]
   ].map(([label,value])=>card(label,value)));
   $('usage').replaceChildren(...[['Primary',primary],['Reviewer',shadow]].map(([name,ledgers])=>{
    const input=sum(ledgers,'input_tokens'),cached=sum(ledgers,'cached_tokens'),missing=sum(ledgers,'unavailable_cost_calls');
@@ -90,11 +90,12 @@ async function refresh(){
   const sorted=[...sessions].sort((a,b)=>(b.updated_at||0)-(a.updated_at||0));
   const renderSession=(s,grouped=false)=>{
    const e=s.cost_estimate;
-   const savings=e?.priced?money(e.savings)+(e.savings_percent!==null?' ('+e.savings_percent.toFixed(1)+'%)':'')+(e.excluded_failed_calls?' · successful requests only ('+fmt(e.excluded_failed_calls)+' failed calls excluded)':''):'Incomplete';
+   const savings=savingsText(e)+(e?.savings!=null&&e.excluded_failed_calls?' · successful requests only ('+fmt(e.excluded_failed_calls)+' failed calls excluded)':'')+(e?.savings!=null?unpricedNote(e):'');
    const issues=[];
+   if(e?.savings==null&&e?.excluded_unpriced_calls)issues.push(unpricedNote(e).trim());
    const unknown=[...new Set([...(s.primary.unpriced_models||[]),...(s.shadow.unpriced_models||[])])];
    if(unknown.length)issues.push('No rate: '+unknown.join(', '));
-   if(!e?.priced){
+   if(e?.savings==null){
     const coverage=e?.coverage||{};
     if(coverage.failed_calls)issues.push('Savings exclude this session: interrupted or failed call');
     else if(coverage.unknown_cache_requests)issues.push('Savings exclude this session: unknown model or cache behavior');
