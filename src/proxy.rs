@@ -2250,10 +2250,23 @@ fn merge_review(
         .saturating_sub(before.reviewer_compactions);
     current.review_epoch = reviewed.review_epoch;
     current.last_review_request = reviewed.last_review_request;
+    // Snapshot validity is insufficient: current-budget revalidation can reject
+    // every accepted memory. Only committed valid advice may cover sources or
+    // update no-yield backoff; valid-empty and partially accepted batches count.
+    let committed_valid = run.valid_admission
+        && (current.review_feedback["rejected_count"] == 0
+            || current.review_feedback["accepted_opinions"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+            || current.review_feedback["accepted_memories"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0);
     admission::complete(
         &before_admission,
         current,
-        run.valid_admission,
+        committed_valid,
         &run.successful_sources,
     );
     true
