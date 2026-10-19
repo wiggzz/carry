@@ -325,8 +325,7 @@ impl Trajectory {
             return;
         }
         self.result.coverage.primary_responses += 1;
-        let (Some(prompt), Some(out)) =
-            (projection(body, route, at), response["output"].as_array())
+        let (Some(prompt), Some(_)) = (projection(body, route, at), response["output"].as_array())
         else {
             // Without a structural projection, omit the entire matched pair
             // before touching money and restart cache/summary assumptions.
@@ -400,14 +399,10 @@ impl Trajectory {
         });
         // Advance the conventional text scenario even when usage/rates are
         // missing. Opaque modalities instead reset the structural epoch above.
-        let tool_turn = out.iter().any(|item| {
-            item["type"]
-                .as_str()
-                .is_some_and(|ty| ty.ends_with("_call"))
-        });
+        // Every completed request is a summary opportunity, including tool calls.
+        // Waiting for an agent turn to finish can overshoot the scenario window.
         let total = traditional_input.saturating_add(token_units(&response["output"]));
-        let summarize = !tool_turn
-            && self.available
+        let summarize = self.available
             && self.scenario.valid()
             && total > self.scenario.context_window - self.scenario.reserve;
         let discarded = total.saturating_sub(self.scenario.keep_recent);

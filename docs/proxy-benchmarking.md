@@ -617,8 +617,14 @@ shown as a loss, not clamped to zero, and percentages use traditional scenario
 cost as the denominator—not actual provider spend.
 
 Assumptions are displayed: 272,000-token window, 16,384 reserve, 20,000 recent
-tokens retained and a 1,000-token summary, checked after completed non-tool
-responses. Cache reuse assumes matching route/key/settings, append-compatible
+tokens retained and a 1,000-token summary. The conventional scenario checks after
+every completed primary response, including tool calls: local input plus output
+above 255,616 units triggers a summary before the next request. It does not wait
+for an agent turn to end. This is not a hard provider-token cap: the first
+observed prompt or one large input/output increment can already exceed the
+threshold. The simulated summary never changes real Carry requests, and an
+upgrade does not replay or repair accumulated historical estimates.
+Cache reuse assumes matching route/key/settings, append-compatible
 prefixes and a 30-minute expiry; the restored branch's literal prefix after a
 Carry edit is unknown, so its frozen-size reuse is conditional. These are not
 reconstructed client/provider compaction or cache guarantees. Summaries could

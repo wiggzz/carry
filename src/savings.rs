@@ -314,8 +314,7 @@ impl Trajectory {
                 } else {
                     self.scenario_available = false;
                 }
-            }
-            "turn_finished" | "run_finished" => {
+                // Check after each response, not just after the whole agent run.
                 let total = self.last_pi_input.saturating_add(self.last_output_proxy);
                 if self.scenario_available
                     && self.scenario.valid()
@@ -348,6 +347,8 @@ impl Trajectory {
                     }
                 }
             }
+            // Completion notifications must not charge the last summary twice.
+            "turn_finished" | "run_finished" => {}
             _ => return None,
         }
         Some(self.snapshot())
