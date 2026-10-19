@@ -3531,6 +3531,7 @@ mod tests {
     mod admission_tests {
         include!("proxy_admission_tests.rs");
         include!("proxy_admission_controls.rs");
+        include!("proxy_admission_merge_tests.rs");
     }
 
     #[test]
