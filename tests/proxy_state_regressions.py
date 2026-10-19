@@ -265,6 +265,34 @@ class StateRegressions(unittest.TestCase):
         if not available:
             self.assertIsNone(estimate["savings_percent"], message)
 
+    def test_reviewer_control_observations_once_and_restart(self):
+        fixture = self.fixture(lambda _body, _n: (200, completed()))
+        options = ["--min-payback-percent", "100"]
+        proxy = self.proxy(fixture, options)
+        history = [{"role": "user", "content": "fixture goal"},
+                   {"role": "assistant", "content": "source once " + "s" * 8192},
+                   {"role": "user", "content": "continue"}]
+        instruction = "UNIQUE_DIRECTION_" + "d" * 32768
+        for n in range(5):
+            if n == 3:
+                proxy.close()
+                proxy = self.proxy(fixture, options)
+            self.assertEqual(proxy.send(history, instructions=instruction)[0], 200)
+        self.assertEqual(len(fixture.reviews), 4)
+        body = fixture.reviews[-1]
+        self.assertEqual(wire(body).count(b"UNIQUE_DIRECTION_"), 1,
+                         "unchanged primary instructions must be ingested once, not per ledger")
+        for before, after in zip(fixture.reviews, fixture.reviews[1:]):
+            self.assertEqual(after["input"][:len(before["input"])], before["input"],
+                             "dedup must not replace historical ledgers in place")
+        self.assertEqual(proxy.saved()["reviewer_compactions"], 0)
+        self.assertEqual(proxy.send(history, instructions="NEW_DIRECTION")[0], 200)
+        self.assertEqual(wire(fixture.reviews[-1]).count(b"NEW_DIRECTION"), 1)
+        self.assertEqual(proxy.send(history, instructions="")[0], 200)
+        current = ledger(fixture.reviews[-1])
+        self.assertEqual(current["primary_instruction_version"], 3)
+        self.assertNotIn("quoted_primary_instructions", current)
+
     def test_dashboard_backend_authoritative_savings(self):
         fixture = self.fixture(lambda _body, _n: (200, completed()))
         proxy = self.proxy(fixture, ["--review-every-requests", "100"])

@@ -59,6 +59,11 @@ fn state_regression(selector: &str) {
 }
 
 #[test]
+fn reviewer_control_observations_once_and_restart() {
+    state_regression("reviewer_control_observations_once_and_restart");
+}
+
+#[test]
 fn dashboard_backend_authoritative_savings() {
     state_regression("dashboard_backend_authoritative_savings");
 }
