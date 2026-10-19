@@ -94,7 +94,9 @@ def contract_proxy(test, provider, state_dir, mode='audit', binary=None, classif
 def contract_send(url, body):
     request = urllib.request.Request(url + '/v1/responses', data=json.dumps(body).encode(),
         headers={'content-type': 'application/json', 'x-carry-session': 'contract'})
-    with urllib.request.urlopen(request, timeout=5) as response:
+    # Full debug-binary admission/planner/journal work can exceed five seconds
+    # on a shared hosted runner. Keep a finite end-to-end deadline.
+    with urllib.request.urlopen(request, timeout=30) as response:
         return json.load(response)
 
 
@@ -673,6 +675,11 @@ class NativeProviderFixtureTests(unittest.TestCase):
                        XDG_CONFIG_HOME=str(home / '.config'),
                        CARRY_PROXY_UPSTREAM_KEY='synthetic-fixture-key',
                        CARRY_PROXY_CLASSIFIER_KEY='synthetic-fixture-key')
+            # This protocol test needs a review on its tiny second request.
+            env.update(CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS='0',
+                       CARRY_PROXY_REVIEW_MIN_NEW_TOKENS='0',
+                       CARRY_PROXY_REVIEW_BACKOFF_FACTOR='1',
+                       CARRY_PROXY_REVIEW_EVERY_REQUESTS='1')
             command = [str(binary), 'proxy', '--verbose', '--listen', '127.0.0.1:0',
                        '--upstream-url', fixture.url + '/v1/responses',
                        '--classifier-url', fixture.url + '/classifier',
