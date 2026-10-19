@@ -54,8 +54,9 @@ pub struct DashboardEstimate {
 }
 
 impl Estimate {
-    pub fn dashboard(self, pending: bool) -> DashboardEstimate {
-        let available = self.priced && !pending;
+    pub fn dashboard(self) -> DashboardEstimate {
+        // Completed observations remain comparable while new work is in flight.
+        let available = self.priced;
         DashboardEstimate {
             carry_cost: available.then_some(self.carry_cost),
             traditional_cost: available.then_some(self.traditional_cost),
@@ -87,7 +88,7 @@ pub struct DashboardTotals {
 
 impl DashboardTotals {
     pub fn observe(&mut self, estimate: &DashboardEstimate) {
-        // Diagnostics cover all sessions, even pending/ineligible comparisons.
+        // Diagnostics cover all sessions, even ineligible comparisons.
         self.excluded_unpriced_calls += estimate.excluded_unpriced_calls;
         self.excluded_unpriced_reviewer_calls += estimate.excluded_unpriced_reviewer_calls;
         let (Some(carry), Some(traditional)) = (estimate.carry_cost, estimate.traditional_cost)
@@ -545,7 +546,7 @@ mod tests {
                 partial.traditional_cost, before.traditional_cost,
                 "{variant}: no half-pair traditional charge"
             );
-            let public = serde_json::to_value(partial.dashboard(false)).unwrap();
+            let public = serde_json::to_value(partial.dashboard()).unwrap();
             assert_eq!(public["excluded_unpriced_calls"], 1, "{variant}");
             assert_eq!(public["excluded_unpriced_reviewer_calls"], 0);
             assert!(
@@ -596,7 +597,7 @@ mod tests {
             }
             trajectory.primary(&body, &terminal, "route", 100, true);
             trajectory.reviewer(&request("known review"), &response(100), true);
-            let public = serde_json::to_value(trajectory.snapshot().dashboard(false)).unwrap();
+            let public = serde_json::to_value(trajectory.snapshot().dashboard()).unwrap();
             assert!(
                 public["carry_cost"].is_null(),
                 "{variant}: no comparable primary, not a false zero"
@@ -615,7 +616,7 @@ mod tests {
         trajectory.reviewer_usage("gpt-6-luna", 100, &Value::Null, true);
         let after = serde_json::to_value(&trajectory).unwrap();
         assert_eq!(after["previous"], before["previous"]);
-        let public = serde_json::to_value(trajectory.snapshot().dashboard(false)).unwrap();
+        let public = serde_json::to_value(trajectory.snapshot().dashboard()).unwrap();
         assert_eq!(public["excluded_unpriced_calls"], 2);
         assert_eq!(public["excluded_unpriced_reviewer_calls"], 2);
         assert_eq!(public["reviewer_cost"], before["result"]["reviewer_cost"]);
@@ -629,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_completed_observations_survive_pending_review() {
+    fn dashboard_preserves_completed_amounts_and_unavailable_controls() {
         for savings in [0.0, -2.0, 2.0] {
             let estimate = Estimate {
                 priced: true,
@@ -642,18 +643,20 @@ mod tests {
                 excluded_unpriced_reviewer_calls: 1,
                 ..Estimate::default()
             };
-            let completed = serde_json::to_value(estimate.clone().dashboard(false)).unwrap();
-            let pending = serde_json::to_value(estimate.dashboard(true)).unwrap();
-            assert_eq!(pending, completed, "pending work is not a recorded expense");
-            assert_eq!(pending["savings"], savings);
-            assert_eq!(pending["reviewer_cost"], 1.0);
+            let completed = serde_json::to_value(estimate.dashboard()).unwrap();
+            assert_eq!(completed["savings"], savings);
+            assert_eq!(completed["carry_cost"], 4.0);
+            assert_eq!(completed["traditional_cost"], 4.0 + savings);
+            assert_eq!(completed["reviewer_cost"], 1.0);
+            assert_eq!(completed["excluded_unpriced_calls"], 2);
+            assert_eq!(completed["excluded_unpriced_reviewer_calls"], 1);
         }
         let empty = Trajectory::default();
         let mut untracked = Trajectory::default();
         untracked.primary(&request("task"), &response(100), "route", 100, true);
         untracked.prior_untracked(1);
         for trajectory in [empty, untracked] {
-            let pending = serde_json::to_value(trajectory.snapshot().dashboard(true)).unwrap();
+            let pending = serde_json::to_value(trajectory.snapshot().dashboard()).unwrap();
             assert!(
                 pending["savings"].is_null(),
                 "unknown observations stay unavailable"
@@ -662,15 +665,15 @@ mod tests {
     }
 
     #[test]
-    fn priced_subset_counters_aggregate_even_when_pending_or_ineligible() {
+    fn priced_subset_counters_aggregate_even_when_ineligible() {
         let mut trajectory = Trajectory::default();
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
         trajectory.reviewer_usage("unknown-model", 100, &response(100)["usage"], true);
         let mut totals = DashboardTotals::default();
-        totals.observe(&trajectory.snapshot().dashboard(false));
-        totals.observe(&trajectory.snapshot().dashboard(true));
+        totals.observe(&trajectory.snapshot().dashboard());
+        totals.observe(&trajectory.snapshot().dashboard());
         trajectory.prior_untracked(1);
-        totals.observe(&trajectory.snapshot().dashboard(false));
+        totals.observe(&trajectory.snapshot().dashboard());
         let public = serde_json::to_value(totals).unwrap();
         assert_eq!(public["included_sessions"], 2);
         assert_eq!(public["excluded_sessions"], 1);
@@ -788,7 +791,7 @@ mod tests {
             !resumed.snapshot().priced,
             "old accounting may have skipped conventional summaries; never flip available"
         );
-        let public = serde_json::to_value(resumed.snapshot().dashboard(false)).unwrap();
+        let public = serde_json::to_value(resumed.snapshot().dashboard()).unwrap();
         assert_eq!(
             public["excluded_unpriced_calls"], 1,
             "historical omissions stay visible even when sums cannot be repaired"
@@ -840,7 +843,7 @@ mod tests {
                 .unwrap()
                 .remove("excluded_unpriced_reviewer_calls");
             let mut legacy: Trajectory = serde_json::from_value(checkpoint).unwrap();
-            let projected = serde_json::to_value(legacy.snapshot().dashboard(false)).unwrap();
+            let projected = serde_json::to_value(legacy.snapshot().dashboard()).unwrap();
             assert_eq!(projected["excluded_unpriced_calls"], expected);
             assert_eq!(projected["excluded_unpriced_reviewer_calls"], 0);
             assert!(projected["carry_cost"].is_null());
@@ -863,7 +866,7 @@ mod tests {
             );
             let restarted: Trajectory =
                 serde_json::from_value(serde_json::to_value(resumed).unwrap()).unwrap();
-            let dashboard = restarted.snapshot().dashboard(false);
+            let dashboard = restarted.snapshot().dashboard();
             let public = serde_json::to_value(&dashboard).unwrap();
             assert_eq!(public["excluded_unpriced_calls"], expected + 1);
             assert_eq!(public["excluded_unpriced_reviewer_calls"], 0);
@@ -878,7 +881,7 @@ mod tests {
                 true,
             );
             let mut totals = DashboardTotals::default();
-            totals.observe(&clean.snapshot().dashboard(false));
+            totals.observe(&clean.snapshot().dashboard());
             totals.observe(&dashboard);
             let aggregate = serde_json::to_value(totals).unwrap();
             assert_eq!(aggregate["excluded_unpriced_calls"], expected + 1);
@@ -934,7 +937,7 @@ mod tests {
             invalid.carry_cost > 0.0,
             "invalid checkpoints retain internal accounting"
         );
-        let dashboard = serde_json::to_value(invalid.dashboard(false)).unwrap();
+        let dashboard = serde_json::to_value(invalid.dashboard()).unwrap();
         for field in [
             "carry_cost",
             "traditional_cost",
@@ -969,7 +972,7 @@ mod tests {
                 excluded_failed_calls: 1,
                 ..Estimate::default()
             }
-            .dashboard(false);
+            .dashboard();
             totals.observe(&estimate);
             assert_eq!(totals.savings, Some(expected_savings));
             assert!((totals.savings_percent.unwrap() - expected_percent).abs() < 1e-12);
@@ -1000,7 +1003,7 @@ mod tests {
             priced: true,
             ..Estimate::default()
         }
-        .dashboard(false);
+        .dashboard();
         let public = serde_json::to_value(&estimate).unwrap();
         for field in [
             "carry_cost",

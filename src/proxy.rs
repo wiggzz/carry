@@ -688,7 +688,7 @@ async fn dashboard_stats(
             .as_ref()
             .map(|t| t.snapshot())
             .unwrap_or_default()
-            .dashboard(session.background_review_pending);
+            .dashboard();
         cost_estimate.observe(&estimate);
         let updated_at = entry
             .metadata()

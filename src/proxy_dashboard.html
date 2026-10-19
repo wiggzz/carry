@@ -67,7 +67,7 @@ async function refresh(){
   const estimate=data.cost_estimate||{};
   const included=estimate.included_sessions||0,excluded=estimate.excluded_sessions||0;
   const excludedFailed=estimate.excluded_failed_calls||0;
-  $('estimate-coverage').textContent='Includes '+fmt(included)+' of '+fmt(included+excluded)+' sessions; '+fmt(excluded)+' excluded because comparable estimates are unavailable.'+(excludedFailed?' Successful requests only: '+fmt(excludedFailed)+' failed calls excluded.':'')+unpricedNote(estimate)+' Totals include conversation histories and client background requests.';
+  $('estimate-coverage').textContent='Includes '+fmt(included)+' of '+fmt(included+excluded)+' sessions; '+fmt(excluded)+' excluded because comparable estimates are unavailable.'+(excludedFailed?' Successful requests only: '+fmt(excludedFailed)+' failed calls excluded.':'')+unpricedNote(estimate)+(sessions.some(s=>s.background_review_pending)?' Completed calls only; in-flight reviewer cost excluded.':'')+' Totals include conversation histories and client background requests.';
   const scenario=data.cost_scenario;
   $('assumptions').textContent=scenario?'Traditional scenario: '+fmt(scenario.context_window)+'-token assumed window, '+fmt(scenario.reserve)+' reserve; after each completed non-tool response crossing the threshold, keep '+fmt(scenario.keep_recent)+' recent tokens plus a '+fmt(scenario.summary)+'-token summary. Cache assumes same route/key, append-compatible prefixes and 30-minute expiry; reviewer inputs priced uncached.':'';
   const recent=sessions.filter(s=>s.updated_at && Date.now()/1000-s.updated_at<300).length;
@@ -101,9 +101,9 @@ async function refresh(){
     else if(coverage.unknown_cache_requests)issues.push('Savings exclude this session: unknown model or cache behavior');
     else if(coverage.missing_usage)issues.push('Savings exclude this session: missing usage');
     else if(coverage.prior_untracked_calls)issues.push('Savings exclude this session: earlier calls were not tracked');
-    else if(s.background_review_pending)issues.push('Savings pending reviewer completion');
     else issues.push('Savings estimate incomplete');
    }
+   if(s.background_review_pending)issues.push('Completed calls only; in-flight reviewer cost excluded');
    const missing=(s.primary.unavailable_cost_calls||0)+(s.shadow.unavailable_cost_calls||0);
    if(missing)issues.push(fmt(missing)+' unpriced calls');
    if(s.failed_primaries)issues.push(fmt(s.failed_primaries)+' incomplete requests'+(s.last_failure?' · '+s.last_failure.reason:' (cancellation or failure; older details unavailable)'));
