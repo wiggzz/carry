@@ -288,6 +288,8 @@ paid reviews and batch low-yield histories, but may delay useful advice. Fewer
 reviews do not establish lower whole-session cost or maintained task quality.
 Batching does not guarantee an 80–95% cache-hit ratio or any savings: removing cold
 calls can change the denominator, and longer backoff can expire provider caches.
+Fewer reviews send fewer repeated mutable-ledger copies; this scheduling change
+does not alter instruction versioning, reviewer prefixes or cache-key handling.
 Evaluate native cached/input counts, total reviewer expense, whole-session cost
 and task quality together before promoting a treatment. Small protocol fixtures
 explicitly select the legacy policy so they continue exercising review behavior;

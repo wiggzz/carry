@@ -5005,6 +5005,14 @@ mod tests {
     fn actual_paired_rendering_and_separate_cache_evidence_can_veto_main_savings() {
         let config = ProxyCli::try_parse_from([
             "carry proxy",
+            "--review-min-primary-tokens",
+            "0",
+            "--review-min-new-tokens",
+            "0",
+            "--review-every-requests",
+            "1",
+            "--review-backoff-factor",
+            "1",
             "--mode",
             "compact",
             "--classifier-model",

@@ -87,7 +87,8 @@ async fn admission_effective_env_policy_cli_precedence_and_actual_forwarding() {
     }
     let metrics: serde_json::Value = reqwest::Client::new()
         .get(format!("{url}/carry/metrics"))
-        .header("x-carry-session", "adaptive-native")
+        .header("x-carry-tenant", "adaptive-native")
+        .header("x-carry-session", "session")
         .header("x-carry-branch", "main")
         .send()
         .await
