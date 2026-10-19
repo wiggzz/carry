@@ -349,6 +349,96 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(len(fixture.primaries), 1)
         self.assertEqual(fixture.reviews, [])
 
+    def test_priced_subset_primary_omissions_and_restart(self):
+        self.evidence["cases"] = []
+        for variant in ("missing_usage", "unknown_model", "unknown_cache", "audio", "nonstandard"):
+            with self.subTest(variant=variant):
+                self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+
+                def primary(_body, n):
+                    value = completed(response_id=f"resp_{n}")
+                    if n == 2:
+                        if variant == "missing_usage":
+                            value.pop("usage")
+                        elif variant == "audio":
+                            value["usage"]["output_tokens_details"] = {"audio_tokens": 1}
+                        elif variant == "nonstandard":
+                            value["service_tier"] = "priority"
+                    return 200, value
+
+                fixture = self.fixture(primary)
+                options = ["--review-every-requests", "100"]
+                proxy = self.proxy(fixture, options)
+                seed = [{"role": "user", "content": "priced prefix " * 600}]
+                self.assertEqual(proxy.send(seed)[0], 200)
+                before = proxy.saved()["cost_trajectory"]["result"]
+                fields = {"model": "unknown-model" if variant == "unknown_model" else "gpt-6-astra"} if variant in ("unknown_model", "unknown_cache") else {}
+                self.assertEqual(proxy.send(seed, **fields)[0], 200)
+                omitted = proxy.saved()["cost_trajectory"]
+                proxy.close()
+                proxy = self.proxy(fixture, options)
+                self.assertEqual(proxy.send(seed)[0], 200)
+                stats = proxy.request("GET", "/carry/dashboard/stats")[1]
+                self.evidence["cases"].append({"variant": variant, "before": before,
+                                               "omitted": omitted, "stats": stats,
+                                               "checkpoint": proxy.saved()})
+                proxy.close()
+                fixture.close()
+                self.assertEqual(fixture.errors, [])
+                self.assertEqual(len(fixture.primaries), 3)
+                self.assertEqual(omitted["result"]["carry_cost"], before["carry_cost"], "omit both branches, never a partial pair")
+                self.assertEqual(omitted["result"]["traditional_cost"], before["traditional_cost"])
+                self.assertTrue(omitted["previous"] is None, "an omitted primary cannot preserve a stale cache predecessor")
+                estimate = stats["sessions"][0]["cost_estimate"]
+                self.assert_estimate_available(estimate, True, "unpriced calls must not hide priced comparisons")
+                self.assertEqual(estimate.get("excluded_unpriced_calls"), 1)
+                self.assertEqual(estimate.get("excluded_unpriced_reviewer_calls"), 0)
+                self.assertAlmostEqual(estimate["carry_cost"], 2 * before["carry_cost"], delta=1e-12,
+                                       msg="post-omission primary is cold, not a stale-prefix cache hit")
+                self.assertEqual(stats["cost_estimate"]["included_sessions"], 1)
+                self.assertEqual(stats["cost_estimate"]["excluded_unpriced_calls"], 1)
+
+    def test_priced_subset_all_unpriced_and_aggregate_counters(self):
+        def primary(_body, n):
+            value = completed(response_id=f"resp_{n}")
+            if n == 1:
+                value.pop("usage")
+            return 200, value
+
+        fixture = self.fixture(primary)
+        proxy = self.proxy(fixture, ["--review-every-requests", "100"])
+        seed = [{"role": "user", "content": "synthetic task"}]
+        self.assertEqual(proxy.send(seed)[0], 200)
+        unpriced = proxy.saved()
+        null_stats = proxy.request("GET", "/carry/dashboard/stats")[1]
+        self.assertEqual(proxy.send(seed)[0], 200)
+        partial = proxy.saved()
+        proxy.close()
+        # Actual producer snapshots plus unavailable/pending variants verify
+        # omission counts do not disappear when the monetary scope is excluded.
+        entries = [unpriced, partial, json.loads(json.dumps(partial)), json.loads(json.dumps(partial))]
+        entries[2]["background_review_pending"] = True
+        entries[3]["cost_trajectory"]["available"] = False
+        entries[3]["cost_trajectory"]["result"]["coverage"]["prior_untracked_calls"] = 1
+        self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        for n, saved in enumerate(entries, 1):
+            (self.state / f"{n:064x}.json").write_text(json.dumps(saved))
+        proxy = self.proxy(fixture, ["--background-reviews=true"])
+        stats = proxy.request("GET", "/carry/dashboard/stats")[1]
+        self.evidence.update(all_unpriced=null_stats, aggregate=stats, partial=partial)
+        estimate = null_stats["sessions"][0]["cost_estimate"]
+        self.assert_estimate_available(estimate, False, "all-unpriced must remain null, not zero")
+        self.assertEqual(estimate.get("excluded_unpriced_calls"), 1)
+        self.assertIsNone(null_stats["cost_estimate"]["carry_cost"])
+        aggregate = stats["cost_estimate"]
+        self.assertEqual(aggregate["included_sessions"], 1)
+        self.assertEqual(aggregate["excluded_sessions"], 3)
+        self.assertEqual(aggregate["excluded_unpriced_calls"], 4)
+        self.assertEqual(aggregate["excluded_unpriced_reviewer_calls"], 0)
+        self.assertEqual(aggregate["carry_cost"], partial["cost_trajectory"]["result"]["carry_cost"])
+        self.assertEqual(len(fixture.primaries), 2)
+        self.assertEqual(fixture.reviews, [])
+
     def test_successful_request_savings_after_failure_and_restart(self):
         fixture = self.fixture(lambda _body, n: (429, {"error": "fixture rate limit"})
                                if n == 2 else (200, completed(response_id=f"resp_{n}")))
@@ -517,11 +607,14 @@ class StateRegressions(unittest.TestCase):
                                      "failed reviewer terminal with usage is not a successful response")
                     self.assertEqual(estimate["coverage"]["failed_calls"], 1 if excluded else 0)
                     self.assertEqual(estimate["coverage"]["missing_usage"], 1 if terminal == "missing_usage" else 0)
-                    self.assert_estimate_available(estimate, terminal != "missing_usage",
-                                     "exclude proven reviewer failures, not completed missing-usage spend")
+                    self.assert_estimate_available(estimate, True,
+                                     "omit failed or unpriced reviewer calls without hiding priced primary pairs")
                     aggregate = stats["cost_estimate"]
-                    self.assertEqual(aggregate["included_sessions"], int(terminal != "missing_usage"))
-                    self.assertEqual(aggregate["excluded_sessions"], int(terminal == "missing_usage"))
+                    self.assertEqual(aggregate["included_sessions"], 1)
+                    self.assertEqual(aggregate["excluded_sessions"], 0)
+                    self.assertEqual(estimate["excluded_unpriced_calls"], int(terminal == "missing_usage"))
+                    self.assertEqual(estimate["excluded_unpriced_reviewer_calls"], int(terminal == "missing_usage"))
+                    self.assertEqual(aggregate["excluded_unpriced_calls"], int(terminal == "missing_usage"))
                     for field in ("carry_cost", "traditional_cost", "savings", "savings_percent"):
                         if estimate[field] is None:
                             self.assertIsNone(aggregate[field])
@@ -529,7 +622,7 @@ class StateRegressions(unittest.TestCase):
                             self.assertAlmostEqual(aggregate[field], estimate[field], delta=1e-12,
                                                    msg="real completed background reviewer spend belongs in backend totals")
                     if terminal == "missing_usage":
-                        self.assertIsNone(estimate["reviewer_cost"])
+                        self.assertEqual(estimate["reviewer_cost"], 0, "known reviewer expense only; missing expense is separately counted")
                     else:
                         self.assertEqual(estimate["reviewer_cost"] > 0,
                                          terminal in ("invalid_advice", "refusal"))

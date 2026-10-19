@@ -64,6 +64,16 @@ fn dashboard_backend_authoritative_savings() {
 }
 
 #[test]
+fn priced_subset_primary_omissions_and_restart() {
+    state_regression("priced_subset_primary_omissions_and_restart");
+}
+
+#[test]
+fn priced_subset_all_unpriced_and_aggregate_counters() {
+    state_regression("priced_subset_all_unpriced_and_aggregate_counters");
+}
+
+#[test]
 fn successful_request_savings_after_failure_and_restart() {
     state_regression("successful_request_savings_after_failure_and_restart");
 }
