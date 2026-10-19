@@ -628,7 +628,15 @@ async fn dashboard_stats(
             unavailable_sessions += 1;
             continue;
         }
-        let Ok(session) = load(&service, id) else {
+        // Registration precedes the pending checkpoint; completion saves its
+        // receipt before unregistering. Hold the registry across the atomic-file
+        // read so completion cannot make an older pending snapshot look orphaned.
+        // Do not take the session lock: a live primary may hold it over network IO.
+        let reviews = service.background_reviews.lock().await;
+        let loaded = load(&service, id);
+        let review_running = reviews.contains(id);
+        drop(reviews);
+        let Ok(session) = loaded else {
             unavailable_sessions += 1;
             continue;
         };
@@ -683,12 +691,19 @@ async fn dashboard_stats(
                 "savings": joint["savings"].as_f64(),
             })),
         });
-        let estimate = session
+        let orphaned_review = session.background_review_pending && !review_running;
+        let mut estimate = session
             .cost_trajectory
             .as_ref()
             .map(|t| t.snapshot())
-            .unwrap_or_default()
-            .dashboard();
+            .unwrap_or_default();
+        if orphaned_review {
+            // Mirror the next primary's fail-closed classification, in the
+            // response only. Unknown expense is not an observed failed receipt.
+            estimate.priced = false;
+            estimate.coverage.prior_untracked_calls += 1;
+        }
+        let estimate = estimate.dashboard();
         cost_estimate.observe(&estimate);
         let updated_at = entry
             .metadata()
@@ -709,7 +724,7 @@ async fn dashboard_stats(
             "id": id, "title": session.title(), "primary": session.primary, "shadow": session.shadow,
             "client": session.client,
             "cost_estimate": estimate,
-            "background_review_pending": session.background_review_pending,
+            "background_review_pending": session.background_review_pending && review_running,
             "completed_requests": session.completed_requests,
             "compactions": session.compactions, "native_compactions": session.native_compactions,
             "reviewer_compactions": session.reviewer_compactions,
