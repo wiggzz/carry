@@ -3,7 +3,7 @@ async fn background_commit_admission_control(kind: &str) {
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let memory = json!({"source_ids":["g2"],"text":"retained learning ".repeat(25)});
+    let memory = json!({"source_ids":["g2"],"text":"retained learning ".repeat(200)});
     let advice = match kind {
         "empty" => json!({"protected":[],"removable":[],"memories":[]}),
         "partial" => json!({"protected":[],"removable":["g2"],"memories":[memory]}),
@@ -63,8 +63,27 @@ async fn background_commit_admission_control(kind: &str) {
     input.push(json!({"role":"user","content":"new task context ".repeat(200)}));
     let mut grown = session.clone();
     grown.ingest(&input).unwrap();
+    let mut budget_probe = grown.clone();
+    budget_probe
+        .apply_advice(
+            &grown.groups(),
+            &json!({"protected":[],"removable":[],"memories":[memory]}),
+        )
+        .unwrap();
+    let base_bytes = reviewer_serialized_identity(&memory_review_body(&service.config, &grown)).0;
+    let memory_bytes =
+        reviewer_serialized_identity(&memory_review_body(&service.config, &budget_probe)).0;
     service.config.classifier_max_input_bytes =
-        (reviewer_serialized_identity(&memory_review_body(&service.config, &grown)).0 + 512) as u32;
+        (base_bytes + 2 * (memory_bytes - base_bytes) - 512) as u32;
+    let mut full_current = grown.clone();
+    full_current.observe_groups(&full_current.groups());
+    assert!(
+        review_fits(
+            &service.config,
+            &review_body(&service.config, &full_current)
+        ),
+        "native growth itself fits: no forced capacity wait may block the primary"
+    );
     let mut snapshot_advice = before.clone();
     snapshot_advice
         .apply_advice_with_memory_admission(&before.groups(), &advice, |candidate| {
@@ -97,14 +116,18 @@ async fn background_commit_admission_control(kind: &str) {
     let mut headers = HeaderMap::new();
     headers.insert("x-carry-session", kind.parse().unwrap());
     headers.insert("content-type", "application/json".parse().unwrap());
-    let primary = forward_request(
-        service.clone(),
-        headers,
-        Bytes::from(serde_json::to_vec(&json!({"model":"gpt-6-luna","input":input})).unwrap()),
-        false,
-        "concurrent".into(),
+    let primary = tokio::time::timeout(
+        Duration::from_secs(5),
+        forward_request(
+            service.clone(),
+            headers,
+            Bytes::from(serde_json::to_vec(&json!({"model":"gpt-6-luna","input":input})).unwrap()),
+            false,
+            "concurrent".into(),
+        ),
     )
     .await
+    .expect("compatible primary must finish while the review response is still gated")
     .unwrap();
     assert!(primary.status().is_success());
     axum::body::to_bytes(primary.into_body(), 1024 * 1024)
