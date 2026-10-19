@@ -3033,3 +3033,212 @@ async fn unknown_primary_pricing_skips_reviews_that_cannot_produce_a_plan() {
     assert_eq!(saved[0]["primary"]["unavailable_cost_calls"], 1);
     assert_eq!(saved[0]["compactions"], 0);
 }
+
+#[tokio::test]
+async fn subscription_model_discovery_authenticates_filters_and_fails_closed() {
+    use axum::{
+        Router,
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+        routing::{get, post},
+    };
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let home = tempfile::tempdir().unwrap();
+    let token = format!(
+        "header.{}.signature",
+        URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#)
+    );
+    std::fs::write(
+        home.path().join("auth.json"),
+        serde_json::to_vec(&json!({
+            "version": 1, "access_token": token, "refresh_token": "fixture-refresh",
+            "expires_at_ms": 4102444800000u64
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let scenario = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let calls = requests.clone();
+    let mode = scenario.clone();
+    let expected_token = token.clone();
+    let router = Router::new().route("/v1/models", get(move |headers: HeaderMap, uri: axum::http::Uri| {
+        let token = expected_token.clone(); let calls = calls.clone(); let mode = mode.clone();
+        async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(headers["authorization"], format!("Bearer {token}"));
+            assert_eq!(headers["chatgpt-account-id"], "fixture-account");
+            assert_eq!(headers["accept"], "application/json");
+            assert_eq!(uri.query(), Some("client_version=0.147.0"));
+            match mode.load(Ordering::SeqCst) {
+                1 => (StatusCode::SERVICE_UNAVAILABLE, "private upstream diagnostic").into_response(),
+                2 => axum::Json(json!({"models": [{"visibility":"list"}]})).into_response(),
+                3 => (StatusCode::FOUND, [("location", "/must-not-follow")], "private redirect").into_response(),
+                4 => axum::Json(json!({"models": []})).into_response(),
+                5 => (StatusCode::UNAUTHORIZED, "private authentication diagnostic").into_response(),
+                6 => "x".repeat(8 * 1024 * 1024 + 1).into_response(),
+                _ => axum::Json(json!({"models": [
+                    {"slug":"fixture-subscription", "visibility":"list", "supported_in_api":false,
+                     "base_instructions":"private provider instructions"},
+                    {"slug":"hidden", "visibility":"hide"},
+                    {"slug":"unlisted", "visibility":"none"}
+                ]})).into_response(),
+            }
+        }
+    })).route("/must-not-follow", get(|| async {
+        axum::Json(json!({"models":[{"slug":"redirected", "visibility":"list"}]}))
+    })).route("/v1/responses", post(move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+        let token = token.clone();
+        async move {
+            assert_eq!(headers["authorization"], format!("Bearer {token}"));
+            assert_eq!(headers["chatgpt-account-id"], "fixture-account");
+            assert_eq!(body["model"], "fixture-subscription");
+            ([ ("content-type", "text/event-stream") ], format!("data: {}\n\n", json!({
+                "type":"response.completed", "response":{"id":"fixture-answer", "status":"completed", "output":[]}
+            })))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let state = tempfile::tempdir().unwrap();
+    // The helper also sets an API key: explicit subscription mode must never use it.
+    let (_proxy, url) = start_proxy_options(
+        state.path(),
+        address,
+        "off",
+        &[
+            "--codex-login",
+            "--codex-home",
+            home.path().to_str().unwrap(),
+        ],
+        "local-client",
+    )
+    .await;
+    let client = reqwest::Client::new();
+    for key in [None, Some("wrong")] {
+        let mut request = client.get(format!("{url}/v1/models"));
+        if let Some(key) = key {
+            request = request.bearer_auth(key);
+        }
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    let response = client
+        .get(format!("{url}/v1/models"))
+        .bearer_auth("local-client")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let catalog: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        catalog,
+        json!({"object":"list", "data":[{
+            "id":"fixture-subscription", "object":"model", "created":0, "owned_by":"openai"
+        }]})
+    );
+    // Select the discovered model through the same OpenAI-compatible HTTP surface.
+    let response = client
+        .post(format!("{url}/v1/responses"))
+        .bearer_auth("local-client")
+        .json(&json!({"model":catalog["data"][0]["id"], "input":[], "stream":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["id"],
+        "fixture-answer"
+    );
+    for failure_mode in [1, 2, 3, 5, 6] {
+        scenario.store(failure_mode, Ordering::SeqCst);
+        let response = client
+            .get(format!("{url}/v1/models"))
+            .bearer_auth("local-client")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response.text().await.unwrap();
+        assert!(!body.contains("private"));
+        assert!(!body.contains("fixture-refresh"));
+    }
+    scenario.store(4, Ordering::SeqCst);
+    let catalog: serde_json::Value = client
+        .get(format!("{url}/v1/models"))
+        .bearer_auth("local-client")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(catalog, json!({"object":"list", "data":[]}));
+    server.abort();
+    let response = client
+        .get(format!("{url}/v1/models"))
+        .bearer_auth("local-client")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn api_key_model_discovery_remains_an_authenticated_upstream_relay() {
+    use axum::{Router, http::HeaderMap, routing::get};
+    let router = Router::new().route(
+        "/v1/models",
+        get(|headers: HeaderMap| async move {
+            assert_eq!(headers["authorization"], "Bearer fixture-primary");
+            assert!(!headers.contains_key("chatgpt-account-id"));
+            axum::Json(json!({"object":"list", "data":[{"id":"fixture-api", "custom":true}]}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let state = tempfile::tempdir().unwrap();
+    let (_proxy, url) = start_proxy_options(
+        state.path(),
+        address,
+        "off",
+        &["--login", "api-key"],
+        "local-client",
+    )
+    .await;
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client
+            .get(format!("{url}/v1/models"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let catalog: serde_json::Value = client
+        .get(format!("{url}/v1/models"))
+        .bearer_auth("local-client")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog,
+        json!({"object":"list", "data":[{"id":"fixture-api", "custom":true}]})
+    );
+    server.abort();
+}

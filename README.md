@@ -193,6 +193,19 @@ unseen histories bootstrap automatically without this flag. Invalid reviewer ite
 and rejection feedback in the next review lets the model self-correct.
 Carry skips paid reviews when the primary model has no known rate, since its
 economic planner cannot select a compaction for that model.
+
+Authenticated `GET /v1/models` also works with `--login codex`: Carry queries the
+subscription catalog using the pinned Codex 0.147.0 discovery contract and returns
+its picker-visible IDs as an OpenAI-compatible list. It does not infer account
+availability from Carry's pricing table or require an API key. The `created` field
+is `0` because the subscription catalog supplies no creation timestamp. Catalog
+responses are limited to 8 MiB. Missing or incorrect local client credentials still
+return 401. Subscription credential, transport, upstream, or malformed catalog
+failures return a sanitized 502 rather than an invented fallback catalog.
+Explicit model configuration remains usable if discovery is unavailable. Discovery
+does not switch the configured authentication mode; API-key discovery remains an
+upstream relay. This adapter is fixture-tested, not live-account verified.
+
 Interactive startup opens the local, token-free stats dashboard. Reusing the
 state directory (by default `$CARRY_HOME/proxy` or `~/.carry/proxy`) preserves committed state
 and cumulative dashboard totals across restarts and working directories. Full per-session
