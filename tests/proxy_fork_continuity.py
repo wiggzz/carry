@@ -62,7 +62,7 @@ class ForkContinuity(unittest.TestCase):
                     if n == 1 else []})
 
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
-        proxy = BranchProxy(self.state, fixture, ["--payoff-requests", "1",
+        proxy = BranchProxy(self.state, fixture, ["--review-replayed-history", "--payoff-requests", "1",
                             "--classifier-cache-policy", "disabled"])
         self.stack.callback(proxy.close)
         self.assertEqual(proxy.send(history)[0], 200)
