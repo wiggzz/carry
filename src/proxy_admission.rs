@@ -59,6 +59,25 @@ pub(super) fn decision_for_plan(
     pressure: bool,
     allow_extra: bool,
 ) -> Value {
+    decision_with_primary(config, session, main, pressure, allow_extra, None)
+}
+
+pub(super) fn primary_tokens(config: &ProxyCli, session: &Session, main: &Value) -> f64 {
+    #[cfg(test)]
+    planner_work::record("admission_primary_projections");
+    let mut retained = main.clone();
+    retained["input"] = json!(session.render_primary());
+    estimate(&primary_wire_body(config, &retained))
+}
+
+pub(super) fn decision_with_primary(
+    config: &ProxyCli,
+    session: &Session,
+    main: &Value,
+    pressure: bool,
+    allow_extra: bool,
+    primary: Option<f64>,
+) -> Value {
     let coverage = coverage(session);
     let eligible = source_ids(session);
     // Each newly eligible native item contributes once, independent of repeated
@@ -69,11 +88,7 @@ pub(super) fn decision_for_plan(
         .filter(|i| eligible.contains(&i.id) && !coverage.source_ids.contains(&i.id))
         .map(|i| estimate(&i.value))
         .sum();
-    let mut retained = main.clone();
-    #[cfg(test)]
-    planner_work::record("admission_primary_projections");
-    retained["input"] = json!(session.render_primary());
-    let primary = estimate(&primary_wire_body(config, &retained));
+    let primary = primary.unwrap_or_else(|| primary_tokens(config, session, main));
     let age = session
         .completed_requests
         .saturating_sub(session.last_review_request);

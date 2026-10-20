@@ -31,12 +31,34 @@ fn review_calls(
     let mut future = session.clone();
     super::admission::initialize(&mut future);
     let mut calls = Vec::new();
+    // Only cadence, exposure, coverage and attempt reservation advance here;
+    // history/removals/materialized memories and the primary wire policy do not.
+    // Reuse just that immutable render/tokenization, never an admission decision
+    // or economic result. A keyless Codex adapter generates a fresh wire key,
+    // whose token count is not invariant, so preserve its per-decision projection.
+    let reusable_primary = !config.codex_login || body.get("prompt_cache_key").is_some();
+    let mut primary = None;
     for request in 0..config.payoff_requests {
         // A source rewrite skips this request's ordinary dispatch. Bootstrap
         // already paid for its source; no hypothetical native growth is added.
         let dispatch = request > 0 || (!changed && !session.bootstrap_review_pending);
+        let projected_primary = if dispatch && reusable_primary {
+            Some(
+                *primary
+                    .get_or_insert_with(|| super::admission::primary_tokens(config, &future, body)),
+            )
+        } else {
+            None
+        };
         if dispatch
-            && super::admission::decision_for_plan(config, &future, body, false, allow_extra)["admitted"]
+            && super::admission::decision_with_primary(
+                config,
+                &future,
+                body,
+                false,
+                allow_extra,
+                projected_primary,
+            )["admitted"]
                 == true
         {
             let targets = future.due_keep_targets();
@@ -323,4 +345,55 @@ fn plan_inner(
         "cache_basis":"exact_compatible_prefix_receipts_expire_after_30_minutes",
         "candidates":reports});
     (best.map(|(state, _)| state), report)
+}
+
+#[cfg(test)]
+mod projection_controls {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn frozen_primary_reuse_respects_generated_keys_exposure_and_pending_work() {
+        let mut config = ProxyCli::try_parse_from([
+            "carry proxy",
+            "--review-min-primary-tokens",
+            "0",
+            "--review-min-new-tokens",
+            "0",
+            "--review-every-requests",
+            "1",
+            "--payoff-requests",
+            "3",
+        ])
+        .unwrap();
+        let mut session = Session::default();
+        session
+            .ingest(&[
+                json!({"role":"user","content":"goal"}),
+                json!({"role":"assistant","content":"evidence"}),
+                json!({"role":"user","content":"continue"}),
+            ])
+            .unwrap();
+        // Initially unexposed: the first projection must not admit a review;
+        // later projections must recompute exposure/eligibility and cadence.
+        for (codex, key, expected) in [(false, false, 1), (true, true, 1), (true, false, 3)] {
+            config.codex_login = codex;
+            let mut body = json!({"model":"gpt-6-sol","input":session.render_primary()});
+            if key {
+                body["prompt_cache_key"] = json!("stable-control-key");
+            }
+            super::super::planner_work::start();
+            let schedule = review_calls(&config, &session, &body, false, false).unwrap();
+            let counts = super::super::planner_work::finish();
+            assert_eq!(schedule.len(), 2, "exposure and cadence must still advance");
+            assert_eq!(counts["admission_primary_projections"], expected);
+
+            let mut pending = session.clone();
+            pending.background_review_pending = true;
+            super::super::planner_work::start();
+            assert!(review_calls(&config, &pending, &body, false, false).is_none());
+            let counts = super::super::planner_work::finish();
+            assert_eq!(counts.get("admission_primary_projections"), None);
+        }
+    }
 }
