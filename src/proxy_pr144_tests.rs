@@ -294,6 +294,123 @@ fn oversized_reviewer_without_advice_never_forces_primary_mutation() {
     }
 }
 
+#[test]
+fn selection_not_due_charges_only_one_conditional_input_rebuild() {
+    for pending in [true, false] {
+        let mut config = config();
+        config.background_reviews = true;
+        config.classifier_cache_policy = ClassifierCachePolicy::OpenaiExplicit;
+        config.payoff_requests = 5;
+        config.review_every_requests = 1;
+        let (mut session, main) = session_with_review();
+        session.completed_requests = 0;
+        session.background_review_pending = pending;
+        let reviewer = review_body(&config, &session);
+        let count = estimate(&reviewer);
+        observe_reviewer_cache(
+            &config,
+            &mut session.reviewer_cache,
+            &reviewer,
+            &json!({"input_tokens":count,"input_tokens_details":{"cached_tokens":count}}),
+        );
+        let mut candidate = session.clone();
+        candidate.remove(&[2], &session.groups());
+        let compact = review_body(&config, &candidate);
+        let cost =
+            reviewer_view_costs(&config, &session.reviewer_cache, &reviewer, &compact, 1).unwrap();
+        let allowance = (cost.compact - cost.keep).max(0.0);
+        assert!(
+            allowance > 0.0,
+            "exact warm receipt must expose a real invalidation loss"
+        );
+        let mut prior = None;
+        for output_cap in [256, 16384] {
+            config.classifier_max_output_tokens = output_cap;
+            let (_, report) = plan(&config, &session, &main);
+            let row = report["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["removed_groups"] == json!([2]))
+                .unwrap();
+            close(
+                row["selection_joint"]["future_shadow_keep"]
+                    .as_f64()
+                    .unwrap(),
+                0.0,
+            );
+            close(
+                row["selection_joint"]["future_shadow_compact"]
+                    .as_f64()
+                    .unwrap(),
+                allowance,
+            );
+            assert!(row["selection_reviewer_output_completions"].is_null());
+            if let Some(prior) = &prior {
+                assert_eq!(prior, &row["selection_joint"]);
+            }
+            prior = Some(row["selection_joint"].clone());
+            if pending {
+                assert!(
+                    row["joint"].is_null(),
+                    "unfinished recurring total remains unknown"
+                );
+            } else {
+                assert_eq!(
+                    report["future_reviewer_calls"], 4,
+                    "the protected timely-completion forecast is a distinct diagnostic"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn selection_due_source_rewrite_charges_real_next_input_invalidation() {
+    let mut config = config();
+    config.background_reviews = true;
+    config.classifier_cache_policy = ClassifierCachePolicy::OpenaiExplicit;
+    config.review_every_requests = 1;
+    let (mut session, main) = session_with_review();
+    let reviewer = review_body(&config, &session);
+    let count = estimate(&reviewer);
+    observe_reviewer_cache(
+        &config,
+        &mut session.reviewer_cache,
+        &reviewer,
+        &json!({"input_tokens":count,"input_tokens_details":{"cached_tokens":count}}),
+    );
+    let mut candidate = session.clone();
+    candidate.remove(&[2], &session.groups());
+    let compact = review_body(&config, &candidate);
+    let cost =
+        reviewer_view_costs(&config, &session.reviewer_cache, &reviewer, &compact, 1).unwrap();
+    let allowance = (cost.compact - cost.keep).max(0.0);
+    assert!(allowance > 0.0);
+    let (_, report) = plan(&config, &session, &main);
+    let row = report["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["removed_groups"] == json!([2]))
+        .unwrap();
+    assert_eq!(row["selection_review_basis"], "presently_due_next_review");
+    assert_eq!(row["selection_reviewer_output_completions"], 0);
+    close(
+        row["selection_joint"]["future_shadow_compact"]
+            .as_f64()
+            .unwrap(),
+        allowance,
+    );
+    assert!(
+        row["selection_joint"]["future_shadow_keep"]
+            .as_f64()
+            .unwrap()
+            > cost.keep,
+        "presently due keep branch includes one output cap, not a free completion"
+    );
+}
+
 fn primary(marker: Option<Value>) -> Value {
     let mut body = json!({"model":"gpt-6-sol","input":[{"role":"user","content":[
         {"type":"input_text","text":"actual rendered primary payload ".repeat(200)}]}]});
