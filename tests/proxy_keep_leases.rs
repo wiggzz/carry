@@ -18,3 +18,22 @@ fn keep_lease_primary_round_target_review_release_tracer() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn keep_lease_target_failure_and_restart_controls() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_keep_lease_controls.py"
+        ))
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python must run the loopback lease controls");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

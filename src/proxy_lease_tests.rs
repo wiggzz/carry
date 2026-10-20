@@ -42,7 +42,8 @@ fn lease_economic_demand_can_admit_one_review_without_new_source_growth() {
     assert_eq!(
         admission::decision(&config, &session, &body, false)["admitted"],
         true,
-        "LEASE_ECON_RED: a bounded due review should unlock an otherwise profitable safe source rewrite"
+        "LEASE_ECON_RED: a bounded due review should unlock an otherwise profitable safe source rewrite; actual rendered costs: {}",
+        lease_cost_probe(&config, &session, &body)
     );
     let (_, report) = plan(&config, &session, &body);
     assert_eq!(
@@ -66,6 +67,149 @@ fn lease_no_profit_or_preexpiry_never_admits_extra_paid_review() {
         admission::decision(&config, &session, &body, false)["admitted"],
         false
     );
+}
+
+fn lease_cost_probe(config: &ProxyCli, session: &Session, body: &Value) -> Value {
+    let mut target = session.clone();
+    let pending = crate::proxy_state::PendingKeepReview {
+        request_id: "forecast".into(),
+        targets: target.due_keep_targets(),
+    };
+    target.keep_leases.as_mut().unwrap().pending = Some(pending.clone());
+    let review = review_body(config, &target);
+    let inputs = reviewer_view_costs(config, &session.reviewer_cache, &review, &review, 1)
+        .unwrap()
+        .keep;
+    let rates = Rates::for_model(&config.classifier_model, estimate(&review)).unwrap();
+    let paid = inputs + config.classifier_max_output_tokens as f64 * rates.output;
+    target.resolve_keep_targets(&pending);
+    let groups = target.groups();
+    let ids = groups
+        .iter()
+        .filter(|g| target.drop_authorized(g))
+        .map(|g| g.id)
+        .collect::<Vec<_>>();
+    target.remove(&ids, &groups);
+    let mut compact = body.clone();
+    compact["input"] = json!(target.render_primary());
+    let primary = view_costs(
+        &primary_wire_body(config, body),
+        &primary_wire_body(config, &compact),
+        &session.primary_cache,
+        body["model"].as_str().unwrap(),
+        config.payoff_requests,
+    )
+    .unwrap();
+    json!({"primary_keep":primary.keep,"primary_compact":primary.compact,"paid_review":paid,
+        "joint":joint_decision(primary, ViewCosts{keep:0.0,compact:paid},config.min_payback_percent)})
+}
+
+#[test]
+fn lease_forecast_prices_the_same_targeted_request_as_actual_dispatch() {
+    let (config, mut session, body) = lease_fixture();
+    let groups = session.groups();
+    prepare_review_history(&mut session, &groups);
+    // A higher-priced primary and the same reviewer isolate a genuinely useful
+    // call without changing capacity, output caps, horizon or payback policy.
+    let mut body = body;
+    body["model"] = json!("gpt-6-sol");
+    let (_, report) = plan(&config, &session, &body);
+    let pending = crate::proxy_state::PendingKeepReview {
+        request_id: "forecast".into(),
+        targets: session.due_keep_targets(),
+    };
+    session.keep_leases.as_mut().unwrap().pending = Some(pending);
+    let wire = review_body_for_groups(&config, &session, &groups);
+    let inputs = reviewer_view_costs(&config, &session.reviewer_cache, &wire, &wire, 1)
+        .unwrap()
+        .keep;
+    let rates = Rates::for_model(&config.classifier_model, estimate(&wire)).unwrap();
+    let expected = inputs + config.classifier_max_output_tokens as f64 * rates.output;
+    let actual = report["candidates"][0]["joint"]["future_shadow_keep"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (actual - expected).abs() < 1e-12,
+        "LEASE_FORECAST_RED: actual targeted body {expected} differs from planner {actual}"
+    );
+}
+
+#[test]
+fn lease_merge_rejects_partial_failed_stale_and_concurrent_same_value_release() {
+    let (config, before, _) = lease_fixture();
+    let pending = crate::proxy_state::PendingKeepReview {
+        request_id: "target".into(),
+        targets: before.due_keep_targets(),
+    };
+    for variant in [
+        "partial",
+        "failed",
+        "cohort_growth",
+        "same_value_keep",
+        "lineage",
+    ] {
+        let mut reviewed = before.clone();
+        reviewed
+            .apply_advice(
+                &reviewed.groups(),
+                &json!({"protected":[],"removable":[],"memories":[]}),
+            )
+            .unwrap();
+        let mut current = before.clone();
+        let mut run = ReviewRun {
+            valid_admission: true,
+            keep_review: Some(pending.clone()),
+            reviewed_sources: before.groups(),
+            ..ReviewRun::default()
+        };
+        match variant {
+            "partial" => {
+                reviewed.review_feedback =
+                    json!({"rejected_count":1,"accepted_opinions":1,"accepted_memories":0})
+            }
+            "failed" => {
+                run.valid_admission = false;
+                reviewed.review_feedback = json!({"rejected_count":1});
+            }
+            "cohort_growth" => current.history[1].cohort += 1,
+            "same_value_keep" => current
+                .apply_advice(
+                    &current.groups(),
+                    &json!({"protected":["g2"],"removable":[],"memories":[]}),
+                )
+                .unwrap(),
+            _ => current.history_rebases += 1,
+        }
+        merge_review(&config, &mut current, &before, &reviewed, &run);
+        assert_eq!(
+            current.opinions.get(&2).map(String::as_str),
+            Some("keep"),
+            "{variant}"
+        );
+        assert!(!current.drop_authorized(&current.groups()[1]), "{variant}");
+    }
+}
+
+#[test]
+fn lease_default_human_keep_never_expires_but_explicit_authorized_drop_still_works() {
+    let (_, mut session, _) = lease_fixture();
+    session
+        .apply_advice(
+            &session.groups(),
+            &json!({"protected":["g1"],"removable":[],"memories":[]}),
+        )
+        .unwrap();
+    session.completed_requests += 100;
+    assert!(!session.due_keep_targets().contains_key("g1"));
+    session
+        .apply_advice(
+            &session.groups(),
+            &json!({"protected":[],"removable":["g1"],"memories":[]}),
+        )
+        .unwrap();
+    let human = session.groups().into_iter().find(|g| g.id == 1).unwrap();
+    assert!(human.human);
+    assert!(session.drop_authorized(&human));
 }
 
 #[test]
