@@ -292,6 +292,95 @@ class ForkContinuity(unittest.TestCase):
             connection.close()
         self.assertEqual((len(fixture.primaries), len(fixture.reviews)), counts)
 
+    def test_off_mode_missing_or_non_utf8_identity_never_ignores_fork(self):
+        fixture = self.fixture(lambda _b, _n: (200, completed()))
+        proxy = BranchProxy(self.state, fixture, mode="off")
+        self.stack.callback(proxy.close)
+        body = {"model": "gpt-6-luna", "input": [{"role": "user", "content": "OFF_RAW_CONTROL"}]}
+        # http.client encodes header strings as Latin-1: this is a real obs-text
+        # header which HeaderValue::to_str rejects, not malformed HTTP framing.
+        for identity in (None, "\u00ff"):
+            for intent in ({"x-carry-fork-parent": "main"},
+                           {"x-carry-fork-point": "0:" + "a" * 64},
+                           {"x-carry-fork-parent": "main", "x-carry-fork-point": "0:" + "a" * 64}):
+                with self.subTest(identity=identity, intent=intent):
+                    headers = {"Content-Type": "application/json", **intent}
+                    if identity is not None:
+                        headers["x-carry-session"] = identity
+                    connection = http.client.HTTPConnection(*proxy.address, timeout=5)
+                    try:
+                        connection.request("POST", "/v1/responses", wire(body), headers)
+                        response = connection.getresponse()
+                        result = json.loads(response.read())
+                    finally:
+                        connection.close()
+                    self.assertEqual(response.status, 409, "HTTP-FORK-001: declared off-mode intent must reject before upstream")
+                    self.assertEqual(result["error"]["code"], "fork_unsupported")
+        self.assertEqual((len(fixture.primaries), len(fixture.reviews)), (0, 0))
+        self.assertEqual(proxy.request("POST", "/v1/responses", body)[0], 200)
+        self.assertEqual(fixture.primaries, [body], "undeclared off mode stays unchanged")
+        self.assertEqual(fixture.reviews, [])
+
+    def test_live_child_incompatible_retry_preserves_checkpoint(self):
+        proxy, fixture, history, handle, options = self.seed()
+        child = history + [{"role": "user", "content": "CHILD_SUFFIX"}]
+        for mutation in ("content", "shorter", "instructions", "model", "suffix-reset", "opaque"):
+            with self.subTest(mutation=mutation):
+                proxy.branch, proxy.intent = "retry-" + mutation, ("main", handle)
+                proxy.history_policy = None
+                self.assertEqual(proxy.send(child)[0], 200)
+                saved = proxy.saved()
+                self.assertTrue(saved["memories"])
+                self.assertTrue(any(item["removed"] for item in saved["history"]), "real child tombstones precede retry")
+                before = {p.name: p.read_bytes() for p in self.state.glob("*.json")}
+                incoming = [dict(item) for item in child]
+                fields = {}
+                proxy.history_policy = "reset-on-divergence"
+                if mutation == "content": incoming[1]["content"] += "altered"
+                if mutation == "shorter": incoming = incoming[:1]
+                if mutation == "instructions": fields["instructions"] = "changed scope"
+                if mutation == "model": fields["model"] = "different-model"
+                if mutation == "suffix-reset": incoming[-1]["content"] = "DIVERGENT_SUFFIX"
+                if mutation == "opaque":
+                    proxy.history_policy = None
+                    incoming = [{"type": "compaction", "encrypted_content": "OPAQUE_REPLACEMENT"},
+                                {"role": "user", "content": "POST_CHECKPOINT"}]
+                counts = (len(fixture.primaries), len(fixture.reviews))
+                status, body = proxy.send(incoming, **fields)
+                self.assertEqual(status, 409, "HTTP-FORK-002: contradictory live fork intent must reject before reset")
+                self.assertEqual(body["error"]["code"], "fork_incompatible")
+                self.assertEqual((len(fixture.primaries), len(fixture.reviews)), counts)
+                self.assertEqual({p.name: p.read_bytes() for p in self.state.glob("*.json")}, before,
+                                 "rejected intent cannot mutate any checkpoint")
+                # Unchanged retry remains valid even with reset opt-in. It must
+                # use the live child, not rehydrate removed source from parent.
+                proxy.history_policy = "reset-on-divergence"
+                self.assertEqual(proxy.send(child)[0], 200)
+                self.assertEqual(proxy.saved()["memories"], saved["memories"])
+                self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]))
+                self.assertEqual(len(fixture.reviews), counts[1])
+
+    def test_live_retry_does_not_resurrect_branch_local_retired_memory(self):
+        proxy, fixture, history, handle, _ = self.seed()
+        proxy.branch, proxy.intent = "retired-child", ("main", handle)
+        child = history + [{"role": "user", "content": "CHILD_SUFFIX"}]
+        self.assertEqual(proxy.send(child)[0], 200)
+        memory_id = "m" + str(proxy.saved()["memories"][0]["id"])
+        fixture.review = lambda _b, _n: (200, advice_response(
+            {"protected": [], "removable": [memory_id], "memories": []}))
+        proxy.intent = None
+        advanced = child + [{"role": "assistant", "content": "LOCAL_ANSWER"},
+                            {"role": "user", "content": "LOCAL_NEXT"}]
+        self.assertEqual(proxy.send(advanced)[0], 200)
+        self.assertEqual(proxy.saved()["memories"], [], "ordinary branch-local reviewer retirement commits")
+        counts = (len(fixture.primaries), len(fixture.reviews))
+        proxy.intent = ("main", handle)
+        self.assertEqual(proxy.send(advanced)[0], 200)
+        self.assertEqual(proxy.saved()["memories"], [], "idempotent fork retry cannot rehydrate retired memory")
+        self.assertNotIn("A_FACT", json.dumps(fixture.primaries[-1]))
+        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]))
+        self.assertEqual((len(fixture.primaries), len(fixture.reviews)), (counts[0] + 1, counts[1]))
+
     def test_audit_and_off_modes_reject_declared_fork(self):
         proxy, fixture, history, handle, options = self.seed()
         proxy.close()
