@@ -169,19 +169,38 @@ class IncrementalReviewer(unittest.TestCase):
             return 200,advice_response({"protected":[i for i in ids if i=="g1"],
                 "removable":[i for i in ids if i!="g1"],"memories":[]})
         fixture=self.fixture(review)
-        options=["--review-replayed-history","--classifier-max-input-tokens","6000"]
+        options=["--review-replayed-history","--classifier-max-input-tokens","6000",
+                 "--review-max-calls","1"]
         proxy=self.harness.proxy(fixture,options)
         history=self.large_history()
         self.assertEqual(proxy.send(history)[0],200)
         saved=proxy.saved()
-        self.assertTrue(saved["bootstrap_reviewed_ids"])
-        self.assertEqual(saved["invalid_reviews"],1)
+        covered=set(saved["bootstrap_reviewed_ids"])
+        self.assertTrue(covered)
+        self.assertEqual(saved["invalid_reviews"],0)
         self.assertEqual(fixture.primaries[0]["input"],history)
+        # Primary economics, not reviewer capacity, may retire the authorized
+        # prefix on the next request. That rewrite deliberately skips dispatch.
+        self.assertEqual(proxy.send(history)[0],200)
+        retired=[i["value"] for i in proxy.saved()["history"] if i["removed"]]
+        self.assertTrue(retired)
+        self.assertEqual(len(fixture.reviews),1)
+        # A subsequent bounded import now has room, and returns invalid advice.
+        self.assertEqual(proxy.send(history)[0],200)
+        saved=proxy.saved()
+        self.assertEqual(len(fixture.reviews),2)
+        self.assertEqual(saved["invalid_reviews"],1)
+        self.assertEqual(set(saved["bootstrap_reviewed_ids"]),covered)
         proxy.close();proxy=self.harness.proxy(fixture,options)
         self.assertEqual(proxy.send(history)[0],200)
-        self.assertEqual(proxy.saved()["invalid_reviews"],1)
-        self.assertEqual(len(fixture.primaries),2)
+        saved=proxy.saved()
+        self.assertEqual(saved["invalid_reviews"],1)
+        self.assertTrue(covered.issubset(saved["bootstrap_reviewed_ids"]))
+        self.assertEqual(len(fixture.primaries),4)
         self.assertIn("DURABLE_IMPORT_REQUIREMENT",json.dumps(fixture.primaries[-1]["input"]))
+        for primary in fixture.primaries[1:]:
+            self.assertTrue(all(value not in primary["input"] for value in retired),
+                            "failed import and restart cannot resurrect retired source")
 
 
 if __name__ == "__main__":

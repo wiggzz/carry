@@ -131,7 +131,8 @@ class Proxy:
                 "--classifier-model", "gpt-6-luna",
                 *([] if "--min-payback-percent" in extra else ["--min-payback-percent", "0"]),
                 "--bootstrap-min-input-bytes", "8388608",
-                "--request-timeout-secs", "5", "--classifier-timeout-secs", "10",
+                *([] if "--request-timeout-secs" in extra else ["--request-timeout-secs", "5"]),
+                *([] if "--classifier-timeout-secs" in extra else ["--classifier-timeout-secs", "10"]),
                 *extra]
         if not any(arg.startswith("--background-reviews") for arg in args):
             args += ["--background-reviews=false"]

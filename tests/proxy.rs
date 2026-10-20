@@ -2534,14 +2534,7 @@ async fn reviewer_timeout_fails_closed_while_primary_can_complete() {
         .unwrap()
         .extend(first["output"].as_array().unwrap().iter().cloned());
     assert!(send(&url, &next, "a", "main").await.status().is_success());
-    let mut saved = checkpoint_states(state.path()).remove(0);
-    for _ in 0..50 {
-        if saved["completed_requests"] == 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        saved = checkpoint_states(state.path()).remove(0);
-    }
+    let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["completed_requests"], 2);
     assert_eq!(saved["shadow"]["calls"], 1);
     assert_eq!(saved["shadow"]["unavailable_cost_calls"], 1);
