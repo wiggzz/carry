@@ -3393,20 +3393,43 @@ fn review_fits(config: &ProxyCli, body: &Value) -> bool {
         && reviewer_required_tokens(config, body) <= config.classifier_max_input_tokens as f64
 }
 
+#[cfg(test)]
 fn reusable(cache: &[CacheEvidence], body: &Value) -> f64 {
+    primary_reusable(cache, body, None)
+}
+
+fn primary_reusable(
+    cache: &[CacheEvidence],
+    body: &Value,
+    resolved: Option<&ResolvedModel>,
+) -> f64 {
     let Some(input) = body["input"].as_array() else {
         return 0.0;
     };
     let base = cache_base(body);
     cache
         .iter()
-        .filter(|e| now().saturating_sub(e.at) <= 1800 && e.matches(&base, input))
+        .filter(|e| {
+            e.matches_route(resolved.map(|r| &r.route))
+                && now().saturating_sub(e.at) <= 1800
+                && e.matches(&base, input)
+        })
         .map(|e| e.estimated_tokens() * e.native_cached_fraction)
         .fold(0.0, f64::max)
         .min(estimate(body))
 }
 
+#[cfg(test)]
 fn observe_cache(cache: &mut Vec<CacheEvidence>, body: &Value, usage: &Value) {
+    observe_primary_cache(cache, body, usage, None);
+}
+
+fn observe_primary_cache(
+    cache: &mut Vec<CacheEvidence>,
+    body: &Value,
+    usage: &Value,
+    resolved: Option<&ResolvedModel>,
+) {
     let Some(input) = body["input"].as_array() else {
         return;
     };
@@ -3424,12 +3447,14 @@ fn observe_cache(cache: &mut Vec<CacheEvidence>, body: &Value, usage: &Value) {
     for evidence in cache.iter_mut() {
         evidence.compact();
     }
-    cache.push(CacheEvidence::new(
+    let mut evidence = CacheEvidence::new(
         &cache_base(body),
         input,
         now(),
         cached as f64 / total as f64,
-    ));
+    );
+    evidence.route = resolved.map(|r| r.route.clone());
+    cache.push(evidence);
     if cache.len() > 8 {
         cache.remove(0);
     }
@@ -3506,7 +3531,7 @@ fn resolved_view_costs(
         input_cost(
             tokens,
             if resolved.is_none() || capability.is_some() {
-                reusable(cache, body)
+                primary_reusable(cache, body, resolved)
             } else {
                 0.0
             },
@@ -3821,10 +3846,16 @@ async fn relay(
                     commit.candidate.response_frontier = Some(commit.candidate.next_id);
                     commit.candidate.pending_output =
                         value["output"].as_array().cloned().unwrap_or_default();
-                    observe_cache(
+                    observe_primary_cache(
                         &mut commit.candidate.primary_cache,
                         &commit.outbound,
                         &value["usage"],
+                        commit
+                            .service
+                            .config
+                            .model_resolution
+                            .as_ref()
+                            .map(|p| &p.primary),
                     );
                     if commit.candidate.bootstrap_review_complete {
                         commit.candidate.bootstrap_review_pending = false;

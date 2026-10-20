@@ -38,6 +38,10 @@ struct PrefixEvidence {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct CacheEvidence {
+    // Destination, auth class and processing tier of the dispatched receipt.
+    // Missing historical qualification is unknown, never a frozen-route hit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<carry::models::Route>,
     // Decode former full-prompt checkpoints; compact them before using state.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub base: Value,
@@ -51,6 +55,7 @@ pub(super) struct CacheEvidence {
 impl CacheEvidence {
     pub fn new(base: &Value, input: &[Value], at: u64, native_cached_fraction: f64) -> Self {
         Self {
+            route: None,
             base: Value::Null,
             input: Vec::new(),
             at,
@@ -65,12 +70,14 @@ impl CacheEvidence {
     }
     pub fn compact(&mut self) {
         if self.prefix.is_none() {
-            *self = Self::new(
+            let mut compact = Self::new(
                 &self.base,
                 &self.input,
                 self.at,
                 self.native_cached_fraction,
             );
+            compact.route = self.route.clone();
+            *self = compact;
         }
     }
     pub fn input_len(&self) -> usize {
@@ -96,9 +103,13 @@ impl CacheEvidence {
             self.base == *base && input.starts_with(&self.input)
         }
     }
+    pub fn matches_route(&self, route: Option<&carry::models::Route>) -> bool {
+        self.route.as_ref() == route
+    }
     #[cfg(test)]
     pub fn legacy(base: Value, input: Vec<Value>, at: u64, native_cached_fraction: f64) -> Self {
         Self {
+            route: None,
             base,
             input,
             at,

@@ -81,7 +81,8 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         folded.extend(rendered.drain(..leading).filter_map(|(id, _)| id));
     }
     for evidence in &session.primary_cache {
-        if now().saturating_sub(evidence.at) <= 1800
+        if evidence.matches_route(config.model_resolution.as_ref().map(|p| &p.primary.route))
+            && now().saturating_sub(evidence.at) <= 1800
             && wire["input"]
                 .as_array()
                 .is_some_and(|input| evidence.matches(&cache_base(&wire), input))
