@@ -1,0 +1,178 @@
+//! Synthetic frozen contracts, not vendor tariff or route evidence.
+// Rates in snapshots are USD per MILLION; planner results are dollars.
+use super::*;
+
+#[test]
+fn frozen_unknown_prices_do_not_fall_back_to_the_known_slug() {
+    let (config, mut session, main) = fixture(Rates {
+        input: 7.0,
+        cached: 0.7,
+        write: 9.0,
+        output: 21.0,
+    });
+    session.model_resolution.as_mut().unwrap().primary.rates = None;
+    let (_, report) = plan(&config, &session, &main);
+    assert_eq!(report["reason"], "unsupported_model_or_tier");
+    assert!(
+        report["candidates"][0]["joint"].is_null(),
+        "unknown price is not zero or legacy slug price"
+    );
+}
+
+#[test]
+fn each_candidate_prices_its_own_frozen_input_tier_after_restart() {
+    let (config, mut session, main) = fixture(Rates {
+        input: 7.0,
+        cached: 0.7,
+        write: 9.0,
+        output: 21.0,
+    });
+    let mut compact = session.clone();
+    let groups = compact.groups();
+    compact.remove(&[groups[1].id], &groups);
+    let mut compact_body = main.clone();
+    compact_body["input"] = json!(compact.render_primary());
+    let keep_tokens = estimate(&primary_wire_body(&config, &main));
+    let compact_tokens = estimate(&primary_wire_body(&config, &compact_body));
+    assert!(compact_tokens < keep_tokens);
+    let threshold = ((keep_tokens + compact_tokens) / 2.0) as u32;
+    let primary = &mut session.model_resolution.as_mut().unwrap().primary;
+    primary.cheap_input_boundary = Some(threshold);
+    primary.long_input_multiplier = Some(3.0);
+    primary.long_output_multiplier = Some(2.0);
+    let restored: Session =
+        serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+    let (_, report) = plan(&config, &restored, &main);
+    let joint = &report["candidates"][0]["joint"];
+    let keep = joint["primary_keep"].as_f64().unwrap();
+    let compact = joint["primary_compact"].as_f64().unwrap();
+    assert!((keep - keep_tokens * 7.0 * 3.0 / 1e6 * 3.0).abs() < 1e-10);
+    assert!((compact - compact_tokens * 7.0 / 1e6 * 3.0).abs() < 1e-10);
+}
+
+fn fixture(rates: Rates) -> (ProxyCli, Session, Value) {
+    let config = ProxyCli::try_parse_from([
+        "carry proxy",
+        "--upstream-url",
+        "https://synthetic-gateway.invalid/v1/responses",
+        "--classifier-model",
+        "gpt-6-sol",
+        "--classifier-cache-policy",
+        "disabled",
+        "--payoff-requests",
+        "3",
+        "--review-every-requests",
+        "100",
+        "--background-reviews=false",
+        "--mode",
+        "compact",
+    ])
+    .unwrap();
+    let mut session = Session::default();
+    session
+        .ingest(&[
+            json!({"role":"user","content":"synthetic retained source ".repeat(800)}),
+            json!({"role":"assistant","content":"synthetic disposable source ".repeat(200)}),
+            json!({"role":"user","content":"finish"}),
+        ])
+        .unwrap();
+    for item in &mut session.history {
+        item.exposed = true;
+    }
+    let groups = session.groups();
+    session.observe_groups(&groups);
+    session
+        .apply_advice(
+            &groups,
+            &json!({"protected":["g1"],"removable":["g2"],"memories":[]}),
+        )
+        .unwrap();
+    let route = Route::new(&config.upstream_url, false);
+    let mut primary =
+        resolve_model("gpt-6-sol", route.clone(), None, None, 272000, 16384, 10).unwrap();
+    primary.rates = Some(rates);
+    primary.price_basis = "synthetic_fixture_only".into();
+    let reviewer = resolve_model("gpt-6-sol", route, None, None, 300000, 4096, 10).unwrap();
+    session.model_resolution = Some(ResolvedPair {
+        schema_version: 1,
+        primary,
+        reviewer,
+    });
+    session.completed_requests = 1;
+    let main = json!({"model":"gpt-6-sol","input":session.render_primary(),"store":false});
+    session.review_context = cache_base(&main);
+    (config, session, main)
+}
+
+#[test]
+fn planner_consumes_frozen_primary_rates_and_does_not_invent_gateway_cache_support() {
+    let modeled = Rates {
+        input: 7.0,
+        cached: 0.0000007,
+        write: 0.000009,
+        output: 0.000021,
+    };
+    let (config, session, main) = fixture(modeled);
+    let (_, report) = plan(&config, &session, &main);
+    let primary_tokens = estimate(&primary_wire_body(&config, &main));
+    assert!(primary_tokens > 1024.0);
+    let expected = primary_tokens * modeled.input / 1e6 * 3.0;
+    let actual = report["candidates"][0]["joint"]["primary_keep"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (actual - expected).abs() < 1e-10,
+        "frozen route has no cache capability: actual={actual} expected={expected}"
+    );
+    assert_eq!(
+        session
+            .model_resolution
+            .as_ref()
+            .unwrap()
+            .primary
+            .price_basis,
+        "synthetic_fixture_only"
+    );
+}
+
+#[test]
+fn planner_consumes_independent_frozen_reviewer_rates_without_gateway_cache_inheritance() {
+    let primary = Rates {
+        input: 7.0,
+        cached: 0.0000007,
+        write: 0.000009,
+        output: 0.000021,
+    };
+    let reviewer = Rates {
+        input: 0.000011,
+        cached: 0.0000001,
+        write: 0.000015,
+        output: 31.0,
+    };
+    let (mut config, mut session, main) = fixture(primary);
+    config.review_min_primary_tokens = 0;
+    config.review_min_new_tokens = 0;
+    config.review_every_requests = 1;
+    session.model_resolution.as_mut().unwrap().reviewer.rates = Some(reviewer);
+    session
+        .model_resolution
+        .as_mut()
+        .unwrap()
+        .reviewer
+        .price_basis = "synthetic_fixture_only".into();
+    let (_, report) = plan(&config, &session, &main);
+    let calls = report["future_review_events"].as_u64().unwrap();
+    assert!(calls > 0);
+    let body = review_body(&config, &session);
+    let expected = calls as f64
+        * (estimate(&body) * reviewer.input
+            + config.classifier_max_output_tokens as f64 * reviewer.output)
+        / 1e6;
+    let actual = report["candidates"][0]["joint"]["future_shadow_keep"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (actual - expected).abs() < 1e-10,
+        "reviewer has its own frozen rates, no speculative route cache: actual={actual} expected={expected}"
+    );
+}
