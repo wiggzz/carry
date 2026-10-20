@@ -18,12 +18,14 @@ def cut(items, epoch=0):
 
 class BranchProxy(Proxy):
     branch = "main"
+    tenant = "local"
+    session_name = "state-regression"
     intent: tuple[str, str] | None = None
     history_policy = None
 
     def request(self, method, path, body=None):
-        headers = {"Content-Type": "application/json", "x-carry-session": "state-regression",
-                   "x-carry-branch": self.branch}
+        headers = {"Content-Type": "application/json", "x-carry-session": self.session_name,
+                   "x-carry-tenant": self.tenant, "x-carry-branch": self.branch}
         if self.history_policy:
             headers["x-carry-history-policy"] = self.history_policy
         if self.intent:
@@ -38,7 +40,7 @@ class BranchProxy(Proxy):
             connection.close()
 
     def saved(self):
-        identity = hashlib.sha256(wire(["local", "state-regression", self.branch])).hexdigest()
+        identity = hashlib.sha256(wire([self.tenant, self.session_name, self.branch])).hexdigest()
         path = self.state / (identity + ".json")
         return json.loads(path.read_text()) if path.exists() else {}
 
@@ -97,6 +99,7 @@ class ForkContinuity(unittest.TestCase):
                          "explicit historical fork must recover accepted A authority after cleanup")
         self.assertIn("ANCESTOR_FACT", encoded)
         self.assertIn(history[0], sent)
+        self.assertIn(history[-1], sent, "historical protected boundary stays protected after C")
         self.assertIn(child[-1], sent)
         self.assertNotIn("SIBLING_B_ONLY", encoded)
         present = [item in sent for item in cohort]
@@ -107,8 +110,8 @@ class ForkContinuity(unittest.TestCase):
         self.assertEqual(saved["reviewer_cache"], [], "never copy parent cache receipts")
 
 
-    def seed(self, extra_env=None):
-        history = [{"role": "user", "content": "PROTECTED_GOAL"},
+    def seed(self, extra_env=None, history=None):
+        history = history if history is not None else [{"role": "user", "content": "PROTECTED_GOAL"},
                    {"role": "assistant", "content": "RAW_A " + "old payload " * 3000},
                    {"role": "user", "content": "A_CUT"}]
         def review(body, n):
@@ -327,6 +330,81 @@ class ForkContinuity(unittest.TestCase):
             thread.join(5)
         self.assertTrue(results)
         self.assertEqual(results[0][0], 200)
+
+
+    def test_cross_namespace_and_malformed_handles_never_import_authority(self):
+        proxy, fixture, history, handle, _ = self.seed()
+        proxy.branch, proxy.intent = "namespace-child", ("main", handle)
+        for tenant, session in [("other-owner", "state-regression"), ("local", "other-session")]:
+            with self.subTest(tenant=tenant, session=session):
+                proxy.tenant, proxy.session_name = tenant, session
+                self.rejected(proxy, fixture, history, "fork_unknown")
+        proxy.tenant, proxy.session_name = "local", "state-regression"
+        for bad in [handle.upper(), "00:" + "a" * 64, "0:" + "a" * 63, "0:" + "g" * 64]:
+            with self.subTest(handle=bad):
+                proxy.intent = ("main", bad)
+                self.rejected(proxy, fixture, history, "fork_invalid_intent")
+        proxy.intent = ("main", handle)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]))
+
+    def test_child_suffix_cannot_extend_reviewed_tool_cohort(self):
+        history = [{"role": "user", "content": "PROTECTED_GOAL"},
+            {"role": "assistant", "content": "RAW_A " + "old payload " * 3000},
+            {"type": "function_call", "call_id": "a1", "name": "one", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "a1", "output": "OLD_COHORT_RESULT"},
+            {"role": "user", "content": "A_CUT"}]
+        proxy, fixture, history, handle, _ = self.seed(history=history)
+        proxy.branch, proxy.intent = "grown-cohort-child", ("main", handle)
+        self.rejected(proxy, fixture, history + [
+            {"type": "function_call_output", "call_id": "a1", "output": "NEW_COHORT_RESULT"},
+            {"role": "user", "content": "C_CONTEXT"}], "fork_incompatible")
+        proxy.branch = "whole-cohort-child"
+        self.assertEqual(proxy.send(history + [{"role": "user", "content": "C_CONTEXT"}])[0], 200)
+        sent = fixture.primaries[-1]["input"]
+        self.assertNotIn(history[2], sent)
+        self.assertNotIn(history[3], sent)
+        self.assertIn(history[-1], sent)
+
+    def test_review_policy_identity_is_not_capacity(self):
+        proxy, fixture, history, handle, options = self.seed()
+        proxy.close()
+        for index, change in enumerate([["--classifier-reasoning-effort", "high"],
+                                       ["--classifier-max-output-tokens", "1"]]):
+            with self.subTest(policy=change):
+                proxy = BranchProxy(self.state, fixture, options + change)
+                self.stack.callback(proxy.close)
+                proxy.branch, proxy.intent = f"policy-child-{index}", ("main", handle)
+                self.rejected(proxy, fixture, history, "fork_incompatible")
+                proxy.close()
+
+    def test_killed_uncommitted_review_and_orphan_tmp_never_publish_authority(self):
+        proxy, fixture, history, handle, options = self.seed()
+        accepted_checkpoint = proxy.saved()
+        def held_review(_body, _n):
+            fixture.held.set()
+            fixture.release.wait(10)
+            return 200, advice_response({"protected": [], "removable": [], "memories": []})
+        fixture.review = held_review
+        proxy.branch = "uncommitted-parent"
+        proxy.wait_reviews = False
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertTrue(fixture.held.wait(3))
+        self.assertEqual(proxy.saved()["fork_points"], [])
+        proxy.process.kill()
+        proxy.process.wait(3)
+        # Stage a fully written but not renamed publication. Even authentic
+        # reviewed evidence in an orphan tmp must not become recovery authority.
+        identity = hashlib.sha256(wire(["local", "state-regression", proxy.branch])).hexdigest()
+        (self.state / ("." + identity + ".tmp")).write_bytes(wire(accepted_checkpoint))
+        fixture.release.set()
+        proxy = BranchProxy(self.state, fixture, options)
+        self.stack.callback(proxy.close)
+        proxy.branch, proxy.intent = "crash-child", ("uncommitted-parent", handle)
+        self.rejected(proxy, fixture, history, "fork_unknown")
+        proxy.intent = ("main", handle)
+        self.assertEqual(proxy.send(history)[0], 200, "committed ancestor survives same crash")
+        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]))
 
 
 if __name__ == "__main__":

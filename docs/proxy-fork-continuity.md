@@ -1,8 +1,10 @@
 # Explicit historical full-history forks (experimental)
 
 The proxy can seed a **new explicit branch** from a retained, committed review
-cut on another branch of the same authenticated owner and session. It hydrates
-accepted whole-group advice and memories **before** the normal primary planner.
+cut on another branch of the same explicit tenant/session namespace. Gateway
+bearer authentication and the existing caller-supplied `x-carry-tenant` identity
+contract are unchanged: this does not add per-tenant authentication or ACLs.
+It hydrates accepted whole-group advice and memories **before** the normal primary planner.
 This is a limited HTTP contract, not automatic native Pi or Codex fork support.
 
 ## Contract
