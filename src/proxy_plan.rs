@@ -40,7 +40,8 @@ fn review_calls(
     for request in 0..config.payoff_requests {
         // A source rewrite skips this request's ordinary dispatch. Bootstrap
         // already paid for its source; no hypothetical native growth is added.
-        let dispatch = request > 0 || (!changed && !session.bootstrap_review_pending);
+        let dispatch = request > 0
+            || (!config.current_review_suppressed && !changed && !session.bootstrap_review_pending);
         let projected_primary = if dispatch && reusable_primary {
             Some(
                 *primary
@@ -234,6 +235,15 @@ fn plan_inner(
     let keep_cost = keep_schedule
         .as_ref()
         .and_then(|s| review_cost(config, session, &reviewer, s));
+    // One frozen admission decision is shared by all candidate comparisons and
+    // the report, rather than repeatedly projecting the same primary per row.
+    let ordinary_admission =
+        super::admission::decision_for_plan(config, session, body, false, acquisition.is_none());
+    let due = !config.current_review_suppressed
+        && !session.background_review_pending
+        && !(session.bootstrap_review_pending && !session.bootstrap_review_complete)
+        && reviewer_ok
+        && ordinary_admission["admitted"] == true;
     let mut reports = Vec::new();
     let mut best: Option<(Session, f64)> = None;
     // Cleaning only disposable reviewer turns is a real candidate. It can make
@@ -293,17 +303,6 @@ fn plan_inner(
         // Keep the existing recurring-completion diagnostic intact. Selection
         // cannot spend hypothetical repeated background completions. Pending
         // paid work is sunk/unknown, not a reason to withhold valid primary advice.
-        let due = !session.background_review_pending
-            && !(session.bootstrap_review_pending && !session.bootstrap_review_complete)
-            && reviewer_ok
-            && super::admission::decision_for_plan(
-                config,
-                session,
-                body,
-                false,
-                acquisition.is_none(),
-            )["admitted"]
-                == true;
         // A local replay rebuild is not a paid summarizer call. When no review
         // is due, reserve only its positive input cache/write delta under ONE
         // explicitly conditional frozen-source next-request scenario; never
@@ -404,7 +403,8 @@ fn plan_inner(
         "current_review_cost_is_sunk":session.shadow.calls > 0 &&
             (session.last_review_request == session.completed_requests ||
              (session.bootstrap_review_pending && session.bootstrap_review_complete)),
-        "ordinary_review_admission":super::admission::decision_for_plan(config,session,body,false,acquisition.is_none()),
+        "ordinary_review_admission":ordinary_admission,
+        "current_review_dispatch_suppressed":config.current_review_suppressed,
         "review_min_primary_tokens":config.review_min_primary_tokens,
         "review_min_new_tokens":config.review_min_new_tokens,
         "review_every_requests":config.review_every_requests,

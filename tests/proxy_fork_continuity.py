@@ -216,6 +216,20 @@ class ForkContinuity(unittest.TestCase):
                             for row in ordinary["candidates"]))
         self.assertEqual(len(fixture.reviews), reviews + 1,
                          "ordinary continuation retains real positive dispatch/credit")
+        proxy.close()
+        future_options = list(options)
+        future_options[future_options.index("--payoff-requests") + 1] = "3"
+        proxy = BranchProxy(self.state, fixture, future_options + ["--min-payback-percent", "100"])
+        self.stack.callback(proxy.close)
+        proxy.branch, proxy.intent = "lease-credit-child", ("main", handle)
+        reviews = len(fixture.reviews)
+        self.assertEqual(proxy.send(child)[0], 200)
+        future = proxy.saved()["last_plan"]
+        self.assertEqual(future["future_reviewer_calls"], 2,
+                         "suppress only CURRENT dispatch, not the two future ordinary continuations")
+        self.assertEqual(len(fixture.reviews), reviews)
+        self.assertTrue(all(row["selection_review_basis"] != "presently_due_next_review"
+                            for row in future["candidates"]))
 
     def test_expired_ancestor_rejected_after_restart(self):
         env = {"CARRY_PROXY_FORK_MAX_AGE_SECS": "1"}

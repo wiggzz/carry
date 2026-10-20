@@ -175,6 +175,7 @@ async fn lease_held_memory_budget_control(budget: &str, grow: bool) {
         );
         service.config.classifier_max_input_tokens = (lower.ceil() + 8.0) as u32;
     }
+    service.config.reviewer_context_override = Some(service.config.classifier_max_input_tokens);
     assert!(review_fits(
         &service.config,
         &review_body(&service.config, &snapshot)
@@ -980,7 +981,8 @@ fn lease_acceptance_target_tail_tier_crossing_reverses_shared_candidate_gain() {
         actual_input_cost / 2.0 + config.classifier_max_output_tokens as f64 * low.output;
     assert!(
         planning::economic_candidate(&config, &released, &main, 0.0),
-        "primary-only release really appears useful"
+        "primary-only release really appears useful: {}",
+        planning::plan(&config, &released, &main).1
     );
     assert!(
         planning::economic_candidate(&config, &released, &main, underpriced),

@@ -186,7 +186,13 @@ class LeaseControls(StateRegressions):
         self.assertEqual(retired["memories"], [])
         self.assertNotIn(fact, json.dumps(fixture.primaries[-1]["input"]))
         self.assertNotIn(raw, fixture.primaries[-1]["input"])
-        self.assertNotIn(fact, json.dumps(retired), "physical replay/control state must not resurrect retired facts")
+        # Immutable historical cut authority is not active replay/control state:
+        # retaining it permits a distinct explicit child, never this lineage.
+        archive = retired.get("fork_points", [])
+        self.assertEqual(archive, released.get("fork_points", []),
+                         "local fact retirement must not rewrite historical cut authority")
+        active_retired = {key: value for key, value in retired.items() if key != "fork_points"}
+        self.assertNotIn(fact, json.dumps(active_retired), "physical replay/control state must not resurrect retired facts")
         proxy.close()
         proxy = self.proxy(fixture, ["--background-reviews=false"])
         self.assertEqual(proxy.send(history)[0], 200)

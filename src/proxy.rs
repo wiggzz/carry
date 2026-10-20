@@ -59,6 +59,9 @@ pub enum Login {
 #[derive(Clone, Debug, Parser)]
 #[command(name = "carry proxy", about = "Opaque native Responses HTTP proxy")]
 pub struct ProxyCli {
+    /// Ephemeral current-request dispatch policy; future ordinary requests remain forecastable.
+    #[arg(skip)]
+    current_review_suppressed: bool,
     /// Auto prefers a configured API key, then Carry's saved subscription.
     /// API-key mode requires a configured upstream environment key.
     #[arg(long, value_enum, default_value = "auto")]
@@ -1362,6 +1365,7 @@ async fn forward_request(
             effective.config.primary_context_tokens = resolved.primary.capacity_tokens;
             effective.config.classifier_max_input_tokens = resolved.reviewer.capacity_tokens;
             effective.config.model_resolution = Some(resolved);
+            effective.config.current_review_suppressed = declared_fork;
             service = Arc::new(effective);
         }
         let prior_reviewer_compactions = session.reviewer_compactions;
