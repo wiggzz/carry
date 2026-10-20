@@ -111,7 +111,7 @@ class Fixture:
 
 
 class Proxy:
-    def __init__(self, state, fixture, extra=(), extra_env=None):
+    def __init__(self, state, fixture, extra=(), extra_env=None, mode="compact"):
         binary = os.environ["CARRY_TEST_BINARY"]
         # Explicit minimal environment prevents ambient provider/auth/refresh
         # configuration from entering even this loopback-only fixture.
@@ -126,7 +126,7 @@ class Proxy:
                "CARRY_PROXY_REVIEW_EVERY_REQUESTS": "1"}
         env.update(extra_env or {})
         args = [binary, "proxy", "--listen", "127.0.0.1:0", "--no-open-dashboard",
-                "--state-dir", str(state), "--mode", "compact",
+                "--state-dir", str(state), "--mode", mode,
                 "--upstream-url", fixture.url + "/v1/responses",
                 "--classifier-url", fixture.url + "/review",
                 "--classifier-model", "gpt-6-luna",

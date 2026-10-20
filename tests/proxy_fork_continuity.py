@@ -4,6 +4,9 @@ import http.client
 import json
 import time
 import unittest
+import contextlib
+import threading
+from pathlib import Path
 
 from proxy_state_regressions import StateRegressions, Proxy, advice_response, completed, ledger, wire
 
@@ -41,6 +44,8 @@ class BranchProxy(Proxy):
 
 
 class ForkContinuity(unittest.TestCase):
+    state: Path
+    stack: contextlib.ExitStack
     setUp = StateRegressions.setUp
     record_evidence = StateRegressions.record_evidence
     fixture = StateRegressions.fixture
@@ -267,6 +272,61 @@ class ForkContinuity(unittest.TestCase):
             self.assertEqual(proxy.saved()["shadow"]["calls"], 0)
         finally:
             fixture.release.set()
+
+
+    def test_declared_fork_never_disappears_without_a_session_identity(self):
+        proxy, fixture, history, handle, _ = self.seed()
+        counts = (len(fixture.primaries), len(fixture.reviews))
+        connection = http.client.HTTPConnection(*proxy.address, timeout=5)
+        try:
+            connection.request("POST", "/v1/responses", wire({"model": "gpt-6-luna", "input": "no full-history array"}),
+                {"Content-Type": "application/json", "x-carry-fork-parent": "main", "x-carry-fork-point": handle})
+            response = connection.getresponse()
+            body = json.loads(response.read())
+            self.assertEqual(response.status, 409, "explicit fork must never be ignored")
+            self.assertEqual(body["error"]["code"], "fork_unsupported")
+        finally:
+            connection.close()
+        self.assertEqual((len(fixture.primaries), len(fixture.reviews)), counts)
+
+    def test_audit_and_off_modes_reject_declared_fork(self):
+        proxy, fixture, history, handle, options = self.seed()
+        proxy.close()
+        for mode in ["audit", "off"]:
+            proxy = BranchProxy(self.state, fixture, options, mode=mode)
+            self.stack.callback(proxy.close)
+            proxy.branch, proxy.intent = mode + "-child", ("main", handle)
+            self.rejected(proxy, fixture, history, "fork_unsupported")
+            proxy.close()
+
+    def test_fork_plan_has_no_parent_receipts_or_spend_before_upstream_completes(self):
+        proxy, fixture, history, handle, _ = self.seed()
+        self.assertTrue(proxy.saved()["primary_cache"], "control parent has a native receipt")
+        self.assertGreater(proxy.saved()["shadow"]["calls"], 0)
+        def held_primary(_body, _n):
+            fixture.held.set()
+            fixture.release.wait(10)
+            return 200, completed()
+        fixture.primary = held_primary
+        proxy.branch, proxy.intent = "cold-child", ("main", handle)
+        results = []
+        thread = threading.Thread(target=lambda: results.append(proxy.send(history)), daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(fixture.held.wait(3))
+            saved = proxy.saved()
+            self.assertEqual(saved["primary_cache"], [])
+            self.assertEqual(saved["reviewer_cache"], [])
+            self.assertEqual(saved["shadow"]["calls"], 0)
+            self.assertEqual(saved["primary"]["calls"], 0)
+            self.assertEqual(saved["completed_requests"], 0)
+            self.assertFalse(saved["background_review_pending"])
+            self.assertEqual(saved["review_cache_key"], "")
+        finally:
+            fixture.release.set()
+            thread.join(5)
+        self.assertTrue(results)
+        self.assertEqual(results[0][0], 200)
 
 
 if __name__ == "__main__":
