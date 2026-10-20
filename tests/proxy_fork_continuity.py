@@ -138,6 +138,56 @@ class ForkContinuity(unittest.TestCase):
         self.assertEqual(body["error"]["code"], code)
         self.assertEqual((len(fixture.primaries), len(fixture.reviews)), counts)
 
+    def test_joined_cold_child_freezes_current_pair_after_hydration_and_restart(self):
+        proxy, fixture, history, handle, options = self.seed()
+        parent = proxy.saved()
+        self.assertGreater(parent["shadow"]["calls"], 0)
+        self.assertGreater(parent["primary"]["calls"], 0)
+        self.assertIsNotNone(parent["model_resolution"])
+        proxy.close()
+        child_options = options + ["--primary-context-tokens", "60000",
+                                   "--classifier-max-input-tokens", "1024"]
+        proxy = BranchProxy(self.state, fixture, child_options)
+        self.stack.callback(proxy.close)
+        proxy.branch, proxy.intent = "catalog-child", ("main", handle)
+        child = history + [{"role": "user", "content": "COLD_CHILD_SUFFIX"}]
+        before = len(fixture.reviews)
+        self.assertEqual(proxy.send(child)[0], 200)
+        saved = proxy.saved()
+        pair = saved.get("model_resolution")
+        self.assertIsNotNone(pair, "JOIN-001: hydration must not erase the child's frozen pair")
+        for role, capacity in (("primary", 60000), ("reviewer", 1024)):
+            self.assertEqual(pair[role]["capacity_tokens"], capacity)
+            provenance = pair[role]["provenance"]["capacity"]
+            self.assertEqual(provenance["operator_override"], capacity)
+            self.assertNotEqual(provenance["status"], "legacy_snapshot_missing",
+                                "JOIN-001: a newly hydrated child is not a legacy checkpoint")
+        self.assertEqual(saved["model_resolution_history"], [])
+        self.assertEqual(saved["primary"]["calls"], 1, "only the child's actual receipt")
+        self.assertEqual(saved["shadow"]["calls"], 0, "no inherited spend")
+        self.assertEqual(saved["reviewer_cache"], [], "no inherited reviewer receipts")
+        self.assertEqual(len(fixture.reviews), before, "no reviewer recovery")
+        self.assertTrue(saved["last_plan"]["primary_fits"])
+        self.assertFalse(saved["last_plan"]["reviewer_fits"])
+        self.assertFalse(saved["last_plan"]["forced"])
+        sent = fixture.primaries[-1]["input"]
+        self.assertNotIn("RAW_A", json.dumps(sent))
+        self.assertIn("A_FACT", json.dumps(sent))
+        self.assertIn(child[-1], sent)
+        proxy.close()
+        proxy = BranchProxy(self.state, fixture, child_options)
+        self.stack.callback(proxy.close)
+        proxy.branch, proxy.intent = "catalog-child", ("main", handle)
+        self.assertEqual(proxy.send(child)[0], 200)
+        restored = proxy.saved()
+        self.assertEqual(restored["model_resolution"], pair, "restart retains child epoch")
+        self.assertEqual(restored["model_resolution_history"], [])
+        self.assertEqual(restored["primary"]["calls"], 2)
+        self.assertEqual(restored["shadow"]["calls"], 0)
+        self.assertEqual(restored["reviewer_cache"], [])
+        self.assertEqual(len(fixture.reviews), before)
+        self.assertEqual(fixture.primaries[-1]["input"], sent)
+
     def test_expired_ancestor_rejected_after_restart(self):
         env = {"CARRY_PROXY_FORK_MAX_AGE_SECS": "1"}
         proxy, fixture, history, handle, options = self.seed(env)
