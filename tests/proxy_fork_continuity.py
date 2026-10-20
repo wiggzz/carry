@@ -85,7 +85,7 @@ class ForkContinuity(unittest.TestCase):
         self.assertEqual(status, 200, result)
         sent = fixture.primaries[-1]["input"]
         encoded = json.dumps(sent)
-        self.assertNotIn("ANCESTOR_RAW", encoded,
+        self.assertFalse("ANCESTOR_RAW" in encoded,
                          "explicit historical fork must recover accepted A authority after cleanup")
         self.assertIn("ANCESTOR_FACT", encoded)
         self.assertIn(history[0], sent)
