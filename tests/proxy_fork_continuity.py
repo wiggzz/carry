@@ -110,7 +110,7 @@ class ForkContinuity(unittest.TestCase):
             ids = ledger(body)["eligible_group_ids"]
             return 200, advice_response({"protected": [i for i in ids if i == "g1"],
                 "removable": [i for i in ids if i != "g1"],
-                "memories": [{"source_ids": [ids[0]], "text": "A_FACT" if n == 1 else "SIBLING_ONLY_FACT"}]
+                "memories": [{"source_ids": ["g2" if n == 1 else ids[0]], "text": "A_FACT" if n == 1 else "SIBLING_ONLY_FACT"}]
                     if ids else []})
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")), review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
