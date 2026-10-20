@@ -393,6 +393,28 @@ class StateRegressions(unittest.TestCase):
                 fixture.close()
                 self.assertEqual(fixture.errors, [])
                 self.assertEqual(len(fixture.primaries), 3)
+                if variant == "unknown_cache":
+                    # New route-frozen scenarios explicitly model BOTH branches
+                    # uncached when cache support is unknown. This is not an
+                    # unpriced call: the frozen tariff is known. Snapshot-missing
+                    # legacy scenarios retain their omission policy in native
+                    # Trajectory tests; do not infer cache hits from this control.
+                    result = omitted["result"]
+                    delta = result["carry_cost"] - before["carry_cost"]
+                    self.assertGreater(delta, 0)
+                    self.assertAlmostEqual(result["traditional_cost"] - before["traditional_cost"],
+                                           delta, delta=1e-12, msg="matched uncached branches, no invented savings")
+                    self.assertIsNotNone(omitted["previous"])
+                    self.assertEqual(result["excluded_unpriced_calls"], 0)
+                    self.assertGreater(result["coverage"]["unknown_cache_requests"],
+                                       before["coverage"]["unknown_cache_requests"])
+                    estimate = stats["sessions"][0]["cost_estimate"]
+                    self.assert_estimate_available(estimate, True)
+                    self.assertEqual(estimate["excluded_unpriced_calls"], 0)
+                    self.assertAlmostEqual(estimate["carry_cost"], 2 * before["carry_cost"] + delta,
+                                           delta=1e-12, msg="restart preserves frozen totals without repricing")
+                    self.assertEqual(stats["cost_estimate"]["excluded_unpriced_calls"], 0)
+                    continue
                 self.assertEqual(omitted["result"]["carry_cost"], before["carry_cost"], "omit both branches, never a partial pair")
                 self.assertEqual(omitted["result"]["traditional_cost"], before["traditional_cost"])
                 self.assertTrue(omitted["previous"] is None, "an omitted primary cannot preserve a stale cache predecessor")
