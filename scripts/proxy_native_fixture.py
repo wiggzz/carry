@@ -189,6 +189,7 @@ class Fixture:
         self.summary_calls = []
         self.calls = []
         self.errors = []
+        self.state_directory = None
         outer = self
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -299,6 +300,14 @@ class Fixture:
                                 raise ValueError('native full-history tool-result echo missing')
                             if outer.case == 'compact' and count < 5:
                                 command='printf SMALL_COHORT_'+str(count)
+                                if outer.state_directory is not None:
+                                    # The primary has already completed. Sequence this
+                                    # fixture's next native turn after durable reviewer
+                                    # merge, never by waiting inside Carry forwarding.
+                                    import shlex
+                                    command += '; ' + shlex.join(['python3',
+                                        str(Path(__file__).with_name('proxy_native_settle.py').resolve()),
+                                        str(outer.state_directory), str(count)])
                                 args=({'cmd':command,'yield_time_ms':1000,'max_output_tokens':128}
                                       if outer.client == 'codex' else {'command':command})
                                 output=[{'type':'function_call','id':f'fc_fixture_{count}',
@@ -458,6 +467,7 @@ def main():
         with Fixture(client,'pi-checkpoint' if case.startswith('pi-checkpoint') else case) as fixture, socket.socket() as sock:
             sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]; sock.close()
             trial=args.output / (label+'-trial')
+            fixture.state_directory = (trial / 'state').resolve()
             command=['python3',str(Path(__file__).with_name('proxy_trial.py')),
                 '--client',client,'--carry-binary',args.carry,'--client-binary',getattr(args,client),
                 '--workspace',str(workspace),'--trial-dir',str(trial),'--mode','off' if case in ('off','pi-checkpoint-off') else 'compact',

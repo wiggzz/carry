@@ -126,6 +126,59 @@ def contract_state(directory):
 
 
 class NativeProviderFixtureTests(unittest.TestCase):
+    def test_native_tool_settlement_fails_closed_for_unusable_or_pending_checkpoint(self):
+        from scripts.proxy_native_settle import wait_settled
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state.json'
+            for text in (None, '{', '{}', json.dumps({'completed_requests': 3,
+                                                      'background_review_pending': True})):
+                with self.subTest(checkpoint=text):
+                    if text is not None:
+                        state.write_text(text)
+                    with self.assertRaises(TimeoutError):
+                        wait_settled(directory, 3, timeout=.03)
+            state.write_text(json.dumps({'completed_requests': 3, 'background_review_pending': False}))
+            (Path(directory) / 'another.json').write_text(state.read_text())
+            with self.assertRaises(TimeoutError):
+                wait_settled(directory, 3, timeout=.03)
+
+    def test_compact_native_tool_waits_for_completed_primary_and_reviewer_settlement(self):
+        from scripts.proxy_native_fixture import Fixture
+        with tempfile.TemporaryDirectory() as directory, Fixture('pi', 'compact') as fixture:
+            fixture.state_directory = Path(directory)
+            state_file = Path(directory) / 'synthetic.json'
+            state_file.write_text(json.dumps({'completed_requests': 3, 'background_review_pending': True}))
+            fixture.calls.extend([{'prompt_cache_key': 'fixture'}] * 2)
+            request = urllib.request.Request(fixture.url + '/v1/responses',
+                data=json.dumps({'prompt_cache_key': 'fixture', 'input': [
+                    {'type': 'function_call_output', 'call_id': 'call_fixture_1_a', 'output': 'synthetic'}]}).encode(),
+                headers={'content-type': 'application/json'})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                events = [json.loads(line[6:]) for line in response.read().decode().splitlines()
+                          if line.startswith('data: ')]
+            completed = next(event['response'] for event in events if event['type'] == 'response.completed')
+            command = json.loads(completed['output'][0]['arguments'])['command']
+            process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, start_new_session=True)
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired,
+                        msg='native next turn must wait for reviewer settlement after primary consumption'):
+                    process.communicate(timeout=.2)
+                state_file.write_text(json.dumps({'completed_requests': 2, 'background_review_pending': False}))
+                with self.assertRaises(subprocess.TimeoutExpired,
+                        msg='an older settled checkpoint cannot release this native turn'):
+                    process.communicate(timeout=.2)
+                state_file.write_text(json.dumps({'completed_requests': 3, 'background_review_pending': False}))
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertEqual(stdout, 'SMALL_COHORT_3')
+            finally:
+                if process.poll() is None:
+                    import signal
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=5)
+            self.assertEqual(fixture.errors, [])
+
     def test_observer_preserves_delayed_response_after_client_write_eof(self):
         from scripts.proxy_native_fixture import ClientObserver
         import base64
