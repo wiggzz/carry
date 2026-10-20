@@ -21,6 +21,7 @@ use axum::{
     routing::{get, post},
 };
 use carry::core::{Rates, ViewCosts, horizon_cost, input_cost, joint_decision, select_removals};
+use carry::models::{ResolvedModel, Route, RouteClass, SourceCatalog, resolve_model};
 use clap::{Parser, ValueEnum};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -160,6 +161,7 @@ pub struct ProxyCli {
 }
 
 struct Service {
+    catalog: tokio::sync::OnceCell<SourceCatalog>,
     config: ProxyCli,
     client: reqwest::Client,
     upstream_key: Option<String>,
@@ -313,6 +315,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         }
     }
     let service = Arc::new(Service {
+        catalog: tokio::sync::OnceCell::new(),
         upstream_key: std::env::var("CARRY_PROXY_UPSTREAM_KEY")
             .ok()
             .filter(|key| !key.trim().is_empty())
@@ -380,6 +383,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
             get(|| async { axum::Json(json!({"status": "ok"})) }),
         )
         .route("/v1/models", get(models))
+        .route("/carry/catalog", get(catalog))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(native_compact))
         .route("/v1/responses/{id}", get(unsupported).delete(unsupported))
@@ -576,7 +580,7 @@ async fn models(
 // openai/codex rust-v0.147.0, codex-api/src/endpoint/models.rs.
 const CODEX_MODELS_CLIENT_VERSION: &str = "0.147.0";
 
-async fn codex_models(service: &Service) -> Result<Response, Failure> {
+async fn fetch_codex_models(service: &Service) -> Result<Value, Failure> {
     let unavailable = || {
         failure(
             StatusCode::BAD_GATEWAY,
@@ -606,6 +610,7 @@ async fn codex_models(service: &Service) -> Result<Response, Failure> {
     let response = service
         .client
         .get(format!("{endpoint}/models"))
+        .timeout(Duration::from_secs(15))
         .query(&[("client_version", CODEX_MODELS_CLIENT_VERSION)])
         .bearer_auth(&credential.access_token)
         .header("chatgpt-account-id", &credential.account_id)
@@ -623,7 +628,17 @@ async fn codex_models(service: &Service) -> Result<Response, Failure> {
     let bytes = bounded(response, 8 * 1024 * 1024)
         .await
         .map_err(|_| unavailable())?;
-    let catalog: Value = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
+    serde_json::from_slice(&bytes).map_err(|_| unavailable())
+}
+
+async fn codex_models(service: &Service) -> Result<Response, Failure> {
+    let catalog = fetch_codex_models(service).await?;
+    let unavailable = || {
+        failure(
+            StatusCode::BAD_GATEWAY,
+            "Codex model discovery unavailable; configure models explicitly",
+        )
+    };
     let models = catalog["models"].as_array().ok_or_else(unavailable)?;
     let mut seen = HashSet::new();
     let mut data = Vec::new();
@@ -647,6 +662,84 @@ async fn codex_models(service: &Service) -> Result<Response, Failure> {
         }
     }
     Ok(axum::Json(json!({"object": "list", "data": data})).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct CatalogQuery {
+    model: String,
+}
+
+async fn resolved_catalog(
+    service: &Service,
+    model: &str,
+) -> Result<(ResolvedModel, ResolvedModel), Failure> {
+    let config = &service.config;
+    let primary_route = Route::new(&config.upstream_url, config.codex_login);
+    let reviewer_route = Route::new(
+        config
+            .classifier_url
+            .as_deref()
+            .unwrap_or(&config.upstream_url),
+        config.codex_login && config.classifier_url.is_none(),
+    );
+    let source = if config.codex_login {
+        Some(
+            service
+                .catalog
+                .get_or_init(|| async {
+                    // Fetch once per process route epoch, including failed resolution.
+                    // Checkpoints freeze the resulting facts rather than refreshing age.
+                    match tokio::time::timeout(Duration::from_secs(20), fetch_codex_models(service))
+                        .await
+                    {
+                        Ok(Ok(value)) => SourceCatalog::from_codex(
+                            &value,
+                            now(),
+                            matches!(primary_route.class, RouteClass::SyntheticSubscription),
+                        )
+                        .unwrap_or_else(|_| SourceCatalog::unavailable(now())),
+                        _ => SourceCatalog::unavailable(now()),
+                    }
+                })
+                .await,
+        )
+    } else {
+        None
+    };
+    let error = |message| failure(StatusCode::BAD_REQUEST, message);
+    let primary = resolve_model(
+        model,
+        primary_route,
+        source,
+        None,
+        config.primary_context_tokens,
+        config.primary_output_reserve_tokens,
+        config.context_margin_percent,
+    )
+    .map_err(error)?;
+    let reviewer = resolve_model(
+        &config.classifier_model,
+        reviewer_route,
+        source,
+        None,
+        config.classifier_max_input_tokens,
+        config.classifier_max_output_tokens,
+        config.context_margin_percent,
+    )
+    .map_err(error)?;
+    Ok((primary, reviewer))
+}
+
+async fn catalog(
+    State(service): State<Arc<Service>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<CatalogQuery>,
+) -> Result<axum::Json<Value>, Failure> {
+    authorize(&service, &headers)?;
+    let (primary, reviewer) = resolved_catalog(&service, &query.model).await?;
+    Ok(axum::Json(
+        json!({"schema_version":1,"primary":primary,"reviewer":reviewer}),
+    ))
 }
 
 async fn metrics(
@@ -3601,6 +3694,7 @@ mod tests {
         let mut config = reviewer_config();
         config.state_dir = directory.to_path_buf();
         Service {
+            catalog: tokio::sync::OnceCell::new(),
             _directory_lock: private_file(&directory.join(".lock"), true).unwrap(),
             config,
             client: reqwest::Client::new(),
@@ -5006,6 +5100,7 @@ mod tests {
             "save must not amplify valid source into a permanently unloadable checkpoint"
         );
         let service = Service {
+            catalog: tokio::sync::OnceCell::new(),
             _directory_lock: private_file(&directory.path().join(".lock"), true).unwrap(),
             config,
             client: reqwest::Client::new(),
