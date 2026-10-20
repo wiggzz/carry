@@ -93,7 +93,7 @@ async fn lease_held_memory_budget_control(budget: &str, grow: bool) {
     session.completed_requests += 8; // only maturity is staged
     let old_lease = session.keep_leases.as_ref().unwrap().entries[&memory_key].clone();
     let proposal = json!({"protected":[],"removable":[],"memories":[
-        {"source_ids":["g2"],"text":"new useful learning ".repeat(170)}]});
+        {"source_ids":["g2"],"text":"new ".repeat(900)}]});
     *advice.lock().await = proposal.clone();
     let mut snapshot = session.clone();
     snapshot.keep_leases.as_mut().unwrap().pending = Some(crate::proxy_state::PendingKeepReview {
@@ -145,6 +145,7 @@ async fn lease_held_memory_budget_control(budget: &str, grow: bool) {
     // cannot masquerade as current-budget rejection at the merge boundary.
     if budget == "bytes" {
         let lower = (2 * sb - seb)
+            .max(gb)
             .max(reviewer_serialized_identity(&review_body(&service.config, &full_grown)).0)
             .max(reviewer_serialized_identity(&review_body(&service.config, &snapshot)).0);
         let upper = 2 * gb - geb;
@@ -155,6 +156,10 @@ async fn lease_held_memory_budget_control(budget: &str, grow: bool) {
         service.config.classifier_max_input_bytes = (lower + 32) as u32;
     } else {
         let lower = (2.0 * st - set)
+            .max(reviewer_required_tokens(
+                &service.config,
+                &memory_review_body(&service.config, &grown_proposal),
+            ))
             .max(reviewer_required_tokens(
                 &service.config,
                 &review_body(&service.config, &full_grown),
@@ -180,6 +185,13 @@ async fn lease_held_memory_budget_control(budget: &str, grow: bool) {
     ));
     assert!(memory_admission_fits(&service.config, &snapshot_proposal));
     assert!(memory_admission_fits(&service.config, &grown));
+    assert!(
+        review_fits(
+            &service.config,
+            &memory_review_body(&service.config, &grown_proposal)
+        ),
+        "proposed memory fits hard capacity: only the half-capacity reserve may reject it"
+    );
     assert!(!memory_admission_fits(&service.config, &grown_proposal));
     let mut accepted_snapshot = snapshot.clone();
     accepted_snapshot
@@ -938,7 +950,7 @@ fn lease_acceptance_target_tail_tier_crossing_reverses_shared_candidate_gain() {
     let high = Rates::for_model(&config.classifier_model, estimate(&targeted)).unwrap();
     let low = Rates::for_model(&config.classifier_model, estimate(&ordinary)).unwrap();
     assert_eq!(high.input, 2.0 * low.input);
-    assert_eq!(high.output, 1.5 * low.output);
+    assert!((high.output - 1.5 * low.output).abs() < 1e-18);
     let actual_input_cost =
         reviewer_view_costs(&config, &session.reviewer_cache, &targeted, &targeted, 1)
             .unwrap()
