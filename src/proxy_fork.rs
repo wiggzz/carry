@@ -207,20 +207,22 @@ pub(super) fn hydrate(
     {
         return Err(conflict("fork_incompatible"));
     }
-    let mut child = Session::default();
-    child.version = 1;
-    child.history = input
-        .iter()
-        .zip(&point.sources)
-        .map(|(v, s)| Item {
-            id: s.id,
-            cohort: s.cohort,
-            exposed: s.exposed,
-            removed: false,
-            value: v.clone(),
-        })
-        .collect();
-    child.next_id = point.sources.iter().map(|s| s.id).max().unwrap_or(0);
+    let mut child = Session {
+        version: 1,
+        history: input
+            .iter()
+            .zip(&point.sources)
+            .map(|(v, s)| Item {
+                id: s.id,
+                cohort: s.cohort,
+                exposed: s.exposed,
+                removed: false,
+                value: v.clone(),
+            })
+            .collect(),
+        next_id: point.sources.iter().map(|s| s.id).max().unwrap_or(0),
+        ..Session::default()
+    };
     if groups(&child) != point.groups {
         return Err(conflict("fork_incompatible"));
     }
