@@ -106,6 +106,9 @@ class KeepLeases(StateRegressions):
         self.assertEqual(proxy.saved()["opinions"].get("2"), "keep")
         proxy.close()
         proxy = self.proxy(fixture, options + ["--review-min-new-tokens", "25000"])
+        # The legacy flag no longer makes review a primary dependency. This
+        # concurrency case must not wait in the fixture's post-response barrier.
+        proxy.wait_reviews = False
         self.assertEqual(proxy.send(history)[0], 200)
         self.assertEqual(proxy.send(history)[0], 200)
         before = len(fixture.primaries)

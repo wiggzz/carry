@@ -32,6 +32,35 @@ fn lease_fixture() -> (ProxyCli, Session, Value) {
 }
 
 #[test]
+fn lease_join_current_suppression_keeps_future_extra_revalidation_positive() {
+    let (mut config, session, mut body) = lease_fixture();
+    body["model"] = json!("gpt-6-sol");
+    config.payoff_requests = 1;
+    assert_eq!(
+        admission::decision(&config, &session, &body, false)["reason"],
+        "keep_lease_economic"
+    );
+    let before = serde_json::to_value(&session).unwrap();
+    config.current_review_suppressed = true;
+    let (_, current) = plan(&config, &session, &body);
+    assert_eq!(current["future_reviewer_calls"], 0);
+    config.payoff_requests = 3;
+    let (_, future) = plan(&config, &session, &body);
+    assert_eq!(
+        future["future_reviewer_calls"], 1,
+        "only current dispatch is suppressed: ordinary future may buy one profitable bounded lease review"
+    );
+    config.current_review_suppressed = false;
+    let (_, ordinary) = plan(&config, &session, &body);
+    assert_eq!(ordinary["future_reviewer_calls"], 1);
+    assert_eq!(
+        serde_json::to_value(&session).unwrap(),
+        before,
+        "forecast cannot reserve live attempts or release live protection"
+    );
+}
+
+#[test]
 fn lease_economic_demand_can_admit_one_review_without_new_source_growth() {
     let (config, session, mut body) = lease_fixture();
     assert!(!session.drop_authorized(&session.groups()[1]));

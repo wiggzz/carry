@@ -979,6 +979,30 @@ fn lease_acceptance_target_tail_tier_crossing_reverses_shared_candidate_gain() {
             .keep;
     let underpriced =
         actual_input_cost / 2.0 + config.classifier_max_output_tokens as f64 * low.output;
+    // JOIN's conservative selection also reserves the positive conditional
+    // reviewer rebuild debit. Preserve the leaf's original five-request result
+    // as a sensitivity-vs-selection negative; calibrate a *longer* bounded
+    // horizon from actual rendered costs to isolate the acquisition tier again.
+    let (_, joined) = planning::plan(&config, &released, &main);
+    let row = &joined["candidates"][0];
+    assert_eq!(row["joint"]["accepted"], true);
+    assert_eq!(
+        row["selection_joint"]["accepted"], false,
+        "original payoff5 must not bypass JOIN's conditional rebuild money gate"
+    );
+    let decision = &row["selection_joint"];
+    let gain_per_request = (decision["primary_keep"].as_f64().unwrap()
+        - decision["primary_compact"].as_f64().unwrap())
+        / config.payoff_requests as f64;
+    let allowance = decision["future_shadow_compact"].as_f64().unwrap();
+    assert!(gain_per_request > 0.0 && allowance > 0.0 && paid > underpriced);
+    let horizon = ((allowance + underpriced) / gain_per_request).floor() as u32 + 1;
+    assert!(horizon >= config.payoff_requests && horizon <= 100);
+    assert!(
+        (horizon as f64) * gain_per_request < allowance + paid,
+        "real-render tier interval must contain an integral authorized horizon"
+    );
+    config.payoff_requests = horizon;
     assert!(
         planning::economic_candidate(&config, &released, &main, 0.0),
         "primary-only release really appears useful: {}",
@@ -999,6 +1023,9 @@ fn lease_acceptance_target_tail_tier_crossing_reverses_shared_candidate_gain() {
     lease_measurement(json!({"scenario":"due_target_tail_tier_monetary_reversal",
         "ordinary_tokens":estimate(&ordinary),"targeted_tokens":estimate(&targeted),"tier_threshold":threshold,
         "actual_paid_usd":paid,"underpriced_control_usd":underpriced,
+        "horizon":config.payoff_requests,"original_horizon":5,"conditional_rebuild_allowance_usd":allowance,
+        "primary_gain_per_request_usd":gain_per_request,
+        "original_sensitivity_accepted":true,"original_selection_accepted":false,
         "primary_only_candidate":true,"underpriced_candidate":true,"actual_candidate":false,
         "cache_credit_tokens":reviewer_reusable(&config,&session.reviewer_cache,&targeted)}));
 }
