@@ -897,11 +897,17 @@ async fn native_compact(
 struct ReviewRun {
     background: bool,
     pressure: bool,
-    valid_admission: bool,
-    successful_sources: Vec<Group>,
+    batches: Vec<ReviewBatch>,
     request_id: String,
     receipts: Vec<ReviewReceipt>,
     reviewed_sources: Vec<Group>,
+}
+
+struct ReviewBatch {
+    sources: Vec<Group>,
+    bootstrap_ids: Vec<u64>,
+    valid_without_memories: bool,
+    memory_ids: Vec<u64>,
 }
 
 struct ReviewReceipt {
@@ -2111,13 +2117,6 @@ fn merge_review(
         return false;
     }
     admission::initialize(current);
-    if before.bootstrap_review_pending && !before.bootstrap_review_complete {
-        current
-            .bootstrap_reviewed_ids
-            .extend(reviewed.bootstrap_reviewed_ids.iter().copied());
-        current.bootstrap_review_complete = reviewed.bootstrap_review_complete;
-        current.bootstrap_review_pending = !reviewed.bootstrap_review_complete;
-    }
     let before_admission = current.clone();
     let before_memory_input = current.render_primary();
     // Apply reviewer deltas only. Never replace a newer live opinion (including
@@ -2223,24 +2222,44 @@ fn merge_review(
         .saturating_sub(before.reviewer_compactions);
     current.review_epoch = reviewed.review_epoch;
     current.last_review_request = reviewed.last_review_request;
-    // Snapshot validity is insufficient: current-budget revalidation can reject
-    // every accepted memory. Only committed valid advice may cover sources or
-    // update no-yield backoff; valid-empty and partially accepted batches count.
-    let committed_valid = run.valid_admission
-        && (current.review_feedback["rejected_count"] == 0
-            || current.review_feedback["accepted_opinions"]
-                .as_u64()
-                .unwrap_or(0)
-                > 0
-            || current.review_feedback["accepted_memories"]
-                .as_u64()
-                .unwrap_or(0)
-                > 0);
+    // Current-budget admission may reject all memories from any import chunk.
+    // Its final feedback describes only the last chunk, not the whole worker.
+    let committed_batches = run
+        .batches
+        .iter()
+        .filter(|batch| {
+            batch.valid_without_memories
+                || batch
+                    .memory_ids
+                    .iter()
+                    .any(|id| current.memories.iter().any(|memory| memory.id == *id))
+        })
+        .collect::<Vec<_>>();
+    let committed_valid = !committed_batches.is_empty();
+    let successful_sources = committed_batches
+        .iter()
+        .flat_map(|batch| batch.sources.iter().cloned())
+        .collect::<Vec<_>>();
+    if before.bootstrap_review_pending && !before.bootstrap_review_complete {
+        for batch in &committed_batches {
+            current.bootstrap_reviewed_ids.extend(&batch.bootstrap_ids);
+        }
+        current.bootstrap_review_complete = !current.groups().iter().any(|group| {
+            group.exposed
+                && !group.pinned
+                && group
+                    .members
+                    .iter()
+                    .all(|id| *id <= current.bootstrap_end_id)
+                && !current.bootstrap_reviewed_ids.contains(&group.id)
+        });
+        current.bootstrap_review_pending = !current.bootstrap_review_complete;
+    }
     admission::complete(
         &before_admission,
         current,
         committed_valid,
-        &run.successful_sources,
+        &successful_sources,
     );
     forking::publish(config, current, before, committed_valid);
     true
@@ -2419,6 +2438,7 @@ async fn review_import(
             }
             return false;
         }
+        run.batches.last_mut().unwrap().bootstrap_ids = added.clone();
         session.bootstrap_reviewed_ids.extend(added);
         if !run.background && save(service, id, session).is_err() {
             return false;
@@ -2669,9 +2689,28 @@ async fn review_chunk(
     {
         session.partial_reviews += 1;
     }
-    run.valid_admission |= valid;
     if valid {
-        run.successful_sources.extend(groups.iter().cloned());
+        run.batches.push(ReviewBatch {
+            sources: groups.to_vec(),
+            bootstrap_ids: Vec::new(),
+            valid_without_memories: (session.review_feedback["rejected_count"] == 0
+                && session.review_feedback["accepted_memories"] == 0)
+                || session.review_feedback["accepted_opinions"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0,
+            memory_ids: session
+                .memories
+                .iter()
+                .filter(|memory| {
+                    !before_admission
+                        .memories
+                        .iter()
+                        .any(|old| old.id == memory.id)
+                })
+                .map(|memory| memory.id)
+                .collect(),
+        });
     }
     let outcome = admission::complete(&before_admission, session, valid, groups);
     journal(
