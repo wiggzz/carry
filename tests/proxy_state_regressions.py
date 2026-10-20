@@ -111,7 +111,7 @@ class Fixture:
 
 
 class Proxy:
-    def __init__(self, state, fixture, extra=()):
+    def __init__(self, state, fixture, extra=(), extra_env=None, mode="compact"):
         binary = os.environ["CARRY_TEST_BINARY"]
         # Explicit minimal environment prevents ambient provider/auth/refresh
         # configuration from entering even this loopback-only fixture.
@@ -124,14 +124,16 @@ class Proxy:
                "CARRY_PROXY_REVIEW_MIN_NEW_TOKENS": "0",
                "CARRY_PROXY_REVIEW_BACKOFF_FACTOR": "1",
                "CARRY_PROXY_REVIEW_EVERY_REQUESTS": "1"}
+        env.update(extra_env or {})
         args = [binary, "proxy", "--listen", "127.0.0.1:0", "--no-open-dashboard",
-                "--state-dir", str(state), "--mode", "compact",
+                "--state-dir", str(state), "--mode", mode,
                 "--upstream-url", fixture.url + "/v1/responses",
                 "--classifier-url", fixture.url + "/review",
                 "--classifier-model", "gpt-6-luna",
                 *([] if "--min-payback-percent" in extra else ["--min-payback-percent", "0"]),
                 "--bootstrap-min-input-bytes", "8388608",
-                "--request-timeout-secs", "5", "--classifier-timeout-secs", "10",
+                *([] if "--request-timeout-secs" in extra else ["--request-timeout-secs", "5"]),
+                *([] if "--classifier-timeout-secs" in extra else ["--classifier-timeout-secs", "10"]),
                 *extra]
         if not any(arg.startswith("--background-reviews") for arg in args):
             args += ["--background-reviews=false"]
@@ -149,6 +151,10 @@ class Proxy:
         host, port = banner.split(" ", 1)[1].rsplit(":", 1)
         self.address = (host, int(port))
         self.state = Path(state)
+        # Legacy synchronous fixtures inspect accepted advice immediately after
+        # a response. Synchronize *after reading the primary response*, never in
+        # production admission. Background/concurrency fixtures opt out.
+        self.wait_reviews = "--background-reviews=false" in args
         status, _ = self.request("GET", "/health")
         assert status == 200, "real Carry health route is required"
 
@@ -168,8 +174,14 @@ class Proxy:
             connection.close()
 
     def send(self, input_items, **fields):
-        return self.request("POST", "/v1/responses",
-                            {"model": "gpt-6-luna", "input": input_items, **fields})
+        response = self.request("POST", "/v1/responses",
+                                {"model": "gpt-6-luna", "input": input_items, **fields})
+        if self.wait_reviews:
+            deadline = time.monotonic() + 15
+            while self.saved().get("background_review_pending"):
+                assert time.monotonic() < deadline, "post-response reviewer did not settle"
+                time.sleep(0.01)
+        return response
 
     def saved(self):
         files = list(self.state.glob("*.json"))

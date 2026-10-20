@@ -58,7 +58,7 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
     let reviewer = review_body(config, session);
     let primary_ok = primary_fits(config, body);
     let reviewer_ok = review_fits(config, &reviewer);
-    let forced = !primary_ok || !reviewer_ok;
+    let forced = !primary_ok;
     let groups = session.groups();
     let eligible = groups
         .iter()
@@ -101,7 +101,7 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
     let keep_calls = if reviewer_ok {
         review_calls(config, session, body, false)
     } else {
-        None // capacity rescue/cleanup must finish before ordinary dispatch
+        None // deferred reviewer schedule; not primary infeasibility
     };
     let keep_cost = keep_calls.and_then(|calls| review_cost(config, session, &reviewer, calls));
     let mut reports = Vec::new();
@@ -120,7 +120,7 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         let mut compact = body.clone();
         compact["input"] = json!(candidate.render_primary());
         let compact_review = review_body(config, &candidate);
-        let feasible = primary_fits(config, &compact) && review_fits(config, &compact_review);
+        let feasible = primary_fits(config, &compact);
         let compact = primary_wire_body(config, &compact);
         let compact_calls = review_calls(config, &candidate, body, changed);
         let shadow = keep_cost
@@ -129,7 +129,7 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
                     .and_then(|calls| review_cost(config, &candidate, &compact_review, calls)),
             )
             .map(|(keep, compact)| ViewCosts { keep, compact });
-        let joint = if standard(body) {
+        let primary = if standard(body) {
             view_costs(
                 &wire,
                 &compact,
@@ -137,24 +137,72 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
                 wire["model"].as_str().unwrap_or(""),
                 config.payoff_requests,
             )
-            .zip(shadow)
-            .map(|(primary, shadow)| joint_decision(primary, shadow, config.min_payback_percent))
         } else {
             None
         };
+        let joint = primary
+            .zip(shadow)
+            .map(|(primary, shadow)| joint_decision(primary, shadow, config.min_payback_percent));
+        // Keep the existing recurring-completion diagnostic intact. Selection
+        // cannot spend hypothetical repeated background completions. Pending
+        // paid work is sunk/unknown, not a reason to withhold valid primary advice.
+        let due = !session.background_review_pending
+            && !(session.bootstrap_review_pending && !session.bootstrap_review_complete)
+            && reviewer_ok
+            && super::admission::decision(config, session, body, false)["admitted"] == true;
+        // A local replay rebuild is not a paid summarizer call. When no review
+        // is due, reserve only its positive input cache/write delta under ONE
+        // explicitly conditional frozen-source next-request scenario; never
+        // credit savings or output completions from that unknown future work.
+        // An oversized rendering is not a request we can dispatch or price as
+        // one. Defer it rather than let fictional reviewer work veto primary.
+        let rebuild_allowance = if review_fits(config, &compact_review) && reviewer_ok {
+            reviewer_view_costs(
+                config,
+                &session.reviewer_cache,
+                &reviewer,
+                &compact_review,
+                1,
+            )
+            .map(|cost| (cost.compact - cost.keep).max(0.0))
+        } else {
+            Some(0.0)
+        };
+        let selection_shadow = if due {
+            review_cost(config, session, &reviewer, 1)
+                .zip(if changed {
+                    // This rewrite skips the due review, but its next cold/write
+                    // input is not free. Reserve ONE positive input delta only;
+                    // do not invent a completion on the compacted branch.
+                    rebuild_allowance
+                } else {
+                    review_cost(config, &candidate, &compact_review, 1)
+                })
+                .map(|(keep, compact)| ViewCosts { keep, compact })
+        } else {
+            rebuild_allowance.map(|allowance| ViewCosts {
+                keep: 0.0,
+                compact: allowance,
+            })
+        };
+        let selection_joint = primary
+            .zip(selection_shadow)
+            .map(|(primary, shadow)| joint_decision(primary, shadow, config.min_payback_percent));
         reports.push(json!({"removed_groups":removed,"feasible":feasible,"joint":joint,
+            "selection_joint":selection_joint,
+            "selection_review_basis":if due {"presently_due_next_review"} else {"conditional_one_request_input_rebuild_allowance_no_review_savings"},
+            "selection_rebuild_allowance_assumption":"one_frozen_source_next_request_if_both_renderings_fit_not_a_dispatch_forecast",
+            "selection_reviewer_output_completions":if due {Some(u64::from(!changed))} else {None},
+            "selection_future_review_total_unknown":keep_calls.is_none(),
             "future_reviewer_keep_calls":keep_calls,"future_reviewer_compact_calls":compact_calls,
             "primary_retained_estimated_tokens":estimate(&compact),
             "reviewer_retained_estimated_tokens":estimate(&compact_review),
             "reviewer_cached_estimated_tokens":reviewer_reusable(config,&session.reviewer_cache,&compact_review)}));
-        if feasible && (forced || joint.is_some_and(|decision| decision.accepted)) {
+        if feasible && (forced || selection_joint.is_some_and(|decision| decision.accepted)) {
             let score = if forced {
-                joint.map_or_else(
-                    || estimate(&compact) + estimate(&compact_review),
-                    |d| d.compact,
-                )
+                selection_joint.map_or_else(|| estimate(&compact), |d| d.compact)
             } else {
-                -joint.map_or(0.0, |d| d.savings)
+                -selection_joint.map_or(0.0, |d| d.savings)
             };
             if best.as_ref().is_none_or(|(_, prior)| score < *prior) {
                 best = Some((candidate, score));

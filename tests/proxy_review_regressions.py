@@ -369,9 +369,10 @@ class ReviewRegressions(unittest.TestCase):
                              primaries=fixture.primaries)
         self.assertEqual(status, 413 if forced else 200)
         self.assertEqual(len(fixture.primaries), 1 if forced else 2)
-        self.assertEqual(len(fixture.reviews), int(known),
-                         "TRANSPORT-SUG06: unknown primary rates must not spend capacity reviews")
-        self.assertEqual(saved["shadow"]["calls"], int(known))
+        expected_reviews = int(known and not forced)
+        self.assertEqual(len(fixture.reviews), expected_reviews,
+                         "no capacity rescue review; unknown prices never authorize paid review")
+        self.assertEqual(saved["shadow"]["calls"], expected_reviews)
 
     def test_transport_sug06_forced_unknown_primary_never_spends_review(self):
         self.unknown_capacity()
@@ -379,8 +380,11 @@ class ReviewRegressions(unittest.TestCase):
     def test_transport_sug06_ordinary_unknown_primary_control(self):
         self.unknown_capacity(forced=False)
 
-    def test_transport_sug06_forced_known_primary_control(self):
+    def test_transport_sug06_forced_known_primary_never_spends_rescue_review(self):
         self.unknown_capacity(known=True)
+
+    def test_transport_sug06_ordinary_known_primary_review_control(self):
+        self.unknown_capacity(known=True, forced=False)
 
 
 if __name__ == "__main__":
