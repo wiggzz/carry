@@ -4124,6 +4124,7 @@ mod tests {
     include!("proxy_pr154_controls.rs");
     include!("proxy_catalog_isolation_tests.rs");
     include!("proxy_catalog_pair_tests.rs");
+    include!("proxy_lease_join_tests.rs");
     mod admission_tests {
         include!("proxy_admission_tests.rs");
         include!("proxy_admission_controls.rs");

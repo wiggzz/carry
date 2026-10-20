@@ -188,6 +188,35 @@ class ForkContinuity(unittest.TestCase):
         self.assertEqual(len(fixture.reviews), before)
         self.assertEqual(fixture.primaries[-1]["input"], sent)
 
+    def test_lease_join_declared_retry_has_no_current_review_credit_but_continuation_does(self):
+        proxy, fixture, history, handle, options = self.seed()
+        proxy.close()
+        proxy = BranchProxy(self.state, fixture, options + ["--min-payback-percent", "100"])
+        self.stack.callback(proxy.close)
+        proxy.branch, proxy.intent = "lease-credit-child", ("main", handle)
+        child = history + [{"role": "user", "content": "CHILD_CREDIT_SUFFIX"}]
+        reviews = len(fixture.reviews)
+        self.assertEqual(proxy.send(child)[0], 200)
+        self.assertEqual(proxy.send(child)[0], 200)
+        suppressed = proxy.saved()["last_plan"]
+        self.assertTrue(suppressed["ordinary_review_admission"]["admitted"],
+                        "nonzero retry age must reach the real due-review planner seam")
+        self.assertTrue(suppressed["candidates"])
+        self.assertEqual(len(fixture.reviews), reviews, "declared retry really suppresses dispatch")
+        self.assertTrue(all(row["selection_review_basis"] != "presently_due_next_review"
+                            for row in suppressed["candidates"]),
+                        "LEASE_JOIN_DECLARED_RETRY_RED: suppressed current request cannot earn avoided-review credit")
+        self.assertEqual(suppressed["future_reviewer_calls"], 0,
+                         "payoff1 contains only the suppressed current request")
+        proxy.intent = None
+        self.assertEqual(proxy.send(child)[0], 200)
+        ordinary = proxy.saved()["last_plan"]
+        self.assertEqual(ordinary["future_reviewer_calls"], 1)
+        self.assertTrue(all(row["selection_review_basis"] == "presently_due_next_review"
+                            for row in ordinary["candidates"]))
+        self.assertEqual(len(fixture.reviews), reviews + 1,
+                         "ordinary continuation retains real positive dispatch/credit")
+
     def test_expired_ancestor_rejected_after_restart(self):
         env = {"CARRY_PROXY_FORK_MAX_AGE_SECS": "1"}
         proxy, fixture, history, handle, options = self.seed(env)

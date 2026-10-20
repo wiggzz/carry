@@ -39,6 +39,10 @@ async fn catalog_pair_send(service: Arc<Service>, body: &Value, request: &str) {
 }
 
 async fn catalog_pair_refresh_control(kind: &str) {
+    catalog_pair_lease_control(kind, false).await;
+}
+
+async fn catalog_pair_lease_control(kind: &str, lease: bool) {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::sync::atomic::{AtomicU32, AtomicUsize};
     let directory = tempfile::tempdir().unwrap();
@@ -158,6 +162,17 @@ async fn catalog_pair_refresh_control(kind: &str) {
         .unwrap()
         .reviewer
         .price_basis = "synthetic_fixture_only".into();
+    if lease {
+        // Stage maturity only; accept protection through the production callback.
+        seeded.initialize_keep_leases(8);
+        seeded
+            .apply_advice(
+                &seeded.groups(),
+                &json!({"protected":["g2"],"removable":[],"memories":[]}),
+            )
+            .unwrap();
+        seeded.completed_requests += 8;
+    }
     save(&service, &id, &seeded).unwrap();
     drop(service);
     capacity.store(new_capacity, Ordering::SeqCst);
@@ -174,6 +189,20 @@ async fn catalog_pair_refresh_control(kind: &str) {
         .unwrap();
     let before = load(&service, &id).unwrap();
     assert!(before.background_review_pending);
+    if lease {
+        assert!(
+            before
+                .keep_leases
+                .as_ref()
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .targets
+                .contains_key("g2"),
+            "actual held dispatch owns due g2"
+        );
+    }
     assert_eq!(before.shadow.calls, 0);
     assert_eq!(
         metadata_calls.load(Ordering::SeqCst),
@@ -259,7 +288,16 @@ async fn catalog_pair_refresh_control(kind: &str) {
             < 1e-12
     );
     assert_eq!(merged.primary.cost_usd, paid_primary);
-    assert_eq!(merged.completed_requests, 3);
+    assert_eq!(merged.completed_requests, if lease { 11 } else { 3 });
+    if lease {
+        assert!(merged.keep_leases.as_ref().unwrap().pending.is_none());
+        assert_eq!(
+            merged.opinions.get(&2).map(String::as_str),
+            if kind == "shrink" { Some("keep") } else { None },
+            "CURRENT catalog rejection cannot release the held target; accepted omission can"
+        );
+        assert_eq!(merged.released_group(&merged.groups()[1]), kind != "shrink");
+    }
     assert!(!merged.background_review_pending);
     assert_eq!(
         serde_json::to_value(&merged.model_resolution).unwrap(),
@@ -292,6 +330,13 @@ async fn catalog_pair_refresh_control(kind: &str) {
         "restart must not settle receipt twice"
     );
     assert_eq!(restored.shadow.cost_usd, merged.shadow.cost_usd);
+    if lease {
+        assert_eq!(
+            serde_json::to_value(&restored.keep_leases).unwrap(),
+            serde_json::to_value(&merged.keep_leases).unwrap()
+        );
+        assert_eq!(restored.opinions, merged.opinions);
+    }
     assert_eq!(restored.memories.len(), merged.memories.len());
     assert_eq!(review_calls.load(Ordering::SeqCst), 1);
     provider.abort();
@@ -308,4 +353,14 @@ async fn catalog_r2_held_review_accepts_fitting_memory_after_current_pair_grows(
 #[tokio::test]
 async fn catalog_r2_held_review_preserves_unchanged_capacity_positive_control() {
     catalog_pair_refresh_control("unchanged").await;
+}
+
+#[tokio::test]
+async fn lease_join_catalog_rejection_preserves_held_target_and_settles_old_tariff_once() {
+    catalog_pair_lease_control("shrink", true).await;
+}
+
+#[tokio::test]
+async fn lease_join_catalog_acceptance_releases_held_target_positive_control() {
+    catalog_pair_lease_control("grow", true).await;
 }
