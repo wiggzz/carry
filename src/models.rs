@@ -364,6 +364,16 @@ impl ResolvedModel {
     }
 }
 
+/// Saved once per route/model configuration epoch, shared by export/admission.
+/// A checkpoint without this additive field is a legacy interpretation, never
+/// permission to apply newly fetched facts to its earlier usage/cost history.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ResolvedPair {
+    pub schema_version: u32,
+    pub primary: ResolvedModel,
+    pub reviewer: ResolvedModel,
+}
+
 pub fn resolve_model(
     model: &str,
     route: Route,

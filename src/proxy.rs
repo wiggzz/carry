@@ -21,7 +21,7 @@ use axum::{
     routing::{get, post},
 };
 use carry::core::{Rates, ViewCosts, horizon_cost, input_cost, joint_decision, select_removals};
-use carry::models::{ResolvedModel, Route, RouteClass, SourceCatalog, resolve_model};
+use carry::models::{ResolvedModel, ResolvedPair, Route, RouteClass, SourceCatalog, resolve_model};
 use clap::{Parser, ValueEnum};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -56,7 +56,7 @@ pub enum Login {
     Codex,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(name = "carry proxy", about = "Opaque native Responses HTTP proxy")]
 pub struct ProxyCli {
     /// Auto prefers a configured API key, then Carry's saved subscription.
@@ -107,7 +107,9 @@ pub struct ProxyCli {
     #[arg(long)]
     review_replayed_history: bool,
     /// Total primary context budget, including output reserve and estimation margin.
-    #[arg(long, default_value_t = 272000, value_parser = clap::value_parser!(u32).range(1024..=2000000))]
+    #[arg(long = "primary-context-tokens", value_parser = clap::value_parser!(u32).range(1024..=2000000))]
+    primary_context_override: Option<u32>,
+    #[arg(skip = 272000)]
     primary_context_tokens: u32,
     /// Reserved primary output tokens when the client supplies no output limit.
     #[arg(long, default_value_t = 16384)]
@@ -116,7 +118,9 @@ pub struct ProxyCli {
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=100))]
     context_margin_percent: u8,
     /// Total reviewer context budget, including its output reserve and margin.
-    #[arg(long, alias = "reviewer-context-tokens", default_value_t = 300000, value_parser = clap::value_parser!(u32).range(1024..=2000000))]
+    #[arg(long = "classifier-max-input-tokens", alias = "reviewer-context-tokens", value_parser = clap::value_parser!(u32).range(1024..=2000000))]
+    reviewer_context_override: Option<u32>,
+    #[arg(skip = 300000)]
     classifier_max_input_tokens: u32,
     /// Serialized transport guard; token budget controls reviewer context size.
     #[arg(long, default_value_t = 8388608, value_parser = clap::value_parser!(u32).range(4096..=8388608))]
@@ -160,16 +164,17 @@ pub struct ProxyCli {
     classifier_max_output_tokens: u32,
 }
 
+#[derive(Clone)]
 struct Service {
-    catalog: tokio::sync::OnceCell<SourceCatalog>,
+    catalog: Arc<tokio::sync::OnceCell<SourceCatalog>>,
     config: ProxyCli,
     client: reqwest::Client,
     upstream_key: Option<String>,
     classifier_key: Option<String>,
     auth_token: Option<String>,
-    locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
-    background_reviews: Mutex<HashSet<String>>,
-    _directory_lock: File,
+    locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    background_reviews: Arc<Mutex<HashSet<String>>>,
+    _directory_lock: Arc<File>,
 }
 
 #[path = "proxy_admission.rs"]
@@ -216,6 +221,8 @@ fn private_file(path: &Path, append: bool) -> std::io::Result<File> {
 }
 
 pub async fn serve(mut config: ProxyCli) -> Result<()> {
+    config.primary_context_tokens = config.primary_context_override.unwrap_or(272000);
+    config.classifier_max_input_tokens = config.reviewer_context_override.unwrap_or(300000);
     if config.codex_login && config.login == Login::ApiKey {
         bail!("--codex-login conflicts with --login api-key");
     }
@@ -315,7 +322,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         }
     }
     let service = Arc::new(Service {
-        catalog: tokio::sync::OnceCell::new(),
+        catalog: Arc::new(tokio::sync::OnceCell::new()),
         upstream_key: std::env::var("CARRY_PROXY_UPSTREAM_KEY")
             .ok()
             .filter(|key| !key.trim().is_empty())
@@ -339,9 +346,9 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
             .connect_timeout(Duration::from_secs(15))
             .build()?,
         config,
-        locks: Mutex::new(HashMap::new()),
-        background_reviews: Mutex::new(HashSet::new()),
-        _directory_lock: directory_lock,
+        locks: Arc::new(Mutex::new(HashMap::new())),
+        background_reviews: Arc::new(Mutex::new(HashSet::new())),
+        _directory_lock: Arc::new(directory_lock),
     });
     logging::maintain(&service);
     let listener = tokio::net::TcpListener::bind(service.config.listen).await?;
@@ -711,8 +718,8 @@ async fn resolved_catalog(
         model,
         primary_route,
         source,
-        None,
-        config.primary_context_tokens,
+        config.primary_context_override,
+        272000,
         config.primary_output_reserve_tokens,
         config.context_margin_percent,
     )
@@ -721,13 +728,102 @@ async fn resolved_catalog(
         &config.classifier_model,
         reviewer_route,
         source,
-        None,
-        config.classifier_max_input_tokens,
+        config.reviewer_context_override,
+        300000,
         config.classifier_max_output_tokens,
         config.context_margin_percent,
     )
     .map_err(error)?;
     Ok((primary, reviewer))
+}
+
+async fn session_resolution(
+    service: &Service,
+    session: &mut Session,
+    model: &str,
+) -> Result<ResolvedPair, Failure> {
+    let config = &service.config;
+    let primary_route = Route::new(&config.upstream_url, config.codex_login);
+    let reviewer_route = Route::new(
+        config
+            .classifier_url
+            .as_deref()
+            .unwrap_or(&config.upstream_url),
+        config.codex_login && config.classifier_url.is_none(),
+    );
+    if let Some(saved) = &session.model_resolution {
+        let same = saved.schema_version == 1
+            && saved.primary.model == model
+            && saved.reviewer.model == config.classifier_model
+            && saved.primary.route == primary_route
+            && saved.reviewer.route == reviewer_route
+            && saved
+                .primary
+                .provenance
+                .get("capacity")
+                .is_some_and(|p| p.operator_override == config.primary_context_override)
+            && saved
+                .reviewer
+                .provenance
+                .get("capacity")
+                .is_some_and(|p| p.operator_override == config.reviewer_context_override)
+            && saved.primary.ordinary.output_reserve == config.primary_output_reserve_tokens
+            && saved.reviewer.ordinary.output_reserve == config.classifier_max_output_tokens
+            && saved.primary.ordinary.estimation_margin_percent == config.context_margin_percent;
+        if same {
+            return Ok(saved.clone());
+        }
+    }
+    let legacy = session.model_resolution.is_none()
+        && (session.version != 0 || !session.history.is_empty() || session.primary.calls > 0);
+    let (mut primary, mut reviewer) = if legacy {
+        let error = |message| failure(StatusCode::BAD_REQUEST, message);
+        (
+            resolve_model(
+                model,
+                primary_route,
+                None,
+                config.primary_context_override,
+                272000,
+                config.primary_output_reserve_tokens,
+                config.context_margin_percent,
+            )
+            .map_err(error)?,
+            resolve_model(
+                &config.classifier_model,
+                reviewer_route,
+                None,
+                config.reviewer_context_override,
+                300000,
+                config.classifier_max_output_tokens,
+                config.context_margin_percent,
+            )
+            .map_err(error)?,
+        )
+    } else {
+        resolved_catalog(service, model).await?
+    };
+    if legacy {
+        for resolved in [&mut primary, &mut reviewer] {
+            let provenance = resolved
+                .provenance
+                .get_mut("capacity")
+                .expect("capacity provenance");
+            provenance.status = "legacy_snapshot_missing".into();
+            provenance.source = "contemporaneous-legacy-role-capacity-v1".into();
+            provenance.fallback_reason =
+                Some("checkpoint_predates_resolved_contract_no_new_catalog_defaults".into());
+        }
+    }
+    let pair = ResolvedPair {
+        schema_version: 1,
+        primary,
+        reviewer,
+    };
+    if let Some(prior) = session.model_resolution.replace(pair.clone()) {
+        session.model_resolution_history.push(prior);
+    }
+    Ok(pair)
 }
 
 async fn catalog(
@@ -1024,7 +1120,7 @@ async fn forward(
 }
 
 async fn forward_request(
-    service: Arc<Service>,
+    mut service: Arc<Service>,
     headers: HeaderMap,
     bytes: Bytes,
     legacy_native: bool,
@@ -1128,6 +1224,19 @@ async fn forward_request(
         }
         let lock = session_lock(&service, &id).await;
         let mut session = load(&service, &id)?;
+        if service.config.mode != Mode::Off {
+            let model = body["model"]
+                .as_str()
+                .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "model is required"))?;
+            let resolved = session_resolution(&service, &mut session, model).await?;
+            // One request-scoped contract drives every existing primary/reviewer
+            // feasibility, memory and bootstrap check. Locks, metadata epoch,
+            // background registry and directory lock remain process-shared.
+            let mut effective = (*service).clone();
+            effective.config.primary_context_tokens = resolved.primary.capacity_tokens;
+            effective.config.classifier_max_input_tokens = resolved.reviewer.capacity_tokens;
+            service = Arc::new(effective);
+        }
         let prior_reviewer_compactions = session.reviewer_compactions;
         let (kind, agent_name) = client_provenance(&body);
         if kind.is_some() || agent_name.is_some() {
@@ -3694,15 +3803,15 @@ mod tests {
         let mut config = reviewer_config();
         config.state_dir = directory.to_path_buf();
         Service {
-            catalog: tokio::sync::OnceCell::new(),
-            _directory_lock: private_file(&directory.join(".lock"), true).unwrap(),
+            catalog: Arc::new(tokio::sync::OnceCell::new()),
+            _directory_lock: Arc::new(private_file(&directory.join(".lock"), true).unwrap()),
             config,
             client: reqwest::Client::new(),
             upstream_key: None,
             classifier_key: None,
             auth_token: None,
-            locks: Mutex::new(HashMap::new()),
-            background_reviews: Mutex::new(HashSet::new()),
+            locks: Arc::new(Mutex::new(HashMap::new())),
+            background_reviews: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -5100,15 +5209,15 @@ mod tests {
             "save must not amplify valid source into a permanently unloadable checkpoint"
         );
         let service = Service {
-            catalog: tokio::sync::OnceCell::new(),
-            _directory_lock: private_file(&directory.path().join(".lock"), true).unwrap(),
+            catalog: Arc::new(tokio::sync::OnceCell::new()),
+            _directory_lock: Arc::new(private_file(&directory.path().join(".lock"), true).unwrap()),
             config,
             client: reqwest::Client::new(),
             upstream_key: None,
             classifier_key: None,
             auth_token: None,
-            locks: Mutex::new(HashMap::new()),
-            background_reviews: Mutex::new(HashSet::new()),
+            locks: Arc::new(Mutex::new(HashMap::new())),
+            background_reviews: Arc::new(Mutex::new(HashSet::new())),
         };
         save(&service, "large-missing-usage", &session).unwrap();
         assert_eq!(

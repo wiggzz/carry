@@ -163,6 +163,12 @@ pub(super) struct Session {
     #[serde(default)]
     pub history_rebases: u64,
     pub last_plan: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_resolution: Option<carry::models::ResolvedPair>,
+    /// Retain earlier contracts on explicit model/route/configuration changes;
+    /// historical ledgers/scenarios keep their original legacy interpretation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_resolution_history: Vec<carry::models::ResolvedPair>,
     pub review_cache_key: String,
     pub review_context: Value,
 }
