@@ -1,6 +1,49 @@
 // Independent-review counterexamples. Existing fixture admits protection through
 // the production advice boundary; these are component gates, not native forks.
 #[test]
+fn lease_planner_evaluates_identical_retirement_action_only_once() {
+    let (mut config, mut session, body) = lease_fixture();
+    config.review_min_new_tokens = 0;
+    let groups = session.groups();
+    let mut prior = review_source_input(&session, &groups);
+    let source_len = prior.len() - 1;
+    let source_sha256 = reviewer_serialized_identity(&prior[..source_len]).1;
+    prior.push(json!({"role":"assistant","content":json!({"protected":["g2"],"removable":[],"memories":[]}).to_string()}));
+    session.review_history = Some(crate::proxy_state::ReviewHistory {
+        source_len,
+        source_sha256,
+        input: prior,
+    });
+    for length in 1..=body["input"].as_array().unwrap().len() {
+        let mut prefix = body.clone();
+        prefix["input"] = json!(&body["input"].as_array().unwrap()[..length]);
+        observe_cache(
+            &mut session.primary_cache,
+            &prefix,
+            &json!({"input_tokens":100,"input_tokens_details":{"cached_tokens":100}}),
+        );
+    }
+    let (_, report) = plan(&config, &session, &body);
+    let actions = report["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| serde_json::from_value::<Vec<u64>>(row["removed_groups"].clone()).unwrap())
+        .collect::<Vec<_>>();
+    let distinct = actions.iter().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "setup has only one authorized retirement action"
+    );
+    assert_eq!(
+        actions.len(),
+        distinct.len(),
+        "LEASE_DUPLICATE_ACTIONS_RED: distinct cache frontiers yielding identical removals must not repeatedly rebuild/tokenize the same paired forecast"
+    );
+}
+
+#[test]
 fn lease_r1_inflight_annotations_cannot_force_following_primary_capacity_wait() {
     let (mut config, mut session, body) = lease_fixture();
     let base = review_body(&config, &session);
