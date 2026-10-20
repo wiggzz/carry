@@ -15,11 +15,14 @@ def cut(items, epoch=0):
 
 class BranchProxy(Proxy):
     branch = "main"
-    intent = None
+    intent: tuple[str, str] | None = None
+    history_policy = None
 
     def request(self, method, path, body=None):
         headers = {"Content-Type": "application/json", "x-carry-session": "state-regression",
                    "x-carry-branch": self.branch}
+        if self.history_policy:
+            headers["x-carry-history-policy"] = self.history_policy
         if self.intent:
             headers.update({"x-carry-fork-parent": self.intent[0],
                             "x-carry-fork-point": self.intent[1]})
@@ -99,5 +102,110 @@ class ForkContinuity(unittest.TestCase):
         self.assertEqual(saved["reviewer_cache"], [], "never copy parent cache receipts")
 
 
+    def seed(self, extra_env=None):
+        history = [{"role": "user", "content": "PROTECTED_GOAL"},
+                   {"role": "assistant", "content": "RAW_A " + "old payload " * 3000},
+                   {"role": "user", "content": "A_CUT"}]
+        def review(body, n):
+            ids = ledger(body)["eligible_group_ids"]
+            return 200, advice_response({"protected": [i for i in ids if i == "g1"],
+                "removable": [i for i in ids if i != "g1"],
+                "memories": [{"source_ids": [ids[0]], "text": "A_FACT" if n == 1 else "SIBLING_ONLY_FACT"}]
+                    if ids else []})
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")), review)
+        options = ["--review-replayed-history", "--payoff-requests", "1",
+                   "--classifier-cache-policy", "disabled"]
+        proxy = BranchProxy(self.state, fixture, options, extra_env)
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(history)[0], 200)
+        saved = proxy.saved()
+        self.assertTrue(saved["drop_members"])
+        self.assertTrue(saved["memories"])
+        return proxy, fixture, history, cut(history, saved["review_epoch"]), options
+
+    def rejected(self, proxy, fixture, history, code):
+        counts = (len(fixture.primaries), len(fixture.reviews))
+        status, body = proxy.send(history)
+        self.assertEqual(status, 409, "declared unavailable fork cannot silently fall back")
+        self.assertEqual(body["error"]["code"], code)
+        self.assertEqual((len(fixture.primaries), len(fixture.reviews)), counts)
+
+    def test_expired_ancestor_rejected_after_restart(self):
+        env = {"CARRY_PROXY_FORK_MAX_AGE_SECS": "1"}
+        proxy, fixture, history, handle, options = self.seed(env)
+        proxy.close()
+        time.sleep(2.05)
+        proxy = BranchProxy(self.state, fixture, options, env)
+        self.stack.callback(proxy.close)
+        proxy.branch, proxy.intent = "expired-child", ("main", handle)
+        self.rejected(proxy, fixture, history, "fork_expired")
+
+    def test_byte_retention_refuses_unpublishable_guarantee(self):
+        proxy, fixture, history, handle, _ = self.seed({"CARRY_PROXY_FORK_MAX_BYTES": "256"})
+        saved = proxy.saved()
+        self.assertLessEqual(len(wire(saved["fork_points"])), 256,
+                             "actual serialized evidence must obey the byte budget")
+        proxy.branch, proxy.intent = "byte-child", ("main", handle)
+        self.rejected(proxy, fixture, history, "fork_expired")
+
+    def test_node_retention_evicts_oldest_without_erasing_live_authority(self):
+        proxy, fixture, history, handle, _ = self.seed({"CARRY_PROXY_FORK_MAX_NODES": "1"})
+        for n in range(2):
+            proxy.history_policy = "reset-on-divergence"
+            changed = [dict(item) for item in history]
+            changed[0]["content"] = f"NEW_EPOCH_{n}"
+            self.assertEqual(proxy.send(changed)[0], 200)
+        saved = proxy.saved()
+        self.assertLessEqual(len(saved["fork_points"]), 1, "bounded nodes across native history epochs")
+        self.assertTrue(saved["drop_members"], "archive eviction cannot delete active review authority")
+        proxy.history_policy = None
+        proxy.branch, proxy.intent = "node-child", ("main", handle)
+        self.rejected(proxy, fixture, history, "fork_expired")
+
+    def test_restart_reset_and_sibling_memories_do_not_mutate_ancestor(self):
+        proxy, fixture, history, handle, options = self.seed()
+        parent = history + [{"role": "user", "content": "B_CONTEXT"}]
+        self.assertEqual(proxy.send(parent)[0], 200)
+        self.assertEqual(proxy.send(parent)[0], 200)
+        self.assertTrue(any(m["text"] == "SIBLING_ONLY_FACT" for m in proxy.saved()["memories"]))
+        proxy.history_policy = "reset-on-divergence"
+        self.assertEqual(proxy.send([{"role": "user", "content": "NEW_PARENT_EPOCH"}])[0], 200)
+        proxy.close()
+        proxy = BranchProxy(self.state, fixture, options)
+        self.stack.callback(proxy.close)
+        proxy.branch, proxy.intent = "restart-child", ("main", handle)
+        child = history + [{"role": "user", "content": "C_CONTEXT"}]
+        calls = len(fixture.reviews)
+        self.assertEqual(proxy.send(child)[0], 200)
+        sent = json.dumps(fixture.primaries[-1])
+        self.assertIn("A_FACT", sent)
+        self.assertNotIn("SIBLING_ONLY_FACT", sent)
+        self.assertNotIn("RAW_A", sent)
+        self.assertNotIn("B_CONTEXT", sent)
+        self.assertEqual(len(fixture.reviews), calls)
+        # Repeated intent is idempotent; never rehydrate an already live child.
+        self.assertEqual(proxy.send(child)[0], 200)
+        self.assertEqual(len(fixture.reviews), calls)
+        self.assertEqual(len(proxy.saved()["memories"]), 1)
+
+    def test_incompatible_and_unknown_forks_reject_before_upstream(self):
+        proxy, fixture, history, handle, _ = self.seed()
+        for n, mutation in enumerate(["content", "order", "instructions", "model", "unknown"]):
+            with self.subTest(mutation=mutation):
+                child = [dict(item) for item in history]
+                fields = {}
+                proxy.branch, proxy.intent = f"bad-{n}", ("main", handle)
+                if mutation == "content": child[1]["content"] += "tampered"
+                if mutation == "order": child[0], child[1] = child[1], child[0]
+                if mutation == "instructions": fields["instructions"] = "different policy"
+                if mutation == "model": fields["model"] = "different-model"
+                if mutation == "unknown": proxy.intent = ("main", "0:" + "f" * 64)
+                counts = (len(fixture.primaries), len(fixture.reviews))
+                status, body = proxy.send(child, **fields)
+                self.assertEqual(status, 409)
+                self.assertEqual(body["error"]["code"], "fork_unknown" if mutation == "unknown" else "fork_incompatible")
+                self.assertEqual((len(fixture.primaries), len(fixture.reviews)), counts)
+
+
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(defaultTest="ForkContinuity")

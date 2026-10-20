@@ -18,7 +18,7 @@ fn historical_full_history_fork_after_parent_cleanup() {
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/proxy_fork_continuity.py"
             ),
-            "ForkContinuity.test_historical_full_history_fork_after_parent_cleanup",
+            "ForkContinuity",
             "-v",
         ])
         .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
