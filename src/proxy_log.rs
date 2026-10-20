@@ -386,7 +386,19 @@ pub(super) fn usage(
         id,
         request_id,
         "usage",
-        &usage_data(actor, response, model, standard),
+        &usage_data(
+            actor,
+            response,
+            model,
+            standard,
+            service.config.model_resolution.as_ref().map(|p| {
+                if actor == "shadow" {
+                    &p.reviewer
+                } else {
+                    &p.primary
+                }
+            }),
+        ),
     );
 }
 
@@ -395,17 +407,19 @@ pub(super) fn usage_data(
     response: Option<&Value>,
     model: &str,
     standard: bool,
+    resolved: Option<&ResolvedModel>,
 ) -> Value {
     let absent = Value::Null;
     let value = response.unwrap_or(&absent);
     let usage = numeric_review_usage(&value["usage"]);
     let mut priced = carry::core::UsageLedger::default();
-    priced.observe(
+    priced.observe_with_rates(
         model,
         &usage,
         standard
             && value["status"] == "completed"
             && value.get("service_tier").is_none_or(|v| v == "default"),
+        receipt_rates(model, &usage, resolved),
     );
     json!({"actor":actor,"native_usage":usage,
         "usage_available":usage["input_tokens"].as_u64().is_some() && usage["output_tokens"].as_u64().is_some(),

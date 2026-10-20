@@ -1731,6 +1731,7 @@ async fn forward_request(
         outbound["model"].as_str().unwrap_or(""),
         native,
         standard(&outbound),
+        service.config.model_resolution.as_ref().map(|p| &p.primary),
     );
     let response = if service.config.codex_login {
         send_codex(&service, &endpoint, &outbound, false).await
@@ -2145,9 +2146,8 @@ fn observe_reviewer_cache(
     body: &Value,
     usage: &Value,
 ) {
-    if config.model_resolution.is_some() && reviewer_cache_capabilities(config).is_none() {
-        return;
-    }
+    // Preserve observed native read evidence even when the route's future
+    // cache contract is unknown. Forecast eligibility is checked separately.
     let Some(input) = reviewer_input(body) else {
         return;
     };
@@ -2430,21 +2430,28 @@ fn merge_review(
     // Spend survives stale advice, rebases and primary failures. Price reviewer
     // receipts against the current trajectory, never replace its primary history.
     for receipt in &run.receipts {
+        // The review snapshot is the dispatch epoch. The live session may have
+        // changed routes/contracts while this already-paid work was in flight.
+        let resolved = before.model_resolution.as_ref().map(|p| &p.reviewer);
         if let Some(usage) = &receipt.usage {
-            current
-                .shadow
-                .observe(&receipt.model, usage, receipt.standard);
+            current.shadow.observe_with_rates(
+                &receipt.model,
+                usage,
+                receipt.standard,
+                receipt_rates(&receipt.model, usage, resolved),
+            );
         } else {
             current.shadow.calls += 1;
             current.shadow.unavailable_cost_calls += 1;
         }
         if let Some(t) = &mut current.cost_trajectory {
             if receipt.completed {
-                t.reviewer_usage(
+                t.reviewer_usage_resolved(
                     &receipt.model,
                     receipt.input,
                     receipt.usage.as_ref().unwrap_or(&Value::Null),
                     receipt.standard,
+                    resolved,
                 );
             } else {
                 t.failed_call();
@@ -2885,7 +2892,18 @@ async fn review_chunk(
     );
     let _ = trace(service, id, "shadow_submitted", body);
     session.last_review_request = session.completed_requests;
-    let attempt = Attempt::start("shadow", &service.config.classifier_model, false, true);
+    let resolved = service
+        .config
+        .model_resolution
+        .as_ref()
+        .map(|p| &p.reviewer);
+    let attempt = Attempt::start(
+        "shadow",
+        &service.config.classifier_model,
+        false,
+        true,
+        resolved,
+    );
     let codex_reviewer = service.config.codex_login && service.config.classifier_url.is_none();
     let response = if codex_reviewer {
         send_codex(service, &service.config.upstream_url, body, true).await
@@ -2943,16 +2961,18 @@ async fn review_chunk(
                 completed: value["status"] == "completed",
             });
         }
-        session.shadow.observe(
+        session.shadow.observe_with_rates(
             &service.config.classifier_model,
             &value["usage"],
             value.get("service_tier").is_none_or(|v| v == "default"),
+            receipt_rates(&service.config.classifier_model, &value["usage"], resolved),
         );
         if let Some(trajectory) = &mut session.cost_trajectory {
-            trajectory.reviewer(
+            trajectory.reviewer_resolved(
                 body,
                 &value,
                 value.get("service_tier").is_none_or(|v| v == "default"),
+                resolved,
             );
         }
         if value["status"] == "completed" {
@@ -2975,6 +2995,7 @@ async fn review_chunk(
                 Some(&value),
                 &service.config.classifier_model,
                 true,
+                resolved,
             ),
         );
         if value["status"] != "completed" {
@@ -3026,7 +3047,13 @@ async fn review_chunk(
             &run.request_id,
             &review_attempt_id,
             "usage",
-            &logging::usage_data("shadow", None, &service.config.classifier_model, true),
+            &logging::usage_data(
+                "shadow",
+                None,
+                &service.config.classifier_model,
+                true,
+                resolved,
+            ),
         );
         if run.background {
             run.receipts.push(ReviewReceipt {
@@ -3522,6 +3549,15 @@ fn resolved_view_costs(
 
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
+fn receipt_rates(model: &str, usage: &Value, resolved: Option<&ResolvedModel>) -> Option<Rates> {
+    let input = usage["input_tokens"].as_u64()? as f64;
+    match resolved {
+        Some(r) if r.model == model => r.rates_for_input(input),
+        Some(_) => None,
+        None => Rates::for_model(model, input), // Explicit snapshot-missing legacy path.
+    }
+}
+
 struct Attempt {
     id: String,
     actor: &'static str,
@@ -3529,10 +3565,17 @@ struct Attempt {
     native: bool,
     started: Instant,
     standard: bool,
+    resolved: Option<ResolvedModel>,
 }
 
 impl Attempt {
-    fn start(actor: &'static str, model: &str, native: bool, standard: bool) -> Self {
+    fn start(
+        actor: &'static str,
+        model: &str,
+        native: bool,
+        standard: bool,
+        resolved: Option<&ResolvedModel>,
+    ) -> Self {
         let attempt = Self {
             id: format!(
                 "{}-{}-{}",
@@ -3545,6 +3588,7 @@ impl Attempt {
             native,
             started: Instant::now(),
             standard,
+            resolved: resolved.cloned(),
         };
         attempt.emit("started", json!({}));
         attempt
@@ -3607,10 +3651,11 @@ impl Attempt {
             }
         }
         let mut priced = carry::core::UsageLedger::default();
-        priced.observe(
+        priced.observe_with_rates(
             &self.model,
             usage,
             self.standard && response.get("service_tier").is_none_or(|v| v == "default"),
+            receipt_rates(&self.model, usage, self.resolved.as_ref()),
         );
         let tools = response["output"]
             .as_array()
@@ -3728,23 +3773,31 @@ async fn relay(
             if complete_transport && status.is_success() && completed {
                 let value = observed.unwrap();
                 let model = commit.outbound["model"].as_str().unwrap_or("");
-                commit.candidate.primary.observe(
+                let resolved = commit
+                    .service
+                    .config
+                    .model_resolution
+                    .as_ref()
+                    .map(|p| &p.primary);
+                commit.candidate.primary.observe_with_rates(
                     model,
                     &value["usage"],
                     standard(&commit.outbound)
                         && value.get("service_tier").is_none_or(|v| v == "default"),
+                    receipt_rates(model, &value["usage"], resolved),
                 );
                 if let Some(trajectory) = &mut commit.candidate.cost_trajectory {
                     if commit.native {
                         trajectory.unmodeled_call();
                     } else {
-                        trajectory.primary(
+                        trajectory.primary_resolved(
                             &commit.outbound,
                             &value,
                             &commit.service.config.upstream_url,
                             now(),
                             standard(&commit.outbound)
                                 && value.get("service_tier").is_none_or(|v| v == "default"),
+                            resolved,
                         );
                     }
                 }
@@ -3819,10 +3872,22 @@ async fn relay(
                     trajectory.failed_call();
                 }
                 if let Some(value) = &observed {
-                    commit.reviewed.primary.observe(
-                        commit.outbound["model"].as_str().unwrap_or(""),
+                    let model = commit.outbound["model"].as_str().unwrap_or("");
+                    commit.reviewed.primary.observe_with_rates(
+                        model,
                         &value["usage"],
-                        standard(&commit.outbound),
+                        standard(&commit.outbound)
+                            && value.get("service_tier").is_none_or(|v| v == "default"),
+                        receipt_rates(
+                            model,
+                            &value["usage"],
+                            commit
+                                .service
+                                .config
+                                .model_resolution
+                                .as_ref()
+                                .map(|p| &p.primary),
+                        ),
                     );
                 } else {
                     commit.reviewed.primary.calls += 1;
