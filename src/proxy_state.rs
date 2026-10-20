@@ -732,17 +732,25 @@ impl Session {
                     item.value.clone()
                 }
             });
-        input.push(json!({"role": "user", "content": json!({
+        let mut control = json!({
             "eligible_group_ids": eligible, "current_groups": ledger,
             "current_task": current_task,
             "quoted_primary_instructions": self.review_context.get("instructions"),
             "eligible_memory_ids": self.memories.iter().map(|m| format!("m{}", m.id)).collect::<Vec<_>>(),
             "current_memories": self.memories.iter().map(|m| json!({"memory_id":format!("m{}",m.id),"source_ids":m.source_ids.iter().map(|id|format!("g{id}")).collect::<Vec<_>>(),"text":m.text})).collect::<Vec<_>>(),
             "previous_review_feedback": self.review_feedback
-            ,"keep_lease_review": self.keep_leases.as_ref().and_then(|s| s.pending.as_ref()).map(|pending| json!({
-                "request_id":pending.request_id,"target_ids":pending.targets.keys().collect::<Vec<_>>()
-            })).unwrap_or_else(|| json!({"target_ids":[]}))
-        }).to_string()}));
+        });
+        // Revalidation is a tail-only exception to sticky omission. Do not tax
+        // every import chunk or mutate the cacheable instruction prefix for a
+        // policy that is not being used by that request.
+        if let Some(pending) = self.keep_leases.as_ref().and_then(|s| s.pending.as_ref()) {
+            control["keep_lease_review"] = json!({
+                "request_id":pending.request_id,
+                "target_ids":pending.targets.keys().collect::<Vec<_>>(),
+                "instructions":"For these targets only, override sticky omission: protect if still needed and not represented elsewhere or accurately captured concisely; removable or valid omission releases temporary protection for economic compaction, not immediate deletion. All other omissions remain unchanged."
+            });
+        }
+        input.push(json!({"role": "user", "content": control.to_string()}));
         input
     }
 
