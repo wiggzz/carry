@@ -90,17 +90,22 @@ async fn catalog_exports_bounded_route_facts_without_inference_or_secrets() {
             .unwrap(),
     );
     let stdout = child.0.stdout.take().unwrap();
-    let url = tokio::task::spawn_blocking(move || {
+    let (ready, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut ready = Some(ready);
         for line in BufReader::new(stdout).lines() {
             let line = line.unwrap();
-            if let Some(address) = line.strip_prefix("CARRY_PROXY_LISTEN ") {
-                return format!("http://{address}");
+            if let Some(address) = line.strip_prefix("CARRY_PROXY_LISTEN ")
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(format!("http://{address}"));
             }
         }
-        panic!("proxy exited before healthy listener handshake")
-    })
-    .await
-    .unwrap();
+    });
+    let url = tokio::time::timeout(std::time::Duration::from_secs(30), receiver)
+        .await
+        .unwrap()
+        .unwrap();
     let client = reqwest::Client::new();
     assert_eq!(
         client
