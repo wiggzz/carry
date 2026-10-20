@@ -7,6 +7,10 @@ use serde_json::{Value, json};
 
 use carry::core::{UsageLedger, prefix_compatible};
 
+#[path = "proxy_lease_state.rs"]
+mod lease;
+pub(super) use lease::{KeepLeases, Pending as PendingKeepReview};
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Item {
     pub id: u64,
@@ -103,6 +107,8 @@ pub(super) struct Session {
     /// Legacy opinions without this provenance remain protective, never drops.
     #[serde(default)]
     pub drop_members: BTreeMap<u64, Vec<u64>>,
+    #[serde(default)]
+    pub keep_leases: Option<KeepLeases>,
     pub memories: Vec<Memory>,
     #[serde(default)]
     pub next_memory_id: u64,
@@ -374,6 +380,7 @@ impl Session {
         self.native_checkpoint.clear();
         self.opinions.clear();
         self.drop_members.clear();
+        self.keep_leases = None;
         self.memories.clear();
         self.memory_anchors.clear();
         self.active_shadow.clear();
@@ -732,6 +739,9 @@ impl Session {
             "eligible_memory_ids": self.memories.iter().map(|m| format!("m{}", m.id)).collect::<Vec<_>>(),
             "current_memories": self.memories.iter().map(|m| json!({"memory_id":format!("m{}",m.id),"source_ids":m.source_ids.iter().map(|id|format!("g{id}")).collect::<Vec<_>>(),"text":m.text})).collect::<Vec<_>>(),
             "previous_review_feedback": self.review_feedback
+            ,"keep_lease_review": self.keep_leases.as_ref().and_then(|s| s.pending.as_ref()).map(|pending| json!({
+                "request_id":pending.request_id,"target_ids":pending.targets.keys().collect::<Vec<_>>()
+            })).unwrap_or_else(|| json!({"target_ids":[]}))
         }).to_string()}));
         input
     }
@@ -740,8 +750,9 @@ impl Session {
     pub fn drop_authorized(&self, group: &Group) -> bool {
         group.exposed
             && !group.pinned
-            && self.opinions.get(&group.id).is_some_and(|s| s == "drop")
-            && self.drop_members.get(&group.id) == Some(&group.members)
+            && ((self.opinions.get(&group.id).is_some_and(|s| s == "drop")
+                && self.drop_members.get(&group.id) == Some(&group.members))
+                || self.released_group(group))
             && !group
                 .members
                 .iter()
@@ -763,7 +774,7 @@ impl Session {
             }
             if protected {
                 self.opinions.insert(group.id, "keep".into());
-            } else if authorized {
+            } else if authorized && !self.released_group(group) {
                 self.opinions.insert(group.id, "drop".into());
             }
         }
@@ -1023,6 +1034,13 @@ impl Session {
         let accepted_opinions = updates.len() + memory_updates.len();
         let mut accepted_memories = 0;
         for (id, opinion) in updates {
+            if let Some(group) = groups.iter().find(|group| group.id == id) {
+                if opinion == "keep" {
+                    self.renew_group_lease(group);
+                } else if let Some(state) = &mut self.keep_leases {
+                    state.entries.remove(&format!("g{id}"));
+                }
+            }
             self.opinions.insert(id, opinion.into());
             self.drop_members.remove(&id);
             if opinion == "drop"
@@ -1164,6 +1182,11 @@ impl Session {
         self.observed.retain(|id, _| !members.contains(id));
         self.opinions.retain(|id, _| !members.contains(id));
         self.drop_members.retain(|id, _| !members.contains(id));
+        if let Some(state) = &mut self.keep_leases {
+            state
+                .entries
+                .retain(|key, _| !ids.iter().any(|id| key == &format!("g{id}")));
+        }
         self.compact_reviewer();
     }
 
