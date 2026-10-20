@@ -131,7 +131,8 @@ pub struct ProxyCli {
     /// Explicit replay declarations override this threshold.
     #[arg(long, default_value_t = 16384)]
     bootstrap_min_input_bytes: usize,
-    /// Run ordinary reviews in the background; bootstrap remains synchronous.
+    /// Use conservative due-next-review selection credit (false retains the
+    /// recurring-completion sensitivity). All reviewer work is nonblocking.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     background_reviews: bool,
     /// Ordinary reviews require this many completed primary requests AND native-source growth.
@@ -1058,6 +1059,11 @@ async fn forward_request(
                 "background_review_censored",
                 &json!({"reason":"restart_with_pending_review","cost_censored":true}),
             );
+            // There is no receipt for an interrupted import. Do not grant a
+            // fresh spend allowance on restart while its actual spend is unknown.
+            if session.bootstrap_review_pending && !session.bootstrap_review_complete {
+                session.bootstrap_estimated_cost_usd = service.config.bootstrap_max_cost_usd;
+            }
             session.shadow.calls += 1;
             session.shadow.unavailable_cost_calls += 1;
             if let Some(trajectory) = &mut session.cost_trajectory {
@@ -1156,120 +1162,16 @@ async fn forward_request(
         session.review_context = cache_base(&body);
         let active = !native && service.config.mode != Mode::Off;
         let primary_priced = Rates::for_model(body["model"].as_str().unwrap_or(""), 0.0).is_some();
-        if active
-            && session.bootstrap_review_pending
-            && !session.bootstrap_review_complete
-            && !service.background_reviews.lock().await.contains(&id)
-            && primary_priced
-            && standard(&body)
-        {
-            review(
-                &service,
-                &id,
-                &mut session,
-                &body,
-                true,
-                &mut ReviewRun {
-                    request_id: request_id.clone(),
-                    ..ReviewRun::default()
-                },
-            )
-            .await;
-        }
-        // This existing rejection cannot be rescued by a plan. Avoid pricing
-        // the whole unfinished import, but let an in-flight reviewer merge first.
-        if active
-            && !session.background_review_pending
-            && !service.background_reviews.lock().await.contains(&id)
-            && session.bootstrap_review_pending
-            && !session.bootstrap_review_complete
-            && !review_fits(&service.config, &review_body(&service.config, &session))
-        {
-            let _ = save(&service, &id, &session);
-            return Err(failure(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "history import is incomplete; protected context exceeds capacity or the bootstrap call/spend limit was reached",
-            ));
-        }
+        // Accepted advice is optional input to planning. Never acquire new
+        // advice (including bootstrap/pressure rescue) on the primary path.
         if active {
             outbound["input"] = json!(session.render_primary());
         }
-        let (mut candidate, mut report) = if active {
+        let (candidate, report) = if active {
             plan(&service.config, &session, &outbound)
         } else {
             (None, Value::Null)
         };
-        if active && report["forced"] == true && session.background_review_pending {
-            journal(
-                &service,
-                &id,
-                &request_id,
-                "review_waiting",
-                &json!({"reason":"background_capacity"}),
-            );
-            // Let the in-flight snapshot merge before deciding capacity. Never
-            // wait while holding the lock its completion needs.
-            drop(lock);
-            let wait = async {
-                while service.background_reviews.lock().await.contains(&id) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            };
-            tokio::time::timeout(
-                Duration::from_secs(service.config.classifier_timeout_secs + 1),
-                wait,
-            )
-            .await
-            .map_err(|_| {
-                failure(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "waiting for reviewer capacity advice timed out",
-                )
-            })?;
-            return Box::pin(forward_request(
-                service,
-                headers,
-                bytes,
-                legacy_native,
-                request_id,
-            ))
-            .await;
-        }
-        if active
-            && session.bootstrap_review_pending
-            && !session.bootstrap_review_complete
-            && !review_fits(&service.config, &review_body(&service.config, &session))
-        {
-            let _ = save(&service, &id, &session);
-            return Err(failure(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "history import is incomplete; protected context exceeds capacity or the bootstrap call/spend limit was reached",
-            ));
-        }
-        if active && report["forced"] == true && candidate.is_none() {
-            // Capacity may require a blocking update even with background reviews.
-            // Drop only disposable control turns before asking for new advice.
-            session.compact_reviewer();
-            if standard(&body)
-                && primary_priced
-                && review_fits(&service.config, &review_body(&service.config, &session))
-            {
-                review(
-                    &service,
-                    &id,
-                    &mut session,
-                    &body,
-                    false,
-                    &mut ReviewRun {
-                        request_id: request_id.clone(),
-                        pressure: true,
-                        ..ReviewRun::default()
-                    },
-                )
-                .await;
-            }
-            (candidate, report) = plan(&service.config, &session, &outbound);
-        }
         let reviewed = session.clone();
         if active {
             session.last_plan = report.clone();
@@ -1313,45 +1215,7 @@ async fn forward_request(
                         &json!({"reason":"main_rewrite_selected"}),
                     );
                 }
-                if before == after
-                    && standard(&body)
-                    && primary_priced
-                    && !session.bootstrap_review_pending
-                {
-                    if service.config.background_reviews {
-                        dispatch_review_for(
-                            service.clone(),
-                            id.clone(),
-                            &mut session,
-                            body.clone(),
-                            request_id.clone(),
-                        )
-                        .await;
-                    } else {
-                        review(
-                            &service,
-                            &id,
-                            &mut session,
-                            &body,
-                            false,
-                            &mut ReviewRun {
-                                request_id: request_id.clone(),
-                                ..ReviewRun::default()
-                            },
-                        )
-                        .await;
-                    }
-                }
-            } else if report["forced"] == true {
-                let _ = save(&service, &id, &session);
-                let message = if service.config.mode == Mode::Audit {
-                    "context budget exceeded in audit mode; use --mode compact or increase the configured budgets"
-                } else {
-                    "retained protected context or incoming material exceeds the primary or reviewer budget; increase the configured budget or start a new conversation"
-                };
-                return Err(failure(StatusCode::PAYLOAD_TOO_LARGE, message));
-            } else if standard(&body) && primary_priced && !session.bootstrap_review_pending {
-                if service.config.background_reviews {
+                if before == after && standard(&body) && primary_priced {
                     dispatch_review_for(
                         service.clone(),
                         id.clone(),
@@ -1360,20 +1224,24 @@ async fn forward_request(
                         request_id.clone(),
                     )
                     .await;
-                } else {
-                    review(
-                        &service,
-                        &id,
-                        &mut session,
-                        &body,
-                        false,
-                        &mut ReviewRun {
-                            request_id: request_id.clone(),
-                            ..ReviewRun::default()
-                        },
-                    )
-                    .await;
                 }
+            } else if report["forced"] == true {
+                let _ = save(&service, &id, &session);
+                let message = if service.config.mode == Mode::Audit {
+                    "context budget exceeded in audit mode; use --mode compact or increase the configured budgets"
+                } else {
+                    "retained protected context or incoming material exceeds the primary budget; increase the configured budget or start a new conversation"
+                };
+                return Err(failure(StatusCode::PAYLOAD_TOO_LARGE, message));
+            } else if standard(&body) && primary_priced {
+                dispatch_review_for(
+                    service.clone(),
+                    id.clone(),
+                    &mut session,
+                    body.clone(),
+                    request_id.clone(),
+                )
+                .await;
             }
         }
         let reviewed = if session.compactions == reviewed.compactions {
@@ -2050,9 +1918,10 @@ async fn dispatch_review_for(
     main: Value,
     request_id: String,
 ) {
+    let bootstrap = session.bootstrap_review_pending && !session.bootstrap_review_complete;
     let decision = admission::decision(&service.config, session, &main, false);
     journal(&service, &id, &request_id, "review_admission", &decision);
-    if decision["admitted"] != true {
+    if !bootstrap && decision["admitted"] != true {
         journal(&service, &id, &request_id, "review_skipped", &decision);
         return;
     }
@@ -2105,7 +1974,7 @@ async fn dispatch_review_for(
             request_id,
             ..ReviewRun::default()
         };
-        review(&service, &id, &mut reviewed, &main, false, &mut run).await;
+        review(&service, &id, &mut reviewed, &main, bootstrap, &mut run).await;
         // Primary transport/checkpoint owns this lock until its commit finishes.
         // Never save the snapshot: merge only reviewer fields into the latest state.
         let _lock = session_lock(&service, &id).await;
@@ -2214,11 +2083,22 @@ fn merge_review(
                     && (!new.pinned || old.pinned)
             })
         });
+    // Import spend is unavoidable even if newer primary progress invalidates
+    // the snapshot. Never replace its primary state with the worker's copy.
+    current.bootstrap_estimated_cost_usd +=
+        (reviewed.bootstrap_estimated_cost_usd - before.bootstrap_estimated_cost_usd).max(0.0);
     if !compatible {
         current.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"background advice discarded: main lineage, source membership or eligibility changed; review current sources again"}]});
         return false;
     }
     admission::initialize(current);
+    if before.bootstrap_review_pending && !before.bootstrap_review_complete {
+        current
+            .bootstrap_reviewed_ids
+            .extend(reviewed.bootstrap_reviewed_ids.iter().copied());
+        current.bootstrap_review_complete = reviewed.bootstrap_review_complete;
+        current.bootstrap_review_pending = !reviewed.bootstrap_review_complete;
+    }
     let before_admission = current.clone();
     let before_memory_input = current.render_primary();
     // Apply reviewer deltas only. Never replace a newer live opinion (including
@@ -2383,9 +2263,13 @@ async fn review(
         return false;
     }
     prepare_review_history(session, &groups);
-    let body = review_body_for_groups(&service.config, session, &groups);
-    // Ordinary reviews are one incremental update. The live planner makes room
-    // first; only oversized imports use multiple bounded admission rounds.
+    let mut body = review_body_for_groups(&service.config, session, &groups);
+    // Dispose of reviewer replay independently; never rewrite primary source
+    // or accepted protection merely to admit another reviewer request.
+    if !review_fits(&service.config, &body) && session.review_history.is_some() {
+        session.compact_reviewer();
+        body = review_body_for_groups(&service.config, session, &groups);
+    }
     if !review_fits(&service.config, &body) {
         journal(
             service,
@@ -2394,16 +2278,6 @@ async fn review(
             "review_skipped",
             &json!({"reason":"reviewer_capacity","background":run.background,"required_tokens":reviewer_required_tokens(&service.config,&body),"context_tokens":service.config.classifier_max_input_tokens}),
         );
-        for group in &groups {
-            let mut clean = session.clone();
-            clean.compact_reviewer();
-            if !review_fits(
-                &service.config,
-                &review_body_for_groups(&service.config, &clean, std::slice::from_ref(group)),
-            ) {
-                session.opinions.insert(group.id, "keep".into());
-            }
-        }
         return false;
     }
     session.observe_groups(&groups);
@@ -2472,40 +2346,16 @@ async fn review_import(
                 );
                 continue;
             }
-            let removed = admitted
-                .iter()
-                .filter(|g| session.drop_authorized(g))
-                .map(|g| g.id)
-                .collect::<Vec<_>>();
-            if removed.is_empty() || service.config.mode != Mode::Compact {
-                session.opinions.insert(remaining[0].id, "keep".into());
-                session.review_feedback = json!({"reason":"import_capacity_exceeded","rejected_count":1,
-                    "rejected":[{"field":"capacity","reason":"protected or indivisible source cannot fit the reviewer context budget"}]});
-                journal(
-                    service,
-                    id,
-                    &run.request_id,
-                    "review_skipped",
-                    &json!({"reason":"import_capacity_exceeded"}),
-                );
-                return false;
-            }
-            let before = session.render_primary();
-            session.remove(&removed, &groups);
-            if session.render_primary() != before {
-                session.compactions += 1;
-            }
-            if save(service, id, session).is_err() {
-                return false;
-            }
+            session.review_feedback = json!({"reason":"import_capacity_exceeded","rejected_count":1,
+                "rejected":[{"field":"capacity","reason":"remaining source cannot fit the reviewer context budget; primary retained unchanged"}]});
             journal(
                 service,
                 id,
                 &run.request_id,
-                "compaction_committed",
-                &json!({"reason":"bootstrap_capacity","main_changed":session.render_primary() != before,"removed_group_count":removed.len()}),
+                "review_skipped",
+                &json!({"reason":"import_capacity_exceeded"}),
             );
-            continue;
+            return false;
         }
         prepare_review_history(session, &admitted);
         let body = review_body_for_groups(&service.config, session, &admitted);
@@ -2539,16 +2389,18 @@ async fn review_import(
         }
         session.bootstrap_estimated_cost_usd += cost;
         session.observe_groups(&admitted);
-        if save(service, id, session).is_err() {
+        if !run.background && save(service, id, session).is_err() {
             return false;
         }
         calls += 1;
         if !review_chunk(service, id, session, &body, &admitted, run).await {
-            let _ = save(service, id, session);
+            if !run.background {
+                let _ = save(service, id, session);
+            }
             return false;
         }
         session.bootstrap_reviewed_ids.extend(added);
-        if save(service, id, session).is_err() {
+        if !run.background && save(service, id, session).is_err() {
             return false;
         }
     }
@@ -3659,7 +3511,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_capacity_forces_shared_compaction_despite_economic_margin() {
+    fn reviewer_capacity_never_forces_primary_compaction_past_economic_margin() {
         let mut config = reviewer_config();
         config.classifier_cache_policy = ClassifierCachePolicy::Disabled;
         config.classifier_max_input_tokens = 5000;
@@ -3678,14 +3530,16 @@ mod tests {
         let body = json!({"model":"gpt-6-luna","input":session.render_primary()});
         let (candidate, report) = plan(&config, &session, &body);
         assert!(
-            candidate.is_some(),
-            "capacity must override the savings margin"
+            candidate.is_none(),
+            "reviewer pressure is not a primary emergency"
         );
-        assert_eq!(report["forced"], true);
+        assert_eq!(report["forced"], false);
+        assert_eq!(report["reviewer_fits"], false);
         assert!(
-            !json!(candidate.unwrap().render_primary())
-                .to_string()
-                .contains("discardable output")
+            session
+                .render_primary()
+                .iter()
+                .any(|item| item.to_string().contains("discardable output"))
         );
     }
 
