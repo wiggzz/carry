@@ -9,6 +9,29 @@ mod admission;
 #[path = "support/pr154.rs"]
 mod pr154;
 
+#[test]
+fn historical_full_history_fork_after_parent_cleanup() {
+    let output = Command::new("python3")
+        .args([
+            "-B",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/proxy_fork_continuity.py"
+            ),
+            "ForkContinuity.test_historical_full_history_fork_after_parent_cleanup",
+            "-v",
+        ])
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python loopback fork regression");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 struct Proxy(Child);
 
 impl Drop for Proxy {
