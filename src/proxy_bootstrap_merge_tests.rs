@@ -208,6 +208,149 @@ async fn bootstrap_multichunk_commit_control(memory_first: bool) {
     provider.abort();
 }
 
+// HTTP-FORK-003: publication is stricter than ordinary partial advice. Execute
+// the real first-import worker over loopback, not a synthetic last-feedback merge.
+async fn fork_multichunk_publication_control(partial_first: bool, empty_last: bool) {
+    let captures = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let requests = captures.clone();
+    let router = Router::new().route("/review", post(move |axum::Json(body): axum::Json<Value>| {
+        let requests = requests.clone();
+        async move {
+            let mut captures = requests.lock().await;
+            captures.push(body);
+            let call = captures.len();
+            assert!(call <= 2, "exactly two real import chunks");
+            let advice = if call == 1 {
+                json!({"protected":[],"removable":["g2"],"memories":[{
+                    "source_ids":[if partial_first {"g999"} else {"g2"}],
+                    "text":"PORTABLE_FACT"}]})
+            } else {
+                json!({"protected":[],"removable":if empty_last {vec![]} else {vec!["g4"]},"memories":[]})
+            };
+            axum::Json(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":advice.to_string()}]}],"usage":{"input_tokens":100,"output_tokens":10}}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let id = pr154_session_id("fork-multichunk");
+    let mut service = checkpoint_service(directory.path());
+    small_admission_config(&mut service.config);
+    service.config.mode = Mode::Compact;
+    service.config.review_max_calls = 2;
+    service.config.classifier_url = Some(format!("http://{address}/review"));
+    let mut session = Session::default();
+    session
+        .ingest(&[
+            json!({"role":"user","content":"durable goal"}),
+            json!({"role":"assistant","content":"first evidence ".repeat(100)}),
+            json!({"role":"user","content":"old direction"}),
+            json!({"role":"assistant","content":"second evidence ".repeat(400)}),
+            json!({"role":"user","content":"current direction"}),
+        ])
+        .unwrap();
+    session.import_replayed_prefix();
+    let main = admission_main(&session);
+    session.review_context = cache_base(&main);
+    admission::initialize(&mut session);
+    session.review_feedback =
+        json!({"rejected_count":1,"rejected":[{"reason":"previous diagnostic ".repeat(1000)}]});
+    let groups = session.groups();
+    service.config.classifier_max_input_bytes = (reviewer_serialized_identity(
+        &review_body_for_groups(&service.config, &session, &groups[..3]),
+    )
+    .0 + 256) as u32;
+    assert!(review_fits(
+        &service.config,
+        &review_body_for_groups(&service.config, &session, &groups[..3])
+    ));
+    assert!(!review_fits(
+        &service.config,
+        &review_body_for_groups(&service.config, &session, &groups[..4])
+    ));
+    let before = session.clone();
+    let service = Arc::new(service);
+    dispatch_review(service.clone(), id.clone(), &mut session, main).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while service.background_reviews.lock().await.contains(&id) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let merged = load(&service, &id).unwrap();
+    let captures = captures.lock().await;
+    assert_eq!(captures.len(), 2);
+    assert!(!captures[0].to_string().contains("second evidence"));
+    assert!(captures[1].to_string().contains("second evidence"));
+    assert_eq!(merged.shadow.calls, 2);
+    assert_eq!(
+        merged.review_feedback["rejected_count"], 0,
+        "last chunk really is fully accepted"
+    );
+    assert_eq!(merged.partial_reviews, u64::from(partial_first));
+    assert!(merged.bootstrap_review_complete);
+    assert_eq!(
+        serde_json::to_value(&merged.history).unwrap(),
+        serde_json::to_value(&before.history).unwrap()
+    );
+    let groups = merged.groups();
+    let dropped = groups.iter().find(|g| g.id == 2).unwrap();
+    assert!(
+        merged.drop_authorized(dropped),
+        "ordinary partially accepted opinion remains usable"
+    );
+    let mut ordinary = merged.clone();
+    ordinary.remove(&[2], &groups);
+    assert!(
+        !serde_json::to_string(&ordinary.render_primary())
+            .unwrap()
+            .contains("first evidence")
+    );
+    assert!(before.opinions.is_empty() && before.memories.is_empty());
+    let finished = pr154_journal(directory.path(), &id)
+        .into_iter()
+        .filter(|e| e["event"] == "review_finished")
+        .collect::<Vec<_>>();
+    assert_eq!(finished.len(), 2);
+    assert_eq!(finished[0]["data"]["accepted_opinions"], 1);
+    assert_eq!(
+        finished[0]["data"]["rejected_count"],
+        u64::from(partial_first)
+    );
+    assert_eq!(finished[1]["data"]["rejected_count"], 0);
+    provider.abort();
+    assert_eq!(
+        merged.fork_points.is_empty(),
+        partial_first,
+        "HTTP-FORK-003: any rejected chunk forbids portable publication, even after clean final feedback"
+    );
+    if !partial_first {
+        assert_eq!(
+            merged.fork_points.len(),
+            1,
+            "fully accepted multi-chunk control publishes"
+        );
+        assert_eq!(merged.memories.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn fork_multichunk_partial_then_empty_never_publishes() {
+    fork_multichunk_publication_control(true, true).await;
+}
+
+#[tokio::test]
+async fn fork_multichunk_partial_then_accepted_never_publishes() {
+    fork_multichunk_publication_control(true, false).await;
+}
+
+#[tokio::test]
+async fn fork_multichunk_fully_accepted_publishes() {
+    fork_multichunk_publication_control(false, false).await;
+}
+
 #[tokio::test]
 async fn bootstrap_multichunk_rejected_memory_then_valid_empty_preserves_chunk_coverage() {
     bootstrap_multichunk_commit_control(true).await;
