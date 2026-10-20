@@ -115,7 +115,9 @@ class KeepLeases(StateRegressions):
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             pending = pool.submit(proxy.send, history)
             try:
-                self.assertTrue(fixture.held.wait(3), "LEASE_ECON_HTTP_RED: no-growth due demand must dispatch bounded review")
+                self.assertTrue(fixture.held.wait(3), "LEASE_ECON_HTTP_RED: no-growth due demand must dispatch bounded review; " +
+                    json.dumps({key: proxy.saved().get(key) for key in
+                                ("completed_requests", "last_review_request", "keep_leases", "last_plan", "review_feedback")}))
                 # RED4 proved status200/primary+1 with real review still pending
                 # and unreleased. Test that causal independence, not a newly
                 # invented one-second CPU latency guarantee.

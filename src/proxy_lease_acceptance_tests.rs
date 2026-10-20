@@ -991,15 +991,38 @@ fn lease_acceptance_target_tail_tier_crossing_reverses_shared_candidate_gain() {
         "original payoff5 must not bypass JOIN's conditional rebuild money gate"
     );
     let decision = &row["selection_joint"];
-    let gain_per_request = (decision["primary_keep"].as_f64().unwrap()
-        - decision["primary_compact"].as_f64().unwrap())
-        / config.payoff_requests as f64;
+    let mut compacted = released.clone();
+    let groups = compacted.groups();
+    let removed = row["removed_groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_u64().unwrap())
+        .collect::<Vec<_>>();
+    compacted.remove(&removed, &groups);
+    let mut compact_main = main.clone();
+    compact_main["input"] = json!(compacted.render_primary());
+    let one = view_costs(
+        &primary_wire_body(&config, &main),
+        &primary_wire_body(&config, &compact_main),
+        &released.primary_cache,
+        main["model"].as_str().unwrap(),
+        1,
+    )
+    .unwrap();
+    let gain_at_one = one.keep - one.compact;
+    let gain_at_original =
+        decision["primary_keep"].as_f64().unwrap() - decision["primary_compact"].as_f64().unwrap();
+    // The first request is cold and later requests have their own actual cache
+    // sensitivity. Dividing a five-call total by five would misprice the slope.
+    let gain_per_request =
+        (gain_at_original - gain_at_one) / config.payoff_requests.saturating_sub(1) as f64;
     let allowance = decision["future_shadow_compact"].as_f64().unwrap();
     assert!(gain_per_request > 0.0 && allowance > 0.0 && paid > underpriced);
-    let horizon = ((allowance + underpriced) / gain_per_request).floor() as u64 + 1;
+    let horizon = 2 + ((allowance + underpriced - gain_at_one) / gain_per_request).floor() as u64;
     assert!(horizon >= config.payoff_requests && horizon <= 100);
     assert!(
-        (horizon as f64) * gain_per_request < allowance + paid,
+        gain_at_one + horizon.saturating_sub(1) as f64 * gain_per_request < allowance + paid,
         "real-render tier interval must contain an integral authorized horizon"
     );
     config.payoff_requests = horizon;
@@ -1024,7 +1047,7 @@ fn lease_acceptance_target_tail_tier_crossing_reverses_shared_candidate_gain() {
         "ordinary_tokens":estimate(&ordinary),"targeted_tokens":estimate(&targeted),"tier_threshold":threshold,
         "actual_paid_usd":paid,"underpriced_control_usd":underpriced,
         "horizon":config.payoff_requests,"original_horizon":5,"conditional_rebuild_allowance_usd":allowance,
-        "primary_gain_per_request_usd":gain_per_request,
+        "primary_gain_first_request_usd":gain_at_one,"primary_gain_per_future_request_usd":gain_per_request,
         "original_sensitivity_accepted":true,"original_selection_accepted":false,
         "primary_only_candidate":true,"underpriced_candidate":true,"actual_candidate":false,
         "cache_credit_tokens":reviewer_reusable(&config,&session.reviewer_cache,&targeted)}));
