@@ -21,6 +21,7 @@ use axum::{
     routing::{get, post},
 };
 use carry::core::{Rates, ViewCosts, horizon_cost, input_cost, joint_decision, select_removals};
+use carry::models::{ResolvedModel, ResolvedPair, Route, RouteClass, SourceCatalog, resolve_model};
 use clap::{Parser, ValueEnum};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -55,7 +56,7 @@ pub enum Login {
     Codex,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(name = "carry proxy", about = "Opaque native Responses HTTP proxy")]
 pub struct ProxyCli {
     /// Auto prefers a configured API key, then Carry's saved subscription.
@@ -106,7 +107,9 @@ pub struct ProxyCli {
     #[arg(long)]
     review_replayed_history: bool,
     /// Total primary context budget, including output reserve and estimation margin.
-    #[arg(long, default_value_t = 272000, value_parser = clap::value_parser!(u32).range(1024..=2000000))]
+    #[arg(long = "primary-context-tokens", value_parser = clap::value_parser!(u32).range(1024..=2000000))]
+    primary_context_override: Option<u32>,
+    #[arg(skip = 272000u32)]
     primary_context_tokens: u32,
     /// Reserved primary output tokens when the client supplies no output limit.
     #[arg(long, default_value_t = 16384)]
@@ -115,8 +118,13 @@ pub struct ProxyCli {
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=100))]
     context_margin_percent: u8,
     /// Total reviewer context budget, including its output reserve and margin.
-    #[arg(long, alias = "reviewer-context-tokens", default_value_t = 300000, value_parser = clap::value_parser!(u32).range(1024..=2000000))]
+    #[arg(long = "classifier-max-input-tokens", alias = "reviewer-context-tokens", value_parser = clap::value_parser!(u32).range(1024..=2000000))]
+    reviewer_context_override: Option<u32>,
+    #[arg(skip = 300000u32)]
     classifier_max_input_tokens: u32,
+    /// Request-scoped frozen contracts, never a second model table.
+    #[arg(skip)]
+    model_resolution: Option<ResolvedPair>,
     /// Serialized transport guard; token budget controls reviewer context size.
     #[arg(long, default_value_t = 8388608, value_parser = clap::value_parser!(u32).range(4096..=8388608))]
     classifier_max_input_bytes: u32,
@@ -168,15 +176,17 @@ pub struct ProxyCli {
     fork_max_age_secs: u64,
 }
 
+#[derive(Clone)]
 struct Service {
+    catalog: Arc<tokio::sync::OnceCell<SourceCatalog>>,
     config: ProxyCli,
     client: reqwest::Client,
     upstream_key: Option<String>,
     classifier_key: Option<String>,
     auth_token: Option<String>,
-    locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
-    background_reviews: Mutex<HashSet<String>>,
-    _directory_lock: File,
+    locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    background_reviews: Arc<Mutex<HashSet<String>>>,
+    _directory_lock: Arc<File>,
 }
 
 #[path = "proxy_admission.rs"]
@@ -225,6 +235,8 @@ fn private_file(path: &Path, append: bool) -> std::io::Result<File> {
 }
 
 pub async fn serve(mut config: ProxyCli) -> Result<()> {
+    config.primary_context_tokens = config.primary_context_override.unwrap_or(272000);
+    config.classifier_max_input_tokens = config.reviewer_context_override.unwrap_or(300000);
     if config.codex_login && config.login == Login::ApiKey {
         bail!("--codex-login conflicts with --login api-key");
     }
@@ -324,6 +336,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         }
     }
     let service = Arc::new(Service {
+        catalog: Arc::new(tokio::sync::OnceCell::new()),
         upstream_key: std::env::var("CARRY_PROXY_UPSTREAM_KEY")
             .ok()
             .filter(|key| !key.trim().is_empty())
@@ -347,9 +360,9 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
             .connect_timeout(Duration::from_secs(15))
             .build()?,
         config,
-        locks: Mutex::new(HashMap::new()),
-        background_reviews: Mutex::new(HashSet::new()),
-        _directory_lock: directory_lock,
+        locks: Arc::new(Mutex::new(HashMap::new())),
+        background_reviews: Arc::new(Mutex::new(HashSet::new())),
+        _directory_lock: Arc::new(directory_lock),
     });
     logging::maintain(&service);
     let listener = tokio::net::TcpListener::bind(service.config.listen).await?;
@@ -391,6 +404,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
             get(|| async { axum::Json(json!({"status": "ok"})) }),
         )
         .route("/v1/models", get(models))
+        .route("/carry/catalog", get(catalog))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(native_compact))
         .route("/v1/responses/{id}", get(unsupported).delete(unsupported))
@@ -588,7 +602,7 @@ async fn models(
 // openai/codex rust-v0.147.0, codex-api/src/endpoint/models.rs.
 const CODEX_MODELS_CLIENT_VERSION: &str = "0.147.0";
 
-async fn codex_models(service: &Service) -> Result<Response, Failure> {
+async fn fetch_codex_models(service: &Service) -> Result<Value, Failure> {
     let unavailable = || {
         failure(
             StatusCode::BAD_GATEWAY,
@@ -618,6 +632,7 @@ async fn codex_models(service: &Service) -> Result<Response, Failure> {
     let response = service
         .client
         .get(format!("{endpoint}/models"))
+        .timeout(Duration::from_secs(15))
         .query(&[("client_version", CODEX_MODELS_CLIENT_VERSION)])
         .bearer_auth(&credential.access_token)
         .header("chatgpt-account-id", &credential.account_id)
@@ -635,7 +650,17 @@ async fn codex_models(service: &Service) -> Result<Response, Failure> {
     let bytes = bounded(response, 8 * 1024 * 1024)
         .await
         .map_err(|_| unavailable())?;
-    let catalog: Value = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
+    serde_json::from_slice(&bytes).map_err(|_| unavailable())
+}
+
+async fn codex_models(service: &Service) -> Result<Response, Failure> {
+    let catalog = fetch_codex_models(service).await?;
+    let unavailable = || {
+        failure(
+            StatusCode::BAD_GATEWAY,
+            "Codex model discovery unavailable; configure models explicitly",
+        )
+    };
     let models = catalog["models"].as_array().ok_or_else(unavailable)?;
     let mut seen = HashSet::new();
     let mut data = Vec::new();
@@ -659,6 +684,214 @@ async fn codex_models(service: &Service) -> Result<Response, Failure> {
         }
     }
     Ok(axum::Json(json!({"object": "list", "data": data})).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct CatalogQuery {
+    model: String,
+}
+
+async fn resolved_catalog(
+    service: &Service,
+    model: &str,
+    processing_tier: &str,
+) -> Result<(ResolvedModel, ResolvedModel), Failure> {
+    let config = &service.config;
+    let mut primary_route = Route::new(&config.upstream_url, config.codex_login);
+    primary_route.processing_tier = processing_tier.into();
+    let reviewer_route = Route::new(
+        config
+            .classifier_url
+            .as_deref()
+            .unwrap_or(&config.upstream_url),
+        config.codex_login && config.classifier_url.is_none(),
+    );
+    let source = if config.codex_login {
+        Some(
+            service
+                .catalog
+                .get_or_init(|| async {
+                    // Fetch once per process route epoch, including failed resolution.
+                    // Checkpoints freeze the resulting facts rather than refreshing age.
+                    match tokio::time::timeout(Duration::from_secs(20), fetch_codex_models(service))
+                        .await
+                    {
+                        Ok(Ok(value)) => SourceCatalog::from_codex(
+                            &value,
+                            now(),
+                            matches!(primary_route.class, RouteClass::SyntheticSubscription),
+                        )
+                        .map(|mut source| {
+                            // Metadata was fetched for the default service, not an
+                            // arbitrary requested processing tier.
+                            source.route =
+                                Some(Route::new(&config.upstream_url, config.codex_login));
+                            source
+                        })
+                        .unwrap_or_else(|_| SourceCatalog::unavailable(now())),
+                        _ => SourceCatalog::unavailable(now()),
+                    }
+                })
+                .await,
+        )
+    } else {
+        None
+    };
+    let error = |message| failure(StatusCode::BAD_REQUEST, message);
+    let primary = resolve_model(
+        model,
+        primary_route,
+        source,
+        config.primary_context_override,
+        272000,
+        config.primary_output_reserve_tokens,
+        config.context_margin_percent,
+    )
+    .map_err(error)?;
+    let mut reviewer = resolve_model(
+        &config.classifier_model,
+        reviewer_route,
+        source,
+        config.reviewer_context_override,
+        300000,
+        config.classifier_max_output_tokens,
+        config.context_margin_percent,
+    )
+    .map_err(error)?;
+    freeze_reviewer_cache_policy(config, &mut reviewer);
+    Ok((primary, reviewer))
+}
+
+fn freeze_reviewer_cache_policy(config: &ProxyCli, reviewer: &mut ResolvedModel) {
+    let explicit_override = config.classifier_cache_policy == ClassifierCachePolicy::OpenaiExplicit
+        && !(config.codex_login && config.classifier_url.is_none());
+    if explicit_override {
+        // This existing CLI option is an operator attestation, NOT certification
+        // that a compatible gateway is the official API.
+        reviewer.cache = carry::models::model_spec(&reviewer.model).and_then(|s| s.cache);
+        reviewer.explicit_cache_transport = reviewer.cache.is_some();
+        if let Some(p) = reviewer.provenance.get_mut("cache") {
+            p.source = "operator_openai_explicit_transport_attestation".into();
+            p.status = "operator_override_not_provider_certification".into();
+        }
+    }
+    if config.classifier_cache_policy == ClassifierCachePolicy::Disabled {
+        reviewer.explicit_cache_transport = false;
+    }
+    let mut provenance = reviewer.provenance["cache"].clone();
+    provenance.revision = format!("{:?}", config.classifier_cache_policy);
+    reviewer
+        .provenance
+        .insert("cache_policy".into(), provenance);
+}
+
+async fn session_resolution(
+    service: &Service,
+    session: &mut Session,
+    model: &str,
+    processing_tier: &str,
+) -> Result<ResolvedPair, Failure> {
+    let config = &service.config;
+    let mut primary_route = Route::new(&config.upstream_url, config.codex_login);
+    primary_route.processing_tier = processing_tier.into();
+    let reviewer_route = Route::new(
+        config
+            .classifier_url
+            .as_deref()
+            .unwrap_or(&config.upstream_url),
+        config.codex_login && config.classifier_url.is_none(),
+    );
+    if let Some(saved) = &session.model_resolution {
+        let same = saved.schema_version == 1
+            && saved.primary.model == model
+            && saved.reviewer.model == config.classifier_model
+            && saved.primary.route == primary_route
+            && saved.reviewer.route == reviewer_route
+            && saved
+                .reviewer
+                .provenance
+                .get("cache_policy")
+                .is_some_and(|p| p.revision == format!("{:?}", config.classifier_cache_policy))
+            && saved
+                .primary
+                .provenance
+                .get("capacity")
+                .is_some_and(|p| p.operator_override == config.primary_context_override)
+            && saved
+                .reviewer
+                .provenance
+                .get("capacity")
+                .is_some_and(|p| p.operator_override == config.reviewer_context_override)
+            && saved.primary.ordinary.output_reserve == config.primary_output_reserve_tokens
+            && saved.reviewer.ordinary.output_reserve == config.classifier_max_output_tokens
+            && saved.primary.ordinary.estimation_margin_percent == config.context_margin_percent;
+        if same {
+            return Ok(saved.clone());
+        }
+    }
+    let legacy = session.model_resolution.is_none()
+        && (session.version != 0 || !session.history.is_empty() || session.primary.calls > 0);
+    let (mut primary, mut reviewer) = if legacy {
+        let error = |message| failure(StatusCode::BAD_REQUEST, message);
+        (
+            resolve_model(
+                model,
+                primary_route,
+                None,
+                config.primary_context_override,
+                272000,
+                config.primary_output_reserve_tokens,
+                config.context_margin_percent,
+            )
+            .map_err(error)?,
+            resolve_model(
+                &config.classifier_model,
+                reviewer_route,
+                None,
+                config.reviewer_context_override,
+                300000,
+                config.classifier_max_output_tokens,
+                config.context_margin_percent,
+            )
+            .map_err(error)?,
+        )
+    } else {
+        resolved_catalog(service, model, processing_tier).await?
+    };
+    if legacy {
+        for resolved in [&mut primary, &mut reviewer] {
+            let provenance = resolved
+                .provenance
+                .get_mut("capacity")
+                .expect("capacity provenance");
+            provenance.status = "legacy_snapshot_missing".into();
+            provenance.source = "contemporaneous-legacy-role-capacity-v1".into();
+            provenance.fallback_reason =
+                Some("checkpoint_predates_resolved_contract_no_new_catalog_defaults".into());
+        }
+    }
+    freeze_reviewer_cache_policy(config, &mut reviewer);
+    let pair = ResolvedPair {
+        schema_version: 1,
+        primary,
+        reviewer,
+    };
+    if let Some(prior) = session.model_resolution.replace(pair.clone()) {
+        session.model_resolution_history.push(prior);
+    }
+    Ok(pair)
+}
+
+async fn catalog(
+    State(service): State<Arc<Service>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<CatalogQuery>,
+) -> Result<axum::Json<Value>, Failure> {
+    authorize(&service, &headers)?;
+    let (primary, reviewer) = resolved_catalog(&service, &query.model, "default").await?;
+    Ok(axum::Json(
+        json!({"schema_version":1,"primary":primary,"reviewer":reviewer}),
+    ))
 }
 
 async fn metrics(
@@ -952,7 +1185,7 @@ async fn forward(
 }
 
 async fn forward_request(
-    service: Arc<Service>,
+    mut service: Arc<Service>,
     headers: HeaderMap,
     bytes: Bytes,
     legacy_native: bool,
@@ -1066,6 +1299,26 @@ async fn forward_request(
         let declared_fork = fork.is_some();
         let lock = session_lock(&service, &id).await;
         let mut session = load(&service, &id)?;
+        if service.config.mode != Mode::Off {
+            let model = body["model"]
+                .as_str()
+                .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "model is required"))?;
+            let resolved = session_resolution(
+                &service,
+                &mut session,
+                model,
+                body["service_tier"].as_str().unwrap_or("default"),
+            )
+            .await?;
+            // One request-scoped contract drives every existing primary/reviewer
+            // feasibility, memory and bootstrap check. Locks, metadata epoch,
+            // background registry and directory lock remain process-shared.
+            let mut effective = (*service).clone();
+            effective.config.primary_context_tokens = resolved.primary.capacity_tokens;
+            effective.config.classifier_max_input_tokens = resolved.reviewer.capacity_tokens;
+            effective.config.model_resolution = Some(resolved);
+            service = Arc::new(effective);
+        }
         if let Some((origin, point)) = &fork {
             forking::hydrate(&service.config, &mut session, origin, point, &body)?;
         }
@@ -1194,7 +1447,8 @@ async fn forward_request(
         );
         session.review_context = cache_base(&body);
         let active = !native && service.config.mode != Mode::Off;
-        let primary_priced = Rates::for_model(body["model"].as_str().unwrap_or(""), 0.0).is_some();
+        let primary_priced =
+            primary_rates(&service.config, body["model"].as_str().unwrap_or(""), 0.0).is_some();
         // Accepted advice is optional input to planning. Never acquire new
         // advice (including bootstrap/pressure rescue) on the primary path.
         if active {
@@ -1378,6 +1632,7 @@ async fn forward_request(
         outbound["model"].as_str().unwrap_or(""),
         native,
         standard(&outbound),
+        service.config.model_resolution.as_ref().map(|p| &p.primary),
     );
     let response = if service.config.codex_login {
         send_codex(&service, &endpoint, &outbound, false).await
@@ -1621,6 +1876,14 @@ fn review_body_with_input(config: &ProxyCli, session: &Session, input: Vec<Value
 }
 
 fn classifier_cache_enabled(config: &ProxyCli) -> Result<bool> {
+    if let Some(pair) = &config.model_resolution {
+        return Ok(
+            config.classifier_cache_policy != ClassifierCachePolicy::Disabled
+                && pair.reviewer.model == config.classifier_model
+                && pair.reviewer.cache.is_some()
+                && pair.reviewer.explicit_cache_transport,
+        );
+    }
     let supported = carry::models::model_spec(&config.classifier_model)
         .is_some_and(|spec| spec.explicit_reviewer_cache);
     match config.classifier_cache_policy {
@@ -1745,6 +2008,9 @@ fn reviewer_reusable_credit(
     cache: &[ReviewerCacheBoundary],
     body: &Value,
 ) -> f64 {
+    if config.model_resolution.is_some() && reviewer_cache_capabilities(config).is_none() {
+        return 0.0;
+    }
     let Some(input) = reviewer_input(body) else {
         return 0.0;
     };
@@ -1781,6 +2047,8 @@ fn observe_reviewer_cache(
     body: &Value,
     usage: &Value,
 ) {
+    // Preserve observed native read evidence even when the route's future
+    // cache contract is unknown. Forecast eligibility is checked separately.
     let Some(input) = reviewer_input(body) else {
         return;
     };
@@ -1870,7 +2138,7 @@ fn reviewer_view_costs(
 ) -> Option<ViewCosts> {
     let cost = |body: &Value| {
         let tokens = estimate(body);
-        let rates = Rates::for_model(&config.classifier_model, tokens)?;
+        let rates = reviewer_rates(config, tokens)?;
         reviewer_input(body)?;
         let prefix = reviewer_prefix_estimate(body, reviewer_stable_end(body));
         let uncached = if classifier_cache_enabled(config).unwrap_or(false) {
@@ -1889,7 +2157,7 @@ fn reviewer_view_costs(
         // evidence that a prefix meets the provider's cache minimum.
         let future = input_cost(
             tokens,
-            if crate::openai::prompt_cache_capabilities(&config.classifier_model)
+            if reviewer_cache_capabilities(config)
                 .is_some_and(|cap| prefix >= cap.minimum_prefix_tokens as f64)
             {
                 prefix
@@ -2067,21 +2335,28 @@ fn merge_review(
     // Spend survives stale advice, rebases and primary failures. Price reviewer
     // receipts against the current trajectory, never replace its primary history.
     for receipt in &run.receipts {
+        // The review snapshot is the dispatch epoch. The live session may have
+        // changed routes/contracts while this already-paid work was in flight.
+        let resolved = before.model_resolution.as_ref().map(|p| &p.reviewer);
         if let Some(usage) = &receipt.usage {
-            current
-                .shadow
-                .observe(&receipt.model, usage, receipt.standard);
+            current.shadow.observe_with_rates(
+                &receipt.model,
+                usage,
+                receipt.standard,
+                receipt_rates(&receipt.model, usage, resolved),
+            );
         } else {
             current.shadow.calls += 1;
             current.shadow.unavailable_cost_calls += 1;
         }
         if let Some(t) = &mut current.cost_trajectory {
             if receipt.completed {
-                t.reviewer_usage(
+                t.reviewer_usage_resolved(
                     &receipt.model,
                     receipt.input,
                     receipt.usage.as_ref().unwrap_or(&Value::Null),
                     receipt.standard,
+                    resolved,
                 );
             } else {
                 t.failed_call();
@@ -2126,6 +2401,14 @@ fn merge_review(
     if !compatible {
         current.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"background advice discarded: main lineage, source membership or eligibility changed; review current sources again"}]});
         return false;
+    }
+    // In-flight work carries dispatch-scoped config. Receipt prices above belong
+    // to that old epoch, but new memory must fit the latest saved pair instead.
+    let mut admission_config = config.clone();
+    if let Some(pair) = &current.model_resolution {
+        admission_config.primary_context_tokens = pair.primary.capacity_tokens;
+        admission_config.classifier_max_input_tokens = pair.reviewer.capacity_tokens;
+        admission_config.model_resolution = Some(pair.clone());
     }
     admission::initialize(current);
     let before_admission = current.clone();
@@ -2183,7 +2466,7 @@ fn merge_review(
         }
         candidate.refresh_memory_shadow();
         // The latest task/settings, not the dispatched snapshot, own admission.
-        if candidate.memories.len() <= 128 && memory_admission_fits(config, &candidate) {
+        if candidate.memories.len() <= 128 && memory_admission_fits(&admission_config, &candidate) {
             *current = candidate;
         } else {
             budget_rejections += 1;
@@ -2414,8 +2697,7 @@ async fn review_import(
         }
         prepare_review_history(session, &admitted);
         let body = review_body_for_groups(&service.config, session, &admitted);
-        let Some(rates) = Rates::for_model(&service.config.classifier_model, estimate(&body))
-        else {
+        let Some(rates) = reviewer_rates(&service.config, estimate(&body)) else {
             journal(
                 service,
                 id,
@@ -2526,7 +2808,18 @@ async fn review_chunk(
     );
     let _ = trace(service, id, "shadow_submitted", body);
     session.last_review_request = session.completed_requests;
-    let attempt = Attempt::start("shadow", &service.config.classifier_model, false, true);
+    let resolved = service
+        .config
+        .model_resolution
+        .as_ref()
+        .map(|p| &p.reviewer);
+    let attempt = Attempt::start(
+        "shadow",
+        &service.config.classifier_model,
+        false,
+        true,
+        resolved,
+    );
     let codex_reviewer = service.config.codex_login && service.config.classifier_url.is_none();
     let response = if codex_reviewer {
         send_codex(service, &service.config.upstream_url, body, true).await
@@ -2584,16 +2877,18 @@ async fn review_chunk(
                 completed: value["status"] == "completed",
             });
         }
-        session.shadow.observe(
+        session.shadow.observe_with_rates(
             &service.config.classifier_model,
             &value["usage"],
             value.get("service_tier").is_none_or(|v| v == "default"),
+            receipt_rates(&service.config.classifier_model, &value["usage"], resolved),
         );
         if let Some(trajectory) = &mut session.cost_trajectory {
-            trajectory.reviewer(
+            trajectory.reviewer_resolved(
                 body,
                 &value,
                 value.get("service_tier").is_none_or(|v| v == "default"),
+                resolved,
             );
         }
         if value["status"] == "completed" {
@@ -2616,6 +2911,7 @@ async fn review_chunk(
                 Some(&value),
                 &service.config.classifier_model,
                 true,
+                resolved,
             ),
         );
         if value["status"] != "completed" {
@@ -2667,7 +2963,13 @@ async fn review_chunk(
             &run.request_id,
             &review_attempt_id,
             "usage",
-            &logging::usage_data("shadow", None, &service.config.classifier_model, true),
+            &logging::usage_data(
+                "shadow",
+                None,
+                &service.config.classifier_model,
+                true,
+                resolved,
+            ),
         );
         if run.background {
             run.receipts.push(ReviewReceipt {
@@ -3027,20 +3329,43 @@ fn review_fits(config: &ProxyCli, body: &Value) -> bool {
         && reviewer_required_tokens(config, body) <= config.classifier_max_input_tokens as f64
 }
 
+#[cfg(test)]
 fn reusable(cache: &[CacheEvidence], body: &Value) -> f64 {
+    primary_reusable(cache, body, None)
+}
+
+fn primary_reusable(
+    cache: &[CacheEvidence],
+    body: &Value,
+    resolved: Option<&ResolvedModel>,
+) -> f64 {
     let Some(input) = body["input"].as_array() else {
         return 0.0;
     };
     let base = cache_base(body);
     cache
         .iter()
-        .filter(|e| now().saturating_sub(e.at) <= 1800 && e.matches(&base, input))
+        .filter(|e| {
+            e.matches_route(resolved.map(|r| &r.route))
+                && now().saturating_sub(e.at) <= 1800
+                && e.matches(&base, input)
+        })
         .map(|e| e.estimated_tokens() * e.native_cached_fraction)
         .fold(0.0, f64::max)
         .min(estimate(body))
 }
 
+#[cfg(test)]
 fn observe_cache(cache: &mut Vec<CacheEvidence>, body: &Value, usage: &Value) {
+    observe_primary_cache(cache, body, usage, None);
+}
+
+fn observe_primary_cache(
+    cache: &mut Vec<CacheEvidence>,
+    body: &Value,
+    usage: &Value,
+    resolved: Option<&ResolvedModel>,
+) {
     let Some(input) = body["input"].as_array() else {
         return;
     };
@@ -3058,17 +3383,48 @@ fn observe_cache(cache: &mut Vec<CacheEvidence>, body: &Value, usage: &Value) {
     for evidence in cache.iter_mut() {
         evidence.compact();
     }
-    cache.push(CacheEvidence::new(
+    let mut evidence = CacheEvidence::new(
         &cache_base(body),
         input,
         now(),
         cached as f64 / total as f64,
-    ));
+    );
+    evidence.route = resolved.map(|r| r.route.clone());
+    cache.push(evidence);
     if cache.len() > 8 {
         cache.remove(0);
     }
 }
 
+fn primary_rates(config: &ProxyCli, model: &str, input: f64) -> Option<Rates> {
+    match &config.model_resolution {
+        Some(pair) if pair.primary.model == model => pair.primary.rates_for_input(input),
+        Some(_) => None,
+        None => Rates::for_model(model, input), // Explicit legacy, snapshot-missing caller.
+    }
+}
+
+fn reviewer_rates(config: &ProxyCli, input: f64) -> Option<Rates> {
+    match &config.model_resolution {
+        Some(pair) if pair.reviewer.model == config.classifier_model => {
+            pair.reviewer.rates_for_input(input)
+        }
+        Some(_) => None,
+        None => Rates::for_model(&config.classifier_model, input),
+    }
+}
+
+fn reviewer_cache_capabilities(
+    config: &ProxyCli,
+) -> Option<carry::models::PromptCacheCapabilities> {
+    match &config.model_resolution {
+        Some(pair) if pair.reviewer.model == config.classifier_model => pair.reviewer.cache,
+        Some(_) => None,
+        None => crate::openai::prompt_cache_capabilities(&config.classifier_model),
+    }
+}
+
+#[cfg(test)]
 fn view_costs(
     keep: &Value,
     compact: &Value,
@@ -3076,10 +3432,30 @@ fn view_costs(
     model: &str,
     requests: u64,
 ) -> Option<ViewCosts> {
+    resolved_view_costs(keep, compact, cache, model, requests, None)
+}
+
+fn resolved_view_costs(
+    keep: &Value,
+    compact: &Value,
+    cache: &[CacheEvidence],
+    model: &str,
+    requests: u64,
+    resolved: Option<&ResolvedModel>,
+) -> Option<ViewCosts> {
     let kt = estimate(keep);
     let ct = estimate(compact);
-    let kr = Rates::for_model(model, kt)?;
-    let cr = Rates::for_model(model, ct)?;
+    let rates = |tokens| match resolved {
+        Some(r) if r.model == model => r.rates_for_input(tokens),
+        Some(_) => None,
+        None => Rates::for_model(model, tokens),
+    };
+    let kr = rates(kt)?;
+    let cr = rates(ct)?;
+    let capability = match resolved {
+        Some(r) => r.cache,
+        None => crate::openai::prompt_cache_capabilities(model),
+    };
     let first = |body: &Value, tokens: f64, rates: Rates| {
         let explicit_write = body["input"].as_array().into_iter().flatten().any(|item| {
             item["content"]
@@ -3090,8 +3466,12 @@ fn view_costs(
         });
         input_cost(
             tokens,
-            reusable(cache, body),
-            if explicit_write {
+            if resolved.is_none() || capability.is_some() {
+                primary_reusable(cache, body, resolved)
+            } else {
+                0.0
+            },
+            if explicit_write && resolved.is_none_or(|r| r.explicit_cache_transport) {
                 rates.write
             } else {
                 rates.input
@@ -3102,8 +3482,7 @@ fn view_costs(
     let keep_first = first(keep, kt, kr);
     let compact_first = first(compact, ct, cr);
     // Native evidence can price the first call even when future cache support is unknown.
-    let minimum =
-        crate::openai::prompt_cache_capabilities(model).map(|cap| cap.minimum_prefix_tokens as f64);
+    let minimum = capability.map(|cap| cap.minimum_prefix_tokens as f64);
     // Future hits are a fixed-history sensitivity assumption, not guaranteed.
     Some(ViewCosts {
         keep: horizon_cost(
@@ -3131,6 +3510,15 @@ fn view_costs(
 
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
+fn receipt_rates(model: &str, usage: &Value, resolved: Option<&ResolvedModel>) -> Option<Rates> {
+    let input = usage["input_tokens"].as_u64()? as f64;
+    match resolved {
+        Some(r) if r.model == model => r.rates_for_input(input),
+        Some(_) => None,
+        None => Rates::for_model(model, input), // Explicit snapshot-missing legacy path.
+    }
+}
+
 struct Attempt {
     id: String,
     actor: &'static str,
@@ -3138,10 +3526,17 @@ struct Attempt {
     native: bool,
     started: Instant,
     standard: bool,
+    resolved: Option<ResolvedModel>,
 }
 
 impl Attempt {
-    fn start(actor: &'static str, model: &str, native: bool, standard: bool) -> Self {
+    fn start(
+        actor: &'static str,
+        model: &str,
+        native: bool,
+        standard: bool,
+        resolved: Option<&ResolvedModel>,
+    ) -> Self {
         let attempt = Self {
             id: format!(
                 "{}-{}-{}",
@@ -3154,6 +3549,7 @@ impl Attempt {
             native,
             started: Instant::now(),
             standard,
+            resolved: resolved.cloned(),
         };
         attempt.emit("started", json!({}));
         attempt
@@ -3216,10 +3612,11 @@ impl Attempt {
             }
         }
         let mut priced = carry::core::UsageLedger::default();
-        priced.observe(
+        priced.observe_with_rates(
             &self.model,
             usage,
             self.standard && response.get("service_tier").is_none_or(|v| v == "default"),
+            receipt_rates(&self.model, usage, self.resolved.as_ref()),
         );
         let tools = response["output"]
             .as_array()
@@ -3337,23 +3734,31 @@ async fn relay(
             if complete_transport && status.is_success() && completed {
                 let value = observed.unwrap();
                 let model = commit.outbound["model"].as_str().unwrap_or("");
-                commit.candidate.primary.observe(
+                let resolved = commit
+                    .service
+                    .config
+                    .model_resolution
+                    .as_ref()
+                    .map(|p| &p.primary);
+                commit.candidate.primary.observe_with_rates(
                     model,
                     &value["usage"],
                     standard(&commit.outbound)
                         && value.get("service_tier").is_none_or(|v| v == "default"),
+                    receipt_rates(model, &value["usage"], resolved),
                 );
                 if let Some(trajectory) = &mut commit.candidate.cost_trajectory {
                     if commit.native {
                         trajectory.unmodeled_call();
                     } else {
-                        trajectory.primary(
+                        trajectory.primary_resolved(
                             &commit.outbound,
                             &value,
                             &commit.service.config.upstream_url,
                             now(),
                             standard(&commit.outbound)
                                 && value.get("service_tier").is_none_or(|v| v == "default"),
+                            resolved,
                         );
                     }
                 }
@@ -3377,10 +3782,16 @@ async fn relay(
                     commit.candidate.response_frontier = Some(commit.candidate.next_id);
                     commit.candidate.pending_output =
                         value["output"].as_array().cloned().unwrap_or_default();
-                    observe_cache(
+                    observe_primary_cache(
                         &mut commit.candidate.primary_cache,
                         &commit.outbound,
                         &value["usage"],
+                        commit
+                            .service
+                            .config
+                            .model_resolution
+                            .as_ref()
+                            .map(|p| &p.primary),
                     );
                     if commit.candidate.bootstrap_review_complete {
                         commit.candidate.bootstrap_review_pending = false;
@@ -3428,10 +3839,22 @@ async fn relay(
                     trajectory.failed_call();
                 }
                 if let Some(value) = &observed {
-                    commit.reviewed.primary.observe(
-                        commit.outbound["model"].as_str().unwrap_or(""),
+                    let model = commit.outbound["model"].as_str().unwrap_or("");
+                    commit.reviewed.primary.observe_with_rates(
+                        model,
                         &value["usage"],
-                        standard(&commit.outbound),
+                        standard(&commit.outbound)
+                            && value.get("service_tier").is_none_or(|v| v == "default"),
+                        receipt_rates(
+                            model,
+                            &value["usage"],
+                            commit
+                                .service
+                                .config
+                                .model_resolution
+                                .as_ref()
+                                .map(|p| &p.primary),
+                        ),
                     );
                 } else {
                     commit.reviewed.primary.calls += 1;
@@ -3487,6 +3910,10 @@ async fn relay(
 mod pr144_regressions;
 
 #[cfg(test)]
+#[path = "proxy_catalog_tests.rs"]
+mod catalog_regressions;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use carry::core::prefix_compatible;
@@ -3529,20 +3956,23 @@ mod tests {
         let mut config = reviewer_config();
         config.state_dir = directory.to_path_buf();
         Service {
-            _directory_lock: private_file(&directory.join(".lock"), true).unwrap(),
+            catalog: Arc::new(tokio::sync::OnceCell::new()),
+            _directory_lock: Arc::new(private_file(&directory.join(".lock"), true).unwrap()),
             config,
             client: reqwest::Client::new(),
             upstream_key: None,
             classifier_key: None,
             auth_token: None,
-            locks: Mutex::new(HashMap::new()),
-            background_reviews: Mutex::new(HashSet::new()),
+            locks: Arc::new(Mutex::new(HashMap::new())),
+            background_reviews: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
     // PR154 tests only: use the current trace/checkpoint seam, not new APIs.
     include!("proxy_pr154_tests.rs");
     include!("proxy_pr154_controls.rs");
+    include!("proxy_catalog_isolation_tests.rs");
+    include!("proxy_catalog_pair_tests.rs");
     mod admission_tests {
         include!("proxy_admission_tests.rs");
         include!("proxy_admission_controls.rs");
@@ -4940,14 +5370,15 @@ mod tests {
             "save must not amplify valid source into a permanently unloadable checkpoint"
         );
         let service = Service {
-            _directory_lock: private_file(&directory.path().join(".lock"), true).unwrap(),
+            catalog: Arc::new(tokio::sync::OnceCell::new()),
+            _directory_lock: Arc::new(private_file(&directory.path().join(".lock"), true).unwrap()),
             config,
             client: reqwest::Client::new(),
             upstream_key: None,
             classifier_key: None,
             auth_token: None,
-            locks: Mutex::new(HashMap::new()),
-            background_reviews: Mutex::new(HashSet::new()),
+            locks: Arc::new(Mutex::new(HashMap::new())),
+            background_reviews: Arc::new(Mutex::new(HashSet::new())),
         };
         save(&service, "large-missing-usage", &session).unwrap();
         assert_eq!(
