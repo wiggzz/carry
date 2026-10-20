@@ -45,11 +45,7 @@ impl Session {
     }
 
     pub fn initialize_keep_leases(&mut self, turns: u64) {
-        if self
-            .keep_leases
-            .as_ref()
-            .is_none_or(|s| s.version != 1 || s.turns != turns)
-        {
+        if self.keep_leases.as_ref().is_none_or(|s| s.version != 1) {
             self.keep_leases = Some(KeepLeases {
                 version: 1,
                 turns,
@@ -58,6 +54,37 @@ impl Session {
                 pending: None,
                 extra_attempted: BTreeMap::new(),
             });
+        }
+        if self.keep_leases.as_ref().unwrap().turns != turns {
+            // A supported policy override is not a new history or a revocation
+            // of accepted release provenance. Preserve released identities;
+            // protected groups/facts receive a fresh full lease and generation.
+            let groups = self.groups();
+            let memories = self
+                .memories
+                .iter()
+                .filter(|m| {
+                    self.keep_leases
+                        .as_ref()
+                        .unwrap()
+                        .entries
+                        .get(&format!("m{}", m.id))
+                        .is_some_and(|l| l.released_at_round.is_none())
+                })
+                .map(|m| m.id)
+                .collect::<Vec<_>>();
+            let state = self.keep_leases.as_mut().unwrap();
+            state.turns = turns;
+            state.pending = None;
+            state.extra_attempted.clear();
+            for group in &groups {
+                if self.opinions.get(&group.id).is_some_and(|s| s == "keep") {
+                    self.renew_group_lease(group);
+                }
+            }
+            for id in memories {
+                self.renew_memory_lease(id);
+            }
         }
         let groups = self.groups();
         for group in &groups {

@@ -130,6 +130,70 @@ class LeaseControls(StateRegressions):
         self.assertEqual(proxy.send(history)[0], 200)
         self.assertNotIn(evidence, fixture.primaries[-1]["input"], "retired raw input cannot resurrect on full-history echo")
 
+    def test_protected_memory_real_wire_release_retirement_restart_and_no_resurrection(self):
+        raw = {"role":"assistant","content":"WIRE_MEMORY_RAW " * 3000}
+        history = [{"role":"user","content":"durable goal"}, raw,
+                   {"role":"user","content":"current task"}]
+        fact = "LEASE_WIRE_FACT: preserve the compact finding, not the raw output"
+        memory_id = []
+        def review(body, n):
+            control = ledger(body)
+            if n == 1:
+                return 200, advice_response({"protected":["g1"],"removable":["g2"],
+                    "memories":[{"source_ids":["g2"],"text":fact}]})
+            if n == 2:
+                memory_id.append(control["current_memories"][0]["memory_id"])
+                self.assertIn(fact, json.dumps(body))
+                self.assertNotIn("WIRE_MEMORY_RAW", json.dumps(body))
+                return 200, advice_response({"protected":[memory_id[0]],"removable":[],"memories":[]})
+            if n == 3:
+                self.assertIn(memory_id[0], control.get("keep_lease_review", {}).get("target_ids", []))
+                self.assertIn(fact, json.dumps(body))
+                fixture.held.set()
+                if not fixture.release.wait(20):
+                    raise AssertionError("memory target was not released")
+            else:
+                self.assertNotIn(fact, json.dumps(body), "retired fact must leave final reviewer wire too")
+                self.assertNotIn("WIRE_MEMORY_RAW", json.dumps(body))
+            return 200, advice_response({"protected":[],"removable":[],"memories":[]})
+        fixture = self.fixture(lambda _b,_n:(200, completed()), review)
+        proxy = self.proxy(fixture, ["--background-reviews=false"])
+        for _ in range(4):
+            self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(len(fixture.reviews), 2)
+        protected = proxy.saved()
+        self.assertTrue(protected["history"][1]["removed"])
+        self.assertIn(fact, json.dumps(fixture.primaries[-1]["input"]))
+        self.assertNotIn(raw, fixture.primaries[-1]["input"])
+        proxy.close()
+        # As in the failure matrix, stage only maturity after real protection.
+        protected["completed_requests"] = protected["keep_leases"]["entries"][memory_id[0]]["renewed_at_round"] + 8
+        files = list(self.state.glob("*.json"))
+        self.assertEqual(len(files), 1)
+        files[0].write_text(json.dumps(protected))
+        proxy = self.proxy(fixture, ["--background-reviews=true"])
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertTrue(fixture.held.wait(5))
+        self.assertIn(fact, json.dumps(fixture.primaries[-1]["input"]))
+        fixture.release.set()
+        released = self.wait_saved(proxy, lambda s:not s["background_review_pending"])
+        self.assertEqual(len(released["memories"]), 1, "target omission is not immediate deletion")
+        self.assertIsNotNone(released["keep_leases"]["entries"][memory_id[0]]["released_at_round"])
+        proxy.close()
+        proxy = self.proxy(fixture, ["--review-min-new-tokens", "25000"])
+        self.assertEqual(proxy.send(history)[0], 200)
+        retired = proxy.saved()
+        self.assertEqual(retired["memories"], [])
+        self.assertNotIn(fact, json.dumps(fixture.primaries[-1]["input"]))
+        self.assertNotIn(raw, fixture.primaries[-1]["input"])
+        self.assertNotIn(fact, json.dumps(retired), "physical replay/control state must not resurrect retired facts")
+        proxy.close()
+        proxy = self.proxy(fixture, ["--background-reviews=false"])
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(len(fixture.reviews), 4)
+        self.assertNotIn(fact, json.dumps(fixture.primaries[-1]["input"]))
+        self.assertNotIn(raw, fixture.primaries[-1]["input"])
+
 
 if __name__ == "__main__":
     suite = unittest.TestSuite(LeaseControls(name) for name in LeaseControls.__dict__ if name.startswith("test_"))

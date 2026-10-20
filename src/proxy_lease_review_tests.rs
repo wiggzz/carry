@@ -115,3 +115,130 @@ fn lease_r3_policy_change_preserves_group_memory_release_and_protected_memory() 
     resumed.completed_requests += 3;
     assert!(resumed.due_keep_targets().contains_key(&protected));
 }
+
+#[tokio::test]
+async fn lease_r1_real_held_extra_review_next_primary_crosses_only_target_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let observed = calls.clone();
+    let held = started.clone();
+    let resume = release.clone();
+    let router = Router::new()
+        .route("/review", post(move || {
+            let calls = observed.clone();
+            let started = held.clone();
+            let release = resume.clone();
+            async move {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n > 0 { started.notify_one(); release.notified().await; }
+                let advice = if n == 0 { json!({"protected":["g2"],"removable":[],"memories":[]}) }
+                    else { json!({"protected":[],"removable":[],"memories":[]}) };
+                axum::Json(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":advice.to_string()}]}],"usage":{"input_tokens":100,"output_tokens":10}}))
+            }
+        }))
+        .route("/primary", post(|| async {
+            axum::Json(json!({"id":"primary_without_review_completion","status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":1}}))
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (config, mut session, mut body) = lease_fixture();
+    // Exposure/maturity are staged component inputs. Discard fixture opinion:
+    // only the real HTTP review below may establish protection for this case.
+    session.opinions.clear();
+    session.keep_leases = None;
+    let mut service = checkpoint_service(directory.path());
+    service.config = config;
+    service.config.review_min_new_tokens = 0;
+    service.config.classifier_url = Some(format!("{base}/review"));
+    service.config.upstream_url = format!("{base}/primary");
+    service.config.classifier_timeout_secs = 10;
+    body["model"] = json!("gpt-6-sol");
+    let mut headers = HeaderMap::new();
+    headers.insert("x-carry-session", "lease-held-boundary".parse().unwrap());
+    let id = identity(&headers).unwrap().unwrap();
+    assert!(
+        review(
+            &service,
+            &id,
+            &mut session,
+            &body,
+            false,
+            &mut ReviewRun::default()
+        )
+        .await
+    );
+    assert_eq!(session.opinions.get(&2).map(String::as_str), Some("keep"));
+    session.completed_requests += 8;
+    service.config.review_min_new_tokens = 25000;
+    let mut target = session.clone();
+    let targets = target.due_keep_targets();
+    target.keep_leases.as_mut().unwrap().pending = Some(crate::proxy_state::PendingKeepReview {
+        request_id: "forecast".into(),
+        targets,
+    });
+    service.config.classifier_max_input_tokens =
+        reviewer_required_tokens(&service.config, &review_body(&service.config, &target)).ceil()
+            as u32;
+    let mut following = body.clone();
+    following["instructions"] = json!("following task instruction ".repeat(3));
+    let mut next = target.clone();
+    next.review_context = cache_base(&following);
+    assert!(!review_fits(
+        &service.config,
+        &review_body(&service.config, &next)
+    ));
+    next.keep_leases.as_mut().unwrap().pending = None;
+    assert!(
+        review_fits(&service.config, &review_body(&service.config, &next)),
+        "only the in-flight target suffix crosses the reviewer bound"
+    );
+    assert!(primary_fits(&service.config, &following));
+    save(&service, &id, &session).unwrap();
+    let service = Arc::new(service);
+    dispatch_review_for(
+        service.clone(),
+        id.clone(),
+        &mut session,
+        body,
+        "held-extra".into(),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        forward_request(
+            service.clone(),
+            headers,
+            serde_json::to_vec(&following).unwrap().into(),
+            false,
+            "following-primary".into(),
+        ),
+    )
+    .await;
+    let response = result
+        .expect("following fitting primary must not await held lease review")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 1024 * 1024),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["status"],
+        "completed"
+    );
+    let saved = load(&service, &id).unwrap();
+    let remained_pending = saved.background_review_pending;
+    release.notify_one();
+    assert!(remained_pending, "success must precede reviewer completion");
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "no rescue review");
+    provider.abort();
+}
