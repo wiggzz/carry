@@ -4004,6 +4004,7 @@ mod tests {
     // PR154 tests only: use the current trace/checkpoint seam, not new APIs.
     include!("proxy_pr154_tests.rs");
     include!("proxy_pr154_controls.rs");
+    include!("proxy_catalog_isolation_tests.rs");
     mod admission_tests {
         include!("proxy_admission_tests.rs");
         include!("proxy_admission_controls.rs");
