@@ -1,0 +1,150 @@
+"""Reviewer-independent forwarding through the production HTTP handler.
+
+Synthetic loopback providers only. No checkpoint fabrication or model calls.
+"""
+import concurrent.futures
+import json
+import unittest
+
+import proxy_state_regressions as support
+from proxy_state_regressions import advice_response, completed, ledger
+
+
+class ReviewerIndependence(unittest.TestCase):
+    def setUp(self):
+        self.harness = support.StateRegressions()
+        self.harness.setUp()
+        self.addCleanup(self.harness.doCleanups)
+
+    @staticmethod
+    def seed():
+        return [{"role": "user", "content": "durable goal"},
+                {"role": "assistant", "content": "AUTHORIZED_OLD_RESULT " * 1000},
+                {"role": "user", "content": "latest protected direction"}]
+
+    def fixture(self, review):
+        fixture = self.harness.fixture(
+            lambda _body, n: (200, completed(response_id=f"primary_{n}")), review)
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+        return fixture
+
+    def held(self, bootstrap):
+        def review(body, _n):
+            fixture.held.set()
+            fixture.release.wait(15)
+            return 200, advice_response({"protected": [], "removable": [], "memories": []})
+        fixture = self.fixture(review)
+        options = ["--background-reviews=false", "--min-payback-percent", "100"]
+        if bootstrap:
+            options += ["--review-replayed-history"]
+        proxy = self.harness.proxy(fixture, options)
+        history = self.seed()
+        if not bootstrap:
+            self.assertEqual(proxy.send(history)[0], 200)
+        before = len(fixture.primaries)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(proxy.send, history)
+            try:
+                self.assertTrue(fixture.held.wait(5), "exercise a real held reviewer")
+                try:
+                    status, _ = pending.result(timeout=3)
+                except concurrent.futures.TimeoutError:
+                    self.fail("fitting primary waited for reviewer completion")
+                self.assertEqual(status, 200)
+                self.assertEqual(len(fixture.primaries), before + 1)
+                self.assertEqual(fixture.primaries[-1]["input"], history)
+                self.assertFalse(fixture.release.is_set())
+            finally:
+                fixture.release.set()
+                pending.result(timeout=15)
+
+    def test_ordinary_review_never_holds_primary_even_in_legacy_sync_mode(self):
+        self.held(False)
+
+    def test_bootstrap_review_never_holds_primary(self):
+        self.held(True)
+
+    def test_reviewer_capacity_is_not_primary_capacity(self):
+        fixture = self.fixture(lambda _b, _n: (503, {"error": "review unavailable"}))
+        proxy = self.harness.proxy(fixture, ["--classifier-max-input-tokens", "128",
+            "--classifier-max-output-tokens", "64", "--min-payback-percent", "0"])
+        history = self.seed()
+        self.assertEqual(proxy.send(history)[0], 200,
+                         "reviewer overflow cannot reject a fitting primary")
+        self.assertEqual(fixture.primaries[-1]["input"], history)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(fixture.primaries[-1]["input"], history)
+        self.assertFalse(proxy.saved()["last_plan"]["forced"])
+        self.assertEqual(fixture.reviews, [])
+
+    @staticmethod
+    def imported_history():
+        history = [{"role": "user", "content": "DURABLE_IMPORT_REQUIREMENT"}]
+        for n in range(18):
+            history += [{"role": "assistant", "content": f"import evidence {n} " * 300},
+                        {"role": "user", "content": f"old direction {n}"}]
+        return history + [{"role": "user", "content": "UNREVIEWED_SUFFIX_DIRECTION"}]
+
+    def test_exhausted_import_spend_never_rejects_primary_or_discards_source(self):
+        fixture = self.fixture(lambda _b, _n: (503, {"error": "must not dispatch"}))
+        options = ["--review-replayed-history", "--classifier-max-input-tokens", "6000",
+                   "--bootstrap-max-cost-usd", "0"]
+        proxy = self.harness.proxy(fixture, options)
+        history = self.imported_history()
+        for restart in [False, True]:
+            if restart:
+                proxy.close()
+                proxy = self.harness.proxy(fixture, options)
+            self.assertEqual(proxy.send(history)[0], 200,
+                             "exhausted reviewer spend is not a primary admission gate")
+            self.assertEqual(fixture.primaries[-1]["input"], history)
+        self.assertEqual(fixture.reviews, [])
+        self.assertTrue(all(not item["removed"] for item in proxy.saved()["history"]))
+
+    def test_partial_import_advice_compacts_only_authorized_prefix_without_full_review(self):
+        def review(body, _n):
+            ids = ledger(body)["eligible_group_ids"]
+            return 200, advice_response({"protected": [i for i in ids if i == "g1"],
+                "removable": [i for i in ids if i != "g1"], "memories": []})
+        fixture = self.fixture(review)
+        proxy = self.harness.proxy(fixture, ["--review-replayed-history",
+            "--classifier-max-input-tokens", "6000", "--review-max-calls", "1",
+            "--payoff-requests", "1", "--classifier-cache-policy", "disabled"])
+        history = self.imported_history()
+        self.assertEqual(proxy.send(history)[0], 200,
+                         "partial bootstrap must forward before review completion")
+        self.assertEqual(fixture.primaries[0]["input"], history,
+                         "bootstrap cannot discard primary to make reviewer room")
+        accepted = self.harness.wait_saved(proxy, lambda s: bool(s["bootstrap_reviewed_ids"])
+            and not s["background_review_pending"])
+        self.assertFalse(accepted["bootstrap_review_complete"])
+        self.assertEqual(len(fixture.reviews), 1, "the bounded import call budget is honored")
+        drops = {int(i) for i, opinion in accepted["opinions"].items() if opinion == "drop"}
+        self.assertTrue(drops, "exercise accepted partial-prefix advice")
+        # Keep a second import request unfinished. Prior advice remains usable.
+        fixture.release.clear()
+        def held_review(body, _n):
+            fixture.held.set()
+            fixture.release.wait(15)
+            return 200, advice_response({"protected": [], "removable": [], "memories": []})
+        fixture.review = held_review
+        try:
+            self.assertEqual(proxy.send(history)[0], 200)
+            sent = fixture.primaries[-1]["input"]
+            removed = [i for i in proxy.saved()["history"] if i["removed"]]
+            self.assertTrue(removed, "pending/incomplete review must not veto profitable prefix removal")
+            self.assertTrue(all(i["id"] in drops for i in removed))
+            self.assertIn(history[0], sent)
+            self.assertIn(history[-1], sent)
+            for item in accepted["history"]:
+                if item["id"] not in drops:
+                    self.assertIn(item["value"], sent, "unreviewed suffix/protection must survive")
+            # A canonical caller replay must not resurrect previously retired ancestors.
+            self.assertEqual(proxy.send(history)[0], 200)
+            self.assertEqual(fixture.primaries[-1]["input"], sent)
+        finally:
+            fixture.release.set()
+
+
+if __name__ == "__main__":
+    unittest.main()

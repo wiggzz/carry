@@ -237,6 +237,63 @@ fn planner_final_existing_pending_work_remains_unknown_not_free() {
     }
 }
 
+#[test]
+fn pending_or_oversized_reviewer_does_not_veto_authorized_primary_savings() {
+    for pending in [true, false] {
+        let mut config = config();
+        config.background_reviews = true;
+        config.classifier_max_input_tokens = if pending { 300000 } else { 128 };
+        let (mut session, main) = session_with_review();
+        session.background_review_pending = pending;
+        let (candidate, report) = plan(&config, &session, &main);
+        assert_eq!(report["primary_fits"], true);
+        assert_eq!(
+            report["forced"], false,
+            "reviewer capacity never forces primary removal"
+        );
+        let selected =
+            candidate.expect("existing complete-group advice remains independently actionable");
+        assert!(
+            !selected
+                .render_primary()
+                .iter()
+                .any(|v| v == &session.history[1].value)
+        );
+        assert!(
+            selected
+                .render_primary()
+                .contains(&session.history[0].value)
+        );
+        assert!(
+            selected
+                .render_primary()
+                .contains(&session.history[2].value)
+        );
+        assert_eq!(selected.opinions.get(&1), session.opinions.get(&1));
+        if pending {
+            assert!(
+                report["future_reviewer_calls"].is_null(),
+                "pending paid work remains unknown"
+            );
+        }
+    }
+}
+
+#[test]
+fn oversized_reviewer_without_advice_never_forces_primary_mutation() {
+    let mut config = config();
+    config.classifier_max_input_tokens = 128;
+    let (mut session, main) = session_with_review();
+    session.opinions.clear();
+    session.drop_members.clear();
+    let (candidate, report) = plan(&config, &session, &main);
+    assert_eq!(report["reviewer_fits"], false);
+    assert_eq!(report["forced"], false);
+    if let Some(candidate) = candidate {
+        assert_eq!(candidate.render_primary(), session.render_primary());
+    }
+}
+
 fn primary(marker: Option<Value>) -> Value {
     let mut body = json!({"model":"gpt-6-sol","input":[{"role":"user","content":[
         {"type":"input_text","text":"actual rendered primary payload ".repeat(200)}]}]});

@@ -170,6 +170,26 @@ fn incremental_reviewer_context_regressions() {
     );
 }
 
+#[test]
+fn reviewer_independent_primary_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_independence.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute reviewer-independent primary HTTP regressions");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // Source-bound PR144 behavior, separate from the unchanged incremental/5s
 // timeout regression. The same file runs against the provenance-bound baseline.
 #[test]
