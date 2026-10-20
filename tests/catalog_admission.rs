@@ -391,7 +391,21 @@ async fn reviewer_route_is_independent_in_actual_admission_and_dispatch() {
     .await;
     let body = json!({"model":"gpt-6-sol","input":[{"role":"user","content":"earlier"},{"role":"assistant","content":"completed synthetic historical work"},{"role":"user","content":"next task"}],"max_output_tokens":10});
     assert_eq!(send(&url, "one", &body).await, 200);
-    let (_, checkpoint) = saved(state.path());
+    // The primary is independent of reviewer completion, including the legacy
+    // synchronous setting. Wait only in this fixture, after consuming primary.
+    let checkpoint = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let (_, checkpoint) = saved(state.path());
+            if checkpoint["background_review_pending"] == false
+                && checkpoint["shadow"]["calls"].as_u64().unwrap_or(0) > 0
+            {
+                break checkpoint;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("real reviewer must settle after primary, without a production wait");
     assert_eq!(checkpoint["last_plan"]["primary_context_tokens"], 40000);
     assert_eq!(
         checkpoint["last_plan"]["reviewer_context_tokens"], 300000,

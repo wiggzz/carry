@@ -790,6 +790,7 @@ async fn session_resolution(
     session: &mut Session,
     model: &str,
     processing_tier: &str,
+    fresh_child: bool,
 ) -> Result<ResolvedPair, Failure> {
     let config = &service.config;
     let mut primary_route = Route::new(&config.upstream_url, config.codex_login);
@@ -829,7 +830,8 @@ async fn session_resolution(
             return Ok(saved.clone());
         }
     }
-    let legacy = session.model_resolution.is_none()
+    let legacy = !fresh_child
+        && session.model_resolution.is_none()
         && (session.version != 0 || !session.history.is_empty() || session.primary.calls > 0);
     let (mut primary, mut reviewer) = if legacy {
         let error = |message| failure(StatusCode::BAD_REQUEST, message);
@@ -1299,6 +1301,14 @@ async fn forward_request(
         let declared_fork = fork.is_some();
         let lock = session_lock(&service, &id).await;
         let mut session = load(&service, &id)?;
+        // Hydration creates a cold branch, not a legacy unpriced checkpoint.
+        // Resolve its own current epoch only after the replacement; never copy
+        // parent contracts, cache receipts or paid usage into the new session.
+        let fresh_child = if let Some((origin, point)) = &fork {
+            forking::hydrate(&service.config, &mut session, origin, point, &body)?
+        } else {
+            false
+        };
         if service.config.mode != Mode::Off {
             let model = body["model"]
                 .as_str()
@@ -1308,6 +1318,7 @@ async fn forward_request(
                 &mut session,
                 model,
                 body["service_tier"].as_str().unwrap_or("default"),
+                fresh_child,
             )
             .await?;
             // One request-scoped contract drives every existing primary/reviewer
@@ -1318,9 +1329,6 @@ async fn forward_request(
             effective.config.classifier_max_input_tokens = resolved.reviewer.capacity_tokens;
             effective.config.model_resolution = Some(resolved);
             service = Arc::new(effective);
-        }
-        if let Some((origin, point)) = &fork {
-            forking::hydrate(&service.config, &mut session, origin, point, &body)?;
         }
         let prior_reviewer_compactions = session.reviewer_compactions;
         let (kind, agent_name) = client_provenance(&body);

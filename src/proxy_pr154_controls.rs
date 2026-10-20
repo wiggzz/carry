@@ -453,6 +453,7 @@ async fn pr154_selected_main_audit_rollback_and_reviewer_only_use_real_forwardin
                 input,
             });
             service.config.classifier_max_input_tokens = 5000;
+            service.config.reviewer_context_override = Some(5000);
         } else {
             session
                 .apply_advice(

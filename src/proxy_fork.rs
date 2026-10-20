@@ -218,7 +218,7 @@ pub(super) fn hydrate(
     origin: &str,
     point: &Point,
     body: &Value,
-) -> Result<(), Failure> {
+) -> Result<bool, Failure> {
     if expired(config, point, now()) {
         return Err(conflict("fork_expired"));
     }
@@ -284,7 +284,7 @@ pub(super) fn hydrate(
         if retry.history_rebases != session.history_rebases {
             return Err(conflict("fork_incompatible"));
         }
-        return Ok(());
+        return Ok(false);
     }
     child.opinions = point.opinions.clone();
     child.drop_members = point.drop_members.clone();
@@ -303,5 +303,5 @@ pub(super) fn hydrate(
     // fitting inherited primary or trigger paid fork recovery.
     child.fork_origin = Some(origin.into());
     *session = child;
-    Ok(())
+    Ok(true)
 }
