@@ -207,12 +207,19 @@ fn plan_inner(
     // Cleaning only disposable reviewer turns is a real candidate. It can make
     // room without rewriting an otherwise valuable primary cache prefix.
     candidates.push(groups.iter().map(|g| g.id).collect());
+    let mut evaluated = HashSet::new();
     for protected in candidates {
         let removed = select_removals(groups.iter().map(|g| g.id), &eligible, &protected);
         if removed.is_empty()
             && session.review_history.is_none()
             && session.released_memory_ids().is_empty()
         {
+            continue;
+        }
+        // Cache-frontier protections are not distinct actions when they yield
+        // the same complete removals. State, memory retirement and forecasts
+        // are identical; evaluate that expensive action once.
+        if !evaluated.insert(removed.clone()) {
             continue;
         }
         let mut candidate = session.clone();

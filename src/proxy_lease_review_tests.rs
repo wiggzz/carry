@@ -1,5 +1,71 @@
 // Independent-review counterexamples. Existing fixture admits protection through
 // the production advice boundary; these are component gates, not native forks.
+#[tokio::test]
+async fn lease_never_dispatched_overcap_target_leaves_no_live_pending_annotation() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut config, mut session, body) = lease_fixture();
+    config.review_min_new_tokens = 0;
+    config.state_dir = directory.path().to_path_buf();
+    config.classifier_url = Some("http://127.0.0.1:1".into());
+    session.review_context = cache_base(&body);
+    session.review_cache_key = format!("{:x}", Sha256::digest("carry-review-overcap"));
+    let groups = session.groups();
+    prepare_review_history(&mut session, &groups);
+    config.classifier_max_input_tokens =
+        reviewer_required_tokens(&config, &review_body(&config, &session)).ceil() as u32;
+    let mut service = checkpoint_service(directory.path());
+    service.config = config;
+    assert!(
+        !review(
+            &service,
+            "overcap",
+            &mut session,
+            &body,
+            false,
+            &mut ReviewRun::default()
+        )
+        .await
+    );
+    assert_eq!(
+        session.shadow.calls, 0,
+        "capacity rejection is before network dispatch"
+    );
+    assert!(
+        session.keep_leases.as_ref().unwrap().pending.is_none(),
+        "LEASE_CANCEL_PENDING_RED: a never-dispatched target cannot remain a live reviewer-tail annotation"
+    );
+    assert_eq!(session.opinions.get(&2).map(String::as_str), Some("keep"));
+}
+
+#[tokio::test]
+async fn lease_checkpoint_reservation_failure_cancels_pending_targets() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut config, mut session, body) = lease_fixture();
+    config.review_min_new_tokens = 0;
+    config.state_dir = directory.path().join("not-a-directory");
+    std::fs::write(&config.state_dir, b"owned fixture obstruction").unwrap();
+    config.classifier_url = Some("http://127.0.0.1:1".into());
+    let mut service = checkpoint_service(directory.path());
+    service.config = config;
+    let service = Arc::new(service);
+    dispatch_review_for(
+        service.clone(),
+        "failed-reservation".into(),
+        &mut session,
+        body,
+        "target".into(),
+    )
+    .await;
+    assert!(!session.background_review_pending);
+    assert!(service.background_reviews.lock().await.is_empty());
+    assert_eq!(session.shadow.calls, 0);
+    assert!(
+        session.keep_leases.as_ref().unwrap().pending.is_none(),
+        "LEASE_CANCEL_PENDING_RED: failed durable reservation must cancel undispatched targets"
+    );
+    assert_eq!(session.opinions.get(&2).map(String::as_str), Some("keep"));
+}
+
 #[test]
 fn lease_planner_evaluates_identical_retirement_action_only_once() {
     let (mut config, mut session, body) = lease_fixture();
