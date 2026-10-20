@@ -165,7 +165,7 @@ pub(super) async fn resolve(
     }
     if implicit
         || native
-        || service.config.mode == Mode::Off
+        || service.config.mode != Mode::Compact
         || body
             .get("previous_response_id")
             .is_some_and(|v| !v.is_null())
@@ -287,9 +287,9 @@ pub(super) fn hydrate(
     }
     child.review_context = cache_base(body);
     child.refresh_memory_shadow();
-    if !memory_admission_fits(config, &child) {
-        return Err(conflict("fork_incompatible"));
-    }
+    // Accepted historical facts are not a new reviewer admission. The normal
+    // planner owns genuine primary capacity; reviewer pressure cannot gate a
+    // fitting inherited primary or trigger paid fork recovery.
     child.fork_origin = Some(origin.into());
     *session = child;
     Ok(())
