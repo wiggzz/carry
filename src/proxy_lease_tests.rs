@@ -33,17 +33,30 @@ fn lease_fixture() -> (ProxyCli, Session, Value) {
 
 #[test]
 fn lease_economic_demand_can_admit_one_review_without_new_source_growth() {
-    let (config, session, body) = lease_fixture();
+    let (config, session, mut body) = lease_fixture();
     assert!(!session.drop_authorized(&session.groups()[1]));
     assert_eq!(
         admission::decision(&config, &session, &body, false)["new_native_source_estimated_tokens"],
         0.0
     );
+    // Exact hosted pricing proved the original Luna/Luna draft loses
+    // $0.00100003 after paying for review. Preserve it as a strict negative
+    // control; do not force an uneconomic admission just to make a test pass.
+    let cheap = lease_cost_probe(&config, &session, &body);
+    assert!(cheap["joint"]["savings"].as_f64().unwrap() < 0.0);
+    assert_eq!(
+        admission::decision(&config, &session, &body, false)["admitted"],
+        false
+    );
+    body["model"] = json!("gpt-6-sol");
+    assert_eq!(
+        lease_cost_probe(&config, &session, &body)["joint"]["accepted"],
+        true
+    );
     assert_eq!(
         admission::decision(&config, &session, &body, false)["admitted"],
         true,
-        "LEASE_ECON_RED: a bounded due review should unlock an otherwise profitable safe source rewrite; actual rendered costs: {}",
-        lease_cost_probe(&config, &session, &body)
+        "a genuinely profitable primary/reviewer pair must admit bounded due revalidation"
     );
     let (_, report) = plan(&config, &session, &body);
     assert_eq!(
@@ -109,6 +122,17 @@ fn lease_forecast_prices_the_same_targeted_request_as_actual_dispatch() {
     let (config, mut session, body) = lease_fixture();
     let groups = session.groups();
     prepare_review_history(&mut session, &groups);
+    // Component fixture for the already-accepted protection's disposable
+    // replay. Real HTTP cases separately establish its admission/lifecycle.
+    let mut prior = review_source_input(&session, &groups);
+    let source_len = prior.len() - 1;
+    let source_sha256 = reviewer_serialized_identity(&prior[..source_len]).1;
+    prior.push(json!({"role":"assistant","content":json!({"protected":["g2"],"removable":[],"memories":[]}).to_string()}));
+    session.review_history = Some(crate::proxy_state::ReviewHistory {
+        source_len,
+        source_sha256,
+        input: prior,
+    });
     // A higher-priced primary and the same reviewer isolate a genuinely useful
     // call without changing capacity, output caps, horizon or payback policy.
     let mut body = body;

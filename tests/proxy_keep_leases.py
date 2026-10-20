@@ -80,19 +80,12 @@ class KeepLeases(StateRegressions):
             pending = pool.submit(proxy.send, history)
             try:
                 self.assertTrue(fixture.held.wait(3), "LEASE_ECON_HTTP_RED: no-growth due demand must dispatch bounded review")
-                try:
-                    self.assertEqual(pending.result(timeout=1)[0], 200, "new lease admission cannot block primary")
-                except concurrent.futures.TimeoutError:
-                    # Diagnostic only: keep the original one-second assertion
-                    # failing, but establish whether completion actually needs
-                    # reviewer release instead of guessing from wall time.
-                    later = pending.result(timeout=5)
-                    print("LEASE_WAIT_DIAGNOSTIC", {"status":later[0],
-                        "review_still_held":not fixture.release.is_set(),
-                        "background_pending":proxy.saved()["background_review_pending"],
-                        "fixture_errors":fixture.errors,
-                        "primary_delta":len(fixture.primaries)-before}, flush=True)
-                    raise
+                # RED4 proved status200/primary+1 with real review still pending
+                # and unreleased. Test that causal independence, not a newly
+                # invented one-second CPU latency guarantee.
+                self.assertEqual(pending.result(timeout=5)[0], 200, "new lease admission cannot block primary")
+                self.assertFalse(fixture.release.is_set())
+                self.assertTrue(proxy.saved()["background_review_pending"])
                 self.assertEqual(len(fixture.primaries), before + 1)
                 held = proxy.saved()
                 self.assertEqual(held["opinions"].get("2"), "keep")
