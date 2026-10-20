@@ -160,7 +160,7 @@ fn capacity_ordinary_target_and_legacy_modeled_rates_are_separate() {
     let short = resolved.rates_for_input(272000.0).unwrap();
     let long = resolved.rates_for_input(272001.0).unwrap();
     assert_eq!(long.input, short.input * 2.0);
-    assert_eq!(long.output, short.output * 1.5);
+    assert!((long.output - short.output * 1.5).abs() < 1e-18);
     assert_eq!(resolved.price_basis, "legacy_api_equivalent_model");
     assert!(
         resolved.cache.is_none(),

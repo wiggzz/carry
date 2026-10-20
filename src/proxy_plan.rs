@@ -1,17 +1,16 @@
 //! Plan the actual next primary and reviewer requests, not historical windows.
 use super::{
     HashSet, ProxyCli, Session, Value, ViewCosts, cache_base, estimate, joint_decision, json, now,
-    primary_fits, primary_required_tokens, primary_wire_body, review_body, review_fits,
-    reviewer_required_tokens, reviewer_reusable, reviewer_view_costs, select_removals, standard,
-    view_costs,
+    primary_fits, primary_rates, primary_required_tokens, primary_wire_body, resolved_view_costs,
+    review_body, review_fits, reviewer_rates, reviewer_required_tokens, reviewer_reusable,
+    reviewer_view_costs, select_removals, standard,
 };
 
 /// Frozen-source sensitivity: advance cadence and exposure, assuming future
 /// reviews complete/merge before their next due dispatch. This is not a latency
 /// guarantee. Already unfinished work is unknown, not free.
 fn review_calls(config: &ProxyCli, session: &Session, body: &Value, changed: bool) -> Option<u64> {
-    if !standard(body)
-        || carry::core::Rates::for_model(body["model"].as_str().unwrap_or(""), 0.0).is_none()
+    if !standard(body) || primary_rates(config, body["model"].as_str().unwrap_or(""), 0.0).is_none()
     {
         return Some(0);
     }
@@ -49,11 +48,15 @@ fn review_cost(config: &ProxyCli, session: &Session, body: &Value, calls: u64) -
         return Some(0.0);
     }
     let inputs = reviewer_view_costs(config, &session.reviewer_cache, body, body, calls)?.keep;
-    let rates = carry::core::Rates::for_model(&config.classifier_model, estimate(body))?;
+    let rates = reviewer_rates(config, estimate(body))?;
     Some(inputs + calls as f64 * config.classifier_max_output_tokens as f64 * rates.output)
 }
 
 pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Option<Session>, Value) {
+    // Direct planner callers and runtime dispatch share the same frozen epoch.
+    let mut scoped = config.clone();
+    scoped.model_resolution = session.model_resolution.clone();
+    let config = &scoped;
     let wire = primary_wire_body(config, body);
     let reviewer = review_body(config, session);
     let primary_ok = primary_fits(config, body);
@@ -130,12 +133,13 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
             )
             .map(|(keep, compact)| ViewCosts { keep, compact });
         let joint = if standard(body) {
-            view_costs(
+            resolved_view_costs(
                 &wire,
                 &compact,
                 &session.primary_cache,
                 wire["model"].as_str().unwrap_or(""),
                 config.payoff_requests,
+                config.model_resolution.as_ref().map(|pair| &pair.primary),
             )
             .zip(shadow)
             .map(|(primary, shadow)| joint_decision(primary, shadow, config.min_payback_percent))
@@ -164,8 +168,12 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
     let reason = if forced && best.is_none() {
         Some("context_capacity_exceeded")
     } else if !standard(body)
-        || carry::core::Rates::for_model(wire["model"].as_str().unwrap_or(""), estimate(&wire))
-            .is_none()
+        || primary_rates(
+            config,
+            wire["model"].as_str().unwrap_or(""),
+            estimate(&wire),
+        )
+        .is_none()
     {
         Some("unsupported_model_or_tier")
     } else if keep_calls.is_none() {

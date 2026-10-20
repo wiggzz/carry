@@ -122,6 +122,9 @@ pub struct ProxyCli {
     reviewer_context_override: Option<u32>,
     #[arg(skip = 300000u32)]
     classifier_max_input_tokens: u32,
+    /// Request-scoped frozen contracts, never a second model table.
+    #[arg(skip)]
+    model_resolution: Option<ResolvedPair>,
     /// Serialized transport guard; token budget controls reviewer context size.
     #[arg(long, default_value_t = 8388608, value_parser = clap::value_parser!(u32).range(4096..=8388608))]
     classifier_max_input_bytes: u32,
@@ -679,9 +682,11 @@ struct CatalogQuery {
 async fn resolved_catalog(
     service: &Service,
     model: &str,
+    processing_tier: &str,
 ) -> Result<(ResolvedModel, ResolvedModel), Failure> {
     let config = &service.config;
-    let primary_route = Route::new(&config.upstream_url, config.codex_login);
+    let mut primary_route = Route::new(&config.upstream_url, config.codex_login);
+    primary_route.processing_tier = processing_tier.into();
     let reviewer_route = Route::new(
         config
             .classifier_url
@@ -704,6 +709,13 @@ async fn resolved_catalog(
                             now(),
                             matches!(primary_route.class, RouteClass::SyntheticSubscription),
                         )
+                        .map(|mut source| {
+                            // Metadata was fetched for the default service, not an
+                            // arbitrary requested processing tier.
+                            source.route =
+                                Some(Route::new(&config.upstream_url, config.codex_login));
+                            source
+                        })
                         .unwrap_or_else(|_| SourceCatalog::unavailable(now())),
                         _ => SourceCatalog::unavailable(now()),
                     }
@@ -724,7 +736,7 @@ async fn resolved_catalog(
         config.context_margin_percent,
     )
     .map_err(error)?;
-    let reviewer = resolve_model(
+    let mut reviewer = resolve_model(
         &config.classifier_model,
         reviewer_route,
         source,
@@ -734,16 +746,42 @@ async fn resolved_catalog(
         config.context_margin_percent,
     )
     .map_err(error)?;
+    freeze_reviewer_cache_policy(config, &mut reviewer);
     Ok((primary, reviewer))
+}
+
+fn freeze_reviewer_cache_policy(config: &ProxyCli, reviewer: &mut ResolvedModel) {
+    let explicit_override = config.classifier_cache_policy == ClassifierCachePolicy::OpenaiExplicit
+        && !(config.codex_login && config.classifier_url.is_none());
+    if explicit_override {
+        // This existing CLI option is an operator attestation, NOT certification
+        // that a compatible gateway is the official API.
+        reviewer.cache = carry::models::model_spec(&reviewer.model).and_then(|s| s.cache);
+        reviewer.explicit_cache_transport = reviewer.cache.is_some();
+        if let Some(p) = reviewer.provenance.get_mut("cache") {
+            p.source = "operator_openai_explicit_transport_attestation".into();
+            p.status = "operator_override_not_provider_certification".into();
+        }
+    }
+    if config.classifier_cache_policy == ClassifierCachePolicy::Disabled {
+        reviewer.explicit_cache_transport = false;
+    }
+    let mut provenance = reviewer.provenance["cache"].clone();
+    provenance.revision = format!("{:?}", config.classifier_cache_policy);
+    reviewer
+        .provenance
+        .insert("cache_policy".into(), provenance);
 }
 
 async fn session_resolution(
     service: &Service,
     session: &mut Session,
     model: &str,
+    processing_tier: &str,
 ) -> Result<ResolvedPair, Failure> {
     let config = &service.config;
-    let primary_route = Route::new(&config.upstream_url, config.codex_login);
+    let mut primary_route = Route::new(&config.upstream_url, config.codex_login);
+    primary_route.processing_tier = processing_tier.into();
     let reviewer_route = Route::new(
         config
             .classifier_url
@@ -757,6 +795,11 @@ async fn session_resolution(
             && saved.reviewer.model == config.classifier_model
             && saved.primary.route == primary_route
             && saved.reviewer.route == reviewer_route
+            && saved
+                .reviewer
+                .provenance
+                .get("cache_policy")
+                .is_some_and(|p| p.revision == format!("{:?}", config.classifier_cache_policy))
             && saved
                 .primary
                 .provenance
@@ -801,7 +844,7 @@ async fn session_resolution(
             .map_err(error)?,
         )
     } else {
-        resolved_catalog(service, model).await?
+        resolved_catalog(service, model, processing_tier).await?
     };
     if legacy {
         for resolved in [&mut primary, &mut reviewer] {
@@ -815,6 +858,7 @@ async fn session_resolution(
                 Some("checkpoint_predates_resolved_contract_no_new_catalog_defaults".into());
         }
     }
+    freeze_reviewer_cache_policy(config, &mut reviewer);
     let pair = ResolvedPair {
         schema_version: 1,
         primary,
@@ -832,7 +876,7 @@ async fn catalog(
     axum::extract::Query(query): axum::extract::Query<CatalogQuery>,
 ) -> Result<axum::Json<Value>, Failure> {
     authorize(&service, &headers)?;
-    let (primary, reviewer) = resolved_catalog(&service, &query.model).await?;
+    let (primary, reviewer) = resolved_catalog(&service, &query.model, "default").await?;
     Ok(axum::Json(
         json!({"schema_version":1,"primary":primary,"reviewer":reviewer}),
     ))
@@ -1228,13 +1272,20 @@ async fn forward_request(
             let model = body["model"]
                 .as_str()
                 .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "model is required"))?;
-            let resolved = session_resolution(&service, &mut session, model).await?;
+            let resolved = session_resolution(
+                &service,
+                &mut session,
+                model,
+                body["service_tier"].as_str().unwrap_or("default"),
+            )
+            .await?;
             // One request-scoped contract drives every existing primary/reviewer
             // feasibility, memory and bootstrap check. Locks, metadata epoch,
             // background registry and directory lock remain process-shared.
             let mut effective = (*service).clone();
             effective.config.primary_context_tokens = resolved.primary.capacity_tokens;
             effective.config.classifier_max_input_tokens = resolved.reviewer.capacity_tokens;
+            effective.config.model_resolution = Some(resolved);
             service = Arc::new(effective);
         }
         let prior_reviewer_compactions = session.reviewer_compactions;
@@ -1357,7 +1408,8 @@ async fn forward_request(
         );
         session.review_context = cache_base(&body);
         let active = !native && service.config.mode != Mode::Off;
-        let primary_priced = Rates::for_model(body["model"].as_str().unwrap_or(""), 0.0).is_some();
+        let primary_priced =
+            primary_rates(&service.config, body["model"].as_str().unwrap_or(""), 0.0).is_some();
         if active
             && session.bootstrap_review_pending
             && !session.bootstrap_review_complete
@@ -1922,6 +1974,14 @@ fn review_body_with_input(config: &ProxyCli, session: &Session, input: Vec<Value
 }
 
 fn classifier_cache_enabled(config: &ProxyCli) -> Result<bool> {
+    if let Some(pair) = &config.model_resolution {
+        return Ok(
+            config.classifier_cache_policy != ClassifierCachePolicy::Disabled
+                && pair.reviewer.model == config.classifier_model
+                && pair.reviewer.cache.is_some()
+                && pair.reviewer.explicit_cache_transport,
+        );
+    }
     let supported = carry::models::model_spec(&config.classifier_model)
         .is_some_and(|spec| spec.explicit_reviewer_cache);
     match config.classifier_cache_policy {
@@ -2046,6 +2106,9 @@ fn reviewer_reusable_credit(
     cache: &[ReviewerCacheBoundary],
     body: &Value,
 ) -> f64 {
+    if config.model_resolution.is_some() && reviewer_cache_capabilities(config).is_none() {
+        return 0.0;
+    }
     let Some(input) = reviewer_input(body) else {
         return 0.0;
     };
@@ -2082,6 +2145,9 @@ fn observe_reviewer_cache(
     body: &Value,
     usage: &Value,
 ) {
+    if config.model_resolution.is_some() && reviewer_cache_capabilities(config).is_none() {
+        return;
+    }
     let Some(input) = reviewer_input(body) else {
         return;
     };
@@ -2171,7 +2237,7 @@ fn reviewer_view_costs(
 ) -> Option<ViewCosts> {
     let cost = |body: &Value| {
         let tokens = estimate(body);
-        let rates = Rates::for_model(&config.classifier_model, tokens)?;
+        let rates = reviewer_rates(config, tokens)?;
         reviewer_input(body)?;
         let prefix = reviewer_prefix_estimate(body, reviewer_stable_end(body));
         let uncached = if classifier_cache_enabled(config).unwrap_or(false) {
@@ -2190,7 +2256,7 @@ fn reviewer_view_costs(
         // evidence that a prefix meets the provider's cache minimum.
         let future = input_cost(
             tokens,
-            if crate::openai::prompt_cache_capabilities(&config.classifier_model)
+            if reviewer_cache_capabilities(config)
                 .is_some_and(|cap| prefix >= cap.minimum_prefix_tokens as f64)
             {
                 prefix
@@ -2711,8 +2777,7 @@ async fn review_import(
         }
         prepare_review_history(session, &admitted);
         let body = review_body_for_groups(&service.config, session, &admitted);
-        let Some(rates) = Rates::for_model(&service.config.classifier_model, estimate(&body))
-        else {
+        let Some(rates) = reviewer_rates(&service.config, estimate(&body)) else {
             journal(
                 service,
                 id,
@@ -3343,6 +3408,35 @@ fn observe_cache(cache: &mut Vec<CacheEvidence>, body: &Value, usage: &Value) {
     }
 }
 
+fn primary_rates(config: &ProxyCli, model: &str, input: f64) -> Option<Rates> {
+    match &config.model_resolution {
+        Some(pair) if pair.primary.model == model => pair.primary.rates_for_input(input),
+        Some(_) => None,
+        None => Rates::for_model(model, input), // Explicit legacy, snapshot-missing caller.
+    }
+}
+
+fn reviewer_rates(config: &ProxyCli, input: f64) -> Option<Rates> {
+    match &config.model_resolution {
+        Some(pair) if pair.reviewer.model == config.classifier_model => {
+            pair.reviewer.rates_for_input(input)
+        }
+        Some(_) => None,
+        None => Rates::for_model(&config.classifier_model, input),
+    }
+}
+
+fn reviewer_cache_capabilities(
+    config: &ProxyCli,
+) -> Option<carry::models::PromptCacheCapabilities> {
+    match &config.model_resolution {
+        Some(pair) if pair.reviewer.model == config.classifier_model => pair.reviewer.cache,
+        Some(_) => None,
+        None => crate::openai::prompt_cache_capabilities(&config.classifier_model),
+    }
+}
+
+#[cfg(test)]
 fn view_costs(
     keep: &Value,
     compact: &Value,
@@ -3350,10 +3444,30 @@ fn view_costs(
     model: &str,
     requests: u64,
 ) -> Option<ViewCosts> {
+    resolved_view_costs(keep, compact, cache, model, requests, None)
+}
+
+fn resolved_view_costs(
+    keep: &Value,
+    compact: &Value,
+    cache: &[CacheEvidence],
+    model: &str,
+    requests: u64,
+    resolved: Option<&ResolvedModel>,
+) -> Option<ViewCosts> {
     let kt = estimate(keep);
     let ct = estimate(compact);
-    let kr = Rates::for_model(model, kt)?;
-    let cr = Rates::for_model(model, ct)?;
+    let rates = |tokens| match resolved {
+        Some(r) if r.model == model => r.rates_for_input(tokens),
+        Some(_) => None,
+        None => Rates::for_model(model, tokens),
+    };
+    let kr = rates(kt)?;
+    let cr = rates(ct)?;
+    let capability = match resolved {
+        Some(r) => r.cache,
+        None => crate::openai::prompt_cache_capabilities(model),
+    };
     let first = |body: &Value, tokens: f64, rates: Rates| {
         let explicit_write = body["input"].as_array().into_iter().flatten().any(|item| {
             item["content"]
@@ -3364,8 +3478,12 @@ fn view_costs(
         });
         input_cost(
             tokens,
-            reusable(cache, body),
-            if explicit_write {
+            if resolved.is_none() || capability.is_some() {
+                reusable(cache, body)
+            } else {
+                0.0
+            },
+            if explicit_write && resolved.is_none_or(|r| r.explicit_cache_transport) {
                 rates.write
             } else {
                 rates.input
@@ -3376,8 +3494,7 @@ fn view_costs(
     let keep_first = first(keep, kt, kr);
     let compact_first = first(compact, ct, cr);
     // Native evidence can price the first call even when future cache support is unknown.
-    let minimum =
-        crate::openai::prompt_cache_capabilities(model).map(|cap| cap.minimum_prefix_tokens as f64);
+    let minimum = capability.map(|cap| cap.minimum_prefix_tokens as f64);
     // Future hits are a fixed-history sensitivity assumption, not guaranteed.
     Some(ViewCosts {
         keep: horizon_cost(

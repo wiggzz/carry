@@ -167,6 +167,10 @@ pub struct SourceModel {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SourceCatalog {
+    /// Missing on historical projections: unbound facts cannot establish a
+    /// destination's entitlement. Includes auth class, exact path and service tier.
+    #[serde(default)]
+    pub route: Option<Route>,
     pub models: Vec<SourceModel>,
     pub revision: String,
     pub fetched_at: u64,
@@ -238,10 +242,21 @@ impl SourceCatalog {
                 }
                 .into(),
             );
-            if let (Some(default), Some(maximum)) = (raw.context_window, raw.max_context_window)
+            if statuses["context_window"] == "valid"
+                && statuses["max_context_window"] == "valid"
+                && let (Some(default), Some(maximum)) = (raw.context_window, raw.max_context_window)
                 && default > maximum
             {
                 statuses.insert("context_window".into(), "invalid_relationship".into());
+            }
+            if statuses["auto_compact_token_limit"] == "valid"
+                && statuses["context_window"] == "valid"
+                && raw.auto_compact_token_limit > raw.context_window
+            {
+                statuses.insert(
+                    "auto_compact_token_limit".into(),
+                    "invalid_relationship".into(),
+                );
             }
             // Keep explicit zero values for provenance, but never select them.
             if raw.comp_hash.as_ref().is_some_and(|s| s.len() > 128) {
@@ -259,6 +274,7 @@ impl SourceCatalog {
             Sha256::digest(serde_json::to_vec(&models).expect("typed projection"))
         );
         Ok(Self {
+            route: None,
             models,
             revision,
             fetched_at: at,
@@ -273,6 +289,7 @@ impl SourceCatalog {
     }
     pub fn unavailable(at: u64) -> Self {
         Self {
+            route: None,
             models: vec![],
             revision: "unavailable-v1".into(),
             fetched_at: at,
@@ -390,7 +407,7 @@ pub fn resolve_model(
         route.class,
         RouteClass::CodexSubscription | RouteClass::SyntheticSubscription
     );
-    let source = source.filter(|_| subscribed);
+    let source = source.filter(|s| subscribed && s.route.as_ref() == Some(&route));
     let entry = source.and_then(|s| s.models.iter().find(|entry| entry.model == model));
     let raw = entry.map(|e| e.raw.clone()).unwrap_or_default();
     let capacity = entry
