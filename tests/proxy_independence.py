@@ -66,7 +66,7 @@ class ReviewerIndependence(unittest.TestCase):
 
     def test_reviewer_capacity_is_not_primary_capacity(self):
         fixture = self.fixture(lambda _b, _n: (503, {"error": "review unavailable"}))
-        proxy = self.harness.proxy(fixture, ["--classifier-max-input-tokens", "128",
+        proxy = self.harness.proxy(fixture, ["--classifier-max-input-tokens", "1024",
             "--classifier-max-output-tokens", "64", "--min-payback-percent", "0"])
         history = self.seed()
         self.assertEqual(proxy.send(history)[0], 200,
