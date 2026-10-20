@@ -181,7 +181,12 @@ fn lease_merge_rejects_partial_failed_stale_and_concurrent_same_value_release() 
             .unwrap();
         let mut current = before.clone();
         let mut run = ReviewRun {
-            valid_admission: true,
+            batches: vec![ReviewBatch {
+                sources: before.groups(),
+                bootstrap_ids: Vec::new(),
+                valid_without_memories: true,
+                memory_ids: Vec::new(),
+            }],
             keep_review: Some(pending.clone()),
             reviewed_sources: before.groups(),
             ..ReviewRun::default()
@@ -192,7 +197,7 @@ fn lease_merge_rejects_partial_failed_stale_and_concurrent_same_value_release() 
                     json!({"rejected_count":1,"accepted_opinions":1,"accepted_memories":0})
             }
             "failed" => {
-                run.valid_admission = false;
+                run.batches.clear();
                 reviewed.review_feedback = json!({"rejected_count":1});
             }
             "cohort_growth" => current.history[1].cohort += 1,
