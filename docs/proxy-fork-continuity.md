@@ -30,10 +30,12 @@ original member/cohort IDs and exposure, group protections, request settings
 (including primary model, instructions and tools), reviewer model/endpoint and
 review policy version. Branch-local cache affinity is excluded. Memories do not
 get to shorten their dependencies merely by claiming older `source_ids`.
-Only first fully committed, fully accepted reviews on an unchanged raw cut with
-no earlier advice/memory are published. Later updates, partially rejected
-batches, legacy advice and reviews whose live history grew during dispatch are
-conservatively not promoted to new portable cuts. Already published cuts remain
+Only first fully committed reviews on an unchanged raw cut with no earlier
+advice/memory are published. Every chunk in an import run must be fully
+accepted; a clean final chunk cannot erase an earlier rejection. Ordinary
+partially accepted advice remains usable on its own branch, but is not portable.
+Later updates, legacy advice and reviews whose live history grew during dispatch
+are conservatively not promoted to new portable cuts. Already published cuts remain
 immutable; later parent advice cannot amend them.
 
 On hydration, historical pins/keeps and current pins both apply. A child suffix
@@ -47,9 +49,13 @@ admission gate for accepted historical facts.
 
 Declare intent only for the creation/retry request. An identical intent within
 the evidence horizon is idempotent, not permission to rehydrate an existing
-child or resurrect its removed sources. Later ordinary requests use the child's
-own lineage and can omit the fork headers. Even existing children cannot use
-expired/evicted parent evidence to request another recovery.
+child or resurrect its removed sources or retired memories. Every retry still
+validates the cut, scope/settings, cohort and live-child lineage. Contradictory
+fork/reset or opaque-compaction intent is rejected before resetting state or
+calling upstream, even with `x-carry-history-policy: reset-on-divergence`.
+Later ordinary requests use the child's own lineage and can omit the fork
+headers. Even existing children cannot use expired/evicted parent evidence to
+request another recovery.
 
 ## Retention and failure
 
@@ -81,7 +87,9 @@ a fresh raw branch. Codes include `fork_invalid_intent`, `fork_unsupported`,
 `fork_requires_distinct_branch`, `fork_unknown`, `fork_expired`,
 `fork_incompatible`, and `fork_child_conflict`. Invalid preexisting session
 identity/checkpoint errors retain their existing validation errors. Audit/off
-modes reject fork declarations rather than imply advice was applied.
+modes reject fork declarations rather than imply advice was applied, including
+when no valid UTF-8 explicit session identity was supplied. Undeclared off-mode
+requests retain ordinary unchanged forwarding.
 
 ## Evidence and remaining work
 
@@ -95,8 +103,8 @@ substitute for actual native branch operations.
 Still required: Pi RPC fork/new session ID and SDK tree/same session ID adapters
 and distinct actual-client fixtures; Codex real thread/fork/new IDs and rollback/
 same-ID adapters and fixtures; general later-review/dependency-closure portable
-cuts; a stable client-facing point-discovery contract. The inherited reviewer
-bootstrap all-rejected current-budget merge issue RI-001 remains a separate
-unresolved prerequisite; this slice does not repair it or introduce
+cuts; a stable client-facing point-discovery contract. The separate reviewer
+bootstrap current-budget merge repair RI-001 has its own behavioral evidence and
+independent-review gate; these HTTP fork repairs do not replace that gate or add
 receipt-anchored accounting. Passing loopback tests alone is not full #148
 acceptance or permission to merge/deploy.

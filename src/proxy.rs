@@ -901,6 +901,9 @@ struct ReviewRun {
     request_id: String,
     receipts: Vec<ReviewReceipt>,
     reviewed_sources: Vec<Group>,
+    // Portable evidence requires every chunk to be fully accepted. Ordinary
+    // partial advice and its coverage remain independently usable.
+    publication_rejected: bool,
 }
 
 struct ReviewBatch {
@@ -966,6 +969,14 @@ async fn forward_request(
     }
     authorize(&service, &headers)?;
     let mut id = identity(&headers)?;
+    // Fork intent is a gate even when off mode has no tracking identity. Never
+    // let missing/non-UTF8 session headers bypass the optional session branch.
+    if id.is_none()
+        && (headers.contains_key("x-carry-fork-parent")
+            || headers.contains_key("x-carry-fork-point"))
+    {
+        return Err(forking::conflict("fork_unsupported"));
+    }
     if service.config.codex_login && legacy_native {
         return Err(failure(
             StatusCode::NOT_IMPLEMENTED,
@@ -2261,7 +2272,12 @@ fn merge_review(
         committed_valid,
         &successful_sources,
     );
-    forking::publish(config, current, before, committed_valid);
+    forking::publish(
+        config,
+        current,
+        before,
+        committed_valid && !run.publication_rejected,
+    );
     true
 }
 
@@ -2689,6 +2705,7 @@ async fn review_chunk(
     {
         session.partial_reviews += 1;
     }
+    run.publication_rejected |= !valid || session.review_feedback["rejected_count"] != 0;
     if valid {
         run.batches.push(ReviewBatch {
             sources: groups.to_vec(),

@@ -360,6 +360,33 @@ class ForkContinuity(unittest.TestCase):
                 self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]))
                 self.assertEqual(len(fixture.reviews), counts[1])
 
+    def test_live_retry_revalidates_reviewer_settings_after_restart(self):
+        proxy, fixture, history, handle, options = self.seed()
+        for index, setting in enumerate((["--classifier-reasoning-effort", "high"],
+                                         ["--classifier-max-output-tokens", "1"])):
+            with self.subTest(setting=setting):
+                branch = f"live-policy-{index}"
+                child = history + [{"role": "user", "content": "CHILD_SUFFIX"}]
+                proxy.branch, proxy.intent = branch, ("main", handle)
+                self.assertEqual(proxy.send(child)[0], 200)
+                proxy.close()
+                before = {p.name: p.read_bytes() for p in self.state.glob("*.json")}
+                proxy = BranchProxy(self.state, fixture, options + setting)
+                self.stack.callback(proxy.close)
+                proxy.branch, proxy.intent = branch, ("main", handle)
+                proxy.history_policy = "reset-on-divergence"
+                self.rejected(proxy, fixture, child, "fork_incompatible")
+                self.assertEqual({p.name: p.read_bytes() for p in self.state.glob("*.json")}, before)
+                proxy.close()
+                proxy = BranchProxy(self.state, fixture, options)
+                self.stack.callback(proxy.close)
+                proxy.branch, proxy.intent = branch, ("main", handle)
+                counts = len(fixture.reviews)
+                self.assertEqual(proxy.send(child)[0], 200)
+                self.assertIn("A_FACT", json.dumps(fixture.primaries[-1]))
+                self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]))
+                self.assertEqual(len(fixture.reviews), counts)
+
     def test_live_retry_does_not_resurrect_branch_local_retired_memory(self):
         proxy, fixture, history, handle, _ = self.seed()
         proxy.branch, proxy.intent = "retired-child", ("main", handle)

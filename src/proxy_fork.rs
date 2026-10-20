@@ -139,7 +139,7 @@ pub(super) fn publish(config: &ProxyCli, current: &mut Session, before: &Session
     prune(config, current);
 }
 
-fn conflict(code: &str) -> Failure {
+pub(super) fn conflict(code: &str) -> Failure {
     (
         StatusCode::CONFLICT,
         axum::Json(json!({"error":{"code":code,
@@ -222,14 +222,12 @@ pub(super) fn hydrate(
     if expired(config, point, now()) {
         return Err(conflict("fork_expired"));
     }
-    if let Some(existing) = &session.fork_origin {
-        return if existing == origin {
-            Ok(())
-        } else {
-            Err(conflict("fork_child_conflict"))
-        };
-    }
-    if session.version != 0 || !session.history.is_empty() {
+    if session
+        .fork_origin
+        .as_ref()
+        .is_some_and(|existing| existing != origin)
+        || (session.fork_origin.is_none() && (session.version != 0 || !session.history.is_empty()))
+    {
         return Err(conflict("fork_child_conflict"));
     }
     let input = body["input"]
@@ -263,16 +261,6 @@ pub(super) fn hydrate(
     if groups(&child) != point.groups {
         return Err(conflict("fork_incompatible"));
     }
-    child.opinions = point.opinions.clone();
-    child.drop_members = point.drop_members.clone();
-    child.memories = point.memories.clone();
-    child.memory_anchors = point.memory_anchors.clone();
-    child.next_memory_id = child
-        .memories
-        .iter()
-        .map(|m| m.id.saturating_add(1))
-        .max()
-        .unwrap_or(0);
     child
         .ingest(input)
         .map_err(|_| conflict("fork_incompatible"))?;
@@ -285,6 +273,29 @@ pub(super) fn hydrate(
     }) {
         return Err(conflict("fork_incompatible"));
     }
+    if session.fork_origin.is_some() {
+        // Revalidate both the declared cut and the live lineage before ordinary
+        // ingest can reset it. A retry never restores parent advice/memories or
+        // tombstones over legitimate branch-local changes.
+        let mut retry = session.clone();
+        retry
+            .ingest(input)
+            .map_err(|_| conflict("fork_incompatible"))?;
+        if retry.history_rebases != session.history_rebases {
+            return Err(conflict("fork_incompatible"));
+        }
+        return Ok(());
+    }
+    child.opinions = point.opinions.clone();
+    child.drop_members = point.drop_members.clone();
+    child.memories = point.memories.clone();
+    child.memory_anchors = point.memory_anchors.clone();
+    child.next_memory_id = child
+        .memories
+        .iter()
+        .map(|m| m.id.saturating_add(1))
+        .max()
+        .unwrap_or(0);
     child.review_context = cache_base(body);
     child.refresh_memory_shadow();
     // Accepted historical facts are not a new reviewer admission. The normal
