@@ -2120,6 +2120,8 @@ async fn dispatch_review_for(
         );
         return;
     }
+    let prior_background_review_pending = session.background_review_pending;
+    let prior_keep_leases = session.keep_leases.clone();
     session.background_review_pending = true;
     session.initialize_keep_leases(service.config.keep_lease_turns);
     let lease_only = decision["reason"] == "keep_lease_economic";
@@ -2132,7 +2134,10 @@ async fn dispatch_review_for(
         });
     // Reserve the pending marker before dispatch so a restart censors unknown spend.
     if save(&service, &id, session).is_err() {
-        session.background_review_pending = false;
+        // No worker or paid attempt owns this reservation. Roll back only our
+        // provisional lease state, including the extra-attempt allowance.
+        session.background_review_pending = prior_background_review_pending;
+        session.keep_leases = prior_keep_leases;
         service.background_reviews.lock().await.remove(&id);
         journal(
             &service,
@@ -2497,6 +2502,7 @@ async fn review(
         return false;
     }
     prepare_review_history(session, &groups);
+    let prior_keep_review = session.keep_leases.as_ref().unwrap().pending.clone();
     let targets = session.due_keep_targets();
     session.keep_leases.as_mut().unwrap().pending =
         (!targets.is_empty()).then(|| crate::proxy_state::PendingKeepReview {
@@ -2524,6 +2530,9 @@ async fn review(
                 session.opinions.insert(group.id, "keep".into());
             }
         }
+        // These targets were rendered but never sent. Do not leave an active
+        // annotation, or cancel a pending generation owned by another attempt.
+        session.keep_leases.as_mut().unwrap().pending = prior_keep_review;
         return false;
     }
     session.observe_groups(&groups);

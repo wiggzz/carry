@@ -15,6 +15,7 @@ async fn lease_never_dispatched_overcap_target_leaves_no_live_pending_annotation
         reviewer_required_tokens(&config, &review_body(&config, &session)).ceil() as u32;
     let mut service = checkpoint_service(directory.path());
     service.config = config;
+    let before = serde_json::to_value(&session).unwrap();
     assert!(
         !review(
             &service,
@@ -35,6 +36,7 @@ async fn lease_never_dispatched_overcap_target_leaves_no_live_pending_annotation
         "LEASE_CANCEL_PENDING_RED: a never-dispatched target cannot remain a live reviewer-tail annotation"
     );
     assert_eq!(session.opinions.get(&2).map(String::as_str), Some("keep"));
+    assert_eq!(serde_json::to_value(&session).unwrap(), before);
 }
 
 #[tokio::test]
@@ -48,6 +50,7 @@ async fn lease_checkpoint_reservation_failure_cancels_pending_targets() {
     let mut service = checkpoint_service(directory.path());
     service.config = config;
     let service = Arc::new(service);
+    let before = serde_json::to_value(&session).unwrap();
     dispatch_review_for(
         service.clone(),
         "failed-reservation".into(),
@@ -64,6 +67,86 @@ async fn lease_checkpoint_reservation_failure_cancels_pending_targets() {
         "LEASE_CANCEL_PENDING_RED: failed durable reservation must cancel undispatched targets"
     );
     assert_eq!(session.opinions.get(&2).map(String::as_str), Some("keep"));
+    assert_eq!(serde_json::to_value(&session).unwrap(), before);
+}
+
+#[tokio::test]
+async fn lease_duplicate_dispatch_preserves_inflight_targets_and_attempt_allowance() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut config, mut session, body) = lease_fixture();
+    config.review_min_new_tokens = 0;
+    config.state_dir = directory.path().to_path_buf();
+    config.classifier_url = Some("http://127.0.0.1:1".into());
+    session.background_review_pending = true;
+    session.reserve_extra_keep_attempt();
+    let targets = session.due_keep_targets();
+    assert!(!targets.is_empty());
+    session.keep_leases.as_mut().unwrap().pending = Some(crate::proxy_state::PendingKeepReview {
+        request_id: "legitimate-inflight-generation".into(),
+        targets,
+    });
+    let mut service = checkpoint_service(directory.path());
+    service.config = config;
+    let service = Arc::new(service);
+    let id = "duplicate-dispatch";
+    assert!(service.background_reviews.lock().await.insert(id.into()));
+    save(&service, id, &session).unwrap();
+    let before = serde_json::to_value(&session).unwrap();
+    dispatch_review_for(
+        service.clone(),
+        id.into(),
+        &mut session,
+        body,
+        "never-owned-this-generation".into(),
+    )
+    .await;
+    assert_eq!(serde_json::to_value(&session).unwrap(), before);
+    assert_eq!(
+        serde_json::to_value(load(&service, id).unwrap()).unwrap(),
+        before
+    );
+    let running = service.background_reviews.lock().await;
+    assert_eq!(running.len(), 1);
+    assert!(running.contains(id));
+}
+
+#[tokio::test]
+async fn lease_overcap_preparation_preserves_prior_pending_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut config, mut session, body) = lease_fixture();
+    config.review_min_new_tokens = 0;
+    config.state_dir = directory.path().to_path_buf();
+    config.classifier_url = Some("http://127.0.0.1:1".into());
+    session.review_context = cache_base(&body);
+    session.review_cache_key = format!("{:x}", Sha256::digest("carry-review-overcap-prior"));
+    let groups = session.groups();
+    prepare_review_history(&mut session, &groups);
+    config.classifier_max_input_tokens =
+        reviewer_required_tokens(&config, &review_body(&config, &session)).ceil() as u32;
+    let targets = session.due_keep_targets();
+    assert!(!targets.is_empty());
+    session.keep_leases.as_mut().unwrap().pending = Some(crate::proxy_state::PendingKeepReview {
+        request_id: "prior-pending-generation".into(),
+        targets,
+    });
+    let before = serde_json::to_value(&session).unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config = config;
+    let mut run = ReviewRun::default();
+    assert!(
+        !review(
+            &service,
+            "overcap-prior",
+            &mut session,
+            &body,
+            false,
+            &mut run
+        )
+        .await
+    );
+    assert!(run.receipts.is_empty());
+    assert!(run.keep_review.is_none());
+    assert_eq!(serde_json::to_value(&session).unwrap(), before);
 }
 
 #[test]
