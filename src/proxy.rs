@@ -22,7 +22,7 @@ use axum::{
 };
 use carry::core::{Rates, ViewCosts, horizon_cost, input_cost, joint_decision, select_removals};
 use carry::models::{ResolvedModel, ResolvedPair, Route, RouteClass, SourceCatalog, resolve_model};
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, oneshot};
@@ -143,6 +143,11 @@ pub struct ProxyCli {
     /// completion sensitivity is diagnostic, never selection credit.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     background_reviews: bool,
+    /// Successful primary completions before temporary keeps may be revalidated.
+    #[arg(long, env = "CARRY_PROXY_KEEP_LEASE_TURNS", default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..))]
+    keep_lease_turns: u64,
+    #[arg(skip)]
+    keep_lease_source: Option<String>,
     /// Ordinary reviews require this many completed primary requests AND native-source growth.
     #[arg(long, env = "CARRY_PROXY_REVIEW_EVERY_REQUESTS", default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=100))]
     review_every_requests: u64,
@@ -174,6 +179,23 @@ pub struct ProxyCli {
     fork_max_bytes: u32,
     #[arg(long, env = "CARRY_PROXY_FORK_MAX_AGE_SECS", default_value_t = 86400, value_parser = clap::value_parser!(u64).range(0..=604800))]
     fork_max_age_secs: u64,
+}
+
+impl ProxyCli {
+    pub fn parse_with_sources(argv: Vec<std::ffi::OsString>) -> Self {
+        let matches = Self::command().get_matches_from(argv);
+        let mut config = Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+        config.keep_lease_source = Some(
+            match matches.value_source("keep_lease_turns") {
+                Some(clap::parser::ValueSource::CommandLine) => "command_line",
+                Some(clap::parser::ValueSource::EnvVariable) => "environment",
+                Some(clap::parser::ValueSource::DefaultValue) => "default",
+                _ => "unknown",
+            }
+            .into(),
+        );
+        config
+    }
 }
 
 #[derive(Clone)]
@@ -916,6 +938,16 @@ async fn metrics(
             "backoff_factor":service.config.review_backoff_factor,
             "backoff_max":service.config.review_backoff_max
         },
+        "keep_lease_policy": {
+            "turns":service.config.keep_lease_turns,
+            "source":service.config.keep_lease_source,
+            "round_basis":"completed_primary_responses",
+            "initialized":session.keep_leases.is_some(),
+            "historical_policy":session.keep_leases.as_ref().map(|s| s.version),
+            "due_targets":session.due_keep_target_count(),
+            "pending_targets":session.keep_leases.as_ref().and_then(|s| s.pending.as_ref()).map_or(0, |p| p.targets.len()),
+            "released_targets":session.keep_leases.as_ref().map_or(0, |s| s.entries.values().filter(|l| l.released_at_round.is_some()).count())
+        },
         "scope": "explicit_session", "primary": session.primary, "shadow": session.shadow,
         "completed_requests": session.completed_requests, "compactions": session.compactions,
         "native_compactions": session.native_compactions, "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews, "partial_reviews": session.partial_reviews,
@@ -1136,6 +1168,8 @@ struct ReviewRun {
     request_id: String,
     receipts: Vec<ReviewReceipt>,
     reviewed_sources: Vec<Group>,
+    keep_review: Option<crate::proxy_state::PendingKeepReview>,
+    lease_only: bool,
     // Portable evidence requires every chunk to be fully accepted. Ordinary
     // partial advice and its coverage remain independently usable.
     publication_rejected: bool,
@@ -1346,6 +1380,9 @@ async fn forward_request(
             // A prior process exited with an unobserved reviewer attempt. Never
             // resurrect its snapshot or pretend its usage was zero.
             session.background_review_pending = false;
+            if let Some(state) = &mut session.keep_leases {
+                state.pending = None;
+            }
             journal(
                 &service,
                 &id,
@@ -1454,6 +1491,7 @@ async fn forward_request(
             &json!({"native_compaction":native}),
         );
         session.review_context = cache_base(&body);
+        session.initialize_keep_leases(service.config.keep_lease_turns);
         let active = !native && service.config.mode != Mode::Off;
         let primary_priced =
             primary_rates(&service.config, body["model"].as_str().unwrap_or(""), 0.0).is_some();
@@ -1737,6 +1775,8 @@ As the primary moves past detailed work on a code section or implementation, mar
 Return only the strict JSON advice object: protected, removable, and memories with source_ids and text. Empty arrays are valid. Do not speculate about token budgets, prices, or savings."#;
 
 fn review_body(config: &ProxyCli, session: &Session) -> Value {
+    #[cfg(test)]
+    planner_work::record("review_renders");
     review_body_for_groups(config, session, &session.groups())
 }
 
@@ -2257,10 +2297,24 @@ async fn dispatch_review_for(
         );
         return;
     }
+    let prior_background_review_pending = session.background_review_pending;
+    let prior_keep_leases = session.keep_leases.clone();
     session.background_review_pending = true;
+    session.initialize_keep_leases(service.config.keep_lease_turns);
+    let lease_only = decision["reason"] == "keep_lease_economic";
+    session.reserve_extra_keep_attempt();
+    let targets = session.due_keep_targets();
+    session.keep_leases.as_mut().unwrap().pending =
+        (!targets.is_empty()).then(|| crate::proxy_state::PendingKeepReview {
+            request_id: request_id.clone(),
+            targets,
+        });
     // Reserve the pending marker before dispatch so a restart censors unknown spend.
     if save(&service, &id, session).is_err() {
-        session.background_review_pending = false;
+        // No worker or paid attempt owns this reservation. Roll back only our
+        // provisional lease state, including the extra-attempt allowance.
+        session.background_review_pending = prior_background_review_pending;
+        session.keep_leases = prior_keep_leases;
         service.background_reviews.lock().await.remove(&id);
         journal(
             &service,
@@ -2283,6 +2337,7 @@ async fn dispatch_review_for(
         let mut reviewed = before.clone();
         let mut run = ReviewRun {
             background: true,
+            lease_only,
             request_id,
             ..ReviewRun::default()
         };
@@ -2340,6 +2395,9 @@ fn merge_review(
     run: &ReviewRun,
 ) -> bool {
     current.background_review_pending = false;
+    if let Some(state) = &mut current.keep_leases {
+        state.pending = None;
+    }
     // Spend survives stale advice, rebases and primary failures. Price reviewer
     // receipts against the current trajectory, never replace its primary history.
     for receipt in &run.receipts {
@@ -2433,6 +2491,18 @@ fn merge_review(
         if current.opinions.get(&id) != before.opinions.get(&id) {
             continue;
         }
+        let key = format!("g{id}");
+        if current
+            .keep_leases
+            .as_ref()
+            .and_then(|s| s.entries.get(&key))
+            != before
+                .keep_leases
+                .as_ref()
+                .and_then(|s| s.entries.get(&key))
+        {
+            continue;
+        }
         if let Some(opinion) = reviewed.opinions.get(&id) {
             current.opinions.insert(id, opinion.clone());
         } else {
@@ -2444,7 +2514,17 @@ fn merge_review(
         }
     }
     current.reconcile_opinions(&current.groups());
+    let live_leases = current.keep_leases.as_ref();
     current.memories.retain(|memory| {
+        let key = format!("m{}", memory.id);
+        if live_leases.and_then(|s| s.entries.get(&key))
+            != before
+                .keep_leases
+                .as_ref()
+                .and_then(|s| s.entries.get(&key))
+        {
+            return true; // A newer same-value protection also beats stale retirement.
+        }
         !before.memories.iter().any(|old| {
             old.id == memory.id && old.text == memory.text && old.source_ids == memory.source_ids
         }) || reviewed.memories.iter().any(|new| new.id == memory.id)
@@ -2557,6 +2637,40 @@ fn merge_review(
         });
         current.bootstrap_review_pending = !current.bootstrap_review_complete;
     }
+    if let (Some(old), Some(new), Some(live)) = (
+        &before.keep_leases,
+        &reviewed.keep_leases,
+        &mut current.keep_leases,
+    ) {
+        let keys = old
+            .entries
+            .keys()
+            .chain(new.entries.keys())
+            .cloned()
+            .collect::<HashSet<_>>();
+        for key in keys {
+            if live.entries.get(&key) != old.entries.get(&key) {
+                continue;
+            }
+            if new.entries.get(&key) == old.entries.get(&key) {
+                continue;
+            }
+            if let Some(lease) = new.entries.get(&key) {
+                let mut lease = lease.clone();
+                lease.renewed_at_round = current.completed_requests;
+                live.entries.insert(key, lease);
+            } else {
+                live.entries.remove(&key);
+            }
+        }
+        live.next_generation = live.next_generation.max(new.next_generation);
+    }
+    if committed_valid
+        && current.review_feedback["rejected_count"] == 0
+        && let Some(pending) = &run.keep_review
+    {
+        current.resolve_keep_targets(pending);
+    }
     admission::complete(
         &before_admission,
         current,
@@ -2583,7 +2697,7 @@ async fn review(
     if run.request_id.is_empty() {
         run.request_id = logging::request_id();
     }
-    if !bootstrap {
+    if !bootstrap && !run.lease_only {
         let decision = admission::decision(&service.config, session, main, run.pressure);
         journal(service, id, &run.request_id, "review_admission", &decision);
         if decision["admitted"] != true {
@@ -2592,6 +2706,7 @@ async fn review(
         }
     }
     admission::initialize(session);
+    session.initialize_keep_leases(service.config.keep_lease_turns);
     session.review_cache_key = format!("{:x}", Sha256::digest(format!("carry-review-{id}")));
     session.review_context = cache_base(main);
     if bootstrap {
@@ -2609,6 +2724,13 @@ async fn review(
         return false;
     }
     prepare_review_history(session, &groups);
+    let prior_keep_review = session.keep_leases.as_ref().unwrap().pending.clone();
+    let targets = session.due_keep_targets();
+    session.keep_leases.as_mut().unwrap().pending =
+        (!targets.is_empty()).then(|| crate::proxy_state::PendingKeepReview {
+            request_id: run.request_id.clone(),
+            targets,
+        });
     let mut body = review_body_for_groups(&service.config, session, &groups);
     // Dispose of reviewer replay independently; never rewrite primary source
     // or accepted protection merely to admit another reviewer request.
@@ -2624,6 +2746,9 @@ async fn review(
             "review_skipped",
             &json!({"reason":"reviewer_capacity","background":run.background,"required_tokens":reviewer_required_tokens(&service.config,&body),"context_tokens":service.config.classifier_max_input_tokens}),
         );
+        // These targets were rendered but never sent. Do not leave an active
+        // annotation, or cancel a pending generation owned by another attempt.
+        session.keep_leases.as_mut().unwrap().pending = prior_keep_review;
         return false;
     }
     session.observe_groups(&groups);
@@ -2948,6 +3073,15 @@ async fn review_chunk(
                             .as_u64()
                             .unwrap_or(0)
                             > 0;
+                    if valid && session.review_feedback["rejected_count"] == 0 {
+                        run.keep_review =
+                            session.keep_leases.as_ref().and_then(|s| s.pending.clone());
+                        if !run.background
+                            && let Some(pending) = &run.keep_review
+                        {
+                            session.resolve_keep_targets(pending);
+                        }
+                    }
                 }
                 Err(error) => {
                     session.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":error.to_string()}]});
@@ -3016,6 +3150,9 @@ async fn review_chunk(
         session.partial_reviews += 1;
     }
     run.publication_rejected |= !valid || session.review_feedback["rejected_count"] != 0;
+    if let Some(state) = &mut session.keep_leases {
+        state.pending = None;
+    }
     if valid {
         run.batches.push(ReviewBatch {
             sources: groups.to_vec(),
@@ -3280,6 +3417,8 @@ fn cache_base(body: &Value) -> Value {
 }
 
 fn estimate(body: &Value) -> f64 {
+    #[cfg(test)]
+    planner_work::record("estimates");
     crate::proxy_savings::token_units(body) as f64
 }
 
@@ -3922,6 +4061,10 @@ mod pr144_regressions;
 mod catalog_regressions;
 
 #[cfg(test)]
+#[path = "proxy_planner_work_tests.rs"]
+mod planner_work;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use carry::core::prefix_compatible;
@@ -3986,6 +4129,12 @@ mod tests {
         include!("proxy_admission_controls.rs");
         include!("proxy_admission_merge_tests.rs");
         include!("proxy_bootstrap_merge_tests.rs");
+    }
+    mod lease_tests {
+        include!("proxy_lease_tests.rs");
+        include!("proxy_lease_review_tests.rs");
+        include!("proxy_lease_acceptance_tests.rs");
+        include!("proxy_lease_performance_tests.rs");
     }
 
     #[test]

@@ -743,6 +743,23 @@ mod tests {
     }
 
     #[test]
+    fn persisted_reviewer_expense_roundtrips_without_repricing() {
+        // This exact paid total exposed a one-ULP drift at a real restart.
+        // Exercise the checkpoint codec, not only a Value-to-Value conversion.
+        for expense in [0.00011470000000000001_f64, 0.0001147, 0.0] {
+            let mut trajectory = Trajectory::default();
+            trajectory.result.reviewer_cost = expense;
+            let bytes = serde_json::to_vec(&trajectory).unwrap();
+            let resumed: Trajectory = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                resumed.result.reviewer_cost.to_bits(),
+                expense.to_bits(),
+                "RECEIPT_CODEC_RED: restarting must not change already settled expense"
+            );
+        }
+    }
+
+    #[test]
     fn priced_subset_unpriced_only_is_null_even_with_known_reviewer_expense() {
         for variant in ["missing_usage", "unknown_model", "unknown_cache", "native"] {
             let mut trajectory = Trajectory::default();

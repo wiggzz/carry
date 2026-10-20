@@ -258,7 +258,7 @@ async fn main() -> Result<()> {
     match argv.get(1).and_then(|argument| argument.to_str()) {
         Some("proxy") => {
             argv.remove(1);
-            return proxy::serve(proxy::ProxyCli::parse_from(argv)).await;
+            return proxy::serve(proxy::ProxyCli::parse_with_sources(argv)).await;
         }
         Some("login") => {
             argv.remove(1);
