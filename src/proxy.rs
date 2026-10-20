@@ -158,6 +158,14 @@ pub struct ProxyCli {
     classifier_reasoning_effort: String,
     #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=16384))]
     classifier_max_output_tokens: u32,
+    /// Retained historical review evidence per explicit parent lineage. Zero
+    /// disables new fork guarantees; eviction never alters active tombstones.
+    #[arg(long, env = "CARRY_PROXY_FORK_MAX_NODES", default_value_t = 8, value_parser = clap::value_parser!(u32).range(0..=32))]
+    fork_max_nodes: u32,
+    #[arg(long, env = "CARRY_PROXY_FORK_MAX_BYTES", default_value_t = 262144, value_parser = clap::value_parser!(u32).range(2..=1048576))]
+    fork_max_bytes: u32,
+    #[arg(long, env = "CARRY_PROXY_FORK_MAX_AGE_SECS", default_value_t = 86400, value_parser = clap::value_parser!(u64).range(0..=604800))]
+    fork_max_age_secs: u64,
 }
 
 struct Service {
@@ -478,6 +486,7 @@ fn load(service: &Service, id: &str) -> Result<Session, Failure> {
                         evidence.compact();
                     }
                     session.shadow_cache.clear();
+                    forking::prune(&service.config, &mut session);
                     session
                 })
                 .map_err(|_| {

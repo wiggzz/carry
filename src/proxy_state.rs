@@ -170,6 +170,9 @@ pub(super) struct Session {
     pub fork_points: Vec<crate::proxy::forking::Point>,
     #[serde(default)]
     pub fork_origin: Option<String>,
+    /// Bounded expiry diagnostics, not global source-removal tombstones.
+    #[serde(default)]
+    pub fork_expired: Vec<String>,
 }
 
 fn identity(value: &Value) -> Value {

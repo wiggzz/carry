@@ -57,6 +57,33 @@ fn groups(session: &Session) -> Value {
     )
 }
 
+fn expired(config: &ProxyCli, point: &Point, at: u64) -> bool {
+    point.at > at || at.saturating_sub(point.at) >= config.fork_max_age_secs
+}
+
+/// Bound the actual serialized evidence vector, not approximate text sizes.
+/// Diagnostics retain only 32 expired handles; older ones become unknown, not
+/// fresh history. This is per lineage, not a global state-directory quota.
+pub(super) fn prune(config: &ProxyCli, session: &mut Session) {
+    let at = now();
+    let mut retained = Vec::new();
+    for point in std::mem::take(&mut session.fork_points) {
+        if expired(config, &point, at) {
+            session.fork_expired.push(point.id);
+        } else {
+            retained.push(point);
+        }
+    }
+    while retained.len() > config.fork_max_nodes as usize
+        || serde_json::to_vec(&retained).unwrap().len() > config.fork_max_bytes as usize
+    {
+        session.fork_expired.push(retained.remove(0).id);
+    }
+    session.fork_points = retained;
+    let discard = session.fork_expired.len().saturating_sub(32);
+    session.fork_expired.drain(..discard);
+}
+
 /// Publish only a first, fully committed review of a raw ancestor. Its entire
 /// observation/dependency frontier is the cut; claimed memory source_ids alone
 /// never shorten that frontier. Legacy opinions and later-context memory chains
@@ -79,7 +106,7 @@ pub(super) fn publish(config: &ProxyCli, current: &mut Session, before: &Session
     }
     let values = current.history.iter().map(|i| &i.value).collect::<Vec<_>>();
     let id = format!("{}:{}", current.review_epoch, digest(&values));
-    if current.fork_points.iter().any(|p| p.id == id) {
+    if current.fork_points.iter().any(|p| p.id == id) || current.fork_expired.contains(&id) {
         return; // immutable: a later review cannot replace the historical cut
     }
     let mut opinions = current.opinions.clone();
@@ -109,6 +136,7 @@ pub(super) fn publish(config: &ProxyCli, current: &mut Session, before: &Session
         memory_anchors: current.memory_anchors.clone(),
     };
     current.fork_points.push(point);
+    prune(config, current);
 }
 
 fn conflict(code: &str) -> Failure {
@@ -173,7 +201,13 @@ pub(super) async fn resolve(
         .fork_points
         .iter()
         .find(|p| p.id == handle)
-        .ok_or_else(|| conflict("fork_unknown"))?
+        .ok_or_else(|| {
+            conflict(if parent.fork_expired.iter().any(|id| id == handle) {
+                "fork_expired"
+            } else {
+                "fork_unknown"
+            })
+        })?
         .clone();
     Ok(Some((format!("{parent_id}/{handle}"), point)))
 }
@@ -185,6 +219,9 @@ pub(super) fn hydrate(
     point: &Point,
     body: &Value,
 ) -> Result<(), Failure> {
+    if expired(config, point, now()) {
+        return Err(conflict("fork_expired"));
+    }
     if let Some(existing) = &session.fork_origin {
         return if existing == origin {
             Ok(())
