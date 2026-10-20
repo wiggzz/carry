@@ -156,6 +156,67 @@ async fn catalog(url: &str) -> Value {
     assert_eq!(response.status(), 200);
     response.json().await.unwrap()
 }
+
+#[tokio::test]
+async fn restarted_primary_receipts_and_scenarios_use_frozen_prices_including_unknown() {
+    let f = Fixture::new().await;
+    for unknown in [false, true] {
+        let state = tempfile::tempdir().unwrap();
+        let (child, url) = start(f.home.path(), state.path(), f.address, true, &[]).await;
+        let body = json!({"model":"gpt-6-sol","input":[{"role":"user","content":"synthetic frozen economics"}],"max_output_tokens":10});
+        assert_eq!(send(&url, "frozen", &body).await, 200);
+        drop(child);
+        let (path, mut checkpoint) = saved(state.path());
+        let prior_native = checkpoint["primary"]["cost_usd"].as_f64().unwrap();
+        let prior_unavailable = checkpoint["primary"]["unavailable_cost_calls"]
+            .as_u64()
+            .unwrap();
+        let prior_scenario = checkpoint["cost_trajectory"]["result"]["carry_cost"]
+            .as_f64()
+            .unwrap();
+        let prior_excluded = checkpoint["cost_trajectory"]["result"]["excluded_unpriced_calls"]
+            .as_u64()
+            .unwrap();
+        checkpoint["model_resolution"]["primary"]["rates"] = if unknown {
+            Value::Null
+        } else {
+            json!({"input":7.0,"cached":0.7,"write":9.0,"output":21.0})
+        };
+        checkpoint["model_resolution"]["primary"]["price_basis"] = json!("synthetic_fixture_only");
+        std::fs::write(path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        let (_child, url) = start(f.home.path(), state.path(), f.address, true, &[]).await;
+        assert_eq!(send(&url, "frozen", &body).await, 200);
+        let (_, checkpoint) = saved(state.path());
+        let delta = checkpoint["primary"]["cost_usd"].as_f64().unwrap() - prior_native;
+        if unknown {
+            assert_eq!(delta, 0.0, "unpriced receipt adds no invented slug price");
+            assert_eq!(
+                checkpoint["primary"]["unavailable_cost_calls"],
+                prior_unavailable + 1
+            );
+            assert_eq!(
+                checkpoint["cost_trajectory"]["result"]["excluded_unpriced_calls"],
+                prior_excluded + 1
+            );
+            assert_eq!(
+                checkpoint["cost_trajectory"]["result"]["carry_cost"],
+                prior_scenario
+            );
+        } else {
+            assert!(
+                (delta - 721.0 / 1e6).abs() < 1e-12,
+                "actual receipt must use frozen input/output tariff: {delta}"
+            );
+            assert!(
+                checkpoint["cost_trajectory"]["result"]["carry_cost"]
+                    .as_f64()
+                    .unwrap()
+                    > prior_scenario,
+                "unknown cache capability must not prevent a matched uncached priced comparison"
+            );
+        }
+    }
+}
 async fn send(url: &str, session: &str, body: &Value) -> u16 {
     let response = reqwest::Client::new()
         .post(format!("{url}/v1/responses"))

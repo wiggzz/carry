@@ -3,6 +3,61 @@
 use super::*;
 
 #[test]
+fn stale_background_receipts_keep_the_dispatched_frozen_tariff_not_current_slug_or_epoch() {
+    let (config, mut before, _) = fixture(Rates {
+        input: 7.0,
+        cached: 0.7,
+        write: 9.0,
+        output: 21.0,
+    });
+    before.cost_trajectory = Some(crate::proxy_savings::Trajectory::default());
+    before.model_resolution.as_mut().unwrap().reviewer.rates = Some(Rates {
+        input: 11.0,
+        cached: 0.1,
+        write: 15.0,
+        output: 31.0,
+    });
+    let reviewed = before.clone();
+    let mut current = before.clone();
+    current.review_epoch += 1; // advice stale; the already paid receipt still counts
+    current.model_resolution.as_mut().unwrap().reviewer.rates = None;
+    let run = ReviewRun {
+        receipts: vec![ReviewReceipt {
+            model: config.classifier_model.clone(),
+            input: 200,
+            usage: Some(
+                json!({"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":10}}),
+            ),
+            standard: true,
+            completed: true,
+        }],
+        ..ReviewRun::default()
+    };
+    assert!(!merge_review(
+        &config,
+        &mut current,
+        &before,
+        &reviewed,
+        &run
+    ));
+    assert_eq!(current.shadow.calls, 1);
+    assert!((current.shadow.cost_usd - (90.0 * 11.0 + 10.0 * 0.1 + 31.0) / 1e6).abs() < 1e-12);
+    // Existing local-unit reviewer scenario deliberately has no native cache
+    // partition. Keep that contract while selecting its frozen input/output rates.
+    assert!(
+        (current
+            .cost_trajectory
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .reviewer_cost
+            - (200.0 * 11.0 + 31.0) / 1e6)
+            .abs()
+            < 1e-12
+    );
+}
+
+#[test]
 fn frozen_unknown_prices_do_not_fall_back_to_the_known_slug() {
     let (config, mut session, main) = fixture(Rates {
         input: 7.0,
