@@ -91,13 +91,29 @@ def contract_proxy(test, provider, state_dir, mode='audit', binary=None, classif
         process.stdout.close()
 
 
-def contract_send(url, body):
+def contract_send(url, body, directory):
     request = urllib.request.Request(url + '/v1/responses', data=json.dumps(body).encode(),
         headers={'content-type': 'application/json', 'x-carry-session': 'contract'})
-    # Full debug-binary admission/planner/journal work can exceed five seconds
-    # on a shared hosted runner. Keep a finite end-to-end deadline.
+    # Consume the primary first. These receipt/provenance tests deliberately
+    # sequence completed reviews; production forwarding must never do this.
     with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)
+        result = json.load(response)
+    contract_settle(directory)
+    return result
+
+
+def contract_settle(directory):
+    import time
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            state = contract_state(directory)
+            if not state['background_review_pending']:
+                return state
+        except (StopIteration, FileNotFoundError):
+            pass
+        time.sleep(.01)
+    raise AssertionError('completed primary reviewer receipt did not settle')
 
 
 def wire_data(body):
@@ -299,9 +315,12 @@ class NativeProviderFixtureTests(unittest.TestCase):
                         req = urllib.request.Request(observer.url+'/v1/responses',
                             data=json.dumps(body).encode(), headers={'content-type':'application/json',
                             'x-carry-session':'contract'})
-                        with urllib.request.urlopen(req, timeout=10) as response:
+                        # This large debug-build planner/journal scenario uses
+                        # the same finite deadline as contract_send.
+                        with urllib.request.urlopen(req, timeout=30) as response:
                             events=[json.loads(line[6:]) for line in response.read().decode().splitlines()
                                     if line.startswith('data: ')]
+                        contract_settle(trial/'state')
                         output=events[-1]['response']['output']
                         body['input'].extend(output)
                         for item in output:
@@ -422,14 +441,14 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 {'role': 'user', 'content': 'current task'}]}
             bulk = 'IMMUTABLE_BULK_MARKER ' * 3000
             with contract_proxy(self, provider, directory) as url:
-                contract_send(url, body)
+                contract_send(url, body, directory)
                 body['input'] += [
                     {'type': 'function_call', 'id': 'native-a', 'status': 'completed',
                      'call_id': 'a', 'name': 'native', 'arguments': '{}'},
                     {'type': 'function_call_output', 'call_id': 'a', 'output': bulk}]
-                contract_send(url, body)
+                contract_send(url, body, directory)
                 body['metadata'] = {'fail_primary': True}
-                contract_send(url, body)
+                contract_send(url, body, directory)
                 self.assertEqual(contract_state(directory)['failed_primaries'], 1)
                 self.assertEqual(contract_state(directory)['shadow']['calls'], 2)
             with contract_proxy(self, provider, directory) as url:
@@ -437,8 +456,8 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 # Tolerated native echo metadata changes are not new source observations.
                 body['input'][2].pop('id')
                 body['input'][2].pop('status')
-                contract_send(url, body)
-                contract_send(url, body)
+                contract_send(url, body, directory)
+                contract_send(url, body, directory)
             self.assertEqual(len(provider.shadow), 3)
             self.assertEqual(provider.primary[-1], body, 'canonical native echo is untouched')
             counts = [json.dumps(r).count('IMMUTABLE_BULK_MARKER') for r in provider.shadow]
@@ -470,8 +489,8 @@ class NativeProviderFixtureTests(unittest.TestCase):
             provider.advice = lambda review: {'protected': [], 'removable': [],
                 'memories': [{'source_ids': ['g1'], 'text': fact}]}
             with contract_proxy(self, provider, directory, mode='compact') as url:
-                contract_send(url, body)
-                contract_send(url, body)
+                contract_send(url, body, directory)
+                contract_send(url, body, directory)
                 self.assertEqual(contract_state(directory)['invalid_reviews'], 0)
                 # A reviewer derives another fact from the shown prior fact's provenance.
                 grounding = []
@@ -482,7 +501,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                         {'source_ids': facts[0].get('source_ids', ['m1']),
                          'text': 'JADE42 remains the required outcome'}]}
                 provider.advice = grounded
-                contract_send(url, body)
+                contract_send(url, body, directory)
                 state = contract_state(directory)
                 if os.environ.get('CARRY_MEMORY_EVIDENCE'):
                     Path(os.environ['CARRY_MEMORY_EVIDENCE']).write_text(json.dumps({
@@ -500,7 +519,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 # Keep provenance strict while applying the valid removable group independently.
                 provider.advice = lambda review: {'protected': [], 'removable': ['g1'],
                     'memories': [{'source_ids': ['m1'], 'text': 'invalid source'}]}
-                contract_send(url, body)
+                contract_send(url, body, directory)
                 state = contract_state(directory)
                 self.assertEqual(state['invalid_reviews'], 0)
                 self.assertEqual(state['partial_reviews'], 1)
@@ -508,8 +527,8 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 self.assertEqual(state['compactions'], 0, 'new advice is considered by the next request planner')
                 # Repeating a retired source action cannot revive its evidence.
                 provider.advice = lambda review: {'protected': [], 'removable': ['g1'], 'memories': []}
-                contract_send(url, body)
-                contract_send(url, body)  # review the retained view after the planning-only compaction
+                contract_send(url, body, directory)
+                contract_send(url, body, directory)  # review the retained view after the planning-only compaction
                 self.assertNotIn('RETIRE_HUMAN_SOURCE', json.dumps(provider.primary[-1]))
                 state = contract_state(directory)
                 self.assertTrue(state['history'][0]['removed'])
@@ -518,7 +537,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 provider.advice = lambda review: {'protected': [], 'removable': [],
                     'memories': [{'source_ids': ['g1'], 'text': 'retired source is not newly eligible'}]}
                 body['input'].append({'role': 'user', 'content': 'next task'})
-                contract_send(url, body)
+                contract_send(url, body, directory)
                 later = provider.shadow[-1]
                 self.assertNotIn('RETIRE_HUMAN_SOURCE', json.dumps(later))
                 self.assertEqual([r for r in wire_data(later) if r.get('text') == fact][0]['source_ids'], ['g1'])
@@ -533,18 +552,18 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 {'role': 'user', 'content': 'current task'}]}
             provider.advice = lambda review: {'protected': ['g1'], 'removable': [], 'memories': []}
             with contract_proxy(self, provider, directory) as url:
-                contract_send(url, body)
+                contract_send(url, body, directory)
                 body['input'] += [
                     {'type': 'function_call', 'call_id': 'a', 'name': 'native', 'arguments': 'CALL_A'},
                     {'type': 'function_call', 'call_id': 'b', 'name': 'native', 'arguments': 'CALL_B'},
                     {'type': 'function_call_output', 'call_id': 'a', 'output': 'RESULT_A ' * 500}]
-                contract_send(url, body)
+                contract_send(url, body, directory)
                 provider.advice = lambda review: {'protected': [], 'removable': ['g1'], 'memories': []}
                 body['input'].append({'type': 'function_call_output', 'call_id': 'b',
                                       'output': 'RESULT_B ' * 500})
-                contract_send(url, body)
+                contract_send(url, body, directory)
                 provider.advice = lambda review: {'protected': [], 'removable': [], 'memories': []}
-                contract_send(url, body)
+                contract_send(url, body, directory)
             self.assertEqual(len(provider.shadow), 3)
             self.assertEqual([json.dumps(r).count('RESULT_A') for r in provider.shadow], [0, 500, 500],
                              'incomplete tool cohorts must be withheld until every result arrives')
@@ -575,17 +594,17 @@ class NativeProviderFixtureTests(unittest.TestCase):
             provider.advice = lambda review: {'protected': ['g1'], 'removable': [],
                 'memories': [{'source_ids': ['g1'], 'text': 'legacy derived fact'}]}
             with contract_proxy(self, provider, directory, binary=legacy) as url:
-                contract_send(url, body)
+                contract_send(url, body, directory)
                 body['input'] += [
                     {'type': 'function_call', 'call_id': 'a', 'name': 'native', 'arguments': '{}'},
                     {'type': 'function_call_output', 'call_id': 'a', 'output': 'LEGACY_BULK ' * 500}]
-                contract_send(url, body)
-                contract_send(url, body)
+                contract_send(url, body, directory)
+                contract_send(url, body, directory)
             self.assertEqual(json.dumps(provider.shadow[-1]).count('LEGACY_BULK'), 1000,
                              'old binary must actually produce the historical duplicated checkpoint')
             with contract_proxy(self, provider, directory) as url:
-                contract_send(url, body)
-                contract_send(url, body)
+                contract_send(url, body, directory)
+                contract_send(url, body, directory)
             for review in provider.shadow[-2:]:
                 self.assertEqual(json.dumps(review).count('LEGACY_BULK'), 500)
                 data = wire_data(review)
@@ -721,12 +740,13 @@ class NativeProviderFixtureTests(unittest.TestCase):
                         try:
                             if turn == 1:
                                 self.assertTrue(review_started.wait(3), 'real reviewer must start')
-                                from concurrent.futures import TimeoutError as FutureTimeout
-                                with self.assertRaises(FutureTimeout,
-                                        msg='primary must await the held synchronous review'):
-                                    pending.result(timeout=0.25)
-                                self.assertEqual(len(fixture.calls), 1,
-                                                 'second primary must follow the review result')
+                                # The legacy flag must not reintroduce a reviewer
+                                # dependency: consume this primary while held.
+                                pending.result(timeout=2)
+                                self.assertFalse(review_release.is_set())
+                                self.assertEqual(len(fixture.calls), 2,
+                                                 'second primary must precede review completion')
+                                self.assertEqual(len(fixture.reviews), 0)
                         finally:
                             if turn == 1:
                                 review_release.set()
@@ -739,7 +759,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                             {'type': 'function_call_output', 'call_id': result['output'][0]['call_id'],
                              'output': 'FIXTURE_TOOL_OK'}]
                 state_file = next(Path(directory).glob('*.json'))
-                state = json.loads(state_file.read_text())
+                state = contract_settle(directory)
                 if os.environ.get('CARRY_TEST_EVIDENCE'):
                     events = [json.loads(line) for line in state_file.with_suffix('.jsonl').read_text().splitlines()]
                     Path(os.environ['CARRY_TEST_EVIDENCE']).write_text(json.dumps({
