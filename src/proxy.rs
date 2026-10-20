@@ -109,7 +109,7 @@ pub struct ProxyCli {
     /// Total primary context budget, including output reserve and estimation margin.
     #[arg(long = "primary-context-tokens", value_parser = clap::value_parser!(u32).range(1024..=2000000))]
     primary_context_override: Option<u32>,
-    #[arg(skip = 272000)]
+    #[arg(skip = 272000u32)]
     primary_context_tokens: u32,
     /// Reserved primary output tokens when the client supplies no output limit.
     #[arg(long, default_value_t = 16384)]
@@ -120,7 +120,7 @@ pub struct ProxyCli {
     /// Total reviewer context budget, including its output reserve and margin.
     #[arg(long = "classifier-max-input-tokens", alias = "reviewer-context-tokens", value_parser = clap::value_parser!(u32).range(1024..=2000000))]
     reviewer_context_override: Option<u32>,
-    #[arg(skip = 300000)]
+    #[arg(skip = 300000u32)]
     classifier_max_input_tokens: u32,
     /// Serialized transport guard; token budget controls reviewer context size.
     #[arg(long, default_value_t = 8388608, value_parser = clap::value_parser!(u32).range(4096..=8388608))]
