@@ -151,6 +151,7 @@ async fn lease_r1_real_held_extra_review_next_primary_crosses_only_target_budget
     session.keep_leases = None;
     let mut service = checkpoint_service(directory.path());
     service.config = config;
+    service.config.state_dir = directory.path().to_path_buf();
     service.config.review_min_new_tokens = 0;
     service.config.classifier_url = Some(format!("{base}/review"));
     service.config.upstream_url = format!("{base}/primary");
