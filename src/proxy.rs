@@ -2493,6 +2493,14 @@ fn merge_review(
         current.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"background advice discarded: main lineage, source membership or eligibility changed; review current sources again"}]});
         return false;
     }
+    // In-flight work carries dispatch-scoped config. Receipt prices above belong
+    // to that old epoch, but new memory must fit the latest saved pair instead.
+    let mut admission_config = config.clone();
+    if let Some(pair) = &current.model_resolution {
+        admission_config.primary_context_tokens = pair.primary.capacity_tokens;
+        admission_config.classifier_max_input_tokens = pair.reviewer.capacity_tokens;
+        admission_config.model_resolution = Some(pair.clone());
+    }
     admission::initialize(current);
     let before_admission = current.clone();
     let before_memory_input = current.render_primary();
@@ -2549,7 +2557,7 @@ fn merge_review(
         }
         candidate.refresh_memory_shadow();
         // The latest task/settings, not the dispatched snapshot, own admission.
-        if candidate.memories.len() <= 128 && memory_admission_fits(config, &candidate) {
+        if candidate.memories.len() <= 128 && memory_admission_fits(&admission_config, &candidate) {
             *current = candidate;
         } else {
             budget_rejections += 1;
