@@ -44,7 +44,11 @@ class IncrementalReviewer(unittest.TestCase):
             history += [{"role": "assistant", "content": (f"old output {n} " * 300)},
                         {"role": "user", "content": f"old task {n}"}]
         history += [{"role": "user", "content": "current task"}]
-        self.assertEqual(proxy.send(history)[0], 200)
+        status, response = proxy.send(history)
+        self.assertEqual(status, 200, {"response": response,
+            "feedback": proxy.saved().get("review_feedback"),
+            "review_bytes": [len(json.dumps(b)) for b in fixture.reviews],
+            "imported": proxy.saved().get("bootstrap_reviewed_ids")})
         self.assertGreater(len(fixture.reviews), 1)
         self.assertTrue(all("DURABLE_IMPORT_REQUIREMENT" in json.dumps(b["input"])
                             for b in fixture.reviews), "protected source survives every admission chunk")
@@ -183,7 +187,11 @@ class IncrementalReviewer(unittest.TestCase):
         self.assertEqual(saved["invalid_reviews"],1)
         self.assertEqual(fixture.primaries,[])
         proxy.close();proxy=self.harness.proxy(fixture,options)
-        self.assertEqual(proxy.send(history)[0],200)
+        status, response = proxy.send(history)
+        self.assertEqual(status, 200, {"response": response,
+            "feedback": proxy.saved().get("review_feedback"),
+            "review_bytes": [len(json.dumps(b)) for b in fixture.reviews],
+            "imported": proxy.saved().get("bootstrap_reviewed_ids")})
         self.assertEqual(proxy.saved()["invalid_reviews"],1)
         self.assertEqual(len(fixture.primaries),1)
         self.assertIn("DURABLE_IMPORT_REQUIREMENT",json.dumps(fixture.primaries[0]["input"]))
