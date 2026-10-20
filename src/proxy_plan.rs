@@ -16,6 +16,8 @@ fn review_calls(
     changed: bool,
     allow_extra: bool,
 ) -> Option<Vec<Option<Value>>> {
+    #[cfg(test)]
+    super::planner_work::record("forecasts");
     if !standard(body)
         || carry::core::Rates::for_model(body["model"].as_str().unwrap_or(""), 0.0).is_none()
     {
@@ -117,6 +119,8 @@ pub(super) fn economic_candidate(
     body: &Value,
     paid: f64,
 ) -> bool {
+    #[cfg(test)]
+    super::planner_work::record("economic_probes");
     let mut retained = body.clone();
     retained["input"] = json!(session.render_primary());
     plan_inner(config, session, &retained, Some(paid))
@@ -147,6 +151,8 @@ fn plan_inner(
     body: &Value,
     acquisition: Option<f64>,
 ) -> (Option<Session>, Value) {
+    #[cfg(test)]
+    super::planner_work::record("plans");
     let wire = primary_wire_body(config, body);
     let reviewer = review_body(config, session);
     let capacity_override = capacity_body(config, session);

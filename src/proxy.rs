@@ -1617,6 +1617,8 @@ As the primary moves past detailed work on a code section or implementation, mar
 Return only the strict JSON advice object: protected, removable, and memories with source_ids and text. Empty arrays are valid. Do not speculate about token budgets, prices, or savings."#;
 
 fn review_body(config: &ProxyCli, session: &Session) -> Value {
+    #[cfg(test)]
+    planner_work::record("review_renders");
     review_body_for_groups(config, session, &session.groups())
 }
 
@@ -3183,6 +3185,8 @@ fn cache_base(body: &Value) -> Value {
 }
 
 fn estimate(body: &Value) -> f64 {
+    #[cfg(test)]
+    planner_work::record("estimates");
     crate::proxy_savings::token_units(body) as f64
 }
 
@@ -3700,6 +3704,10 @@ async fn relay(
 mod pr144_regressions;
 
 #[cfg(test)]
+#[path = "proxy_planner_work_tests.rs"]
+mod planner_work;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use carry::core::prefix_compatible;
@@ -3765,6 +3773,7 @@ mod tests {
         include!("proxy_lease_tests.rs");
         include!("proxy_lease_review_tests.rs");
         include!("proxy_lease_acceptance_tests.rs");
+        include!("proxy_lease_performance_tests.rs");
     }
 
     #[test]

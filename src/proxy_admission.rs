@@ -70,6 +70,8 @@ pub(super) fn decision_for_plan(
         .map(|i| estimate(&i.value))
         .sum();
     let mut retained = main.clone();
+    #[cfg(test)]
+    planner_work::record("admission_primary_projections");
     retained["input"] = json!(session.render_primary());
     let primary = estimate(&primary_wire_body(config, &retained));
     let age = session
