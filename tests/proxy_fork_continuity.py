@@ -207,5 +207,67 @@ class ForkContinuity(unittest.TestCase):
                 self.assertEqual((len(fixture.primaries), len(fixture.reviews)), counts)
 
 
+    def test_fork_primary_does_not_depend_on_reviewer_capacity(self):
+        proxy, fixture, history, handle, options = self.seed()
+        proxy.close()
+        # Reviewer capacity is not review identity or primary feasibility.
+        proxy = BranchProxy(self.state, fixture, options + ["--classifier-max-input-tokens", "1024"])
+        self.stack.callback(proxy.close)
+        proxy.branch, proxy.intent = "review-pressure-child", ("main", handle)
+        calls = len(fixture.reviews)
+        status, body = proxy.send(history + [{"role": "user", "content": "FIT_C"}])
+        self.assertEqual(status, 200, "inherited authority is not a new reviewer request")
+        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]))
+        self.assertEqual(len(fixture.reviews), calls)
+
+    def test_fork_genuine_primary_overflow_fails_before_upstream(self):
+        proxy, fixture, history, handle, options = self.seed()
+        proxy.close()
+        options += ["--primary-context-tokens", "1024", "--primary-output-reserve-tokens", "1",
+                    "--context-margin-percent", "0"]
+        proxy = BranchProxy(self.state, fixture, options)
+        self.stack.callback(proxy.close)
+        proxy.branch, proxy.intent = "fit-capacity-child", ("main", handle)
+        counts = len(fixture.reviews)
+        self.assertEqual(proxy.send(history + [{"role": "user", "content": "FIT_C"}])[0], 200)
+        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]))
+        primaries = len(fixture.primaries)
+        proxy.branch = "overflow-child"
+        status, _ = proxy.send(history + [{"role": "user", "content": "PROTECTED_C " * 10000}])
+        self.assertEqual(status, 413, "genuine primary overflow is not reviewer rescue")
+        self.assertEqual(len(fixture.primaries), primaries)
+        self.assertEqual(len(fixture.reviews), counts)
+        # Undeclared fresh fitting histories still forward unchanged.
+        proxy.branch, proxy.intent = "fresh-control", None
+        fresh = [{"role": "user", "content": "FRESH_WITHOUT_ADVICE"}]
+        self.assertEqual(proxy.send(fresh)[0], 200)
+        self.assertEqual(fixture.primaries[-1]["input"], fresh)
+
+    def test_held_parent_reviewer_does_not_block_child(self):
+        proxy, fixture, history, handle, _ = self.seed()
+        def held_review(_body, _n):
+            fixture.held.set()
+            fixture.release.wait(15)
+            return 200, advice_response({"protected": [], "removable": [], "memories": []})
+        fixture.review = held_review
+        proxy.wait_reviews = False
+        parent = history + [{"role": "user", "content": "HELD_B"}]
+        self.assertEqual(proxy.send(parent)[0], 200)
+        self.assertEqual(proxy.send(parent)[0], 200)
+        self.assertTrue(fixture.held.wait(3))
+        try:
+            proxy.branch, proxy.intent = "concurrent-child", ("main", handle)
+            started = time.monotonic()
+            self.assertEqual(proxy.send(history + [{"role": "user", "content": "LIVE_C"}])[0], 200)
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertFalse(fixture.release.is_set())
+            sent = json.dumps(fixture.primaries[-1])
+            self.assertNotIn("RAW_A", sent)
+            self.assertNotIn("HELD_B", sent)
+            self.assertEqual(proxy.saved()["shadow"]["calls"], 0)
+        finally:
+            fixture.release.set()
+
+
 if __name__ == "__main__":
     unittest.main(defaultTest="ForkContinuity")
