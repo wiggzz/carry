@@ -3703,6 +3703,9 @@ mod tests {
         include!("proxy_admission_controls.rs");
         include!("proxy_admission_merge_tests.rs");
     }
+    mod lease_tests {
+        include!("proxy_lease_tests.rs");
+    }
 
     #[test]
     fn dashboard_client_provenance_is_bounded_and_optional() {

@@ -1,14 +1,98 @@
 """Synthetic loopback keep-lease lifecycles against the real Carry binary."""
 import json
+import concurrent.futures
+import os
+import subprocess
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 
 from proxy_state_regressions import StateRegressions, advice_response, completed, ledger
 
 
 class KeepLeases(StateRegressions):
     # Do not inherit the unrelated fixture cases into this suite.
+    def test_cli_environment_values_and_effective_provenance(self):
+        fixture = self.fixture(lambda _body, _n: (200, completed()))
+        for environment, extra, expected, source in [
+            ({}, [], 8, "default"),
+            ({"CARRY_PROXY_KEEP_LEASE_TURNS": "3"}, [], 3, "environment"),
+            ({"CARRY_PROXY_KEEP_LEASE_TURNS": "3"}, ["--keep-lease-turns", "5"], 5, "command_line"),
+            ({}, ["--keep-lease-turns", "8"], 8, "command_line"),
+        ]:
+            with self.subTest(environment=environment, extra=extra):
+                self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+                proxy = self.proxy(fixture, extra, environment)
+                self.assertEqual(proxy.send([{"role":"user","content":"configuration control"}])[0], 200)
+                policy = proxy.request("GET", "/carry/metrics")[1].get("keep_lease_policy")
+                self.assertIsNotNone(policy, "LEASE_CONFIG_RED: metrics must expose actual configured policy, not infer history")
+                self.assertEqual(policy["turns"], expected)
+                self.assertEqual(policy["source"], source)
+                self.assertEqual(policy["round_basis"], "completed_primary_responses")
+                self.assertEqual(policy["due_targets"], 0)
+                self.assertEqual(policy["pending_targets"], 0)
+                self.assertEqual(policy["released_targets"], 0)
+                self.assertEqual(proxy.saved()["keep_leases"]["turns"], expected)
+                proxy.close()
+
+    def test_cli_and_environment_reject_invalid_lease_turns_before_network(self):
+        binary = os.environ["CARRY_TEST_BINARY"]
+        for bad in ("0", "-1", "18446744073709551616", "not-a-round"):
+            for via_env in (False, True):
+                with self.subTest(value=bad, environment=via_env):
+                    env = {"PATH":os.environ.get("PATH", "/usr/bin:/bin"), "HOME":str(self.state),
+                           "CARRY_HOME":str(self.state)}
+                    args = [binary, "proxy"]
+                    if via_env:
+                        env["CARRY_PROXY_KEEP_LEASE_TURNS"] = bad
+                    else:
+                        args.append("--keep-lease-turns=" + bad)
+                    result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertNotIn("CARRY_PROXY_LISTEN", result.stdout)
+
+    def test_economic_lease_only_review_is_nonblocking_even_legacy_synchronous(self):
+        evidence = {"role":"assistant","content":"DEMAND_EVIDENCE " * 6000}
+        history = [{"role":"user","content":"goal"}, evidence,
+                   {"role":"user","content":"current task"}]
+        def review(body, n):
+            if n == 1:
+                return 200, advice_response({"protected":["g2"],"removable":[],"memories":[]})
+            self.assertIn("g2", ledger(body).get("keep_lease_review", {}).get("target_ids", []))
+            fixture.held.set()
+            if not fixture.release.wait(8):
+                raise AssertionError("targeted review was not released")
+            return 200, advice_response({"protected":[],"removable":[],"memories":[]})
+        fixture = self.fixture(lambda _b, _n: (200, completed()), review)
+        options = ["--background-reviews=false", "--keep-lease-turns", "2"]
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(proxy.saved()["opinions"].get("2"), "keep")
+        proxy.close()
+        proxy = self.proxy(fixture, options + ["--review-min-new-tokens", "25000"])
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(proxy.send(history)[0], 200)
+        before = len(fixture.primaries)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(proxy.send, history)
+            try:
+                self.assertTrue(fixture.held.wait(3), "LEASE_ECON_HTTP_RED: no-growth due demand must dispatch bounded review")
+                self.assertEqual(pending.result(timeout=1)[0], 200, "new lease admission cannot block primary")
+                self.assertEqual(len(fixture.primaries), before + 1)
+                held = proxy.saved()
+                self.assertEqual(held["opinions"].get("2"), "keep")
+                self.assertIn(evidence, fixture.primaries[-1]["input"])
+            finally:
+                fixture.release.set()
+        released = self.wait_saved(proxy, lambda s: not s["background_review_pending"])
+        self.assertIsNone(released["opinions"].get("2"))
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertNotIn(evidence, fixture.primaries[-1]["input"])
+        self.assertEqual(len(fixture.reviews), 2, "no immediate repeat paid loop after release")
+
     def test_expiry_target_omission_becomes_economic_not_timer_deletion(self):
         evidence = {"role": "assistant", "content": "LEASE_EVIDENCE " * 6000}
         transcript = [{"role": "user", "content": "preserve the task"}, evidence,
