@@ -9,11 +9,16 @@ use super::{
 /// Frozen-source sensitivity: advance cadence and exposure, assuming future
 /// reviews complete/merge before their next due dispatch. This is not a latency
 /// guarantee. Already unfinished work is unknown, not free.
-fn review_calls(config: &ProxyCli, session: &Session, body: &Value, changed: bool) -> Option<u64> {
+fn review_calls(
+    config: &ProxyCli,
+    session: &Session,
+    body: &Value,
+    changed: bool,
+) -> Option<Vec<Option<Value>>> {
     if !standard(body)
         || carry::core::Rates::for_model(body["model"].as_str().unwrap_or(""), 0.0).is_none()
     {
-        return Some(0);
+        return Some(Vec::new());
     }
     if session.background_review_pending
         || (session.bootstrap_review_pending && !session.bootstrap_review_complete)
@@ -22,20 +27,39 @@ fn review_calls(config: &ProxyCli, session: &Session, body: &Value, changed: boo
     }
     let mut future = session.clone();
     super::admission::initialize(&mut future);
-    let mut calls = 0;
+    let mut calls = Vec::new();
     for request in 0..config.payoff_requests {
         // A source rewrite skips this request's ordinary dispatch. Bootstrap
         // already paid for its source; no hypothetical native growth is added.
         let dispatch = request > 0 || (!changed && !session.bootstrap_review_pending);
         if dispatch && super::admission::decision(config, &future, body, false)["admitted"] == true
         {
-            calls += 1;
+            let targets = future.due_keep_targets();
+            let targeted = if targets.is_empty() {
+                None
+            } else {
+                let mut dispatch = future.clone();
+                dispatch.keep_leases.as_mut().unwrap().pending =
+                    Some(crate::proxy_state::PendingKeepReview {
+                        request_id: "forecast".into(),
+                        targets,
+                    });
+                Some(review_body(config, &dispatch))
+            };
             // No outcome is known for a hypothetical targeted review. Reserve
             // its single extra attempt; do not invent repeated paid renewals.
             future.reserve_extra_keep_attempt();
-            future.last_review_request = future.completed_requests;
-            let groups = future.groups();
-            super::admission::cover(&mut future, &groups);
+            // The actual dispatcher skips an over-cap targeted body; do not
+            // forecast a paid call that cannot be sent.
+            if targeted
+                .as_ref()
+                .is_none_or(|wire| review_fits(config, wire))
+            {
+                calls.push(targeted);
+                future.last_review_request = future.completed_requests;
+                let groups = future.groups();
+                super::admission::cover(&mut future, &groups);
+            }
         }
         future.completed_requests = future.completed_requests.saturating_add(1);
         for item in &mut future.history {
@@ -47,9 +71,33 @@ fn review_calls(config: &ProxyCli, session: &Session, body: &Value, changed: boo
     Some(calls)
 }
 
-fn review_cost(config: &ProxyCli, session: &Session, body: &Value, calls: u64) -> Option<f64> {
+fn review_cost(
+    config: &ProxyCli,
+    session: &Session,
+    body: &Value,
+    schedule: &[Option<Value>],
+) -> Option<f64> {
+    let calls = schedule.len() as u64;
     if calls == 0 {
         return Some(0.0);
+    }
+    if schedule.iter().any(Option::is_some) {
+        // Lease annotations live in the volatile tail. Price each dispatched
+        // body at its own tariff, preserving the existing stable-prefix warm
+        // sensitivity for later calls, not discounting the new target ledger.
+        let mut total = 0.0;
+        for (index, targeted) in schedule.iter().enumerate() {
+            let wire = targeted.as_ref().unwrap_or(body);
+            let first = reviewer_view_costs(config, &session.reviewer_cache, wire, wire, 1)?.keep;
+            let input = if index == 0 {
+                first
+            } else {
+                reviewer_view_costs(config, &session.reviewer_cache, wire, wire, 2)?.keep - first
+            };
+            let rates = carry::core::Rates::for_model(&config.classifier_model, estimate(wire))?;
+            total += input + config.classifier_max_output_tokens as f64 * rates.output;
+        }
+        return Some(total);
     }
     let inputs = reviewer_view_costs(config, &session.reviewer_cache, body, body, calls)?.keep;
     let rates = carry::core::Rates::for_model(&config.classifier_model, estimate(body))?;
@@ -101,12 +149,15 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
             );
         }
     }
-    let keep_calls = if reviewer_ok {
+    let keep_schedule = if reviewer_ok {
         review_calls(config, session, body, false)
     } else {
         None // capacity rescue/cleanup must finish before ordinary dispatch
     };
-    let keep_cost = keep_calls.and_then(|calls| review_cost(config, session, &reviewer, calls));
+    let keep_calls = keep_schedule.as_ref().map(|s| s.len() as u64);
+    let keep_cost = keep_schedule
+        .as_ref()
+        .and_then(|s| review_cost(config, session, &reviewer, s));
     let mut reports = Vec::new();
     let mut best: Option<(Session, f64)> = None;
     // Cleaning only disposable reviewer turns is a real candidate. It can make
@@ -128,11 +179,13 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         let compact_review = review_body(config, &candidate);
         let feasible = primary_fits(config, &compact) && review_fits(config, &compact_review);
         let compact = primary_wire_body(config, &compact);
-        let compact_calls = review_calls(config, &candidate, body, changed);
+        let compact_schedule = review_calls(config, &candidate, body, changed);
+        let compact_calls = compact_schedule.as_ref().map(|s| s.len() as u64);
         let shadow = keep_cost
             .zip(
-                compact_calls
-                    .and_then(|calls| review_cost(config, &candidate, &compact_review, calls)),
+                compact_schedule
+                    .as_ref()
+                    .and_then(|s| review_cost(config, &candidate, &compact_review, s)),
             )
             .map(|(keep, compact)| ViewCosts { keep, compact });
         let joint = if standard(body) {

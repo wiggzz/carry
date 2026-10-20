@@ -745,7 +745,6 @@ impl Session {
         // policy that is not being used by that request.
         if let Some(pending) = self.keep_leases.as_ref().and_then(|s| s.pending.as_ref()) {
             control["keep_lease_review"] = json!({
-                "request_id":pending.request_id,
                 "target_ids":pending.targets.keys().collect::<Vec<_>>(),
                 "instructions":"For these targets only, override sticky omission: protect if still needed and not represented elsewhere or accurately captured concisely; removable or valid omission releases temporary protection for economic compaction, not immediate deletion. All other omissions remain unchanged."
             });
