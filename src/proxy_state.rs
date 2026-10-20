@@ -1057,44 +1057,16 @@ impl Session {
                 self.drop_members.insert(id, group.members.clone());
             }
         }
+        for (&id, opinion) in &memory_updates {
+            if *opinion == "keep" {
+                self.renew_memory_lease(id);
+            }
+        }
         let retired = memory_updates
             .into_iter()
             .filter_map(|(id, opinion)| (opinion == "drop").then_some(id))
             .collect::<HashSet<_>>();
-        let retired_facts = self
-            .memories
-            .iter()
-            .filter(|m| retired.contains(&m.id))
-            .cloned()
-            .collect::<Vec<_>>();
-        self.active_shadow.retain(|record| {
-            if record.source_id != 0 {
-                return true;
-            }
-            let Some(data) = record.value["content"]
-                .as_str()
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            else {
-                return true;
-            };
-            !retired_facts.iter().any(|m| {
-                data["memory_id"] == format!("m{}", m.id)
-                    || (data["text"] == m.text
-                        && data["source_ids"]
-                            == json!(
-                                m.source_ids
-                                    .iter()
-                                    .map(|id| format!("g{id}"))
-                                    .collect::<Vec<_>>()
-                            ))
-            })
-        });
-        self.memories.retain(|m| !retired.contains(&m.id));
-        self.memory_anchors.retain(|id, _| !retired.contains(id));
-        if !retired_facts.is_empty() {
-            // Answers and old ledgers can contain an unmaterialized fact too.
-            self.compact_reviewer();
-        }
+        self.retire_memories(&retired);
         for ((sources, text), index) in memories.into_iter().zip(memory_indexes) {
             if self.memories.len() >= 128 {
                 reject("memories", index, "active memory limit of 128 reached");
@@ -1159,6 +1131,49 @@ impl Session {
         Ok(())
     }
 
+    /// Shared physical retirement path; callers own authorization and accounting.
+    fn retire_memories(&mut self, retired: &HashSet<u64>) {
+        let retired_facts = self
+            .memories
+            .iter()
+            .filter(|m| retired.contains(&m.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.active_shadow.retain(|record| {
+            if record.source_id != 0 {
+                return true;
+            }
+            let Some(data) = record.value["content"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            else {
+                return true;
+            };
+            !retired_facts.iter().any(|m| {
+                data["memory_id"] == format!("m{}", m.id)
+                    || (data["text"] == m.text
+                        && data["source_ids"]
+                            == json!(
+                                m.source_ids
+                                    .iter()
+                                    .map(|id| format!("g{id}"))
+                                    .collect::<Vec<_>>()
+                            ))
+            })
+        });
+        self.memories.retain(|m| !retired.contains(&m.id));
+        self.memory_anchors.retain(|id, _| !retired.contains(id));
+        if let Some(state) = &mut self.keep_leases {
+            for id in retired {
+                state.entries.remove(&format!("m{id}"));
+                state.extra_attempted.remove(&format!("m{id}"));
+            }
+        }
+        if !retired_facts.is_empty() {
+            self.compact_reviewer();
+        }
+    }
+
     /// Rebuild only shared fact records after a background memory delta. Native
     /// observations are independent; source retirement cannot retire a fact.
     pub fn refresh_memory_shadow(&mut self) {
@@ -1177,6 +1192,9 @@ impl Session {
     }
 
     pub fn remove(&mut self, ids: &[u64], groups: &[Group]) {
+        // Released facts are candidates, never automatic expiry deletions. This
+        // method runs on planner clones; the selected action owns the debit.
+        self.retire_memories(&self.released_memory_ids().into_iter().collect());
         let members = groups
             .iter()
             .filter(|g| ids.contains(&g.id))
@@ -1193,6 +1211,9 @@ impl Session {
         if let Some(state) = &mut self.keep_leases {
             state
                 .entries
+                .retain(|key, _| !ids.iter().any(|id| key == &format!("g{id}")));
+            state
+                .extra_attempted
                 .retain(|key, _| !ids.iter().any(|id| key == &format!("g{id}")));
         }
         self.compact_reviewer();

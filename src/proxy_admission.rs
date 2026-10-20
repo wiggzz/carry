@@ -68,7 +68,7 @@ pub(super) fn decision(
     let multiplier = multiplier(config, session);
     let requests = config.review_every_requests.saturating_mul(multiplier);
     let tokens = (config.review_min_new_tokens as u64).saturating_mul(multiplier);
-    let reason = if eligible.is_empty() && session.memories.is_empty() {
+    let mut reason = if eligible.is_empty() && session.memories.is_empty() {
         "no_eligible_sources"
     } else if pressure {
         "pressure_override"
@@ -81,13 +81,90 @@ pub(super) fn decision(
     } else {
         "admitted"
     };
-    json!({"admitted": matches!(reason, "admitted" | "pressure_override"),
+    if reason == "native_source_growth" && economic_keep_demand(config, session, main) {
+        reason = "keep_lease_economic";
+    }
+    json!({"admitted": matches!(reason, "admitted" | "pressure_override" | "keep_lease_economic"),
         "reason":reason,"primary_estimated_tokens":primary,
         "new_native_source_estimated_tokens":growth,"completed_requests_since_review":age,
         "required_requests":requests,"required_new_tokens":tokens,
         "min_primary_tokens":config.review_min_primary_tokens,"multiplier":multiplier,
         "no_yield_streak":coverage.no_yield_streak,"covered_source_count":coverage.source_ids.len(),
         "eligible_source_count":eligible.len(),"lineage_rebases":session.history_rebases})
+}
+
+/// One bounded hypothetical release, using the very same removal, rendered
+/// feasibility, cache/tier pricing and payback decision as the live planner.
+/// No paid work is justified by elapsed rounds alone or speculative review wins.
+fn economic_keep_demand(config: &ProxyCli, session: &Session, main: &Value) -> bool {
+    if !session.extra_keep_attempt_available()
+        || session.background_review_pending
+        || session.bootstrap_review_pending
+        || !standard(main)
+    {
+        return false;
+    }
+    let mut keep = main.clone();
+    keep["input"] = json!(session.render_primary());
+    let wire = primary_wire_body(config, &keep);
+    let evaluate = |state: &Session, paid: f64| {
+        let groups = state.groups();
+        let ids = groups
+            .iter()
+            .filter(|g| state.drop_authorized(g))
+            .map(|g| g.id)
+            .collect::<Vec<_>>();
+        let mut compact = state.clone();
+        compact.remove(&ids, &groups);
+        let mut body = main.clone();
+        body["input"] = json!(compact.render_primary());
+        compact.render_primary() != session.render_primary()
+            && primary_fits(config, &body)
+            && review_fits(config, &review_body(config, &compact))
+            && view_costs(
+                &wire,
+                &primary_wire_body(config, &body),
+                &session.primary_cache,
+                wire["model"].as_str().unwrap_or(""),
+                config.payoff_requests,
+            )
+            .is_some_and(|primary| {
+                joint_decision(
+                    primary,
+                    ViewCosts {
+                        keep: 0.0,
+                        compact: paid,
+                    },
+                    config.min_payback_percent,
+                )
+                .accepted
+            })
+    };
+    // Do not buy advice when already-authorized material supplies a safe useful
+    // candidate. Released memories use the ordinary candidate path too.
+    if evaluate(session, 0.0) {
+        return false;
+    }
+    let mut reviewed = session.clone();
+    let pending = crate::proxy_state::PendingKeepReview {
+        request_id: "forecast".into(),
+        targets: session.due_keep_targets(),
+    };
+    reviewed.keep_leases.as_mut().unwrap().pending = Some(pending.clone());
+    let request = review_body(config, &reviewed);
+    if !review_fits(config, &request) {
+        return false;
+    }
+    let Some(rates) = Rates::for_model(&config.classifier_model, estimate(&request)) else {
+        return false;
+    };
+    let Some(inputs) = reviewer_view_costs(config, &session.reviewer_cache, &request, &request, 1)
+    else {
+        return false;
+    };
+    let paid = inputs.keep + config.classifier_max_output_tokens as f64 * rates.output;
+    reviewed.resolve_keep_targets(&pending);
+    evaluate(&reviewed, paid)
 }
 
 /// Classify actual committed deltas, not accepted-opinion counters (which include

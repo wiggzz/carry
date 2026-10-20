@@ -30,6 +30,9 @@ fn review_calls(config: &ProxyCli, session: &Session, body: &Value, changed: boo
         if dispatch && super::admission::decision(config, &future, body, false)["admitted"] == true
         {
             calls += 1;
+            // No outcome is known for a hypothetical targeted review. Reserve
+            // its single extra attempt; do not invent repeated paid renewals.
+            future.reserve_extra_keep_attempt();
             future.last_review_request = future.completed_requests;
             let groups = future.groups();
             super::admission::cover(&mut future, &groups);
@@ -111,7 +114,10 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
     candidates.push(groups.iter().map(|g| g.id).collect());
     for protected in candidates {
         let removed = select_removals(groups.iter().map(|g| g.id), &eligible, &protected);
-        if removed.is_empty() && session.review_history.is_none() {
+        if removed.is_empty()
+            && session.review_history.is_none()
+            && session.released_memory_ids().is_empty()
+        {
             continue;
         }
         let mut candidate = session.clone();

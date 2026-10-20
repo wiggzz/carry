@@ -21,7 +21,7 @@ use axum::{
     routing::{get, post},
 };
 use carry::core::{Rates, ViewCosts, horizon_cost, input_cost, joint_decision, select_removals};
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, oneshot};
@@ -137,6 +137,8 @@ pub struct ProxyCli {
     /// Successful primary completions before temporary keeps may be revalidated.
     #[arg(long, env = "CARRY_PROXY_KEEP_LEASE_TURNS", default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..))]
     keep_lease_turns: u64,
+    #[arg(skip)]
+    keep_lease_source: Option<String>,
     /// Ordinary reviews require this many completed primary requests AND native-source growth.
     #[arg(long, env = "CARRY_PROXY_REVIEW_EVERY_REQUESTS", default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=100))]
     review_every_requests: u64,
@@ -160,6 +162,23 @@ pub struct ProxyCli {
     classifier_reasoning_effort: String,
     #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=16384))]
     classifier_max_output_tokens: u32,
+}
+
+impl ProxyCli {
+    pub fn parse_with_sources(argv: Vec<std::ffi::OsString>) -> Self {
+        let matches = Self::command().get_matches_from(argv);
+        let mut config = Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+        config.keep_lease_source = Some(
+            match matches.value_source("keep_lease_turns") {
+                Some(clap::parser::ValueSource::CommandLine) => "command_line",
+                Some(clap::parser::ValueSource::EnvVariable) => "environment",
+                Some(clap::parser::ValueSource::DefaultValue) => "default",
+                _ => "unknown",
+            }
+            .into(),
+        );
+        config
+    }
 }
 
 struct Service {
@@ -672,6 +691,16 @@ async fn metrics(
             "backoff_factor":service.config.review_backoff_factor,
             "backoff_max":service.config.review_backoff_max
         },
+        "keep_lease_policy": {
+            "turns":service.config.keep_lease_turns,
+            "source":service.config.keep_lease_source,
+            "round_basis":"completed_primary_responses",
+            "initialized":session.keep_leases.is_some(),
+            "historical_policy":session.keep_leases.as_ref().map(|s| s.version),
+            "due_targets":session.due_keep_target_count(),
+            "pending_targets":session.keep_leases.as_ref().and_then(|s| s.pending.as_ref()).map_or(0, |p| p.targets.len()),
+            "released_targets":session.keep_leases.as_ref().map_or(0, |s| s.entries.values().filter(|l| l.released_at_round.is_some()).count())
+        },
         "scope": "explicit_session", "primary": session.primary, "shadow": session.shadow,
         "completed_requests": session.completed_requests, "compactions": session.compactions,
         "native_compactions": session.native_compactions, "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews, "partial_reviews": session.partial_reviews,
@@ -894,6 +923,7 @@ struct ReviewRun {
     receipts: Vec<ReviewReceipt>,
     reviewed_sources: Vec<Group>,
     keep_review: Option<crate::proxy_state::PendingKeepReview>,
+    lease_only: bool,
 }
 
 struct ReviewReceipt {
@@ -1326,7 +1356,10 @@ async fn forward_request(
                     && primary_priced
                     && !session.bootstrap_review_pending
                 {
-                    if service.config.background_reviews {
+                    if service.config.background_reviews
+                        || admission::decision(&service.config, &session, &body, false)["reason"]
+                            == "keep_lease_economic"
+                    {
                         dispatch_review_for(
                             service.clone(),
                             id.clone(),
@@ -1359,7 +1392,10 @@ async fn forward_request(
                 };
                 return Err(failure(StatusCode::PAYLOAD_TOO_LARGE, message));
             } else if standard(&body) && primary_priced && !session.bootstrap_review_pending {
-                if service.config.background_reviews {
+                if service.config.background_reviews
+                    || admission::decision(&service.config, &session, &body, false)["reason"]
+                        == "keep_lease_economic"
+                {
                     dispatch_review_for(
                         service.clone(),
                         id.clone(),
@@ -2086,6 +2122,8 @@ async fn dispatch_review_for(
     }
     session.background_review_pending = true;
     session.initialize_keep_leases(service.config.keep_lease_turns);
+    let lease_only = decision["reason"] == "keep_lease_economic";
+    session.reserve_extra_keep_attempt();
     let targets = session.due_keep_targets();
     session.keep_leases.as_mut().unwrap().pending =
         (!targets.is_empty()).then(|| crate::proxy_state::PendingKeepReview {
@@ -2117,6 +2155,7 @@ async fn dispatch_review_for(
         let mut reviewed = before.clone();
         let mut run = ReviewRun {
             background: true,
+            lease_only,
             request_id,
             ..ReviewRun::default()
         };
@@ -2274,7 +2313,17 @@ fn merge_review(
         }
     }
     current.reconcile_opinions(&current.groups());
+    let live_leases = current.keep_leases.as_ref();
     current.memories.retain(|memory| {
+        let key = format!("m{}", memory.id);
+        if live_leases.and_then(|s| s.entries.get(&key))
+            != before
+                .keep_leases
+                .as_ref()
+                .and_then(|s| s.entries.get(&key))
+        {
+            return true; // A newer same-value protection also beats stale retirement.
+        }
         !before.memories.iter().any(|old| {
             old.id == memory.id && old.text == memory.text && old.source_ids == memory.source_ids
         }) || reviewed.memories.iter().any(|new| new.id == memory.id)
@@ -2421,7 +2470,7 @@ async fn review(
     if run.request_id.is_empty() {
         run.request_id = logging::request_id();
     }
-    if !bootstrap {
+    if !bootstrap && !run.lease_only {
         let decision = admission::decision(&service.config, session, main, run.pressure);
         journal(service, id, &run.request_id, "review_admission", &decision);
         if decision["admitted"] != true {

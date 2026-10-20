@@ -1,5 +1,5 @@
 //! Durable, content-bound temporary protection. Expiry only permits review.
-use super::{Group, Session};
+use super::{Group, Memory, Session};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -27,6 +27,10 @@ pub(crate) struct KeepLeases {
     pub next_generation: u64,
     pub entries: BTreeMap<String, Lease>,
     pub pending: Option<Pending>,
+    /// At most one additional paid attempt per unchanged target generation.
+    /// Ordinary, growth-admitted reviews may still retry these targets.
+    #[serde(default)]
+    pub extra_attempted: BTreeMap<String, u64>,
 }
 
 impl Session {
@@ -52,6 +56,7 @@ impl Session {
                 next_generation: 0,
                 entries: BTreeMap::new(),
                 pending: None,
+                extra_attempted: BTreeMap::new(),
             });
         }
         let groups = self.groups();
@@ -71,12 +76,11 @@ impl Session {
         let keys = groups
             .iter()
             .map(|g| format!("g{}", g.id))
+            .chain(self.memories.iter().map(|m| format!("m{}", m.id)))
             .collect::<Vec<_>>();
-        self.keep_leases
-            .as_mut()
-            .unwrap()
-            .entries
-            .retain(|key, _| keys.contains(key));
+        let state = self.keep_leases.as_mut().unwrap();
+        state.entries.retain(|key, _| keys.contains(key));
+        state.extra_attempted.retain(|key, _| keys.contains(key));
     }
 
     pub fn renew_group_lease(&mut self, group: &Group) {
@@ -86,6 +90,9 @@ impl Session {
         };
         // Exhausted identities cannot be confused with a newer renewal.
         let Some(generation) = state.next_generation.checked_add(1) else {
+            // A same-value explicit keep must invalidate every old target even
+            // when a fresh generation cannot be represented. Sticky keep wins.
+            state.entries.remove(&format!("g{}", group.id));
             return;
         };
         state.next_generation = generation;
@@ -122,6 +129,14 @@ impl Session {
     }
 
     pub fn due_keep_targets(&self) -> BTreeMap<String, Lease> {
+        self.keep_targets(4)
+    }
+
+    pub fn due_keep_target_count(&self) -> usize {
+        self.keep_targets(usize::MAX).len()
+    }
+
+    fn keep_targets(&self, limit: usize) -> BTreeMap<String, Lease> {
         let Some(state) = &self.keep_leases else {
             return BTreeMap::new();
         };
@@ -151,15 +166,43 @@ impl Session {
                     })
             })
             .collect::<Vec<_>>();
+        for memory in &self.memories {
+            let key = format!("m{}", memory.id);
+            if let Some(lease) = state.entries.get(&key)
+                && lease.released_at_round.is_none()
+                && self.lease_memory_matches(memory, lease)
+                && self
+                    .completed_requests
+                    .saturating_sub(lease.renewed_at_round)
+                    >= state.turns
+            {
+                due.push((key, lease.clone(), memory.text.len()));
+            }
+        }
         due.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
         due.into_iter()
-            .take(4)
+            .take(limit)
             .map(|(key, lease, _)| (key, lease))
             .collect()
     }
 
     pub fn resolve_keep_targets(&mut self, pending: &Pending) {
         for (key, target) in &pending.targets {
+            if let Some(id) = key.strip_prefix('m').and_then(|s| s.parse::<u64>().ok()) {
+                let matches = self
+                    .memories
+                    .iter()
+                    .find(|m| m.id == id)
+                    .is_some_and(|m| self.lease_memory_matches(m, target));
+                if matches
+                    && let Some(state) = &mut self.keep_leases
+                    && state.entries.get(key) == Some(target)
+                {
+                    state.entries.get_mut(key).unwrap().released_at_round =
+                        Some(self.completed_requests);
+                }
+                continue;
+            }
             let Some(id) = key.strip_prefix('g').and_then(|s| s.parse::<u64>().ok()) else {
                 continue;
             };
@@ -179,6 +222,82 @@ impl Session {
                 self.opinions.remove(&id);
                 state.entries.get_mut(key).unwrap().released_at_round =
                     Some(self.completed_requests);
+            }
+        }
+    }
+
+    fn memory_identity(memory: &Memory) -> String {
+        format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(memory.id, &memory.source_ids, &memory.text)).unwrap()
+            )
+        )
+    }
+
+    fn lease_memory_matches(&self, memory: &Memory, lease: &Lease) -> bool {
+        lease.lineage == self.history_rebases
+            && lease.members == memory.source_ids
+            && lease.source_sha256 == Self::memory_identity(memory)
+    }
+
+    pub fn renew_memory_lease(&mut self, id: u64) {
+        let Some(memory) = self.memories.iter().find(|m| m.id == id) else {
+            return;
+        };
+        let source_sha256 = Self::memory_identity(memory);
+        let Some(state) = &mut self.keep_leases else {
+            return;
+        };
+        let key = format!("m{id}");
+        let Some(generation) = state.next_generation.checked_add(1) else {
+            state.entries.remove(&key);
+            return;
+        };
+        state.next_generation = generation;
+        state.entries.insert(
+            key,
+            Lease {
+                generation,
+                renewed_at_round: self.completed_requests,
+                members: memory.source_ids.clone(),
+                source_sha256,
+                lineage: self.history_rebases,
+                released_at_round: None,
+            },
+        );
+    }
+
+    pub fn released_memory_ids(&self) -> Vec<u64> {
+        self.memories
+            .iter()
+            .filter(|m| {
+                self.keep_leases
+                    .as_ref()
+                    .and_then(|s| s.entries.get(&format!("m{}", m.id)))
+                    .is_some_and(|l| {
+                        l.released_at_round.is_some() && self.lease_memory_matches(m, l)
+                    })
+            })
+            .map(|m| m.id)
+            .collect()
+    }
+
+    pub fn extra_keep_attempt_available(&self) -> bool {
+        let targets = self.due_keep_targets();
+        !targets.is_empty()
+            && self.keep_leases.as_ref().is_some_and(|s| {
+                targets
+                    .iter()
+                    .any(|(key, l)| s.extra_attempted.get(key) != Some(&l.generation))
+            })
+    }
+
+    pub fn reserve_extra_keep_attempt(&mut self) {
+        let targets = self.due_keep_targets();
+        if let Some(state) = &mut self.keep_leases {
+            for (key, lease) in targets {
+                state.extra_attempted.insert(key, lease.generation);
             }
         }
     }
