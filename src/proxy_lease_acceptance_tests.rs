@@ -308,7 +308,28 @@ async fn lease_held_memory_budget_control(budget: &str, grow: bool) {
             merged.keep_leases.as_ref().unwrap().entries[&memory_key],
             old_lease
         );
+        assert_eq!(merged.review_feedback["accepted_memories"], 0);
+        assert_eq!(
+            merged.review_feedback["rejected"][0]["field"], "memories",
+            "must reject committed memory admission, not discard a stale batch"
+        );
+        assert!(
+            merged.review_feedback["rejected"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with(
+                    "background memory rejected: current aggregate byte or token budget exceeded"
+                )
+        );
+        assert_eq!(merged.partial_reviews, current.partial_reviews + 1);
     }
+    let events = pr154_journal(directory.path(), &id);
+    assert!(
+        events
+            .iter()
+            .any(|entry| entry["event"] == "background_review_merged"),
+        "current-budget case must reach compatible background merge, not stale discard"
+    );
     let mut restarted = checkpoint_service(directory.path());
     restarted.config.classifier_max_input_bytes = service.config.classifier_max_input_bytes;
     restarted.config.classifier_max_input_tokens = service.config.classifier_max_input_tokens;
