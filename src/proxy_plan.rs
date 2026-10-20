@@ -14,6 +14,7 @@ fn review_calls(
     session: &Session,
     body: &Value,
     changed: bool,
+    allow_extra: bool,
 ) -> Option<Vec<Option<Value>>> {
     if !standard(body)
         || carry::core::Rates::for_model(body["model"].as_str().unwrap_or(""), 0.0).is_none()
@@ -32,7 +33,9 @@ fn review_calls(
         // A source rewrite skips this request's ordinary dispatch. Bootstrap
         // already paid for its source; no hypothetical native growth is added.
         let dispatch = request > 0 || (!changed && !session.bootstrap_review_pending);
-        if dispatch && super::admission::decision(config, &future, body, false)["admitted"] == true
+        if dispatch
+            && super::admission::decision_for_plan(config, &future, body, false, allow_extra)["admitted"]
+                == true
         {
             let targets = future.due_keep_targets();
             let targeted = if targets.is_empty() {
@@ -105,11 +108,50 @@ fn review_cost(
 }
 
 pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Option<Session>, Value) {
+    plan_inner(config, session, body, None)
+}
+
+pub(super) fn economic_candidate(
+    config: &ProxyCli,
+    session: &Session,
+    body: &Value,
+    paid: f64,
+) -> bool {
+    let mut retained = body.clone();
+    retained["input"] = json!(session.render_primary());
+    plan_inner(config, session, &retained, Some(paid))
+        .0
+        .is_some_and(|candidate| candidate.render_primary() != session.render_primary())
+}
+
+fn capacity_body(config: &ProxyCli, session: &Session) -> Value {
+    if session.background_review_pending
+        && session
+            .keep_leases
+            .as_ref()
+            .is_some_and(|s| s.pending.is_some())
+    {
+        // The worker still checks/sends its real targeted body. Its in-flight
+        // tail annotations are not a new primary capacity dependency.
+        let mut view = session.clone();
+        view.keep_leases.as_mut().unwrap().pending = None;
+        review_body(config, &view)
+    } else {
+        review_body(config, session)
+    }
+}
+
+fn plan_inner(
+    config: &ProxyCli,
+    session: &Session,
+    body: &Value,
+    acquisition: Option<f64>,
+) -> (Option<Session>, Value) {
     let wire = primary_wire_body(config, body);
     let reviewer = review_body(config, session);
     let primary_ok = primary_fits(config, body);
-    let reviewer_ok = review_fits(config, &reviewer);
-    let forced = !primary_ok || !reviewer_ok;
+    let reviewer_ok = review_fits(config, &capacity_body(config, session));
+    let forced = acquisition.is_none() && (!primary_ok || !reviewer_ok);
     let groups = session.groups();
     let eligible = groups
         .iter()
@@ -150,7 +192,7 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         }
     }
     let keep_schedule = if reviewer_ok {
-        review_calls(config, session, body, false)
+        review_calls(config, session, body, false, acquisition.is_none())
     } else {
         None // capacity rescue/cleanup must finish before ordinary dispatch
     };
@@ -177,9 +219,11 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         let mut compact = body.clone();
         compact["input"] = json!(candidate.render_primary());
         let compact_review = review_body(config, &candidate);
-        let feasible = primary_fits(config, &compact) && review_fits(config, &compact_review);
+        let feasible = primary_fits(config, &compact)
+            && review_fits(config, &capacity_body(config, &candidate));
         let compact = primary_wire_body(config, &compact);
-        let compact_schedule = review_calls(config, &candidate, body, changed);
+        let compact_schedule =
+            review_calls(config, &candidate, body, changed, acquisition.is_none());
         let compact_calls = compact_schedule.as_ref().map(|s| s.len() as u64);
         let shadow = keep_cost
             .zip(
@@ -187,7 +231,10 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
                     .as_ref()
                     .and_then(|s| review_cost(config, &candidate, &compact_review, s)),
             )
-            .map(|(keep, compact)| ViewCosts { keep, compact });
+            .map(|(keep, compact)| ViewCosts {
+                keep,
+                compact: compact + acquisition.unwrap_or(0.0),
+            });
         let joint = if standard(body) {
             view_costs(
                 &wire,
@@ -237,7 +284,8 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         "primary_fits":primary_ok,"reviewer_fits":reviewer_ok,
         "primary_estimated_tokens":estimate(&wire),"reviewer_estimated_tokens":estimate(&reviewer),
         "primary_required_tokens":primary_required_tokens(config,body),
-        "reviewer_required_tokens":reviewer_required_tokens(config,&reviewer),
+        "reviewer_required_tokens":reviewer_required_tokens(config,&capacity_body(config,session)),
+        "reviewer_targeted_required_tokens":reviewer_required_tokens(config,&reviewer),
         "primary_context_tokens":config.primary_context_tokens,
         "reviewer_context_tokens":config.classifier_max_input_tokens,
         "context_margin_percent":config.context_margin_percent,
@@ -246,7 +294,7 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         "current_review_cost_is_sunk":session.shadow.calls > 0 &&
             (session.last_review_request == session.completed_requests ||
              (session.bootstrap_review_pending && session.bootstrap_review_complete)),
-        "ordinary_review_admission":super::admission::decision(config,session,body,false),
+        "ordinary_review_admission":super::admission::decision_for_plan(config,session,body,false,acquisition.is_none()),
         "review_min_primary_tokens":config.review_min_primary_tokens,
         "review_min_new_tokens":config.review_min_new_tokens,
         "review_every_requests":config.review_every_requests,

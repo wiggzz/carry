@@ -78,23 +78,25 @@ fn lease_r3_policy_change_preserves_group_memory_release_and_protected_memory() 
         {"source_ids":["g2"],"text":"protected fact"}]}),
         )
         .unwrap();
+    let released = format!("m{}", session.memories[0].id);
+    let protected = format!("m{}", session.memories[1].id);
     session
         .apply_advice(
             &session.groups(),
-            &json!({"protected":["m0","m1"],"removable":[],"memories":[]}),
+            &json!({"protected":[released.clone(),protected.clone()],"removable":[],"memories":[]}),
         )
         .unwrap();
     session.completed_requests += 8;
     let mut targets = session.due_keep_targets();
-    targets.remove("m1");
+    targets.remove(&protected);
     session.resolve_keep_targets(&crate::proxy_state::PendingKeepReview {
         request_id: "accepted-targets".into(),
         targets,
     });
     let before = session.keep_leases.as_ref().unwrap().entries.clone();
     assert!(before["g2"].released_at_round.is_some());
-    assert!(before["m0"].released_at_round.is_some());
-    assert!(before["m1"].released_at_round.is_none());
+    assert!(before[&released].released_at_round.is_some());
+    assert!(before[&protected].released_at_round.is_none());
     let mut resumed: Session =
         serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
     resumed.initialize_keep_leases(3);
@@ -104,9 +106,12 @@ fn lease_r3_policy_change_preserves_group_memory_release_and_protected_memory() 
         before.get("g2"),
         "LEASE_R3_RED: durable released group eligibility cannot disappear on a supported turns override"
     );
-    assert_eq!(after.get("m0"), before.get("m0"));
-    assert!(after["m1"].released_at_round.is_none());
-    assert_eq!(after["m1"].renewed_at_round, resumed.completed_requests);
+    assert_eq!(after.get(&released), before.get(&released));
+    assert!(after[&protected].released_at_round.is_none());
+    assert_eq!(
+        after[&protected].renewed_at_round,
+        resumed.completed_requests
+    );
     resumed.completed_requests += 3;
-    assert!(resumed.due_keep_targets().contains_key("m1"));
+    assert!(resumed.due_keep_targets().contains_key(&protected));
 }

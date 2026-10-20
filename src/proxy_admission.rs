@@ -49,6 +49,16 @@ pub(super) fn decision(
     main: &Value,
     pressure: bool,
 ) -> Value {
+    decision_for_plan(config, session, main, pressure, true)
+}
+
+pub(super) fn decision_for_plan(
+    config: &ProxyCli,
+    session: &Session,
+    main: &Value,
+    pressure: bool,
+    allow_extra: bool,
+) -> Value {
     let coverage = coverage(session);
     let eligible = source_ids(session);
     // Each newly eligible native item contributes once, independent of repeated
@@ -81,7 +91,10 @@ pub(super) fn decision(
     } else {
         "admitted"
     };
-    if reason == "native_source_growth" && economic_keep_demand(config, session, main) {
+    if allow_extra
+        && reason == "native_source_growth"
+        && economic_keep_demand(config, session, main)
+    {
         reason = "keep_lease_economic";
     }
     json!({"admitted": matches!(reason, "admitted" | "pressure_override" | "keep_lease_economic"),
@@ -104,45 +117,10 @@ fn economic_keep_demand(config: &ProxyCli, session: &Session, main: &Value) -> b
     {
         return false;
     }
-    let mut keep = main.clone();
-    keep["input"] = json!(session.render_primary());
-    let wire = primary_wire_body(config, &keep);
-    let evaluate = |state: &Session, paid: f64| {
-        let groups = state.groups();
-        let ids = groups
-            .iter()
-            .filter(|g| state.drop_authorized(g))
-            .map(|g| g.id)
-            .collect::<Vec<_>>();
-        let mut compact = state.clone();
-        compact.remove(&ids, &groups);
-        let mut body = main.clone();
-        body["input"] = json!(compact.render_primary());
-        compact.render_primary() != session.render_primary()
-            && primary_fits(config, &body)
-            && review_fits(config, &review_body(config, &compact))
-            && view_costs(
-                &wire,
-                &primary_wire_body(config, &body),
-                &session.primary_cache,
-                wire["model"].as_str().unwrap_or(""),
-                config.payoff_requests,
-            )
-            .is_some_and(|primary| {
-                joint_decision(
-                    primary,
-                    ViewCosts {
-                        keep: 0.0,
-                        compact: paid,
-                    },
-                    config.min_payback_percent,
-                )
-                .accepted
-            })
-    };
     // Do not buy advice when already-authorized material supplies a safe useful
-    // candidate. Released memories use the ordinary candidate path too.
-    if evaluate(session, 0.0) {
+    // candidate, including a cache-preserving subset. Probe the actual planner
+    // with extra-lease admission disabled to break the admission/forecast cycle.
+    if planning::economic_candidate(config, session, main, 0.0) {
         return false;
     }
     let mut reviewed = session.clone();
@@ -164,7 +142,7 @@ fn economic_keep_demand(config: &ProxyCli, session: &Session, main: &Value) -> b
     };
     let paid = inputs.keep + config.classifier_max_output_tokens as f64 * rates.output;
     reviewed.resolve_keep_targets(&pending);
-    evaluate(&reviewed, paid)
+    planning::economic_candidate(config, &reviewed, main, paid)
 }
 
 /// Classify actual committed deltas, not accepted-opinion counters (which include
