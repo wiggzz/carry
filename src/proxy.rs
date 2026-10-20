@@ -173,6 +173,8 @@ struct Service {
 
 #[path = "proxy_admission.rs"]
 mod admission;
+#[path = "proxy_fork.rs"]
+pub(crate) mod forking;
 #[path = "proxy_plan.rs"]
 mod planning;
 use planning::plan;
@@ -1034,8 +1036,13 @@ async fn forward_request(
                 Sha256::digest(format!("carry-primary-{id}").as_bytes())
             ));
         }
+        let fork = forking::resolve(&service, &headers, &body, &id, implicit, native).await?;
+        let declared_fork = fork.is_some();
         let lock = session_lock(&service, &id).await;
         let mut session = load(&service, &id)?;
+        if let Some((origin, point)) = &fork {
+            forking::hydrate(&service.config, &mut session, origin, point, &body)?;
+        }
         let prior_reviewer_compactions = session.reviewer_compactions;
         let (kind, agent_name) = client_provenance(&body);
         if kind.is_some() || agent_name.is_some() {
@@ -1215,7 +1222,7 @@ async fn forward_request(
                         &json!({"reason":"main_rewrite_selected"}),
                     );
                 }
-                if before == after && standard(&body) && primary_priced {
+                if before == after && standard(&body) && primary_priced && !declared_fork {
                     dispatch_review_for(
                         service.clone(),
                         id.clone(),
@@ -1233,7 +1240,7 @@ async fn forward_request(
                     "retained protected context or incoming material exceeds the primary budget; increase the configured budget or start a new conversation"
                 };
                 return Err(failure(StatusCode::PAYLOAD_TOO_LARGE, message));
-            } else if standard(&body) && primary_priced {
+            } else if standard(&body) && primary_priced && !declared_fork {
                 dispatch_review_for(
                     service.clone(),
                     id.clone(),
@@ -2226,6 +2233,7 @@ fn merge_review(
         committed_valid,
         &run.successful_sources,
     );
+    forking::publish(config, current, before, committed_valid);
     true
 }
 

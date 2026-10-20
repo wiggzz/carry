@@ -165,6 +165,11 @@ pub(super) struct Session {
     pub last_plan: Value,
     pub review_cache_key: String,
     pub review_context: Value,
+    /// Immutable committed ancestor authority, separate from disposable replay.
+    #[serde(default)]
+    pub fork_points: Vec<crate::proxy::forking::Point>,
+    #[serde(default)]
+    pub fork_origin: Option<String>,
 }
 
 fn identity(value: &Value) -> Value {
