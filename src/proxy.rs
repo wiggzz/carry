@@ -3754,6 +3754,7 @@ mod tests {
     }
     mod lease_tests {
         include!("proxy_lease_tests.rs");
+        include!("proxy_lease_review_tests.rs");
     }
 
     #[test]
