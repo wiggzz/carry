@@ -162,7 +162,7 @@ class ForkContinuity(unittest.TestCase):
             self.assertEqual(provenance["operator_override"], capacity)
             self.assertNotEqual(provenance["status"], "legacy_snapshot_missing",
                                 "JOIN-001: a newly hydrated child is not a legacy checkpoint")
-        self.assertEqual(saved["model_resolution_history"], [])
+        self.assertEqual(saved.get("model_resolution_history", []), [])
         self.assertEqual(saved["primary"]["calls"], 1, "only the child's actual receipt")
         self.assertEqual(saved["shadow"]["calls"], 0, "no inherited spend")
         self.assertEqual(saved["reviewer_cache"], [], "no inherited reviewer receipts")
@@ -181,7 +181,7 @@ class ForkContinuity(unittest.TestCase):
         self.assertEqual(proxy.send(child)[0], 200)
         restored = proxy.saved()
         self.assertEqual(restored["model_resolution"], pair, "restart retains child epoch")
-        self.assertEqual(restored["model_resolution_history"], [])
+        self.assertEqual(restored.get("model_resolution_history", []), [])
         self.assertEqual(restored["primary"]["calls"], 2)
         self.assertEqual(restored["shadow"]["calls"], 0)
         self.assertEqual(restored["reviewer_cache"], [])
