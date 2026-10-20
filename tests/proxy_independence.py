@@ -82,33 +82,37 @@ class ReviewerIndependence(unittest.TestCase):
         self.assertFalse(proxy.saved()["last_plan"]["forced"])
         self.assertEqual(fixture.reviews, [])
 
-    def test_reviewer_failure_and_timeout_preserve_primary_progress_and_unknown_spend(self):
-        for scenario in ["failure", "timeout"]:
-            with self.subTest(scenario=scenario):
-                def review(_body, _n):
-                    if scenario == "timeout":
-                        fixture.held.set()
-                        fixture.release.wait(10)
-                    return 503, {"error": "unavailable"}
-                fixture = self.fixture(review)
-                proxy = self.proxy(fixture, ["--classifier-timeout-secs", "1",
-                    "--background-reviews=false", "--min-payback-percent", "100"])
-                history = self.seed()
-                self.assertEqual(proxy.send(history)[0], 200)
-                self.assertEqual(proxy.send(history)[0], 200)
-                if scenario == "timeout":
-                    self.assertTrue(fixture.held.wait(2))
-                    self.assertFalse(fixture.release.is_set())
-                    self.assertEqual(proxy.send(history)[0], 200)
-                saved = self.harness.wait_saved(proxy,
-                    lambda s: s["shadow"]["calls"] == 1 and not s["background_review_pending"])
-                self.assertEqual(saved["invalid_reviews"], 1)
-                self.assertEqual(saved["shadow"]["unavailable_cost_calls"], 1)
-                self.assertEqual(saved["compactions"], 0)
-                self.assertEqual(saved["opinions"], {})
-                self.assertTrue(all(p["input"] == history for p in fixture.primaries))
-                self.assertEqual(saved["completed_requests"], len(fixture.primaries))
-                fixture.release.set()
+    def failed_review(self, scenario):
+        def review(_body, _n):
+            if scenario == "timeout":
+                fixture.held.set()
+                fixture.release.wait(10)
+            return 503, {"error": "unavailable"}
+        fixture = self.fixture(review)
+        proxy = self.proxy(fixture, ["--classifier-timeout-secs", "1",
+            "--background-reviews=false", "--min-payback-percent", "100"])
+        history = self.seed()
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(proxy.send(history)[0], 200)
+        if scenario == "timeout":
+            self.assertTrue(fixture.held.wait(2))
+            self.assertFalse(fixture.release.is_set())
+            self.assertEqual(proxy.send(history)[0], 200)
+        saved = self.harness.wait_saved(proxy,
+            lambda s: s["shadow"]["calls"] == 1 and not s["background_review_pending"])
+        self.assertEqual(saved["invalid_reviews"], 1)
+        self.assertEqual(saved["shadow"]["unavailable_cost_calls"], 1)
+        self.assertEqual(saved["compactions"], 0)
+        self.assertEqual(saved["opinions"], {})
+        self.assertTrue(all(p["input"] == history for p in fixture.primaries))
+        self.assertEqual(saved["completed_requests"], len(fixture.primaries))
+        fixture.release.set()
+
+    def test_reviewer_failure_preserves_primary_progress_and_unknown_spend(self):
+        self.failed_review("failure")
+
+    def test_reviewer_timeout_preserves_primary_progress_and_unknown_spend(self):
+        self.failed_review("timeout")
 
     @staticmethod
     def imported_history():
@@ -175,6 +179,11 @@ class ReviewerIndependence(unittest.TestCase):
             # A canonical caller replay must not resurrect previously retired ancestors.
             self.assertEqual(proxy.send(history)[0], 200)
             self.assertEqual(fixture.primaries[-1]["input"], sent)
+            self.assertTrue(fixture.held.wait(2), "exercise the next real partial import in flight")
+            extended = history + [{"role": "user", "content": "NEW_LIVE_UNREVIEWED_SUFFIX"}]
+            self.assertEqual(proxy.send(extended)[0], 200)
+            self.assertEqual(fixture.primaries[-1]["input"], sent + [extended[-1]])
+            self.assertFalse(fixture.release.is_set())
         finally:
             fixture.release.set()
 

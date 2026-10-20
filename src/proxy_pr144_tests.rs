@@ -357,10 +357,14 @@ fn selection_not_due_charges_only_one_conditional_input_rebuild() {
                 allowance,
             );
             assert!(row["selection_reviewer_output_completions"].is_null());
-            if let Some(prior) = &prior {
-                assert_eq!(prior, &row["selection_joint"]);
+            // Changing an output-cap field can change serialized INPUT token
+            // units. Remove that measured input allowance before comparing;
+            // no output completion cost may leak into non-due selection.
+            let primary_only = row["selection_joint"]["compact"].as_f64().unwrap() - allowance;
+            if let Some(prior) = prior {
+                close(primary_only, prior);
             }
-            prior = Some(row["selection_joint"].clone());
+            prior = Some(primary_only);
             if pending {
                 assert!(
                     row["joint"].is_null(),

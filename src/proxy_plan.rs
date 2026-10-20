@@ -170,12 +170,14 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
         };
         let selection_shadow = if due {
             review_cost(config, session, &reviewer, 1)
-                .zip(review_cost(
-                    config,
-                    &candidate,
-                    &compact_review,
-                    u64::from(!changed),
-                ))
+                .zip(if changed {
+                    // This rewrite skips the due review, but its next cold/write
+                    // input is not free. Reserve ONE positive input delta only;
+                    // do not invent a completion on the compacted branch.
+                    rebuild_allowance
+                } else {
+                    review_cost(config, &candidate, &compact_review, 1)
+                })
                 .map(|(keep, compact)| ViewCosts { keep, compact })
         } else {
             rebuild_allowance.map(|allowance| ViewCosts {
