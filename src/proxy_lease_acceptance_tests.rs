@@ -59,6 +59,7 @@ async fn lease_held_memory_budget_control(budget: &str, grow: bool) {
         item.exposed = true;
     }
     let main = json!({"model":"gpt-6-luna","input":input});
+    session.completed_requests = 1; // initial ordinary cadence is genuinely due
     assert!(
         review(
             &service,
@@ -397,7 +398,7 @@ fn lease_acceptance_due_reviewer_cache_loss_reverses_shared_candidate_gain() {
     session.observe_groups(&groups);
     admission::cover(&mut session, &groups);
     session.completed_requests = 8;
-    session.last_review_request = 7;
+    session.last_review_request = 8; // accepted ordinary target review is sunk
     let main = json!({"model":"gpt-6-luna","input":session.render_primary()});
     session.review_context = cache_base(&main);
     session.review_cache_key = "lease-cache-counterexample".into();
@@ -422,7 +423,7 @@ fn lease_acceptance_due_reviewer_cache_loss_reverses_shared_candidate_gain() {
         .find(|row| row["removed_groups"] == json!([2]))
         .unwrap();
     assert_eq!(row["feasible"], true);
-    assert_eq!(row["future_reviewer_keep_calls"], 5);
+    assert_eq!(row["future_reviewer_keep_calls"], 4);
     assert_eq!(row["future_reviewer_compact_calls"], 4);
     let joint = &row["joint"];
     let primary_gain =
@@ -440,8 +441,8 @@ fn lease_acceptance_due_reviewer_cache_loss_reverses_shared_candidate_gain() {
     assert_eq!(joint["accepted"], false);
     assert!(candidate.is_none());
     assert!(
-        !planning::economic_candidate(&config, &released, &main, paid),
-        "actual shared candidate with acquisition cost must veto the apparent primary gain"
+        !planning::economic_candidate(&config, &released, &main, 0.0),
+        "actual shared candidate must veto primary gain after the ordinary target review is sunk"
     );
     let mut removed = released.clone();
     removed.remove(&[2], &removed.groups());
@@ -457,14 +458,14 @@ fn lease_acceptance_due_reviewer_cache_loss_reverses_shared_candidate_gain() {
     cold.reviewer_cache.clear();
     let (cold_released, cold_paid, _) = lease_paid_target(&config, &cold);
     assert!(
-        planning::economic_candidate(&config, &cold_released, &main, cold_paid),
+        planning::economic_candidate(&config, &cold_released, &main, 0.0),
         "same due release with only reviewer cache evidence removed must be useful"
     );
     lease_measurement(
         json!({"scenario":"due_target_reviewer_cache_monetary_reversal",
         "primary_gain_usd":primary_gain,"reviewer_loss_usd":reviewer_loss,
         "cached_acquisition_usd":paid,"cold_acquisition_usd":cold_paid,
-        "cached_candidate_accepted":false,"cold_candidate_accepted":true,
+        "cached_candidate_accepted":false,"cold_candidate_accepted":true,"ordinary_target_review_is_sunk":true,
         "targeted_tokens":estimate(&targeted),"cache_credit_tokens":reviewer_reusable(&config,&session.reviewer_cache,&targeted),
         "actual_candidate":row}),
     );
@@ -472,6 +473,7 @@ fn lease_acceptance_due_reviewer_cache_loss_reverses_shared_candidate_gain() {
     // Mixed eligible/due controls use the identical actual admission/planner.
     // A useful already-authorized suffix wins without purchasing due advice.
     let mut mixed = session.clone();
+    mixed.completed_requests += 1;
     let mut extended = input.clone();
     extended.extend([
         json!({"role":"assistant","content":"eligible suffix ".repeat(1000)}),
@@ -507,6 +509,7 @@ fn lease_acceptance_due_reviewer_cache_loss_reverses_shared_candidate_gain() {
 
     // An eligible but below-payback tiny suffix must not mask useful due work.
     let mut tiny = session.clone();
+    tiny.completed_requests += 1;
     let mut extended = input;
     extended.extend([
         json!({"role":"assistant","content":"tiny"}),
@@ -782,7 +785,9 @@ fn lease_acceptance_max_horizon_cache_frontiers_bound_distinct_action_work() {
     let mut config = reviewer_config();
     config.payoff_requests = 100; // actual public maximum, not a new policy
     config.min_payback_percent = 0;
-    config.review_min_new_tokens = 25000;
+    // Ordinary growth threshold disabled in this scenario: exercise up to 100
+    // actual dispatch projections without repeatedly nesting extra-admission probes.
+    config.review_min_new_tokens = 0;
     let mut session = lease_many_cohorts(12, 8);
     let groups = session.groups();
     let due = session.due_keep_targets();
