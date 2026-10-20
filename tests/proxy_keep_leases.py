@@ -2,6 +2,7 @@
 import json
 import concurrent.futures
 import os
+import select
 import subprocess
 import tempfile
 import threading
@@ -9,11 +10,43 @@ import time
 import unittest
 from pathlib import Path
 
-from proxy_state_regressions import StateRegressions, advice_response, completed, ledger
+from proxy_state_regressions import Proxy, StateRegressions, advice_response, completed, ledger
 
 
 class KeepLeases(StateRegressions):
     # Do not inherit the unrelated fixture cases into this suite.
+    def test_fixture_diagnostic_pipes_are_drained_without_losing_bytes(self):
+        command = ["python3", "-c", "import sys; sys.stdout.buffer.write(b'x'*262144+b'out-end'); sys.stdout.flush(); sys.stderr.buffer.write(b'y'*262144+b'err-end'); sys.stderr.flush()"]
+        env = {"PATH":os.environ.get("PATH", "/usr/bin:/bin"), "HOME":str(self.state)}
+        blocked = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.assertTrue(select.select([blocked.stdout], [], [], 5)[0], "negative control actually started writing")
+            with self.assertRaises(subprocess.TimeoutExpired):
+                blocked.wait(timeout=0.2)
+        finally:
+            blocked.kill()
+            partial, _ = blocked.communicate(timeout=5)
+        self.assertGreater(len(partial), 0)
+        self.assertNotIn(b'out-end', partial, "undrained diagnostic output really blocks before completion")
+        with (self.state / "stdout-probe.log").open("wb", buffering=0) as out, (self.state / "stderr-probe.log").open("wb", buffering=0) as err:
+            process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            drains = [threading.Thread(target=Proxy.drain_output, args=(stream, capture))
+                      for stream, capture in ((process.stdout, out), (process.stderr, err))]
+            try:
+                for drain in drains: drain.start()
+                self.assertEqual(process.wait(timeout=5), 0)
+            finally:
+                if process.poll() is None: process.kill()
+                process.wait(timeout=5)
+                for drain in drains: drain.join(timeout=5)
+                process.stdout.close(); process.stderr.close()
+            self.assertTrue(all(not drain.is_alive() for drain in drains))
+        self.assertEqual((self.state / "stdout-probe.log").read_bytes(), b'x'*262144+b'out-end')
+        self.assertEqual((self.state / "stderr-probe.log").read_bytes(), b'y'*262144+b'err-end')
+        self.evidence.update(negative_control_partial_stdout_bytes=len(partial),
+            drained_stdout_bytes=(self.state / "stdout-probe.log").stat().st_size,
+            drained_stderr_bytes=(self.state / "stderr-probe.log").stat().st_size)
+
     def test_cli_environment_values_and_effective_provenance(self):
         fixture = self.fixture(lambda _body, _n: (200, completed()))
         for environment, extra, expected, source in [

@@ -139,6 +139,7 @@ class Proxy:
             args += ["--background-reviews=false"]
         if "--payoff-requests" not in args:
             args += ["--payoff-requests", "5"]
+        self._captures = []
         self.process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if not select.select([self.process.stdout], [], [], 5)[0]:
@@ -151,8 +152,20 @@ class Proxy:
         host, port = banner.split(" ", 1)[1].rsplit(":", 1)
         self.address = (host, int(port))
         self.state = Path(state)
+        # Long loopback tracers must not deadlock the actual binary on a full
+        # unread diagnostic pipe. Spool both streams; never discard evidence.
+        for name, stream in (("stdout", self.process.stdout), ("stderr", self.process.stderr)):
+            capture = (self.state / f"fixture-{self.process.pid}-{name}.log").open("ab", buffering=0)
+            drain = threading.Thread(target=self.drain_output, args=(stream, capture), daemon=True)
+            self._captures.append((drain, capture))
+            drain.start()
         status, _ = self.request("GET", "/health")
         assert status == 200, "real Carry health route is required"
+
+    @staticmethod
+    def drain_output(stream, capture):
+        while chunk := stream.read1(16384):
+            capture.write(chunk)
 
     def request(self, method, path, body=None):
         # Bootstrap import runs a dozen sequential review round-trips before
@@ -182,6 +195,11 @@ class Proxy:
         if self.process.poll() is None:
             self.process.kill()
         self.process.wait(timeout=5)
+        for drain, capture in self._captures:
+            drain.join(timeout=5)
+            if drain.is_alive():
+                raise AssertionError("fixture diagnostic stream did not reach EOF")
+            capture.close()
         self.process.stdout.close()
         self.process.stderr.close()
 

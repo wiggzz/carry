@@ -124,7 +124,7 @@ pub(super) fn economic_candidate(
         .is_some_and(|candidate| candidate.render_primary() != session.render_primary())
 }
 
-fn capacity_body(config: &ProxyCli, session: &Session) -> Value {
+fn capacity_body(config: &ProxyCli, session: &Session) -> Option<Value> {
     if session.background_review_pending
         && session
             .keep_leases
@@ -135,9 +135,9 @@ fn capacity_body(config: &ProxyCli, session: &Session) -> Value {
         // tail annotations are not a new primary capacity dependency.
         let mut view = session.clone();
         view.keep_leases.as_mut().unwrap().pending = None;
-        review_body(config, &view)
+        Some(review_body(config, &view))
     } else {
-        review_body(config, session)
+        None
     }
 }
 
@@ -149,8 +149,10 @@ fn plan_inner(
 ) -> (Option<Session>, Value) {
     let wire = primary_wire_body(config, body);
     let reviewer = review_body(config, session);
+    let capacity_override = capacity_body(config, session);
+    let capacity = capacity_override.as_ref().unwrap_or(&reviewer);
     let primary_ok = primary_fits(config, body);
-    let reviewer_ok = review_fits(config, &capacity_body(config, session));
+    let reviewer_ok = review_fits(config, capacity);
     let forced = acquisition.is_none() && (!primary_ok || !reviewer_ok);
     let groups = session.groups();
     let eligible = groups
@@ -219,8 +221,11 @@ fn plan_inner(
         let mut compact = body.clone();
         compact["input"] = json!(candidate.render_primary());
         let compact_review = review_body(config, &candidate);
-        let feasible = primary_fits(config, &compact)
-            && review_fits(config, &capacity_body(config, &candidate));
+        let compact_capacity_override = capacity_body(config, &candidate);
+        let compact_capacity = compact_capacity_override
+            .as_ref()
+            .unwrap_or(&compact_review);
+        let feasible = primary_fits(config, &compact) && review_fits(config, compact_capacity);
         let compact = primary_wire_body(config, &compact);
         let compact_schedule =
             review_calls(config, &candidate, body, changed, acquisition.is_none());
@@ -284,7 +289,7 @@ fn plan_inner(
         "primary_fits":primary_ok,"reviewer_fits":reviewer_ok,
         "primary_estimated_tokens":estimate(&wire),"reviewer_estimated_tokens":estimate(&reviewer),
         "primary_required_tokens":primary_required_tokens(config,body),
-        "reviewer_required_tokens":reviewer_required_tokens(config,&capacity_body(config,session)),
+        "reviewer_required_tokens":reviewer_required_tokens(config,capacity),
         "reviewer_targeted_required_tokens":reviewer_required_tokens(config,&reviewer),
         "primary_context_tokens":config.primary_context_tokens,
         "reviewer_context_tokens":config.classifier_max_input_tokens,
