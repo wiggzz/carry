@@ -131,8 +131,8 @@ pub struct ProxyCli {
     /// Explicit replay declarations override this threshold.
     #[arg(long, default_value_t = 16384)]
     bootstrap_min_input_bytes: usize,
-    /// Use conservative due-next-review selection credit (false retains the
-    /// recurring-completion sensitivity). All reviewer work is nonblocking.
+    /// Compatibility flag; reviewer work is always nonblocking. Recurring
+    /// completion sensitivity is diagnostic, never selection credit.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     background_reviews: bool,
     /// Ordinary reviews require this many completed primary requests AND native-source growth.
@@ -1925,7 +1925,10 @@ async fn dispatch_review_for(
         journal(&service, &id, &request_id, "review_skipped", &decision);
         return;
     }
-    if !session.groups().iter().any(|g| g.exposed && !g.pinned) && session.memories.is_empty() {
+    if !bootstrap
+        && !session.groups().iter().any(|g| g.exposed && !g.pinned)
+        && session.memories.is_empty()
+    {
         journal(
             &service,
             &id,
@@ -4196,7 +4199,10 @@ mod tests {
             .await
         );
         assert_eq!(session.invalid_reviews, 0);
-        assert_eq!(session.opinions.get(&1).map(String::as_str), Some("keep"));
+        assert!(
+            !session.opinions.contains_key(&1),
+            "capacity is not reviewer advice"
+        );
         assert_eq!(
             session.shadow.calls, 0,
             "an oversized atomic group must not dispatch a paid review"
@@ -5064,9 +5070,13 @@ mod tests {
             output_joint["savings"].as_f64().unwrap()
                 <= output_joint["keep"].as_f64().unwrap() * 0.25
         );
+        assert_eq!(
+            output_joint["accepted"], false,
+            "recurring completion sensitivity retains its output allowance and margin: {output_report}"
+        );
         assert!(
-            candidate.is_none(),
-            "future review output cap belongs to both payoff costs and the minimum joint payback margin: {output_report}"
+            candidate.is_some(),
+            "hypothetical repeated output completions must not veto primary savings when no review is due"
         );
     }
 }

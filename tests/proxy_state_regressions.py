@@ -149,6 +149,10 @@ class Proxy:
         host, port = banner.split(" ", 1)[1].rsplit(":", 1)
         self.address = (host, int(port))
         self.state = Path(state)
+        # Legacy synchronous fixtures inspect accepted advice immediately after
+        # a response. Synchronize *after reading the primary response*, never in
+        # production admission. Background/concurrency fixtures opt out.
+        self.wait_reviews = "--background-reviews=false" in args
         status, _ = self.request("GET", "/health")
         assert status == 200, "real Carry health route is required"
 
@@ -168,8 +172,14 @@ class Proxy:
             connection.close()
 
     def send(self, input_items, **fields):
-        return self.request("POST", "/v1/responses",
-                            {"model": "gpt-6-luna", "input": input_items, **fields})
+        response = self.request("POST", "/v1/responses",
+                                {"model": "gpt-6-luna", "input": input_items, **fields})
+        if self.wait_reviews:
+            deadline = time.monotonic() + 15
+            while self.saved().get("background_review_pending"):
+                assert time.monotonic() < deadline, "post-response reviewer did not settle"
+                time.sleep(0.01)
+        return response
 
     def saved(self):
         files = list(self.state.glob("*.json"))

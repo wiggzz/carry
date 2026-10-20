@@ -328,7 +328,7 @@ async fn proxy_does_not_write_session_traces_by_default() {
             response.json::<serde_json::Value>().await.unwrap()["id"],
             "resp_trace"
         );
-        let saved = checkpoint_states(state.path()).remove(0);
+        let saved = settled(state.path()).await.remove(0);
         assert_eq!(saved["completed_requests"], completed);
         assert_eq!(saved["primary"]["input_tokens"], completed * 7);
         assert!(
@@ -382,7 +382,7 @@ async fn proxy_verbose_traces_streams_and_default_restart_leaves_them_untouched(
         .await;
         assert!(response.status().is_success());
         assert_eq!(response.text().await.unwrap(), expected);
-        let saved = checkpoint_states(state.path()).remove(0);
+        let saved = settled(state.path()).await.remove(0);
         assert_eq!(saved["completed_requests"], if verbose { 1 } else { 2 });
         let trace_path = std::fs::read_dir(state.path())
             .unwrap()
@@ -1217,6 +1217,7 @@ async fn classifier_cache_affinity_is_bounded_stable_and_identity_isolated() {
                 .unwrap();
             assert!(response.status().is_success());
             let _ = response.bytes().await.unwrap();
+            settled(state.path()).await;
             assert_eq!(
                 primary.lock().await.last().unwrap(),
                 &request,
@@ -1298,8 +1299,9 @@ async fn failed_classifier_records_only_bounded_content_free_provider_fields() {
         let response = send(&url, &request, "a", "main").await;
         assert!(response.status().is_success());
         let _ = response.bytes().await.unwrap();
+        settled(state.path()).await;
     }
-    let saved = checkpoint_states(state.path()).remove(0);
+    let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["invalid_reviews"], 3);
     assert_eq!(saved["shadow"]["unavailable_cost_calls"], 3);
     assert_eq!(saved["compactions"], 0);
@@ -1451,6 +1453,7 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         .unwrap();
     assert!(result.status().is_success());
     let _ = result.bytes().await.unwrap();
+    settled(temp.path()).await;
     assert_eq!(shadow.lock().await.len(), 1);
     assert!(
         primary.lock().await[1]
@@ -1676,6 +1679,25 @@ fn checkpoint_states(path: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+// Legacy advice/receipt assertions run only after the primary body is read.
+// This is fixture synchronization, not primary admission or a rescue review.
+async fn settled(path: &std::path::Path) -> Vec<serde_json::Value> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let states = checkpoint_states(path);
+            if states
+                .iter()
+                .all(|s| s["background_review_pending"] != true)
+            {
+                break states;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("post-response reviewer must settle")
+}
+
 async fn send(
     url: &str,
     request: &serde_json::Value,
@@ -1694,7 +1716,7 @@ async fn send(
 }
 
 #[tokio::test]
-async fn explicit_replay_reviews_before_first_primary_without_exposing_fresh_tool_results() {
+async fn explicit_replay_reviews_after_first_primary_without_exposing_fresh_tool_results() {
     for mode in ["compact", "audit", "off"] {
         let fixture =
             fixture(json!({"protected": ["g1"], "removable": ["g2"], "memories": []})).await;
@@ -1725,18 +1747,15 @@ async fn explicit_replay_reviews_before_first_primary_without_exposing_fresh_too
             .unwrap();
         assert!(response.status().is_success());
         response.bytes().await.unwrap();
-        let saved = checkpoint_states(state.path()).remove(0);
+        let saved = settled(state.path()).await.remove(0);
         assert_eq!(
             saved["shadow"]["calls"],
             if mode == "off" { 0 } else { 1 },
-            "replayed history must be reviewed before request one, independent of normal cadence"
+            "bootstrap completes independently after request one, regardless of ordinary cadence"
         );
         assert_eq!(saved["invalid_reviews"], 0);
         let primary = fixture.requests.lock().await[0].clone();
-        assert_eq!(
-            primary.to_string().contains("REPLAY_OLD_SOURCE"),
-            mode != "compact"
-        );
+        assert!(primary.to_string().contains("REPLAY_OLD_SOURCE"));
         assert!(
             primary
                 .to_string()
@@ -1766,12 +1785,20 @@ async fn explicit_replay_reviews_before_first_primary_without_exposing_fresh_too
             .unwrap();
         assert!(response.status().is_success());
         response.bytes().await.unwrap();
+        let resumed = fixture.requests.lock().await[1].clone();
         assert_eq!(
-            fixture.requests.lock().await[1],
-            primary,
-            "restart and full replay must not resurrect committed removals"
+            resumed.to_string().contains("REPLAY_OLD_SOURCE"),
+            mode != "compact",
+            "accepted advice becomes actionable only on the later primary"
         );
-        let saved = checkpoint_states(state.path()).remove(0);
+        assert!(
+            resumed
+                .to_string()
+                .contains("FRESH_RESULT_MUST_REACH_PRIMARY")
+        );
+        assert!(resumed.to_string().contains("original requirement"));
+        assert!(resumed.to_string().contains("current request"));
+        let saved = settled(state.path()).await.remove(0);
         assert_eq!(
             saved["shadow"]["calls"],
             if mode == "off" { 0 } else { 1 },
@@ -1821,7 +1848,7 @@ async fn replay_import_does_not_reclassify_fresh_suffix_on_failed_primary_retry(
         {"type": "function_call", "call_id": "fresh", "name": "native", "arguments": "{}"},
         {"type": "function_call_output", "call_id": "fresh", "output": "new result"}
     ], "metadata": {"scenario": "http_error"}});
-    for _ in 0..2 {
+    for attempt in 0..2 {
         let response = reqwest::Client::new()
             .post(format!("{url}/v1/responses"))
             .header("x-carry-session", "replayed")
@@ -1832,7 +1859,7 @@ async fn replay_import_does_not_reclassify_fresh_suffix_on_failed_primary_retry(
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
         response.bytes().await.unwrap();
-        let saved = checkpoint_states(state.path()).remove(0);
+        let saved = settled(state.path()).await.remove(0);
         for i in 0..6 {
             assert_eq!(
                 saved["history"][i]["exposed"],
@@ -1842,15 +1869,17 @@ async fn replay_import_does_not_reclassify_fresh_suffix_on_failed_primary_retry(
         }
         assert_eq!(saved["completed_requests"], 0);
         assert_eq!(saved["invalid_reviews"], 0);
-        assert!(
-            !fixture
+        assert_eq!(
+            fixture
                 .requests
                 .lock()
                 .await
                 .last()
                 .unwrap()
                 .to_string()
-                .contains("old source")
+                .contains("old source"),
+            attempt == 0,
+            "failed primary retry may use independently accepted bootstrap advice"
         );
     }
 }
@@ -1881,7 +1910,7 @@ async fn failed_rebase_primary_reuses_successful_bootstrap_before_review_cadence
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
         response.bytes().await.unwrap();
-        let saved = checkpoint_states(state.path()).remove(0);
+        let saved = settled(state.path()).await.remove(0);
         assert_eq!(saved["completed_requests"], 1);
         assert_eq!(saved["history_rebases"], 1);
         assert_eq!(saved["invalid_reviews"], 0);
@@ -1890,7 +1919,8 @@ async fn failed_rebase_primary_reuses_successful_bootstrap_before_review_cadence
             "successful bootstrap chunks survive failed primaries and restarts without replay"
         );
         assert_eq!(saved["history"][2]["exposed"], false);
-        assert_eq!(saved["bootstrap_review_pending"], true);
+        assert_eq!(saved["bootstrap_review_pending"], false);
+        assert_eq!(saved["bootstrap_review_complete"], true);
         if attempt == 1 {
             drop(proxy);
             let restarted = start_proxy(state.path(), fixture.address, "compact").await;
@@ -1912,7 +1942,7 @@ async fn fragmented_sse_preserves_bytes_and_exposes_only_completed_primary_input
         response.bytes().await.unwrap().as_ref(),
         COMPLETED_SSE.as_bytes()
     );
-    let saved = checkpoint_states(state.path()).remove(0);
+    let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["history"].as_array().unwrap().len(), 1);
     assert_eq!(saved["history"][0]["exposed"], true);
     assert_eq!(saved["pending_output"][0]["call_id"], "sse_call");
@@ -1930,7 +1960,7 @@ async fn fragmented_sse_preserves_bytes_and_exposes_only_completed_primary_input
             .as_ref(),
         FAILED_SSE.as_bytes()
     );
-    let saved = checkpoint_states(state.path()).remove(0);
+    let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["history"][1]["exposed"], false);
     assert_eq!(saved["history"][2]["exposed"], false);
     assert_eq!(saved["completed_requests"], 1);
@@ -2155,7 +2185,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
                 .bytes()
                 .await
                 .unwrap();
-            let saved = checkpoint_states(state.path()).remove(0);
+            let saved = settled(state.path()).await.remove(0);
             assert_eq!(saved["completed_requests"], 3);
             assert_eq!(saved["shadow"]["calls"], 1);
             assert_eq!(saved["shadow"]["unavailable_cost_calls"], 1);
@@ -2183,7 +2213,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
         release.notify_one();
         let saved = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let saved = checkpoint_states(state.path()).remove(0);
+                let saved = settled(state.path()).await.remove(0);
                 if saved["shadow"]["calls"] == 1 {
                     break saved;
                 }
@@ -2262,7 +2292,7 @@ async fn mixed_advice_applies_valid_items_and_failed_primary_keeps_feedback() {
     let response = send(&url, &next, "a", "main").await;
     assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(response.text().await.unwrap(), "native-quota-body");
-    let saved = checkpoint_states(state.path()).remove(0);
+    let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["invalid_reviews"], 0);
     assert_eq!(saved["partial_reviews"], 1);
     assert_eq!(saved["shadow"]["calls"], 1);
@@ -2374,7 +2404,7 @@ async fn primary_timeout_and_client_cancellation_are_censored_without_exposure()
         send(&url, &request, "a", "main").await.status(),
         reqwest::StatusCode::BAD_GATEWAY
     );
-    let saved = checkpoint_states(state.path()).remove(0);
+    let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["history"][0]["exposed"], false);
     assert_eq!(
         saved["primary"]["calls"], 1,
@@ -2454,7 +2484,7 @@ async fn valid_completed_shadow_and_shared_memory_survive_a_failed_primary() {
         .extend(first["output"].as_array().unwrap().iter().cloned());
     next["metadata"] = json!({"scenario": "http_error"});
     let _ = send(&url, &next, "a", "main").await.bytes().await.unwrap();
-    let saved = checkpoint_states(state.path()).remove(0);
+    let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["invalid_reviews"], 0);
     assert_eq!(saved["shadow"]["calls"], 1);
     assert_eq!(saved["memories"][0]["text"], "remember tested outcome");
@@ -2714,8 +2744,9 @@ async fn implicit_active_prefix_reuses_removals_and_rebuilds_on_divergence() {
         response.bytes().await.unwrap();
     }
     implicit(&url, &original).await;
+    settled(state.path()).await;
     assert!(
-        !fixture.requests.lock().await[0]
+        fixture.requests.lock().await[0]
             .to_string()
             .contains("IMPLICIT_OLD_SOURCE")
     );
@@ -2761,13 +2792,15 @@ async fn unseen_explicit_history_bootstraps_but_small_histories_skip_replay() {
         let response = send(&url, &request, "a", "main").await;
         assert!(response.status().is_success());
         response.bytes().await.unwrap();
+        settled(state.path()).await;
         assert_eq!(fixture.reviews.lock().await.len(), calls);
         assert_eq!(
             fixture.requests.lock().await[0]["input"]
                 .as_array()
                 .unwrap()
                 .len(),
-            if calls == 0 { 3 } else { 2 }
+            3,
+            "bootstrap does not rewrite the first primary"
         );
     }
 }
@@ -2798,9 +2831,10 @@ async fn oversized_replay_groups_are_kept_whole_without_reviewer_dispatch() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
     response.bytes().await.unwrap();
-    assert!(fixture.requests.lock().await.is_empty());
+    settled(state.path()).await;
+    assert_eq!(fixture.requests.lock().await[0], request);
     let reviews = fixture.reviews.lock().await;
     assert!(
         reviews
@@ -2813,7 +2847,7 @@ async fn oversized_replay_groups_are_kept_whole_without_reviewer_dispatch() {
             .all(|body| !body.to_string().contains("function_call")),
         "never review a partial oversized tool group"
     );
-    let saved = checkpoint_states(state.path()).remove(0);
+    let saved = settled(state.path()).await.remove(0);
     assert!(
         saved["history"]
             .as_array()
@@ -2842,7 +2876,7 @@ async fn unseen_history_with_only_pinned_sources_skips_bootstrap_calls() {
         "nothing is safely removable"
     );
     assert_eq!(fixture.requests.lock().await[0], request);
-    let saved = checkpoint_states(state.path()).remove(0);
+    let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["bootstrap_review_pending"], false);
 }
 
@@ -2876,6 +2910,7 @@ async fn implicit_prefix_state_is_isolated_by_tenant_branch_and_settings() {
             .unwrap();
         assert!(response.status().is_success());
         response.bytes().await.unwrap();
+        settled(state.path()).await;
     }
     assert_eq!(checkpoint_states(state.path()).len(), 4);
     assert_eq!(
@@ -2889,7 +2924,8 @@ async fn implicit_prefix_state_is_isolated_by_tenant_branch_and_settings() {
             .lock()
             .await
             .iter()
-            .all(|body| !body.to_string().contains("OLD_EVIDENCE"))
+            .all(|body| body.to_string().contains("OLD_EVIDENCE")),
+        "first requests cannot consume advice not yet accepted"
     );
 }
 
@@ -2921,7 +2957,7 @@ async fn implicit_unseen_history_can_replace_a_native_checkpoint_epoch() {
         );
         response.bytes().await.unwrap();
     }
-    let saved = checkpoint_states(state.path()).remove(0);
+    let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["history_rebases"], 1);
     assert_eq!(saved["native_checkpoint"], json!([]));
     server.abort();
@@ -2949,6 +2985,7 @@ async fn client_turn_metadata_preserves_proxy_session_and_reviewer_affinity() {
             .json()
             .await
             .unwrap();
+        settled(state.path()).await;
         request["input"]
             .as_array_mut()
             .unwrap()
@@ -2971,6 +3008,7 @@ async fn client_turn_metadata_preserves_proxy_session_and_reviewer_affinity() {
         .bytes()
         .await
         .unwrap();
+    settled(state.path()).await;
     assert_eq!(
         checkpoint_states(state.path()).len(),
         2,
@@ -3011,6 +3049,7 @@ async fn reviewer_transport_preserves_encrypted_reasoning_and_native_tool_pairs(
         .unwrap();
     assert!(response.status().is_success());
     response.bytes().await.unwrap();
+    settled(state.path()).await;
     let reviews = fixture.reviews.lock().await;
     assert_eq!(reviews[0]["model"], "gpt-6-luna");
     let input = reviews[0]["input"].as_array().unwrap();

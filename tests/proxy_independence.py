@@ -22,6 +22,11 @@ class ReviewerIndependence(unittest.TestCase):
                 {"role": "assistant", "content": "AUTHORIZED_OLD_RESULT " * 1000},
                 {"role": "user", "content": "latest protected direction"}]
 
+    def proxy(self, fixture, options):
+        proxy = self.harness.proxy(fixture, options)
+        proxy.wait_reviews = False  # These assertions measure primary admission itself.
+        return proxy
+
     def fixture(self, review):
         fixture = self.harness.fixture(
             lambda _body, n: (200, completed(response_id=f"primary_{n}")), review)
@@ -37,7 +42,7 @@ class ReviewerIndependence(unittest.TestCase):
         options = ["--background-reviews=false", "--min-payback-percent", "100"]
         if bootstrap:
             options += ["--review-replayed-history"]
-        proxy = self.harness.proxy(fixture, options)
+        proxy = self.proxy(fixture, options)
         history = self.seed()
         if not bootstrap:
             self.assertEqual(proxy.send(history)[0], 200)
@@ -66,7 +71,7 @@ class ReviewerIndependence(unittest.TestCase):
 
     def test_reviewer_capacity_is_not_primary_capacity(self):
         fixture = self.fixture(lambda _b, _n: (503, {"error": "review unavailable"}))
-        proxy = self.harness.proxy(fixture, ["--classifier-max-input-tokens", "1024",
+        proxy = self.proxy(fixture, ["--classifier-max-input-tokens", "1024",
             "--classifier-max-output-tokens", "64", "--min-payback-percent", "0"])
         history = self.seed()
         self.assertEqual(proxy.send(history)[0], 200,
@@ -76,6 +81,34 @@ class ReviewerIndependence(unittest.TestCase):
         self.assertEqual(fixture.primaries[-1]["input"], history)
         self.assertFalse(proxy.saved()["last_plan"]["forced"])
         self.assertEqual(fixture.reviews, [])
+
+    def test_reviewer_failure_and_timeout_preserve_primary_progress_and_unknown_spend(self):
+        for scenario in ["failure", "timeout"]:
+            with self.subTest(scenario=scenario):
+                def review(_body, _n):
+                    if scenario == "timeout":
+                        fixture.held.set()
+                        fixture.release.wait(10)
+                    return 503, {"error": "unavailable"}
+                fixture = self.fixture(review)
+                proxy = self.proxy(fixture, ["--classifier-timeout-secs", "1",
+                    "--background-reviews=false", "--min-payback-percent", "100"])
+                history = self.seed()
+                self.assertEqual(proxy.send(history)[0], 200)
+                self.assertEqual(proxy.send(history)[0], 200)
+                if scenario == "timeout":
+                    self.assertTrue(fixture.held.wait(2))
+                    self.assertFalse(fixture.release.is_set())
+                    self.assertEqual(proxy.send(history)[0], 200)
+                saved = self.harness.wait_saved(proxy,
+                    lambda s: s["shadow"]["calls"] == 1 and not s["background_review_pending"])
+                self.assertEqual(saved["invalid_reviews"], 1)
+                self.assertEqual(saved["shadow"]["unavailable_cost_calls"], 1)
+                self.assertEqual(saved["compactions"], 0)
+                self.assertEqual(saved["opinions"], {})
+                self.assertTrue(all(p["input"] == history for p in fixture.primaries))
+                self.assertEqual(saved["completed_requests"], len(fixture.primaries))
+                fixture.release.set()
 
     @staticmethod
     def imported_history():
@@ -89,12 +122,12 @@ class ReviewerIndependence(unittest.TestCase):
         fixture = self.fixture(lambda _b, _n: (503, {"error": "must not dispatch"}))
         options = ["--review-replayed-history", "--classifier-max-input-tokens", "6000",
                    "--bootstrap-max-cost-usd", "0"]
-        proxy = self.harness.proxy(fixture, options)
+        proxy = self.proxy(fixture, options)
         history = self.imported_history()
         for restart in [False, True]:
             if restart:
                 proxy.close()
-                proxy = self.harness.proxy(fixture, options)
+                proxy = self.proxy(fixture, options)
             self.assertEqual(proxy.send(history)[0], 200,
                              "exhausted reviewer spend is not a primary admission gate")
             self.assertEqual(fixture.primaries[-1]["input"], history)
@@ -107,7 +140,7 @@ class ReviewerIndependence(unittest.TestCase):
             return 200, advice_response({"protected": [i for i in ids if i == "g1"],
                 "removable": [i for i in ids if i != "g1"], "memories": []})
         fixture = self.fixture(review)
-        proxy = self.harness.proxy(fixture, ["--review-replayed-history",
+        proxy = self.proxy(fixture, ["--review-replayed-history",
             "--classifier-max-input-tokens", "6000", "--review-max-calls", "1",
             "--payoff-requests", "1", "--classifier-cache-policy", "disabled"])
         history = self.imported_history()

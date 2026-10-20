@@ -150,15 +150,25 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
             && !(session.bootstrap_review_pending && !session.bootstrap_review_complete)
             && reviewer_ok
             && super::admission::decision(config, session, body, false)["admitted"] == true;
-        let incremental = review_cost(config, session, &reviewer, 1)
-            .zip(review_cost(config, &candidate, &compact_review, 1))
-            .map(|(keep, compact)| ViewCosts {
-                keep: 0.0,
-                compact: (compact - keep).max(0.0),
-            });
-        let selection_shadow = if !config.background_reviews && shadow.is_some() {
-            shadow
-        } else if due {
+        // A local replay rebuild is not a paid summarizer call. When no review
+        // is due, reserve only its positive input cache/write delta under ONE
+        // explicitly conditional frozen-source next-request scenario; never
+        // credit savings or output completions from that unknown future work.
+        // An oversized rendering is not a request we can dispatch or price as
+        // one. Defer it rather than let fictional reviewer work veto primary.
+        let rebuild_allowance = if review_fits(config, &compact_review) && reviewer_ok {
+            reviewer_view_costs(
+                config,
+                &session.reviewer_cache,
+                &reviewer,
+                &compact_review,
+                1,
+            )
+            .map(|cost| (cost.compact - cost.keep).max(0.0))
+        } else {
+            Some(0.0)
+        };
+        let selection_shadow = if due {
             review_cost(config, session, &reviewer, 1)
                 .zip(review_cost(
                     config,
@@ -168,17 +178,19 @@ pub(super) fn plan(config: &ProxyCli, session: &Session, body: &Value) -> (Optio
                 ))
                 .map(|(keep, compact)| ViewCosts { keep, compact })
         } else {
-            // A frozen-source one-rebuild debit, not zero-priced future work.
-            // Credit no recurring savings, and charge any cold/cache/tier loss
-            // on the rendered replay even while its dispatch time is unknown.
-            incremental
+            rebuild_allowance.map(|allowance| ViewCosts {
+                keep: 0.0,
+                compact: allowance,
+            })
         };
         let selection_joint = primary
             .zip(selection_shadow)
             .map(|(primary, shadow)| joint_decision(primary, shadow, config.min_payback_percent));
         reports.push(json!({"removed_groups":removed,"feasible":feasible,"joint":joint,
             "selection_joint":selection_joint,
-            "selection_review_basis":if !config.background_reviews && shadow.is_some() {"recurring_completion_sensitivity"} else if due {"presently_due_next_review"} else {"incremental_one_rebuild_debit_no_review_savings"},
+            "selection_review_basis":if due {"presently_due_next_review"} else {"conditional_one_request_input_rebuild_allowance_no_review_savings"},
+            "selection_rebuild_allowance_assumption":"one_frozen_source_next_request_if_both_renderings_fit_not_a_dispatch_forecast",
+            "selection_reviewer_output_completions":if due {Some(u64::from(!changed))} else {None},
             "selection_future_review_total_unknown":keep_calls.is_none(),
             "future_reviewer_keep_calls":keep_calls,"future_reviewer_compact_calls":compact_calls,
             "primary_retained_estimated_tokens":estimate(&compact),

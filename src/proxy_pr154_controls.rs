@@ -483,6 +483,13 @@ async fn pr154_selected_main_audit_rollback_and_reviewer_only_use_real_forwardin
         axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while service.background_reviews.lock().await.contains(&id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         let saved = load(&service, &id).unwrap();
         let committed_main = scenario == "main" || scenario == "journal_io";
         assert_eq!(saved.compactions, u64::from(committed_main), "{scenario}");
@@ -496,6 +503,22 @@ async fn pr154_selected_main_audit_rollback_and_reviewer_only_use_real_forwardin
             continue;
         }
         let events = pr154_journal(directory.path(), &id);
+        if scenario == "reviewer_only" {
+            assert_eq!(saved.compactions, 0);
+            assert_eq!(
+                saved.reviewer_compactions, 1,
+                "replay pressure is handled independently after forwarding"
+            );
+            assert!(!events.iter().any(|e| e["event"] == "compaction_selected"));
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e["event"] == "background_review_merged")
+            );
+            assert!(!serde_json::to_string(&events).unwrap().contains("PRIVATE_"));
+            provider.abort();
+            continue;
+        }
         let selected = events
             .iter()
             .find(|event| event["event"] == "compaction_selected")
