@@ -507,7 +507,7 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
         u64::from(growth >= 16384)
     );
     let bytes = std::fs::read(directory.path().join("history.index")).unwrap();
-    assert!(bytes.len() <= budget);
+    assert!(bytes.len() <= budget as usize);
     history_race_send(service.clone(), input).await;
     let saved = load(&restarted, &owner).unwrap();
     assert_eq!(
@@ -543,7 +543,7 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
     }
     let bytes = std::fs::read(directory.path().join("history.index")).unwrap();
     let index: Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(bytes.len() <= budget);
+    assert!(bytes.len() <= budget as usize);
     assert!(index["nodes"].as_object().unwrap().len() <= 8);
     assert!(
         index["tips"].as_object().unwrap().len() + index["transcripts"].as_object().unwrap().len()
