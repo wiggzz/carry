@@ -32,6 +32,26 @@ fn historical_full_history_fork_after_parent_cleanup() {
     );
 }
 
+#[test]
+fn committed_fork_cut_discovery() {
+    let output = Command::new("python3")
+        .args([
+            "-B",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/proxy_fork_discovery.py"),
+            "ForkDiscovery",
+            "-v",
+        ])
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python loopback neutral fork discovery regression");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 struct Proxy(Child);
 
 impl Drop for Proxy {
