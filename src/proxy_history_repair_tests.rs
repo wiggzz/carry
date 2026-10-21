@@ -126,3 +126,61 @@ async fn history_two_tip_interleaving() {
     );
     provider.abort();
 }
+
+#[tokio::test]
+async fn history_failed_small_publication_and_lowered_restart_preserve_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = Router::new().route(
+        "/v1/responses",
+        post(|| async {
+            axum::Json(
+                json!({"id":"durable_before_capacity", "status":"completed", "output":[],
+            "usage":{"input_tokens":100,"output_tokens":1}}),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let provider = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut service = checkpoint_service(directory.path());
+    service.config.upstream_url = endpoint;
+    service.config.review_every_requests = 100;
+    service.config.bootstrap_min_input_bytes = usize::MAX;
+    let service = Arc::new(service);
+    let input = json!([{"role":"user","content":"durable before capacity"}]);
+    history_race_send(service.clone(), input.clone()).await;
+    let owner = history_race_owner(&service, "durable before capacity");
+    let index = directory.path().join("history.index");
+    let prior = std::fs::read(&index).unwrap();
+    let selected = load(&service, &owner).unwrap();
+    let mut lowered = (*service).clone();
+    lowered.config.history_max_bytes = 67;
+    let pin = history::pin(&lowered, &owner).unwrap();
+    assert!(history::committed(&lowered, &owner, &selected, None).is_err());
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        prior,
+        "failed publication cannot replace prior generation"
+    );
+    assert!(!directory.path().join(".history-index.tmp").exists());
+    drop(pin);
+    // A lowered-budget process must fail closed on an oversized previous
+    // generation, not pretend it was absent or replace it with an empty index.
+    let lowered = Arc::new(lowered);
+    for _ in 0..2 {
+        let result = forward_request(
+            lowered.clone(),
+            HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&json!({"model":"gpt-6-luna","input":input})).unwrap()),
+            false,
+            logging::request_id(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&index).unwrap(), prior);
+    }
+    let restarted = checkpoint_service(directory.path());
+    assert_eq!(load(&restarted, &owner).unwrap().primary.calls, 1);
+    assert_eq!(std::fs::read(index).unwrap(), prior);
+    provider.abort();
+}
