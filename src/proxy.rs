@@ -562,13 +562,22 @@ fn load(service: &Service, id: &str) -> Result<Session, Failure> {
 }
 
 fn save(service: &Service, id: &str, session: &Session) -> std::io::Result<()> {
+    save_observed(service, id, session, None)
+}
+
+fn save_observed(
+    service: &Service,
+    id: &str,
+    session: &Session,
+    observation: Option<(&[Value], &Value)>,
+) -> std::io::Result<()> {
     save_with_limit(
         service,
         id,
         &history::compact(session),
         CHECKPOINT_MAX_BYTES,
     )?;
-    history::committed(service, id, session)
+    history::committed(service, id, session, observation)
 }
 
 fn save_with_limit(
@@ -1240,6 +1249,9 @@ struct Commit {
     candidate: Session,
     reviewed: Session,
     submitted_ids: Vec<u64>,
+    // Canonical caller ancestry is independent of the selected context. Native
+    // compaction can clear the latter before this observation is committed.
+    observed_input: Vec<Value>,
     outbound: Value,
     native: bool,
     _lock: OwnedMutexGuard<()>,
@@ -1692,6 +1704,7 @@ async fn forward_request(
             candidate: session,
             reviewed,
             submitted_ids,
+            observed_input: body["input"].as_array().cloned().unwrap_or_default(),
             outbound: outbound.clone(),
             native,
             _lock: lock,
@@ -4003,7 +4016,14 @@ async fn relay(
                     commit.candidate.completed_requests += 1;
                 }
                 let _ = trace(&commit.service, &commit.id, "primary_completed", &value);
-                if save(&commit.service, &commit.id, &commit.candidate).is_err() {
+                if save_observed(
+                    &commit.service,
+                    &commit.id,
+                    &commit.candidate,
+                    Some((&commit.observed_input, &value)),
+                )
+                .is_err()
+                {
                     journal(
                         &commit.service,
                         &commit.id,

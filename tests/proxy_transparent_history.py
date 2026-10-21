@@ -369,13 +369,19 @@ class TransparentHistory(unittest.TestCase):
                 assert release.wait(10), "held review release"
             return 200, advice_response({"protected": [i for i in ids if i == "g1"],
                 "removable": [i for i in ids if i != "g1"],
-                "memories": [{"source_ids": ["g2"], "text": "A_FACT" if n == 1 else "UNCOMMITTED_B_FACT"}]})
+                "memories": [{"source_ids": ["g2"] if n == 1 else [i for i in ids if i != "g1"][:1],
+                              "text": "A_FACT" if n == 1 else "UNCOMMITTED_B_FACT"}]})
         proxy, fixture, history, options = self.seed(review=review)
         proxy.close()
         proxy = TransparentProxy(self.state, fixture, [*options, "--background-reviews=true"])
         self.stack.callback(proxy.close)
-        self.assertEqual(proxy.send(history + [{"role": "assistant", "content": "B_ONLY " + "payload " * 100},
-                                               {"role": "user", "content": "B_BOUNDARY"}], wait=False)[0], 200)
+        b = [*history, {"role": "assistant", "content": "B_ONLY " + "payload " * 6000},
+             {"role": "user", "content": "B_BOUNDARY"}]
+        self.assertEqual(proxy.send(b, wait=False)[0], 200)
+        # A newly submitted source must first be exposed by a real primary
+        # response. A later request can then schedule its retirement review.
+        if not held.wait(.1):
+            self.assertEqual(proxy.send([*b, {"role": "user", "content": "B_REVIEW_BOUNDARY"}], wait=False)[0], 200)
         self.assertTrue(held.wait(5), "actual dispatched reviewer must be in flight")
         proxy.close()
         release.set()

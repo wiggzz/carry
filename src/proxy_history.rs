@@ -82,6 +82,12 @@ fn gc(index: &mut Index) {
         .keys()
         .chain(index.reviews.keys())
         .chain(index.transcripts.values().map(|r| &r.frontier))
+        .chain(
+            index
+                .snapshots
+                .values()
+                .filter_map(|s| s.history_frontier.as_ref()),
+        )
     {
         let mut key = root.as_str();
         while reachable.insert(key.to_owned()) {
@@ -335,7 +341,12 @@ pub(super) fn restore(service: &Service, id: &str) -> std::io::Result<Session> {
 
 /// Publish nodes, reviewed versions and selected metadata in ONE atomic index.
 /// A mirror written before this transaction cannot publish uncommitted advice.
-pub(super) fn committed(service: &Service, id: &str, session: &Session) -> std::io::Result<()> {
+pub(super) fn committed(
+    service: &Service,
+    id: &str,
+    session: &Session,
+    observation: Option<(&[Value], &Value)>,
+) -> std::io::Result<()> {
     let Some(namespace) = &session.history_namespace else {
         return Ok(());
     };
@@ -348,51 +359,66 @@ pub(super) fn committed(service: &Service, id: &str, session: &Session) -> std::
         .collect::<Vec<_>>();
     let prior = index.snapshots.keys().cloned().collect::<HashSet<_>>();
     let keys = insert(&mut index, namespace, &input);
-    if let Some(response) = &session.last_response_id
-        && let Some(frontier) = session.response_frontier
-    {
-        let transcript = session
-            .history
-            .iter()
-            .take_while(|i| i.id <= frontier)
-            .map(|i| i.value.clone())
-            .chain(session.pending_output.iter().cloned())
-            .collect::<Vec<_>>();
+    let observed_keys = observation
+        .map(|(input, _)| insert(&mut index, namespace, input))
+        .unwrap_or_else(|| keys.clone());
+    let completed = observation
+        .map(|(input, response)| {
+            (
+                response["id"].as_str(),
+                conversation(response).or(session.history_conversation.as_deref()),
+                input
+                    .iter()
+                    .cloned()
+                    .chain(response["output"].as_array().into_iter().flatten().cloned())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .or_else(|| {
+            let frontier = session.response_frontier?;
+            Some((
+                session.last_response_id.as_deref(),
+                session.history_conversation.as_deref(),
+                session
+                    .history
+                    .iter()
+                    .take_while(|i| i.id <= frontier)
+                    .map(|i| i.value.clone())
+                    .chain(session.pending_output.iter().cloned())
+                    .collect::<Vec<_>>(),
+            ))
+        });
+    if let Some((Some(response), conversation, transcript)) = completed {
         let full_keys = insert(&mut index, namespace, &transcript);
-        if let Some(key) = full_keys.last() {
-            for (kind, external) in [
-                ("response", Some(response)),
-                ("conversation", session.history_conversation.as_ref()),
-            ] {
-                if let Some(external) = external {
-                    let reference_key = hash(&(namespace, kind, external));
-                    let reference = Transcript {
-                        namespace: namespace.clone(),
-                        external_id: external.clone(),
-                        frontier: key.clone(),
-                        session: id.into(),
-                        at: now(),
-                    };
-                    if kind == "response" {
-                        index.transcripts.entry(reference_key).or_insert(reference);
-                    } else {
-                        index.transcripts.insert(reference_key, reference);
-                    }
+        let key = full_keys.last().unwrap_or(namespace);
+        for (kind, external) in [("response", Some(response)), ("conversation", conversation)] {
+            if let Some(external) = external {
+                let reference_key = hash(&(namespace, kind, external));
+                let reference = Transcript {
+                    namespace: namespace.clone(),
+                    external_id: external.to_owned(),
+                    frontier: key.clone(),
+                    session: id.into(),
+                    at: now(),
+                };
+                if kind == "response" {
+                    index.transcripts.entry(reference_key).or_insert(reference);
+                } else {
+                    index.transcripts.insert(reference_key, reference);
                 }
             }
         }
     }
     index.tips.retain(|_, r| r.session != id);
-    if let Some(key) = keys.last() {
-        index.tips.insert(
-            key.clone(),
-            Reference {
-                session: id.into(),
-                namespace: namespace.clone(),
-                at: now(),
-            },
-        );
-    }
+    let key = observed_keys.last().unwrap_or(namespace);
+    index.tips.insert(
+        key.clone(),
+        Reference {
+            session: id.into(),
+            namespace: namespace.clone(),
+            at: now(),
+        },
+    );
     for point in &session.fork_points {
         if !forking::matches_sources(point, &input) {
             continue;

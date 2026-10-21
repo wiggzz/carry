@@ -9,15 +9,11 @@ import select
 import subprocess
 import threading
 import time
-import uuid
-import urllib.request
 
 try:
     from proxy_trial import client_configuration, stop_process_group
-    from proxy_native_settle import wait_lineage_settled
 except ImportError:
     from scripts.proxy_trial import client_configuration, stop_process_group
-    from scripts.proxy_native_settle import wait_lineage_settled
 
 
 class Rpc:
@@ -70,16 +66,6 @@ def path_ids(tree):
     return list(reversed(path))
 
 
-def state_path(directory, tenant, session, branch):
-    # Exact checkpoint FILE locator only, never fork authority/cut canonicalization.
-    identity = json.dumps([tenant, session, branch], separators=(',', ':')).encode()
-    return Path(directory)/(hashlib.sha256(identity).hexdigest()+'.json')
-
-
-def settled(directory, session, branch, completed):
-    return wait_lineage_settled(directory, 'local-trial', session, branch, completed)
-
-
 class ParentCheckpointProof:
     """Fixture-only exact-file readback; never reserialize the raw baseline."""
     def __init__(self, root, target, expected):
@@ -112,7 +98,6 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         CARRY_PROXY_CLASSIFIER_KEY='synthetic-key', CARRY_TRIAL_GATEWAY_TOKEN='synthetic-fork-gateway',
         CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS='0', CARRY_PROXY_REVIEW_MIN_NEW_TOKENS='0',
         CARRY_PROXY_REVIEW_BACKOFF_FACTOR='1', CARRY_PROXY_REVIEW_EVERY_REQUESTS='2')
-    session = uuid.uuid4().hex
     state_dir = root/'state'
     rpc = proxy = None
     result = {'case':'fork', 'client':'pi', 'fixture_only':True}
@@ -203,8 +188,9 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         b = wait_transparent(4)[1]
         rpc.prompt('B_ONLY: verify later disposable reviewer cleanup.')
         parent_path, b = wait_transparent(5)
-        parent_proof = ParentCheckpointProof(root,
-            parent_path,b)
+        parent_snapshot = json.loads(parent_path.read_text())
+        assert json.loads((state_dir/'history.index').read_text())['snapshots'][parent_path.stem] == parent_snapshot
+        parent_proof = ParentCheckpointProof(root, parent_path, parent_snapshot)
         assert b['reviewer_compactions']>0, 'actual parent disposable cleanup'
         assert any(m['text']=='B_ONLY_FACT' for m in b['memories']), 'B-only advice must really exist on parent'
         (root/'b-checkpoint.json').write_text(json.dumps(b)+'\n')
@@ -251,7 +237,8 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         assert child['primary']['cost_usd']>0, 'actual cold child spend, not copied or free'
         assert child['reviewer_cache']==[] and not child['background_review_pending']
         (root/'child-checkpoint.json').write_text(json.dumps(child)+'\n')
-        assert json.loads(parent_path.read_text())==b, 'parent B unchanged'
+        assert json.loads(parent_path.read_text())==parent_snapshot, 'parent B unchanged'
+        assert json.loads((state_dir/'history.index').read_text())['snapshots'][parent_path.stem] == parent_snapshot
         parent_proof.check('after-child')
         # Restart the native process; the server owns lineage without mapping glue.
         resumed = rpc.call('get_state')
@@ -266,7 +253,8 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         assert json.dumps(fixture.calls[-1]['input']).count('ACCEPTED_A_FACT')==1
         assert 'B_ONLY' not in json.dumps(fixture.calls[-1])
         assert len(fixture.reviews)==before_reviews and not fixture.summary_calls
-        assert json.loads(parent_path.read_text())==b
+        assert json.loads(parent_path.read_text())==parent_snapshot
+        assert json.loads((state_dir/'history.index').read_text())['snapshots'][parent_path.stem] == parent_snapshot
         parent_proof.check('after-resume')
         incoming = observer.bodies()
         assert native_observer.bodies()==incoming, 'ordinary native forwarding must preserve complete caller body'
