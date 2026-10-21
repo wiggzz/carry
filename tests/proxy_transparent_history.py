@@ -24,7 +24,7 @@ class TransparentProxy(Proxy):
         found = []
         for reference in index["tips"].values():
             path = self.state / (reference["session"] + ".json")
-            state = json.loads(path.read_text())
+            state = index.get("snapshots", {}).get(reference["session"]) or json.loads(path.read_text())
             values = [i["value"] for i in state["history"]]
             if state.get("history_frontier"):
                 values = []
@@ -211,6 +211,28 @@ class TransparentHistory(unittest.TestCase):
         _, child = proxy.checkpoint(c)
         self.assertTrue(any(m["text"] == "A_FACT" for m in child["memories"]))
         self.assertFalse(any("B_DEPENDENT" in m["text"] for m in child["memories"]))
+        # The same later frontier IS reusable when the complete B dependency
+        # remains. Advance its mutable tip first so this must hydrate B's review.
+        self.assertEqual(proxy.send(b + [{"role": "user", "content": "B_NEXT"}])[0], 200)
+        d = b + [{"role": "user", "content": "B_FORK_D"}]
+        self.assertEqual(proxy.send(d)[0], 200)
+        _, compatible = proxy.checkpoint(d)
+        self.assertTrue(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in compatible["memories"]))
+        self.assertNotIn("B_NEXT", json.dumps(fixture.primaries[-1]["input"]))
+
+    def test_empty_input_response_is_observed_and_resumable(self):
+        answer = {"role": "assistant", "content": "EMPTY_INPUT_ACTUAL_OUTPUT"}
+        fixture = self.fixture(lambda _b, n: (200, completed([answer], f"empty_{n}")))
+        proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"])
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send([])[0], 200)
+        proxy.close()
+        proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"])
+        self.stack.callback(proxy.close)
+        followup = {"role": "user", "content": "AFTER_EMPTY"}
+        status, response = proxy.send([followup], previous_response_id="empty_1")
+        self.assertEqual(status, 200, response)
+        self.assertEqual(fixture.primaries[-1]["input"], [answer, followup])
 
     def test_active_checkpoints_reference_shared_canonical_ancestry(self):
         proxy, fixture, history, options = self.seed()

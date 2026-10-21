@@ -72,29 +72,35 @@ Private `history.index` is an atomic bounded JSON index. Each immutable node hol
 a parsed canonical wire value and its parent digest. Tips, review versions and
 external IDs reference frontiers, sharing prefixes instead of copying a raw
 transcript per reference/version. Lookup hashes request prefixes and reads this
-index, never scans state directories. Mutable per-lineage selection/accounting
-checkpoints retain their existing format and separate lifetime.
+index, never scans state directories. Headerless selection/accounting snapshots
+store null wire values plus a canonical frontier; loading resolves those references.
+Snapshots and canonical nodes publish in one atomic index transaction. Per-session
+JSON files are diagnostic mirrors, not independent authority. Existing explicit
+session checkpoints retain their legacy format and lifetime.
 
 | Control | Default | Range/meaning |
 | --- | --- | --- |
 | `--history-max-nodes` / `CARRY_PROXY_HISTORY_MAX_NODES` | 16384 | 1–65536 unique canonical nodes |
 | `--history-max-references` / `CARRY_PROXY_HISTORY_MAX_REFERENCES` | 256 | 1–4096 tip/review-frontier/transcript references |
+| `--history-max-bytes` / `CARRY_PROXY_HISTORY_MAX_BYTES` | 33554432 | 2–67108864 total index bytes, including selected snapshots |
 | `--fork-max-nodes` / `CARRY_PROXY_FORK_MAX_NODES` | 8 | 0–32 committed review versions |
-| `--fork-max-bytes` / `CARRY_PROXY_FORK_MAX_BYTES` | 262144 | 2–1048576 serialized archive bytes |
+| `--fork-max-bytes` / `CARRY_PROXY_FORK_MAX_BYTES` | 262144 | 2–1048576 serialized review-version bytes per lineage |
 | `--fork-max-age-secs` / `CARRY_PROXY_FORK_MAX_AGE_SECS` | 86400 | 0–604800 seconds |
 
 Historical `fork-max-*` operator names now bound transparent evidence, not a
 client fork API. Expired/oldest references are removed until bounds fit, then
 mark-and-sweep removes unreachable nodes. Age is enforced at lookup/publication;
 physical erasure occurs on the next index publication, not a background janitor.
-This is not a global quota or automatic deletion of legacy mutable checkpoints.
-Archive eviction does not clear existing child removal state. Large/unretained
-histories can continue but may lack reusable evidence/ID expansion. One proxy
+Evicting a transparent tip evicts its selected snapshot and diagnostic mirror;
+unreachable canonical nodes are collected. This does not delete legacy explicit
+checkpoints. Retained children preserve their own removal state. Large/unretained
+histories may lack reusable evidence/ID expansion. One proxy
 process owns a state directory; independent concurrent process writers are not
 supported.
 
-Checkpoint publication precedes index publication. A crash between them can lose
-reuse but cannot grant uncommitted advice. Orphan temporary files are never
+Diagnostic mirror publication precedes atomic index publication. A crash between
+them leaves the prior indexed selection authoritative, never new uncommitted
+advice. Orphan temporary files are never
 authority. Archive size is bounded on load/publication; loss/corruption is not
 repaired by scanning arbitrary old checkpoints.
 

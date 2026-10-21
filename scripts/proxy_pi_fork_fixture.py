@@ -164,7 +164,7 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
                     for ref in index['tips'].values():
                         path = state_dir/(ref['session']+'.json')
                         if not path.exists(): continue
-                        value = json.loads(path.read_text())
+                        value = index.get('snapshots', {}).get(ref['session']) or json.loads(path.read_text())
                         if value.get('history_frontier'):
                             frontier = value['history_frontier']
                             canonical = []
