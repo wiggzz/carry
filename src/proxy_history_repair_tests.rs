@@ -212,6 +212,109 @@ async fn history_failed_small_publication_and_lowered_restart_preserve_generatio
 }
 
 #[tokio::test]
+async fn history_paid_primary_abandoned_attempt_is_durably_censored_once() {
+    use std::sync::atomic::AtomicUsize;
+    let directory = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (seen, held, go) = (calls.clone(), arrived.clone(), release.clone());
+    let app = Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let (seen, held, go) = (seen.clone(), held.clone(), go.clone());
+            async move {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    held.notify_one();
+                    go.notified().await;
+                }
+                axum::Json(json!({"id":format!("abandoned_{n}"),"status":"completed",
+                "output":[],"usage":{"input_tokens":100,"output_tokens":1}}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let provider = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut service = checkpoint_service(directory.path());
+    service.config.upstream_url = endpoint;
+    service.config.review_every_requests = 100;
+    service.config.bootstrap_min_input_bytes = usize::MAX;
+    service.config.history_max_bytes = 16384;
+    let service = Arc::new(service);
+    let input = json!([{"role":"user","content":"abandoned paid goal"}]);
+    let pending_service = service.clone();
+    let body =
+        Bytes::from(serde_json::to_vec(&json!({"model":"gpt-6-luna","input":input})).unwrap());
+    let pending = tokio::spawn(async move {
+        forward_request(
+            pending_service,
+            HeaderMap::new(),
+            body,
+            false,
+            logging::request_id(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+        .await
+        .unwrap();
+    let owner = history_race_owner(&service, "abandoned paid goal");
+    let prior = std::fs::read(directory.path().join("history.index")).unwrap();
+    pending.abort();
+    let _ = pending.await;
+    release.notify_one();
+    let store: Value = serde_json::from_slice(&prior).unwrap();
+    assert_eq!(
+        store["snapshots"][&owner]["primary_pending"], true,
+        "a paid transport must own a durable primary attempt before it can be abandoned"
+    );
+    // A new process/service has no worker or in-memory candidate. The next
+    // actual call must preserve one unknown attempted call, never invent usage.
+    let mut restarted = checkpoint_service(directory.path());
+    restarted.config = service.config.clone();
+    let restarted = Arc::new(restarted);
+    history_race_send(restarted.clone(), input.clone()).await;
+    let saved = load(&restarted, &owner).unwrap();
+    assert_eq!(saved.primary.calls, 2);
+    assert_eq!(saved.primary.unavailable_cost_calls, 1);
+    assert_eq!(saved.primary.input_tokens, 100);
+    assert_eq!(
+        saved
+            .cost_trajectory
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .coverage
+            .prior_untracked_calls,
+        1
+    );
+    history_race_send(restarted.clone(), input).await;
+    let saved = load(&restarted, &owner).unwrap();
+    assert_eq!(saved.primary.calls, 3);
+    assert_eq!(saved.primary.unavailable_cost_calls, 1);
+    assert_eq!(
+        saved
+            .cost_trajectory
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .coverage
+            .prior_untracked_calls,
+        1
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert!(
+        std::fs::read(directory.path().join("history.index"))
+            .unwrap()
+            .len()
+            <= 16384
+    );
+    provider.abort();
+}
+
+#[tokio::test]
 async fn history_paid_primary_oversized_settlement_survives_restart() {
     history_paid_growth(false, 32768).await;
 }
