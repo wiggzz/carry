@@ -80,6 +80,28 @@ def settled(directory, session, branch, completed):
     return wait_lineage_settled(directory, 'local-trial', session, branch, completed)
 
 
+class ParentCheckpointProof:
+    """Fixture-only exact-file readback; never reserialize the raw baseline."""
+    def __init__(self, root, target, expected):
+        self.root, self.target, self.expected = Path(root), Path(target), expected
+        self.before = self.target.read_bytes()
+        self.snapshots = []
+        self.check('before-fork')
+
+    def check(self, stage):
+        raw = self.target.read_bytes()
+        filename = 'parent-b-'+stage+'.raw.json'
+        (self.root/filename).write_bytes(raw)
+        row = {'stage':stage, 'file':filename, 'bytes':len(raw),
+            'sha256':hashlib.sha256(raw).hexdigest(), 'raw_equal':raw==self.before,
+            'parsed_equal':json.loads(raw)==self.expected}
+        self.snapshots.append(row)
+        (self.root/'parent-raw-proof.json').write_text(json.dumps({
+            'target':str(self.target),'snapshots':self.snapshots},indent=2)+'\n')
+        assert row['raw_equal'], 'parent raw bytes changed: '+stage
+        assert row['parsed_equal'], 'parent B parsed state changed: '+stage
+
+
 def run_case(*, carry, pi, output, fixture_class, observer_class):
     root = Path(output); root.mkdir()
     workspace = root/'workspace'; workspace.mkdir()
@@ -177,6 +199,8 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         b = settled(state_dir, session, parent_branch, 4)
         rpc.prompt('B_ONLY: verify later disposable reviewer cleanup.')
         b = settled(state_dir, session, parent_branch, 5)
+        parent_proof = ParentCheckpointProof(root,
+            state_path(state_dir,'local-trial',session,parent_branch),b)
         assert b['reviewer_compactions']>0, 'actual parent disposable cleanup'
         assert any(m['text']=='B_ONLY_FACT' for m in b['memories']), 'B-only advice must really exist on parent'
         (root/'b-checkpoint.json').write_text(json.dumps(b)+'\n')
@@ -229,6 +253,7 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         assert child['reviewer_cache']==[] and not child['background_review_pending']
         (root/'child-checkpoint.json').write_text(json.dumps(child)+'\n')
         assert json.loads(state_path(state_dir,'local-trial',session,parent_branch).read_text())==b, 'parent B unchanged'
+        parent_proof.check('after-child')
         # Restart the native process and reload the bounded mapping from disk.
         # This uses actual --session resume, not a manufactured native transcript.
         resumed = rpc.call('get_state')
@@ -250,6 +275,7 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         assert 'B_ONLY' not in json.dumps(fixture.calls[-1])
         assert len(fixture.reviews)==before_reviews and not fixture.summary_calls
         assert json.loads(state_path(state_dir,'local-trial',session,parent_branch).read_text())==b
+        parent_proof.check('after-resume')
         incoming = observer.bodies()
         assert native_observer.bodies()==incoming, 'bridge must preserve actual complete native body'
         assert len(incoming)==len(fixture.calls), 'both wire sides complete cardinality'
@@ -265,6 +291,7 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
             child_branch=child_branch, parent_native=parent_native, child_native=child_native,
             clone_native=clone_native, selected_b_user=selected, a_path=path_ids(a_tree),
             clone_path=path_ids(clone_tree), child_path=path_ids(child_tree),
-            native_requests=len(fixture.calls), reviews=len(fixture.reviews))
+            native_requests=len(fixture.calls), reviews=len(fixture.reviews),
+            parent_raw_proof=parent_proof.snapshots)
         (root/'result.json').write_text(json.dumps(result, indent=2)+'\n')
     return result

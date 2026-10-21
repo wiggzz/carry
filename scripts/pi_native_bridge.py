@@ -14,6 +14,11 @@ import time
 from urllib.parse import urlsplit
 import uuid
 
+try:
+    from pi_terminal_sse import TerminalSSE
+except ImportError:
+    from scripts.pi_terminal_sse import TerminalSSE
+
 MAX_BODY = 16 * 1024 * 1024
 MAX_MAPPING = 65536
 MAX_BRANCHES = 32
@@ -99,21 +104,13 @@ class PiNativeBridge:
                             for k,v in response.getheaders():
                                 if k.lower() not in HOP: self.send_header(k,v)
                             self.end_headers()
-                            tail = b''
+                            terminal = TerminalSSE()
                             while True:
                                 chunk = response.read1(65536)
                                 if not chunk: break
-                                tail = (tail+chunk)[-65536:]
                                 self.wfile.write(chunk); self.wfile.flush()
-                            complete = False
-                            for line in tail.splitlines():
-                                if not line.startswith(b'data: '): continue
-                                try: event = json.loads(line[6:])
-                                except ValueError: continue
-                                if (event.get('type')=='response.completed'
-                                        and event.get('response',{}).get('status')=='completed'):
-                                    complete = True
-                            if response.status==200 and complete:
+                                terminal.feed(chunk)
+                            if response.status==200 and terminal.completed():
                                 # Volatile original complete input, only for the next
                                 # explicit observe_boundary() after durable settlement.
                                 outer.last_body = (outer.active, raw)
@@ -141,6 +138,9 @@ class PiNativeBridge:
         temporary = self.mapping.with_suffix('.tmp')
         fd = os.open(temporary, os.O_WRONLY|os.O_CREAT|os.O_TRUNC, 0o600)
         with os.fdopen(fd,'wb') as output:
+            # The directory belongs to this single trusted controller. Creation
+            # mode alone does not harden a leftover temporary inode.
+            os.fchmod(output.fileno(), 0o600)
             output.write(raw); output.flush(); os.fsync(output.fileno())
         os.replace(temporary,self.mapping)
 

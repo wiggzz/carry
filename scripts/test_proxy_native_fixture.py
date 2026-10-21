@@ -11,6 +11,10 @@ import subprocess
 import tempfile
 import threading
 
+# The existing normal hosted suite owns these additive model-free regressions.
+from scripts.test_pi_native_bridge import (PiBridgeCompletionTests, PiMappingModeTests,
+    PiParentRawProofTests, PiTerminalParserTests)
+
 
 class ShadowContractProvider:
     """Real HTTP wire capture; no model, credentials or synthesized proxy state."""

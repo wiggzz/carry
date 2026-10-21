@@ -60,6 +60,29 @@ the child uses only its own branch. Failure leaves creation intent intact.
 Unknown, expired and incompatible native intent is typed and fail-closed.
 Ordinary fitting unreviewed branches pass with no discovery requirement.
 
+### Terminal observation contract
+
+The bridge forwards each raw response chunk immediately and unchanged, then
+observes it with `pi_terminal_sse.py`; it does not buffer a response or journal
+output. The final framed SSE JSON data event must have root
+`type="response.completed"` and direct `response.status="completed"` on HTTP
+200. A following exact `[DONE]` data event is allowed. Event names, nested
+lookalikes and output text are not completion authority. A later failed,
+incomplete or malformed data event, a truncated frame, or invalid UTF-8 leaves
+intent pending. All JSON syntax is validated, including discarded output;
+escaped selector names/values are decoded. Duplicate selector fields fail
+closed rather than choosing one interpretation.
+
+LF, CRLF and CR line/frame delimiters, comments, optional data-field spacing,
+multiple events and multiline data joined with LF are supported. Recognition
+does not depend on event, output-string, numeric-token or array length. It
+retains at most 128 grammar frames and 256 raw characters per string token;
+longer strings are validated but cannot match the small selector names/values.
+Depth above 128 fails closed without changing forwarded bytes. No general
+provider JSON response or unterminated EOF frame is promoted to SSE success.
+There was no existing Python incremental JSON/SSE parser in this repository;
+the isolated observer has stdlib-only behavioral/differential tests.
+
 ## Bounded state and evidence
 
 The 0600 atomically replaced mapping has a 64 KiB / 32-native bound; it holds
@@ -70,6 +93,11 @@ A single bounded original request is volatile only, for explicit association;
 there is no journal, global checkpoint search or reset-on-divergence fallback.
 This is an exclusive single-controller trial seam, not a multi-process mapping
 service or a production plugin.
+The mapping directory must be private and owned by the single trusted
+controller. `fchmod` on the opened temporary descriptor enforces 0600 even for
+a preexisting 0644 temporary inode, before any write or replacement; hardening
+failure does not replace the last mapping. This is not a hostile-filesystem,
+symlink or multi-process integrity guarantee.
 
 Fixture-only `native-wire.jsonl` (actual caller), `carry-wire.jsonl` (operator
 projection/matching), `provider-wire.json` (actual outbound requests, receipts,
@@ -81,6 +109,14 @@ B-only advice must be absent; C, protected A and remaining tool cohorts must
 survive. The parent has real B-only advice and later disposable reviewer cleanup.
 The child has zero rescue review/summary, cold spend/cache, no inherited mutable
 workers, an unchanged parent checkpoint and stable actual native restart/resume.
+The tracer now reads the exact parent checkpoint immediately after B settles
+and before any fork/clone, then reads that same target after the first child
+and resumed child requests. `parent-b-{before-fork,after-child,after-resume}.raw.json`
+preserve these actual bytes; `parent-raw-proof.json` records each SHA-256/size
+and requires both raw-byte and parsed-state equality. The older reserialized
+`b-checkpoint.json` remains a decoded-state artifact, not a byte baseline. This
+new proof applies only to fresh runs; prior captures are not retroactively
+certified as raw-byte identical.
 
 `wait_lineage_settled` locates precisely tenant/session/branch's checkpoint;
 malformed/decoy/unrelated-held controls cannot substitute for or block that
