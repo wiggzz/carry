@@ -68,6 +68,16 @@ async fn history_two_tip_interleaving() {
     let c = json!({"role":"user","content":"waiting divergent C"});
     history_race_send(service.clone(), json!([a, b])).await;
     let first = history_race_owner(&service, "race common goal");
+    // Explicit selected-state fixture: primary receipts came from ingress;
+    // nonempty removal/memory authority must survive the lock race as well.
+    let mut selected = load(&service, &first).unwrap();
+    selected.history[1].removed = true;
+    selected.memories.push(Memory {
+        id: 99,
+        source_ids: vec![selected.history[1].id],
+        text: "first branch selected fact".into(),
+    });
+    save(&service, &first, &selected).unwrap();
     let first_lock = session_lock(&service, &first).await;
     let (sender, mut waits) = tokio::sync::mpsc::unbounded_channel();
     *service.lock_waits.lock().unwrap() = Some(sender);
@@ -96,6 +106,11 @@ async fn history_two_tip_interleaving() {
         std::fs::read(directory.path().join(format!("{first}.json"))).unwrap(),
         first_bytes
     );
+    let saved_first = load(&service, &first).unwrap();
+    assert!(saved_first.history[1].removed);
+    assert_eq!(saved_first.memories[0].text, "first branch selected fact");
+    assert_eq!(saved_first.completed_requests, 2);
+    assert_eq!(saved_first.primary.calls, 2);
     let saved_second = load(&service, &second).unwrap();
     assert_eq!(
         saved_second

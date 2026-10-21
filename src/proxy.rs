@@ -1400,15 +1400,26 @@ async fn forward_request(
         let mut lock = session_lock(&service, &id).await;
         let mut session = load(&service, &id)?;
         if implicit {
-            // A sibling may have advanced this mutable tip while we waited.
-            // Re-resolve after taking the lock; never reset that sibling.
-            let mut check = session.clone();
-            if !session.history.is_empty()
-                && check.ingest(body["input"].as_array().unwrap()).is_err()
-            {
+            loop {
+                // Every selected mutable tip can advance while its lock is awaited,
+                // including a replacement selected after an earlier wait.
+                let mut check = session.clone();
+                if session.history.is_empty()
+                    || check.ingest(body["input"].as_array().unwrap()).is_ok()
+                {
+                    break;
+                }
                 drop(lock);
                 let (selected, point, pin) =
                     history::resolve(&service, history_namespace.as_ref().unwrap(), &body)?;
+                if selected == id {
+                    // A stable exact tip rejected ingest for another reason (for
+                    // example its opaque checkpoint/item limit). Never spin.
+                    return Err(failure(
+                        StatusCode::BAD_REQUEST,
+                        "history incompatible with retained tip",
+                    ));
+                }
                 id = selected;
                 history_pin = pin;
                 fork = point.map(|p| (format!("automatic/{}", p.id), p));
