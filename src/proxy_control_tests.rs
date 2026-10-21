@@ -47,6 +47,81 @@ fn ledger(body: &Value) -> Value {
 }
 
 #[test]
+fn primary_direction_precedes_sources_in_every_projection() {
+    let (config, mut session) = fixture();
+    let first = review_body(&config, &session);
+    commit(&mut session, &first);
+    let mut clean = session.clone();
+    clean.compact_reviewer();
+    let groups = session.groups();
+    for input in [
+        first["input"].as_array().unwrap().clone(),
+        review_body(&config, &session)["input"]
+            .as_array()
+            .unwrap()
+            .clone(),
+        memory_review_body(&config, &clean)["input"]
+            .as_array()
+            .unwrap()
+            .clone(),
+        review_body_for_groups(&config, &clean, &groups[..1])["input"]
+            .as_array()
+            .unwrap()
+            .clone(),
+        session.shadow_input_for_groups(&groups),
+    ] {
+        let direction = input
+            .iter()
+            .position(|item| item.to_string().contains("FIRST_DIRECTION"))
+            .unwrap();
+        let source = input
+            .iter()
+            .position(|item| item.to_string().contains("durable task"))
+            .unwrap_or(input.len());
+        assert!(
+            direction < source,
+            "primary direction must precede observed conversation sources"
+        );
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item.to_string().contains("FIRST_DIRECTION"))
+                .count(),
+            1
+        );
+        assert_eq!(input[direction]["role"], "user");
+    }
+}
+
+#[test]
+fn changed_direction_rejects_background_authority_but_settles_receipt() {
+    let (config, mut current) = fixture();
+    let body = review_body(&config, &current);
+    commit(&mut current, &body);
+    let before = current.clone();
+    let mut reviewed = before.clone();
+    reviewed.apply_advice(&reviewed.groups(), &json!({"protected":["g2"],"removable":[],"memories":[{"source_ids":["g2"],"text":"STALE_DIRECTION_FACT"}]})).unwrap();
+    current.review_context["instructions"] = json!("LATEST_DIRECTION");
+    let run = ReviewRun {
+        receipts: vec![ReviewReceipt {
+            model: "gpt-6-luna".into(),
+            input: 100,
+            usage: Some(json!({"input_tokens":100,"output_tokens":1})),
+            standard: true,
+            completed: true,
+        }],
+        ..ReviewRun::default()
+    };
+    assert!(
+        !merge_review(&config, &mut current, &before, &reviewed, &run),
+        "old-direction advice has no current authority"
+    );
+    assert!(current.memories.is_empty());
+    assert!(current.opinions.is_empty());
+    assert_eq!(current.shadow.calls, before.shadow.calls + 1);
+}
+
+#[test]
 fn initial_empty_direction_has_no_moving_control_suffix() {
     let (config, mut session) = fixture();
     for instructions in [Value::Null, json!("")] {

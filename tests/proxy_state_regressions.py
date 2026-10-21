@@ -285,6 +285,13 @@ class StateRegressions(unittest.TestCase):
             self.assertEqual(proxy.send(history, instructions=instruction)[0], 200)
         self.assertEqual(len(fixture.reviews), 4)
         body = fixture.reviews[-1]
+        for captured in fixture.reviews:
+            direction = next(i for i, item in enumerate(captured["input"])
+                             if b"UNIQUE_DIRECTION_" in wire(item))
+            source = next(i for i, item in enumerate(captured["input"])
+                          if b"fixture goal" in wire(item))
+            self.assertLess(direction, source,
+                            "quoted primary direction must precede conversation sources")
         self.assertEqual(wire(body).count(b"UNIQUE_DIRECTION_"), 1,
                          "unchanged primary instructions must be ingested once, not per ledger")
         for before, after in zip(fixture.reviews, fixture.reviews[1:]):
