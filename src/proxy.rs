@@ -220,6 +220,8 @@ struct Service {
     auth_token: Option<String>,
     locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     background_reviews: Arc<Mutex<HashSet<String>>>,
+    #[cfg(test)]
+    lock_waits: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
     _directory_lock: Arc<File>,
 }
 
@@ -398,6 +400,8 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         config,
         locks: Arc::new(Mutex::new(HashMap::new())),
         background_reviews: Arc::new(Mutex::new(HashSet::new())),
+        #[cfg(test)]
+        lock_waits: std::sync::Mutex::new(None),
         _directory_lock: Arc::new(directory_lock),
     });
     logging::maintain(&service);
@@ -521,6 +525,12 @@ async fn session_lock(service: &Service, id: &str) -> OwnedMutexGuard<()> {
             lock
         }
     };
+    #[cfg(test)]
+    if let Some(sender) = service.lock_waits.lock().unwrap().as_ref() {
+        // On the single-threaded regression runtime the next poll registers the
+        // waiter before the observer runs. No sleep or production scheduling hook.
+        let _ = sender.send(id.to_owned());
+    }
     lock.lock_owned().await
 }
 
@@ -4219,6 +4229,8 @@ mod tests {
             auth_token: None,
             locks: Arc::new(Mutex::new(HashMap::new())),
             background_reviews: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            lock_waits: std::sync::Mutex::new(None),
         }
     }
 
@@ -4228,6 +4240,7 @@ mod tests {
     include!("proxy_catalog_isolation_tests.rs");
     include!("proxy_catalog_pair_tests.rs");
     include!("proxy_lease_join_tests.rs");
+    include!("proxy_history_repair_tests.rs");
     mod output_action_tests {
         include!("proxy_output_action_tests.rs");
     }
@@ -5644,6 +5657,8 @@ mod tests {
             auth_token: None,
             locks: Arc::new(Mutex::new(HashMap::new())),
             background_reviews: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            lock_waits: std::sync::Mutex::new(None),
         };
         save(&service, "large-missing-usage", &session).unwrap();
         assert_eq!(
