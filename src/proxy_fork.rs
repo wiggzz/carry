@@ -17,9 +17,9 @@ pub(super) struct Source {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Point {
     pub id: String,
-    at: u64,
+    pub(super) at: u64,
     scope: String,
-    sources: Vec<Source>,
+    pub(super) sources: Vec<Source>,
     groups: Value,
     opinions: BTreeMap<u64, String>,
     drop_members: BTreeMap<u64, Vec<u64>>,
@@ -31,7 +31,7 @@ fn digest(value: &impl Serialize) -> String {
     format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap()))
 }
 
-fn scope(config: &ProxyCli, context: &Value) -> String {
+pub(super) fn scope(config: &ProxyCli, context: &Value) -> String {
     let mut context = context.clone();
     if let Some(object) = context.as_object_mut() {
         // Affinity is branch-local, and is never evidence of review authority.
@@ -57,7 +57,7 @@ fn groups(session: &Session) -> Value {
     )
 }
 
-fn expired(config: &ProxyCli, point: &Point, at: u64) -> bool {
+pub(super) fn expired(config: &ProxyCli, point: &Point, at: u64) -> bool {
     point.at > at || at.saturating_sub(point.at) >= config.fork_max_age_secs
 }
 
@@ -228,6 +228,14 @@ pub(super) async fn matching(
     })))
 }
 
+pub(super) fn matches_sources(point: &Point, input: &[Value]) -> bool {
+    input.len() >= point.sources.len()
+        && input
+            .iter()
+            .zip(&point.sources)
+            .all(|(v, s)| digest(v) == s.sha256)
+}
+
 pub(super) fn conflict(code: &str) -> Failure {
     (
         StatusCode::CONFLICT,
@@ -304,7 +312,11 @@ pub(super) async fn resolve(
 /// Validate caller-owned full input using exactly the hydration prefix,
 /// settings and complete-cohort rules. This transient projection contains no
 /// inherited advice, memories, receipts or worker state and is never saved.
-fn compatible_child(config: &ProxyCli, point: &Point, body: &Value) -> Result<Session, Failure> {
+pub(super) fn compatible_child(
+    config: &ProxyCli,
+    point: &Point,
+    body: &Value,
+) -> Result<Session, Failure> {
     let input = body["input"]
         .as_array()
         .ok_or_else(|| conflict("fork_unsupported"))?;

@@ -182,6 +182,8 @@ pub(super) struct Session {
     pub fork_points: Vec<crate::proxy::forking::Point>,
     #[serde(default)]
     pub fork_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_namespace: Option<String>,
     /// Bounded expiry diagnostics, not global source-removal tombstones.
     #[serde(default)]
     pub fork_expired: Vec<String>,

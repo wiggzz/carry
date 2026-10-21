@@ -218,6 +218,8 @@ struct Service {
 mod admission;
 #[path = "proxy_fork.rs"]
 pub(crate) mod forking;
+#[path = "proxy_history.rs"]
+mod history;
 #[path = "proxy_plan.rs"]
 mod planning;
 use planning::plan;
@@ -545,7 +547,8 @@ fn load(service: &Service, id: &str) -> Result<Session, Failure> {
 }
 
 fn save(service: &Service, id: &str, session: &Session) -> std::io::Result<()> {
-    save_with_limit(service, id, session, CHECKPOINT_MAX_BYTES)
+    save_with_limit(service, id, session, CHECKPOINT_MAX_BYTES)?;
+    history::committed(service, id, session)
 }
 
 fn save_with_limit(
@@ -1289,6 +1292,8 @@ async fn forward_request(
         ));
     }
     let implicit = service.config.mode != Mode::Off && id.is_none();
+    let mut automatic_point = None;
+    let mut history_namespace = None;
     if implicit {
         if body
             .get("previous_response_id")
@@ -1299,19 +1304,11 @@ async fn forward_request(
                 "previous_response_id requires an explicit session; use full history otherwise",
             ));
         }
-        // One active prefix per owner/settings scope, NOT a fork index or a
-        // search by response ID. A divergent or shorter history replaces it.
-        let mut scope_headers = headers.clone();
-        scope_headers.insert("x-carry-session", "carry-active-prefix".parse().unwrap());
-        let owner = identity(&scope_headers)?.unwrap();
-        id = Some(
-            reviewer_serialized_identity(&json!({
-                "domain": "carry-active-prefix-v1", "owner": owner,
-                "settings": cache_base(&body),
-                "client_scope": stable_client_scope(&body)
-            }))
-            .1,
-        );
+        let namespace = history::namespace(&service, &headers, &body)?;
+        let (selected, point) = history::resolve(&service, &namespace, &body)?;
+        id = Some(selected);
+        automatic_point = point;
+        history_namespace = Some(namespace);
     }
     let native = legacy_native
         || body["input"].as_array().is_some_and(|items| {
@@ -1349,7 +1346,11 @@ async fn forward_request(
                 Sha256::digest(format!("carry-primary-{id}").as_bytes())
             ));
         }
-        let fork = forking::resolve(&service, &headers, &body, &id, implicit, native).await?;
+        let fork = if let Some(point) = automatic_point {
+            Some((format!("automatic/{}", point.id), point))
+        } else {
+            forking::resolve(&service, &headers, &body, &id, implicit, native).await?
+        };
         let declared_fork = fork.is_some();
         let lock = session_lock(&service, &id).await;
         let mut session = load(&service, &id)?;
@@ -1361,6 +1362,7 @@ async fn forward_request(
         } else {
             false
         };
+        session.history_namespace = history_namespace;
         if service.config.mode != Mode::Off {
             let model = body["model"]
                 .as_str()
