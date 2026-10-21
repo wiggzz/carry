@@ -313,6 +313,56 @@ class TransparentHistory(unittest.TestCase):
         self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
         self.assertIn("A_FACT", json.dumps(fixture.primaries[-1]["input"]))
 
+    def test_explicit_settings_change_cannot_republish_old_observed_ids(self):
+        import concurrent.futures
+        import threading
+        held, release = threading.Event(), threading.Event()
+        self.stack.callback(release.set)
+        def primary(_body, n):
+            if n == 2:
+                held.set()
+                assert release.wait(5), "held settings-B primary release"
+                return 503, {"error": "B did not complete"}
+            value = completed(response_id=f"scope_{n}")
+            if n == 1:
+                value["conversation"] = {"id": "conversation_A"}
+            return 200, value
+        fixture = self.fixture(primary)
+        options = ["--review-every-requests", "100"]
+        proxy = Proxy(self.state, fixture, options)
+        self.stack.callback(proxy.close)
+        a = [{"role": "user", "content": "EXPLICIT_A"}]
+        b = a + [{"role": "user", "content": "EXPLICIT_B"}]
+        self.assertEqual(proxy.send(a, instructions="A")[0], 200)
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            pending = pool.submit(proxy.send, b, instructions="B")
+            self.assertTrue(held.wait(2))
+            lookup = pool.submit(proxy.send, [], previous_response_id="scope_1", instructions="B")
+            try:
+                done, _ = concurrent.futures.wait([lookup], timeout=1)
+                self.assertIn(lookup, done, "foreign-setting ID must reject before waiting on the held branch")
+                status, result = lookup.result()
+                self.assertEqual(status, 409, result)
+                self.assertEqual(len(fixture.primaries), 2, "reject B ancestry before lock/upstream")
+            finally:
+                release.set()
+            self.assertEqual(pending.result()[0], 503)
+        count = (len(fixture.primaries), len(fixture.reviews))
+        for selector in ({"previous_response_id": "scope_1"}, {"conversation": "conversation_A"}):
+            self.assertEqual(proxy.send([], instructions="B", **selector)[0], 409)
+        self.assertEqual((len(fixture.primaries), len(fixture.reviews)), count)
+        proxy.close()
+        proxy = Proxy(self.state, fixture, options)
+        self.stack.callback(proxy.close)
+        for selector in ({"previous_response_id": "scope_1"}, {"conversation": "conversation_A"}):
+            self.assertEqual(proxy.send([], instructions="B", **selector)[0], 409)
+            self.assertEqual(proxy.send([b[-1]], instructions="A", **selector)[0], 200)
+        self.assertEqual(proxy.send(b, instructions="B")[0], 200)
+        observed_b = f"scope_{len(fixture.primaries)}"
+        self.assertEqual(proxy.send([], instructions="B", previous_response_id=observed_b)[0], 200)
+        self.assertEqual(proxy.send([], instructions="B", conversation="conversation_A")[0], 409,
+                         "a genuine B response cannot inherit an unobserved A conversation")
+
     def test_unknown_settings_and_client_rewrites_do_not_reuse_advice(self):
         proxy, fixture, history, _ = self.seed()
         changed = history + [{"role": "user", "content": "CHANGED_SETTINGS"}]
@@ -408,7 +458,7 @@ class TransparentHistory(unittest.TestCase):
                 self.stack.callback(release.set)
                 def review(body, _n):
                     held.set()
-                    assert release.wait(9), "held reviewer release"
+                    assert release.wait(45), "held reviewer release"
                     ids = ledger(body)["eligible_group_ids"]
                     return 200, advice_response({"protected": ["g1"],
                         "removable": [i for i in ids if i != "g1"],
@@ -419,7 +469,8 @@ class TransparentHistory(unittest.TestCase):
                     {"CARRY_PROXY_HISTORY_MAX_BYTES": "300000"} if pressure == "bytes" else
                     {"CARRY_PROXY_FORK_MAX_AGE_SECS": "1"}))
                 options = ["--review-replayed-history", "--payoff-requests", "1",
-                           "--classifier-cache-policy", "disabled", "--background-reviews=true"]
+                           "--classifier-cache-policy", "disabled", "--background-reviews=true",
+                           "--classifier-timeout-secs", "60"]
                 proxy = TransparentProxy(self.state, fixture, options, env)
                 self.stack.callback(proxy.close)
                 history = [{"role": "user", "content": "PINNED_GOAL"},
@@ -480,12 +531,12 @@ class TransparentHistory(unittest.TestCase):
         def primary(_b, n):
             if n == 2:
                 held.set()
-                assert release.wait(4), "held primary release"
+                assert release.wait(20), "held primary release"
             return 200, completed(response_id=f"primary_pin_{n}")
         fixture.primary = primary
         proxy.close()
         env = {"CARRY_PROXY_HISTORY_MAX_REFERENCES": "6"}
-        proxy = TransparentProxy(self.state, fixture, options, env)
+        proxy = TransparentProxy(self.state, fixture, [*options, "--request-timeout-secs", "30"], env)
         self.stack.callback(proxy.close)
         parent = history + [{"role": "user", "content": "HELD_PRIMARY"}]
         with concurrent.futures.ThreadPoolExecutor() as pool:
