@@ -570,6 +570,8 @@ impl Session {
     }
 
     pub fn render_primary(&self) -> Vec<Value> {
+        #[cfg(test)]
+        crate::proxy::planner_work::record("primary_renders");
         self.render_primary_with_ids()
             .into_iter()
             .map(|(_, value)| value)
@@ -578,6 +580,8 @@ impl Session {
 
     /// Source identity stays aligned with wire slots, including inserted memories.
     pub fn render_primary_with_ids(&self) -> Vec<(Option<u64>, Value)> {
+        #[cfg(test)]
+        crate::proxy::planner_work::record("primary_renders_with_ids");
         let removed = self
             .history
             .iter()

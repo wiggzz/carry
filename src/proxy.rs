@@ -4080,7 +4080,7 @@ mod catalog_regressions;
 
 #[cfg(test)]
 #[path = "proxy_planner_work_tests.rs"]
-mod planner_work;
+pub(crate) mod planner_work;
 
 #[cfg(test)]
 mod tests {
@@ -4157,6 +4157,7 @@ mod tests {
         include!("proxy_lease_review_tests.rs");
         include!("proxy_lease_acceptance_tests.rs");
         include!("proxy_lease_performance_tests.rs");
+        include!("proxy_primary_render_reuse_tests.rs");
     }
 
     #[test]

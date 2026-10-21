@@ -144,10 +144,18 @@ pub(super) fn economic_candidate(
     #[cfg(test)]
     super::planner_work::record("economic_probes");
     let mut retained = body.clone();
+    #[cfg(test)]
+    let primary_scope = super::planner_work::primary_scope("economic_primary_renders");
     retained["input"] = json!(session.render_primary());
+    #[cfg(test)]
+    drop(primary_scope);
     plan_inner(config, session, &retained, Some(paid))
         .0
-        .is_some_and(|candidate| candidate.render_primary() != session.render_primary())
+        .is_some_and(|candidate| {
+            #[cfg(test)]
+            let _primary_scope = super::planner_work::primary_scope("economic_primary_renders");
+            candidate.render_primary() != session.render_primary()
+        })
 }
 
 fn capacity_body(config: &ProxyCli, session: &Session) -> Option<Value> {
@@ -271,6 +279,8 @@ fn plan_inner(
         }
         let mut candidate = session.clone();
         candidate.remove(&removed, &groups);
+        #[cfg(test)]
+        let primary_scope = super::planner_work::primary_scope("candidate_primary_renders");
         let changed = candidate.render_primary() != session.render_primary();
         let action = if changed { "joint" } else { "reviewer_only" };
         // Identity names the action, not its score, enumeration index, cap, or
@@ -289,6 +299,8 @@ fn plan_inner(
         );
         let mut compact = body.clone();
         compact["input"] = json!(candidate.render_primary());
+        #[cfg(test)]
+        drop(primary_scope);
         let compact_review = review_body(config, &candidate);
         let feasible = primary_fits(config, &compact);
         let compact = primary_wire_body(config, &compact);
