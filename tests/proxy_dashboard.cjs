@@ -159,5 +159,19 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   await vm.runInContext('refresh()', sandbox);
   assert.equal(cards().get('Estimated savings · all time'), 'Unavailable');
   assert.ok(elements.get('estimate-coverage').textContent.includes('Includes 0 of 0 sessions'));
+  data.sessions = [{...session(1, 2), title:'Action identity', planner:{
+    selected:true, selected_candidate_id:'stable-reviewer', selected_action:'reviewer_only',
+    mode:'compact', payoff_requests:3, min_payback_percent:0,
+    primary_output_allowance_tokens:500,
+    primary_output_allowance_basis:'request_max_output_tokens_cap_sensitivity_not_expected_generation',
+    candidate:{candidate_id:'stable-reviewer', action:'reviewer_only', keep:2, compact:1.5, savings:0.5}
+  }}];
+  await vm.runInContext('refresh()', sandbox);
+  assert.ok(walk(elements.get('sessions')).some(n=>/reviewer.only cleanup selected/i.test(n.textContent)), 'render the actual selected action, not generic primary compaction');
+  assert.ok(walk(elements.get('sessions')).some(n=>/500.*cap sensitivity.*not expected generation/i.test(n.textContent)), 'explicit output cap is sensitivity, not a usage prediction');
+  data.sessions[0].planner.primary_output_allowance_tokens=0;
+  data.sessions[0].planner.primary_output_allowance_basis='legacy_zero_no_explicit_request_cap_not_headroom';
+  await vm.runInContext('refresh()', sandbox);
+  assert.ok(walk(elements.get('sessions')).some(n=>/zero.*no explicit.*cap/i.test(n.textContent)), 'missing request cap must not silently mean expected headroom output');
   console.log('proxy dashboard scenarios: ok');
 })().catch(error => { console.error(error); process.exitCode = 1; });

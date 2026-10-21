@@ -1031,20 +1031,32 @@ async fn dashboard_stats(
             .map(|g| g.members.len())
             .sum::<usize>();
         let last_plan = &session.last_plan;
-        let best_candidate = last_plan["candidates"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|candidate| candidate.get("joint"))
-            .filter(|joint| joint["savings"].as_f64().is_some())
-            .max_by(|a, b| {
-                a["savings"]
-                    .as_f64()
-                    .partial_cmp(&b["savings"].as_f64())
-                    .unwrap()
-            });
+        let rows = last_plan["candidates"].as_array();
+        let selected_id = last_plan["selected_candidate_id"].as_str();
+        let best_candidate = if last_plan["selected"] == true {
+            // Forced selection minimizes feasible cost, not the largest recurring
+            // savings row. Older selected reports have no recoverable identity.
+            rows.into_iter()
+                .flatten()
+                .find(|row| selected_id.is_some() && row["candidate_id"].as_str() == selected_id)
+        } else {
+            rows.into_iter()
+                .flatten()
+                .filter(|row| row["feasible"] == true)
+                .filter(|row| row["selection_joint"]["savings"].as_f64().is_some())
+                .max_by(|a, b| {
+                    a["selection_joint"]["savings"]
+                        .as_f64()
+                        .partial_cmp(&b["selection_joint"]["savings"].as_f64())
+                        .unwrap()
+                })
+        };
         let planner = json!({
             "selected": last_plan["selected"].as_bool().unwrap_or(false),
+            "selected_candidate_id": selected_id,
+            "selected_action": last_plan["selected_action"].as_str(),
+            "primary_output_allowance_tokens": last_plan["primary_output_allowance_tokens"].as_u64(),
+            "primary_output_allowance_basis": last_plan["primary_output_allowance_basis"].as_str(),
             "mode": last_plan["mode"].as_str().unwrap_or("unknown"),
             "reason": last_plan["reason"].as_str(),
             "payoff_requests": last_plan["payoff_requests"].as_u64(),
@@ -1056,9 +1068,11 @@ async fn dashboard_stats(
             "reviewer_estimated_tokens": last_plan["reviewer_estimated_tokens"].as_f64(),
             "primary_context_tokens": service.config.primary_context_tokens,
             "reviewer_context_tokens": service.config.classifier_max_input_tokens,
-            "candidate": best_candidate.map(|joint| json!({
-                "keep": joint["keep"].as_f64(), "compact": joint["compact"].as_f64(),
-                "savings": joint["savings"].as_f64(),
+            "candidate": best_candidate.map(|row| json!({
+                "candidate_id": row["candidate_id"].as_str(), "action": row["action"].as_str(),
+                "keep": row["selection_joint"]["keep"].as_f64(),
+                "compact": row["selection_joint"]["compact"].as_f64(),
+                "savings": row["selection_joint"]["savings"].as_f64(),
             })),
         });
         let estimate = session

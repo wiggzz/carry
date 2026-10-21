@@ -128,6 +128,12 @@ async function refresh(){
    const decision=document.createElement('p');
    decision.textContent=p.forced&&p.selected?(p.mode==='audit'?'Would require compaction (audit)':'Compacted to fit the next requests'):p.selected?(p.mode==='audit'?'Last plan: would compact (audit)':'Last plan: compaction selected'):p.reason?({context_capacity_exceeded:'Protected context exceeds the available budget',unsupported_model_or_tier:'Compaction unavailable for this model or service tier'}[p.reason]||p.reason.replaceAll('_',' ')):p.candidate?'Waiting for compaction payoff':'Waiting for removable context';
    section.append(decision);
+   if(p.selected&&p.selected_action==='reviewer_only')decision.textContent=p.mode==='audit'?'Last plan: would select reviewer-only cleanup (audit)':'Last plan: reviewer-only cleanup selected';
+   if(p.primary_output_allowance_tokens!=null){
+    const output=document.createElement('p');output.className='legend';
+    output.textContent=p.primary_output_allowance_basis==='legacy_zero_no_explicit_request_cap_not_headroom'?'Primary output: legacy zero · no explicit request cap; capacity headroom is not expected output.':'Primary output: '+fmt(p.primary_output_allowance_tokens)+' tokens/request cap sensitivity · not expected generation; priced at each branch’s input-selected tariff.';
+    section.append(output);
+   }
    const capacities=document.createElement('div');capacities.className='capacity-grid';
    for(const [name,estimated,required,limit] of [['Primary',p.primary_estimated_tokens,p.primary_required_tokens,p.primary_context_tokens],['Reviewer',p.reviewer_estimated_tokens,p.reviewer_required_tokens,p.reviewer_context_tokens]]){
     if(required==null||!limit)continue;

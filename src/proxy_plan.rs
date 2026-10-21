@@ -1,9 +1,9 @@
 //! Plan the actual next primary and reviewer requests, not historical windows.
 use super::{
-    HashSet, ProxyCli, Session, Value, ViewCosts, cache_base, estimate, joint_decision, json, now,
-    primary_fits, primary_rates, primary_required_tokens, primary_wire_body, resolved_view_costs,
-    review_body, review_fits, reviewer_rates, reviewer_required_tokens, reviewer_reusable,
-    reviewer_view_costs, select_removals, standard,
+    Digest, HashSet, ProxyCli, Session, Value, ViewCosts, cache_base, estimate, joint_decision,
+    json, now, primary_fits, primary_rates, primary_required_tokens, primary_wire_body,
+    resolved_view_costs, review_body, review_fits, reviewer_rates, reviewer_required_tokens,
+    reviewer_reusable, reviewer_view_costs, select_removals, standard,
 };
 
 /// Frozen-source sensitivity: advance cadence and exposure, assuming future
@@ -179,6 +179,11 @@ fn plan_inner(
     let mut scoped = config.clone();
     scoped.model_resolution = session.model_resolution.clone();
     let config = &scoped;
+    // An explicit request cap is an opt-in sensitivity, not expected generation.
+    // Capacity headroom remains independent, including on subscription routes
+    // that strip the cap from the adapted wire. Missing caps preserve legacy zero.
+    let output_allowance = body["max_output_tokens"].as_u64();
+    let output_tokens = output_allowance.unwrap_or(0) as f64 * config.payoff_requests as f64;
     let wire = primary_wire_body(config, body);
     let reviewer = review_body(config, session);
     let capacity_override = capacity_body(config, session);
@@ -245,7 +250,7 @@ fn plan_inner(
         && reviewer_ok
         && ordinary_admission["admitted"] == true;
     let mut reports = Vec::new();
-    let mut best: Option<(Session, f64)> = None;
+    let mut best: Option<(Session, f64, String, &'static str)> = None;
     // Cleaning only disposable reviewer turns is a real candidate. It can make
     // room without rewriting an otherwise valuable primary cache prefix.
     candidates.push(groups.iter().map(|g| g.id).collect());
@@ -267,6 +272,21 @@ fn plan_inner(
         let mut candidate = session.clone();
         candidate.remove(&removed, &groups);
         let changed = candidate.render_primary() != session.render_primary();
+        let action = if changed { "joint" } else { "reviewer_only" };
+        // Identity names the action, not its score, enumeration index, cap, or
+        // generated transport keys. Memory retirement can change primary even
+        // without source removal. Keep the legacy candidate vector unchanged.
+        let mut retired_memories = session
+            .released_memory_ids()
+            .into_iter()
+            .collect::<Vec<_>>();
+        retired_memories.sort();
+        let candidate_id = format!(
+            "{:x}",
+            super::Sha256::digest(
+                serde_json::to_vec(&(action, &removed, &retired_memories)).unwrap()
+            )
+        );
         let mut compact = body.clone();
         compact["input"] = json!(candidate.render_primary());
         let compact_review = review_body(config, &candidate);
@@ -297,6 +317,31 @@ fn plan_inner(
         } else {
             None
         };
+        let output = if output_tokens == 0.0 {
+            Some(ViewCosts {
+                keep: 0.0,
+                compact: 0.0,
+            })
+        } else {
+            primary_rates(
+                config,
+                wire["model"].as_str().unwrap_or(""),
+                estimate(&wire),
+            )
+            .zip(primary_rates(
+                config,
+                compact["model"].as_str().unwrap_or(""),
+                estimate(&compact),
+            ))
+            .map(|(keep, compact)| ViewCosts {
+                keep: output_tokens * keep.output,
+                compact: output_tokens * compact.output,
+            })
+        };
+        let selection_primary = primary.zip(output).map(|(input, output)| ViewCosts {
+            keep: input.keep + output.keep,
+            compact: input.compact + output.compact,
+        });
         let joint = primary
             .zip(shadow)
             .map(|(primary, shadow)| joint_decision(primary, shadow, config.min_payback_percent));
@@ -348,10 +393,13 @@ fn plan_inner(
             keep: cost.keep,
             compact: cost.compact + acquisition.unwrap_or(0.0),
         });
-        let selection_joint = primary
+        let selection_joint = selection_primary
             .zip(selection_shadow)
             .map(|(primary, shadow)| joint_decision(primary, shadow, config.min_payback_percent));
-        reports.push(json!({"removed_groups":removed,"feasible":feasible,"joint":joint,
+        reports.push(json!({"candidate_id":candidate_id,"action":action,
+            "removed_groups":removed,"retired_memory_ids":retired_memories,"feasible":feasible,"joint":joint,
+            "selection_primary_input":primary.map(|c| json!({"keep":c.keep,"compact":c.compact})),
+            "selection_primary_output":output.map(|c| json!({"keep":c.keep,"compact":c.compact})),
             "selection_joint":selection_joint,
             "selection_review_basis":if due {"presently_due_next_review"} else {"conditional_one_request_input_rebuild_allowance_no_review_savings"},
             "selection_rebuild_allowance_assumption":"one_frozen_source_next_request_if_both_renderings_fit_not_a_dispatch_forecast",
@@ -367,8 +415,8 @@ fn plan_inner(
             } else {
                 -selection_joint.map_or(0.0, |d| d.savings)
             };
-            if best.as_ref().is_none_or(|(_, prior)| score < *prior) {
-                best = Some((candidate, score));
+            if best.as_ref().is_none_or(|(_, prior, _, _)| score < *prior) {
+                best = Some((candidate, score, candidate_id, action));
             }
         }
     }
@@ -389,6 +437,16 @@ fn plan_inner(
         None
     };
     let report = json!({"selected":best.is_some(),"forced":forced,"reason":reason,
+        "selected_candidate_id":best.as_ref().map(|(_, _, id, _)| id.as_str()).or(if forced {None} else {Some("keep")}),
+        "selected_action":best.as_ref().map(|(_, _, _, action)| *action).or(if forced {None} else {Some("keep")}),
+        "keep_candidate":{"candidate_id":"keep","action":"keep","feasible":primary_ok},
+        "candidate_identity_basis":"action_ordered_removed_groups_sorted_retired_memory_ids_v1",
+        "primary_only_action":"not_applicable_source_removal_rebuilds_reviewer_replay",
+        "primary_output_allowance_tokens":output_allowance.unwrap_or(0),
+        "primary_output_allowance_requests":config.payoff_requests,
+        "primary_output_allowance_basis":if output_allowance.is_some() {"request_max_output_tokens_cap_sensitivity_not_expected_generation"} else {"legacy_zero_no_explicit_request_cap_not_headroom"},
+        "primary_output_tariff_basis":"each_rendered_branch_input_selected_frozen_tariff",
+        "joint_basis":"legacy_input_only_primary_recurring_reviewer_sensitivity",
         "mode":format!("{:?}",config.mode).to_lowercase(),
         "primary_fits":primary_ok,"reviewer_fits":reviewer_ok,
         "primary_estimated_tokens":estimate(&wire),"reviewer_estimated_tokens":estimate(&reviewer),
@@ -414,7 +472,7 @@ fn plan_inner(
         "review_completion_basis":"future_reviews_complete_and_merge_before_next_due_dispatch",
         "cache_basis":"exact_compatible_prefix_receipts_expire_after_30_minutes",
         "candidates":reports});
-    (best.map(|(state, _)| state), report)
+    (best.map(|(state, _, _, _)| state), report)
 }
 
 #[cfg(test)]
