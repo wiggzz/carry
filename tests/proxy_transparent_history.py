@@ -272,6 +272,20 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(status, 200, response)
         self.assertEqual(fixture.primaries[-1]["input"], [answer, followup])
 
+    def test_empty_input_and_output_still_publish_observed_response_id(self):
+        fixture = self.fixture(lambda _b, n: (200, completed([], f"zero_{n}")))
+        options = ["--review-every-requests", "100"]
+        proxy = TransparentProxy(self.state, fixture, options)
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send([])[0], 200)
+        proxy.close()
+        proxy = TransparentProxy(self.state, fixture, options)
+        self.stack.callback(proxy.close)
+        followup = {"role": "user", "content": "AFTER_ZERO_OUTPUT"}
+        status, response = proxy.send([followup], previous_response_id="zero_1")
+        self.assertEqual(status, 200, response)
+        self.assertEqual(fixture.primaries[-1]["input"], [followup])
+
     def test_active_checkpoints_reference_shared_canonical_ancestry(self):
         proxy, fixture, history, options = self.seed()
         self.assertEqual(proxy.send(history + [{"role": "user", "content": "B_ONLY"}])[0], 200)
