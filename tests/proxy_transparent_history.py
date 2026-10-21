@@ -69,5 +69,51 @@ class TransparentHistory(unittest.TestCase):
         self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]))
 
 
+    def test_response_id_expands_observed_outputs_and_can_rewind_after_restart(self):
+        a = {"role": "user", "content": "INPUT_A"}
+        oa = {"role": "assistant", "content": "ACTUAL_OUTPUT_A"}
+        ob = {"role": "assistant", "content": "ACTUAL_OUTPUT_B"}
+        b = {"role": "user", "content": "INPUT_B"}
+        c = {"role": "user", "content": "INPUT_C"}
+        fixture = self.fixture(lambda _body, n: (200, completed([oa if n == 1 else ob], f"resp_{n}")))
+        options = ["--review-every-requests", "100"]
+        proxy = TransparentProxy(self.state, fixture, options)
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send([a])[0], 200)
+        status, result = proxy.send([b], previous_response_id="resp_1")
+        self.assertEqual(status, 200, result)
+        self.assertEqual(fixture.primaries[-1]["input"], [a, oa, b])
+        proxy.close()
+        proxy = TransparentProxy(self.state, fixture, options)
+        self.stack.callback(proxy.close)
+        status, result = proxy.send([c], previous_response_id="resp_1")
+        self.assertEqual(status, 200, result)
+        self.assertEqual(fixture.primaries[-1]["input"], [a, oa, c], "older response is a transcript frontier, not latest state")
+        self.assertNotIn("previous_response_id", fixture.primaries[-1])
+        counts = len(fixture.primaries)
+        self.assertEqual(proxy.send([c], previous_response_id="unobserved")[0], 409)
+        self.assertEqual(len(fixture.primaries), counts)
+
+    def test_conversation_id_expands_only_observed_transcript(self):
+        a = {"role": "user", "content": "CONVERSATION_A"}
+        out = {"role": "assistant", "content": "ACTUAL_CONVERSATION_OUTPUT"}
+        b = {"role": "user", "content": "CONVERSATION_B"}
+        def primary(_body, n):
+            value = completed([out], f"conv_resp_{n}")
+            value["conversation"] = {"id": "conv_observed"}
+            return 200, value
+        fixture = self.fixture(primary)
+        proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"])
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send([a])[0], 200)
+        status, result = proxy.send([b], conversation={"id": "conv_observed"})
+        self.assertEqual(status, 200, result)
+        self.assertEqual(fixture.primaries[-1]["input"], [a, out, b])
+        self.assertNotIn("conversation", fixture.primaries[-1], "upstream must not re-expand selected context")
+        count = len(fixture.primaries)
+        self.assertEqual(proxy.send([b], conversation="unobserved")[0], 409)
+        self.assertEqual(len(fixture.primaries), count)
+
+
 if __name__ == "__main__":
     unittest.main()
