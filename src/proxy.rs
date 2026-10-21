@@ -561,6 +561,18 @@ fn load(service: &Service, id: &str) -> Result<Session, Failure> {
     }
 }
 
+fn load_existing(service: &Service, id: &str) -> Result<Session, Failure> {
+    // A paid worker already has an owner. Missing authority is an error, never
+    // permission to merge its receipt into a newly defaulted logical session.
+    if !service.config.state_dir.join(format!("{id}.json")).exists() {
+        return Err(failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "active history owner unavailable",
+        ));
+    }
+    load(service, id)
+}
+
 fn save(service: &Service, id: &str, session: &Session) -> std::io::Result<()> {
     save_observed(service, id, session, None)
 }
@@ -1254,6 +1266,7 @@ struct Commit {
     observed_input: Vec<Value>,
     outbound: Value,
     native: bool,
+    _history_pin: history::Pin,
     _lock: OwnedMutexGuard<()>,
 }
 
@@ -1320,6 +1333,7 @@ async fn forward_request(
     }
     let implicit = service.config.mode != Mode::Off && id.is_none();
     let mut automatic_point = None;
+    let mut history_pin = None;
     let mut history_namespace = None;
     let requested_conversation = history::conversation(&body).map(str::to_owned);
     if service.config.mode != Mode::Off {
@@ -1329,9 +1343,10 @@ async fn forward_request(
     }
     if implicit {
         let namespace = history_namespace.as_ref().unwrap();
-        let (selected, point) = history::resolve(&service, namespace, &body)?;
+        let (selected, point, pin) = history::resolve(&service, namespace, &body)?;
         id = Some(selected);
         automatic_point = point;
+        history_pin = Some(pin);
     }
     let native = legacy_native
         || body["input"].as_array().is_some_and(|items| {
@@ -1363,6 +1378,10 @@ async fn forward_request(
     let mut outbound = body.clone();
     let mut commit = None;
     if let Some(mut id) = id {
+        let mut history_pin = match history_pin {
+            Some(pin) => pin,
+            None => history::pin(&service, &id)?,
+        };
         let mut fork = if let Some(point) = automatic_point {
             Some((format!("automatic/{}", point.id), point))
         } else {
@@ -1378,9 +1397,10 @@ async fn forward_request(
                 && check.ingest(body["input"].as_array().unwrap()).is_err()
             {
                 drop(lock);
-                let (selected, point) =
+                let (selected, point, pin) =
                     history::resolve(&service, history_namespace.as_ref().unwrap(), &body)?;
                 id = selected;
+                history_pin = pin;
                 fork = point.map(|p| (format!("automatic/{}", p.id), p));
                 lock = session_lock(&service, &id).await;
                 session = load(&service, &id)?;
@@ -1707,6 +1727,7 @@ async fn forward_request(
             observed_input: body["input"].as_array().cloned().unwrap_or_default(),
             outbound: outbound.clone(),
             native,
+            _history_pin: history_pin,
             _lock: lock,
         });
     }
@@ -2362,6 +2383,10 @@ async fn dispatch_review_for(
         );
         return;
     }
+    let Ok(history_pin) = history::pin(&service, &id) else {
+        service.background_reviews.lock().await.remove(&id);
+        return;
+    };
     let prior_background_review_pending = session.background_review_pending;
     let prior_keep_leases = session.keep_leases.clone();
     session.background_review_pending = true;
@@ -2399,6 +2424,7 @@ async fn dispatch_review_for(
         &json!({}),
     );
     tokio::spawn(async move {
+        let _history_pin = history_pin;
         let mut reviewed = before.clone();
         let mut run = ReviewRun {
             background: true,
@@ -2410,7 +2436,7 @@ async fn dispatch_review_for(
         // Primary transport/checkpoint owns this lock until its commit finishes.
         // Never save the snapshot: merge only reviewer fields into the latest state.
         let _lock = session_lock(&service, &id).await;
-        if let Ok(mut current) = load(&service, &id) {
+        if let Ok(mut current) = load_existing(&service, &id) {
             let merged = merge_review(&service.config, &mut current, &before, &reviewed, &run);
             if save(&service, &id, &current).is_err() {
                 journal(

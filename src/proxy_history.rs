@@ -5,6 +5,45 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 static IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static PINS: std::sync::Mutex<BTreeMap<(PathBuf, String), usize>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Selected authority stays live across lock waits, primary transport and paid
+/// reviewer settlement. Restart censors pending work, rather than reviving workers.
+pub(super) struct Pin((PathBuf, String));
+impl Drop for Pin {
+    fn drop(&mut self) {
+        let mut pins = PINS.lock().unwrap();
+        let count = pins.get_mut(&self.0).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            pins.remove(&self.0);
+        }
+    }
+}
+pub(super) fn pin(service: &Service, id: &str) -> Result<Pin, Failure> {
+    let mut pins = PINS.lock().unwrap();
+    let key = (service.config.state_dir.clone(), id.to_owned());
+    if !pins.contains_key(&key)
+        && pins.keys().filter(|(dir, _)| dir == &key.0).count()
+            >= service.config.history_max_references as usize
+    {
+        return Err(failure(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "history owners busy",
+        ));
+    }
+    *pins.entry(key.clone()).or_default() += 1;
+    Ok(Pin(key))
+}
+fn pinned(service: &Service) -> HashSet<String> {
+    PINS.lock()
+        .unwrap()
+        .keys()
+        .filter(|(dir, _)| dir == &service.config.state_dir)
+        .map(|(_, id)| id.clone())
+        .collect()
+}
 
 #[derive(Default, Serialize, Deserialize)]
 struct Index {
@@ -69,13 +108,15 @@ fn insert(index: &mut Index, namespace: &str, input: &[Value]) -> Vec<String> {
     }
     keys
 }
-fn gc(index: &mut Index) {
+fn gc(index: &mut Index, pins: &HashSet<String>) {
     let live = index
         .tips
         .values()
         .map(|r| r.session.as_str())
         .collect::<HashSet<_>>();
-    index.snapshots.retain(|id, _| live.contains(id.as_str()));
+    index
+        .snapshots
+        .retain(|id, _| live.contains(id.as_str()) || pins.contains(id));
     let mut reachable = HashSet::new();
     for root in index
         .tips
@@ -99,11 +140,12 @@ fn gc(index: &mut Index) {
     }
     index.nodes.retain(|key, _| reachable.contains(key));
 }
-fn prune(service: &Service, index: &mut Index) {
+fn prune(service: &Service, index: &mut Index) -> bool {
     let at = now();
-    index
-        .tips
-        .retain(|_, r| r.at <= at && at - r.at < service.config.fork_max_age_secs);
+    let pins = pinned(service);
+    index.tips.retain(|_, r| {
+        pins.contains(&r.session) || (r.at <= at && at - r.at < service.config.fork_max_age_secs)
+    });
     index.reviews.retain(|_, points| {
         points.retain(|p| !forking::expired(&service.config, p, at));
         !points.is_empty()
@@ -112,7 +154,7 @@ fn prune(service: &Service, index: &mut Index) {
         .transcripts
         .retain(|_, r| r.at <= at && at - r.at < service.config.fork_max_age_secs);
     loop {
-        gc(index);
+        gc(index, &pins);
         if index.nodes.len() <= service.config.history_max_nodes as usize
             && index.tips.len() + index.reviews.len() + index.transcripts.len()
                 <= service.config.history_max_references as usize
@@ -120,14 +162,19 @@ fn prune(service: &Service, index: &mut Index) {
                 <= service.config.fork_max_nodes as usize
             && serde_json::to_vec(index).unwrap().len() <= service.config.history_max_bytes as usize
         {
-            break;
+            return true;
         }
         let review = index
             .reviews
             .iter()
             .flat_map(|(k, ps)| ps.iter().map(move |p| (p.at, k.clone(), p.id.clone())))
             .min();
-        let tip = index.tips.iter().map(|(k, r)| (r.at, k.clone())).min();
+        let tip = index
+            .tips
+            .iter()
+            .filter(|(_, r)| !pins.contains(&r.session))
+            .map(|(k, r)| (r.at, k.clone()))
+            .min();
         let transcript = index
             .transcripts
             .iter()
@@ -157,7 +204,7 @@ fn prune(service: &Service, index: &mut Index) {
                 index.reviews.get_mut(&k).unwrap().retain(|p| p.id != id);
                 index.reviews.retain(|_, ps| !ps.is_empty());
             }
-            _ => break,
+            _ => return false,
         }
     }
 }
@@ -266,7 +313,7 @@ pub(super) fn resolve(
     service: &Service,
     namespace: &str,
     body: &Value,
-) -> Result<(String, Option<forking::Point>), Failure> {
+) -> Result<(String, Option<forking::Point>, Pin), Failure> {
     let _guard = IO.lock().unwrap();
     let mut index = read(service).map_err(|_| {
         failure(
@@ -281,20 +328,21 @@ pub(super) fn resolve(
     let keys = path(namespace, input);
     for key in keys.iter().rev() {
         if let Some(r) = index.tips.get(key) {
-            return Ok((r.session.clone(), None));
+            return Ok((r.session.clone(), None, pin(service, &r.session)?));
         }
         if let Some(points) = index.reviews.get(key) {
             for point in points.iter().rev() {
                 if forking::compatible_child(&service.config, point, body).is_ok() {
-                    return Ok((
-                        hash(&(namespace, "reviewed-child", &point.id, keys.last())),
-                        Some(point.clone()),
-                    ));
+                    let id = hash(&(namespace, "reviewed-child", &point.id, keys.last()));
+                    let pin = pin(service, &id)?;
+                    return Ok((id, Some(point.clone()), pin));
                 }
             }
         }
     }
-    Ok((hash(&(namespace, keys.last())), None))
+    let id = hash(&(namespace, keys.last()));
+    let pin = pin(service, &id)?;
+    Ok((id, None, pin))
 }
 
 /// Selected checkpoints reference canonical nodes; the atomic index is their
@@ -433,7 +481,11 @@ pub(super) fn committed(
     if session.history_shared {
         index.snapshots.insert(id.into(), compact(session));
     }
-    prune(service, &mut index);
+    if !prune(service, &mut index) {
+        return Err(std::io::Error::other(
+            "history capacity held by active owners",
+        ));
+    }
     let temporary = service.config.state_dir.join(".history-index.tmp");
     let mut file = private_file(&temporary, false)?;
     serde_json::to_writer(&mut file, &index)?;
