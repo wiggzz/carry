@@ -397,6 +397,122 @@ class TransparentHistory(unittest.TestCase):
         _, state = proxy.checkpoint(child)
         self.assertEqual(state["shadow"]["calls"], 0)
 
+    def test_live_reviewer_survives_each_history_gc_bound_and_restart(self):
+        import threading
+        original_state = self.state
+        for pressure in ("nodes", "references", "bytes", "age"):
+            with self.subTest(pressure=pressure):
+                self.state = original_state / pressure
+                self.state.mkdir()
+                held, release = threading.Event(), threading.Event()
+                self.stack.callback(release.set)
+                def review(body, _n):
+                    held.set()
+                    assert release.wait(9), "held reviewer release"
+                    ids = ledger(body)["eligible_group_ids"]
+                    return 200, advice_response({"protected": ["g1"],
+                        "removable": [i for i in ids if i != "g1"],
+                        "memories": [{"source_ids": ["g2"], "text": "PINNED_FACT"}]})
+                fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"pin_{pressure}_{n}")), review)
+                env = {"CARRY_PROXY_HISTORY_MAX_NODES": "8"} if pressure == "nodes" else (
+                    {"CARRY_PROXY_HISTORY_MAX_REFERENCES": "6"} if pressure == "references" else (
+                    {"CARRY_PROXY_HISTORY_MAX_BYTES": "300000"} if pressure == "bytes" else
+                    {"CARRY_PROXY_FORK_MAX_AGE_SECS": "1"}))
+                options = ["--review-replayed-history", "--payoff-requests", "1",
+                           "--classifier-cache-policy", "disabled", "--background-reviews=true"]
+                proxy = TransparentProxy(self.state, fixture, options, env)
+                self.stack.callback(proxy.close)
+                history = [{"role": "user", "content": "PINNED_GOAL"},
+                           {"role": "assistant", "content": "PINNED_RAW " + "payload " * 2000},
+                           {"role": "user", "content": "PINNED_BOUNDARY"}]
+                self.assertEqual(proxy.send(history, wait=False)[0], 200)
+                self.assertTrue(held.wait(3), "real background worker must own the branch")
+                path, before = proxy.checkpoint(history)
+                owner = path.stem
+                self.assertEqual(before["primary"]["calls"], 1)
+                if pressure == "age":
+                    time.sleep(2.05)
+                for n in range(12):
+                    # A quota may backpressure this unrelated reservation; it
+                    # may never satisfy the quota by deleting a live owner.
+                    status, _ = proxy.send([{"role": "user", "content":
+                        f"UNRELATED_{n} " + ("x" * 40000 if pressure == "bytes" else "x")}], wait=False)
+                    self.assertIn(status, (200, 500, 507))
+                index = json.loads((self.state / "history.index").read_text())
+                try:
+                    self.assertIn(owner, index["snapshots"],
+                                  "GC must not delete an in-flight review's accounting/removal owner")
+                    self.assertTrue(path.exists())
+                finally:
+                    release.set()
+                deadline = time.monotonic() + 5
+                while True:
+                    index = json.loads((self.state / "history.index").read_text())
+                    settled = index["snapshots"].get(owner, {})
+                    if not settled.get("background_review_pending", True):
+                        break
+                    self.assertLess(time.monotonic(), deadline, "held review must durably settle")
+                    time.sleep(.01)
+                self.assertEqual(settled["primary"]["calls"], 1)
+                self.assertEqual(settled["shadow"]["calls"], 1, "paid receipt settles exactly once")
+                self.assertTrue(any(m["text"] == "PINNED_FACT" for m in settled["memories"]))
+                proxy.close()
+                # The age policy may legitimately expire a settled branch. The
+                # durable receipt is checked above; non-age restart must retain it.
+                if pressure != "age":
+                    proxy = TransparentProxy(self.state, fixture, options, env)
+                    self.stack.callback(proxy.close)
+                    followup = history + [{"role": "user", "content": "PINNED_CONTINUE"}]
+                    self.assertEqual(proxy.send(followup)[0], 200)
+                    _, resumed = proxy.checkpoint(followup)
+                    self.assertEqual(resumed["primary"]["calls"], 2)
+                    self.assertEqual(resumed["shadow"]["calls"], 1)
+                    self.assertNotIn("PINNED_RAW", json.dumps(fixture.primaries[-1]["input"]))
+                proxy.close()
+        self.state = original_state
+
+    def test_held_primary_keeps_selected_removals_and_receipts_under_gc(self):
+        import concurrent.futures
+        import threading
+        held, release = threading.Event(), threading.Event()
+        self.stack.callback(release.set)
+        proxy, fixture, history, options = self.seed()
+        def primary(_b, n):
+            if n == 2:
+                held.set()
+                assert release.wait(4), "held primary release"
+            return 200, completed(response_id=f"primary_pin_{n}")
+        fixture.primary = primary
+        proxy.close()
+        env = {"CARRY_PROXY_HISTORY_MAX_REFERENCES": "6"}
+        proxy = TransparentProxy(self.state, fixture, options, env)
+        self.stack.callback(proxy.close)
+        parent = history + [{"role": "user", "content": "HELD_PRIMARY"}]
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            pending = pool.submit(proxy.send, parent)
+            self.assertTrue(held.wait(2))
+            path, before = proxy.checkpoint(parent)
+            owner = path.stem
+            for n in range(12):
+                self.assertIn(proxy.send([{"role": "user", "content": f"PRIMARY_PRESSURE_{n}"}])[0], (200, 500, 507))
+            try:
+                index = json.loads((self.state / "history.index").read_text())
+                self.assertIn(owner, index["snapshots"], "primary transport owns its selected snapshot")
+            finally:
+                release.set()
+            self.assertEqual(pending.result()[0], 200)
+        _, after = proxy.checkpoint(parent)
+        self.assertEqual(after["primary"]["calls"], 2)
+        self.assertEqual(after["shadow"]["calls"], before["shadow"]["calls"])
+        self.assertTrue(any(i["removed"] for i in after["history"]))
+        proxy.close()
+        proxy = TransparentProxy(self.state, fixture, options, env)
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(parent)[0], 200)
+        _, resumed = proxy.checkpoint(parent)
+        self.assertEqual(resumed["primary"]["calls"], 3)
+        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
+
     def test_concurrent_siblings_keep_independent_selection_and_restart(self):
         import concurrent.futures
         proxy, fixture, history, options = self.seed()
