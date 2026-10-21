@@ -33,6 +33,29 @@ fn historical_full_history_fork_after_parent_cleanup() {
 }
 
 #[test]
+fn transparent_server_owned_history() {
+    let output = Command::new("python3")
+        .args([
+            "-B",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/proxy_transparent_history.py"
+            ),
+            "-v",
+        ])
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("transparent loopback history regression");
+    std::io::Write::write_all(&mut std::io::stdout(), &output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn committed_fork_cut_discovery() {
     let output = Command::new("python3")
         .args([
