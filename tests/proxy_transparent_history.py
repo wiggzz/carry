@@ -196,6 +196,33 @@ class TransparentHistory(unittest.TestCase):
         self.assertTrue(any(m["text"] == "A_FACT" for m in child["memories"]))
         self.assertFalse(any("B_DEPENDENT" in m["text"] for m in child["memories"]))
 
+    def test_active_checkpoints_reference_shared_canonical_ancestry(self):
+        proxy, fixture, history, options = self.seed()
+        self.assertEqual(proxy.send(history + [{"role": "user", "content": "B_ONLY"}])[0], 200)
+        child = history + [{"role": "user", "content": "C_ONLY"}]
+        self.assertEqual(proxy.send(child)[0], 200)
+        archive = json.loads((self.state / "history.index").read_text())
+        checkpoints = [json.loads(p.read_text()) for p in self.state.glob("*.json")]
+        self.assertGreaterEqual(len(checkpoints), 2)
+        for state in checkpoints:
+            self.assertTrue(all(item["value"] is None for item in state["history"]),
+                            "mutable checkpoints must reference, not copy, canonical wire history")
+            frontier = state.get("history_frontier")
+            restored = []
+            while frontier in archive["nodes"]:
+                node = archive["nodes"][frontier]
+                restored.append(node["value"])
+                frontier = node["parent"]
+            self.assertEqual(len(restored), len(state["history"]))
+            self.assertIn(history[1], restored)
+        self.assertEqual(sum(n["value"] == history[1] for n in archive["nodes"].values()), 1)
+        proxy.close()
+        proxy = TransparentProxy(self.state, fixture, options)
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(child + [{"role": "user", "content": "D_ONLY"}])[0], 200)
+        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
+        self.assertIn("A_FACT", json.dumps(fixture.primaries[-1]["input"]))
+
     def test_unknown_settings_and_client_rewrites_do_not_reuse_advice(self):
         proxy, fixture, history, _ = self.seed()
         changed = history + [{"role": "user", "content": "CHANGED_SETTINGS"}]
