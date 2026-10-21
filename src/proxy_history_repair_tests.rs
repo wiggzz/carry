@@ -210,3 +210,174 @@ async fn history_failed_small_publication_and_lowered_restart_preserve_generatio
     assert_eq!(std::fs::read(index).unwrap(), prior);
     provider.abort();
 }
+
+#[tokio::test]
+async fn history_paid_primary_oversized_settlement_survives_restart() {
+    history_paid_growth(false, 32768).await;
+}
+
+#[tokio::test]
+async fn history_paid_reviewer_oversized_settlement_survives_restart() {
+    history_paid_growth(true, 32768).await;
+}
+
+#[tokio::test]
+async fn history_paid_primary_fitting_growth_publishes_output() {
+    history_paid_growth(false, 64).await;
+}
+
+#[tokio::test]
+async fn history_paid_reviewer_fitting_growth_preserves_replay() {
+    history_paid_growth(true, 64).await;
+}
+
+async fn history_paid_growth(reviewer: bool, growth: usize) {
+    use std::sync::atomic::AtomicUsize;
+    let directory = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reviews = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let reviewed = reviews.clone();
+    let app = Router::new()
+        .route("/v1/responses", post(move || {
+            let seen = seen.clone();
+            async move {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"id":format!("paid_{n}"),"status":"completed",
+                    "output":if !reviewer && n == 0 {json!([{"role":"assistant","content":"X".repeat(growth)}])} else {json!([])},
+                    "usage":{"input_tokens":100,"output_tokens":1}}))
+            }
+        }))
+        .route("/review", post(move || {
+            let reviewed = reviewed.clone();
+            async move {
+                reviewed.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"id":"paid_review","status":"completed",
+                    "output":[{"type":"message","role":"assistant","content":[{"type":"output_text",
+                    "text":format!("{}{{\"protected\":[],\"removable\":[],\"memories\":[]}}", " ".repeat(growth))}]}],
+                    "usage":{"input_tokens":101,"output_tokens":2}}))
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let provider = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut service = checkpoint_service(directory.path());
+    service.config.upstream_url = format!("{endpoint}/v1/responses");
+    service.config.classifier_url = format!("{endpoint}/review");
+    service.config.classifier_model = "gpt-6-luna".into();
+    service.config.review_every_requests = 100;
+    service.config.bootstrap_min_input_bytes = usize::MAX;
+    service.config.history_max_bytes = 16384;
+    let service = Arc::new(service);
+    let input = json!([{"role":"user","content":"paid growth goal"},
+        {"role":"assistant","content":"already removed source"},
+        {"role":"assistant","content":"still eligible source"},
+        {"role":"user","content":"paid growth boundary"}]);
+    let response = forward_request(
+        service.clone(),
+        HeaderMap::new(),
+        Bytes::from(serde_json::to_vec(&json!({"model":"gpt-6-luna","input":input})).unwrap()),
+        false,
+        logging::request_id(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // A failed publication may truncate the client stream. Still inspect the
+    // authoritative store, never the diagnostic mirror or a synthetic receipt.
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
+    let owner = history_race_owner(&service, "paid growth goal");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "fitting predispatch state actually reached loopback"
+    );
+    if reviewer {
+        let mut selected = load(&service, &owner).unwrap();
+        selected.history[1].removed = true; // Explicit prior removal authority.
+        save(&service, &owner, &selected).unwrap();
+        let mut worker = (*service).clone();
+        worker.config.review_every_requests = 1;
+        dispatch_review_for(
+            Arc::new(worker),
+            owner.clone(),
+            &mut selected,
+            json!({"model":"gpt-6-luna","input":input}),
+            logging::request_id(),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while service.background_reviews.lock().await.contains(&owner) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("real reviewer worker must finish settlement, not time out");
+        assert_eq!(
+            reviews.load(Ordering::SeqCst),
+            1,
+            "actual metered review required"
+        );
+    }
+    let restarted = checkpoint_service(directory.path());
+    let saved = load(&restarted, &owner).unwrap();
+    assert_eq!(
+        saved.primary.calls, 1,
+        "paid primary must survive failed publication"
+    );
+    assert_eq!(saved.primary.input_tokens, 100);
+    assert_eq!(saved.primary.unavailable_cost_calls, 0);
+    assert_eq!(
+        saved.shadow.calls,
+        u64::from(reviewer),
+        "paid reviewer must survive failed publication"
+    );
+    if reviewer {
+        assert_eq!(saved.shadow.input_tokens, 101);
+        assert_eq!(saved.shadow.unavailable_cost_calls, 0);
+        assert!(!saved.background_review_pending);
+        assert!(
+            saved.history[1].removed,
+            "settlement fallback cannot reset removal state"
+        );
+        if growth < 16384 {
+            assert!(
+                saved.review_history.is_some(),
+                "fitting replay must not be discarded"
+            );
+        }
+    } else if growth < 16384 {
+        assert_eq!(saved.pending_output[0]["content"], "X".repeat(growth));
+        assert_eq!(saved.last_response_id.as_deref(), Some("paid_0"));
+    } else {
+        assert!(
+            saved.pending_output.is_empty(),
+            "oversized uncommitted output is not replay authority"
+        );
+        let namespace = saved.history_namespace.as_deref().unwrap();
+        let mut delta = json!({"input":[],"previous_response_id":"paid_0"});
+        assert!(
+            history::expand(&service, namespace, &mut delta).is_err(),
+            "failed publication must not publish external IDs"
+        );
+    }
+    let bytes = std::fs::read(directory.path().join("history.index")).unwrap();
+    assert!(bytes.len() <= 16384);
+    history_race_send(service.clone(), input).await;
+    let saved = load(&restarted, &owner).unwrap();
+    assert_eq!(
+        saved.primary.calls, 2,
+        "retry adds exactly one actual primary"
+    );
+    assert_eq!(
+        saved.shadow.calls,
+        u64::from(reviewer),
+        "restart/retry cannot replay a paid review receipt"
+    );
+    if reviewer {
+        assert!(saved.history[1].removed);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(reviews.load(Ordering::SeqCst), usize::from(reviewer));
+    provider.abort();
+}
