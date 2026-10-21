@@ -258,6 +258,34 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(fixture.primaries[-1]["input"], fresh)
         self.assertEqual(len(list(self.state.glob("*.json"))), 2)
 
+    def test_history_empty_envelope_limits_two_requests_and_restart(self):
+        fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"minimum_{n}")))
+        minimum = len(wire({"nodes": {}, "tips": {}, "reviews": {},
+                            "transcripts": {}, "snapshots": {}}))
+        self.assertEqual(minimum, 67)
+        for limit in (2, minimum - 1):
+            with self.subTest(rejected_limit=limit):
+                with self.assertRaises(AssertionError, msg="impossible history byte limits must reject startup"):
+                    unexpected = self.proxy(fixture, ["--history-max-bytes", str(limit)])
+                    unexpected.close()
+        # The envelope is accepted, but cannot reserve an active selected owner.
+        # Backpressure must not publish an unreadable generation or dispatch work.
+        options = ["--history-max-bytes", str(minimum), "--review-every-requests", "100"]
+        proxy = self.proxy(fixture, options)
+        for attempt in range(2):
+            status, result = proxy.send([{"role": "user", "content": f"minimum request {attempt}"}])
+            self.assertEqual(status, 507, result)
+            self.assertNotIn("id", result)
+            index = proxy.state / "history.index"
+            if index.exists():
+                self.assertLessEqual(index.stat().st_size, minimum)
+                json.loads(index.read_bytes())
+        self.assertEqual(fixture.primaries, [])
+        proxy.close()
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send([{"role": "user", "content": "minimum after restart"}])[0], 507)
+        self.assertEqual(fixture.primaries, [])
+
     def test_empty_input_response_is_observed_and_resumable(self):
         answer = {"role": "assistant", "content": "EMPTY_INPUT_ACTUAL_OUTPUT"}
         fixture = self.fixture(lambda _b, n: (200, completed([answer], f"empty_{n}")))
