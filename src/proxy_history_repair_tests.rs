@@ -278,7 +278,7 @@ async fn history_paid_primary_abandoned_attempt_is_durably_censored_once() {
     history_race_send(restarted.clone(), input.clone()).await;
     let saved = load(&restarted, &owner).unwrap();
     assert_eq!(saved.primary.calls, 2);
-    assert_eq!(saved.primary.unavailable_cost_calls, 2);
+    assert_eq!(saved.primary.unavailable_cost_calls, 1);
     assert_eq!(saved.primary.input_tokens, 100);
     assert_eq!(
         saved
@@ -429,9 +429,9 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
         "paid primary must survive failed publication"
     );
     assert_eq!(saved.primary.input_tokens, 100);
-    // The loopback route is deliberately not certified as an official priced
-    // provider. Metered tokens are exact; dollar cost must remain unavailable.
-    assert_eq!(saved.primary.unavailable_cost_calls, 1);
+    // Explicit cached_tokens:0 makes this fixture's metered usage priceable
+    // under checkpoint_service's fixed test catalog (not live-provider data).
+    assert_eq!(saved.primary.unavailable_cost_calls, 0);
     assert_eq!(
         saved.shadow.calls,
         u64::from(reviewer),
