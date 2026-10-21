@@ -139,6 +139,95 @@ pub(super) fn publish(config: &ProxyCli, current: &mut Session, before: &Session
     prune(config, current);
 }
 
+/// Read-only, exact-namespace matching. The committed checkpoint is the only
+/// authority; no directory scan, model/catalog refresh, publication or save.
+pub(super) async fn matching(
+    State(service): State<Arc<Service>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Result<axum::Json<Value>, Failure> {
+    if headers.contains_key("origin") {
+        return Err(failure(
+            StatusCode::FORBIDDEN,
+            "browser-origin writes are not supported",
+        ));
+    }
+    authorize(&service, &headers)?;
+    // Unlike ordinary loopback forwarding, discovery is never unauthenticated.
+    if service.auth_token.is_none() {
+        return Err(failure(
+            StatusCode::UNAUTHORIZED,
+            "gateway authentication required",
+        ));
+    }
+    for key in ["x-carry-tenant", "x-carry-session", "x-carry-branch"] {
+        if headers.get_all(key).iter().count() != 1
+            || headers.get(key).and_then(|v| v.to_str().ok()).is_none()
+        {
+            return Err(failure(
+                StatusCode::BAD_REQUEST,
+                "explicit tenant/session/branch required",
+            ));
+        }
+    }
+    let id = identity(&headers)?.ok_or_else(|| {
+        failure(
+            StatusCode::BAD_REQUEST,
+            "explicit tenant/session/branch required",
+        )
+    })?;
+    if headers.contains_key("x-carry-fork-parent") || headers.contains_key("x-carry-fork-point") {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "match the selected namespace, not fork intent",
+        ));
+    }
+    if service.config.mode != Mode::Compact {
+        return Err(conflict("fork_unsupported"));
+    }
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| failure(StatusCode::BAD_REQUEST, "invalid JSON request"))?;
+    if !body.is_object()
+        || body["model"].as_str().is_none_or(|s| s.is_empty())
+        || !body["input"]
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_object))
+        || body
+            .get("previous_response_id")
+            .is_some_and(|v| !v.is_null())
+        || body.get("conversation").is_some_and(|v| !v.is_null())
+        || body["background"] == true
+    {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "original full input and model/settings required",
+        ));
+    }
+    let _lock = session_lock(&service, &id).await;
+    let session = load(&service, &id)?;
+    let points = session
+        .fork_points
+        .iter()
+        .filter(|point| {
+            !expired(&service.config, point, now())
+                && compatible_child(&service.config, point, &body).is_ok()
+        })
+        .map(|point| {
+            json!({
+                "id":point.id, "input_items":point.sources.len(),
+                "expires_at":point.at.saturating_add(service.config.fork_max_age_secs)
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(axum::Json(json!({
+        "schema_version":1, "outcome":if points.is_empty() {"no_match"} else {"matched"},
+        "matching":"ordered-prefix-cohort-scope-v1", "points":points,
+        "horizon":{"publication":"first-fully-accepted-raw-cut-v1",
+            "max_age_secs":service.config.fork_max_age_secs,
+            "max_nodes":service.config.fork_max_nodes, "max_bytes":service.config.fork_max_bytes}
+    })))
+}
+
 pub(super) fn conflict(code: &str) -> Failure {
     (
         StatusCode::CONFLICT,
@@ -212,24 +301,10 @@ pub(super) async fn resolve(
     Ok(Some((format!("{parent_id}/{handle}"), point)))
 }
 
-pub(super) fn hydrate(
-    config: &ProxyCli,
-    session: &mut Session,
-    origin: &str,
-    point: &Point,
-    body: &Value,
-) -> Result<bool, Failure> {
-    if expired(config, point, now()) {
-        return Err(conflict("fork_expired"));
-    }
-    if session
-        .fork_origin
-        .as_ref()
-        .is_some_and(|existing| existing != origin)
-        || (session.fork_origin.is_none() && (session.version != 0 || !session.history.is_empty()))
-    {
-        return Err(conflict("fork_child_conflict"));
-    }
+/// Validate caller-owned full input using exactly the hydration prefix,
+/// settings and complete-cohort rules. This transient projection contains no
+/// inherited advice, memories, receipts or worker state and is never saved.
+fn compatible_child(config: &ProxyCli, point: &Point, body: &Value) -> Result<Session, Failure> {
     let input = body["input"]
         .as_array()
         .ok_or_else(|| conflict("fork_unsupported"))?;
@@ -273,6 +348,31 @@ pub(super) fn hydrate(
     }) {
         return Err(conflict("fork_incompatible"));
     }
+    Ok(child)
+}
+
+pub(super) fn hydrate(
+    config: &ProxyCli,
+    session: &mut Session,
+    origin: &str,
+    point: &Point,
+    body: &Value,
+) -> Result<bool, Failure> {
+    if expired(config, point, now()) {
+        return Err(conflict("fork_expired"));
+    }
+    if session
+        .fork_origin
+        .as_ref()
+        .is_some_and(|existing| existing != origin)
+        || (session.fork_origin.is_none() && (session.version != 0 || !session.history.is_empty()))
+    {
+        return Err(conflict("fork_child_conflict"));
+    }
+    let input = body["input"]
+        .as_array()
+        .ok_or_else(|| conflict("fork_unsupported"))?;
+    let mut child = compatible_child(config, point, body)?;
     if session.fork_origin.is_some() {
         // Revalidate both the declared cut and the live lineage before ordinary
         // ingest can reset it. A retry never restores parent advice/memories or

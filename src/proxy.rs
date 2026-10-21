@@ -430,6 +430,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         )
         .route("/v1/models", get(models))
         .route("/carry/catalog", get(catalog))
+        .route("/carry/fork-points/match", post(forking::matching))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(native_compact))
         .route("/v1/responses/{id}", get(unsupported).delete(unsupported))

@@ -44,6 +44,8 @@ fn committed_fork_cut_discovery() {
         .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python loopback neutral fork discovery regression");
+    // Keep the actual HTTP method results visible even without --nocapture.
+    std::io::Write::write_all(&mut std::io::stdout(), &output.stderr).unwrap();
     assert!(
         output.status.success(),
         "{}\n{}",

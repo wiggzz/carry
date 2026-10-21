@@ -16,14 +16,11 @@ not selectable through the fork headers. Use compact mode and a full `input`
 array containing the entire cut in its original order followed by child input.
 Do not combine this with `previous_response_id` or a native checkpoint request.
 
-Handles are `<review_epoch>:<lowercase SHA-256 of the canonical source array>`.
-The authoritative available handles are the parent's checkpoint `fork_points`
-`id` fields after the asynchronous review has committed. This experimental slice
-has no remote point-discovery API or native client adapter. Python fixture
-`cut()` in `tests/proxy_fork_continuity.py` computes handles for the tested text
-and tool payloads; cross-language canonical-number interoperability is not a
-native-client acceptance claim. A caller must know an actually retained handle,
-not infer review completion from the primary's response.
+Handles are server-owned opaque identifiers. Use the read-only matching API
+below rather than computing a handle or reading a checkpoint. The committed
+parent checkpoint remains the authority after asynchronous review settlement;
+the primary's response alone does not prove that a portable cut was committed.
+Python fixture `cut()` is not a production canonicalization or authority API.
 
 A point binds the complete ordered observation/dependency frontier, item hashes,
 original member/cohort IDs and exposure, group protections, request settings
@@ -56,6 +53,81 @@ calling upstream, even with `x-carry-history-policy: reset-on-divergence`.
 Later ordinary requests use the child's own lineage and can omit the fork
 headers. Even existing children cannot use expired/evicted parent evidence to
 request another recovery.
+
+## Neutral retained-cut matching (schema 1)
+
+`POST /carry/fork-points/match` takes the caller-owned **original complete
+Responses body**: full `input` array plus original `model`, instructions, tools
+and other settings. It compares the ordered prefix, scope and complete cohorts
+server-side using the same validator as fork hydration. A suffix is allowed but
+must not extend an authorized cohort. Send raw original input, not Carry's
+compacted outgoing primary input. JSON object key order and equivalent numeric
+spellings are parsed by the server; adapters must not reproduce Rust serde's
+numeric hashing in Python/JavaScript. This is a matching operation, not a GET
+listing or a source-ID-to-authority conversion.
+
+Require `Authorization: Bearer <configured gateway token>` and all three
+explicit `x-carry-tenant`, `x-carry-session`, `x-carry-branch` headers selecting
+the **parent's exact namespace**. Missing, duplicate, invalid or defaulted
+identity is rejected. Even loopback requires configured gateway authentication
+for this endpoint. This reuses the existing shared gateway token and
+caller-supplied identity: **it does not establish a per-tenant ACL**. A trusted
+operator/gateway must own namespace assignment and continue stripping untrusted
+Carry headers. No query/body parent namespace or arbitrary-session search exists;
+fork-intent headers on matching requests are rejected.
+
+The successful response contains only:
+
+```json
+{
+  "schema_version": 1,
+  "outcome": "matched",
+  "matching": "ordered-prefix-cohort-scope-v1",
+  "points": [{"id": "<opaque retained handle>", "input_items": 3, "expires_at": 1234567890}],
+  "horizon": {
+    "publication": "first-fully-accepted-raw-cut-v1",
+    "max_age_secs": 86400,
+    "max_nodes": 8,
+    "max_bytes": 262144
+  }
+}
+```
+
+The example expiry is illustrative; actual `expires_at` is the absolute Unix
+second of the point's current configured age limit. `input_items` is the retained
+prefix length in the supplied full input array (exclusive end offset), not a
+native entry/turn ID. Points retain committed publication order and stable IDs;
+`horizon` reflects effective per-lineage configuration. There are at most
+`max_nodes` rows. No bodies, source/member hashes, facts, advice, protections,
+private paths, spend or cache receipts are returned.
+
+A valid request without compatible committed retained evidence returns HTTP200,
+`outcome: "no_match"`, `points: []` and the same version/matching/horizon metadata.
+Unknown, evicted, expired, uncommitted, other-namespace and incompatible cuts do
+not cause fresh-history forwarding, recovery review or fabricated handles. This
+bounded empty result deliberately does not reveal which unavailable condition
+applied. An explicit later fork still uses the typed HTTP409 errors below;
+matching does not reserve a point against expiry/eviction or guarantee primary
+capacity. The creation/retry request must use a distinct child branch and the
+returned handle with the existing fork headers, and is revalidated normally.
+
+HTTP401 means missing/wrong/unconfigured gateway auth; HTTP400 means malformed
+JSON/full-input/model or explicit identity, fork-intent headers or unsupported
+stateful/background body. Browser Origin returns HTTP403; audit/off modes return
+HTTP409 `fork_unsupported`. Corrupt/unreadable exact committed checkpoints retain
+HTTP500 rather than being treated as fresh. The existing 16MiB request bound
+applies. This is read-only despite POST: it acquires only the exact lineage lock,
+loads/prunes a local copy of its committed checkpoint, and never saves/creates a
+checkpoint, refreshes the model catalog, changes receipts, or starts a worker or
+outbound request. No other branch/directory scan, index or background job exists.
+Age/node/byte filtering during discovery does not physically erase saved bytes.
+
+A future native adapter must bind an observed original full-wire prefix and
+this boundary to the actual native entry/turn selected by the pinned client's
+fork/tree/rollback operation. It must preserve operator namespace ownership and
+create a distinct Carry branch/generation as required. A matching handle is not
+native-operation acceptance, arbitrary later-cut portability, or proof that an
+adapter has observed the right native boundary.
 
 ## Retention and failure
 
@@ -103,7 +175,8 @@ substitute for actual native branch operations.
 Still required: Pi RPC fork/new session ID and SDK tree/same session ID adapters
 and distinct actual-client fixtures; Codex real thread/fork/new IDs and rollback/
 same-ID adapters and fixtures; general later-review/dependency-closure portable
-cuts; a stable client-facing point-discovery contract. The separate reviewer
+cuts. The neutral server-side matching contract does not implement these native
+adapters. The separate reviewer
 bootstrap current-budget merge repair RI-001 has its own behavioral evidence and
 independent-review gate; these HTTP fork repairs do not replace that gate or add
 receipt-anchored accounting. Passing loopback tests alone is not full #148
