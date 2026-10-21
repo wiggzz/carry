@@ -317,7 +317,9 @@ fn plan_inner(
         } else {
             None
         };
-        let output = if output_tokens == 0.0 {
+        let output = if primary.is_none() {
+            None
+        } else if output_tokens == 0.0 {
             Some(ViewCosts {
                 keep: 0.0,
                 compact: 0.0,
@@ -441,6 +443,7 @@ fn plan_inner(
         "selected_action":best.as_ref().map(|(_, _, _, action)| *action).or(if forced {None} else {Some("keep")}),
         "keep_candidate":{"candidate_id":"keep","action":"keep","feasible":primary_ok},
         "candidate_identity_basis":"action_ordered_removed_groups_sorted_retired_memory_ids_v1",
+        "candidate_identity_scope":"actions_within_one_frozen_source_plan_not_global_session_identity",
         "primary_only_action":"not_applicable_source_removal_rebuilds_reviewer_replay",
         "primary_output_allowance_tokens":output_allowance.unwrap_or(0),
         "primary_output_allowance_requests":config.payoff_requests,

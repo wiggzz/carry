@@ -180,8 +180,28 @@ skips an immediate ordinary review, while a reviewer-only cleanup does not. This
 is a **frozen-source, timely-completion sensitivity**: hypothetical future reviews
 are assumed to complete and merge before their next due dispatch, not guaranteed
 to do so. Already-pending background work and unfinished imports remain unknown,
-not free; completed bootstrap receipts are sunk. Primary generation-output cost
-is not separately forecast (the primary output reserve is a capacity allowance).
+not free; completed bootstrap receipts are sunk. The legacy `joint` diagnostic
+keeps its input-only primary arithmetic. `selection_joint` separately includes
+an explicit primary **output-cap sensitivity**: when the request supplies
+`max_output_tokens`, that many output tokens per payoff request are priced at
+**each rendered branch's own input-selected, frozen output tariff**. This is
+neither expected generation nor measured usage. An explicit zero is zero; without
+a request cap, the legacy zero-output assumption is reported explicitly.
+`--primary-output-reserve-tokens` is capacity headroom only, never an implicit
+expected-output estimate. The report separates primary input and output costs,
+allowance, horizon and assumption basis; native paid receipts remain unchanged.
+
+Reports identify actual actions as `keep`, `reviewer_only` or `joint`; primary-only
+removal is not an applicable action because removing source necessarily rebuilds
+reviewer replay. The additive `keep_candidate` stays outside the legacy
+`candidates` vector. Stable candidate IDs name removal/memory-retirement actions
+within one frozen source plan, not globally unique sessions or rank positions.
+`selected_candidate_id` and `selected_action` are carried with the selected state;
+the dashboard uses that exact row's `selection_joint`, not the largest recurring
+savings row. Older selected reports without identity remain unidentified rather
+than guessing which rendering won. Audit mode still records a proposal, not proof
+of forwarding or mutation.
+
 Fresh compatible receipts can credit
 cache reads; evidence expires after 30 minutes. Implicit fills use ordinary input
 rates, while explicit cache writes use the modeled write rate. No cache markers
