@@ -1431,6 +1431,11 @@ async fn forward_request(
         } else {
             false
         };
+        if session.history_namespace != history_namespace {
+            // Conversation IDs belong to the observation's settings namespace,
+            // not to a reusable explicit session file.
+            session.history_conversation = None;
+        }
         session.history_namespace = history_namespace;
         session.history_shared = implicit;
         if requested_conversation.is_some() {

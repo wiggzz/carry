@@ -410,32 +410,20 @@ pub(super) fn committed(
     let observed_keys = observation
         .map(|(input, _)| insert(&mut index, namespace, input))
         .unwrap_or_else(|| keys.clone());
-    let completed = observation
-        .map(|(input, response)| {
-            (
-                response["id"].as_str(),
-                conversation(response).or(session.history_conversation.as_deref()),
-                input
-                    .iter()
-                    .cloned()
-                    .chain(response["output"].as_array().into_iter().flatten().cloned())
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .or_else(|| {
-            let frontier = session.response_frontier?;
-            Some((
-                session.last_response_id.as_deref(),
-                session.history_conversation.as_deref(),
-                session
-                    .history
-                    .iter()
-                    .take_while(|i| i.id <= frontier)
-                    .map(|i| i.value.clone())
-                    .chain(session.pending_output.iter().cloned())
-                    .collect::<Vec<_>>(),
-            ))
-        });
+    // Only an actual successful observation creates external authority. Pending,
+    // reviewer and failed-primary saves preserve existing immutable bindings;
+    // mutable session frontiers must never be re-scoped under current settings.
+    let completed = observation.map(|(input, response)| {
+        (
+            response["id"].as_str(),
+            conversation(response).or(session.history_conversation.as_deref()),
+            input
+                .iter()
+                .cloned()
+                .chain(response["output"].as_array().into_iter().flatten().cloned())
+                .collect::<Vec<_>>(),
+        )
+    });
     if let Some((Some(response), conversation, transcript)) = completed {
         let full_keys = insert(&mut index, namespace, &transcript);
         let key = full_keys.last().unwrap_or(namespace);
