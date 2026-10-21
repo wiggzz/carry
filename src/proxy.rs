@@ -335,6 +335,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
     if !config.bootstrap_max_cost_usd.is_finite() || config.bootstrap_max_cost_usd < 0.0 {
         bail!("bootstrap cost limit must be finite and nonnegative");
     }
+    history::validate_capacity(&config)?;
     validate_url(&config.upstream_url)?;
     if let Some(url) = &config.classifier_url {
         validate_url(url)?;
@@ -593,13 +594,21 @@ fn save_observed(
     session: &Session,
     observation: Option<(&[Value], &Value)>,
 ) -> std::io::Result<()> {
+    let mirror = service.config.state_dir.join(format!("{id}.json"));
+    let new_shared_mirror = session.history_shared && !mirror.exists();
     save_with_limit(
         service,
         id,
         &history::compact(session),
         CHECKPOINT_MAX_BYTES,
     )?;
-    history::committed(service, id, session, observation)
+    let published = history::committed(service, id, session, observation);
+    if published.is_err() && new_shared_mirror {
+        // A rejected fresh admission owns no authoritative state. Repeated
+        // capacity backpressure must not accumulate unindexed diagnostics.
+        let _ = std::fs::remove_file(mirror);
+    }
+    published
 }
 
 fn save_with_limit(
@@ -1700,8 +1709,16 @@ async fn forward_request(
         }
         // Persist completed shadow work before starting the primary. New native
         // input remains unexposed even when the reviewer already observed it.
-        save(&service, &id, &reviewed)
-            .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "checkpoint write failed"))?;
+        save(&service, &id, &reviewed).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::StorageFull {
+                failure(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "history capacity unavailable",
+                )
+            } else {
+                failure(StatusCode::INTERNAL_SERVER_ERROR, "checkpoint write failed")
+            }
+        })?;
         journal(
             &service,
             &id,

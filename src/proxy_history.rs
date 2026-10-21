@@ -87,6 +87,21 @@ fn path(namespace: &str, input: &[Value]) -> Vec<String> {
         })
         .collect()
 }
+fn minimum_bytes() -> std::io::Result<usize> {
+    Ok(serde_json::to_vec(&Index::default())?.len())
+}
+
+pub(super) fn validate_capacity(config: &ProxyCli) -> std::io::Result<()> {
+    let minimum = minimum_bytes()?;
+    if (config.history_max_bytes as usize) < minimum {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("history-max-bytes must fit the serialized empty index ({minimum} bytes)"),
+        ));
+    }
+    Ok(())
+}
+
 fn read(service: &Service) -> std::io::Result<Index> {
     match std::fs::read(service.config.state_dir.join("history.index")) {
         Ok(bytes) if bytes.len() <= service.config.history_max_bytes as usize => {
@@ -470,13 +485,23 @@ pub(super) fn committed(
         index.snapshots.insert(id.into(), compact(session));
     }
     if !prune(service, &mut index) {
-        return Err(std::io::Error::other(
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
             "history capacity held by active owners",
+        ));
+    }
+    // Validate the exact bytes that will become authority before opening the
+    // temporary file. No failed publication may replace a readable generation.
+    let bytes = serde_json::to_vec(&index)?;
+    if bytes.len() > service.config.history_max_bytes as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "history index exceeds configured byte bound",
         ));
     }
     let temporary = service.config.state_dir.join(".history-index.tmp");
     let mut file = private_file(&temporary, false)?;
-    serde_json::to_writer(&mut file, &index)?;
+    file.write_all(&bytes)?;
     file.sync_all()?;
     std::fs::rename(temporary, service.config.state_dir.join("history.index"))?;
     File::open(&service.config.state_dir)?.sync_all()?;
