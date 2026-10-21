@@ -174,7 +174,7 @@ async fn history_failed_small_publication_and_lowered_restart_preserve_generatio
     bounded.config.history_max_bytes = prior.len().try_into().unwrap();
     let pin = history::pin(&bounded, &owner).unwrap();
     let mut oversized = selected.clone();
-    oversized.title = "new oversized selected metadata ".repeat(prior.len());
+    oversized.title = Some("new oversized selected metadata ".repeat(prior.len()));
     assert!(history::committed(&bounded, &owner, &oversized, None).is_err());
     assert_eq!(std::fs::read(&index).unwrap(), prior);
     assert_eq!(load(&bounded, &owner).unwrap().primary.calls, 1);
