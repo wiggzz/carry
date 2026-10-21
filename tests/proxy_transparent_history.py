@@ -425,11 +425,21 @@ class TransparentHistory(unittest.TestCase):
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")))
         proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"], env)
         self.stack.callback(proxy.close)
+        # 4 KiB cannot hold the real selected session snapshot. Protecting a
+        # live owner now backpressures instead of deleting its authority.
+        self.assertEqual(proxy.send([{"role": "user", "content": "TOO_SMALL_OWNER"}])[0], 507)
+        self.assertEqual(fixture.primaries, [])
+        self.assertFalse((self.state / "history.index").exists())
+        self.assertEqual(list(self.state.glob("*.json")), [])
+        proxy.close()
+        env["CARRY_PROXY_HISTORY_MAX_BYTES"] = "16384"
+        proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"], env)
+        self.stack.callback(proxy.close)
         for n in range(8):
             self.assertEqual(proxy.send([{"role": "user", "content": f"UNIQUE_{n}"}])[0], 200)
             raw = (self.state / "history.index").read_bytes()
             index = json.loads(raw)
-            self.assertLessEqual(len(raw), 4096)
+            self.assertLessEqual(len(raw), int(env["CARRY_PROXY_HISTORY_MAX_BYTES"]))
             self.assertLessEqual(len(index["nodes"]), 4)
             self.assertLessEqual(len(index["tips"]) + len(index["transcripts"]), 4)
         self.assertEqual(proxy.send([], previous_response_id="resp_1")[0], 409)
@@ -597,6 +607,35 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(resumed["primary"]["calls"], 3)
         self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
 
+    def test_bounded_many_sibling_storage_observation_is_not_latency_evidence(self):
+        proxy, fixture, history, _ = self.seed(extra=("--history-max-references", "32"))
+        self.assertEqual(proxy.send(history + [{"role": "user", "content": "STORAGE_PARENT"}])[0], 200)
+        observations = []
+        for n in range(20):
+            child = history + [{"role": "user", "content": f"STORAGE_CHILD_{n}"}]
+            self.assertEqual(proxy.send(child)[0], 200)
+            path = self.state / "history.index"
+            index = json.loads(path.read_text())
+            mirrors = list(self.state.glob("*.json"))
+            observation = {"index_bytes": path.stat().st_size,
+                "diagnostic_mirror_bytes": sum(p.stat().st_size for p in mirrors),
+                "diagnostic_mirror_count": len(mirrors), "node_count": len(index["nodes"]),
+                "reference_count": len(index["tips"]) + len(index["reviews"]) + len(index["transcripts"]),
+                "snapshot_count": len(index["snapshots"]),
+                "shared_payload_copies": sum(node["value"] == history[1] for node in index["nodes"].values())}
+            observations.append(observation)
+            self.assertLessEqual(observation["reference_count"], 32)
+            self.assertLessEqual(observation["index_bytes"], 33554432)
+            self.assertEqual(observation["shared_payload_copies"], 1)
+        summary = {"case": "20_siblings_shared_42k_prefix_reference_pressure", "samples": len(observations),
+            "last": observations[-1],
+            "maximum_observed_index_plus_mirrors_bytes": max(o["index_bytes"] + o["diagnostic_mirror_bytes"] for o in observations),
+            "temporary_peak_bytes_measured": False, "lookup_serialization_counts_measured": False,
+            "latency_claim": False}
+        self.evidence.update(storage=summary)
+        import sys
+        print("TRANSPARENT_HISTORY_STORAGE=" + json.dumps(summary, sort_keys=True), file=sys.stderr, flush=True)
+
     def test_malformed_combined_and_unknown_selectors_never_dispatch(self):
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"selector_{n}")))
         proxy = self.proxy(fixture, ["--review-every-requests", "100"])
@@ -715,7 +754,15 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(advanced)[0], 200)
         self.assertNotIn("A_FACT", json.dumps(fixture.primaries[-1]["input"]))
         self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
+        _, retried = proxy.checkpoint(advanced)
+        self.assertEqual(retried["shadow"]["calls"], shadow + 1,
+                         "configured cadence-one retry settles exactly one paid review")
+        shadow = retried["shadow"]["calls"]
         proxy.close()
+        # Freeze further reviewer work to isolate receipt persistence across
+        # restart/GC; cadence is not a review-authority namespace dimension.
+        options = list(options)
+        options[options.index("--review-every-requests") + 1] = "100"
         proxy = TransparentProxy(self.state, fixture, options)
         self.stack.callback(proxy.close)
         self.assertEqual(proxy.send(advanced)[0], 200)
@@ -768,7 +815,7 @@ class TransparentHistory(unittest.TestCase):
         proxy, fixture, history, options = self.seed(history=history)
         self.assertEqual(proxy.send(history + [{"role": "user", "content": "COHORT_PARENT"}])[0], 200)
         proxy.close()
-        options += ["--review-every-requests", "100", "--bootstrap-min-input-bytes", "10000000"]
+        options += ["--review-every-requests", "100"]
         proxy = TransparentProxy(self.state, fixture, options)
         self.stack.callback(proxy.close)
         grown = history + [{"type": "function_call_output", "call_id": "a1", "output": "NEW_COHORT_RESULT"},

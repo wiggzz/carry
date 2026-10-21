@@ -60,7 +60,16 @@ state. Unknown, expired, evicted or differently scoped IDs return HTTP409 before
 upstream; corrupt/unreadable indexes fail closed with HTTP500.
 
 The canonical archive contains original observed inputs **and actual assistant
-outputs**, separately from selected primary/shadow active context. Response IDs
+outputs**, separately from selected primary/shadow active context. Canonical
+here means parsed JSON values with object-key-order-independent identity, not
+semantic normalization. Exact provider-output replay can match; changing message
+shape, deleting provider fields, or replacing text with a summary is a different
+history. Carry does not fuzzy-match SDK-specific assistant echoes. The existing
+native Pi fixture forwards that client's actual ordinary history and fork replay;
+it does not certify every client's possible output transformation. Top-level
+`metadata`, `client_metadata` and cache affinity are excluded from settings scope,
+not accepted as logical-session credentials; fields inside input remain content.
+Response IDs
 retain immutable frontiers, permitting rewind after restart. Conversation IDs
 advance with observed successful responses. This does not implement remote
 conversation retrieval/creation or unseen provider history. Background provider
@@ -82,7 +91,7 @@ session checkpoints retain their legacy format and lifetime.
 | --- | --- | --- |
 | `--history-max-nodes` / `CARRY_PROXY_HISTORY_MAX_NODES` | 16384 | 1–65536 unique canonical nodes |
 | `--history-max-references` / `CARRY_PROXY_HISTORY_MAX_REFERENCES` | 256 | 1–4096 tip/review-frontier/transcript references |
-| `--history-max-bytes` / `CARRY_PROXY_HISTORY_MAX_BYTES` | 33554432 | 2–67108864 total index bytes, including selected snapshots |
+| `--history-max-bytes` / `CARRY_PROXY_HISTORY_MAX_BYTES` | 33554432 | 67–67108864 total index bytes, including selected snapshots; smaller values reject startup |
 | `--fork-max-nodes` / `CARRY_PROXY_FORK_MAX_NODES` | 8 | 0–32 committed review versions |
 | `--fork-max-bytes` / `CARRY_PROXY_FORK_MAX_BYTES` | 262144 | 2–1048576 serialized review-version bytes per lineage |
 | `--fork-max-age-secs` / `CARRY_PROXY_FORK_MAX_AGE_SECS` | 86400 | 0–604800 seconds |
@@ -96,7 +105,28 @@ unreachable canonical nodes are collected. This does not delete legacy explicit
 checkpoints. Retained children preserve their own removal state. Large/unretained
 histories may lack reusable evidence/ID expansion. One proxy
 process owns a state directory; independent concurrent process writers are not
-supported.
+supported. Selected owners are pinned across lock waits, primary transport and
+paid reviewer settlement. Pins are bounded by the reference budget and released
+when work finishes; they are not a durable no-GC flag. If live authority cannot
+fit the configured bounds, new work fails with HTTP507 before primary dispatch
+rather than evicting that authority. Even a valid 67-byte limit fits only the
+empty envelope, not a working owner. Lowering a limit below a previously published
+index fails closed without replacing that generation.
+
+The node graph shares raw wire payloads; it does not make the entire state
+constant-size. A request reads/parses the bounded JSON index, hashes its full
+input, clones selected state and serializes the index on publication (including
+prune size checks). Each retained tip can have a selected snapshot and diagnostic
+mirror. Atomic replacement temporarily holds old and new generations, and raw
+reviewer replay/diagnostic mirrors can add bytes beyond the index bound. The
+synthetic many-sibling control reports observed index/mirror bytes and node/reference
+counts only, not peak temporary storage, operation counts or latency. No speedup,
+linear-work, or whole-directory byte-bound claim follows from prefix sharing.
+
+Predecessor unmerged headerless checkpoints are not automatically migrated into
+this index. Missing history begins with supplied full input; unknown explicit
+IDs reject. Existing explicit-session legacy checkpoint handling remains separate;
+no directory scan promotes arbitrary old/temporary files into authority.
 
 Diagnostic mirror publication precedes atomic index publication. A crash between
 them leaves the prior indexed selection authoritative, never new uncommitted
