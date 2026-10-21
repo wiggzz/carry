@@ -438,7 +438,7 @@ fn plan_inner(
     } else {
         None
     };
-    let report = json!({"selected":best.is_some(),"forced":forced,"reason":reason,
+    let identity_and_output = json!({
         "selected_candidate_id":best.as_ref().map(|(_, _, id, _)| id.as_str()).or(if forced {None} else {Some("keep")}),
         "selected_action":best.as_ref().map(|(_, _, _, action)| *action).or(if forced {None} else {Some("keep")}),
         "keep_candidate":{"candidate_id":"keep","action":"keep","feasible":primary_ok},
@@ -449,7 +449,8 @@ fn plan_inner(
         "primary_output_allowance_requests":config.payoff_requests,
         "primary_output_allowance_basis":if output_allowance.is_some() {"request_max_output_tokens_cap_sensitivity_not_expected_generation"} else {"legacy_zero_no_explicit_request_cap_not_headroom"},
         "primary_output_tariff_basis":"each_rendered_branch_input_selected_frozen_tariff",
-        "joint_basis":"legacy_input_only_primary_recurring_reviewer_sensitivity",
+        "joint_basis":"legacy_input_only_primary_recurring_reviewer_sensitivity"});
+    let mut report = json!({"selected":best.is_some(),"forced":forced,"reason":reason,
         "mode":format!("{:?}",config.mode).to_lowercase(),
         "primary_fits":primary_ok,"reviewer_fits":reviewer_ok,
         "primary_estimated_tokens":estimate(&wire),"reviewer_estimated_tokens":estimate(&reviewer),
@@ -475,6 +476,10 @@ fn plan_inner(
         "review_completion_basis":"future_reviews_complete_and_merge_before_next_due_dispatch",
         "cache_basis":"exact_compatible_prefix_receipts_expire_after_30_minutes",
         "candidates":reports});
+    report
+        .as_object_mut()
+        .unwrap()
+        .extend(identity_and_output.as_object().unwrap().clone());
     (best.map(|(state, _, _, _)| state), report)
 }
 
