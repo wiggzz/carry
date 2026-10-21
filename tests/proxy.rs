@@ -2556,7 +2556,11 @@ async fn reviewer_timeout_fails_closed_while_primary_can_complete() {
         .as_array_mut()
         .unwrap()
         .extend(first["output"].as_array().unwrap().iter().cloned());
-    assert!(send(&url, &next, "a", "main").await.status().is_success());
+    let second = send(&url, &next, "a", "main").await;
+    assert!(second.status().is_success());
+    // Primary usage/checkpoint commit completes while the response is consumed;
+    // an HTTP status alone can precede the second successful-request debit.
+    second.bytes().await.unwrap();
     let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["completed_requests"], 2);
     assert_eq!(saved["shadow"]["calls"], 1);

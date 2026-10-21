@@ -279,7 +279,7 @@ fn action_identity_reviewer_only_preserves_primary_and_keep_has_no_fake_primary_
     // Accepted source authority remains separate from disposable native turns.
     session.review_history = Some(crate::proxy_state::ReviewHistory {
         source_len: 0,
-        source_sha256: String::new(),
+        source_sha256: reviewer_serialized_identity(&Vec::<Value>::new()).1,
         input: vec![json!({"role":"assistant","content":"disposable review replay ".repeat(2000)})],
     });
     let (selected, report) = plan(&config, &session, &body);
