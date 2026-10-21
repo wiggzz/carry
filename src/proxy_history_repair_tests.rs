@@ -211,6 +211,28 @@ async fn history_failed_small_publication_and_lowered_restart_preserve_generatio
     provider.abort();
 }
 
+#[test]
+fn history_pre_settlement_marker_generation_remains_readable() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = checkpoint_service(directory.path());
+    let input = vec![json!({"role":"user","content":"old generation"})];
+    let mut session = Session::default();
+    session.ingest(&input).unwrap();
+    let mut old = serde_json::to_value(&session).unwrap();
+    old.as_object_mut().unwrap().remove("primary_pending");
+    // Explicit pre-field serialized fixture, loaded by the real production
+    // checkpoint reader rather than a bespoke migration/test decoder.
+    std::fs::write(
+        directory.path().join("old-generation.json"),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+    let restored = load(&service, "old-generation").unwrap();
+    assert!(!restored.primary_pending);
+    assert_eq!(restored.render_primary(), input);
+    assert_eq!(restored.primary.calls, 0);
+}
+
 #[tokio::test]
 async fn history_paid_primary_abandoned_attempt_is_durably_censored_once() {
     use std::sync::atomic::AtomicUsize;
@@ -293,7 +315,7 @@ async fn history_paid_primary_abandoned_attempt_is_durably_censored_once() {
     history_race_send(restarted.clone(), input).await;
     let saved = load(&restarted, &owner).unwrap();
     assert_eq!(saved.primary.calls, 3);
-    assert_eq!(saved.primary.unavailable_cost_calls, 3);
+    assert_eq!(saved.primary.unavailable_cost_calls, 1);
     assert_eq!(
         saved
             .cost_trajectory
@@ -370,7 +392,14 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
     service.config.classifier_model = "gpt-6-luna".into();
     service.config.review_every_requests = 100;
     service.config.bootstrap_min_input_bytes = usize::MAX;
-    service.config.history_max_bytes = 16384;
+    // Real native reviewer replay also retains its fixed instruction envelope.
+    // Only this fitting control has 64 KiB; both oversized cases keep 16 KiB.
+    let budget = if reviewer && growth < 16384 {
+        65536
+    } else {
+        16384
+    };
+    service.config.history_max_bytes = budget;
     let service = Arc::new(service);
     let input = json!([{"role":"user","content":"paid growth goal"},
         {"role":"assistant","content":"already removed source"},
@@ -439,7 +468,7 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
     );
     if reviewer {
         assert_eq!(saved.shadow.input_tokens, 101);
-        assert_eq!(saved.shadow.unavailable_cost_calls, 1);
+        assert_eq!(saved.shadow.unavailable_cost_calls, 0);
         assert!(!saved.background_review_pending);
         assert!(
             saved.history[1].removed,
@@ -466,8 +495,19 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
             "failed publication must not publish external IDs"
         );
     }
+    assert!(!saved.primary_pending);
+    assert_eq!(
+        saved
+            .cost_trajectory
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .coverage
+            .prior_untracked_calls,
+        u64::from(growth >= 16384)
+    );
     let bytes = std::fs::read(directory.path().join("history.index")).unwrap();
-    assert!(bytes.len() <= 16384);
+    assert!(bytes.len() <= budget);
     history_race_send(service.clone(), input).await;
     let saved = load(&restarted, &owner).unwrap();
     assert_eq!(
@@ -483,6 +523,35 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
         assert!(saved.history[1].removed);
     }
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(reviews.load(Ordering::SeqCst), usize::from(reviewer));
+    // Once settlement releases ownership, ordinary unrelated traffic may
+    // collect it. Neither the receipt nor its diagnostic mirror becomes a
+    // permanent pin or permission to reconstruct expired authority.
+    let mut gc = checkpoint_service(directory.path());
+    gc.config = service.config.clone();
+    gc.config.history_max_references = 4;
+    gc.config.history_max_nodes = 8;
+    // CLI permits zero-age expiry; deterministic GC, no clock sleeps/tie order.
+    gc.config.fork_max_age_secs = 0;
+    let gc = Arc::new(gc);
+    for n in 0..8 {
+        history_race_send(
+            gc.clone(),
+            json!([{"role":"user","content":format!("settlement GC {n}")}]),
+        )
+        .await;
+    }
+    let bytes = std::fs::read(directory.path().join("history.index")).unwrap();
+    let index: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(bytes.len() <= budget);
+    assert!(index["nodes"].as_object().unwrap().len() <= 8);
+    assert!(
+        index["tips"].as_object().unwrap().len() + index["transcripts"].as_object().unwrap().len()
+            <= 4
+    );
+    assert!(index["snapshots"].get(&owner).is_none());
+    assert!(history::restore(&gc, &owner).is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 2 + 8);
     assert_eq!(reviews.load(Ordering::SeqCst), usize::from(reviewer));
     provider.abort();
 }

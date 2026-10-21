@@ -588,6 +588,41 @@ fn save(service: &Service, id: &str, session: &Session) -> std::io::Result<()> {
     save_observed(service, id, session, None)
 }
 
+/// Settle paid accounting without the material whose publication failed. Start
+/// from authority, not the failed candidate/mirror: no new response ID, replay,
+/// advice, or removal state may leak through this fallback. The normal hard
+/// limits still apply. If even this cannot publish, the predispatch pending
+/// marker remains canonical and restart conservatively censors the attempt.
+fn save_paid_accounting(service: &Service, id: &str, paid: &Session) -> std::io::Result<()> {
+    let mut durable = load_existing(service, id)
+        .map_err(|_| std::io::Error::other("paid accounting authority unavailable"))?;
+    let calls = paid.primary.calls.saturating_sub(durable.primary.calls)
+        + paid.shadow.calls.saturating_sub(durable.shadow.calls);
+    durable.primary = paid.primary.clone();
+    durable.shadow = paid.shadow.clone();
+    durable.completed_requests = paid.completed_requests;
+    durable.failed_primaries = paid.failed_primaries;
+    durable.primary_pending = paid.primary_pending;
+    durable.background_review_pending = paid.background_review_pending;
+    if let Some(state) = &mut durable.keep_leases {
+        state.pending = paid
+            .keep_leases
+            .as_ref()
+            .and_then(|state| state.pending.clone());
+    }
+    durable.bootstrap_review_pending = paid.bootstrap_review_pending;
+    durable.bootstrap_estimated_cost_usd = paid.bootstrap_estimated_cost_usd;
+    durable.cost_trajectory = paid.cost_trajectory.clone();
+    if calls > 0
+        && let Some(trajectory) = &mut durable.cost_trajectory
+    {
+        // Receipts remain exact, but the lost observation/replay cannot
+        // support a complete counterfactual savings comparison.
+        trajectory.prior_untracked(calls);
+    }
+    save(service, id, &durable)
+}
+
 fn save_observed(
     service: &Service,
     id: &str,
@@ -1144,7 +1179,7 @@ async fn dashboard_stats(
             .as_ref()
             .map(|t| t.snapshot())
             .unwrap_or_default()
-            .dashboard(session.background_review_pending);
+            .dashboard(session.background_review_pending || session.primary_pending);
         cost_estimate.observe(&estimate);
         let updated_at = entry
             .metadata()
@@ -1493,6 +1528,23 @@ async fn forward_request(
             trajectory.prior_untracked(session.primary.calls + session.shadow.calls);
             session.cost_trajectory = Some(trajectory);
         }
+        if session.primary_pending {
+            // The per-owner primary lock excludes a live predecessor. This is
+            // an abandoned transport or a settlement that could not publish.
+            session.primary_pending = false;
+            session.primary.calls += 1;
+            session.primary.unavailable_cost_calls += 1;
+            if let Some(trajectory) = &mut session.cost_trajectory {
+                trajectory.prior_untracked(1);
+            }
+            journal(
+                &service,
+                &id,
+                &request_id,
+                "primary_censored",
+                &json!({"reason":"unsettled_primary_attempt","cost_censored":true}),
+            );
+        }
         if session.background_review_pending
             && !service.background_reviews.lock().await.contains(&id)
         {
@@ -1709,7 +1761,9 @@ async fn forward_request(
         }
         // Persist completed shadow work before starting the primary. New native
         // input remains unexposed even when the reviewer already observed it.
-        save(&service, &id, &reviewed).map_err(|error| {
+        let mut reserved = reviewed.clone();
+        reserved.primary_pending = true;
+        save(&service, &id, &reserved).map_err(|error| {
             if error.kind() == std::io::ErrorKind::StorageFull {
                 failure(
                     StatusCode::INSUFFICIENT_STORAGE,
@@ -1856,7 +1910,9 @@ async fn forward_request(
                 }
                 commit.reviewed.primary.calls += 1;
                 commit.reviewed.primary.unavailable_cost_calls += 1;
-                let _ = save(&service, &commit.id, &commit.reviewed);
+                if save(&service, &commit.id, &commit.reviewed).is_err() {
+                    let _ = save_paid_accounting(&service, &commit.id, &commit.reviewed);
+                }
                 logging::usage(
                     &service,
                     &commit.id,
@@ -2482,12 +2538,13 @@ async fn dispatch_review_for(
         if let Ok(mut current) = load_existing(&service, &id) {
             let merged = merge_review(&service.config, &mut current, &before, &reviewed, &run);
             if save(&service, &id, &current).is_err() {
+                let accounting_committed = save_paid_accounting(&service, &id, &current).is_ok();
                 journal(
                     &service,
                     &id,
                     &run.request_id,
                     "background_review_checkpoint_failed",
-                    &json!({}),
+                    &json!({"accounting_committed":accounting_committed}),
                 );
                 let _ = trace(
                     &service,
@@ -4093,12 +4150,15 @@ async fn relay(
                 )
                 .is_err()
                 {
+                    let accounting_committed =
+                        save_paid_accounting(&commit.service, &commit.id, &commit.candidate)
+                            .is_ok();
                     journal(
                         &commit.service,
                         &commit.id,
                         &commit.request_id,
                         "primary_checkpoint_failed",
-                        &json!({"candidate_committed":false}),
+                        &json!({"candidate_committed":false,"accounting_committed":accounting_committed}),
                     );
                     converted_value = None;
                     let _ = sender
@@ -4153,7 +4213,9 @@ async fn relay(
                     commit.reviewed.primary.calls += 1;
                     commit.reviewed.primary.unavailable_cost_calls += 1;
                 }
-                let _ = save(&commit.service, &commit.id, &commit.reviewed);
+                if save(&commit.service, &commit.id, &commit.reviewed).is_err() {
+                    let _ = save_paid_accounting(&commit.service, &commit.id, &commit.reviewed);
+                }
                 let _ = trace(
                     &commit.service,
                     &commit.id,

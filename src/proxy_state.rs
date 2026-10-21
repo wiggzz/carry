@@ -160,6 +160,8 @@ pub(super) struct Session {
     #[serde(default)]
     pub review_epoch: u64,
     #[serde(default)]
+    pub primary_pending: bool,
+    #[serde(default)]
     pub background_review_pending: bool,
     #[serde(default)]
     pub last_failure: Option<Value>,
