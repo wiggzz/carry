@@ -139,7 +139,20 @@ fn output_allowance_same_rate_cancels_and_missing_cap_is_explicit_zero_not_headr
     let mut config = output_config();
     config.payoff_requests = 3;
     config.primary_output_reserve_tokens = 99999;
-    let session = output_session(100, 80);
+    let mut session = output_session(100, 80);
+    // Frozen dispatch-epoch prices must win over today's slug catalog, while
+    // historical paid cost remains a separate receipt ledger.
+    session
+        .model_resolution
+        .as_mut()
+        .unwrap()
+        .primary
+        .rates
+        .as_mut()
+        .unwrap()
+        .output = 47.0;
+    session.primary.calls = 4;
+    session.primary.cost_usd = 7.23;
     let mut prior = None;
     for cap in [None, Some(0u64), Some(100_000)] {
         let mut body = json!({"model":"gpt-6-sol","input":session.render_primary()});
@@ -162,9 +175,16 @@ fn output_allowance_same_rate_cancels_and_missing_cap_is_explicit_zero_not_headr
         .unwrap();
         let allowance = cap.unwrap_or(0) as f64
             * 3.0
-            * Rates::for_model("gpt-6-sol", estimate(&body))
+            * session
+                .model_resolution
+                .as_ref()
+                .unwrap()
+                .primary
+                .rates_for_input(estimate(&body))
                 .unwrap()
                 .output;
+        assert_eq!(session.primary.calls, 4);
+        assert_eq!(session.primary.cost_usd, 7.23);
         let joint = &row["selection_joint"];
         output_close(
             joint["primary_keep"].as_f64().unwrap(),
@@ -194,11 +214,71 @@ fn output_allowance_same_rate_cancels_and_missing_cap_is_explicit_zero_not_headr
     }
 }
 
+#[test]
+fn output_allowance_preserves_unknown_pricing_and_original_cap_after_wire_adaptation() {
+    let mut config = output_config();
+    config.codex_login = true;
+    let mut session = output_session(100, 80);
+    let body = json!({"model":"gpt-6-sol","input":session.render_primary(),
+        "max_output_tokens":600,"prompt_cache_key":"stable-output-control"});
+    let wire = primary_wire_body(&config, &body);
+    assert!(wire.get("max_output_tokens").is_none());
+    let (_, report) = plan(&config, &session, &body);
+    assert_eq!(report["primary_output_allowance_tokens"], 600);
+    let expected = 600.0
+        * session
+            .model_resolution
+            .as_ref()
+            .unwrap()
+            .primary
+            .rates_for_input(estimate(&wire))
+            .unwrap()
+            .output;
+    output_close(
+        report["candidates"][0]["selection_primary_output"]["keep"]
+            .as_f64()
+            .unwrap(),
+        expected,
+    );
+    for cap in [0, 600] {
+        session.model_resolution.as_mut().unwrap().primary.rates = None;
+        let mut unknown = body.clone();
+        unknown["max_output_tokens"] = json!(cap);
+        let (selected, report) = plan(&config, &session, &unknown);
+        assert!(selected.is_none());
+        assert_eq!(report["reason"], "unsupported_model_or_tier");
+        for row in report["candidates"].as_array().unwrap() {
+            assert!(row["selection_joint"].is_null());
+            assert!(row["selection_primary_input"].is_null());
+            assert!(
+                row["selection_primary_output"].is_null(),
+                "zero cap must not relabel unsupported pricing as known"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn action_identity_forced_selection_and_dashboard_follow_actual_render_not_max_savings() {
     let mut config = output_config();
-    let mut session = output_session(100, 800);
+    config.classifier_max_input_tokens = 300000;
+    let mut session = output_session(1000, 200);
+    // Both real actions exist, but reviewer-only cannot relieve primary overflow.
+    // A warm primary makes that infeasible row's zero input savings larger than
+    // the fitting cold rewrite's loss: forced selection must not report max gain.
+    session.review_history = Some(crate::proxy_state::ReviewHistory {
+        source_len: 0,
+        source_sha256: reviewer_serialized_identity(&Vec::<Value>::new()).1,
+        input: Vec::new(),
+    });
     let body = json!({"model":"gpt-6-sol","input":session.render_primary()});
+    let resolved = session.model_resolution.as_ref().unwrap().primary.clone();
+    observe_primary_cache(
+        &mut session.primary_cache,
+        &body,
+        &json!({"input_tokens":2000,"input_tokens_details":{"cached_tokens":2000}}),
+        Some(&resolved),
+    );
     let mut expected = session.clone();
     expected.remove(&[2], &session.groups());
     let mut compact = body.clone();
@@ -226,17 +306,25 @@ async fn action_identity_forced_selection_and_dashboard_follow_actual_render_not
     assert_eq!(row["removed_groups"], json!([2]));
     assert_eq!(report["selected_action"], "joint");
     assert_eq!(report["keep_candidate"]["action"], "keep");
-    // Synthetic saved-report decoy: huge recurring savings on an infeasible,
-    // unselected row must never masquerade as the actual forced action.
-    session.last_plan = report;
-    session.last_plan["candidates"]
-        .as_array_mut()
+    let maximum = report["candidates"]
+        .as_array()
         .unwrap()
-        .push(json!({
-            "candidate_id":"decoy-unselected", "action":"reviewer_only", "feasible":false,
-            "joint":{"keep":999.0,"compact":0.0,"savings":999.0},
-            "selection_joint":{"keep":888.0,"compact":0.0,"savings":888.0}
-        }));
+        .iter()
+        .max_by(|a, b| {
+            a["joint"]["savings"]
+                .as_f64()
+                .unwrap()
+                .partial_cmp(&b["joint"]["savings"].as_f64().unwrap())
+                .unwrap()
+        })
+        .unwrap();
+    assert_eq!(maximum["action"], "reviewer_only");
+    assert_eq!(maximum["feasible"], false);
+    assert_ne!(maximum["candidate_id"], id);
+    assert!(
+        maximum["joint"]["savings"].as_f64().unwrap() > row["joint"]["savings"].as_f64().unwrap()
+    );
+    session.last_plan = report;
     let directory = tempfile::tempdir().unwrap();
     let service = Arc::new(super::checkpoint_service(directory.path()));
     save(&service, &"a".repeat(64), &session).unwrap();
@@ -279,7 +367,7 @@ fn action_identity_reviewer_only_preserves_primary_and_keep_has_no_fake_primary_
     // Accepted source authority remains separate from disposable native turns.
     session.review_history = Some(crate::proxy_state::ReviewHistory {
         source_len: 0,
-        source_sha256: String::new(),
+        source_sha256: reviewer_serialized_identity(&Vec::<Value>::new()).1,
         input: vec![json!({"role":"assistant","content":"disposable review replay ".repeat(2000)})],
     });
     let (selected, report) = plan(&config, &session, &body);
