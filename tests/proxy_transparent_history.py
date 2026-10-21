@@ -219,7 +219,8 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(json.loads((self.state / "history.index").read_text())["reviews"], {})
 
     def test_index_byte_node_age_limits_and_evicted_ids_fail_closed(self):
-        env = {"CARRY_PROXY_FORK_MAX_BYTES": "4096", "CARRY_PROXY_FORK_MAX_NODES": "4",
+        env = {"CARRY_PROXY_FORK_MAX_BYTES": "4096", "CARRY_PROXY_HISTORY_MAX_NODES": "4",
+               "CARRY_PROXY_HISTORY_MAX_REFERENCES": "4",
                "CARRY_PROXY_FORK_MAX_AGE_SECS": "1"}
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")))
         proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"], env)
@@ -239,6 +240,38 @@ class TransparentHistory(unittest.TestCase):
         proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"], env)
         self.stack.callback(proxy.close)
         self.assertEqual(proxy.send([], previous_response_id="resp_8")[0], 409)
+
+    def test_killed_uncommitted_review_does_not_replace_committed_ancestor(self):
+        import threading
+        held, release = threading.Event(), threading.Event()
+        self.stack.callback(release.set)
+        def review(body, n):
+            ids = ledger(body)["eligible_group_ids"]
+            if n == 2:
+                held.set()
+                assert release.wait(10), "held review release"
+            return 200, advice_response({"protected": [i for i in ids if i == "g1"],
+                "removable": [i for i in ids if i != "g1"],
+                "memories": [{"source_ids": ["g2"], "text": "A_FACT" if n == 1 else "UNCOMMITTED_B_FACT"}]})
+        proxy, fixture, history, options = self.seed(review=review)
+        proxy.close()
+        proxy = TransparentProxy(self.state, fixture, [*options, "--background-reviews=true"])
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(history + [{"role": "user", "content": "B_ONLY"}])[0], 200)
+        self.assertTrue(held.wait(5), "actual dispatched reviewer must be in flight")
+        proxy.close()
+        release.set()
+        (self.state / "orphan.json.tmp").write_text('{"memories":[{"text":"UNCOMMITTED_B_FACT"}]}')
+        proxy = TransparentProxy(self.state, fixture, options)
+        self.stack.callback(proxy.close)
+        child = history + [{"role": "user", "content": "C_ONLY"}]
+        self.assertEqual(proxy.send(child)[0], 200)
+        sent = json.dumps(fixture.primaries[-1])
+        self.assertIn("A_FACT", sent)
+        self.assertNotIn("RAW_A", sent)
+        self.assertNotIn("UNCOMMITTED_B_FACT", sent)
+        _, state = proxy.checkpoint(child)
+        self.assertEqual(state["shadow"]["calls"], 0)
 
     def test_concurrent_siblings_keep_independent_selection_and_restart(self):
         import concurrent.futures

@@ -11,11 +11,6 @@ import subprocess
 import tempfile
 import threading
 
-# The existing normal hosted suite owns these additive model-free regressions.
-from scripts.test_pi_native_bridge import (PiBridgeCompletionTests, PiMappingModeTests,
-    PiParentRawProofTests, PiTerminalParserTests)
-
-
 class ShadowContractProvider:
     """Real HTTP wire capture; no model, credentials or synthesized proxy state."""
     def __init__(self):
@@ -130,52 +125,6 @@ def contract_state(directory):
 
 
 class NativeProviderFixtureTests(unittest.TestCase):
-    def test_explicit_native_bridge_owns_identity_and_preserves_full_body_and_resume(self):
-        from scripts.pi_native_bridge import PiNativeBridge, NativeIntentError
-        import uuid
-        seen = []
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *args): pass
-            def do_POST(self):
-                seen.append((self.path,list(self.headers.raw_items()),
-                    self.rfile.read(int(self.headers['content-length']))))
-                self.send_response(200); self.send_header('content-length','2')
-                self.end_headers(); self.wfile.write(b'{}')
-        server = http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
-        thread = threading.Thread(target=server.serve_forever,daemon=True); thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                mapping = Path(directory)/'mapping.json'
-                target = 'http://127.0.0.1:'+str(server.server_port)
-                native = str(uuid.uuid4())
-                with PiNativeBridge(target,'synthetic',tenant='operator',session='family',mapping=mapping) as bridge:
-                    branch = bridge.resume(native)
-                    body = b' {"model":"exact-model", "input":[{"role":"user","content":"RAW_ONLY_7"}], "temperature":1.0} '
-                    request = urllib.request.Request(bridge.url+'/v1/responses',data=body,headers={
-                        'authorization':'Bearer synthetic','x-carry-tenant':'spoof',
-                        'x-carry-session':'spoof','x-carry-branch':'spoof','x-carry-fork-parent':'spoof',
-                        'x-carry-fork-point':'spoof','x-carry-history-policy':'reset-on-divergence',
-                        'x-carry-unknown':'spoof'})
-                    with urllib.request.urlopen(request,timeout=3) as response:
-                        self.assertEqual(response.read(),b'{}')
-                    self.assertEqual(seen[0][0],'/v1/responses')
-                    self.assertEqual(seen[0][2],body)
-                    headers = {k.lower():v for k,v in seen[0][1]}
-                    self.assertEqual(headers['x-carry-tenant'],'operator')
-                    self.assertEqual(headers['x-carry-session'],'family')
-                    self.assertEqual(headers['x-carry-branch'],branch)
-                    self.assertEqual(headers['x-carry-history-policy'],'strict')
-                    self.assertFalse(any('spoof'==v for v in headers.values()))
-                    self.assertNotIn('x-carry-fork-parent',headers)
-                    with self.assertRaises(NativeIntentError) as error: bridge.resume(str(uuid.uuid4()))
-                    self.assertEqual(error.exception.code,'fork_unknown')
-                    self.assertNotIn('RAW_ONLY_7',mapping.read_text())
-                    self.assertEqual(mapping.stat().st_mode & 0o777,0o600)
-                with PiNativeBridge(target,'synthetic',tenant='operator',session='family',mapping=mapping) as restored:
-                    self.assertEqual(restored.resume(native),branch)
-        finally:
-            server.shutdown(); server.server_close(); thread.join(3)
-
     def test_exact_checkpoint_settlement_ignores_malformed_decoy_and_unrelated_pending(self):
         from scripts.proxy_native_settle import wait_settled
         with tempfile.TemporaryDirectory() as directory:

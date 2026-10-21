@@ -19,7 +19,8 @@ import uuid
 def client_configuration(root, *, client, base_url, model, session_id,
                          history_policy="strict", native_compaction="disabled"):
     """Write credential-free native HTTP Responses provider configuration."""
-    headers = {'x-carry-session': session_id, 'x-carry-tenant':'local-trial', 'x-carry-branch':'main'}
+    headers = ({'x-carry-session': session_id, 'x-carry-tenant':'local-trial', 'x-carry-branch':'main'}
+               if session_id is not None else {})
     if history_policy != 'strict': headers['x-carry-history-policy']=history_policy
     if client == 'codex':
         home = root / 'codex'; home.mkdir()

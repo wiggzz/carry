@@ -10,29 +10,6 @@ mod admission;
 mod pr154;
 
 #[test]
-fn historical_full_history_fork_after_parent_cleanup() {
-    let output = Command::new("python3")
-        .args([
-            "-B",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/proxy_fork_continuity.py"
-            ),
-            "ForkContinuity",
-            "-v",
-        ])
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
-        .output()
-        .expect("Python loopback fork regression");
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
 fn transparent_server_owned_history() {
     let output = Command::new("python3")
         .args([
@@ -46,28 +23,6 @@ fn transparent_server_owned_history() {
         .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("transparent loopback history regression");
-    std::io::Write::write_all(&mut std::io::stdout(), &output.stderr).unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-fn committed_fork_cut_discovery() {
-    let output = Command::new("python3")
-        .args([
-            "-B",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/proxy_fork_discovery.py"),
-            "ForkDiscovery",
-            "-v",
-        ])
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
-        .output()
-        .expect("Python loopback neutral fork discovery regression");
-    // Keep the actual HTTP method results visible even without --nocapture.
     std::io::Write::write_all(&mut std::io::stdout(), &output.stderr).unwrap();
     assert!(
         output.status.success(),
@@ -2785,7 +2740,7 @@ async fn client_continuation_is_expanded_but_never_forwarded_upstream() {
 }
 
 #[tokio::test]
-async fn implicit_active_prefix_reuses_removals_and_rebuilds_on_divergence() {
+async fn implicit_history_reuses_removals_and_keeps_divergent_history_separate() {
     let fixture = fixture(json!({"protected": ["g1"], "removable": ["g2"], "memories": []})).await;
     let state = tempfile::tempdir().unwrap();
     let (proxy, url) = start_proxy(state.path(), fixture.address, "compact").await;
@@ -2835,12 +2790,16 @@ async fn implicit_active_prefix_reuses_removals_and_rebuilds_on_divergence() {
     let saved = checkpoint_states(state.path());
     assert_eq!(
         saved.len(),
-        1,
-        "only one active history, not retained forks"
+        2,
+        "unrelated history has its own selection, not a destructive reset"
     );
-    assert_eq!(saved[0]["history_rebases"], 1);
-    assert!(saved[0]["memories"].as_array().unwrap().is_empty());
-    assert!(saved[0]["opinions"].as_object().unwrap().is_empty());
+    let fresh = saved
+        .iter()
+        .find(|s| s["history"].as_array().unwrap().len() == 1)
+        .unwrap();
+    assert_eq!(fresh["history_rebases"], 0);
+    assert!(fresh["memories"].as_array().unwrap().is_empty());
+    assert!(fresh["opinions"].as_object().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -3022,9 +2981,14 @@ async fn implicit_unseen_history_can_replace_a_native_checkpoint_epoch() {
         );
         response.bytes().await.unwrap();
     }
-    let saved = settled(state.path()).await.remove(0);
-    assert_eq!(saved["history_rebases"], 1);
-    assert_eq!(saved["native_checkpoint"], json!([]));
+    let saved = settled(state.path()).await;
+    assert_eq!(
+        saved.len(),
+        2,
+        "native epoch and unrelated history stay separate"
+    );
+    assert!(saved.iter().all(|s| s["history_rebases"] == 0));
+    assert!(saved.iter().any(|s| s["native_checkpoint"] == json!([])));
     server.abort();
 }
 

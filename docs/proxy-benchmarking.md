@@ -65,19 +65,21 @@ the client. API-key users omit `--codex-login` and supply the upstream/reviewer
 keys through the proxy environment.
 
 Clients use `http://127.0.0.1:8787/v1`. A full-history client may omit
-`x-carry-session`: Carry keeps one active prefix per tenant/branch and request
-settings scope. Matching prefixes reuse removals and reviewer decisions; a
-shorter or divergent history replaces that state, without searching old forks.
-This also works across restarts with the same state directory. Headerless
-clients sharing a scope share its active history; use explicit identities when
-conversations must stay independent.
+`x-carry-session`: Carry's server-owned prefix tree reuses compatible committed
+review versions across ordinary forks, rewinds and restart. A divergent child
+does not reset its parent or require a client bridge/discovery API. Exact owner,
+settings and reviewer policy boundaries still apply. Identical headerless
+histories within one scope may share a selection; logical-session identity/auth
+is deferred. See [transparent history](proxy-fork-continuity.md) for retention,
+dependency-frontier safety and unknown-history behavior.
 
 For explicit continuity, choose a unique `x-carry-session` per conversation and
 reuse it when resuming. Optional `x-carry-tenant` and `x-carry-branch` headers
 isolate owners and branches. Explicit sessions remain strict on divergence
-unless the caller opts into a reset. `previous_response_id` requires an explicit
-session and is validated there; Carry never discovers sessions from response
-IDs. Restart Carry with the **same state directory** to recover checkpoints,
+unless the caller opts into a reset. `previous_response_id` or `conversation`
+can expand an observed, retained canonical transcript through the server-owned
+index, including actual assistant outputs. Unknown/unobserved IDs fail closed.
+Restart Carry with the **same state directory** to recover checkpoints,
 removals, reviewer state and usage. Do not put provider keys in client configuration.
 For a shared listener, set `CARRY_PROXY_AUTH_TOKEN` securely and give clients
 only that scoped gateway token. Loopback model endpoints also enforce it when
@@ -93,7 +95,7 @@ replace other providers):
       "baseUrl": "http://127.0.0.1:8787/v1",
       "api": "openai-responses",
       "apiKey": "carry-local",
-      "headers": {"x-carry-session": "$CARRY_SESSION_ID"},
+
       "models": [{"id": "gpt-6.1-sol", "reasoning": true, "input": ["text", "image"], "contextWindow": 272000, "maxTokens": 128000}]
     }
   }

@@ -169,9 +169,12 @@ printf 'explain the failing tests' | carry --print
 
 Run `carry proxy`, then
 connect a separate OpenAI Responses client to `http://127.0.0.1:8787/v1`.
-Full-history clients can omit `x-carry-session` and reuse one active matching
-history prefix; explicit session IDs isolate conversations and support validated
-response-ID continuations. The reviewer retains the same sources and memories as the primary, appending new
+Full-history clients can omit `x-carry-session`: Carry automatically reuses
+compatible committed reviewed prefixes across forks, rewinds and restart, without
+a client adapter or fork-discovery API. Server-owned response/conversation indexes
+also expand observed delta histories; unknown ancestry is never fabricated.
+See [transparent history](docs/proxy-fork-continuity.md) for boundaries and limits.
+The reviewer retains the same sources and memories as the primary, appending new
 material and review updates between compactions. Oversized imports are admitted
 in bounded chunks, pruning approved sources as needed, with restart-safe progress
 and configurable call and estimated-spend limits. Before each primary request,

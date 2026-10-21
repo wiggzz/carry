@@ -115,7 +115,6 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
     session = uuid.uuid4().hex
     state_dir = root/'state'
     rpc = proxy = None
-    bridge = None
     result = {'case':'fork', 'client':'pi', 'fixture_only':True}
     with fixture_class('pi', 'fork') as fixture, contextlib.ExitStack() as stack:
         def capture():
@@ -152,21 +151,28 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         url = 'http://'+banner.split(' ',1)[1]
         observer = stack.enter_context(observer_class(int(url.rsplit(':',1)[1]), root/'carry-wire.jsonl'))
         endpoint = observer.url
-        # Tests-only RED uses the existing isolated launcher unchanged. The future
-        # explicit bridge is the only optional seam; absence still runs real RPC.
-        try:
-            from pi_native_bridge import PiNativeBridge
-        except ImportError:
-            PiNativeBridge = None
-        if PiNativeBridge:
-            bridge = stack.enter_context(PiNativeBridge(endpoint, 'synthetic-fork-gateway',
-                tenant='local-trial', session=session, mapping=root/'mapping.json'))
-            endpoint = bridge.url
         native_observer = stack.enter_context(observer_class(int(endpoint.rsplit(':',1)[1]),
             root/'native-wire.jsonl'))
         endpoint = native_observer.url
+        def wait_transparent(completed):
+            deadline = time.monotonic()+30
+            while time.monotonic() < deadline:
+                target = native_observer.bodies()[-1]['input']
+                index_path = state_dir/'history.index'
+                if index_path.exists():
+                    index = json.loads(index_path.read_text())
+                    for ref in index['tips'].values():
+                        path = state_dir/(ref['session']+'.json')
+                        if not path.exists(): continue
+                        value = json.loads(path.read_text())
+                        if ([i['value'] for i in value['history']] == target
+                                and value['completed_requests'] >= completed
+                                and not value['background_review_pending']):
+                            return path, value
+                time.sleep(.01)
+            raise AssertionError('exact transparent native lineage did not settle')
         env.update(client_configuration(root, client='pi', base_url=endpoint+'/v1',
-            model='gpt-6-luna', session_id=session))
+            model='gpt-6-luna', session_id=None))
         (root/'pi/settings.json').write_text(json.dumps({'compaction':{'enabled':False}}))
         client_command = [str(pi),'--mode','rpc','--provider','carry-trial','--model','gpt-6-luna',
             '--thinking','off','--no-approve','--no-extensions','--no-skills','--no-prompt-templates',
@@ -174,33 +180,20 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         log = stack.enter_context((root/'rpc.jsonl').open('w'))
         rpc = Rpc(client_command, workspace, env, log); stack.callback(rpc.close)
         native = rpc.call('get_state')
-        if bridge: bridge.resume(native['sessionId'])
         rpc.prompt('PROTECTED_A: run the scripted tools and finish A.')
-        a = settled(state_dir, session, bridge.branch if bridge else 'main', 3)
+        a = wait_transparent(3)[1]
         assert a.get('fork_points'), 'real first accepted unchanged raw cut must commit'
         assert any(m['text']=='ACCEPTED_A_FACT' for m in a['memories']), 'actual A advice required'
         a_tree = rpc.call('get_entries')
-        if bridge:
-            point = bridge.observe_boundary(native['sessionId'], a_tree)
-            from pi_native_bridge import NativeIntentError
-            try:
-                bridge.fork(str(uuid.uuid4()), str(uuid.uuid4()), a_tree)
-            except NativeIntentError as error: assert error.code=='fork_unknown'
-            else: raise AssertionError('unknown native intent must not become fresh')
-            from unittest.mock import patch
-            with patch('pi_native_bridge.time.time', return_value=point['expires_at']+1):
-                try: bridge.fork(native['sessionId'], str(uuid.uuid4()), a_tree)
-                except NativeIntentError as error: assert error.code=='fork_expired'
-                else: raise AssertionError('expired intent must not become fresh')
         (root/'a-checkpoint.json').write_text(json.dumps(a)+'\n')
         rpc.prompt('B_ONLY: advance the parent and clean up A.')
         b_tree = rpc.call('get_entries'); parent_native = rpc.call('get_state')
-        parent_branch = bridge.branch if bridge else 'main'
-        b = settled(state_dir, session, parent_branch, 4)
+        parent_branch = wait_transparent(4)[0].stem
+        b = wait_transparent(4)[1]
         rpc.prompt('B_ONLY: verify later disposable reviewer cleanup.')
-        b = settled(state_dir, session, parent_branch, 5)
+        parent_path, b = wait_transparent(5)
         parent_proof = ParentCheckpointProof(root,
-            state_path(state_dir,'local-trial',session,parent_branch),b)
+            parent_path,b)
         assert b['reviewer_compactions']>0, 'actual parent disposable cleanup'
         assert any(m['text']=='B_ONLY_FACT' for m in b['memories']), 'B-only advice must really exist on parent'
         (root/'b-checkpoint.json').write_text(json.dumps(b)+'\n')
@@ -215,10 +208,6 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         assert clone_result['cancelled'] is False
         assert clone_native['sessionId']!=parent_native['sessionId']
         assert path_ids(clone_tree)==path_ids(parent_tree), 'clone must be inclusive, not fork-before-user'
-        if bridge:
-            try: bridge.fork(native['sessionId'],clone_native['sessionId'],clone_tree)
-            except NativeIntentError as error: assert error.code=='fork_incompatible'
-            else: raise AssertionError('inclusive clone is not the supported A cut')
         rpc.call('switch_session', sessionPath=parent_native['sessionFile'])
         assert rpc.call('get_state')['sessionId']==parent_native['sessionId']
         fork_result = rpc.call('fork', entryId=selected)
@@ -234,7 +223,6 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
             'child':child_native,'clone':clone_native,'selected_b_user':selected,
             'a_tree':a_tree,'parent_tree':parent_tree,'clone_tree':clone_tree,
             'child_tree':child_tree,'child_header':header}, indent=2)+'\n')
-        if bridge: bridge.fork(parent_native['sessionId'], child_native['sessionId'], child_tree)
         before_reviews = len(fixture.reviews)
         before_calls = len(fixture.calls)
         rpc.prompt('C_ONLY: continue from A, never B.')
@@ -245,39 +233,32 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         assert 'PROTECTED_A' in text and 'C_ONLY' in text
         assert len(fixture.reviews)==before_reviews, 'no recovery review'
         assert not fixture.summary_calls, 'no native summary rescue'
-        child_branch = bridge.branch if bridge else 'main'
-        child = settled(state_dir, session, child_branch, 1)
+        child_path, child = wait_transparent(1)
+        child_branch = child_path.stem
         assert child['primary']['calls']==1 and child['shadow']['calls']==0
         assert child['primary']['cached_tokens']==0 and child['primary']['input_tokens']==1000
         assert child['primary']['cost_usd']>0, 'actual cold child spend, not copied or free'
         assert child['reviewer_cache']==[] and not child['background_review_pending']
         (root/'child-checkpoint.json').write_text(json.dumps(child)+'\n')
-        assert json.loads(state_path(state_dir,'local-trial',session,parent_branch).read_text())==b, 'parent B unchanged'
+        assert json.loads(parent_path.read_text())==b, 'parent B unchanged'
         parent_proof.check('after-child')
-        # Restart the native process and reload the bounded mapping from disk.
-        # This uses actual --session resume, not a manufactured native transcript.
+        # Restart the native process; the server owns lineage without mapping glue.
         resumed = rpc.call('get_state')
         rpc.close()
-        if bridge:
-            from pi_native_bridge import PiNativeBridge
-            reloaded = PiNativeBridge(observer.url, 'synthetic-fork-gateway', tenant='local-trial',
-                session=session, mapping=root/'mapping.json')
-            try: assert reloaded.resume(child_native['sessionId'])==child_branch
-            finally: reloaded.server.server_close()
-            assert bridge.resume(child_native['sessionId'])==child_branch
         rpc = Rpc(client_command+['--session',resumed['sessionFile']], workspace, env, log)
         stack.callback(rpc.close)
         assert rpc.call('get_state')['sessionId']==child_native['sessionId']
         rpc.prompt('C_ONLY_RESUMED: normal continuation on the child.')
-        resumed_state = settled(state_dir,session,child_branch,2)
+        resumed_path, resumed_state = wait_transparent(2)
+        assert resumed_path == child_path, 'server-owned child index resumes the same lineage'
         assert resumed_state['primary']['calls']==2 and resumed_state['shadow']['calls']==0
         assert json.dumps(fixture.calls[-1]['input']).count('ACCEPTED_A_FACT')==1
         assert 'B_ONLY' not in json.dumps(fixture.calls[-1])
         assert len(fixture.reviews)==before_reviews and not fixture.summary_calls
-        assert json.loads(state_path(state_dir,'local-trial',session,parent_branch).read_text())==b
+        assert json.loads(parent_path.read_text())==b
         parent_proof.check('after-resume')
         incoming = observer.bodies()
-        assert native_observer.bodies()==incoming, 'bridge must preserve actual complete native body'
+        assert native_observer.bodies()==incoming, 'ordinary native forwarding must preserve complete caller body'
         assert len(incoming)==len(fixture.calls), 'both wire sides complete cardinality'
         assert len(fixture.responses)==len(fixture.calls), 'every primary must have an actual provider receipt'
         child_receipt = fixture.responses[before_calls]['usage']

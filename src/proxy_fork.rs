@@ -1,5 +1,5 @@
-//! Explicit, same-owner historical full-history forks. This is not native client
-//! ancestry discovery. Evidence contains hashes/accepted facts, never raw replay,
+//! Same-owner committed review versions for transparent history reuse. This is
+//! not native client ancestry discovery. Evidence holds hashes/facts, not raw replay,
 //! usage, cache receipts, transport frontiers or in-flight reviewer state.
 use super::*;
 use crate::proxy_state::{Item, Memory};
@@ -11,6 +11,8 @@ pub(super) struct Source {
     id: u64,
     cohort: u64,
     exposed: bool,
+    #[serde(default)]
+    removed: bool,
     sha256: String,
 }
 
@@ -38,7 +40,7 @@ pub(super) fn scope(config: &ProxyCli, context: &Value) -> String {
         object.remove("prompt_cache_key");
     }
     digest(
-        &json!({"policy":"carry-explicit-fork-v1", "context":context,
+        &json!({"policy":"carry-transparent-review-v2", "context":context,
         "upstream":config.upstream_url, "subscription":config.codex_login,
         "reviewer":config.classifier_model, "reviewer_url":config.classifier_url,
         "reasoning":config.classifier_reasoning_effort,
@@ -84,28 +86,29 @@ pub(super) fn prune(config: &ProxyCli, session: &mut Session) {
     session.fork_expired.drain(..discard);
 }
 
-/// Publish only a first, fully committed review of a raw ancestor. Its entire
-/// observation/dependency frontier is the cut; claimed memory source_ids alone
-/// never shorten that frontier. Legacy opinions and later-context memory chains
-/// are deliberately not promoted to portable evidence.
+/// Publish committed review versions at their entire canonical observation
+/// frontier, including prior removed members and dependent accepted facts.
+/// Claimed source IDs never shorten this dependency closure.
 pub(super) fn publish(config: &ProxyCli, current: &mut Session, before: &Session, valid: bool) {
     if !valid
         || current.review_feedback["rejected_count"] != 0
-        || !before.opinions.is_empty()
-        || !before.memories.is_empty()
         || current.history.is_empty()
         || current.history.len() != before.history.len()
         || current
             .history
             .iter()
             .zip(&before.history)
-            .any(|(a, b)| a.value != b.value || a.removed || b.removed)
+            .any(|(a, b)| a.value != b.value || a.removed != b.removed)
         || current.review_context != before.review_context
     {
         return;
     }
     let values = current.history.iter().map(|i| &i.value).collect::<Vec<_>>();
-    let id = format!("{}:{}", current.review_epoch, digest(&values));
+    let id = format!(
+        "{}:{}",
+        current.review_epoch,
+        digest(&(values, &current.opinions, &current.memories))
+    );
     if current.fork_points.iter().any(|p| p.id == id) || current.fork_expired.contains(&id) {
         return; // immutable: a later review cannot replace the historical cut
     }
@@ -126,6 +129,7 @@ pub(super) fn publish(config: &ProxyCli, current: &mut Session, before: &Session
                 id: i.id,
                 cohort: i.cohort,
                 exposed: i.exposed,
+                removed: i.removed,
                 sha256: digest(&i.value),
             })
             .collect(),
@@ -137,95 +141,6 @@ pub(super) fn publish(config: &ProxyCli, current: &mut Session, before: &Session
     };
     current.fork_points.push(point);
     prune(config, current);
-}
-
-/// Read-only, exact-namespace matching. The committed checkpoint is the only
-/// authority; no directory scan, model/catalog refresh, publication or save.
-pub(super) async fn matching(
-    State(service): State<Arc<Service>>,
-    headers: HeaderMap,
-    bytes: Bytes,
-) -> Result<axum::Json<Value>, Failure> {
-    if headers.contains_key("origin") {
-        return Err(failure(
-            StatusCode::FORBIDDEN,
-            "browser-origin writes are not supported",
-        ));
-    }
-    authorize(&service, &headers)?;
-    // Unlike ordinary loopback forwarding, discovery is never unauthenticated.
-    if service.auth_token.is_none() {
-        return Err(failure(
-            StatusCode::UNAUTHORIZED,
-            "gateway authentication required",
-        ));
-    }
-    for key in ["x-carry-tenant", "x-carry-session", "x-carry-branch"] {
-        if headers.get_all(key).iter().count() != 1
-            || headers.get(key).and_then(|v| v.to_str().ok()).is_none()
-        {
-            return Err(failure(
-                StatusCode::BAD_REQUEST,
-                "explicit tenant/session/branch required",
-            ));
-        }
-    }
-    let id = identity(&headers)?.ok_or_else(|| {
-        failure(
-            StatusCode::BAD_REQUEST,
-            "explicit tenant/session/branch required",
-        )
-    })?;
-    if headers.contains_key("x-carry-fork-parent") || headers.contains_key("x-carry-fork-point") {
-        return Err(failure(
-            StatusCode::BAD_REQUEST,
-            "match the selected namespace, not fork intent",
-        ));
-    }
-    if service.config.mode != Mode::Compact {
-        return Err(conflict("fork_unsupported"));
-    }
-    let body: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| failure(StatusCode::BAD_REQUEST, "invalid JSON request"))?;
-    if !body.is_object()
-        || body["model"].as_str().is_none_or(|s| s.is_empty())
-        || !body["input"]
-            .as_array()
-            .is_some_and(|items| items.iter().all(Value::is_object))
-        || body
-            .get("previous_response_id")
-            .is_some_and(|v| !v.is_null())
-        || body.get("conversation").is_some_and(|v| !v.is_null())
-        || body["background"] == true
-    {
-        return Err(failure(
-            StatusCode::BAD_REQUEST,
-            "original full input and model/settings required",
-        ));
-    }
-    let _lock = session_lock(&service, &id).await;
-    let session = load(&service, &id)?;
-    let points = session
-        .fork_points
-        .iter()
-        .filter(|point| {
-            !expired(&service.config, point, now())
-                && compatible_child(&service.config, point, &body).is_ok()
-        })
-        .map(|point| {
-            json!({
-                "id":point.id, "input_items":point.sources.len(),
-                "expires_at":point.at.saturating_add(service.config.fork_max_age_secs)
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(axum::Json(json!({
-        "schema_version":1, "outcome":if points.is_empty() {"no_match"} else {"matched"},
-        "matching":"ordered-prefix-cohort-scope-v1", "points":points,
-        "horizon":{"publication":"first-fully-accepted-raw-cut-v1",
-            "max_age_secs":service.config.fork_max_age_secs,
-            "max_nodes":service.config.fork_max_nodes, "max_bytes":service.config.fork_max_bytes}
-    })))
 }
 
 pub(super) fn matches_sources(point: &Point, input: &[Value]) -> bool {
@@ -240,73 +155,8 @@ pub(super) fn conflict(code: &str) -> Failure {
     (
         StatusCode::CONFLICT,
         axum::Json(json!({"error":{"code":code,
-        "message":"explicit historical fork unavailable; no fresh-history fallback"}})),
+        "message":"historical review version unavailable"}})),
     )
-}
-
-/// Resolve the immutable parent under its lock, release it, then acquire the
-/// child lock at the call site. Never nest parent/child/worker locks or rewrite
-/// parent state. The parent checkpoint's atomic publication owns the evidence.
-pub(super) async fn resolve(
-    service: &Service,
-    headers: &HeaderMap,
-    body: &Value,
-    child_id: &str,
-    implicit: bool,
-    native: bool,
-) -> Result<Option<(String, Point)>, Failure> {
-    let parent = headers.get("x-carry-fork-parent");
-    let point = headers.get("x-carry-fork-point");
-    if parent.is_none() && point.is_none() {
-        return Ok(None);
-    }
-    if implicit
-        || native
-        || service.config.mode != Mode::Compact
-        || body
-            .get("previous_response_id")
-            .is_some_and(|v| !v.is_null())
-        || !body["input"].is_array()
-    {
-        return Err(conflict("fork_unsupported"));
-    }
-    let (Some(parent), Some(point)) = (parent, point) else {
-        return Err(conflict("fork_invalid_intent"));
-    };
-    let handle = point
-        .to_str()
-        .map_err(|_| conflict("fork_invalid_intent"))?;
-    let valid = handle.split_once(':').is_some_and(|(epoch, hash)| {
-        epoch.parse::<u64>().is_ok_and(|v| v.to_string() == epoch)
-            && hash.len() == 64
-            && hash
-                .bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-    });
-    if !valid {
-        return Err(conflict("fork_invalid_intent"));
-    }
-    let mut parent_headers = headers.clone();
-    parent_headers.insert("x-carry-branch", parent.clone());
-    let parent_id = identity(&parent_headers)?.ok_or_else(|| conflict("fork_invalid_intent"))?;
-    if parent_id == child_id {
-        return Err(conflict("fork_requires_distinct_branch"));
-    }
-    let _lock = session_lock(service, &parent_id).await;
-    let parent = load(service, &parent_id)?;
-    let point = parent
-        .fork_points
-        .iter()
-        .find(|p| p.id == handle)
-        .ok_or_else(|| {
-            conflict(if parent.fork_expired.iter().any(|id| id == handle) {
-                "fork_expired"
-            } else {
-                "fork_unknown"
-            })
-        })?
-        .clone();
-    Ok(Some((format!("{parent_id}/{handle}"), point)))
 }
 
 /// Validate caller-owned full input using exactly the hydration prefix,
@@ -338,7 +188,7 @@ pub(super) fn compatible_child(
                 id: s.id,
                 cohort: s.cohort,
                 exposed: s.exposed,
-                removed: false,
+                removed: s.removed,
                 value: v.clone(),
             })
             .collect(),

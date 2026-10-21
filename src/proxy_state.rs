@@ -184,6 +184,8 @@ pub(super) struct Session {
     pub fork_origin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_conversation: Option<String>,
     /// Bounded expiry diagnostics, not global source-removal tombstones.
     #[serde(default)]
     pub fork_expired: Vec<String>,

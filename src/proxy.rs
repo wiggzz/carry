@@ -178,6 +178,12 @@ pub struct ProxyCli {
     /// disables new fork guarantees; eviction never alters active tombstones.
     #[arg(long, env = "CARRY_PROXY_FORK_MAX_NODES", default_value_t = 8, value_parser = clap::value_parser!(u32).range(0..=32))]
     fork_max_nodes: u32,
+    /// Global transparent canonical-node bound; shared prefixes count once.
+    #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_NODES", default_value_t = 16384, value_parser = clap::value_parser!(u32).range(1..=65536))]
+    history_max_nodes: u32,
+    /// Global tip/review-frontier/transcript index reference bound.
+    #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_REFERENCES", default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    history_max_references: u32,
     #[arg(long, env = "CARRY_PROXY_FORK_MAX_BYTES", default_value_t = 262144, value_parser = clap::value_parser!(u32).range(2..=1048576))]
     fork_max_bytes: u32,
     #[arg(long, env = "CARRY_PROXY_FORK_MAX_AGE_SECS", default_value_t = 86400, value_parser = clap::value_parser!(u64).range(0..=604800))]
@@ -432,7 +438,6 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         )
         .route("/v1/models", get(models))
         .route("/carry/catalog", get(catalog))
-        .route("/carry/fork-points/match", post(forking::matching))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(native_compact))
         .route("/v1/responses/{id}", get(unsupported).delete(unsupported))
@@ -1259,13 +1264,11 @@ async fn forward_request(
     }
     authorize(&service, &headers)?;
     let mut id = identity(&headers)?;
-    // Fork intent is a gate even when off mode has no tracking identity. Never
-    // let missing/non-UTF8 session headers bypass the optional session branch.
-    if id.is_none()
-        && (headers.contains_key("x-carry-fork-parent")
-            || headers.contains_key("x-carry-fork-point"))
-    {
-        return Err(forking::conflict("fork_unsupported"));
+    if headers.contains_key("x-carry-fork-parent") || headers.contains_key("x-carry-fork-point") {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "fork headers are obsolete; send ordinary history",
+        ));
     }
     if service.config.codex_login && legacy_native {
         return Err(failure(
@@ -1273,7 +1276,7 @@ async fn forward_request(
             "Codex subscription native /compact is not supported; Pi summary requests use /responses",
         ));
     }
-    let body: Value = serde_json::from_slice(&bytes)
+    let mut body: Value = serde_json::from_slice(&bytes)
         .map_err(|_| failure(StatusCode::BAD_REQUEST, "invalid JSON request"))?;
     if !body.is_object() {
         return Err(failure(
@@ -1281,34 +1284,26 @@ async fn forward_request(
             "request must be an object",
         ));
     }
-    if service.config.mode != Mode::Off
-        && (body["background"] == true
-            || body["conversation"].is_object()
-            || body["conversation"].is_string())
-    {
+    if service.config.mode != Mode::Off && body["background"] == true {
         return Err(failure(
             StatusCode::BAD_REQUEST,
-            "review modes do not support conversation/background",
+            "review modes do not support background",
         ));
     }
     let implicit = service.config.mode != Mode::Off && id.is_none();
     let mut automatic_point = None;
     let mut history_namespace = None;
-    if implicit {
-        if body
-            .get("previous_response_id")
-            .is_some_and(|v| !v.is_null())
-        {
-            return Err(failure(
-                StatusCode::BAD_REQUEST,
-                "previous_response_id requires an explicit session; use full history otherwise",
-            ));
-        }
+    let requested_conversation = history::conversation(&body).map(str::to_owned);
+    if service.config.mode != Mode::Off {
         let namespace = history::namespace(&service, &headers, &body)?;
-        let (selected, point) = history::resolve(&service, &namespace, &body)?;
+        history::expand(&service, &namespace, &mut body)?;
+        history_namespace = Some(namespace);
+    }
+    if implicit {
+        let namespace = history_namespace.as_ref().unwrap();
+        let (selected, point) = history::resolve(&service, namespace, &body)?;
         id = Some(selected);
         automatic_point = point;
-        history_namespace = Some(namespace);
     }
     let native = legacy_native
         || body["input"].as_array().is_some_and(|items| {
@@ -1339,21 +1334,37 @@ async fn forward_request(
     };
     let mut outbound = body.clone();
     let mut commit = None;
-    if let Some(id) = id {
+    if let Some(mut id) = id {
+        let mut fork = if let Some(point) = automatic_point {
+            Some((format!("automatic/{}", point.id), point))
+        } else {
+            None
+        };
+        let mut lock = session_lock(&service, &id).await;
+        let mut session = load(&service, &id)?;
+        if implicit {
+            // A sibling may have advanced this mutable tip while we waited.
+            // Re-resolve after taking the lock; never reset that sibling.
+            let mut check = session.clone();
+            if !session.history.is_empty()
+                && check.ingest(body["input"].as_array().unwrap()).is_err()
+            {
+                drop(lock);
+                let (selected, point) =
+                    history::resolve(&service, history_namespace.as_ref().unwrap(), &body)?;
+                id = selected;
+                fork = point.map(|p| (format!("automatic/{}", p.id), p));
+                lock = session_lock(&service, &id).await;
+                session = load(&service, &id)?;
+            }
+        }
         if service.config.codex_login && outbound.get("prompt_cache_key").is_none() {
             outbound["prompt_cache_key"] = json!(format!(
                 "{:x}",
                 Sha256::digest(format!("carry-primary-{id}").as_bytes())
             ));
         }
-        let fork = if let Some(point) = automatic_point {
-            Some((format!("automatic/{}", point.id), point))
-        } else {
-            forking::resolve(&service, &headers, &body, &id, implicit, native).await?
-        };
         let declared_fork = fork.is_some();
-        let lock = session_lock(&service, &id).await;
-        let mut session = load(&service, &id)?;
         // Hydration creates a cold branch, not a legacy unpriced checkpoint.
         // Resolve its own current epoch only after the replacement; never copy
         // parent contracts, cache receipts or paid usage into the new session.
@@ -1363,6 +1374,9 @@ async fn forward_request(
             false
         };
         session.history_namespace = history_namespace;
+        if requested_conversation.is_some() {
+            session.history_conversation = requested_conversation;
+        }
         if service.config.mode != Mode::Off {
             let model = body["model"]
                 .as_str()
@@ -3430,6 +3444,8 @@ fn cache_base(body: &Value) -> Value {
             "client_metadata",
             "include",
             "max_output_tokens",
+            "previous_response_id",
+            "conversation",
         ] {
             object.remove(key);
         }
@@ -3947,6 +3963,9 @@ async fn relay(
                         }
                     }
                     commit.candidate.last_response_id = value["id"].as_str().map(str::to_owned);
+                    if let Some(conversation) = history::conversation(&value) {
+                        commit.candidate.history_conversation = Some(conversation.into());
+                    }
                     commit.candidate.response_frontier = Some(commit.candidate.next_id);
                     commit.candidate.pending_output =
                         value["output"].as_array().cloned().unwrap_or_default();
