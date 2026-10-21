@@ -58,7 +58,7 @@ fn render_reuse_codex_fixture() -> (ProxyCli, Session, Value) {
     // A genuine disposable replay makes the keep-all reviewer-only row legal.
     session.review_history = Some(crate::proxy_state::ReviewHistory {
         source_len: 0,
-        source_sha256: reviewer_serialized_identity(&[]).1,
+        source_sha256: reviewer_serialized_identity(&Vec::<Value>::new()).1,
         input: vec![json!({"role":"assistant","content":"disposable review turn"})],
     });
     let body = json!({"model":"gpt-6-sol","prompt_cache_key":"render-reuse-stable",
