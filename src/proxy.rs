@@ -221,7 +221,7 @@ struct Service {
     locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     background_reviews: Arc<Mutex<HashSet<String>>>,
     #[cfg(test)]
-    lock_waits: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
+    lock_waits: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
     _directory_lock: Arc<File>,
 }
 
@@ -401,7 +401,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         locks: Arc::new(Mutex::new(HashMap::new())),
         background_reviews: Arc::new(Mutex::new(HashSet::new())),
         #[cfg(test)]
-        lock_waits: std::sync::Mutex::new(None),
+        lock_waits: Arc::new(std::sync::Mutex::new(None)),
         _directory_lock: Arc::new(directory_lock),
     });
     logging::maintain(&service);
@@ -4230,7 +4230,7 @@ mod tests {
             locks: Arc::new(Mutex::new(HashMap::new())),
             background_reviews: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
-            lock_waits: std::sync::Mutex::new(None),
+            lock_waits: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -5658,7 +5658,7 @@ mod tests {
             locks: Arc::new(Mutex::new(HashMap::new())),
             background_reviews: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
-            lock_waits: std::sync::Mutex::new(None),
+            lock_waits: Arc::new(std::sync::Mutex::new(None)),
         };
         save(&service, "large-missing-usage", &session).unwrap();
         assert_eq!(
