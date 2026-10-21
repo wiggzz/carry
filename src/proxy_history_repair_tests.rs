@@ -263,7 +263,7 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
     let provider = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let mut service = checkpoint_service(directory.path());
     service.config.upstream_url = format!("{endpoint}/v1/responses");
-    service.config.classifier_url = format!("{endpoint}/review");
+    service.config.classifier_url = Some(format!("{endpoint}/review"));
     service.config.classifier_model = "gpt-6-luna".into();
     service.config.review_every_requests = 100;
     service.config.bootstrap_min_input_bytes = usize::MAX;
