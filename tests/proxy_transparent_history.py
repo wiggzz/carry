@@ -39,13 +39,26 @@ class TransparentProxy(Proxy):
         assert len(found) == 1, (items, len(found))
         return found[0]
 
+    def send(self, input_items, *, wait=True, **fields):
+        response = self.request("POST", "/v1/responses",
+                                {"model": "gpt-6-luna", "input": input_items, **fields})
+        self.response_id = response[1].get("id")
+        if wait and self.wait_reviews:
+            deadline = time.monotonic() + 15
+            while self.saved().get("background_review_pending"):
+                assert time.monotonic() < deadline, "post-response reviewer did not settle"
+                time.sleep(0.01)
+        return response
+
     def saved(self):
-        # Settle all fixture-owned workers; never pick an arbitrary checkpoint.
+        # Settle the exact completed response, not an unrelated/orphaned worker.
         path = self.state / "history.index"
-        if not path.exists():
-            return {"background_review_pending": False}
-        states = json.loads(path.read_text()).get("snapshots", {}).values()
-        return {"background_review_pending": any(s.get("background_review_pending") for s in states)}
+        if path.exists():
+            index = json.loads(path.read_text())
+            for reference in index["transcripts"].values():
+                if reference["external_id"] == getattr(self, "response_id", None):
+                    return index.get("snapshots", {}).get(reference["session"], {})
+        return {"background_review_pending": False}
 
 
 class TransparentHistory(unittest.TestCase):
@@ -205,7 +218,7 @@ class TransparentHistory(unittest.TestCase):
                         "later compatible reviews must be committed too, not first-raw-only: "
                         + json.dumps({"feedback": parent.get("review_feedback"),
                                       "versions": parent.get("fork_points"),
-                                      "stderr": proxy.stderr.read_text()[-3000:]}))
+                                      "stderr": (self.state / f"fixture-{proxy.process.pid}-stderr.log").read_text()[-3000:]}))
         c = history + [{"role": "user", "content": "C_NOT_B"}]
         self.assertEqual(proxy.send(c)[0], 200)
         _, child = proxy.checkpoint(c)
@@ -219,6 +232,31 @@ class TransparentHistory(unittest.TestCase):
         _, compatible = proxy.checkpoint(d)
         self.assertTrue(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in compatible["memories"]))
         self.assertNotIn("B_NEXT", json.dumps(fixture.primaries[-1]["input"]))
+
+    def test_native_checkpoint_archives_observed_input_and_actual_output(self):
+        history = [{"role": "user", "content": "BEFORE_NATIVE_CHECKPOINT"},
+                   {"type": "compaction_trigger"}]
+        checkpoint = {"type": "compaction", "encrypted_content": "actual_observed_anchor"}
+        fixture = self.fixture(lambda _b, _n: (200, completed([checkpoint], "native_1")))
+        proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"])
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(history)[0], 200)
+        archive = json.loads((self.state / "history.index").read_text())
+        references = [r for r in archive["transcripts"].values() if r["external_id"] == "native_1"]
+        self.assertEqual(len(references), 1, "native reset must not erase the observed canonical transcript")
+        frontier, observed = references[0]["frontier"], []
+        while frontier in archive["nodes"]:
+            node = archive["nodes"][frontier]
+            observed.append(node["value"])
+            frontier = node["parent"]
+        self.assertEqual(list(reversed(observed)), history + [checkpoint])
+        proxy.close()
+        proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"])
+        self.stack.callback(proxy.close)
+        fresh = [{"role": "user", "content": "UNRELATED_AFTER_NATIVE"}]
+        self.assertEqual(proxy.send(fresh)[0], 200)
+        self.assertEqual(fixture.primaries[-1]["input"], fresh)
+        self.assertEqual(len(list(self.state.glob("*.json"))), 2)
 
     def test_empty_input_response_is_observed_and_resumable(self):
         answer = {"role": "assistant", "content": "EMPTY_INPUT_ACTUAL_OUTPUT"}

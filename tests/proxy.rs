@@ -1694,11 +1694,26 @@ async fn fixture(advice: serde_json::Value) -> Fixture {
 }
 
 fn checkpoint_states(path: &std::path::Path) -> Vec<serde_json::Value> {
+    // Advice becomes authority at the atomic index publication, not at its
+    // earlier per-session diagnostic mirror write. Explicit legacy sessions
+    // remain mirror-owned; implicit selected snapshots are index-owned.
+    let index = std::fs::read(path.join("history.index"))
+        .ok()
+        .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
     std::fs::read_dir(path)
         .unwrap()
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-        .map(|e| serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap())
+        .filter_map(|e| {
+            let mirror: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap();
+            if mirror["history_shared"] == true {
+                let name = e.path().file_stem()?.to_str()?.to_owned();
+                index.as_ref()?.get("snapshots")?.get(name).cloned()
+            } else {
+                Some(mirror)
+            }
+        })
         .collect()
 }
 
@@ -2724,11 +2739,16 @@ async fn client_continuation_is_expanded_but_never_forwarded_upstream() {
         send(&url, &delta, "other", "main").await.status(),
         reqwest::StatusCode::CONFLICT
     );
-    assert_eq!(
-        send(&url, &delta, "a", "main").await.status(),
-        reqwest::StatusCode::CONFLICT,
-        "a stale response ID must not silently fork the session"
+    let rewind = send(&url, &delta, "a", "main").await;
+    assert!(
+        rewind.status().is_success(),
+        "an observed historical response ID is a valid rewind"
     );
+    let _: serde_json::Value = rewind.json().await.unwrap();
+    {
+        let captured = requests.lock().await;
+        assert_eq!(captured[2]["input"], captured[1]["input"]);
+    }
     drop(proxy);
     let (_proxy, url) = start_proxy(state.path(), address, "compact").await;
     let resumed = json!({"model": "fixture-model", "previous_response_id": "resp_2", "input": [{"role": "user", "content": "after restart"}]});
@@ -2736,10 +2756,10 @@ async fn client_continuation_is_expanded_but_never_forwarded_upstream() {
     assert!(response.status().is_success());
     let _: serde_json::Value = response.json().await.unwrap();
     let captured = requests.lock().await;
-    assert_eq!(captured.len(), 3);
-    assert!(captured[2].get("previous_response_id").is_none());
-    assert_eq!(captured[2]["input"].as_array().unwrap().len(), 5);
-    assert_eq!(captured[2]["input"][4]["content"], "after restart");
+    assert_eq!(captured.len(), 4);
+    assert!(captured[3].get("previous_response_id").is_none());
+    assert_eq!(captured[3]["input"].as_array().unwrap().len(), 5);
+    assert_eq!(captured[3]["input"][4]["content"], "after restart");
     server.abort();
 }
 
