@@ -25,6 +25,7 @@ class TransparentProxy(Proxy):
 
 class TransparentHistory(unittest.TestCase):
     setUp = StateRegressions.setUp
+    record_evidence = StateRegressions.record_evidence
     fixture = StateRegressions.fixture
 
     def test_no_header_fork_reuses_committed_ancestor_after_cleanup_and_restart(self):
