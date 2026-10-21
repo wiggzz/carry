@@ -9,6 +9,7 @@ import contextlib
 import http.client
 import http.server
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -268,6 +269,81 @@ class StateRegressions(unittest.TestCase):
                 self.assertIsNone(estimate[field], message or field)
         if not available:
             self.assertIsNone(estimate["savings_percent"], message)
+
+    def test_reviewer_control_observations_once_and_restart(self):
+        fixture = self.fixture(lambda _body, _n: (200, completed()))
+        options = ["--min-payback-percent", "100"]
+        proxy = self.proxy(fixture, options)
+        history = [{"role": "user", "content": "fixture goal"},
+                   {"role": "assistant", "content": "source once " + "s" * 8192},
+                   {"role": "user", "content": "continue"}]
+        instruction = "UNIQUE_DIRECTION_" + "d" * 32768
+        for n in range(5):
+            if n == 3:
+                proxy.close()
+                proxy = self.proxy(fixture, options)
+            self.assertEqual(proxy.send(history, instructions=instruction)[0], 200)
+        self.assertEqual(len(fixture.reviews), 4)
+        body = fixture.reviews[-1]
+        self.assertEqual(wire(body).count(b"UNIQUE_DIRECTION_"), 1,
+                         "unchanged primary instructions must be ingested once, not per ledger")
+        for before, after in zip(fixture.reviews, fixture.reviews[1:]):
+            self.assertEqual(after["input"][:len(before["input"])], before["input"],
+                             "dedup must not replace historical ledgers in place")
+        self.assertEqual(proxy.saved()["reviewer_compactions"], 0)
+        self.assertEqual(proxy.send(history, instructions="NEW_DIRECTION")[0], 200)
+        self.assertEqual(wire(fixture.reviews[-1]).count(b"NEW_DIRECTION"), 1)
+        self.assertEqual(proxy.send(history, instructions="")[0], 200)
+        current = ledger(fixture.reviews[-1])
+        self.assertEqual(current["primary_instruction_version"], 3)
+        self.assertNotIn("quoted_primary_instructions", current)
+
+    def test_reviewer_wire_fingerprints_are_content_free_and_join_usage(self):
+        def review(_body, n):
+            value = advice_response({"protected": [], "removable": [], "memories": []})
+            if n == 2:
+                del value["usage"]["input_tokens_details"]
+            if n == 3:
+                del value["usage"]
+            return 200, value
+
+        fixture = self.fixture(lambda _body, _n: (200, completed()), review)
+        proxy = self.proxy(fixture, ["--min-payback-percent", "100"])
+        history = [{"role": "user", "content": "PRIVATE_FIXTURE_GOAL"},
+                   {"role": "assistant", "content": "PRIVATE_TOOL_BYTES" + "x" * 8192},
+                   {"role": "user", "content": "continue"}]
+        for _ in range(4):
+            self.assertEqual(proxy.send(history, instructions="PRIVATE_INSTRUCTION")[0], 200)
+        raw = b"".join(p.read_bytes() for p in (self.state / "diagnostics").glob("*.jsonl"))
+        entries = [json.loads(line) for line in raw.splitlines()]
+        requests = [e for e in entries if e["event"] == "review_wire"]
+        self.assertEqual(len(requests), 3, "every final transport request needs bounded item-order diagnostics")
+        for sentinel in (b"PRIVATE_FIXTURE_GOAL", b"PRIVATE_TOOL_BYTES", b"PRIVATE_INSTRUCTION",
+                         b"fixture-primary", b"fixture-shadow", fixture.url.encode()):
+            self.assertNotIn(sentinel, raw)
+        for n, (entry, body) in enumerate(zip(requests, fixture.reviews), 1):
+            data = entry["data"]
+            self.assertEqual(data["format_version"], 1)
+            self.assertEqual(data["item_count"], len(body["input"]))
+            self.assertTrue(data["coverage_complete"])
+            self.assertEqual(len(data["items"]), len(body["input"]))
+            self.assertLessEqual(len(wire(entry)), 16384)
+            receipts = [e for e in entries if e["event"] == "usage" and
+                        e.get("review_attempt_id") == entry["review_attempt_id"]]
+            self.assertEqual(len(receipts), 1)
+            usage = receipts[0]["data"]["native_usage"]
+            if n == 3:
+                self.assertEqual(usage, {}, "absent native usage must remain unknown")
+            else:
+                self.assertEqual(usage["input_tokens"], 100)
+                if n == 2:
+                    self.assertNotIn("input_tokens_details", usage,
+                                     "unknown cache receipt must not become a fabricated zero")
+                else:
+                    self.assertEqual(usage["input_tokens_details"]["cached_tokens"], 0)
+        for entry in requests[1:]:
+            self.assertTrue(entry["data"]["prior_prefix_equal"])
+            self.assertTrue(entry["data"]["settings_equal"])
 
     def test_dashboard_backend_authoritative_savings(self):
         fixture = self.fixture(lambda _body, _n: (200, completed()))
@@ -715,7 +791,12 @@ class StateRegressions(unittest.TestCase):
                 self.assertEqual(estimate["coverage"]["reviewer_responses"], 1)
                 self.assertEqual(estimate["coverage"]["primary_responses"], 2)
                 self.assertGreater(estimate["reviewer_cost"], 0)
-                self.assertEqual(estimate["reviewer_cost"], saved["cost_trajectory"]["result"]["reviewer_cost"])
+                # Rust/Python JSON roundtrip can differ by one IEEE-754 ULP;
+                # permit only that representation error, not a money tolerance.
+                saved_cost = saved["cost_trajectory"]["result"]["reviewer_cost"]
+                self.assertAlmostEqual(estimate["reviewer_cost"], saved_cost,
+                                       delta=max(math.ulp(estimate["reviewer_cost"]),
+                                                 math.ulp(saved_cost)))
                 self.assert_estimate_available(estimate, True, "successful reviewer spend must survive a failed primary")
 
     def test_restart_orphan_reviewer_is_untracked_not_proven_failed(self):
