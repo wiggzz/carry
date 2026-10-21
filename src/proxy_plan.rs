@@ -146,7 +146,8 @@ pub(super) fn economic_candidate(
     let mut retained = body.clone();
     #[cfg(test)]
     let primary_scope = super::planner_work::primary_scope("economic_primary_renders");
-    retained["input"] = json!(session.render_primary());
+    let original_primary = session.render_primary();
+    retained["input"] = json!(original_primary);
     #[cfg(test)]
     drop(primary_scope);
     plan_inner(config, session, &retained, Some(paid))
@@ -154,7 +155,7 @@ pub(super) fn economic_candidate(
         .is_some_and(|candidate| {
             #[cfg(test)]
             let _primary_scope = super::planner_work::primary_scope("economic_primary_renders");
-            candidate.render_primary() != session.render_primary()
+            candidate.render_primary() != original_primary
         })
 }
 
@@ -263,6 +264,9 @@ fn plan_inner(
     // room without rewriting an otherwise valuable primary cache prefix.
     candidates.push(groups.iter().map(|g| g.id).collect());
     let mut evaluated = HashSet::new();
+    // Preserve the complete raw view, not the Codex-folded cache-slot view.
+    // Render lazily so plans with no legal actions do no additional work.
+    let mut original_primary = None;
     for protected in candidates {
         let removed = select_removals(groups.iter().map(|g| g.id), &eligible, &protected);
         if removed.is_empty()
@@ -281,7 +285,9 @@ fn plan_inner(
         candidate.remove(&removed, &groups);
         #[cfg(test)]
         let primary_scope = super::planner_work::primary_scope("candidate_primary_renders");
-        let changed = candidate.render_primary() != session.render_primary();
+        let candidate_primary = candidate.render_primary();
+        let changed =
+            candidate_primary != *original_primary.get_or_insert_with(|| session.render_primary());
         let action = if changed { "joint" } else { "reviewer_only" };
         // Identity names the action, not its score, enumeration index, cap, or
         // generated transport keys. Memory retirement can change primary even
@@ -298,7 +304,7 @@ fn plan_inner(
             )
         );
         let mut compact = body.clone();
-        compact["input"] = json!(candidate.render_primary());
+        compact["input"] = json!(candidate_primary);
         #[cfg(test)]
         drop(primary_scope);
         let compact_review = review_body(config, &candidate);
