@@ -815,6 +815,7 @@ class TransparentHistory(unittest.TestCase):
         proxy, fixture, history, options = self.seed(history=history)
         self.assertEqual(proxy.send(history + [{"role": "user", "content": "COHORT_PARENT"}])[0], 200)
         proxy.close()
+        options.remove("--review-replayed-history")
         options += ["--review-every-requests", "100"]
         proxy = TransparentProxy(self.state, fixture, options)
         self.stack.callback(proxy.close)
