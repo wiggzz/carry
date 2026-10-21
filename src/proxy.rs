@@ -184,6 +184,9 @@ pub struct ProxyCli {
     /// Global tip/review-frontier/transcript index reference bound.
     #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_REFERENCES", default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=4096))]
     history_max_references: u32,
+    /// Global canonical index, selected metadata and transcript byte bound.
+    #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_BYTES", default_value_t = 33554432, value_parser = clap::value_parser!(u32).range(2..=67108864))]
+    history_max_bytes: u32,
     #[arg(long, env = "CARRY_PROXY_FORK_MAX_BYTES", default_value_t = 262144, value_parser = clap::value_parser!(u32).range(2..=1048576))]
     fork_max_bytes: u32,
     #[arg(long, env = "CARRY_PROXY_FORK_MAX_AGE_SECS", default_value_t = 86400, value_parser = clap::value_parser!(u64).range(0..=604800))]
@@ -528,6 +531,13 @@ fn load(service: &Service, id: &str) -> Result<Session, Failure> {
     match std::fs::read(path) {
         Ok(bytes) if bytes.len() <= CHECKPOINT_MAX_BYTES => {
             serde_json::from_slice::<Session>(&bytes)
+                .and_then(|session| {
+                    if session.history_shared {
+                        history::restore(service, id).map_err(serde_json::Error::io)
+                    } else {
+                        Ok(session)
+                    }
+                })
                 .map(|mut session| {
                     for evidence in &mut session.primary_cache {
                         evidence.compact();
@@ -552,7 +562,12 @@ fn load(service: &Service, id: &str) -> Result<Session, Failure> {
 }
 
 fn save(service: &Service, id: &str, session: &Session) -> std::io::Result<()> {
-    save_with_limit(service, id, session, CHECKPOINT_MAX_BYTES)?;
+    save_with_limit(
+        service,
+        id,
+        &history::compact(session),
+        CHECKPOINT_MAX_BYTES,
+    )?;
     history::committed(service, id, session)
 }
 
@@ -1284,6 +1299,7 @@ async fn forward_request(
             "request must be an object",
         ));
     }
+    let original_body = body.clone();
     if service.config.mode != Mode::Off && body["background"] == true {
         return Err(failure(
             StatusCode::BAD_REQUEST,
@@ -1374,6 +1390,7 @@ async fn forward_request(
             false
         };
         session.history_namespace = history_namespace;
+        session.history_shared = implicit;
         if requested_conversation.is_some() {
             session.history_conversation = requested_conversation;
         }
@@ -1695,7 +1712,7 @@ async fn forward_request(
         .client
         .post(&endpoint)
         .header("content-type", "application/json");
-    request = if outbound == body {
+    request = if outbound == original_body {
         request.body(bytes)
     } else {
         request.json(&outbound)

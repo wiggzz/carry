@@ -13,6 +13,8 @@ struct Index {
     reviews: BTreeMap<String, Vec<forking::Point>>,
     #[serde(default)]
     transcripts: BTreeMap<String, Transcript>,
+    #[serde(default)]
+    snapshots: BTreeMap<String, Session>,
 }
 #[derive(Serialize, Deserialize)]
 struct Node {
@@ -48,7 +50,7 @@ fn path(namespace: &str, input: &[Value]) -> Vec<String> {
 }
 fn read(service: &Service) -> std::io::Result<Index> {
     match std::fs::read(service.config.state_dir.join("history.index")) {
-        Ok(bytes) if bytes.len() <= service.config.fork_max_bytes as usize => {
+        Ok(bytes) if bytes.len() <= service.config.history_max_bytes as usize => {
             Ok(serde_json::from_slice(&bytes)?)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Index::default()),
@@ -68,6 +70,12 @@ fn insert(index: &mut Index, namespace: &str, input: &[Value]) -> Vec<String> {
     keys
 }
 fn gc(index: &mut Index) {
+    let live = index
+        .tips
+        .values()
+        .map(|r| r.session.as_str())
+        .collect::<HashSet<_>>();
+    index.snapshots.retain(|id, _| live.contains(id.as_str()));
     let mut reachable = HashSet::new();
     for root in index
         .tips
@@ -104,7 +112,7 @@ fn prune(service: &Service, index: &mut Index) {
                 <= service.config.history_max_references as usize
             && index.reviews.values().map(Vec::len).sum::<usize>()
                 <= service.config.fork_max_nodes as usize
-            && serde_json::to_vec(index).unwrap().len() <= service.config.fork_max_bytes as usize
+            && serde_json::to_vec(index).unwrap().len() <= service.config.history_max_bytes as usize
         {
             break;
         }
@@ -283,8 +291,50 @@ pub(super) fn resolve(
     Ok((hash(&(namespace, keys.last())), None))
 }
 
-/// Called only AFTER atomic checkpoint publication. A crash can lose an index
-/// optimization, never create authority from uncommitted or temporary advice.
+/// Selected checkpoints reference canonical nodes; the atomic index is their
+/// authority. The per-session JSON is a diagnostic mirror, never new authority.
+pub(super) fn compact(session: &Session) -> Session {
+    let mut snapshot = session.clone();
+    if snapshot.history_shared {
+        let namespace = snapshot.history_namespace.as_deref().unwrap();
+        let input = snapshot
+            .history
+            .iter()
+            .map(|i| i.value.clone())
+            .collect::<Vec<_>>();
+        snapshot.history_frontier = path(namespace, &input).last().cloned();
+        for item in &mut snapshot.history {
+            item.value = Value::Null;
+        }
+    }
+    snapshot
+}
+
+pub(super) fn restore(service: &Service, id: &str) -> std::io::Result<Session> {
+    let _guard = IO.lock().unwrap();
+    let mut index = read(service)?;
+    prune(service, &mut index);
+    let mut session = index
+        .snapshots
+        .remove(id)
+        .ok_or_else(|| std::io::Error::other("selected history unavailable"))?;
+    let mut key = session.history_frontier.as_deref();
+    for item in session.history.iter_mut().rev() {
+        let node = key
+            .and_then(|k| index.nodes.get(k))
+            .ok_or_else(|| std::io::Error::other("canonical history unavailable"))?;
+        item.value = node.value.clone();
+        key = Some(&node.parent);
+    }
+    if key != session.history_namespace.as_deref() && !session.history.is_empty() {
+        return Err(std::io::Error::other("invalid canonical ancestry"));
+    }
+    session.history_frontier = None;
+    Ok(session)
+}
+
+/// Publish nodes, reviewed versions and selected metadata in ONE atomic index.
+/// A mirror written before this transaction cannot publish uncommitted advice.
 pub(super) fn committed(service: &Service, id: &str, session: &Session) -> std::io::Result<()> {
     let Some(namespace) = &session.history_namespace else {
         return Ok(());
@@ -296,6 +346,7 @@ pub(super) fn committed(service: &Service, id: &str, session: &Session) -> std::
         .iter()
         .map(|i| i.value.clone())
         .collect::<Vec<_>>();
+    let prior = index.snapshots.keys().cloned().collect::<HashSet<_>>();
     let keys = insert(&mut index, namespace, &input);
     if let Some(response) = &session.last_response_id
         && let Some(frontier) = session.response_frontier
@@ -353,11 +404,20 @@ pub(super) fn committed(service: &Service, id: &str, session: &Session) -> std::
             }
         }
     }
+    if session.history_shared {
+        index.snapshots.insert(id.into(), compact(session));
+    }
     prune(service, &mut index);
     let temporary = service.config.state_dir.join(".history-index.tmp");
     let mut file = private_file(&temporary, false)?;
     serde_json::to_writer(&mut file, &index)?;
     file.sync_all()?;
     std::fs::rename(temporary, service.config.state_dir.join("history.index"))?;
-    File::open(&service.config.state_dir)?.sync_all()
+    File::open(&service.config.state_dir)?.sync_all()?;
+    for stale in prior.into_iter().chain(std::iter::once(id.to_owned())) {
+        if !index.snapshots.contains_key(&stale) && (stale != id || session.history_shared) {
+            let _ = std::fs::remove_file(service.config.state_dir.join(format!("{stale}.json")));
+        }
+    }
+    Ok(())
 }

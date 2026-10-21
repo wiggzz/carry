@@ -2342,7 +2342,7 @@ async fn mixed_advice_applies_valid_items_and_failed_primary_keeps_feedback() {
 }
 
 #[tokio::test]
-async fn unsupported_stateful_review_and_retrieval_fail_explicitly() {
+async fn unknown_stateful_ancestry_and_unsupported_retrieval_fail_explicitly() {
     let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
     let state = tempfile::tempdir().unwrap();
     let (_proxy, url) = start_proxy(state.path(), fixture.address, "audit").await;
@@ -2353,7 +2353,7 @@ async fn unsupported_stateful_review_and_retrieval_fail_explicitly() {
         .send()
         .await
         .unwrap();
-    assert_eq!(missing.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(missing.status(), reqwest::StatusCode::CONFLICT);
     for field in ["conversation", "background"] {
         let mut request = plain.clone();
         request[field] = if field == "background" {
@@ -2363,7 +2363,11 @@ async fn unsupported_stateful_review_and_retrieval_fail_explicitly() {
         };
         assert_eq!(
             send(&url, &request, "a", "main").await.status(),
-            reqwest::StatusCode::BAD_REQUEST
+            if field == "background" {
+                reqwest::StatusCode::BAD_REQUEST
+            } else {
+                reqwest::StatusCode::CONFLICT
+            }
         );
     }
     assert_eq!(

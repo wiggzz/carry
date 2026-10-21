@@ -25,14 +25,26 @@ class TransparentProxy(Proxy):
         for reference in index["tips"].values():
             path = self.state / (reference["session"] + ".json")
             state = json.loads(path.read_text())
-            if [i["value"] for i in state["history"]] == items:
+            values = [i["value"] for i in state["history"]]
+            if state.get("history_frontier"):
+                values = []
+                frontier = state["history_frontier"]
+                while frontier in index["nodes"]:
+                    node = index["nodes"][frontier]
+                    values.append(node["value"])
+                    frontier = node["parent"]
+                values.reverse()
+            if values == items:
                 found.append((path, state))
         assert len(found) == 1, (items, len(found))
         return found[0]
 
     def saved(self):
         # Settle all fixture-owned workers; never pick an arbitrary checkpoint.
-        states = [json.loads(p.read_text()) for p in self.state.glob("*.json")]
+        path = self.state / "history.index"
+        if not path.exists():
+            return {"background_review_pending": False}
+        states = json.loads(path.read_text()).get("snapshots", {}).values()
         return {"background_review_pending": any(s.get("background_review_pending") for s in states)}
 
 
@@ -181,7 +193,8 @@ class TransparentHistory(unittest.TestCase):
                 "removable": [], "memories": [{"source_ids": ["g2"],
                 "text": "A_FACT" if n == 1 else "B_DEPENDENT_FACT_CLAIMS_A"}]})
         proxy, fixture, history, _ = self.seed(review=review, extra=["--min-payback-percent", "100"])
-        b = history + [{"role": "user", "content": "B_OBSERVED"}]
+        b = history + [{"role": "assistant", "content": "B_OBSERVED " + "payload " * 100},
+                       {"role": "user", "content": "B_BOUNDARY"}]
         self.assertEqual(proxy.send(b)[0], 200)
         self.assertGreaterEqual(len(fixture.reviews), 2)
         _, parent = proxy.checkpoint(b)
@@ -189,7 +202,10 @@ class TransparentHistory(unittest.TestCase):
         index = json.loads((self.state / "history.index").read_text())
         self.assertTrue(any(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in p["memories"])
                             for versions in index["reviews"].values() for p in versions),
-                        "later compatible reviews must be committed too, not first-raw-only")
+                        "later compatible reviews must be committed too, not first-raw-only: "
+                        + json.dumps({"feedback": parent.get("review_feedback"),
+                                      "versions": parent.get("fork_points"),
+                                      "stderr": proxy.stderr.read_text()[-3000:]}))
         c = history + [{"role": "user", "content": "C_NOT_B"}]
         self.assertEqual(proxy.send(c)[0], 200)
         _, child = proxy.checkpoint(c)
@@ -246,7 +262,7 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(json.loads((self.state / "history.index").read_text())["reviews"], {})
 
     def test_index_byte_node_age_limits_and_evicted_ids_fail_closed(self):
-        env = {"CARRY_PROXY_FORK_MAX_BYTES": "4096", "CARRY_PROXY_HISTORY_MAX_NODES": "4",
+        env = {"CARRY_PROXY_HISTORY_MAX_BYTES": "4096", "CARRY_PROXY_HISTORY_MAX_NODES": "4",
                "CARRY_PROXY_HISTORY_MAX_REFERENCES": "4",
                "CARRY_PROXY_FORK_MAX_AGE_SECS": "1"}
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")))
@@ -284,7 +300,8 @@ class TransparentHistory(unittest.TestCase):
         proxy.close()
         proxy = TransparentProxy(self.state, fixture, [*options, "--background-reviews=true"])
         self.stack.callback(proxy.close)
-        self.assertEqual(proxy.send(history + [{"role": "user", "content": "B_ONLY"}])[0], 200)
+        self.assertEqual(proxy.send(history + [{"role": "assistant", "content": "B_ONLY " + "payload " * 100},
+                                               {"role": "user", "content": "B_BOUNDARY"}], wait=False)[0], 200)
         self.assertTrue(held.wait(5), "actual dispatched reviewer must be in flight")
         proxy.close()
         release.set()

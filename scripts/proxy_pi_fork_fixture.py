@@ -165,6 +165,17 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
                         path = state_dir/(ref['session']+'.json')
                         if not path.exists(): continue
                         value = json.loads(path.read_text())
+                        if value.get('history_frontier'):
+                            frontier = value['history_frontier']
+                            canonical = []
+                            while frontier in index['nodes']:
+                                node = index['nodes'][frontier]
+                                canonical.append(node['value'])
+                                frontier = node['parent']
+                            canonical.reverse()
+                            assert len(canonical) == len(value['history']), 'complete canonical ancestry'
+                            for item, original in zip(value['history'], canonical):
+                                item['value'] = original
                         if ([i['value'] for i in value['history']] == target
                                 and value['completed_requests'] >= completed
                                 and not value['background_review_pending']):
