@@ -66,6 +66,11 @@ fn reviewer_control_observations_once_and_restart() {
 }
 
 #[test]
+fn direction_changes_reject_held_advice_and_preserve_paid_receipt() {
+    state_regression("direction_changes_reject_held_advice_and_preserve_paid_receipt");
+}
+
+#[test]
 fn reviewer_wire_fingerprints_are_content_free_and_join_usage() {
     state_regression("reviewer_wire_fingerprints_are_content_free_and_join_usage");
 }

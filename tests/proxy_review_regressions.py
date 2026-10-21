@@ -260,13 +260,18 @@ class ReviewRegressions(unittest.TestCase):
         options = ["--review-replayed-history", "--payoff-requests", "1",
                    "--review-every-requests", "100", "--min-payback-percent", "100"]
         proxy = self.harness.proxy(fixture, options)
-        self.assertEqual(proxy.send(self.seed())[0], 200)
+        self.assertEqual(proxy.send(self.seed(), instructions="BOOTSTRAP_DIRECTION")[0], 200)
         before = proxy.saved()
         self.assertEqual(len(fixture.reviews), 1, "setup executes a real completed bootstrap")
+        body = fixture.reviews[0]
+        self.assertEqual(wire(body).count(b"BOOTSTRAP_DIRECTION"), 1)
+        self.assertIn(b"BOOTSTRAP_DIRECTION", wire(body["input"][1]),
+                      "disposable bootstrap/import must carry primary direction before sources")
+        self.assertNotIn("primary_instruction_version", ledger(body))
         self.assertTrue(before["bootstrap_review_complete"])
         proxy.close()
         proxy = self.harness.proxy(fixture, options)
-        self.assertEqual(proxy.send(self.seed())[0], 200)
+        self.assertEqual(proxy.send(self.seed(), instructions="BOOTSTRAP_DIRECTION")[0], 200)
         after = proxy.saved()
         self.evidence.update(before=before, after=after, reviews=fixture.reviews)
         self.assertEqual(after["shadow"]["calls"], before["shadow"]["calls"])

@@ -299,11 +299,66 @@ class StateRegressions(unittest.TestCase):
                              "dedup must not replace historical ledgers in place")
         self.assertEqual(proxy.saved()["reviewer_compactions"], 0)
         self.assertEqual(proxy.send(history, instructions="NEW_DIRECTION")[0], 200)
-        self.assertEqual(wire(fixture.reviews[-1]).count(b"NEW_DIRECTION"), 1)
+        changed = fixture.reviews[-1]
+        self.assertEqual(wire(changed).count(b"NEW_DIRECTION"), 1)
+        self.assertNotIn(b"UNIQUE_DIRECTION_", wire(changed))
+        self.assertEqual(proxy.saved()["reviewer_compactions"], 1)
         self.assertEqual(proxy.send(history, instructions="")[0], 200)
-        current = ledger(fixture.reviews[-1])
-        self.assertEqual(current["primary_instruction_version"], 3)
-        self.assertNotIn("quoted_primary_instructions", current)
+        cleared = fixture.reviews[-1]
+        self.assertNotIn(b"NEW_DIRECTION", wire(cleared))
+        self.assertNotIn(b"UNIQUE_DIRECTION_", wire(cleared))
+        self.assertNotIn("primary_instruction_version", ledger(cleared))
+        self.assertEqual(proxy.saved()["reviewer_compactions"], 2)
+        proxy.close()
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(fixture.reviews[-1]["input"][:len(cleared["input"])], cleared["input"])
+        self.assertEqual(proxy.saved()["reviewer_compactions"], 2)
+        self.evidence.update(reviews=fixture.reviews, checkpoint=proxy.saved())
+
+    def test_direction_changes_reject_held_advice_and_preserve_paid_receipt(self):
+        for change in ("unchanged", "changed", "clear_then_restore"):
+            with self.subTest(change=change):
+                def review(_body, _n):
+                    fixture.held.set()
+                    if not fixture.release.wait(8):
+                        raise AssertionError("held reviewer was not released")
+                    return 200, advice_response({"protected": ["g2"], "removable": [],
+                        "memories": [{"text": "HELD_DIRECTION_FACT", "source_ids": ["g2"]}]})
+
+                fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
+                options = ["--background-reviews=true", "--min-payback-percent", "100"]
+                proxy = Proxy(self.state / change, fixture, options)
+                self.addCleanup(proxy.close)
+                seed = [{"role": "user", "content": "goal"},
+                        {"role": "assistant", "content": "eligible evidence"},
+                        {"role": "user", "content": "current"}]
+                self.assertEqual(proxy.send(seed, instructions="ORIGINAL_DIRECTION")[0], 200)
+                self.assertEqual(proxy.send(seed, instructions="ORIGINAL_DIRECTION")[0], 200)
+                self.assertTrue(fixture.held.wait(3))
+                if change == "changed":
+                    self.assertEqual(proxy.send(seed, instructions="CHANGED_DIRECTION")[0], 200)
+                elif change == "clear_then_restore":
+                    self.assertEqual(proxy.send(seed, instructions="")[0], 200)
+                    self.assertEqual(proxy.send(seed, instructions="ORIGINAL_DIRECTION")[0], 200)
+                fixture.release.set()
+                saved = self.wait_saved(proxy, lambda s: not s["background_review_pending"])
+                self.assertEqual(saved["shadow"]["calls"], 1,
+                                 "even stale advice must settle its actual paid receipt once")
+                self.assertEqual(len(fixture.reviews), 1)
+                accepted = change == "unchanged"
+                self.assertEqual(any(m["text"] == "HELD_DIRECTION_FACT" for m in saved.get("memories", [])), accepted)
+                self.assertEqual(saved.get("opinions", {}).get("2") == "keep", accepted)
+                proxy.close()
+                proxy = Proxy(self.state / change, fixture, ["--review-every-requests", "100"])
+                self.addCleanup(proxy.close)
+                direction = "CHANGED_DIRECTION" if change == "changed" else "ORIGINAL_DIRECTION"
+                self.assertEqual(proxy.send(seed, instructions=direction)[0], 200)
+                restarted = proxy.saved()
+                self.assertEqual(restarted["shadow"]["calls"], 1)
+                self.assertEqual(any(m["text"] == "HELD_DIRECTION_FACT" for m in restarted.get("memories", [])), accepted)
+                self.evidence[change] = {"settled": saved, "restarted": restarted, "reviews": fixture.reviews}
+                proxy.close()
 
     def test_reviewer_wire_fingerprints_are_content_free_and_join_usage(self):
         def review(_body, n):

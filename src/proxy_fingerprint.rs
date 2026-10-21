@@ -130,6 +130,7 @@ fn summary(
         "review_epoch":context.epoch,"transport_attempt":transport_attempt,"rewrite_reason":match context.reason {
             Some("control_observation_migration") => "control_observation_migration",
             Some("history_rebase") => "history_rebase",
+            Some("primary_instructions_changed") => "primary_instructions_changed",
             Some("shared_projection_or_cleanup") => "shared_projection_or_cleanup",
             _ => "none",
         },"comparison_basis":if prior.is_some(){"prior_retained_transport"}else{"unavailable_restart_eviction_or_first"}});

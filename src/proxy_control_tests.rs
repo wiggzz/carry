@@ -124,23 +124,38 @@ fn changed_direction_rejects_background_authority_but_settles_receipt() {
 #[test]
 fn initial_empty_direction_has_no_moving_control_suffix() {
     let (config, mut session) = fixture();
-    for instructions in [Value::Null, json!("")] {
-        session.review_context = json!({"instructions": instructions});
+    for context in [
+        json!({}),
+        json!({"instructions":null}),
+        json!({"instructions":""}),
+    ] {
+        session.review_context = context;
         assert!(review_control_observations(&session).is_empty());
-        assert_eq!(
-            ledger(&review_body(&config, &session))["primary_instruction_version"],
-            0
+        assert!(review_primary_observation(&session).is_none());
+        assert!(
+            ledger(&review_body(&config, &session))
+                .get("primary_instruction_version")
+                .is_none()
         );
     }
 }
 
 #[test]
-fn control_versions_append_clear_restart_and_preserve_native_replay() {
+fn stable_prefix_clear_restart_and_preserve_native_replay() {
     let (config, mut session) = fixture();
     let first = review_body(&config, &session);
     commit(&mut session, &first);
-    for _ in 0..4 {
+    for round in 0..4 {
+        let mut ancestry = session
+            .history
+            .iter()
+            .map(|node| node.value.clone())
+            .collect::<Vec<_>>();
+        ancestry.push(json!({"role":"user","content":format!("new task direction {round}")}));
+        session.ingest(&ancestry).unwrap();
+        let replay = session.review_history.as_ref().unwrap().input.clone();
         let next = review_body(&config, &session);
+        assert!(next["input"].as_array().unwrap()[1..].starts_with(&replay));
         assert!(
             next["input"]
                 .as_array()
@@ -172,9 +187,12 @@ fn control_versions_append_clear_restart_and_preserve_native_replay() {
     );
     session.review_context["instructions"] = json!("SECOND_DIRECTION");
     let changed = review_body(&config, &session);
-    assert_eq!(changed.to_string().matches("FIRST_DIRECTION").count(), 1);
+    assert!(!changed.to_string().contains("FIRST_DIRECTION"));
     assert_eq!(changed.to_string().matches("SECOND_DIRECTION").count(), 1);
-    assert_eq!(ledger(&changed)["primary_instruction_version"], 2);
+    assert!(!changed.to_string().contains("REVIEW_CIPHER"));
+    let groups = session.groups();
+    prepare_review_history(&mut session, &groups);
+    assert_eq!(session.reviewer_compactions, 1);
     commit(&mut session, &changed);
     session
         .review_context
@@ -182,18 +200,22 @@ fn control_versions_append_clear_restart_and_preserve_native_replay() {
         .unwrap()
         .remove("instructions");
     let cleared = review_body(&config, &session);
-    assert_eq!(ledger(&cleared)["primary_instruction_version"], 3);
+    assert!(!cleared.to_string().contains("FIRST_DIRECTION"));
+    assert!(!cleared.to_string().contains("SECOND_DIRECTION"));
     assert!(
-        cleared
-            .to_string()
-            .contains("quoted_primary_instructions\\\":null")
+        ledger(&cleared)
+            .get("primary_instruction_version")
+            .is_none()
     );
     assert_eq!(
         review_body(&config, &session),
         cleared,
         "invalid/uncommitted preview must not advance the observation frontier"
     );
-    assert_eq!(session.reviewer_compactions, 0);
+    assert_eq!(session.reviewer_compactions, 1);
+    prepare_review_history(&mut session, &groups);
+    assert_eq!(session.reviewer_compactions, 2);
+    assert!(cleared.to_string().contains("NATIVE_CIPHER"));
 }
 
 #[test]
@@ -252,7 +274,7 @@ fn replacement_memory_uses_new_handle_and_purges_obsolete_replay() {
 }
 
 #[test]
-fn background_merge_preserves_latest_direction_and_stale_replay_cannot_return() {
+fn background_merge_rejects_changed_direction_and_stale_replay_cannot_return() {
     let (config, mut current) = fixture();
     let body = review_body(&config, &current);
     commit(&mut current, &body);
@@ -261,7 +283,7 @@ fn background_merge_preserves_latest_direction_and_stale_replay_cannot_return() 
     let body = review_body(&config, &reviewed);
     commit(&mut reviewed, &body);
     current.review_context["instructions"] = json!("LATEST_DIRECTION");
-    assert!(merge_review(
+    assert!(!merge_review(
         &config,
         &mut current,
         &before,
@@ -269,9 +291,9 @@ fn background_merge_preserves_latest_direction_and_stale_replay_cannot_return() 
         &ReviewRun::default()
     ));
     let latest = review_body(&config, &current);
-    assert_eq!(latest.to_string().matches("FIRST_DIRECTION").count(), 1);
+    assert!(!latest.to_string().contains("FIRST_DIRECTION"));
     assert_eq!(latest.to_string().matches("LATEST_DIRECTION").count(), 1);
-    assert_eq!(ledger(&latest)["primary_instruction_version"], 2);
+    assert!(ledger(&latest).get("primary_instruction_version").is_none());
     current.compact_reviewer();
     assert!(!merge_review(
         &config,
@@ -527,17 +549,23 @@ fn legacy_checkpoint_has_one_explicit_accounted_rewrite() {
         .as_object_mut()
         .unwrap()
         .remove("reviewer_controls");
-    let mut restored: Session = serde_json::from_value(checkpoint).unwrap();
-    let groups = restored.groups();
-    prepare_review_history(&mut restored, &groups);
-    assert_eq!(restored.reviewer_compactions, 1);
-    assert_eq!(
-        restored.reviewer_rewrite_reason.as_deref(),
-        Some("control_observation_migration")
-    );
-    assert_eq!(restored.render_primary(), before);
-    let body = review_body(&config, &restored);
-    commit(&mut restored, &body);
-    prepare_review_history(&mut restored, &groups);
-    assert_eq!(restored.reviewer_compactions, 1);
+    // Simulate the old versioned-tail checkpoint as well as the missing frontier.
+    let missing = checkpoint.clone();
+    checkpoint["reviewer_controls"] = json!({"instruction_version":2,
+        "instruction_sha256":"old-format", "memory_ids":[]});
+    for checkpoint in [missing, checkpoint] {
+        let mut restored: Session = serde_json::from_value(checkpoint).unwrap();
+        let groups = restored.groups();
+        prepare_review_history(&mut restored, &groups);
+        assert_eq!(restored.reviewer_compactions, 1);
+        assert_eq!(
+            restored.reviewer_rewrite_reason.as_deref(),
+            Some("control_observation_migration")
+        );
+        assert_eq!(restored.render_primary(), before);
+        let body = review_body(&config, &restored);
+        commit(&mut restored, &body);
+        prepare_review_history(&mut restored, &groups);
+        assert_eq!(restored.reviewer_compactions, 1);
+    }
 }

@@ -113,7 +113,7 @@ pub(super) struct Session {
     pub active_shadow: Vec<ShadowRecord>,
     #[serde(default)]
     pub review_history: Option<ReviewHistory>,
-    /// Committed immutable reviewer control observations; no extra payload copy.
+    /// Internal committed prefix identity and memory observation frontier; no payload copy.
     #[serde(default)]
     pub reviewer_controls: Option<Value>,
     #[serde(default)]
@@ -663,7 +663,9 @@ impl Session {
                 sources.push((source_id, data));
             }
         }
-        let mut input = Vec::new();
+        let mut input = super::proxy::review_primary_observation(self)
+            .into_iter()
+            .collect::<Vec<_>>();
         let removed = self
             .history
             .iter()
@@ -739,7 +741,6 @@ impl Session {
         input.push(json!({"role": "user", "content": json!({
             "eligible_group_ids": eligible, "current_groups": ledger,
             "current_task": current_task,
-            "primary_instruction_version": super::proxy::review_control_state(self)["instruction_version"],
             "eligible_memory_ids": self.memories.iter().map(|m| format!("m{}", m.id)).collect::<Vec<_>>(),
             "current_memories": self.memories.iter().map(|m| json!({"memory_id":format!("m{}",m.id),"source_ids":m.source_ids.iter().map(|id|format!("g{id}")).collect::<Vec<_>>() })).collect::<Vec<_>>(),
             "previous_review_feedback": self.review_feedback
