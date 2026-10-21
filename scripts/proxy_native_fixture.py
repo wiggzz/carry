@@ -188,6 +188,7 @@ class Fixture:
         self.compact_calls = []
         self.summary_calls = []
         self.calls = []
+        self.responses = []
         self.errors = []
         self.state_directory = None
         outer = self
@@ -328,6 +329,7 @@ class Fixture:
                             value['usage']['input_tokens']=50000
                             value['usage']['total_tokens']=50010
                             value['usage']['input_tokens_details']['cache_write_tokens']=50000
+                        outer.responses.append(value)
                         events = [{'type':'response.created','response':{**value,'output':[],'status':'in_progress'}}]
                         for index, item in enumerate(output):
                             initial = {**item,'status':'in_progress'}

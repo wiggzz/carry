@@ -126,6 +126,85 @@ def contract_state(directory):
 
 
 class NativeProviderFixtureTests(unittest.TestCase):
+    def test_explicit_native_bridge_owns_identity_and_preserves_full_body_and_resume(self):
+        from scripts.pi_native_bridge import PiNativeBridge, NativeIntentError
+        import uuid
+        seen = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_POST(self):
+                seen.append((self.path,list(self.headers.raw_items()),
+                    self.rfile.read(int(self.headers['content-length']))))
+                self.send_response(200); self.send_header('content-length','2')
+                self.end_headers(); self.wfile.write(b'{}')
+        server = http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+        thread = threading.Thread(target=server.serve_forever,daemon=True); thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                mapping = Path(directory)/'mapping.json'
+                target = 'http://127.0.0.1:'+str(server.server_port)
+                native = str(uuid.uuid4())
+                with PiNativeBridge(target,'synthetic',tenant='operator',session='family',mapping=mapping) as bridge:
+                    branch = bridge.resume(native)
+                    body = b' {"model":"exact-model", "input":[{"role":"user","content":"RAW_ONLY_7"}], "temperature":1.0} '
+                    request = urllib.request.Request(bridge.url+'/v1/responses',data=body,headers={
+                        'authorization':'Bearer synthetic','x-carry-tenant':'spoof',
+                        'x-carry-session':'spoof','x-carry-branch':'spoof','x-carry-fork-parent':'spoof',
+                        'x-carry-fork-point':'spoof','x-carry-history-policy':'reset-on-divergence',
+                        'x-carry-unknown':'spoof'})
+                    with urllib.request.urlopen(request,timeout=3) as response:
+                        self.assertEqual(response.read(),b'{}')
+                    self.assertEqual(seen[0][0],'/v1/responses')
+                    self.assertEqual(seen[0][2],body)
+                    headers = {k.lower():v for k,v in seen[0][1]}
+                    self.assertEqual(headers['x-carry-tenant'],'operator')
+                    self.assertEqual(headers['x-carry-session'],'family')
+                    self.assertEqual(headers['x-carry-branch'],branch)
+                    self.assertEqual(headers['x-carry-history-policy'],'strict')
+                    self.assertFalse(any('spoof'==v for v in headers.values()))
+                    self.assertNotIn('x-carry-fork-parent',headers)
+                    with self.assertRaises(NativeIntentError) as error: bridge.resume(str(uuid.uuid4()))
+                    self.assertEqual(error.exception.code,'fork_unknown')
+                    self.assertNotIn('RAW_ONLY_7',mapping.read_text())
+                    self.assertEqual(mapping.stat().st_mode & 0o777,0o600)
+                with PiNativeBridge(target,'synthetic',tenant='operator',session='family',mapping=mapping) as restored:
+                    self.assertEqual(restored.resume(native),branch)
+        finally:
+            server.shutdown(); server.server_close(); thread.join(3)
+
+    def test_exact_checkpoint_settlement_ignores_malformed_decoy_and_unrelated_pending(self):
+        from scripts.proxy_native_settle import wait_settled
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/'malformed.json').write_text('{')
+            (root/'unrelated-held.json').write_text(json.dumps({'completed_requests':99,
+                'background_review_pending':True}))
+            target = root/'exact-owned-lineage.json'
+            target.write_text(json.dumps({'completed_requests':3,'background_review_pending':False}))
+            # Target is an exact file, never first-file/global scan semantics.
+            try:
+                wait_settled(target, 3, timeout=.05)
+            except TimeoutError:
+                self.fail('exact settled checkpoint must not be blocked by unrelated files')
+            target.write_text(json.dumps({'completed_requests':3,'background_review_pending':True}))
+            (root/'decoy.json').write_text(json.dumps({'completed_requests':99,
+                'background_review_pending':False}))
+            with self.assertRaises(TimeoutError): wait_settled(target, 3, timeout=.03)
+            target.write_text('{')
+            with self.assertRaises(TimeoutError): wait_settled(target, 3, timeout=.03)
+            from scripts.proxy_native_settle import wait_lineage_settled
+            import hashlib
+            for identity in [('tenant','family','parent'),('tenant','family','child')]:
+                key = hashlib.sha256(json.dumps(identity, separators=(',', ':')).encode()).hexdigest()
+                value = {'completed_requests':4,'background_review_pending':identity[-1]=='parent'}
+                (root/(key+'.json')).write_text(json.dumps(value))
+            self.assertEqual(wait_lineage_settled(root,'tenant','family','child',4,.05),
+                {'completed_requests':4,'background_review_pending':False})
+            with self.assertRaises(TimeoutError):
+                wait_lineage_settled(root,'tenant','family','parent',4,.03)
+            with self.assertRaises(TimeoutError):
+                wait_lineage_settled(root,'other','family','child',4,.03)
+
     def test_native_tool_settlement_fails_closed_for_unusable_or_pending_checkpoint(self):
         from scripts.proxy_native_settle import wait_settled
         with tempfile.TemporaryDirectory() as directory:
