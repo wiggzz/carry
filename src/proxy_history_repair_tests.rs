@@ -230,7 +230,7 @@ async fn history_paid_primary_abandoned_attempt_is_durably_censored_once() {
                     go.notified().await;
                 }
                 axum::Json(json!({"id":format!("abandoned_{n}"),"status":"completed",
-                "output":[],"usage":{"input_tokens":100,"output_tokens":1}}))
+                "output":[],"usage":{"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}))
             }
         }),
     );
@@ -278,7 +278,7 @@ async fn history_paid_primary_abandoned_attempt_is_durably_censored_once() {
     history_race_send(restarted.clone(), input.clone()).await;
     let saved = load(&restarted, &owner).unwrap();
     assert_eq!(saved.primary.calls, 2);
-    assert_eq!(saved.primary.unavailable_cost_calls, 1);
+    assert_eq!(saved.primary.unavailable_cost_calls, 2);
     assert_eq!(saved.primary.input_tokens, 100);
     assert_eq!(
         saved
@@ -293,7 +293,7 @@ async fn history_paid_primary_abandoned_attempt_is_durably_censored_once() {
     history_race_send(restarted.clone(), input).await;
     let saved = load(&restarted, &owner).unwrap();
     assert_eq!(saved.primary.calls, 3);
-    assert_eq!(saved.primary.unavailable_cost_calls, 1);
+    assert_eq!(saved.primary.unavailable_cost_calls, 3);
     assert_eq!(
         saved
             .cost_trajectory
@@ -348,7 +348,7 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
                 let n = seen.fetch_add(1, Ordering::SeqCst);
                 axum::Json(json!({"id":format!("paid_{n}"),"status":"completed",
                     "output":if !reviewer && n == 0 {json!([{"role":"assistant","content":"X".repeat(growth)}])} else {json!([])},
-                    "usage":{"input_tokens":100,"output_tokens":1}}))
+                    "usage":{"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}))
             }
         }))
         .route("/review", post(move || {
@@ -358,7 +358,7 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
                 axum::Json(json!({"id":"paid_review","status":"completed",
                     "output":[{"type":"message","role":"assistant","content":[{"type":"output_text",
                     "text":format!("{}{{\"protected\":[],\"removable\":[],\"memories\":[]}}", " ".repeat(growth))}]}],
-                    "usage":{"input_tokens":101,"output_tokens":2}}))
+                    "usage":{"input_tokens":101,"output_tokens":2,"input_tokens_details":{"cached_tokens":0}}}))
             }
         }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -429,7 +429,9 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
         "paid primary must survive failed publication"
     );
     assert_eq!(saved.primary.input_tokens, 100);
-    assert_eq!(saved.primary.unavailable_cost_calls, 0);
+    // The loopback route is deliberately not certified as an official priced
+    // provider. Metered tokens are exact; dollar cost must remain unavailable.
+    assert_eq!(saved.primary.unavailable_cost_calls, 1);
     assert_eq!(
         saved.shadow.calls,
         u64::from(reviewer),
@@ -437,7 +439,7 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
     );
     if reviewer {
         assert_eq!(saved.shadow.input_tokens, 101);
-        assert_eq!(saved.shadow.unavailable_cost_calls, 0);
+        assert_eq!(saved.shadow.unavailable_cost_calls, 1);
         assert!(!saved.background_review_pending);
         assert!(
             saved.history[1].removed,
