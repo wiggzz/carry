@@ -453,25 +453,35 @@ async fn history_rejected_reservations_never_censor_undispatched_primary() {
 
 #[tokio::test]
 async fn history_paid_primary_oversized_settlement_survives_restart() {
-    history_paid_growth(false, 32768).await;
+    history_paid_growth(false, 32768, false).await;
 }
 
 #[tokio::test]
 async fn history_paid_reviewer_oversized_settlement_survives_restart() {
-    history_paid_growth(true, 32768).await;
+    history_paid_growth(true, 32768, false).await;
 }
 
 #[tokio::test]
 async fn history_paid_primary_fitting_growth_publishes_output() {
-    history_paid_growth(false, 64).await;
+    history_paid_growth(false, 64, false).await;
 }
 
 #[tokio::test]
 async fn history_paid_reviewer_fitting_growth_preserves_replay() {
-    history_paid_growth(true, 64).await;
+    history_paid_growth(true, 64, false).await;
 }
 
-async fn history_paid_growth(reviewer: bool, growth: usize) {
+#[tokio::test]
+async fn history_oversized_bootstrap_settlement_retains_retry_intent() {
+    history_paid_growth(true, 32768, true).await;
+}
+
+#[tokio::test]
+async fn history_fitting_bootstrap_settlement_commits_coverage_and_replay() {
+    history_paid_growth(true, 64, true).await;
+}
+
+async fn history_paid_growth(reviewer: bool, growth: usize, bootstrap: bool) {
     use std::sync::atomic::AtomicUsize;
     let directory = tempfile::tempdir().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -491,7 +501,8 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
         .route("/review", post(move || {
             let reviewed = reviewed.clone();
             async move {
-                reviewed.fetch_add(1, Ordering::SeqCst);
+                let n = reviewed.fetch_add(1, Ordering::SeqCst);
+                let growth = if bootstrap && n > 0 { 64 } else { growth };
                 axum::Json(json!({"id":"paid_review","status":"completed",
                     "output":[{"type":"message","role":"assistant","content":[{"type":"output_text",
                     "text":format!("{}{{\"protected\":[],\"removable\":[],\"memories\":[]}}", " ".repeat(growth))}]}],
@@ -542,6 +553,11 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
     if reviewer {
         let mut selected = load(&service, &owner).unwrap();
         selected.history[1].removed = true; // Explicit prior removal authority.
+        if bootstrap {
+            // Seed an imported prefix on real ingress authority, then execute the
+            // actual bootstrap worker/paid settlement (not a synthetic merge).
+            selected.import_replayed_prefix();
+        }
         save(&service, &owner, &selected).unwrap();
         let mut worker = (*service).clone();
         worker.config.review_every_requests = 1;
@@ -589,6 +605,15 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
             saved.history[1].removed,
             "settlement fallback cannot reset removal state"
         );
+        if bootstrap {
+            assert_eq!(saved.bootstrap_review_complete, growth < 16384);
+            assert_eq!(
+                saved.bootstrap_review_pending,
+                growth >= 16384,
+                "discarded bootstrap coverage must remain retryable"
+            );
+            assert_eq!(saved.bootstrap_reviewed_ids.is_empty(), growth >= 16384);
+        }
         if growth < 16384 {
             assert!(
                 saved.review_history.is_some(),
@@ -623,27 +648,49 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
     );
     let bytes = std::fs::read(directory.path().join("history.index")).unwrap();
     assert!(bytes.len() <= budget as usize);
-    history_race_send(service.clone(), input).await;
+    let retry = if bootstrap {
+        let mut retry = checkpoint_service(directory.path());
+        retry.config = service.config.clone();
+        retry.config.history_max_bytes = 65536; // The follow-up replay really fits.
+        Arc::new(retry)
+    } else {
+        service.clone()
+    };
+    history_race_send(retry.clone(), input).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while retry.background_reviews.lock().await.contains(&owner) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("fitting follow-up reviewer must finish");
     let saved = load(&restarted, &owner).unwrap();
+    let expected_reviews = u64::from(reviewer) + u64::from(bootstrap && growth >= 16384);
+    if bootstrap {
+        assert!(saved.bootstrap_review_complete);
+        assert!(!saved.bootstrap_review_pending);
+        assert!(!saved.bootstrap_reviewed_ids.is_empty());
+        assert!(saved.review_history.is_some());
+        assert_eq!(saved.shadow.input_tokens, 101 * expected_reviews);
+    }
     assert_eq!(
         saved.primary.calls, 2,
         "retry adds exactly one actual primary"
     );
     assert_eq!(
-        saved.shadow.calls,
-        u64::from(reviewer),
-        "restart/retry cannot replay a paid review receipt"
+        saved.shadow.calls, expected_reviews,
+        "retry only adds a new paid review for uncommitted bootstrap coverage"
     );
     if reviewer {
         assert!(saved.history[1].removed);
     }
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert_eq!(reviews.load(Ordering::SeqCst), usize::from(reviewer));
+    assert_eq!(reviews.load(Ordering::SeqCst) as u64, expected_reviews);
     // Once settlement releases ownership, ordinary unrelated traffic may
     // collect it. Neither the receipt nor its diagnostic mirror becomes a
     // permanent pin or permission to reconstruct expired authority.
     let mut gc = checkpoint_service(directory.path());
-    gc.config = service.config.clone();
+    gc.config = retry.config.clone();
     gc.config.history_max_references = 4;
     gc.config.history_max_nodes = 8;
     // CLI permits zero-age expiry; deterministic GC, no clock sleeps/tie order.
@@ -658,7 +705,7 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
     }
     let bytes = std::fs::read(directory.path().join("history.index")).unwrap();
     let index: Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(bytes.len() <= budget as usize);
+    assert!(bytes.len() <= gc.config.history_max_bytes as usize);
     assert!(index["nodes"].as_object().unwrap().len() <= 8);
     assert!(
         index["tips"].as_object().unwrap().len() + index["transcripts"].as_object().unwrap().len()
@@ -667,6 +714,6 @@ async fn history_paid_growth(reviewer: bool, growth: usize) {
     assert!(index["snapshots"].get(&owner).is_none());
     assert!(history::restore(&gc, &owner).is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 2 + 8);
-    assert_eq!(reviews.load(Ordering::SeqCst), usize::from(reviewer));
+    assert_eq!(reviews.load(Ordering::SeqCst) as u64, expected_reviews);
     provider.abort();
 }

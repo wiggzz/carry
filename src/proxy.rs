@@ -629,8 +629,16 @@ fn save_observed(
     session: &Session,
     observation: Option<(&[Value], &Value)>,
 ) -> std::io::Result<()> {
+    if !session.history_shared {
+        // The explicit checkpoint is authority, not a diagnostic mirror. Stage
+        // its exact bounded bytes first, then admit history before replacing it.
+        // A rejected reservation must never become an abandoned paid attempt.
+        return save_checkpoint(service, id, session, CHECKPOINT_MAX_BYTES, || {
+            history::committed(service, id, session, observation)
+        });
+    }
     let mirror = service.config.state_dir.join(format!("{id}.json"));
-    let new_shared_mirror = session.history_shared && !mirror.exists();
+    let new_shared_mirror = !mirror.exists();
     save_with_limit(
         service,
         id,
@@ -652,6 +660,16 @@ fn save_with_limit(
     session: &Session,
     max_bytes: usize,
 ) -> std::io::Result<()> {
+    save_checkpoint(service, id, session, max_bytes, || Ok(()))
+}
+
+fn save_checkpoint(
+    service: &Service,
+    id: &str,
+    session: &Session,
+    max_bytes: usize,
+    admit: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let path = service.config.state_dir.join(format!("{id}.json"));
     let temporary = service.config.state_dir.join(format!(".{id}.tmp"));
     let mut file = private_file(&temporary, false)?;
@@ -666,6 +684,11 @@ fn save_with_limit(
         ));
     }
     file.sync_all()?;
+    if let Err(error) = admit() {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
     std::fs::rename(temporary, path)?;
     File::open(&service.config.state_dir)?.sync_all()
 }
