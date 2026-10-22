@@ -337,6 +337,119 @@ async fn history_paid_primary_abandoned_attempt_is_durably_censored_once() {
 }
 
 #[tokio::test]
+async fn history_rejected_reservations_never_censor_undispatched_primary() {
+    use std::sync::atomic::AtomicUsize;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let app = Router::new().route("/v1/responses", post(move || {
+        let seen = seen.clone();
+        async move {
+            seen.fetch_add(1, Ordering::SeqCst);
+            axum::Json(json!({"id":"reservation_ok","status":"completed","output":[],
+                "usage":{"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let provider = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for explicit in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = checkpoint_service(directory.path()).config;
+        config.upstream_url = endpoint.clone();
+        config.review_every_requests = 100;
+        config.bootstrap_min_input_bytes = usize::MAX;
+        config.history_max_bytes = 1024;
+        let mut headers = HeaderMap::new();
+        if explicit {
+            headers.insert("x-carry-session", "rejected-reservation".parse().unwrap());
+        }
+        let id = identity(&headers).unwrap();
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({"model":"gpt-6-luna",
+            "input":[{"role":"user","content":"valid but cannot publish"}]}))
+            .unwrap(),
+        );
+        // Two requests in one process, then the same request after restart.
+        let mut service = checkpoint_service(directory.path());
+        service.config = config.clone();
+        let mut service = Arc::new(service);
+        for attempt in 0..3 {
+            if attempt == 2 {
+                let mut restarted = checkpoint_service(directory.path());
+                restarted.config = config.clone();
+                service = Arc::new(restarted);
+            }
+            let error = forward_request(
+                service.clone(),
+                headers.clone(),
+                body.clone(),
+                false,
+                logging::request_id(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::INSUFFICIENT_STORAGE);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            if let Some(id) = &id {
+                if attempt < 2 {
+                    continue;
+                }
+                let saved = load(&service, id).unwrap();
+                assert_eq!(saved.primary.calls, 0, "rejection is not a paid attempt");
+                assert_eq!(saved.primary.unavailable_cost_calls, 0);
+                assert!(
+                    !saved.primary_pending,
+                    "unpublished reservation is not dispatch authority"
+                );
+                assert_eq!(
+                    saved
+                        .cost_trajectory
+                        .as_ref()
+                        .map(|t| t.snapshot().coverage.prior_untracked_calls)
+                        .unwrap_or(0),
+                    0
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read_dir(directory.path())
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|e| e.path().extension().is_some_and(|s| s == "json"))
+                        .count(),
+                    0
+                );
+            }
+        }
+        // The identical explicit/shared request succeeds once publication fits.
+        let mut fitting = checkpoint_service(directory.path());
+        fitting.config = config;
+        fitting.config.history_max_bytes = 65536;
+        let response = forward_request(
+            Arc::new(fitting),
+            headers.clone(),
+            body,
+            false,
+            logging::request_id(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let restarted = checkpoint_service(directory.path());
+        let owner =
+            id.unwrap_or_else(|| history_race_owner(&restarted, "valid but cannot publish"));
+        let saved = load(&restarted, &owner).unwrap();
+        assert_eq!(saved.primary.calls, 1);
+        assert_eq!(saved.primary.unavailable_cost_calls, 0);
+        assert!(!saved.primary_pending);
+        assert_eq!(calls.swap(0, Ordering::SeqCst), 1);
+    }
+    provider.abort();
+}
+
+#[tokio::test]
 async fn history_paid_primary_oversized_settlement_survives_restart() {
     history_paid_growth(false, 32768).await;
 }
