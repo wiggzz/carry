@@ -117,6 +117,26 @@ fn capacity_rejection_clear_restore_rejects_held_advice() {
 }
 
 #[test]
+fn capacity_rejection_failed_save_unchanged_accepts_held_advice() {
+    state_regression("capacity_rejection_failed_save_unchanged_accepts_held_advice");
+}
+
+#[test]
+fn capacity_rejection_failed_save_changed_rejects_held_advice() {
+    state_regression("capacity_rejection_failed_save_changed_rejects_held_advice");
+}
+
+#[test]
+fn capacity_rejection_failed_save_cleared_rejects_held_advice() {
+    state_regression("capacity_rejection_failed_save_cleared_rejects_held_advice");
+}
+
+#[test]
+fn capacity_rejection_failed_save_restore_rejects_held_advice() {
+    state_regression("capacity_rejection_failed_save_restore_rejects_held_advice");
+}
+
+#[test]
 fn reviewer_wire_fingerprints_are_content_free_and_join_usage() {
     state_regression("reviewer_wire_fingerprints_are_content_free_and_join_usage");
 }

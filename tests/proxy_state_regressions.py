@@ -391,7 +391,7 @@ class StateRegressions(unittest.TestCase):
                 self.evidence[change] = {"settled": saved, "restarted": restarted, "reviews": fixture.reviews}
                 proxy.close()
 
-    def capacity_rejection_direction(self, change):
+    def capacity_rejection_direction(self, change, publication_failure=False):
         def review(body, n):
             if n == 1:
                 self.assertIn("g2", ledger(body)["eligible_group_ids"])
@@ -423,6 +423,13 @@ class StateRegressions(unittest.TestCase):
         direction = "ORIGINAL_DIRECTION" if change == "unchanged" else (
             "CHANGED_DIRECTION" if change == "changed" else "")
         result, errors = [], []
+        checkpoint = next(self.state.glob("*.json"))
+        original_bytes = checkpoint.read_bytes()
+        blocked_temporary = self.state / f".{checkpoint.stem}.tmp"
+        if publication_failure:
+            # Fail the real explicit-authority staging open, not its reader or
+            # the provider. The old checkpoint remains readable byte-for-byte.
+            blocked_temporary.mkdir()
 
         def send_pressure():
             try:
@@ -447,7 +454,22 @@ class StateRegressions(unittest.TestCase):
                 self.assertEqual(proxy.send(growing, **fields)[0], 413)
                 direction = "ORIGINAL_DIRECTION"
             before_release = proxy.saved()
+            if publication_failure:
+                self.assertEqual(checkpoint.read_bytes(), original_bytes,
+                                 "fault must preserve the old readable authority")
+                self.evidence["failed_publication"] = {
+                    "checkpoint_unchanged": True, "temporary": blocked_temporary.name,
+                    "old_epoch": before["review_epoch"],
+                    "readable_epoch": before_release["review_epoch"]}
+                blocked_temporary.rmdir()
+                if change == "clear_then_restore":
+                    # Recover storage and persist A again before releasing A's
+                    # old worker. A same-input ingress must not erase the fence.
+                    self.assertEqual(proxy.send(growing, **fields)[0], 413)
+                    before_release = proxy.saved()
         finally:
+            if publication_failure and blocked_temporary.is_dir():
+                blocked_temporary.rmdir()
             fixture.release.set()
             waiter.join(timeout=20)
         settled = self.wait_saved(proxy, lambda s: not s["background_review_pending"])
@@ -456,10 +478,17 @@ class StateRegressions(unittest.TestCase):
             # earlier rejected primary into a blocking reviewer-dependent call.
             self.assertEqual(proxy.send(growing, instructions=direction, max_output_tokens=1)[0], 200)
             settled = proxy.saved()
-        entries = [json.loads(line) for path in (self.state / "diagnostics").glob("*.jsonl")
-                   for line in path.read_bytes().splitlines()]
-        merges = [e for e in entries if e["event"] in (
-            "background_review_merged", "background_review_discarded")]
+        # Checkpoint replacement precedes its settlement journal append. Wait
+        # for that actual event rather than racing the worker's final logging.
+        deadline = time.monotonic() + 3
+        while True:
+            entries = [json.loads(line) for path in (self.state / "diagnostics").glob("*.jsonl")
+                       for line in path.read_bytes().splitlines()]
+            merges = [e for e in entries if e["event"] in (
+                "background_review_merged", "background_review_discarded")]
+            if merges or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
         self.evidence.update(change=change, before=before, at_wait=at_wait,
                              before_release=before_release, settled=settled, result=result,
                              reviews=fixture.reviews, primaries=fixture.primaries, events=entries)
@@ -533,6 +562,18 @@ class StateRegressions(unittest.TestCase):
 
     def test_capacity_rejection_clear_restore_rejects_held_advice(self):
         self.capacity_rejection_direction("clear_then_restore")
+
+    def test_capacity_rejection_failed_save_unchanged_accepts_held_advice(self):
+        self.capacity_rejection_direction("unchanged", publication_failure=True)
+
+    def test_capacity_rejection_failed_save_changed_rejects_held_advice(self):
+        self.capacity_rejection_direction("changed", publication_failure=True)
+
+    def test_capacity_rejection_failed_save_cleared_rejects_held_advice(self):
+        self.capacity_rejection_direction("cleared", publication_failure=True)
+
+    def test_capacity_rejection_failed_save_restore_rejects_held_advice(self):
+        self.capacity_rejection_direction("clear_then_restore", publication_failure=True)
 
     def test_reviewer_wire_fingerprints_are_content_free_and_join_usage(self):
         def review(_body, n):
