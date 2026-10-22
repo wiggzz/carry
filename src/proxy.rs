@@ -1188,8 +1188,13 @@ async fn dashboard_stats(
             "reviewer_required_tokens": last_plan["reviewer_required_tokens"].as_f64(),
             "primary_estimated_tokens": last_plan["primary_estimated_tokens"].as_f64(),
             "reviewer_estimated_tokens": last_plan["reviewer_estimated_tokens"].as_f64(),
-            "primary_context_tokens": service.config.primary_context_tokens,
-            "reviewer_context_tokens": service.config.classifier_max_input_tokens,
+            // Numerators and denominators describe the same saved request.
+            // Legacy sessions without a plan can still use their frozen epoch;
+            // absent historical contracts remain unknown, not process defaults.
+            "primary_context_tokens": last_plan["primary_context_tokens"].as_u64()
+                .or_else(|| session.model_resolution.as_ref().map(|pair| pair.primary.capacity_tokens as u64)),
+            "reviewer_context_tokens": last_plan["reviewer_context_tokens"].as_u64()
+                .or_else(|| session.model_resolution.as_ref().map(|pair| pair.reviewer.capacity_tokens as u64)),
             "candidate": best_candidate.map(|row| json!({
                 "candidate_id": row["candidate_id"].as_str(), "action": row["action"].as_str(),
                 "keep": row["selection_joint"]["keep"].as_f64(),
@@ -2928,21 +2933,8 @@ async fn review(
         );
         return false;
     }
-    prepare_review_history(session, &groups);
     let prior_keep_review = session.keep_leases.as_ref().unwrap().pending.clone();
-    let targets = session.due_keep_targets();
-    session.keep_leases.as_mut().unwrap().pending =
-        (!targets.is_empty()).then(|| crate::proxy_state::PendingKeepReview {
-            request_id: run.request_id.clone(),
-            targets,
-        });
-    let mut body = review_body_for_groups(&service.config, session, &groups);
-    // Dispose of reviewer replay independently; never rewrite primary source
-    // or accepted protection merely to admit another reviewer request.
-    if !review_fits(&service.config, &body) && session.review_history.is_some() {
-        session.compact_reviewer();
-        body = review_body_for_groups(&service.config, session, &groups);
-    }
+    let body = prepare_ordinary_review(&service.config, session, &groups, &run.request_id);
     if !review_fits(&service.config, &body) {
         journal(
             service,
@@ -2958,6 +2950,32 @@ async fn review(
     }
     session.observe_groups(&groups);
     review_chunk(service, id, session, &body, &groups, run).await
+}
+
+/// Render the actual ordinary request, including target annotations and the
+/// dispatcher's replay-only capacity cleanup. Forecasts use a private clone;
+/// the caller owns reservation/cancellation of any installed pending targets.
+fn prepare_ordinary_review(
+    config: &ProxyCli,
+    session: &mut Session,
+    groups: &[Group],
+    request_id: &str,
+) -> Value {
+    prepare_review_history(session, groups);
+    let targets = session.due_keep_targets();
+    session.keep_leases.as_mut().unwrap().pending =
+        (!targets.is_empty()).then(|| crate::proxy_state::PendingKeepReview {
+            request_id: request_id.into(),
+            targets,
+        });
+    let mut body = review_body_for_groups(config, session, groups);
+    // Dispose of reviewer replay independently; never rewrite primary source
+    // or accepted protection merely to admit another reviewer request.
+    if !review_fits(config, &body) && session.review_history.is_some() {
+        session.compact_reviewer();
+        body = review_body_for_groups(config, session, groups);
+    }
+    body
 }
 
 async fn review_import(

@@ -6,6 +6,12 @@ use super::{
     reviewer_reusable, reviewer_view_costs, select_removals, standard,
 };
 
+#[derive(Default)]
+struct ReviewForecast {
+    calls: Vec<Option<Value>>,
+    immediate: bool,
+}
+
 /// Frozen-source sensitivity: advance cadence and exposure, assuming future
 /// reviews complete/merge before their next due dispatch. This is not a latency
 /// guarantee. Already unfinished work is unknown, not free.
@@ -15,12 +21,12 @@ fn review_calls(
     body: &Value,
     changed: bool,
     allow_extra: bool,
-) -> Option<Vec<Option<Value>>> {
+) -> Option<ReviewForecast> {
     #[cfg(test)]
     super::planner_work::record("forecasts");
     if !standard(body) || primary_rates(config, body["model"].as_str().unwrap_or(""), 0.0).is_none()
     {
-        return Some(Vec::new());
+        return Some(ReviewForecast::default());
     }
     if session.background_review_pending
         || (session.bootstrap_review_pending && !session.bootstrap_review_complete)
@@ -29,7 +35,7 @@ fn review_calls(
     }
     let mut future = session.clone();
     super::admission::initialize(&mut future);
-    let mut calls = Vec::new();
+    let mut forecast = ReviewForecast::default();
     // Only cadence, exposure, coverage and attempt reservation advance here;
     // history/removals/materialized memories and the primary wire policy do not.
     // Reuse just that immutable render/tokenization, never an admission decision
@@ -61,28 +67,30 @@ fn review_calls(
             )["admitted"]
                 == true
         {
-            let targets = future.due_keep_targets();
-            let targeted = if targets.is_empty() {
+            let targeted = if future.due_keep_targets().is_empty() {
                 None
             } else {
                 let mut dispatch = future.clone();
-                dispatch.keep_leases.as_mut().unwrap().pending =
-                    Some(crate::proxy_state::PendingKeepReview {
-                        request_id: "forecast".into(),
-                        targets,
-                    });
-                Some(review_body(config, &dispatch))
+                let groups = dispatch.groups();
+                Some(super::prepare_ordinary_review(
+                    config,
+                    &mut dispatch,
+                    &groups,
+                    "forecast",
+                ))
             };
-            // No outcome is known for a hypothetical targeted review. Reserve
-            // its single extra attempt; do not invent repeated paid renewals.
-            future.reserve_extra_keep_attempt();
             // The actual dispatcher skips an over-cap targeted body; do not
             // forecast a paid call that cannot be sent.
             if targeted
                 .as_ref()
                 .is_none_or(|wire| review_fits(config, wire))
             {
-                calls.push(targeted);
+                // A later forecast call is not evidence of immediate readiness.
+                forecast.immediate |= request == 0;
+                forecast.calls.push(targeted);
+                // No outcome is known for a hypothetical targeted review.
+                // Reserve only a dispatchable attempt; invent no paid renewals.
+                future.reserve_extra_keep_attempt();
                 future.last_review_request = future.completed_requests;
                 let groups = future.groups();
                 super::admission::cover(&mut future, &groups);
@@ -95,7 +103,7 @@ fn review_calls(
             }
         }
     }
-    Some(calls)
+    Some(forecast)
 }
 
 fn review_cost(
@@ -245,19 +253,17 @@ fn plan_inner(
     } else {
         None // deferred reviewer schedule; not primary infeasibility
     };
-    let keep_calls = keep_schedule.as_ref().map(|s| s.len() as u64);
+    let keep_calls = keep_schedule.as_ref().map(|s| s.calls.len() as u64);
     let keep_cost = keep_schedule
         .as_ref()
-        .and_then(|s| review_cost(config, session, &reviewer, s));
+        .and_then(|s| review_cost(config, session, &reviewer, &s.calls));
     // One frozen admission decision is shared by all candidate comparisons and
     // the report, rather than repeatedly projecting the same primary per row.
     let ordinary_admission =
         super::admission::decision_for_plan(config, session, body, false, acquisition.is_none());
-    let due = !config.current_review_suppressed
-        && !session.background_review_pending
-        && !(session.bootstrap_review_pending && !session.bootstrap_review_complete)
-        && reviewer_ok
-        && ordinary_admission["admitted"] == true;
+    let due = keep_schedule
+        .as_ref()
+        .is_some_and(|schedule| schedule.immediate);
     let mut reports = Vec::new();
     let mut best: Option<(Session, f64, String, &'static str)> = None;
     // Cleaning only disposable reviewer turns is a real candidate. It can make
@@ -312,12 +318,12 @@ fn plan_inner(
         let compact = primary_wire_body(config, &compact);
         let compact_schedule =
             review_calls(config, &candidate, body, changed, acquisition.is_none());
-        let compact_calls = compact_schedule.as_ref().map(|s| s.len() as u64);
+        let compact_calls = compact_schedule.as_ref().map(|s| s.calls.len() as u64);
         let shadow = keep_cost
             .zip(
                 compact_schedule
                     .as_ref()
-                    .and_then(|s| review_cost(config, &candidate, &compact_review, s)),
+                    .and_then(|s| review_cost(config, &candidate, &compact_review, &s.calls)),
             )
             .map(|(keep, compact)| ViewCosts {
                 keep,
@@ -389,7 +395,7 @@ fn plan_inner(
         let selection_shadow = if due {
             keep_schedule
                 .as_ref()
-                .and_then(|s| s.get(..1))
+                .and_then(|s| s.calls.get(..1))
                 .and_then(|s| review_cost(config, session, &reviewer, s))
                 .zip(if changed {
                     // This rewrite skips the due review, but its next cold/write
@@ -399,7 +405,7 @@ fn plan_inner(
                 } else {
                     compact_schedule
                         .as_ref()
-                        .and_then(|s| s.get(..1))
+                        .and_then(|s| s.calls.get(..1))
                         .and_then(|s| review_cost(config, &candidate, &compact_review, s))
                 })
                 .map(|(keep, compact)| ViewCosts { keep, compact })
