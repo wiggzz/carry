@@ -265,9 +265,18 @@ class Proxy:
             connection.close()
 
     def send(self, body, headers=None, stream=False):
-        return self.request("POST", "/v1/responses", encoded(body),
-                            {"Content-Type": "application/json",
-                             "x-carry-session": "transport-fixture", **(headers or {})}, stream)
+        response = self.request("POST", "/v1/responses", encoded(body),
+                                {"Content-Type": "application/json",
+                                 "x-carry-session": "transport-fixture", **(headers or {})}, stream)
+        # Transport receipts are asserted after the primary body has finished;
+        # synchronize here without restoring production reviewer blocking.
+        deadline = time.monotonic() + 120
+        while any(json.loads(p.read_bytes()).get("background_review_pending")
+                  for p in (Path(self.temp.name) / "state").glob("*.json")):
+            if time.monotonic() >= deadline:
+                raise AssertionError("post-response transport review did not settle")
+            time.sleep(0.01)
+        return response
 
     def metrics(self):
         status, value = self.request("GET", "/carry/metrics", headers={

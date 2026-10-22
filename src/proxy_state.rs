@@ -7,6 +7,10 @@ use serde_json::{Value, json};
 
 use carry::core::{UsageLedger, prefix_compatible};
 
+#[path = "proxy_lease_state.rs"]
+mod lease;
+pub(super) use lease::{KeepLeases, Pending as PendingKeepReview};
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Item {
     pub id: u64,
@@ -103,6 +107,8 @@ pub(super) struct Session {
     /// Legacy opinions without this provenance remain protective, never drops.
     #[serde(default)]
     pub drop_members: BTreeMap<u64, Vec<u64>>,
+    #[serde(default)]
+    pub keep_leases: Option<KeepLeases>,
     pub memories: Vec<Memory>,
     #[serde(default)]
     pub next_memory_id: u64,
@@ -159,6 +165,8 @@ pub(super) struct Session {
     #[serde(default)]
     pub review_epoch: u64,
     #[serde(default)]
+    pub primary_pending: bool,
+    #[serde(default)]
     pub background_review_pending: bool,
     #[serde(default)]
     pub last_failure: Option<Value>,
@@ -168,8 +176,30 @@ pub(super) struct Session {
     #[serde(default)]
     pub history_rebases: u64,
     pub last_plan: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_resolution: Option<carry::models::ResolvedPair>,
+    /// Retain earlier contracts on explicit model/route/configuration changes;
+    /// historical ledgers/scenarios keep their original legacy interpretation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_resolution_history: Vec<carry::models::ResolvedPair>,
     pub review_cache_key: String,
     pub review_context: Value,
+    /// Immutable committed ancestor authority, separate from disposable replay.
+    #[serde(default)]
+    pub fork_points: Vec<crate::proxy::forking::Point>,
+    #[serde(default)]
+    pub fork_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_namespace: Option<String>,
+    #[serde(default)]
+    pub history_shared: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_frontier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_conversation: Option<String>,
+    /// Bounded expiry diagnostics, not global source-removal tombstones.
+    #[serde(default)]
+    pub fork_expired: Vec<String>,
 }
 
 fn identity(value: &Value) -> Value {
@@ -360,6 +390,21 @@ impl Session {
         self.bootstrap_review_complete = false;
     }
 
+    /// Retry intent follows committed imported-source coverage, never a worker's
+    /// unpublished completion flag or receipt-only settlement candidate.
+    pub fn refresh_bootstrap_progress(&mut self) {
+        if self.bootstrap_end_id == 0 {
+            return;
+        }
+        self.bootstrap_review_complete = !self.groups().iter().any(|group| {
+            group.exposed
+                && !group.pinned
+                && group.members.iter().all(|id| *id <= self.bootstrap_end_id)
+                && !self.bootstrap_reviewed_ids.contains(&group.id)
+        });
+        self.bootstrap_review_pending = !self.bootstrap_review_complete;
+    }
+
     pub fn reset_active(&mut self) {
         self.review_epoch = self.review_epoch.saturating_add(1);
         if let Some(trajectory) = &mut self.cost_trajectory {
@@ -379,6 +424,7 @@ impl Session {
         self.native_checkpoint.clear();
         self.opinions.clear();
         self.drop_members.clear();
+        self.keep_leases = None;
         self.memories.clear();
         self.memory_anchors.clear();
         self.active_shadow.clear();
@@ -556,6 +602,8 @@ impl Session {
     }
 
     pub fn render_primary(&self) -> Vec<Value> {
+        #[cfg(test)]
+        crate::proxy::planner_work::record("primary_renders");
         self.render_primary_with_ids()
             .into_iter()
             .map(|(_, value)| value)
@@ -564,6 +612,8 @@ impl Session {
 
     /// Source identity stays aligned with wire slots, including inserted memories.
     pub fn render_primary_with_ids(&self) -> Vec<(Option<u64>, Value)> {
+        #[cfg(test)]
+        crate::proxy::planner_work::record("primary_renders_with_ids");
         let removed = self
             .history
             .iter()
@@ -738,13 +788,23 @@ impl Session {
         if include_controls {
             input.extend(super::proxy::review_control_observations(self));
         }
-        input.push(json!({"role": "user", "content": json!({
+        let mut control = json!({
             "eligible_group_ids": eligible, "current_groups": ledger,
             "current_task": current_task,
             "eligible_memory_ids": self.memories.iter().map(|m| format!("m{}", m.id)).collect::<Vec<_>>(),
             "current_memories": self.memories.iter().map(|m| json!({"memory_id":format!("m{}",m.id),"source_ids":m.source_ids.iter().map(|id|format!("g{id}")).collect::<Vec<_>>() })).collect::<Vec<_>>(),
             "previous_review_feedback": self.review_feedback
-        }).to_string()}));
+        });
+        // Revalidation is a tail-only exception to sticky omission. Do not tax
+        // every import chunk or mutate the cacheable instruction prefix for a
+        // policy that is not being used by that request.
+        if let Some(pending) = self.keep_leases.as_ref().and_then(|s| s.pending.as_ref()) {
+            control["keep_lease_review"] = json!({
+                "target_ids":pending.targets.keys().collect::<Vec<_>>(),
+                "instructions":"For these targets only, override sticky omission: protect if still needed and not represented elsewhere or accurately captured concisely; removable or valid omission releases temporary protection for economic compaction, not immediate deletion. All other omissions remain unchanged."
+            });
+        }
+        input.push(json!({"role": "user", "content": control.to_string()}));
         input
     }
 
@@ -752,8 +812,9 @@ impl Session {
     pub fn drop_authorized(&self, group: &Group) -> bool {
         group.exposed
             && !group.pinned
-            && self.opinions.get(&group.id).is_some_and(|s| s == "drop")
-            && self.drop_members.get(&group.id) == Some(&group.members)
+            && ((self.opinions.get(&group.id).is_some_and(|s| s == "drop")
+                && self.drop_members.get(&group.id) == Some(&group.members))
+                || self.released_group(group))
             && !group
                 .members
                 .iter()
@@ -775,7 +836,7 @@ impl Session {
             }
             if protected {
                 self.opinions.insert(group.id, "keep".into());
-            } else if authorized {
+            } else if authorized && !self.released_group(group) {
                 self.opinions.insert(group.id, "drop".into());
             }
         }
@@ -1035,6 +1096,13 @@ impl Session {
         let accepted_opinions = updates.len() + memory_updates.len();
         let mut accepted_memories = 0;
         for (id, opinion) in updates {
+            if let Some(group) = groups.iter().find(|group| group.id == id) {
+                if opinion == "keep" {
+                    self.renew_group_lease(group);
+                } else if let Some(state) = &mut self.keep_leases {
+                    state.entries.remove(&format!("g{id}"));
+                }
+            }
             self.opinions.insert(id, opinion.into());
             self.drop_members.remove(&id);
             if opinion == "drop"
@@ -1043,44 +1111,16 @@ impl Session {
                 self.drop_members.insert(id, group.members.clone());
             }
         }
+        for (&id, opinion) in &memory_updates {
+            if *opinion == "keep" {
+                self.renew_memory_lease(id);
+            }
+        }
         let retired = memory_updates
             .into_iter()
             .filter_map(|(id, opinion)| (opinion == "drop").then_some(id))
             .collect::<HashSet<_>>();
-        let retired_facts = self
-            .memories
-            .iter()
-            .filter(|m| retired.contains(&m.id))
-            .cloned()
-            .collect::<Vec<_>>();
-        self.active_shadow.retain(|record| {
-            if record.source_id != 0 {
-                return true;
-            }
-            let Some(data) = record.value["content"]
-                .as_str()
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            else {
-                return true;
-            };
-            !retired_facts.iter().any(|m| {
-                data["memory_id"] == format!("m{}", m.id)
-                    || (data["text"] == m.text
-                        && data["source_ids"]
-                            == json!(
-                                m.source_ids
-                                    .iter()
-                                    .map(|id| format!("g{id}"))
-                                    .collect::<Vec<_>>()
-                            ))
-            })
-        });
-        self.memories.retain(|m| !retired.contains(&m.id));
-        self.memory_anchors.retain(|id, _| !retired.contains(id));
-        if !retired_facts.is_empty() {
-            // Answers and old ledgers can contain an unmaterialized fact too.
-            self.compact_reviewer();
-        }
+        self.retire_memories(&retired);
         for ((sources, text), index) in memories.into_iter().zip(memory_indexes) {
             if self.memories.len() >= 128 {
                 reject("memories", index, "active memory limit of 128 reached");
@@ -1145,6 +1185,49 @@ impl Session {
         Ok(())
     }
 
+    /// Shared physical retirement path; callers own authorization and accounting.
+    fn retire_memories(&mut self, retired: &HashSet<u64>) {
+        let retired_facts = self
+            .memories
+            .iter()
+            .filter(|m| retired.contains(&m.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.active_shadow.retain(|record| {
+            if record.source_id != 0 {
+                return true;
+            }
+            let Some(data) = record.value["content"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            else {
+                return true;
+            };
+            !retired_facts.iter().any(|m| {
+                data["memory_id"] == format!("m{}", m.id)
+                    || (data["text"] == m.text
+                        && data["source_ids"]
+                            == json!(
+                                m.source_ids
+                                    .iter()
+                                    .map(|id| format!("g{id}"))
+                                    .collect::<Vec<_>>()
+                            ))
+            })
+        });
+        self.memories.retain(|m| !retired.contains(&m.id));
+        self.memory_anchors.retain(|id, _| !retired.contains(id));
+        if let Some(state) = &mut self.keep_leases {
+            for id in retired {
+                state.entries.remove(&format!("m{id}"));
+                state.extra_attempted.remove(&format!("m{id}"));
+            }
+        }
+        if !retired_facts.is_empty() {
+            self.compact_reviewer();
+        }
+    }
+
     /// Rebuild only shared fact records after a background memory delta. Native
     /// observations are independent; source retirement cannot retire a fact.
     pub fn refresh_memory_shadow(&mut self) {
@@ -1163,6 +1246,9 @@ impl Session {
     }
 
     pub fn remove(&mut self, ids: &[u64], groups: &[Group]) {
+        // Released facts are candidates, never automatic expiry deletions. This
+        // method runs on planner clones; the selected action owns the debit.
+        self.retire_memories(&self.released_memory_ids().into_iter().collect());
         let members = groups
             .iter()
             .filter(|g| ids.contains(&g.id))
@@ -1176,6 +1262,14 @@ impl Session {
         self.observed.retain(|id, _| !members.contains(id));
         self.opinions.retain(|id, _| !members.contains(id));
         self.drop_members.retain(|id, _| !members.contains(id));
+        if let Some(state) = &mut self.keep_leases {
+            state
+                .entries
+                .retain(|key, _| !ids.iter().any(|id| key == &format!("g{id}")));
+            state
+                .extra_attempted
+                .retain(|key, _| !ids.iter().any(|id| key == &format!("g{id}")));
+        }
         self.compact_reviewer();
     }
 

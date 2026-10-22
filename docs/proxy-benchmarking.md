@@ -65,19 +65,21 @@ the client. API-key users omit `--codex-login` and supply the upstream/reviewer
 keys through the proxy environment.
 
 Clients use `http://127.0.0.1:8787/v1`. A full-history client may omit
-`x-carry-session`: Carry keeps one active prefix per tenant/branch and request
-settings scope. Matching prefixes reuse removals and reviewer decisions; a
-shorter or divergent history replaces that state, without searching old forks.
-This also works across restarts with the same state directory. Headerless
-clients sharing a scope share its active history; use explicit identities when
-conversations must stay independent.
+`x-carry-session`: Carry's server-owned prefix tree reuses compatible committed
+review versions across ordinary forks, rewinds and restart. A divergent child
+does not reset its parent or require a client bridge/discovery API. Exact owner,
+settings and reviewer policy boundaries still apply. Identical headerless
+histories within one scope may share a selection; logical-session identity/auth
+is deferred. See [transparent history](proxy-fork-continuity.md) for retention,
+dependency-frontier safety and unknown-history behavior.
 
 For explicit continuity, choose a unique `x-carry-session` per conversation and
 reuse it when resuming. Optional `x-carry-tenant` and `x-carry-branch` headers
 isolate owners and branches. Explicit sessions remain strict on divergence
-unless the caller opts into a reset. `previous_response_id` requires an explicit
-session and is validated there; Carry never discovers sessions from response
-IDs. Restart Carry with the **same state directory** to recover checkpoints,
+unless the caller opts into a reset. `previous_response_id` or `conversation`
+can expand an observed, retained canonical transcript through the server-owned
+index, including actual assistant outputs. Unknown/unobserved IDs fail closed.
+Restart Carry with the **same state directory** to recover checkpoints,
 removals, reviewer state and usage. Do not put provider keys in client configuration.
 For a shared listener, set `CARRY_PROXY_AUTH_TOKEN` securely and give clients
 only that scoped gateway token. Loopback model endpoints also enforce it when
@@ -93,7 +95,7 @@ replace other providers):
       "baseUrl": "http://127.0.0.1:8787/v1",
       "api": "openai-responses",
       "apiKey": "carry-local",
-      "headers": {"x-carry-session": "$CARRY_SESSION_ID"},
+
       "models": [{"id": "gpt-6.1-sol", "reasoning": true, "input": ["text", "image"], "contextWindow": 272000, "maxTokens": 128000}]
     }
   }
@@ -180,8 +182,28 @@ skips an immediate ordinary review, while a reviewer-only cleanup does not. This
 is a **frozen-source, timely-completion sensitivity**: hypothetical future reviews
 are assumed to complete and merge before their next due dispatch, not guaranteed
 to do so. Already-pending background work and unfinished imports remain unknown,
-not free; completed bootstrap receipts are sunk. Primary generation-output cost
-is not separately forecast (the primary output reserve is a capacity allowance).
+not free; completed bootstrap receipts are sunk. The legacy `joint` diagnostic
+keeps its input-only primary arithmetic. `selection_joint` separately includes
+an explicit primary **output-cap sensitivity**: when the request supplies
+`max_output_tokens`, that many output tokens per payoff request are priced at
+**each rendered branch's own input-selected, frozen output tariff**. This is
+neither expected generation nor measured usage. An explicit zero is zero; without
+a request cap, the legacy zero-output assumption is reported explicitly.
+`--primary-output-reserve-tokens` is capacity headroom only, never an implicit
+expected-output estimate. The report separates primary input and output costs,
+allowance, horizon and assumption basis; native paid receipts remain unchanged.
+
+Reports identify actual actions as `keep`, `reviewer_only` or `joint`; primary-only
+removal is not an applicable action because removing source necessarily rebuilds
+reviewer replay. The additive `keep_candidate` stays outside the legacy
+`candidates` vector. Stable candidate IDs name removal/memory-retirement actions
+within one frozen source plan, not globally unique sessions or rank positions.
+`selected_candidate_id` and `selected_action` are carried with the selected state;
+the dashboard uses that exact row's `selection_joint`, not the largest recurring
+savings row. Older selected reports without identity remain unidentified rather
+than guessing which rendering won. Audit mode still records a proposal, not proof
+of forwarding or mutation.
+
 Fresh compatible receipts can credit
 cache reads; evidence expires after 30 minutes. Implicit fills use ordinary input
 rates, while explicit cache writes use the modeled write rate. No cache markers

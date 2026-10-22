@@ -1,6 +1,7 @@
 //! Proxy-specific coverage and lifecycle around the shared savings estimator.
 use crate::openai::{Usage, estimated_cost_usd, prompt_cache_capabilities};
 pub(crate) use crate::savings::{Scenario, token_units};
+use carry::models::ResolvedModel;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -254,20 +255,44 @@ impl Trajectory {
         self.carry_edited = true;
     }
 
+    #[cfg(test)]
     pub fn reviewer(&mut self, body: &Value, response: &Value, standard: bool) {
+        self.reviewer_resolved(body, response, standard, None);
+    }
+
+    pub fn reviewer_resolved(
+        &mut self,
+        body: &Value,
+        response: &Value,
+        standard: bool,
+        resolved: Option<&ResolvedModel>,
+    ) {
         if response["status"] != "completed" {
             self.failed_call();
             return;
         }
-        self.reviewer_usage(
+        self.reviewer_usage_resolved(
             body["model"].as_str().unwrap_or(""),
             token_units(body),
             &response["usage"],
             standard,
+            resolved,
         );
     }
 
+    #[cfg(test)]
     pub fn reviewer_usage(&mut self, model: &str, input: u64, usage: &Value, standard: bool) {
+        self.reviewer_usage_resolved(model, input, usage, standard, None);
+    }
+
+    pub fn reviewer_usage_resolved(
+        &mut self,
+        model: &str,
+        input: u64,
+        usage: &Value,
+        standard: bool,
+        resolved: Option<&ResolvedModel>,
+    ) {
         self.start_priced_subset();
         self.result.coverage.reviewer_responses += 1;
         let output = usage["output_tokens"]
@@ -279,13 +304,14 @@ impl Trajectory {
             self.result.coverage.unmodeled_calls += 1;
         }
         let cost = output.filter(|_| standard).and_then(|output| {
-            estimated_cost_usd(
+            modeled_cost(
                 model,
                 &Usage {
                     input_tokens: input,
                     output_tokens: output,
                     ..Usage::default()
                 },
+                resolved,
             )
         });
         if let Some(cost) = cost {
@@ -302,6 +328,7 @@ impl Trajectory {
         }
     }
 
+    #[cfg(test)]
     pub fn primary(
         &mut self,
         body: &Value,
@@ -309,6 +336,18 @@ impl Trajectory {
         route: &str,
         at: u64,
         standard: bool,
+    ) {
+        self.primary_resolved(body, response, route, at, standard, None);
+    }
+
+    pub fn primary_resolved(
+        &mut self,
+        body: &Value,
+        response: &Value,
+        route: &str,
+        at: u64,
+        standard: bool,
+        resolved: Option<&ResolvedModel>,
     ) {
         self.start_priced_subset();
         if has_native_modalities(body)
@@ -371,29 +410,43 @@ impl Trajectory {
             } else {
                 0
             };
-        let minimum =
-            prompt_cache_capabilities(&prompt.model).map(|cap| cap.minimum_prefix_tokens as u64);
+        let minimum = match resolved {
+            Some(r) => r.cache,
+            None => prompt_cache_capabilities(&prompt.model),
+        }
+        .map(|cap| cap.minimum_prefix_tokens as u64);
         if minimum.is_none() {
             self.result.coverage.unknown_cache_requests += 1;
         }
-        if estimated_cost_usd(&prompt.model, &Usage::default()).is_none() {
+        if modeled_cost(&prompt.model, &Usage::default(), resolved).is_none() {
             self.result.coverage.unknown_rate_calls += 1;
         }
         // Freeze the output count, not its rate: each branch selects its own tier.
         let pair = output.filter(|_| standard).and_then(|output| {
-            minimum?;
+            // Legacy scenarios required a known cache contract. Frozen routes
+            // with unknown caching instead compare both branches uncached.
+            if resolved.is_none() {
+                minimum?;
+            }
             Some((
-                scenario_input_cost(&prompt.model, prompt.input, carry_cached, minimum)?
-                    + crate::savings::scenario_output_cost(&prompt.model, prompt.input, output)?,
-                scenario_input_cost(
+                scenario_input_cost_resolved(
+                    &prompt.model,
+                    prompt.input,
+                    carry_cached,
+                    minimum,
+                    resolved,
+                )? + scenario_output_cost_resolved(&prompt.model, prompt.input, output, resolved)?,
+                scenario_input_cost_resolved(
                     &prompt.model,
                     traditional_input,
                     traditional_cached,
                     minimum,
-                )? + crate::savings::scenario_output_cost(
+                    resolved,
+                )? + scenario_output_cost_resolved(
                     &prompt.model,
                     traditional_input,
                     output,
+                    resolved,
                 )?,
             ))
         });
@@ -407,13 +460,14 @@ impl Trajectory {
             && total > self.scenario.context_window - self.scenario.reserve;
         let discarded = total.saturating_sub(self.scenario.keep_recent);
         let summary_cost = if summarize {
-            estimated_cost_usd(
+            modeled_cost(
                 &prompt.model,
                 &Usage {
                     input_tokens: discarded,
                     output_tokens: self.scenario.summary,
                     ..Usage::default()
                 },
+                resolved,
             )
         } else {
             Some(0.0)
@@ -448,8 +502,56 @@ impl Trajectory {
     }
 }
 
+#[cfg(test)]
 fn scenario_input_cost(model: &str, input: u64, cached: u64, minimum: Option<u64>) -> Option<f64> {
-    crate::savings::scenario_input_cost(model, input, cached, minimum, estimated_cost_usd)
+    scenario_input_cost_resolved(model, input, cached, minimum, None)
+}
+
+fn scenario_input_cost_resolved(
+    model: &str,
+    input: u64,
+    cached: u64,
+    minimum: Option<u64>,
+    resolved: Option<&ResolvedModel>,
+) -> Option<f64> {
+    crate::savings::scenario_input_cost(model, input, cached, minimum, |model, usage| {
+        modeled_cost(model, usage, resolved)
+    })
+}
+
+fn scenario_output_cost_resolved(
+    model: &str,
+    input: u64,
+    output: u64,
+    resolved: Option<&ResolvedModel>,
+) -> Option<f64> {
+    match resolved {
+        Some(r) if r.model == model => r
+            .rates_for_input(input as f64)
+            .map(|rates| output as f64 * rates.output),
+        Some(_) => None,
+        None => crate::savings::scenario_output_cost(model, input, output),
+    }
+}
+
+fn modeled_cost(model: &str, usage: &Usage, resolved: Option<&ResolvedModel>) -> Option<f64> {
+    let Some(resolved) = resolved else {
+        return estimated_cost_usd(model, usage);
+    };
+    if resolved.model != model {
+        return None;
+    }
+    let rates = resolved.rates_for_input(usage.input_tokens as f64)?;
+    let cached = usage.cached_input_tokens.min(usage.input_tokens);
+    let written = usage
+        .cache_write_input_tokens
+        .min(usage.input_tokens - cached);
+    Some(
+        (usage.input_tokens - cached - written) as f64 * rates.input
+            + cached as f64 * rates.cached
+            + written as f64 * rates.write
+            + usage.output_tokens as f64 * rates.output,
+    )
 }
 
 fn has_native_modalities(value: &Value) -> bool {
@@ -636,6 +738,23 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(after).unwrap()["excluded_unpriced_calls"],
                 1
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_reviewer_expense_roundtrips_without_repricing() {
+        // This exact paid total exposed a one-ULP drift at a real restart.
+        // Exercise the checkpoint codec, not only a Value-to-Value conversion.
+        for expense in [0.00011470000000000001_f64, 0.0001147, 0.0] {
+            let mut trajectory = Trajectory::default();
+            trajectory.result.reviewer_cost = expense;
+            let bytes = serde_json::to_vec(&trajectory).unwrap();
+            let resumed: Trajectory = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                resumed.result.reviewer_cost.to_bits(),
+                expense.to_bits(),
+                "RECEIPT_CODEC_RED: restarting must not change already settled expense"
             );
         }
     }

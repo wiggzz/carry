@@ -382,10 +382,20 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
                         req = urllib.request.Request(endpoint + '/v1/responses', data=wire, headers=headers)
                         with urllib.request.urlopen(req, timeout=10) as response:
                             assert json.load(response)['status'] == 'completed'
-                        if case == 'missing-usage':
+                        # This cache/restart fixture sequences actual completed
+                        # reviews. A consumed primary is not a review receipt:
+                        # settle only in the driver, never in production admission.
+                        deadline = time.monotonic() + 30
+                        while True:
                             checkpoints = list((directory / 'state').glob('*.json'))
                             assert len(checkpoints) == 1
                             snapshot = json.loads(checkpoints[0].read_text())
+                            if not snapshot['background_review_pending']:
+                                break
+                            if time.monotonic() > deadline:
+                                raise AssertionError('reviewer cache receipt did not settle')
+                            time.sleep(.01)
+                        if case == 'missing-usage':
                             credit_snapshots.append({'turn': turn,
                                 'read_credit': sum(e['read_estimated_tokens'] for e in snapshot.get('reviewer_cache', []))})
                 finally:

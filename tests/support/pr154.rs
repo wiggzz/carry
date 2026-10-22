@@ -60,6 +60,7 @@ async fn default_failure_journal(mode: &str) {
                 "review failure must not fail primary"
             );
             response.bytes().await.unwrap();
+            settled(state.path()).await;
         }
     }
     server.abort();
