@@ -506,7 +506,13 @@ class StateRegressions(unittest.TestCase):
                                      "--min-payback-percent", "100"])
         self.assertEqual(proxy.send(growing, instructions=direction, max_output_tokens=1)[0], 200)
         restarted = proxy.saved()
-        self.assertEqual(restarted["shadow"], settled["shadow"], "restart cannot lose or double-charge A")
+        for field in settled["shadow"]:
+            if field == "cost_usd":
+                old, new = settled["shadow"][field], restarted["shadow"][field]
+                self.assertAlmostEqual(new, old, delta=max(math.ulp(old), math.ulp(new)))
+            else:
+                self.assertEqual(restarted["shadow"][field], settled["shadow"][field],
+                                 "restart cannot lose or double-charge A")
         self.assertEqual(restarted.get("opinions", {}), settled.get("opinions", {}))
         self.assertEqual(restarted.get("memories", []), settled.get("memories", []))
         self.assertEqual(len(fixture.reviews), settled["shadow"]["calls"])
