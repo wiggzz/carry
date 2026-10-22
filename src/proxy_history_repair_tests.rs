@@ -366,7 +366,9 @@ async fn history_rejected_reservations_never_censor_undispatched_primary() {
         let id = identity(&headers).unwrap();
         let body = Bytes::from(
             serde_json::to_vec(&json!({"model":"gpt-6-luna",
-            "input":[{"role":"user","content":"valid but cannot publish"}]}))
+            "input":[{"role":"user","content":"valid but cannot publish"},
+                {"role":"assistant","content":"bounded history evidence ".repeat(100)},
+                {"role":"user","content":"continue"}]}))
             .unwrap(),
         );
         // Two requests in one process, then the same request after restart.
