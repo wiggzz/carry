@@ -421,14 +421,14 @@ pub(super) fn resolve(
     let keys = path(namespace, input);
     // Empty observations are published at the namespace root. They still have
     // a real selected owner: do not mistake a retained empty tip for a miss.
-    if keys.is_empty() {
-        if let Some(reference) = index.tips.get(namespace) {
-            return Ok((
-                reference.session.clone(),
-                None,
-                pin(service, &reference.session)?,
-            ));
-        }
+    if keys.is_empty()
+        && let Some(reference) = index.tips.get(namespace)
+    {
+        return Ok((
+            reference.session.clone(),
+            None,
+            pin(service, &reference.session)?,
+        ));
     }
     for key in keys.iter().rev() {
         if let Some(r) = index.tips.get(key) {
