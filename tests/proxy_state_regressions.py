@@ -459,8 +459,10 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(any(m["text"] == "CAPACITY_HELD_A_FACT"
                              for m in settled.get("memories", [])), accepted,
                          "capacity yield must not admit old-direction A memory")
-        self.assertEqual(settled.get("opinions", {}).get("2") == "drop", accepted,
-                         "capacity yield must not admit old-direction A drop permission")
+        self.assertEqual(any(item["id"] == 2 and item["removed"] for item in settled["history"]),
+                         accepted, "only compatible A drop advice may retire its source")
+        self.assertNotIn("2", settled.get("opinions", {}),
+                         "retired-source opinions are pruned; rejected advice grants none")
         self.assertEqual(merges[0]["event"], "background_review_merged" if accepted
                          else "background_review_discarded")
         self.assertEqual(result[0][0], 200 if accepted else 413)
@@ -481,6 +483,10 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(restarted.get("memories", []), settled.get("memories", []))
         self.assertEqual(len(fixture.reviews), settled["shadow"]["calls"])
         self.evidence["restarted"] = restarted
+        print("CAPACITY_EPOCH_RESTART " + json.dumps({"change": change,
+              "shadow": restarted["shadow"], "review_calls": len(fixture.reviews),
+              "memory_accepted": any(m["text"] == "CAPACITY_HELD_A_FACT"
+                                     for m in restarted.get("memories", []))}), flush=True)
 
     def test_capacity_wait_unchanged_direction_accepts_held_advice(self):
         self.capacity_wait_direction("unchanged")
