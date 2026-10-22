@@ -452,6 +452,9 @@ async fn pr154_selected_main_audit_rollback_and_reviewer_only_use_real_forwardin
                 source_sha256: reviewer_serialized_identity(&sources).1,
                 input,
             });
+            // This is a current committed replay under pressure, not a legacy
+            // checkpoint whose missing prefix identity requires migration.
+            session.reviewer_controls = Some(review_control_state(&session));
             service.config.classifier_max_input_tokens = 5000;
             service.config.reviewer_context_override = Some(5000);
         } else {

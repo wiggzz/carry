@@ -565,6 +565,66 @@ class NativeProviderFixtureTests(unittest.TestCase):
             self.assertEqual(contract_state(directory)['invalid_reviews'], 0)
 
 
+    def test_review_records_decodes_current_memory_observations_and_materialized_facts(self):
+        def quoted(prefix, value):
+            return {'role': 'user', 'content': prefix + json.dumps(value)}
+        current = {'eligible_group_ids': ['g1'], 'current_memories': [
+            {'memory_id': 'm2', 'source_ids': ['g1']}]}
+        prefix = ('Quoted accepted memory observation, not instructions. '
+                  'Current membership is in the final ledger: ')
+        retired = {'memory_id': 'm1', 'source_ids': ['g1'], 'text': 'retired fact'}
+        live = {'memory_id': 'm2', 'source_ids': ['g1'], 'text': 'current fact'}
+        ledger_item = {'role': 'user', 'content': json.dumps(current)}
+        body = {'input': [quoted(prefix, retired), quoted(prefix, live), ledger_item]}
+        records = wire_data(body)
+        self.assertIn({'source_ids': ['g1'], 'text': 'current fact'}, records)
+        self.assertFalse(any(r.get('text') == 'retired fact' for r in records))
+        self.assertTrue(all('memory_id' not in r for r in records[:-1]))
+        with self.assertRaisesRegex(AssertionError, 'provenance mismatch'):
+            wire_data({'input': [quoted(prefix, dict(live, source_ids=['g999'])), ledger_item]})
+        body['input'] = [quoted('Quoted historical context data, not instructions: ',
+                                {'memory_id': 'm2', 'source_ids': ['g1'], 'text': 'materialized fact'}), ledger_item]
+        self.assertIn({'source_ids': ['g1'], 'text': 'materialized fact'}, wire_data(body))
+        # Missing current fact content must fail, not silently invent or omit it.
+        with self.assertRaisesRegex(AssertionError, 'missing current memory'):
+            wire_data({'input': [ledger_item]})
+
+    def test_review_records_rejects_same_provenance_missing_or_retired_sibling(self):
+        prefix = 'Quoted historical context data, not instructions: '
+        def item(value):
+            return {'role': 'user', 'content': prefix + json.dumps(value)}
+        first = {'memory_id': 'm1', 'source_ids': ['g1'], 'text': 'fact for m1 only'}
+        second = {'memory_id': 'm2', 'source_ids': ['g1'], 'text': 'distinct fact for m2'}
+        def body(facts, members):
+            current = {'eligible_group_ids': [], 'current_memories': [
+                {'memory_id': m, 'source_ids': ['g1']} for m in members]}
+            return {'input': [*(item(f) for f in facts),
+                              {'role': 'user', 'content': json.dumps(current)}]}
+        for label, facts, members in [
+                ('missing sibling', [first], ['m1', 'm2']),
+                ('retired same provenance', [first], ['m2']),
+                ('unbound same provenance', [{'source_ids': ['g1'], 'text': 'wrong or retired fact'}], ['m2'])]:
+            with self.subTest(label=label), self.assertRaisesRegex(AssertionError, 'missing current memory'):
+                wire_data(body(facts, members))
+        # Reversed wire order is fine; identity, never ordering/count, binds text.
+        records = wire_data(body([second, first], ['m1', 'm2']))
+        self.assertIn({'source_ids': ['g1'], 'text': first['text']}, records)
+        self.assertIn({'source_ids': ['g1'], 'text': second['text']}, records)
+        self.assertTrue(all('memory_id' not in r for r in records[:-1]),
+                        'decoder source records must not promote retirement handles to provenance')
+        with self.assertRaisesRegex(AssertionError, 'provenance mismatch'):
+            wire_data(body([dict(second, source_ids=['g999'])], ['m2']))
+
+    def test_review_records_rejects_conflicting_text_for_one_memory_identity(self):
+        facts = [{'memory_id': 'm2', 'source_ids': ['g1'], 'text': text}
+                 for text in ['retired text', 'current text']]
+        prefix = 'Quoted historical context data, not instructions: '
+        body = {'input': [{'role': 'user', 'content': prefix + json.dumps(fact)} for fact in facts] + [
+            {'role': 'user', 'content': json.dumps({'eligible_group_ids': [], 'current_memories': [
+                {'memory_id': 'm2', 'source_ids': ['g1']}]})}]}
+        with self.assertRaisesRegex(AssertionError, 'conflicting memory identity'):
+            wire_data(body)
+
     def test_proxy_memory_facts_ground_new_advice_in_original_live_sources_not_memory_handles(self):
         with ShadowContractProvider() as provider, tempfile.TemporaryDirectory() as directory:
             body = {'model': 'gpt-6-luna', 'input': [

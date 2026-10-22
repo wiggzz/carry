@@ -65,6 +65,7 @@ class Fixture:
         self.reviewer = reviewer
         self.codex = codex
         self.requests = []
+        self.wire_requests = []
         self.errors = []
         self.lock = threading.Lock()
         fixture = self
@@ -80,10 +81,12 @@ class Fixture:
                     length = int(self.headers["Content-Length"])
                     if length > 65536:
                         raise AssertionError("fixture only accepts tiny request bodies")
-                    body = json.loads(self.rfile.read(length))
+                    raw = self.rfile.read(length)
+                    body = json.loads(raw)
                     review = body.get("prompt_cache_key") != "transport-main"
                     with fixture.lock:
                         fixture.requests.append((review, body))
+                        fixture.wire_requests.append((review, raw))
                     value = completed(encoded(ADVICE).decode() if review else "fixture answer")
                     if not fixture.codex:
                         data = encoded(value)
@@ -471,6 +474,35 @@ class TransportTests(unittest.TestCase):
                           metrics["primary"]["unavailable_cost_calls"]), (1, 1, 0), metrics)
         self.assertEqual((metrics["primary"]["input_tokens"], metrics["primary"]["output_tokens"]),
                          (100, 10), "conversion must not double-observe or double-commit usage")
+
+    def test_codex_reviewer_wire_diagnostics_use_final_transformed_body(self):
+        fixture, proxy = self.start(replay=True)
+        status, response = proxy.send(replay_body())
+        self.assertEqual(status, 200, response)
+        with fixture.lock:
+            raw = [body for review, body in fixture.wire_requests if review]
+        self.assertEqual(len(raw), 1)
+        body = json.loads(raw[0])
+        self.assertTrue(body["stream"], "fixture must observe the Codex transformation")
+        self.assertNotIn("max_output_tokens", body)
+        journal = b"".join(p.read_bytes() for p in
+            (Path(proxy.temp.name) / "state" / "diagnostics").glob("*.jsonl"))
+        events = [json.loads(line) for line in journal.splitlines()]
+        requests = [e for e in events if e["event"] == "review_wire"]
+        self.assertEqual(len(requests), 1, "log the final Codex transport, not a pre-transform plan")
+        data = requests[0]["data"]
+        self.assertEqual(data["wire_bytes"], len(raw[0]))
+        self.assertEqual(data["item_count"], len(body["input"]))
+        self.assertTrue(data["coverage_complete"])
+        self.assertEqual([item["bytes"] for item in data["items"]],
+                         [len(encoded(item)) for item in body["input"]])
+        for secret in (b"fixture tool result", b"fixture-never-refresh", b"fixture-account",
+                       fixture.endpoint.encode()):
+            self.assertNotIn(secret, journal)
+        receipts = [e for e in events if e["event"] == "usage" and
+                    e.get("review_attempt_id") == requests[0]["review_attempt_id"]]
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]["data"]["native_usage"]["input_tokens"], 100)
 
     def test_codex_reviewer_accepts_many_small_frames(self):
         fixture, proxy = self.start(reviewer="many", replay=True)
