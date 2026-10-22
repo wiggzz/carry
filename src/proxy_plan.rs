@@ -545,7 +545,12 @@ mod projection_controls {
             super::super::planner_work::start();
             let schedule = review_calls(&config, &session, &body, false, false).unwrap();
             let counts = super::super::planner_work::finish();
-            assert_eq!(schedule.len(), 2, "exposure and cadence must still advance");
+            assert_eq!(
+                schedule.calls.len(),
+                2,
+                "exposure and cadence must still advance"
+            );
+            assert!(!schedule.immediate, "later forecast calls are not due now");
             assert_eq!(counts["admission_primary_projections"], expected);
 
             let mut pending = session.clone();
