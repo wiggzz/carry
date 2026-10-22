@@ -41,6 +41,9 @@ fn state_regression(selector: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    if selector.starts_with("capacity_wait_") {
+        std::io::Write::write_all(&mut std::io::stdout(), &output.stdout).unwrap();
+    }
     if selector.starts_with("small_") {
         let path = evidence.path().join(format!("test_{selector}.json"));
         let captured: serde_json::Value =
@@ -58,6 +61,41 @@ fn state_regression(selector: &str) {
             );
         }
     }
+}
+
+#[test]
+fn reviewer_control_observations_once_and_restart() {
+    state_regression("reviewer_control_observations_once_and_restart");
+}
+
+#[test]
+fn direction_changes_reject_held_advice_and_preserve_paid_receipt() {
+    state_regression("direction_changes_reject_held_advice_and_preserve_paid_receipt");
+}
+
+#[test]
+fn capacity_wait_unchanged_direction_accepts_held_advice() {
+    state_regression("capacity_wait_unchanged_direction_accepts_held_advice");
+}
+
+#[test]
+fn capacity_wait_changed_direction_rejects_held_advice() {
+    state_regression("capacity_wait_changed_direction_rejects_held_advice");
+}
+
+#[test]
+fn capacity_wait_cleared_direction_rejects_held_advice() {
+    state_regression("capacity_wait_cleared_direction_rejects_held_advice");
+}
+
+#[test]
+fn capacity_wait_clear_restore_rejects_held_advice() {
+    state_regression("capacity_wait_clear_restore_rejects_held_advice");
+}
+
+#[test]
+fn reviewer_wire_fingerprints_are_content_free_and_join_usage() {
+    state_regression("reviewer_wire_fingerprints_are_content_free_and_join_usage");
 }
 
 #[test]

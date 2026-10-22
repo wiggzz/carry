@@ -9,6 +9,7 @@ import contextlib
 import http.client
 import http.server
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -268,6 +269,306 @@ class StateRegressions(unittest.TestCase):
                 self.assertIsNone(estimate[field], message or field)
         if not available:
             self.assertIsNone(estimate["savings_percent"], message)
+
+    def test_reviewer_control_observations_once_and_restart(self):
+        fixture = self.fixture(lambda _body, _n: (200, completed()))
+        options = ["--min-payback-percent", "100"]
+        proxy = self.proxy(fixture, options)
+        history = [{"role": "user", "content": "fixture goal"},
+                   {"role": "assistant", "content": "source once " + "s" * 8192},
+                   {"role": "user", "content": "continue"}]
+        instruction = "UNIQUE_DIRECTION_" + "d" * 32768
+        for n in range(5):
+            if n == 3:
+                proxy.close()
+                proxy = self.proxy(fixture, options)
+            self.assertEqual(proxy.send(history, instructions=instruction)[0], 200)
+        self.assertEqual(len(fixture.reviews), 4)
+        body = fixture.reviews[-1]
+        for captured in fixture.reviews:
+            direction = next(i for i, item in enumerate(captured["input"])
+                             if b"UNIQUE_DIRECTION_" in wire(item))
+            source = next(i for i, item in enumerate(captured["input"])
+                          if b"fixture goal" in wire(item))
+            self.assertLess(direction, source,
+                            "quoted primary direction must precede conversation sources")
+        self.assertEqual(wire(body).count(b"UNIQUE_DIRECTION_"), 1,
+                         "unchanged primary instructions must be ingested once, not per ledger")
+        for before, after in zip(fixture.reviews, fixture.reviews[1:]):
+            self.assertEqual(after["input"][:len(before["input"])], before["input"],
+                             "dedup must not replace historical ledgers in place")
+        self.assertEqual(proxy.saved()["reviewer_compactions"], 0)
+        self.assertEqual(proxy.send(history, instructions="NEW_DIRECTION")[0], 200)
+        changed = fixture.reviews[-1]
+        self.assertEqual(wire(changed).count(b"NEW_DIRECTION"), 1)
+        self.assertNotIn(b"UNIQUE_DIRECTION_", wire(changed))
+        self.assertEqual(proxy.saved()["reviewer_compactions"], 1)
+        self.assertEqual(proxy.send(history, instructions="")[0], 200)
+        cleared = fixture.reviews[-1]
+        self.assertNotIn(b"NEW_DIRECTION", wire(cleared))
+        self.assertNotIn(b"UNIQUE_DIRECTION_", wire(cleared))
+        self.assertNotIn("primary_instruction_version", ledger(cleared))
+        self.assertEqual(proxy.saved()["reviewer_compactions"], 2)
+        proxy.close()
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(fixture.reviews[-1]["input"][:len(cleared["input"])], cleared["input"])
+        self.assertEqual(proxy.saved()["reviewer_compactions"], 2)
+        self.evidence.update(reviews=fixture.reviews, checkpoint=proxy.saved())
+
+    def test_direction_changes_reject_held_advice_and_preserve_paid_receipt(self):
+        for change in ("unchanged", "changed", "clear_then_restore"):
+            with self.subTest(change=change):
+                def review(_body, _n):
+                    fixture.held.set()
+                    if not fixture.release.wait(8):
+                        raise AssertionError("held reviewer was not released")
+                    return 200, advice_response({"protected": ["g2"], "removable": [],
+                        "memories": [{"text": "HELD_DIRECTION_FACT", "source_ids": ["g2"]}]})
+
+                fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
+                options = ["--background-reviews=true", "--min-payback-percent", "100"]
+                proxy = Proxy(self.state / change, fixture, options)
+                self.addCleanup(proxy.close)
+                seed = [{"role": "user", "content": "goal"},
+                        {"role": "assistant", "content": "eligible evidence"},
+                        {"role": "user", "content": "current"}]
+                self.assertEqual(proxy.send(seed, instructions="ORIGINAL_DIRECTION")[0], 200)
+                self.assertEqual(proxy.send(seed, instructions="ORIGINAL_DIRECTION")[0], 200)
+                self.assertTrue(fixture.held.wait(3))
+                if change == "changed":
+                    self.assertEqual(proxy.send(seed, instructions="CHANGED_DIRECTION")[0], 200)
+                elif change == "clear_then_restore":
+                    self.assertEqual(proxy.send(seed, instructions="")[0], 200)
+                    self.assertEqual(proxy.send(seed, instructions="ORIGINAL_DIRECTION")[0], 200)
+                fixture.release.set()
+                saved = self.wait_saved(proxy, lambda s: not s["background_review_pending"])
+                self.assertEqual(saved["shadow"]["calls"], 1,
+                                 "even stale advice must settle its actual paid receipt once")
+                self.assertEqual(len(fixture.reviews), 1)
+                accepted = change == "unchanged"
+                self.assertEqual(any(m["text"] == "HELD_DIRECTION_FACT" for m in saved.get("memories", [])), accepted)
+                self.assertEqual(saved.get("opinions", {}).get("2") == "keep", accepted)
+                proxy.close()
+                proxy = Proxy(self.state / change, fixture, ["--review-every-requests", "100"])
+                self.addCleanup(proxy.close)
+                direction = "CHANGED_DIRECTION" if change == "changed" else "ORIGINAL_DIRECTION"
+                self.assertEqual(proxy.send(seed, instructions=direction)[0], 200)
+                restarted = proxy.saved()
+                self.assertEqual(restarted["shadow"]["calls"], 1)
+                self.assertEqual(any(m["text"] == "HELD_DIRECTION_FACT" for m in restarted.get("memories", [])), accepted)
+                self.evidence[change] = {"settled": saved, "restarted": restarted, "reviews": fixture.reviews}
+                proxy.close()
+
+    def capacity_wait_direction(self, change):
+        def review(body, n):
+            if n == 1:
+                self.assertIn("g2", ledger(body)["eligible_group_ids"])
+                fixture.held.set()
+                if not fixture.release.wait(8):
+                    raise AssertionError("capacity waiter did not release the held A reviewer")
+                return 200, advice_response({"protected": [], "removable": ["g2"],
+                    "memories": [{"text": "CAPACITY_HELD_A_FACT", "source_ids": ["g2"]}]})
+            # A rejected old review may need a fresh blocking capacity review.
+            # That actual B review grants no removal or memory authority.
+            return 200, advice_response({"protected": [], "removable": [], "memories": []})
+
+        fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
+        options = ["--background-reviews=true", "--primary-context-tokens", "4096",
+                   "--min-payback-percent", "100", "--payoff-requests", "1"]
+        proxy = self.proxy(fixture, options)
+        seed = [{"role": "user", "content": "goal"},
+                {"role": "assistant", "content": "old evidence " * 1500},
+                {"role": "user", "content": "current"}]
+        fields = {"instructions": "ORIGINAL_DIRECTION", "max_output_tokens": 1}
+        self.assertEqual(proxy.send(seed, **fields)[0], 200)
+        self.assertEqual(proxy.send(seed, **fields)[0], 200)
+        self.assertTrue(fixture.held.wait(3), "an actual A-direction reviewer must be in flight")
+        before = proxy.saved()
+        self.assertTrue(before["background_review_pending"])
+        self.assertNotIn("2", before.get("opinions", {}))
+        self.assertEqual(before.get("memories", []), [])
+        growing = seed + [{"role": "user", "content": "new material " * 1500}]
+        direction = "ORIGINAL_DIRECTION" if change == "unchanged" else (
+            "CHANGED_DIRECTION" if change == "changed" else "")
+        result, errors = [], []
+
+        def send_pressure():
+            try:
+                result.append(proxy.send(growing, instructions=direction, max_output_tokens=1))
+            except Exception as error:
+                errors.append(repr(error))
+
+        waiter = threading.Thread(target=send_pressure, daemon=True)
+        restorer, restore_results = None, []
+        waiter.start()
+        try:
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline:
+                entries = [json.loads(line) for path in (self.state / "diagnostics").glob("*.jsonl")
+                           for line in path.read_bytes().splitlines()]
+                if any(e["event"] == "review_waiting" and
+                       e["data"].get("reason") == "background_capacity" for e in entries):
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("new input must reach the real forced-capacity background wait")
+            self.assertTrue(waiter.is_alive(), "pressure request must still be waiting for held review")
+            self.assertEqual(len(fixture.primaries), 2, "no capacity-overflow input may reach upstream")
+            at_wait = proxy.saved()
+            if change == "clear_then_restore":
+                # The published input is now growing. Restore A at that same
+                # frontier; both over-capacity requests wait for the held review.
+                restorer = threading.Thread(target=lambda: restore_results.append(
+                    proxy.send(growing, **fields)), daemon=True)
+                restorer.start()
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    events = [json.loads(line) for path in (self.state / "diagnostics").glob("*.jsonl")
+                              for line in path.read_bytes().splitlines()]
+                    if sum(e["event"] == "review_waiting" for e in events) >= 2:
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("restored direction must reach its own capacity wait before release")
+            before_release = proxy.saved()
+        finally:
+            fixture.release.set()
+            waiter.join(timeout=20)
+            if restorer is not None:
+                restorer.join(timeout=20)
+        if restorer is not None:
+            self.assertFalse(restorer.is_alive())
+            self.assertEqual(len(restore_results), 1)
+            self.assertEqual(restore_results[0][0], 413)
+        self.assertFalse(waiter.is_alive(), "capacity retry must finish after reviewer settlement")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(result), 1)
+        settled = self.wait_saved(proxy, lambda s: not s["background_review_pending"])
+        entries = [json.loads(line) for path in (self.state / "diagnostics").glob("*.jsonl")
+                   for line in path.read_bytes().splitlines()]
+        merges = [e for e in entries if e["event"] in (
+            "background_review_merged", "background_review_discarded")]
+        self.evidence.update(change=change, before=before, at_wait=at_wait,
+                             before_release=before_release, settled=settled, result=result,
+                             reviews=fixture.reviews, primaries=fixture.primaries, events=entries)
+        print("CAPACITY_EPOCH_SETTLED " + json.dumps({
+            "change": change, "wait_seen": True, "status": result[0][0],
+            "before_epoch": before["review_epoch"], "wait_epoch": at_wait["review_epoch"],
+            "release_epoch": before_release["review_epoch"],
+            "settled_epoch": settled["review_epoch"],
+            "merges": [{"event": e["event"], "data": e["data"]} for e in merges],
+            "shadow": settled["shadow"], "review_calls": len(fixture.reviews),
+            "primary_calls": len(fixture.primaries),
+            "memory_accepted": any(m["text"] == "CAPACITY_HELD_A_FACT"
+                                   for m in settled.get("memories", [])),
+            "drop_accepted": settled.get("opinions", {}).get("2") == "drop",
+            "removed_ids": [item["id"] for item in settled["history"] if item["removed"]],
+        }), flush=True)
+        self.assertEqual(len(merges), 1, "held completed review must have exactly one settlement")
+        self.assertEqual(merges[0]["data"]["receipt_count"], 1)
+        self.assertEqual(settled["shadow"]["calls"], len(fixture.reviews),
+                         "each completed reviewer, including rejected A, must be charged once")
+        self.assertEqual(settled["shadow"]["input_tokens"], 100 * len(fixture.reviews))
+        accepted = change == "unchanged"
+        # Assert authority before the later status: RED must expose actual stale
+        # accepted advice, not just an early capacity/fixture error.
+        self.assertEqual(any(m["text"] == "CAPACITY_HELD_A_FACT"
+                             for m in settled.get("memories", [])), accepted,
+                         "capacity yield must not admit old-direction A memory")
+        self.assertEqual(any(item["id"] == 2 and item["removed"] for item in settled["history"]),
+                         accepted, "only compatible A drop advice may retire its source")
+        self.assertNotIn("2", settled.get("opinions", {}),
+                         "retired-source opinions are pruned; rejected advice grants none")
+        self.assertEqual(merges[0]["event"], "background_review_merged" if accepted
+                         else "background_review_discarded")
+        self.assertEqual(result[0][0], 200 if accepted else 413)
+        if accepted:
+            self.assertIn(b"CAPACITY_HELD_A_FACT", wire(fixture.primaries[-1]))
+            self.assertNotIn(b"old evidence", wire(fixture.primaries[-1]))
+        else:
+            self.assertFalse(any(item["removed"] for item in settled["history"]))
+            self.assertNotIn(b"CAPACITY_HELD_A_FACT", wire(fixture.primaries))
+        proxy.close()
+        proxy = self.proxy(fixture, ["--review-every-requests", "100",
+                                     "--primary-context-tokens", "16384",
+                                     "--min-payback-percent", "100"])
+        self.assertEqual(proxy.send(growing, instructions=direction, max_output_tokens=1)[0], 200)
+        restarted = proxy.saved()
+        for field in settled["shadow"]:
+            if field == "cost_usd":
+                old, new = settled["shadow"][field], restarted["shadow"][field]
+                self.assertAlmostEqual(new, old, delta=max(math.ulp(old), math.ulp(new)))
+            else:
+                self.assertEqual(restarted["shadow"][field], settled["shadow"][field],
+                                 "restart cannot lose or double-charge A")
+        self.assertEqual(restarted.get("opinions", {}), settled.get("opinions", {}))
+        self.assertEqual(restarted.get("memories", []), settled.get("memories", []))
+        self.assertEqual(len(fixture.reviews), settled["shadow"]["calls"])
+        self.evidence["restarted"] = restarted
+        print("CAPACITY_EPOCH_RESTART " + json.dumps({"change": change,
+              "shadow": restarted["shadow"], "review_calls": len(fixture.reviews),
+              "memory_accepted": any(m["text"] == "CAPACITY_HELD_A_FACT"
+                                     for m in restarted.get("memories", []))}), flush=True)
+
+    def test_capacity_wait_unchanged_direction_accepts_held_advice(self):
+        self.capacity_wait_direction("unchanged")
+
+    def test_capacity_wait_changed_direction_rejects_held_advice(self):
+        self.capacity_wait_direction("changed")
+
+    def test_capacity_wait_cleared_direction_rejects_held_advice(self):
+        self.capacity_wait_direction("cleared")
+
+    def test_capacity_wait_clear_restore_rejects_held_advice(self):
+        self.capacity_wait_direction("clear_then_restore")
+
+    def test_reviewer_wire_fingerprints_are_content_free_and_join_usage(self):
+        def review(_body, n):
+            value = advice_response({"protected": [], "removable": [], "memories": []})
+            if n == 2:
+                del value["usage"]["input_tokens_details"]
+            if n == 3:
+                del value["usage"]
+            return 200, value
+
+        fixture = self.fixture(lambda _body, _n: (200, completed()), review)
+        proxy = self.proxy(fixture, ["--min-payback-percent", "100"])
+        history = [{"role": "user", "content": "PRIVATE_FIXTURE_GOAL"},
+                   {"role": "assistant", "content": "PRIVATE_TOOL_BYTES" + "x" * 8192},
+                   {"role": "user", "content": "continue"}]
+        for _ in range(4):
+            self.assertEqual(proxy.send(history, instructions="PRIVATE_INSTRUCTION")[0], 200)
+        raw = b"".join(p.read_bytes() for p in (self.state / "diagnostics").glob("*.jsonl"))
+        entries = [json.loads(line) for line in raw.splitlines()]
+        requests = [e for e in entries if e["event"] == "review_wire"]
+        self.assertEqual(len(requests), 3, "every final transport request needs bounded item-order diagnostics")
+        for sentinel in (b"PRIVATE_FIXTURE_GOAL", b"PRIVATE_TOOL_BYTES", b"PRIVATE_INSTRUCTION",
+                         b"fixture-primary", b"fixture-shadow", fixture.url.encode()):
+            self.assertNotIn(sentinel, raw)
+        for n, (entry, body) in enumerate(zip(requests, fixture.reviews), 1):
+            data = entry["data"]
+            self.assertEqual(data["format_version"], 1)
+            self.assertEqual(data["item_count"], len(body["input"]))
+            self.assertTrue(data["coverage_complete"])
+            self.assertEqual(len(data["items"]), len(body["input"]))
+            self.assertLessEqual(len(wire(entry)), 16384)
+            receipts = [e for e in entries if e["event"] == "usage" and
+                        e.get("review_attempt_id") == entry["review_attempt_id"]]
+            self.assertEqual(len(receipts), 1)
+            usage = receipts[0]["data"]["native_usage"]
+            if n == 3:
+                self.assertEqual(usage, {}, "absent native usage must remain unknown")
+            else:
+                self.assertEqual(usage["input_tokens"], 100)
+                if n == 2:
+                    self.assertNotIn("input_tokens_details", usage,
+                                     "unknown cache receipt must not become a fabricated zero")
+                else:
+                    self.assertEqual(usage["input_tokens_details"]["cached_tokens"], 0)
+        for entry in requests[1:]:
+            self.assertTrue(entry["data"]["prior_prefix_equal"])
+            self.assertTrue(entry["data"]["settings_equal"])
 
     def test_dashboard_backend_authoritative_savings(self):
         fixture = self.fixture(lambda _body, _n: (200, completed()))
@@ -715,7 +1016,12 @@ class StateRegressions(unittest.TestCase):
                 self.assertEqual(estimate["coverage"]["reviewer_responses"], 1)
                 self.assertEqual(estimate["coverage"]["primary_responses"], 2)
                 self.assertGreater(estimate["reviewer_cost"], 0)
-                self.assertEqual(estimate["reviewer_cost"], saved["cost_trajectory"]["result"]["reviewer_cost"])
+                # Rust/Python JSON roundtrip can differ by one IEEE-754 ULP;
+                # permit only that representation error, not a money tolerance.
+                saved_cost = saved["cost_trajectory"]["result"]["reviewer_cost"]
+                self.assertAlmostEqual(estimate["reviewer_cost"], saved_cost,
+                                       delta=max(math.ulp(estimate["reviewer_cost"]),
+                                                 math.ulp(saved_cost)))
                 self.assert_estimate_available(estimate, True, "successful reviewer spend must survive a failed primary")
 
     def test_restart_orphan_reviewer_is_untracked_not_proven_failed(self):
