@@ -372,20 +372,30 @@ async fn lease_r1_real_held_extra_review_next_primary_crosses_only_target_budget
         request_id: "forecast".into(),
         targets,
     });
-    service.config.classifier_max_input_tokens =
-        reviewer_required_tokens(&service.config, &review_body(&service.config, &target)).ceil()
-            as u32;
     let mut following = body.clone();
-    following["instructions"] = json!("following task instruction ".repeat(3));
+    // Grow native input without changing the stable instruction prefix: a
+    // direction change now intentionally rebuilds replay and discards old advice.
+    following["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"continue"}));
     let mut next = target.clone();
-    next.review_context = cache_base(&following);
+    next.ingest(following["input"].as_array().unwrap()).unwrap();
+    let mut untargeted = next.clone();
+    untargeted.keep_leases.as_mut().unwrap().pending = None;
+    service.config.classifier_max_input_tokens =
+        reviewer_required_tokens(&service.config, &review_body(&service.config, &target))
+            .max(reviewer_required_tokens(
+                &service.config,
+                &review_body(&service.config, &untargeted),
+            ))
+            .ceil() as u32;
     assert!(!review_fits(
         &service.config,
         &review_body(&service.config, &next)
     ));
-    next.keep_leases.as_mut().unwrap().pending = None;
     assert!(
-        review_fits(&service.config, &review_body(&service.config, &next)),
+        review_fits(&service.config, &review_body(&service.config, &untargeted)),
         "only the in-flight target suffix crosses the reviewer bound"
     );
     assert!(primary_fits(&service.config, &following));

@@ -370,6 +370,8 @@ fn action_identity_reviewer_only_preserves_primary_and_keep_has_no_fake_primary_
         source_sha256: reviewer_serialized_identity(&Vec::<Value>::new()).1,
         input: vec![json!({"role":"assistant","content":"disposable review replay ".repeat(2000)})],
     });
+    // Stage a current replay, not a legacy checkpoint requiring migration.
+    session.reviewer_controls = Some(review_control_state(&session));
     let (selected, report) = plan(&config, &session, &body);
     let candidate = selected.expect("real reviewer-only cleanup should be profitable");
     assert_eq!(candidate.render_primary(), session.render_primary());
