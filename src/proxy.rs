@@ -220,6 +220,9 @@ struct Service {
     auth_token: Option<String>,
     locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     background_reviews: Arc<Mutex<HashSet<String>>>,
+    // Advice authority belongs to the live worker, independently of whether a
+    // changed-direction checkpoint can be published. Cleared on settlement.
+    invalidated_reviews: Arc<Mutex<HashSet<String>>>,
     #[cfg(test)]
     lock_waits: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
     _directory_lock: Arc<File>,
@@ -401,6 +404,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         config,
         locks: Arc::new(Mutex::new(HashMap::new())),
         background_reviews: Arc::new(Mutex::new(HashSet::new())),
+        invalidated_reviews: Arc::new(Mutex::new(HashSet::new())),
         #[cfg(test)]
         lock_waits: Arc::new(std::sync::Mutex::new(None)),
         _directory_lock: Arc::new(directory_lock),
@@ -1307,6 +1311,7 @@ async fn native_compact(
 #[derive(Default)]
 struct ReviewRun {
     background: bool,
+    advice_invalidated: bool,
     pressure: bool,
     batches: Vec<ReviewBatch>,
     request_id: String,
@@ -1689,7 +1694,16 @@ async fn forward_request(
             "primary_received",
             &json!({"native_compaction":native}),
         );
-        set_review_context(&mut session, cache_base(&body));
+        let context = cache_base(&body);
+        if primary_direction(&session.review_context) != primary_direction(&context)
+            && service.background_reviews.lock().await.contains(&id)
+        {
+            // The owner lock orders this fence before worker settlement. Never
+            // roll it back on failed publication or a later same-input/ABA
+            // ingress. A restart kills the worker and censors its pending spend.
+            service.invalidated_reviews.lock().await.insert(id.clone());
+        }
+        set_review_context(&mut session, context);
         session.initialize_keep_leases(service.config.keep_lease_turns);
         let active = !native && service.config.mode != Mode::Off;
         let primary_priced =
@@ -2657,6 +2671,7 @@ async fn dispatch_review_for(
         // Primary transport/checkpoint owns this lock until its commit finishes.
         // Never save the snapshot: merge only reviewer fields into the latest state.
         let _lock = session_lock(&service, &id).await;
+        run.advice_invalidated = service.invalidated_reviews.lock().await.remove(&id);
         if let Ok(mut current) = load_existing(&service, &id) {
             let merged = merge_review(&service.config, &mut current, &before, &reviewed, &run);
             if save(&service, &id, &current).is_err() {
@@ -2753,8 +2768,8 @@ fn merge_review(
         .into_iter()
         .map(|g| (g.id, g))
         .collect::<HashMap<_, _>>();
-    let compatible = primary_direction(&current.review_context)
-        == primary_direction(&before.review_context)
+    let compatible = !run.advice_invalidated
+        && primary_direction(&current.review_context) == primary_direction(&before.review_context)
         && current.review_epoch == before.review_epoch
         && before.history.len() <= current.history.len()
         && before
@@ -4492,6 +4507,7 @@ mod tests {
             auth_token: None,
             locks: Arc::new(Mutex::new(HashMap::new())),
             background_reviews: Arc::new(Mutex::new(HashSet::new())),
+            invalidated_reviews: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             lock_waits: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -5922,6 +5938,7 @@ mod tests {
             auth_token: None,
             locks: Arc::new(Mutex::new(HashMap::new())),
             background_reviews: Arc::new(Mutex::new(HashSet::new())),
+            invalidated_reviews: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             lock_waits: Arc::new(std::sync::Mutex::new(None)),
         };
