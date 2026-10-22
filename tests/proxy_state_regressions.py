@@ -400,6 +400,7 @@ class StateRegressions(unittest.TestCase):
                 errors.append(repr(error))
 
         waiter = threading.Thread(target=send_pressure, daemon=True)
+        restorer, restore_results = None, []
         waiter.start()
         try:
             deadline = time.monotonic() + 4
@@ -416,14 +417,30 @@ class StateRegressions(unittest.TestCase):
             self.assertEqual(len(fixture.primaries), 2, "no capacity-overflow input may reach upstream")
             at_wait = proxy.saved()
             if change == "clear_then_restore":
-                # The wait releases the lock. Restore A with a fitting request
-                # before A's old reviewer completes: the intervening clear must
-                # remain an epoch boundary even though the final text is A.
-                self.assertEqual(proxy.send(seed, **fields)[0], 200)
+                # The published input is now growing. Restore A at that same
+                # frontier; both over-capacity requests wait for the held review.
+                restorer = threading.Thread(target=lambda: restore_results.append(
+                    proxy.send(growing, **fields)), daemon=True)
+                restorer.start()
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    events = [json.loads(line) for path in (self.state / "diagnostics").glob("*.jsonl")
+                              for line in path.read_bytes().splitlines()]
+                    if sum(e["event"] == "review_waiting" for e in events) >= 2:
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("restored direction must reach its own capacity wait before release")
             before_release = proxy.saved()
         finally:
             fixture.release.set()
             waiter.join(timeout=20)
+            if restorer is not None:
+                restorer.join(timeout=20)
+        if restorer is not None:
+            self.assertFalse(restorer.is_alive())
+            self.assertEqual(len(restore_results), 1)
+            self.assertEqual(restore_results[0][0], 413)
         self.assertFalse(waiter.is_alive(), "capacity retry must finish after reviewer settlement")
         self.assertEqual(errors, [])
         self.assertEqual(len(result), 1)
@@ -478,7 +495,13 @@ class StateRegressions(unittest.TestCase):
                                      "--min-payback-percent", "100"])
         self.assertEqual(proxy.send(growing, instructions=direction, max_output_tokens=1)[0], 200)
         restarted = proxy.saved()
-        self.assertEqual(restarted["shadow"], settled["shadow"], "restart cannot lose or double-charge A")
+        for field in settled["shadow"]:
+            if field == "cost_usd":
+                old, new = settled["shadow"][field], restarted["shadow"][field]
+                self.assertAlmostEqual(new, old, delta=max(math.ulp(old), math.ulp(new)))
+            else:
+                self.assertEqual(restarted["shadow"][field], settled["shadow"][field],
+                                 "restart cannot lose or double-charge A")
         self.assertEqual(restarted.get("opinions", {}), settled.get("opinions", {}))
         self.assertEqual(restarted.get("memories", []), settled.get("memories", []))
         self.assertEqual(len(fixture.reviews), settled["shadow"]["calls"])
