@@ -1200,6 +1200,12 @@ async fn forward_request(
             (None, Value::Null)
         };
         if active && report["forced"] == true && session.background_review_pending {
+            // Settlement reloads the checkpoint after acquiring this lock. Publish
+            // ingress invalidation before yielding, even if instructions are later
+            // restored; the pending review still owns its receipt, not new advice.
+            save(&service, &id, &session).map_err(|_| {
+                failure(StatusCode::INTERNAL_SERVER_ERROR, "checkpoint write failed")
+            })?;
             journal(
                 &service,
                 &id,
