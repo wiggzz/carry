@@ -419,6 +419,17 @@ pub(super) fn resolve(
         .as_array()
         .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "array input required"))?;
     let keys = path(namespace, input);
+    // Empty observations are published at the namespace root. They still have
+    // a real selected owner: do not mistake a retained empty tip for a miss.
+    if keys.is_empty() {
+        if let Some(reference) = index.tips.get(namespace) {
+            return Ok((
+                reference.session.clone(),
+                None,
+                pin(service, &reference.session)?,
+            ));
+        }
+    }
     for key in keys.iter().rev() {
         if let Some(r) = index.tips.get(key) {
             return Ok((r.session.clone(), None, pin(service, &r.session)?));

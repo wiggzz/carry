@@ -458,6 +458,24 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(status, 200, response)
         self.assertEqual(fixture.primaries[-1]["input"], [answer, followup])
 
+    def test_empty_input_repeat_reuses_retained_owner_after_restart(self):
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"empty_retry_{n}")))
+        proxy = self.proxy(fixture, ["--review-every-requests", "100"])
+        self.assertEqual(proxy.send([])[0], 200)
+        owner, initial = proxy.checkpoint([])
+        self.assertEqual(initial["primary"]["calls"], 1)
+        self.assertEqual(proxy.send([])[0], 200)
+        selected, retried = proxy.checkpoint([])
+        self.assertEqual(selected, owner, "empty live input still selects its retained tip")
+        self.assertEqual(retried["primary"]["calls"], 2)
+        proxy.close()
+        proxy = self.proxy(fixture, ["--review-every-requests", "100"])
+        self.assertEqual(proxy.send([])[0], 200)
+        selected, restored = proxy.checkpoint([])
+        self.assertEqual(selected, owner)
+        self.assertEqual(restored["primary"]["calls"], 3)
+        self.assertEqual(fixture.reviews, [])
+
     def test_empty_input_and_output_still_publish_observed_response_id(self):
         fixture = self.fixture(lambda _b, n: (200, completed([], f"zero_{n}")))
         options = ["--review-every-requests", "100"]
