@@ -92,12 +92,17 @@ session checkpoints retain their legacy format and lifetime.
 | `--history-max-nodes` / `CARRY_PROXY_HISTORY_MAX_NODES` | 16384 | 1–65536 unique canonical nodes |
 | `--history-max-references` / `CARRY_PROXY_HISTORY_MAX_REFERENCES` | 256 | 1–4096 tip/review-frontier/transcript references |
 | `--history-max-bytes` / `CARRY_PROXY_HISTORY_MAX_BYTES` | 33554432 | 67–67108864 total index bytes, including selected snapshots; smaller values reject startup |
-| `--fork-max-nodes` / `CARRY_PROXY_FORK_MAX_NODES` | 8 | 0–32 committed review versions |
-| `--fork-max-bytes` / `CARRY_PROXY_FORK_MAX_BYTES` | 262144 | 2–1048576 serialized review-version bytes per lineage |
+| `--fork-max-nodes` / `CARRY_PROXY_FORK_MAX_NODES` | 8 | 0–32 committed review versions per lineage and across the shared index |
+| `--fork-max-bytes` / `CARRY_PROXY_FORK_MAX_BYTES` | 262144 | 2–1048576 serialized review-version bytes per lineage and across the shared index |
 | `--fork-max-age-secs` / `CARRY_PROXY_FORK_MAX_AGE_SECS` | 86400 | 0–604800 seconds |
 
 Historical `fork-max-*` operator names now bound transparent evidence, not a
-client fork API. Expired/oldest references are removed until bounds fit, then
+client fork API. The shared-index review budget measures the exact serialized
+flattened version vector, including array punctuation, in addition to each
+lineage's evidence vector. This aggregate bound is deliberately stricter than
+independent per-lineage allowances. Retiring portable evidence alone does not
+clear a retained mutable owner's memories, removals or paid receipts.
+Expired/oldest references are removed until bounds fit, then
 mark-and-sweep removes unreachable nodes. Age is enforced at lookup/publication;
 physical erasure occurs on the next index publication, not a background janitor.
 Evicting a transparent tip evicts its selected snapshot and diagnostic mirror;
@@ -125,7 +130,11 @@ linear-work, or whole-directory byte-bound claim follows from prefix sharing.
 
 Predecessor unmerged headerless checkpoints are not automatically migrated into
 this index. Missing history begins with supplied full input; unknown explicit
-IDs reject. Existing explicit-session legacy checkpoint handling remains separate;
+IDs reject. A lookup miss reserves a cold owner without reusing an expired
+snapshot or treating a diagnostic mirror as authority. Concurrent same-input
+fresh requests share a bounded reservation even in the mirror-before-index
+publication window; selected live owners still retain their normal pins.
+Existing explicit-session legacy checkpoint handling remains separate;
 no directory scan promotes arbitrary old/temporary files into authority.
 
 Diagnostic mirror publication precedes atomic index publication. A crash between

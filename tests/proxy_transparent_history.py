@@ -203,7 +203,56 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(saved["primary"]["calls"], 1)
         self.assertEqual(saved["shadow"]["calls"], 0)
         self.assertEqual(saved["memories"], [])
-        self.assertEqual(json.loads((self.state / "history.index").read_text())["reviews"], {})
+        index = json.loads((self.state / "history.index").read_text())
+        self.assertEqual(index["reviews"], {})
+        self.assertEqual(len(wire([p for ps in index["reviews"].values() for p in ps])), 2)
+        # Evidence eviction is not permission to clear an existing selected
+        # lineage's accepted memory, removals or once-only paid receipts.
+        self.assertEqual(proxy.send(control)[0], 200)
+        _, retained = proxy.checkpoint(control)
+        self.assertEqual(retained["primary"]["calls"], 2)
+        self.assertEqual(retained["shadow"]["calls"], 0)
+        self.assertIn("A_FACT", json.dumps(fixture.primaries[-1]["input"]))
+        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
+
+    def test_shared_review_budget_counts_exact_flattened_vector_not_individual_points(self):
+        proxy, fixture, history, _ = self.seed()
+        parent = history + [{"role": "user", "content": "AGGREGATE_PARENT"}]
+        self.assertEqual(proxy.send(parent)[0], 200)
+        other = [{"role": "user", "content": "OTHER_GOAL"},
+                 {"role": "assistant", "content": "OTHER_RAW " + "payload " * 6000},
+                 {"role": "user", "content": "OTHER_BOUNDARY"}]
+        self.assertEqual(proxy.send(other)[0], 200)
+        index = json.loads((self.state / "history.index").read_text())
+        points = [p for ps in index["reviews"].values() for p in ps]
+        self.assertGreaterEqual(len(points), 2, "actual independent committed reviews required")
+        limit = len(wire(points)) - 1
+        self.assertTrue(all(len(wire([p])) <= limit for p in points))
+        self.assertLessEqual(sum(len(wire(p)) for p in points), limit,
+                             "point-only summation must miss this exact-vector boundary")
+        _, selected = proxy.checkpoint(parent)
+        proxy.close()
+        proxy = self.proxy(fixture, ["--fork-max-bytes", str(limit),
+                                   "--review-every-requests", "100"])
+        reviews = len(fixture.reviews)
+        self.assertEqual(proxy.send(parent)[0], 200)
+        index = json.loads((self.state / "history.index").read_text())
+        retained = [p for ps in index["reviews"].values() for p in ps]
+        self.assertLessEqual(len(wire(retained)), limit)
+        self.assertLess(len(retained), len(points))
+        self.assertTrue(retained, "a fitting version still remains portable")
+        self.assertEqual(len(fixture.reviews), reviews)
+        _, resumed = proxy.checkpoint(parent)
+        self.assertEqual(resumed["primary"]["calls"], selected["primary"]["calls"] + 1)
+        self.assertEqual(resumed["shadow"], selected["shadow"])
+        self.assertEqual(resumed["memories"], selected["memories"])
+        self.assertEqual([i["removed"] for i in resumed["history"]],
+                         [i["removed"] for i in selected["history"]])
+        self.assertIn("A_FACT", json.dumps(fixture.primaries[-1]["input"]))
+        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
+        self.evidence.update(flattened_before_bytes=len(wire(points)),
+                             individual_point_bytes=sum(len(wire(p)) for p in points),
+                             configured_bytes=limit, retained_bytes=len(wire(retained)))
 
     def test_expired_original_input_starts_cold_with_and_without_restart(self):
         root = self.state
@@ -235,6 +284,49 @@ class TransparentHistory(unittest.TestCase):
                     self.assertEqual(saved["memories"], [])
                 proxy.close()
         self.state = root
+
+    def test_same_input_concurrency_keeps_live_owner_past_age_and_restart(self):
+        import concurrent.futures
+        import threading
+        held, release = threading.Event(), threading.Event()
+        self.stack.callback(release.set)
+        def primary(_body, n):
+            if n == 1:
+                held.set()
+                assert release.wait(15), "fresh primary release"
+            return 200, completed(response_id=f"same_input_{n}")
+        fixture = self.fixture(primary)
+        options = ["--fork-max-age-secs", "1", "--review-every-requests", "100",
+                   "--request-timeout-secs", "30"]
+        proxy = self.proxy(fixture, options)
+        history = [{"role": "user", "content": "CONCURRENT_FRESH_INPUT"}]
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            first = pool.submit(proxy.send, history)
+            try:
+                self.assertTrue(held.wait(3))
+                owner, initial = proxy.checkpoint(history)
+                self.assertEqual(initial["primary"]["calls"], 0)
+                time.sleep(2.05)
+                second = pool.submit(proxy.send, history)
+                done, _ = concurrent.futures.wait([second], timeout=.2)
+                self.assertNotIn(second, done, "same input must queue behind the selected primary")
+                self.assertEqual(len(fixture.primaries), 1, "no concurrent duplicate owner/dispatch")
+                self.assertEqual(proxy.checkpoint(history)[0], owner)
+            finally:
+                release.set()
+            self.assertEqual(first.result()[0], 200)
+            self.assertEqual(second.result()[0], 200)
+        _, saved = proxy.checkpoint(history)
+        self.assertEqual(saved["primary"]["calls"], 2)
+        self.assertEqual(saved["shadow"]["calls"], 0)
+        self.assertEqual(len(list(self.state.glob("*.json"))), 1)
+        proxy.close()
+        proxy = self.proxy(fixture, ["--review-every-requests", "100"])
+        self.assertEqual(proxy.send(history)[0], 200)
+        resumed_owner, resumed = proxy.checkpoint(history)
+        self.assertEqual(resumed_owner, owner)
+        self.assertEqual(resumed["primary"]["calls"], 3)
+        self.assertEqual(fixture.reviews, [])
 
     def test_parallel_cohorts_and_cold_child_receipts(self):
         proxy, fixture, history, options = self.seed()

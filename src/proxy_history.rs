@@ -5,8 +5,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 static IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
-static PINS: std::sync::Mutex<BTreeMap<(PathBuf, String), usize>> =
+static PINS: std::sync::Mutex<BTreeMap<(PathBuf, String), Owner>> =
     std::sync::Mutex::new(BTreeMap::new());
+
+struct Owner {
+    count: usize,
+    // Only a fresh resolution grants coalescing authority. An arbitrary pin on
+    // a historical owner must not turn a lookup miss into restored authority.
+    reservation: Option<String>,
+}
 
 /// Selected authority stays live across lock waits, primary transport and paid
 /// reviewer settlement. Restart censors pending work, rather than reviving workers.
@@ -14,15 +21,21 @@ pub(super) struct Pin((PathBuf, String));
 impl Drop for Pin {
     fn drop(&mut self) {
         let mut pins = PINS.lock().unwrap();
-        let count = pins.get_mut(&self.0).unwrap();
-        *count -= 1;
-        if *count == 0 {
+        let owner = pins.get_mut(&self.0).unwrap();
+        owner.count -= 1;
+        if owner.count == 0 {
             pins.remove(&self.0);
         }
     }
 }
 pub(super) fn pin(service: &Service, id: &str) -> Result<Pin, Failure> {
-    let mut pins = PINS.lock().unwrap();
+    pin_owner(service, id, &mut PINS.lock().unwrap())
+}
+fn pin_owner(
+    service: &Service,
+    id: &str,
+    pins: &mut BTreeMap<(PathBuf, String), Owner>,
+) -> Result<Pin, Failure> {
     let key = (service.config.state_dir.clone(), id.to_owned());
     if !pins.contains_key(&key)
         && pins.keys().filter(|(dir, _)| dir == &key.0).count()
@@ -33,8 +46,46 @@ pub(super) fn pin(service: &Service, id: &str) -> Result<Pin, Failure> {
             "history owners busy",
         ));
     }
-    *pins.entry(key.clone()).or_default() += 1;
+    pins.entry(key.clone())
+        .or_insert(Owner {
+            count: 0,
+            reservation: None,
+        })
+        .count += 1;
     Ok(Pin(key))
+}
+
+// Called under IO: reserve a genuinely cold owner without promoting an expired
+// snapshot or mirror. Keep the pin lock through lookup/acquire so the last live
+// fresh request cannot disappear between coalescing and pinning its successor.
+fn reserve(
+    service: &Service,
+    key: String,
+    occupied: &HashSet<String>,
+) -> Result<(String, Pin), Failure> {
+    let mut pins = PINS.lock().unwrap();
+    let existing = pins.iter().find_map(|((dir, id), owner)| {
+        (dir == &service.config.state_dir
+            && !occupied.contains(id)
+            && owner.reservation.as_ref() == Some(&key))
+        .then(|| id.clone())
+    });
+    if let Some(id) = existing {
+        let pin = pin_owner(service, &id, &mut pins)?;
+        return Ok((id, pin));
+    }
+    let mut id = key.clone();
+    let mut generation = 0_u64;
+    while occupied.contains(&id)
+        || pins.contains_key(&(service.config.state_dir.clone(), id.clone()))
+        || service.config.state_dir.join(format!("{id}.json")).exists()
+    {
+        generation += 1;
+        id = hash(&(&key, generation));
+    }
+    let pin = pin_owner(service, &id, &mut pins)?;
+    pins.get_mut(&pin.0).unwrap().reservation = Some(key);
+    Ok((id, pin))
 }
 fn pinned(service: &Service) -> HashSet<String> {
     PINS.lock()
@@ -170,6 +221,29 @@ fn prune(service: &Service, index: &mut Index) -> bool {
         .retain(|_, r| r.at <= at && at - r.at < service.config.fork_max_age_secs);
     loop {
         gc(index, &pins);
+        // The shared index is an additional aggregate portability bound. Count
+        // the exact flattened JSON vector (including delimiters), not only the
+        // points' individual lengths. Retire evidence, not selected state, when
+        // this budget alone is exceeded.
+        let reviews = index.reviews.values().flatten().collect::<Vec<_>>();
+        let reviews_fit = reviews.len() <= service.config.fork_max_nodes as usize
+            && serde_json::to_vec(&reviews).unwrap().len()
+                <= service.config.fork_max_bytes as usize;
+        if !reviews_fit {
+            let (_, key, id) = index
+                .reviews
+                .iter()
+                .flat_map(|(key, points)| {
+                    points
+                        .iter()
+                        .map(move |p| (p.at, key.clone(), p.id.clone()))
+                })
+                .min()
+                .unwrap();
+            index.reviews.get_mut(&key).unwrap().retain(|p| p.id != id);
+            index.reviews.retain(|_, points| !points.is_empty());
+            continue;
+        }
         if index.nodes.len() <= service.config.history_max_nodes as usize
             && index.tips.len() + index.reviews.len() + index.transcripts.len()
                 <= service.config.history_max_references as usize
@@ -336,6 +410,10 @@ pub(super) fn resolve(
             "history index unavailable",
         )
     })?;
+    // Pruning is a read-time projection. Those historical IDs remain occupied
+    // in the on-disk generation until publication; pinning one would otherwise
+    // make restore protect and resurrect exactly the snapshot just retired.
+    let occupied = index.snapshots.keys().cloned().collect::<HashSet<_>>();
     prune(service, &mut index);
     let input = body["input"]
         .as_array()
@@ -349,14 +427,13 @@ pub(super) fn resolve(
             for point in points.iter().rev() {
                 if forking::compatible_child(&service.config, point, body).is_ok() {
                     let id = hash(&(namespace, "reviewed-child", &point.id, keys.last()));
-                    let pin = pin(service, &id)?;
+                    let (id, pin) = reserve(service, id, &occupied)?;
                     return Ok((id, Some(point.clone()), pin));
                 }
             }
         }
     }
-    let id = hash(&(namespace, keys.last()));
-    let pin = pin(service, &id)?;
+    let (id, pin) = reserve(service, hash(&(namespace, keys.last())), &occupied)?;
     Ok((id, None, pin))
 }
 

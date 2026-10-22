@@ -717,3 +717,53 @@ async fn history_paid_growth(reviewer: bool, growth: usize, bootstrap: bool) {
     assert_eq!(reviews.load(Ordering::SeqCst) as u64, expected_reviews);
     provider.abort();
 }
+
+#[test]
+fn history_concurrent_fresh_reservations_coalesce_across_uncommitted_mirror() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = checkpoint_service(directory.path());
+    let body =
+        json!({"model":"gpt-6-luna","input":[{"role":"user","content":"fresh reservation"}]});
+    let namespace = history::namespace(&service, &HeaderMap::new(), &body).unwrap();
+    let (owner, point, first_pin) = history::resolve(&service, &namespace, &body).unwrap();
+    assert!(point.is_none());
+    // Stage the real mirror-before-index window: no authoritative tip exists.
+    // A mirror name alone cannot split concurrent fresh requests into branches.
+    std::fs::write(
+        directory.path().join(format!("{owner}.json")),
+        b"uncommitted mirror",
+    )
+    .unwrap();
+    let worker_pin = history::pin(&service, &owner).unwrap();
+    drop(first_pin);
+    let barrier = std::sync::Barrier::new(8);
+    std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    history::resolve(&service, &namespace, &body).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let reservations = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>();
+        for (selected, point, _) in &reservations {
+            assert_eq!(selected, &owner);
+            assert!(point.is_none());
+        }
+    });
+    drop(worker_pin);
+    // After all fresh reservations finish, the leftover mirror and a generic
+    // historical pin cannot authorize a cold lookup. Only the newly reserved
+    // owner may coalesce subsequent requests.
+    let historical_pin = history::pin(&service, &owner).unwrap();
+    let (cold, point, cold_pin) = history::resolve(&service, &namespace, &body).unwrap();
+    assert_ne!(cold, owner);
+    assert!(point.is_none());
+    let (retry, _, retry_pin) = history::resolve(&service, &namespace, &body).unwrap();
+    assert_eq!(retry, cold);
+    drop((historical_pin, cold_pin, retry_pin));
+}
