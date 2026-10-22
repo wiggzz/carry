@@ -190,8 +190,7 @@ class TransparentHistory(unittest.TestCase):
         # A distinct divergent child cannot use the now-over-budget A version.
         # Disable new reviews so no fresh paid advice can hide stale hydration.
         bounded = ["--payoff-requests", "1", "--classifier-cache-policy", "disabled",
-                   "--review-every-requests", "100", "--bootstrap-min-input-bytes",
-                   "18446744073709551615", "--fork-max-bytes", "2"]
+                   "--review-every-requests", "100", "--fork-max-bytes", "2"]
         proxy = self.proxy(fixture, bounded)
         reviews = len(fixture.reviews)
         child = history + [{"role": "user", "content": "BYTE_COLD_D"}]
@@ -221,8 +220,7 @@ class TransparentHistory(unittest.TestCase):
                 if restart:
                     proxy.close()
                     proxy = self.proxy(fixture, ["--fork-max-age-secs", "1",
-                        "--review-every-requests", "100", "--bootstrap-min-input-bytes",
-                        "18446744073709551615", "--classifier-cache-policy", "disabled"])
+                        "--review-every-requests", "100", "--classifier-cache-policy", "disabled"])
                 status, result = proxy.send(history)
                 self.assertEqual(status, 200, result)
                 new_path, saved = proxy.checkpoint(history)
