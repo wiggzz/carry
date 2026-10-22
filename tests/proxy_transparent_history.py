@@ -175,6 +175,69 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(history)[0], 200)
         return proxy, fixture, history, options
 
+    def test_lowered_fork_byte_budget_retires_indexed_review_after_restart(self):
+        proxy, fixture, history, options = self.seed()
+        self.assertEqual(proxy.send(history + [{"role": "user", "content": "BYTE_PARENT_B"}])[0], 200)
+        self.assertTrue(json.loads((self.state / "history.index").read_text())["reviews"])
+        proxy.close()
+        # Positive restart control: the retained A version really is portable.
+        proxy = self.proxy(fixture, options)
+        control = history + [{"role": "user", "content": "BYTE_CONTROL_C"}]
+        self.assertEqual(proxy.send(control)[0], 200)
+        self.assertIn("A_FACT", json.dumps(fixture.primaries[-1]))
+        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]))
+        proxy.close()
+        # A distinct divergent child cannot use the now-over-budget A version.
+        # Disable new reviews so no fresh paid advice can hide stale hydration.
+        bounded = ["--payoff-requests", "1", "--classifier-cache-policy", "disabled",
+                   "--review-every-requests", "100", "--bootstrap-min-input-bytes",
+                   "18446744073709551615", "--fork-max-bytes", "2"]
+        proxy = self.proxy(fixture, bounded)
+        reviews = len(fixture.reviews)
+        child = history + [{"role": "user", "content": "BYTE_COLD_D"}]
+        status, result = proxy.send(child)
+        self.assertEqual(status, 200, result)
+        self.assertEqual(fixture.primaries[-1]["input"], child,
+                         "the index must not bypass the portable-review byte bound")
+        self.assertEqual(len(fixture.reviews), reviews)
+        _, saved = proxy.checkpoint(child)
+        self.assertEqual(saved["primary"]["calls"], 1)
+        self.assertEqual(saved["shadow"]["calls"], 0)
+        self.assertEqual(saved["memories"], [])
+        self.assertEqual(json.loads((self.state / "history.index").read_text())["reviews"], {})
+
+    def test_expired_original_input_starts_cold_with_and_without_restart(self):
+        root = self.state
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                self.state = root / ("restart" if restart else "same_process")
+                self.state.mkdir()
+                proxy, fixture, history, _ = self.seed(extra=["--fork-max-age-secs", "1",
+                                                             "--review-every-requests", "100"])
+                old_path, old = proxy.checkpoint(history)
+                self.assertEqual(old["primary"]["calls"], 1)
+                self.assertTrue(old["memories"], "real accepted review supplies old authority")
+                time.sleep(2.05)
+                if restart:
+                    proxy.close()
+                    proxy = self.proxy(fixture, ["--fork-max-age-secs", "1",
+                        "--review-every-requests", "100", "--bootstrap-min-input-bytes",
+                        "18446744073709551615", "--classifier-cache-policy", "disabled"])
+                status, result = proxy.send(history)
+                self.assertEqual(status, 200, result)
+                new_path, saved = proxy.checkpoint(history)
+                self.assertNotEqual(new_path, old_path,
+                                    "a lookup miss must not pin/revive the expired owner")
+                self.assertEqual(saved["primary"]["calls"], 1,
+                                 "the new lineage must not inherit expired paid receipts")
+                self.assertNotIn("A_FACT", json.dumps(fixture.primaries[-1]))
+                if restart:
+                    self.assertEqual(saved["shadow"]["calls"], 0)
+                    self.assertEqual(fixture.primaries[-1]["input"], history)
+                    self.assertEqual(saved["memories"], [])
+                proxy.close()
+        self.state = root
+
     def test_parallel_cohorts_and_cold_child_receipts(self):
         proxy, fixture, history, options = self.seed()
         # First seed proves review; a separate actual complete cohort is then reviewed.
