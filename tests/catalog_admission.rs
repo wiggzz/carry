@@ -244,6 +244,21 @@ fn saved(state: &Path) -> (std::path::PathBuf, Value) {
     )
 }
 
+async fn assert_dashboard_capacity(url: &str, primary: u64, reviewer: u64) {
+    let response = reqwest::get(format!("{url}/carry/dashboard/stats"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let stats: Value = response.json().await.unwrap();
+    let sessions = stats["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0]["planner"]["primary_context_tokens"], primary,
+        "dashboard denominator must describe the saved request plan"
+    );
+    assert_eq!(sessions[0]["planner"]["reviewer_context_tokens"], reviewer);
+}
+
 #[tokio::test]
 async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
     let f = Fixture::new().await;
@@ -257,6 +272,7 @@ async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
         "catalog capacity must reach the real admission gate"
     );
     assert_eq!(checkpoint["last_plan"]["reviewer_context_tokens"], 6000);
+    assert_dashboard_capacity(&url, 40000, 6000).await;
     assert_eq!(
         checkpoint["model_resolution"]["primary"]["capacity_tokens"],
         40000
@@ -293,6 +309,7 @@ async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
         413,
         "saved route epoch must not silently adopt new metadata"
     );
+    assert_dashboard_capacity(&url, 40000, 6000).await;
     let (_, mut checkpoint) = saved(state.path());
     assert_eq!(
         checkpoint["primary"]["cost_usd"], before_cost,
@@ -316,6 +333,7 @@ async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
     );
     let (_, checkpoint) = saved(state.path());
     assert_eq!(checkpoint["last_plan"]["primary_context_tokens"], 272000);
+    assert_dashboard_capacity(&url, 272000, 300000).await;
     assert_eq!(
         checkpoint["model_resolution"]["primary"]["provenance"]["capacity"]["status"],
         "legacy_snapshot_missing"

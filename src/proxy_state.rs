@@ -385,6 +385,21 @@ impl Session {
         self.bootstrap_review_complete = false;
     }
 
+    /// Retry intent follows committed imported-source coverage, never a worker's
+    /// unpublished completion flag or receipt-only settlement candidate.
+    pub fn refresh_bootstrap_progress(&mut self) {
+        if self.bootstrap_end_id == 0 {
+            return;
+        }
+        self.bootstrap_review_complete = !self.groups().iter().any(|group| {
+            group.exposed
+                && !group.pinned
+                && group.members.iter().all(|id| *id <= self.bootstrap_end_id)
+                && !self.bootstrap_reviewed_ids.contains(&group.id)
+        });
+        self.bootstrap_review_pending = !self.bootstrap_review_complete;
+    }
+
     pub fn reset_active(&mut self) {
         self.review_epoch = self.review_epoch.saturating_add(1);
         if let Some(trajectory) = &mut self.cost_trajectory {

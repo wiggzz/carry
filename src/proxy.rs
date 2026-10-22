@@ -610,7 +610,7 @@ fn save_paid_accounting(service: &Service, id: &str, paid: &Session) -> std::io:
             .as_ref()
             .and_then(|state| state.pending.clone());
     }
-    durable.bootstrap_review_pending = paid.bootstrap_review_pending;
+    durable.refresh_bootstrap_progress();
     durable.bootstrap_estimated_cost_usd = paid.bootstrap_estimated_cost_usd;
     durable.cost_trajectory = paid.cost_trajectory.clone();
     if calls > 0
@@ -2840,16 +2840,7 @@ fn merge_review(
         for batch in &committed_batches {
             current.bootstrap_reviewed_ids.extend(&batch.bootstrap_ids);
         }
-        current.bootstrap_review_complete = !current.groups().iter().any(|group| {
-            group.exposed
-                && !group.pinned
-                && group
-                    .members
-                    .iter()
-                    .all(|id| *id <= current.bootstrap_end_id)
-                && !current.bootstrap_reviewed_ids.contains(&group.id)
-        });
-        current.bootstrap_review_pending = !current.bootstrap_review_complete;
+        current.refresh_bootstrap_progress();
     }
     if let (Some(old), Some(new), Some(live)) = (
         &before.keep_leases,

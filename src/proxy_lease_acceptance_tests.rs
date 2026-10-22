@@ -404,6 +404,142 @@ fn lease_paid_target(config: &ProxyCli, session: &Session) -> (Session, f64, Val
     (released, paid, wire)
 }
 
+#[tokio::test]
+async fn lease_unsendable_target_tail_never_vetoes_authorized_primary_removal() {
+    use std::sync::atomic::AtomicUsize;
+    let directory = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let app = Router::new().route("/review", post(move || {
+        let seen = seen.clone();
+        async move {
+            seen.fetch_add(1, Ordering::SeqCst);
+            axum::Json(json!({"status":"completed","output":[{"type":"message","role":"assistant",
+                "content":[{"type":"output_text","text":"{\"protected\":[],\"removable\":[],\"memories\":[]}"}]}],
+                "usage":{"input_tokens":101,"output_tokens":2,"input_tokens_details":{"cached_tokens":0}}}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.classifier_url =
+        Some(format!("http://{}/review", listener.local_addr().unwrap()));
+    service.config.payoff_requests = 1;
+    service.config.min_payback_percent = 0;
+    let provider = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut session = Session::default();
+    session.ingest(&[
+        json!({"role":"user","content":"original task"}),
+        json!({"role":"assistant","content":"retained valuable evidence"}),
+        json!({"role":"user","content":"next step"}),
+        json!({"type":"function_call","name":"native","call_id":"independent","arguments":"{}"}),
+        json!({"type":"function_call_output","call_id":"independent","output":"disposable native evidence ".repeat(1200)}),
+        json!({"role":"user","content":"current task"}),
+    ]).unwrap();
+    for item in &mut session.history {
+        item.exposed = true;
+    }
+    session.initialize_keep_leases(8);
+    let groups = session.groups();
+    session
+        .apply_advice(
+            &groups,
+            &json!({"protected":["g2"],"removable":["g4"],"memories":[]}),
+        )
+        .unwrap();
+    session.observe_groups(&groups);
+    session.completed_requests = 8;
+    let main = json!({"model":"gpt-6-luna","input":session.render_primary()});
+    session.review_context = cache_base(&main);
+    session.review_cache_key = format!("{:x}", Sha256::digest("carry-review-unsendable"));
+    let pending = crate::proxy_state::PendingKeepReview {
+        request_id: "capacity-probe".into(),
+        targets: session.due_keep_targets(),
+    };
+    assert!(pending.targets.contains_key("g2"));
+    let mut targeted = session.clone();
+    targeted.keep_leases.as_mut().unwrap().pending = Some(pending.clone());
+    let ordinary = review_body(&service.config, &session);
+    let targeted = review_body(&service.config, &targeted);
+    let limit = reviewer_serialized_identity(&ordinary).0 as u32;
+    assert!(reviewer_serialized_identity(&targeted).0 > limit as usize);
+    service.config.classifier_max_input_bytes = limit;
+    assert!(review_fits(&service.config, &ordinary));
+    assert!(!review_fits(&service.config, &targeted));
+    assert_eq!(
+        admission::decision(&service.config, &session, &main, false)["admitted"],
+        true
+    );
+    let mut skipped = session.clone();
+    let leases = skipped.keep_leases.clone();
+    assert!(
+        !review(
+            &service,
+            "unsendable",
+            &mut skipped,
+            &main,
+            false,
+            &mut ReviewRun::default()
+        )
+        .await
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        serde_json::to_value(&skipped.keep_leases).unwrap(),
+        serde_json::to_value(&leases).unwrap(),
+        "unsent targets cannot renew or leak pending state"
+    );
+    let (selected, report) = plan(&service.config, &session, &main);
+    assert_eq!(report["forced"], false);
+    assert_eq!(report["candidates"][0]["future_reviewer_keep_calls"], 0);
+    let selected = selected
+        .expect("unsendable targeted review must not veto profitable independent source removal");
+    assert!(selected.history[3].removed && selected.history[4].removed);
+    assert!(!selected.history[1].removed);
+    assert_eq!(
+        selected.keep_leases.as_ref().unwrap().entries.get("g2"),
+        session.keep_leases.as_ref().unwrap().entries.get("g2")
+    );
+    assert!(selected.keep_leases.as_ref().unwrap().pending.is_none());
+    let row = &report["candidates"][0];
+    assert_eq!(row["selection_joint"]["accepted"], true);
+    assert_ne!(row["selection_review_basis"], "presently_due_next_review");
+    assert_eq!(row["selection_joint"]["future_shadow_keep"], 0.0);
+    for in_flight in [false, true] {
+        let mut config = service.config.clone();
+        config.current_review_suppressed = !in_flight;
+        let mut source = session.clone();
+        if in_flight {
+            source.background_review_pending = true;
+            source.keep_leases.as_mut().unwrap().pending = Some(pending.clone());
+        }
+        assert!(
+            plan(&config, &source, &main).0.is_some(),
+            "suppression/in-flight work stays independent"
+        );
+    }
+    // Positive control: the exact same targeted request is sent once it fits.
+    service.config.classifier_max_input_bytes = reviewer_serialized_identity(&targeted).0 as u32;
+    let (_, fitting) = plan(&service.config, &session, &main);
+    assert_eq!(fitting["candidates"][0]["future_reviewer_keep_calls"], 1);
+    assert_eq!(
+        fitting["candidates"][0]["selection_review_basis"],
+        "presently_due_next_review"
+    );
+    assert!(
+        review(
+            &service,
+            "fitting-target",
+            &mut session,
+            &main,
+            false,
+            &mut ReviewRun::default()
+        )
+        .await
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    provider.abort();
+}
+
 #[test]
 fn lease_acceptance_due_reviewer_cache_loss_reverses_shared_candidate_gain() {
     let mut config = reviewer_config();
