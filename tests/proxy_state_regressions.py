@@ -660,8 +660,10 @@ class StateRegressions(unittest.TestCase):
                                   (999, 1000, "legacy"), (888, 1000, "missing_usage"),
                                   (777, 1000, "pending"), (666, 1000, "no_trajectory"),
                                   (555, 1000, "unknown_cache"), (444, 1000, "untracked")],
-             1, (12, 12, 0, 0)),
-            ("no_eligible", [(999, 1000, "legacy"), (888, 1000, "pending")], 1, None),
+             1, (789, 1012, 223, 100.0 * 223 / 1012)),
+            ("pending_with_legacy_peer", [(999, 1000, "legacy"), (888, 1000, "pending")],
+             1, (888, 1000, 112, 11.2)),
+            ("no_eligible", [(999, 1000, "legacy")], 1, None),
         ]
         for name, entries, unreadable, expected in cases:
             with self.subTest(case=name):
@@ -704,9 +706,11 @@ class StateRegressions(unittest.TestCase):
                 self.assertEqual(len(stats["sessions"]), len(entries))
                 self.assertIn("cost_estimate", stats, "backend must supply dashboard totals")
                 aggregate = stats["cost_estimate"]
-                included = sum(invalid is None for _, _, invalid in entries)
+                included = sum(invalid in (None, "pending") for _, _, invalid in entries)
                 self.assertEqual(aggregate["included_sessions"], included)
                 self.assertEqual(aggregate["excluded_sessions"], len(entries) - included + unreadable)
+                self.assertEqual(aggregate["in_flight_sessions"],
+                                 sum(invalid == "pending" for _, _, invalid in entries))
                 self.assertEqual(aggregate["excluded_failed_calls"], included,
                                  "failed-call scope belongs only to included comparisons")
                 for field, value in zip(("carry_cost", "traditional_cost", "savings", "savings_percent"),
@@ -715,8 +719,9 @@ class StateRegressions(unittest.TestCase):
                 by_id = {session["id"]: session for session in stats["sessions"]}
                 for index, (carry, traditional, invalid) in enumerate(entries, 1):
                     estimate = by_id[f"{index:064x}"]["cost_estimate"]
-                    self.assert_estimate_available(estimate, invalid is None)
-                    if invalid is None:
+                    self.assert_estimate_available(estimate, invalid in (None, "pending"))
+                    self.assertEqual(estimate["in_flight_costs_excluded"], invalid == "pending")
+                    if invalid in (None, "pending"):
                         self.assertEqual(estimate["carry_cost"], carry)
                         self.assertEqual(estimate["traditional_cost"], traditional)
                         self.assertEqual(estimate["savings"], traditional - carry)
@@ -834,11 +839,12 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(estimate.get("excluded_unpriced_calls"), 1)
         self.assertIsNone(null_stats["cost_estimate"]["carry_cost"])
         aggregate = stats["cost_estimate"]
-        self.assertEqual(aggregate["included_sessions"], 1)
-        self.assertEqual(aggregate["excluded_sessions"], 3)
+        self.assertEqual(aggregate["included_sessions"], 2)
+        self.assertEqual(aggregate["excluded_sessions"], 2)
+        self.assertEqual(aggregate["in_flight_sessions"], 1)
         self.assertEqual(aggregate["excluded_unpriced_calls"], 4)
         self.assertEqual(aggregate["excluded_unpriced_reviewer_calls"], 0)
-        self.assertEqual(aggregate["carry_cost"], partial["cost_trajectory"]["result"]["carry_cost"])
+        self.assertEqual(aggregate["carry_cost"], 2 * partial["cost_trajectory"]["result"]["carry_cost"])
         self.assertEqual(len(fixture.primaries), 2)
         self.assertEqual(fixture.reviews, [])
 
@@ -1127,6 +1133,68 @@ class StateRegressions(unittest.TestCase):
                                                  math.ulp(saved_cost)))
                 self.assert_estimate_available(estimate, True, "successful reviewer spend must survive a failed primary")
 
+    def test_reviewer_only_failures_preserve_primary_cache_continuity(self):
+        self.evidence["cases"] = []
+        for background in (False, True):
+            for restart in (False, True):
+                controls = None
+                for outcome in ("no-review", "completed", "failed", "incomplete", "429", "transport"):
+                    with self.subTest(background=background, restart=restart, outcome=outcome):
+                        self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+
+                        def primary(_body, n):
+                            response = completed(response_id=f"resp_{n}")
+                            response["usage"]["input_tokens"] = 2000 + 100 * n
+                            response["usage"]["output_tokens"] = 0
+                            return 200, response
+
+                        def review(_body, n):
+                            if n == 1 and outcome == "transport":
+                                return None
+                            if n == 1 and outcome == "429":
+                                return 429, {"error": "fixture reviewer rate limit"}
+                            response = advice_response({"protected": [], "removable": [], "memories": []})
+                            if n == 1 and outcome in ("failed", "incomplete"):
+                                response["status"] = outcome
+                            return 200, response
+
+                        fixture = self.fixture(primary, review)
+                        options = [f"--background-reviews={'true' if background else 'false'}"]
+                        if outcome == "no-review":
+                            options += ["--review-every-requests", "100"]
+                        proxy = self.proxy(fixture, options)
+                        seed = [{"role": "user", "content": "goal"},
+                                {"role": "assistant", "content": "eligible evidence"},
+                                {"role": "user", "content": "current"}]
+                        costs = []
+                        for n in range(3):
+                            self.assertEqual(proxy.send(seed + [
+                                {"role": "user", "content": f"continue {i}"} for i in range(n)
+                            ])[0], 200)
+                            saved = self.wait_saved(proxy, lambda s: not s.get("background_review_pending", False))
+                            costs.append(saved["cost_trajectory"]["result"]["traditional_cost"])
+                            if restart and n == 1:
+                                proxy.close()
+                                proxy = self.proxy(fixture, ["--review-every-requests", "100"])
+                        estimate = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
+                        proxy.close()
+                        fixture.close()
+                        self.assertEqual(fixture.errors, [])
+                        self.evidence["cases"].append({"background": background, "restart": restart,
+                                                       "outcome": outcome, "costs": costs, "estimate": estimate})
+                        if outcome == "no-review":
+                            self.assertEqual(len(fixture.reviews), 0)
+                            controls = (costs, estimate["observed_primary_cost"])
+                        else:
+                            self.assertGreaterEqual(len(fixture.reviews), 1)
+                        self.assertEqual(estimate["coverage"]["failed_calls"],
+                                         0 if outcome in ("no-review", "completed") else 1)
+                        self.assertEqual(estimate["coverage"]["primary_responses"], 3)
+                        self.assertAlmostEqual(estimate["observed_primary_cost"], controls[1], places=12)
+                        for actual, expected in zip(costs, controls[0]):
+                            self.assertAlmostEqual(actual, expected, places=12,
+                                                   msg="reviewer-only failures must not cool the untouched primary scenario")
+
     def test_restart_orphan_reviewer_is_untracked_not_proven_failed(self):
         def review(_body, _n):
             fixture.held.set()
@@ -1145,7 +1213,10 @@ class StateRegressions(unittest.TestCase):
         self.assertTrue(fixture.held.wait(3))
         pending = proxy.saved()
         self.assertTrue(pending["background_review_pending"])
-        self.assert_estimate_available(proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"], False)
+        held = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
+        self.assert_estimate_available(held, True, "completed costs remain visible while reviewer is held")
+        self.assertTrue(held["in_flight_costs_excluded"])
+        self.assertEqual(held["carry_cost"], pending["cost_trajectory"]["result"]["carry_cost"])
         proxy.close()
         fixture.release.set()
         proxy = self.proxy(fixture, ["--review-every-requests", "100"])

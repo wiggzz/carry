@@ -197,5 +197,42 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.match(elements.get('assumptions').textContent, /provider.*input/i);
   assert.match(elements.get('assumptions').textContent, /estimated.*restor/i);
   assert.ok(!/non-tool|reviewer inputs priced uncached/.test(elements.get('assumptions').textContent));
+  // Activity is independent of completed accounting. Exercise actual rendering
+  // for both pending producers, losses, valid zero and genuinely unavailable.
+  for (const pending of ['processing', 'background_review_pending']) {
+    for (const [carry, traditional, available, rendered] of [
+      [1, 2, true, '$1.000000 (50.0%)'],
+      [3, 2, true, '$-1.000000 (-50.0%)'],
+      [0, 0, true, '$0.000000'],
+      [0, 0, false, 'Unavailable'],
+    ]) {
+      data.sessions = [{...session(carry, traditional, available), [pending]: true}];
+      data.cost_estimate = total(available ? carry : null, available ? traditional : null,
+        available ? traditional - carry : null,
+        available && traditional ? 100 * (traditional - carry) / traditional : null,
+        available ? 1 : 0, available ? 0 : 1);
+      await vm.runInContext('refresh()', sandbox);
+      assert.equal(cards().get('Estimated savings · all time'), rendered);
+      assert.equal(elements.get('sessions').children[0].children[1].textContent,
+        pending === 'processing' ? 'Processing request' : 'Reviewing');
+      assert.equal(elements.get('sessions').children[0].children[3].textContent,
+        'Estimated savings: ' + rendered);
+      assert.match(walk(elements.get('sessions')).map(n=>n.textContent).join('\n'), /in.flight.*not.*included/i);
+    }
+  }
+  for (const [policy, label] of [
+    ['legacy_route_cache_v0', /legacy route.cache.*not repaired/i],
+    ['mixed_legacy_route_v0_and_model_v1', /mixed cache policies.*retained unchanged.*prospectively/i],
+    ['conditional_model_cache_v1', /conditional model cache.*not route entitlement/i],
+  ]) {
+    data.sessions = [session(1, 2)];
+    data.sessions[0].cost_estimate.counterfactual_cache_policy = policy;
+    data.cost_estimate = {...total(1, 2, 1, 50, 1), legacy_cache_policy_sessions: 2,
+      mixed_cache_policy_sessions: 3, in_flight_sessions: 1};
+    await vm.runInContext('refresh()', sandbox);
+    assert.match(elements.get('sessions').children[0].children[3].textContent, label);
+    assert.match(elements.get('estimate-coverage').textContent, /2 legacy, 3 mixed.*not repaired/i);
+    assert.match(elements.get('estimate-coverage').textContent, /in.flight costs.*not included/i);
+  }
   console.log('proxy dashboard scenarios: ok');
 })().catch(error => { console.error(error); process.exitCode = 1; });

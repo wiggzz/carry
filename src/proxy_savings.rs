@@ -13,6 +13,9 @@ pub fn accounting_policy() -> Value {
     json!({"default_basis": RECEIPT_BASIS, "retained_legacy_basis": LEGACY_BASIS,
         "observed_cost_basis": "provider_native_partitions_with_dispatch_frozen_tariffs",
         "counterfactual_basis": RECEIPT_COUNTERFACTUAL_BASIS,
+        "counterfactual_cache_policy": "conditional_model_cache_v1",
+        "retained_counterfactual_cache_policy": "legacy_route_cache_v0",
+        "cache_policy_upgrade": "prospective_cold_boundary_with_immutable_legacy_segment_no_repricing",
         "opaque_output_retention": "unknown_not_ciphertext_length",
         "claim": "conditional_counterfactual_not_measured_savings"})
 }
@@ -39,8 +42,24 @@ pub struct Coverage {
     pub unknown_rate_calls: u64,
 }
 
+/// Immutable historical comparison segment. No replay or historical repricing.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CachePolicySegment {
+    pub matched_primary_responses: u64,
+    pub carry_cost: f64,
+    pub traditional_cost: f64,
+    pub reviewer_cost: f64,
+    pub summary_cost: f64,
+    pub traditional_compactions: u64,
+    pub coverage: Coverage,
+}
+
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Estimate {
+    #[serde(default)]
+    pub counterfactual_cache_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_cache_policy_segment: Option<CachePolicySegment>,
     #[serde(default)]
     pub accounting_basis: String,
     #[serde(default)]
@@ -76,6 +95,9 @@ pub struct Estimate {
 /// comparable primary observations exist. Omitted reviewer expense is carry-only.
 #[derive(Debug, Serialize)]
 pub struct DashboardEstimate {
+    counterfactual_cache_policy: String,
+    legacy_cache_policy_segment: Option<CachePolicySegment>,
+    in_flight_costs_excluded: bool,
     accounting_basis: String,
     matched_primary_responses: u64,
     observed_primary_cost: Option<f64>,
@@ -99,8 +121,11 @@ pub struct DashboardEstimate {
 
 impl Estimate {
     pub fn dashboard(self, pending: bool) -> DashboardEstimate {
-        let available = self.priced && !pending;
+        let available = self.priced;
         DashboardEstimate {
+            counterfactual_cache_policy: self.counterfactual_cache_policy,
+            legacy_cache_policy_segment: self.legacy_cache_policy_segment,
+            in_flight_costs_excluded: pending,
             observed_primary_cost: (self.accounting_basis == RECEIPT_BASIS
                 && self.coverage.primary_responses > self.unavailable_primary_cost_calls)
                 .then_some(self.observed_primary_cost),
@@ -135,6 +160,9 @@ impl Estimate {
 
 #[derive(Default, Debug, Serialize)]
 pub struct DashboardTotals {
+    legacy_cache_policy_sessions: u64,
+    mixed_cache_policy_sessions: u64,
+    in_flight_sessions: u64,
     legacy_sessions: u64,
     observed_primary_cost: Option<f64>,
     observed_reviewer_cost: Option<f64>,
@@ -154,6 +182,7 @@ pub struct DashboardTotals {
 
 impl DashboardTotals {
     pub fn observe(&mut self, estimate: &DashboardEstimate) {
+        self.in_flight_sessions += u64::from(estimate.in_flight_costs_excluded);
         // Diagnostics cover all sessions, even pending/ineligible comparisons.
         self.excluded_unpriced_calls += estimate.excluded_unpriced_calls;
         self.excluded_unpriced_reviewer_calls += estimate.excluded_unpriced_reviewer_calls;
@@ -176,6 +205,11 @@ impl DashboardTotals {
             return;
         };
         self.included_sessions += 1;
+        match estimate.counterfactual_cache_policy.as_str() {
+            "legacy_route_cache_v0" => self.legacy_cache_policy_sessions += 1,
+            "mixed_legacy_route_v0_and_model_v1" => self.mixed_cache_policy_sessions += 1,
+            _ => (),
+        }
         self.matched_primary_responses += estimate.matched_primary_responses;
         self.excluded_failed_calls += estimate.excluded_failed_calls;
         let carry = self.carry_cost.unwrap_or(0.0) + carry;
@@ -248,6 +282,18 @@ impl Default for Trajectory {
 impl Trajectory {
     pub fn snapshot(&self) -> Estimate {
         let mut estimate = self.result.clone();
+        estimate.counterfactual_cache_policy = match self
+            .receipts
+            .as_ref()
+            .and_then(|r| r.scenario_cache_policy_version)
+        {
+            None => "legacy_route_cache_v0",
+            Some(_) if estimate.legacy_cache_policy_segment.is_some() => {
+                "mixed_legacy_route_v0_and_model_v1"
+            }
+            Some(_) => "conditional_model_cache_v1",
+        }
+        .into();
         estimate.accounting_basis = if self.receipts.is_some() {
             RECEIPT_BASIS
         } else {
@@ -317,6 +363,20 @@ impl Trajectory {
     }
 
     pub fn failed_call(&mut self) {
+        if let Some(receipts) = &mut self.receipts {
+            // A failed primary cannot promise reuse, but must not discard the
+            // successful scenario's restoration or hypothetical summary.
+            receipts.invalidate();
+        }
+        self.record_failed_call();
+    }
+
+    pub fn failed_reviewer_call(&mut self) {
+        // Carry-only work did not touch either primary history or its cache.
+        self.record_failed_call();
+    }
+
+    fn record_failed_call(&mut self) {
         self.result.coverage.failed_calls += 1;
         if self.successful_requests_only {
             self.result.excluded_failed_calls += 1;
@@ -354,7 +414,8 @@ impl Trajectory {
 
     pub fn compacted(&mut self, before: u64, after: u64) {
         if let Some(receipts) = &mut self.receipts {
-            receipts.invalidate();
+            // Carry changed its own wire input, not the traditional history.
+            receipts.invalidate_actual();
         }
         // Restore the net input difference, including newly rendered memories.
         self.restored = self.restored.saturating_add(before as i128 - after as i128);
@@ -374,7 +435,7 @@ impl Trajectory {
         resolved: Option<&ResolvedModel>,
     ) {
         if response["status"] != "completed" {
-            self.failed_call();
+            self.failed_reviewer_call();
             return;
         }
         self.reviewer_usage_resolved(
@@ -1169,7 +1230,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_projection_suppresses_all_money_without_changing_persisted_estimate() {
+    fn dashboard_projection_keeps_completed_money_without_changing_persisted_estimate() {
         let mut trajectory = legacy_trajectory();
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
         trajectory.failed_call();
@@ -1190,14 +1251,7 @@ mod tests {
                 "savings",
                 "savings_percent",
             ] {
-                if pending {
-                    assert!(
-                        dashboard[field].is_null(),
-                        "pending {field} must not expose partial sums"
-                    );
-                } else {
-                    assert_eq!(dashboard[field], persisted[field]);
-                }
+                assert_eq!(dashboard[field], persisted[field]);
             }
             for field in [
                 "coverage",
@@ -1258,7 +1312,7 @@ mod tests {
                 &Estimate {
                     carry_cost: 999.0,
                     traditional_cost: 1000.0,
-                    priced: pending,
+                    priced: false,
                     excluded_failed_calls: 2,
                     ..Estimate::default()
                 }

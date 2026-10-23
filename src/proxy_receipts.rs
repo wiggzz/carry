@@ -2,14 +2,31 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Receipts {
     anchor: Option<Anchor>,
+    #[serde(default)]
+    traditional_anchor: Option<Anchor>,
+    #[serde(default)]
+    pub scenario_cache_policy_version: Option<u32>,
     #[serde(default)]
     configuration: Option<String>,
     pub last_appended_input: Option<u64>,
     pub legacy_estimate: Option<Box<Estimate>>,
     epochs: u64,
+}
+impl Default for Receipts {
+    fn default() -> Self {
+        Self {
+            anchor: None,
+            traditional_anchor: None,
+            configuration: None,
+            scenario_cache_policy_version: Some(1),
+            last_appended_input: None,
+            legacy_estimate: None,
+            epochs: 0,
+        }
+    }
 }
 
 /// One numeric prefix, not a body journal or per-message allocation. Fork
@@ -26,6 +43,11 @@ struct Anchor {
 
 impl Receipts {
     pub(super) fn invalidate(&mut self) {
+        self.invalidate_actual();
+        self.traditional_anchor = None;
+    }
+
+    pub(super) fn invalidate_actual(&mut self) {
         self.anchor = None;
         self.last_appended_input = None;
         self.epochs = self.epochs.saturating_add(1);
@@ -238,6 +260,36 @@ impl Trajectory {
             self.failed_call();
             return;
         }
+        let policy_version = resolved.map_or(Some(1), |r| {
+            r.scenario_cache_policy.as_ref().map(|p| p.version)
+        });
+        let receipts = self.receipts.as_ref().unwrap();
+        if receipts.scenario_cache_policy_version.is_none() && policy_version.is_some() {
+            // One immutable pre-upgrade segment, not a replay or accounting reset.
+            // The next comparison starts cold under its newly frozen policy.
+            let prior = self.snapshot();
+            if prior.coverage.primary_responses > 0 || prior.coverage.reviewer_responses > 0 {
+                self.result.legacy_cache_policy_segment = Some(CachePolicySegment {
+                    matched_primary_responses: prior.matched_primary_responses,
+                    carry_cost: prior.carry_cost,
+                    traditional_cost: prior.traditional_cost,
+                    reviewer_cost: prior.reviewer_cost,
+                    summary_cost: prior.summary_cost,
+                    traditional_compactions: prior.traditional_compactions,
+                    coverage: prior.coverage,
+                });
+            }
+            self.reset_epoch();
+            self.receipts
+                .as_mut()
+                .unwrap()
+                .scenario_cache_policy_version = policy_version;
+        } else if self.result.coverage.primary_responses == 0 {
+            self.receipts
+                .as_mut()
+                .unwrap()
+                .scenario_cache_policy_version = policy_version;
+        }
         self.result.coverage.primary_responses += 1;
         let native = receipt(&response["usage"]);
         let model = body["model"].as_str().unwrap_or("");
@@ -297,13 +349,19 @@ impl Trajectory {
         }
         self.receipts.as_mut().unwrap().configuration = Some(config.clone());
         let previous = self.receipts.as_ref().unwrap().anchor.clone();
+        let traditional_previous = self.receipts.as_ref().unwrap().traditional_anchor.clone();
         let compatible = previous.as_ref().is_some_and(|a| {
             append_compatible(a, body, &config)
                 && at >= a.at
                 && native.input_tokens >= a.input
                 && (items.len() > a.items || native.input_tokens == a.input)
         });
-        if previous.is_some() && !compatible && !self.carry_edited {
+        let traditional_compatible = traditional_previous.as_ref().is_some_and(|a| {
+            a.configuration == config && at >= a.at && (self.carry_edited || compatible)
+        });
+        if (previous.is_some() && !compatible && !self.carry_edited)
+            || (traditional_previous.is_some() && !traditional_compatible)
+        {
             // Rewind, edit, configuration switch or negative total-input delta:
             // start a new comparison epoch, not a guessed removal allocation.
             self.reset_epoch();
@@ -318,15 +376,28 @@ impl Trajectory {
             .saturating_add(self.summary as i128)
             .clamp(0, u64::MAX as i128) as u64;
 
-        let minimum = resolved
-            .map_or_else(|| prompt_cache_capabilities(model), |r| r.cache)
-            .map(|c| c.minimum_prefix_tokens as u64);
+        // The alternative models an API-equivalent policy, not this route's
+        // ability to request an explicit breakpoint or promise a future hit.
+        // Old resolved snapshots remain explicitly legacy until resolution
+        // upgrades their prospective policy; never consult a live catalog here.
+        let minimum = resolved.map_or_else(
+            || carry::models::ScenarioCachePolicy::for_model(model).minimum_prefix_tokens,
+            |r| {
+                r.scenario_cache_policy.as_ref().map_or_else(
+                    || r.cache.map(|c| c.minimum_prefix_tokens as u64),
+                    |p| p.minimum_prefix_tokens,
+                )
+            },
+        );
         if minimum.is_none() {
             self.result.coverage.unknown_cache_requests += 1;
         }
-        let warm = previous
+        let ttl = resolved
+            .and_then(|r| r.scenario_cache_policy.as_ref())
+            .map_or(1800, |p| p.ttl_seconds);
+        let warm = traditional_previous
             .as_ref()
-            .is_some_and(|a| compatible && at >= a.at && at - a.at < 1800)
+            .is_some_and(|a| traditional_compatible && at - a.at < ttl)
             && !self.traditional_edited;
         // The alternative shares total-input units, never observed cache hits:
         // cache behavior is a conditional append-prefix scenario even before
@@ -396,13 +467,16 @@ impl Trajectory {
             self.last_traditional_input = self.scenario.keep_recent.saturating_add(self.summary);
             self.traditional_edited = true;
         }
-        self.receipts.as_mut().unwrap().anchor = Some(Anchor {
+        let anchor = Anchor {
             configuration: config,
             prefix: digest(items),
             items: items.len(),
             input: native.input_tokens,
             local_input: local,
             at,
-        });
+        };
+        let receipts = self.receipts.as_mut().unwrap();
+        receipts.anchor = Some(anchor.clone());
+        receipts.traditional_anchor = Some(anchor);
     }
 }
