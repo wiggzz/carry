@@ -42,8 +42,8 @@ fn stale_background_receipts_keep_the_dispatched_frozen_tariff_not_current_slug_
     ));
     assert_eq!(current.shadow.calls, 1);
     assert!((current.shadow.cost_usd - (90.0 * 11.0 + 10.0 * 0.1 + 31.0) / 1e6).abs() < 1e-12);
-    // Existing local-unit reviewer scenario deliberately has no native cache
-    // partition. Keep that contract while selecting its frozen input/output rates.
+    // Advice is stale, but the paid receipt uses its native partition and
+    // dispatch-frozen contract, not projected bytes or the newer missing price.
     assert!(
         (current
             .cost_trajectory
@@ -51,7 +51,7 @@ fn stale_background_receipts_keep_the_dispatched_frozen_tariff_not_current_slug_
             .unwrap()
             .snapshot()
             .reviewer_cost
-            - (200.0 * 11.0 + 31.0) / 1e6)
+            - (90.0 * 11.0 + 10.0 * 0.1 + 31.0) / 1e6)
             .abs()
             < 1e-12
     );

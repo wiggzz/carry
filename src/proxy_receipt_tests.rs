@@ -167,6 +167,7 @@ fn receipt_bounded_anchor_restart_and_legacy_window_do_not_reprice_history() {
     assert_eq!(total["included_sessions"], 1);
     assert_eq!(total["legacy_sessions"], 1);
     assert_eq!(total["carry_cost"], current["carry_cost"]);
+    old.begin_receipt_window();
     old.primary(&body(), &terminal(100_000, 0, 0, 3), "route", 200, true);
     let public = serde_json::to_value(old.snapshot().dashboard(false)).unwrap();
     assert_eq!(public["accounting_basis"], "receipt_anchored_v2");

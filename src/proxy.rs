@@ -1561,6 +1561,9 @@ async fn forward_request(
             trajectory.prior_untracked(session.primary.calls + session.shadow.calls);
             session.cost_trajectory = Some(trajectory);
         }
+        if let Some(trajectory) = &mut session.cost_trajectory {
+            trajectory.begin_receipt_window();
+        }
         if session.primary_pending {
             // The per-owner primary lock excludes a live predecessor. This is
             // an abandoned transport or a settlement that could not publish.
@@ -2556,9 +2559,17 @@ fn reviewer_view_costs(
 /// Keep receipts numeric and bounded: a provider usage object is untrusted too.
 fn numeric_review_usage(usage: &Value) -> Value {
     let mut result = json!({});
-    for field in ["input_tokens", "output_tokens"] {
-        if let Some(n) = usage[field].as_u64() {
-            result[field] = json!(n);
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "cache_creation_input_tokens",
+    ] {
+        if let Some(value) = usage.get(field) {
+            // Preserve invalid presence as a bounded numeric sentinel. Dropping
+            // an invalid optional partition would falsely turn it into zero.
+            result[field] = value.as_u64().map_or(json!(-1), |n| json!(n));
         }
     }
     for field in ["input_tokens_details", "output_tokens_details"] {
@@ -2568,8 +2579,8 @@ fn numeric_review_usage(usage: &Value) -> Value {
             "cache_creation_tokens",
             "audio_tokens",
         ] {
-            if let Some(n) = usage[field][key].as_u64() {
-                result[field][key] = json!(n);
+            if let Some(value) = usage[field].get(key) {
+                result[field][key] = value.as_u64().map_or(json!(-1), |n| json!(n));
             }
         }
     }

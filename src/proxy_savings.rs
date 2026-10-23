@@ -5,6 +5,9 @@ use carry::models::ResolvedModel;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+#[path = "proxy_receipts.rs"]
+mod receipts;
+
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Coverage {
     pub primary_responses: u64,
@@ -20,6 +23,20 @@ pub struct Coverage {
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Estimate {
+    #[serde(default)]
+    pub accounting_basis: String,
+    #[serde(default)]
+    pub matched_primary_responses: u64,
+    #[serde(default)]
+    pub observed_primary_cost: f64,
+    #[serde(default)]
+    pub observed_reviewer_cost: f64,
+    #[serde(default)]
+    pub unavailable_primary_cost_calls: u64,
+    #[serde(default)]
+    pub unavailable_reviewer_cost_calls: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_estimate: Option<Box<Estimate>>,
     pub carry_cost: f64,
     pub traditional_cost: f64,
     pub reviewer_cost: f64,
@@ -41,6 +58,14 @@ pub struct Estimate {
 /// comparable primary observations exist. Omitted reviewer expense is carry-only.
 #[derive(Debug, Serialize)]
 pub struct DashboardEstimate {
+    accounting_basis: String,
+    matched_primary_responses: u64,
+    observed_primary_cost: Option<f64>,
+    observed_reviewer_cost: Option<f64>,
+    unavailable_primary_cost_calls: u64,
+    unavailable_reviewer_cost_calls: u64,
+    legacy_estimate: Option<Box<Estimate>>,
+    counterfactual_basis: &'static str,
     carry_cost: Option<f64>,
     traditional_cost: Option<f64>,
     reviewer_cost: Option<f64>,
@@ -58,6 +83,16 @@ impl Estimate {
     pub fn dashboard(self, pending: bool) -> DashboardEstimate {
         let available = self.priced && !pending;
         DashboardEstimate {
+            observed_primary_cost: (self.accounting_basis == "receipt_anchored_v2")
+                .then_some(self.observed_primary_cost),
+            observed_reviewer_cost: (self.accounting_basis == "receipt_anchored_v2")
+                .then_some(self.observed_reviewer_cost),
+            accounting_basis: self.accounting_basis,
+            matched_primary_responses: self.matched_primary_responses,
+            unavailable_primary_cost_calls: self.unavailable_primary_cost_calls,
+            unavailable_reviewer_cost_calls: self.unavailable_reviewer_cost_calls,
+            legacy_estimate: self.legacy_estimate,
+            counterfactual_basis: "shared_receipt_input_plus_estimated_restoration_summary_retained_output_conditional_append_cache",
             carry_cost: available.then_some(self.carry_cost),
             traditional_cost: available.then_some(self.traditional_cost),
             reviewer_cost: available.then_some(self.reviewer_cost),
@@ -75,6 +110,7 @@ impl Estimate {
 
 #[derive(Default, Debug, Serialize)]
 pub struct DashboardTotals {
+    legacy_sessions: u64,
     carry_cost: Option<f64>,
     traditional_cost: Option<f64>,
     savings: Option<f64>,
@@ -91,6 +127,11 @@ impl DashboardTotals {
         // Diagnostics cover all sessions, even pending/ineligible comparisons.
         self.excluded_unpriced_calls += estimate.excluded_unpriced_calls;
         self.excluded_unpriced_reviewer_calls += estimate.excluded_unpriced_reviewer_calls;
+        if estimate.accounting_basis == "legacy_json_v1" {
+            self.legacy_sessions += 1;
+            self.excluded_sessions += 1;
+            return;
+        }
         let (Some(carry), Some(traditional)) = (estimate.carry_cost, estimate.traditional_cost)
         else {
             self.excluded_sessions += 1;
@@ -122,6 +163,8 @@ struct Prompt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Trajectory {
+    #[serde(default)]
+    receipts: Option<receipts::Receipts>,
     pub scenario: Scenario,
     result: Estimate,
     previous: Option<Prompt>,
@@ -144,6 +187,7 @@ pub struct Trajectory {
 impl Default for Trajectory {
     fn default() -> Self {
         Self {
+            receipts: Some(receipts::Receipts::default()),
             scenario: Scenario::default(),
             result: Estimate::default(),
             previous: None,
@@ -162,6 +206,17 @@ impl Default for Trajectory {
 impl Trajectory {
     pub fn snapshot(&self) -> Estimate {
         let mut estimate = self.result.clone();
+        estimate.accounting_basis = if self.receipts.is_some() {
+            "receipt_anchored_v2"
+        } else {
+            "legacy_json_v1"
+        }
+        .into();
+        estimate.matched_primary_responses = self.priced_primary_responses.unwrap_or(0);
+        estimate.legacy_estimate = self
+            .receipts
+            .as_ref()
+            .and_then(|r| r.legacy_estimate.clone());
         estimate.savings = estimate.traditional_cost - estimate.carry_cost;
         estimate.priced = self.available
             && self.scenario.valid()
@@ -238,6 +293,9 @@ impl Trajectory {
     }
 
     pub fn reset_epoch(&mut self) {
+        if let Some(receipts) = &mut self.receipts {
+            receipts.invalidate();
+        }
         // Totals survive actual rebases/native summaries; cache and restoration
         // assumptions do not cross an ancestry discontinuity.
         self.previous = None;
@@ -250,6 +308,9 @@ impl Trajectory {
     }
 
     pub fn compacted(&mut self, before: u64, after: u64) {
+        if let Some(receipts) = &mut self.receipts {
+            receipts.invalidate();
+        }
         // Restore the net input difference, including newly rendered memories.
         self.restored = self.restored.saturating_add(before as i128 - after as i128);
         self.carry_edited = true;
@@ -293,6 +354,10 @@ impl Trajectory {
         standard: bool,
         resolved: Option<&ResolvedModel>,
     ) {
+        if self.receipts.is_some() {
+            self.observed_reviewer(model, usage, standard, resolved);
+            return;
+        }
         self.start_priced_subset();
         self.result.coverage.reviewer_responses += 1;
         let output = usage["output_tokens"]
@@ -349,6 +414,10 @@ impl Trajectory {
         standard: bool,
         resolved: Option<&ResolvedModel>,
     ) {
+        if self.receipts.is_some() {
+            self.observed_primary(body, response, route, at, standard, resolved);
+            return;
+        }
         self.start_priced_subset();
         if has_native_modalities(body)
             || has_native_modalities(&response["output"])
@@ -592,6 +661,16 @@ mod receipt_tests;
 mod tests {
     use super::*;
 
+    // Preserve the executable v1 arithmetic/migration controls. Current-window
+    // behavior is exercised separately in receipt_tests, never by relabeling
+    // these local-JSON scenarios as provider observations.
+    fn legacy_trajectory() -> Trajectory {
+        Trajectory {
+            receipts: None,
+            ..Trajectory::default()
+        }
+    }
+
     fn request(text: &str) -> Value {
         json!({"model": "gpt-6-luna", "input": [{"role": "user", "content": text}], "prompt_cache_key": "scenario"})
     }
@@ -622,7 +701,7 @@ mod tests {
                         keep_recent: 1500,
                         summary: 100,
                     },
-                    ..Trajectory::default()
+                    ..legacy_trajectory()
                 };
                 trajectory.primary(&body, &terminal, "route", 100, true);
                 let before = trajectory.snapshot();
@@ -680,7 +759,7 @@ mod tests {
             "missing_output",
             "nonstandard",
         ] {
-            let mut trajectory = Trajectory::default();
+            let mut trajectory = legacy_trajectory();
             let body = request(&"prefix ".repeat(3000));
             trajectory.primary(&body, &response(100), "route", 100, true);
             trajectory.reviewer(&request("known review"), &response(100), true);
@@ -727,7 +806,7 @@ mod tests {
             );
             let mut resumed: Trajectory =
                 serde_json::from_value(serde_json::to_value(&trajectory).unwrap()).unwrap();
-            let mut cold = Trajectory::default();
+            let mut cold = legacy_trajectory();
             cold.primary(&body, &response(100), "route", 102, true);
             resumed.primary(&body, &response(100), "route", 102, true);
             let after = resumed.snapshot();
@@ -751,7 +830,7 @@ mod tests {
         // This exact paid total exposed a one-ULP drift at a real restart.
         // Exercise the checkpoint codec, not only a Value-to-Value conversion.
         for expense in [0.00011470000000000001_f64, 0.0001147, 0.0] {
-            let mut trajectory = Trajectory::default();
+            let mut trajectory = legacy_trajectory();
             trajectory.result.reviewer_cost = expense;
             let bytes = serde_json::to_vec(&trajectory).unwrap();
             let resumed: Trajectory = serde_json::from_slice(&bytes).unwrap();
@@ -766,7 +845,7 @@ mod tests {
     #[test]
     fn priced_subset_unpriced_only_is_null_even_with_known_reviewer_expense() {
         for variant in ["missing_usage", "unknown_model", "unknown_cache", "native"] {
-            let mut trajectory = Trajectory::default();
+            let mut trajectory = legacy_trajectory();
             let mut body = request("task");
             let mut terminal = response(100);
             match variant {
@@ -793,7 +872,7 @@ mod tests {
 
     #[test]
     fn priced_subset_reviewer_omissions_preserve_known_expense_without_touching_primary_cache() {
-        let mut trajectory = Trajectory::default();
+        let mut trajectory = legacy_trajectory();
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
         trajectory.reviewer(&request("known review"), &response(100), true);
         let before = serde_json::to_value(&trajectory).unwrap();
@@ -816,7 +895,7 @@ mod tests {
 
     #[test]
     fn priced_subset_counters_aggregate_even_when_pending_or_ineligible() {
-        let mut trajectory = Trajectory::default();
+        let mut trajectory = legacy_trajectory();
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
         trajectory.reviewer_usage("unknown-model", 100, &response(100)["usage"], true);
         let mut totals = DashboardTotals::default();
@@ -825,11 +904,12 @@ mod tests {
         trajectory.prior_untracked(1);
         totals.observe(&trajectory.snapshot().dashboard(false));
         let public = serde_json::to_value(totals).unwrap();
-        assert_eq!(public["included_sessions"], 1);
-        assert_eq!(public["excluded_sessions"], 2);
+        assert_eq!(public["included_sessions"], 0);
+        assert_eq!(public["excluded_sessions"], 3);
+        assert_eq!(public["legacy_sessions"], 3);
         assert_eq!(public["excluded_unpriced_calls"], 3);
         assert_eq!(public["excluded_unpriced_reviewer_calls"], 3);
-        assert!(public["carry_cost"].is_number());
+        assert!(public["carry_cost"].is_null());
     }
 
     #[test]
@@ -842,7 +922,7 @@ mod tests {
                     keep_recent: 200,
                     summary: 50,
                 },
-                ..Trajectory::default()
+                ..legacy_trajectory()
             };
             trajectory.primary(&request("task"), &response(100), "route", 100, true);
             let mut body = request("omitted");
@@ -884,7 +964,7 @@ mod tests {
                 keep_recent: 200,
                 summary: 50,
             },
-            ..Trajectory::default()
+            ..legacy_trajectory()
         };
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
         let before = trajectory.snapshot();
@@ -918,7 +998,7 @@ mod tests {
 
     #[test]
     fn priced_subset_legacy_poisoned_sums_remain_unavailable_without_replay() {
-        let mut trajectory = Trajectory::default();
+        let mut trajectory = legacy_trajectory();
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
         let mut checkpoint = serde_json::to_value(trajectory).unwrap();
         checkpoint
@@ -953,7 +1033,7 @@ mod tests {
         for (extra_unmodeled, keep_explicit_count, expected) in
             [(0, false, 1), (2, false, 2), (2, true, 3)]
         {
-            let mut trajectory = Trajectory::default();
+            let mut trajectory = legacy_trajectory();
             let mut body = request("one request with overlapping omission reasons");
             body["model"] = json!("gpt-6-astra");
             trajectory.primary(
@@ -1022,7 +1102,7 @@ mod tests {
             assert_eq!(public["excluded_unpriced_reviewer_calls"], 0);
             assert!(public["carry_cost"].is_null());
 
-            let mut clean = Trajectory::default();
+            let mut clean = legacy_trajectory();
             clean.primary(
                 &request("priced control"),
                 &response(100),
@@ -1036,15 +1116,16 @@ mod tests {
             let aggregate = serde_json::to_value(totals).unwrap();
             assert_eq!(aggregate["excluded_unpriced_calls"], expected + 1);
             assert_eq!(aggregate["excluded_unpriced_reviewer_calls"], 0);
-            assert_eq!(aggregate["included_sessions"], 1);
-            assert_eq!(aggregate["excluded_sessions"], 1);
-            assert!(aggregate["carry_cost"].is_number());
+            assert_eq!(aggregate["included_sessions"], 0);
+            assert_eq!(aggregate["excluded_sessions"], 2);
+            assert_eq!(aggregate["legacy_sessions"], 2);
+            assert!(aggregate["carry_cost"].is_null());
         }
     }
 
     #[test]
     fn dashboard_projection_suppresses_all_money_without_changing_persisted_estimate() {
-        let mut trajectory = Trajectory::default();
+        let mut trajectory = legacy_trajectory();
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
         trajectory.failed_call();
         let snapshot = trajectory.snapshot();
@@ -1186,7 +1267,7 @@ mod tests {
                 keep_recent: 200,
                 summary: 50,
             },
-            ..Trajectory::default()
+            ..legacy_trajectory()
         };
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
         let mut control = trajectory.clone();
@@ -1217,7 +1298,7 @@ mod tests {
 
     #[test]
     fn excluded_failures_leave_successful_prompt_and_summary_state_unchanged() {
-        let mut trajectory = Trajectory::default();
+        let mut trajectory = legacy_trajectory();
         trajectory.primary(
             &request(&"prefix ".repeat(3000)),
             &response(100),
@@ -1251,7 +1332,7 @@ mod tests {
 
     #[test]
     fn failed_reviewer_terminals_with_usage_are_excluded_but_completed_invalid_advice_is_charged() {
-        let mut trajectory = Trajectory::default();
+        let mut trajectory = legacy_trajectory();
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
         let before = trajectory.snapshot();
         for status in ["failed", "incomplete"] {
@@ -1285,7 +1366,7 @@ mod tests {
 
     #[test]
     fn legacy_checkpoints_keep_fail_closed_policy_across_epoch_and_restart() {
-        let mut initial = Trajectory::default();
+        let mut initial = legacy_trajectory();
         initial.primary(&request("task"), &response(100), "route", 100, true);
         let mut checkpoint = serde_json::to_value(initial).unwrap();
         checkpoint
@@ -1316,7 +1397,7 @@ mod tests {
     #[test]
     fn exclusions_never_resurrect_unknown_successful_spend() {
         for variant in 0..4 {
-            let mut trajectory = Trajectory::default();
+            let mut trajectory = legacy_trajectory();
             match variant {
                 0 => trajectory.prior_untracked(1),
                 1 => trajectory.unmodeled_call(),
@@ -1353,7 +1434,7 @@ mod tests {
     #[test]
     fn scenario_input_is_independent_of_native_input_metering() {
         let replay = |metered| {
-            let mut trajectory = Trajectory::default();
+            let mut trajectory = legacy_trajectory();
             trajectory.primary(
                 &request(&"evidence ".repeat(2000)),
                 &response(metered),
@@ -1382,7 +1463,7 @@ mod tests {
     #[test]
     fn added_memory_can_make_the_traditional_input_smaller_than_carry() {
         let body = request("a retained derived memory with additional quoting overhead");
-        let mut trajectory = Trajectory::default();
+        let mut trajectory = legacy_trajectory();
         trajectory.compacted(20, 30);
         trajectory.primary(&body, &response(100), "route", 100, true);
         let expected = projection(&body, "route", 100).unwrap().input - 10;
@@ -1394,7 +1475,7 @@ mod tests {
 
     #[test]
     fn reviewer_overhead_can_produce_a_negative_saving() {
-        let mut trajectory = Trajectory::default();
+        let mut trajectory = legacy_trajectory();
         let body = request("tiny task");
         trajectory.primary(&body, &response(100), "route", 100, true);
         trajectory.reviewer(&body, &response(100), true);
@@ -1414,7 +1495,7 @@ mod tests {
                 keep_recent: 200,
                 summary: 50,
             },
-            ..Trajectory::default()
+            ..legacy_trajectory()
         };
         let body = request(&"evidence ".repeat(3000));
         let mut tool_response = response(3000);
@@ -1442,7 +1523,7 @@ mod tests {
     #[test]
     fn cache_reuse_requires_compatible_route_key_and_time() {
         let body = request(&"evidence ".repeat(3000));
-        let mut initial = Trajectory::default();
+        let mut initial = legacy_trajectory();
         initial.primary(&body, &response(100), "route", 100, true);
         let mut hit = initial.clone();
         hit.primary(&body, &response(100), "route", 101, true);
@@ -1464,7 +1545,7 @@ mod tests {
     fn scenario_uses_the_proxy_rate_card_including_gpt61_sol() {
         let mut body = request("task");
         body["model"] = json!("gpt-6.1-sol");
-        let mut trajectory = Trajectory::default();
+        let mut trajectory = legacy_trajectory();
         trajectory.primary(&body, &response(100), "route", 100, true);
         assert!(trajectory.snapshot().priced);
         assert!(trajectory.snapshot().carry_cost > 0.0);
@@ -1490,7 +1571,7 @@ mod tests {
                         context_window: 1_050_000,
                         ..Scenario::default()
                     },
-                    ..Trajectory::default()
+                    ..legacy_trajectory()
                 };
                 // Establish the alternative size through the real compaction path.
                 if traditional_input >= carry_input {
@@ -1548,7 +1629,7 @@ mod tests {
     fn priced_model_with_unknown_cache_support_excludes_savings() {
         let mut body = request("task");
         body["model"] = json!("gpt-6-astra");
-        let mut trajectory = Trajectory::default();
+        let mut trajectory = legacy_trajectory();
         trajectory.primary(&body, &response(100), "route", 100, true);
         let estimate = trajectory.snapshot();
         assert_eq!(
@@ -1563,7 +1644,7 @@ mod tests {
 
     #[test]
     fn restored_unknown_cache_coverage_excludes_scenario_savings() {
-        let mut trajectory = Trajectory::default();
+        let mut trajectory = legacy_trajectory();
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
         let mut checkpoint = serde_json::to_value(&trajectory).unwrap();
         checkpoint
@@ -1594,7 +1675,7 @@ mod tests {
         ] {
             let mut body = request("task");
             body["input"][0]["content"] = content;
-            let mut trajectory = Trajectory::default();
+            let mut trajectory = legacy_trajectory();
             trajectory.primary(&body, &response(100), "route", 100, true);
             assert!(
                 !trajectory.snapshot().priced,
@@ -1607,7 +1688,7 @@ mod tests {
     #[test]
     fn missing_usage_failure_unknown_pricing_and_old_history_make_savings_unavailable() {
         let body = request("task");
-        let mut checkpoint = serde_json::to_value(Trajectory::default()).unwrap();
+        let mut checkpoint = serde_json::to_value(legacy_trajectory()).unwrap();
         checkpoint
             .as_object_mut()
             .unwrap()
