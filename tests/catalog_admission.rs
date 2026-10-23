@@ -392,6 +392,81 @@ async fn unknown_reviewer_context_does_not_block_a_fitting_known_primary() {
 }
 
 #[tokio::test]
+async fn frozen_primary_is_independent_of_unresolved_reviewer_after_restart() {
+    let mut failures = Vec::new();
+    for unknown_reviewer in [false, true] {
+        for missing_discovery in [false, true] {
+            for unknown_price in [false, true] {
+                let f = Fixture::new().await;
+                let state = tempfile::tempdir().unwrap();
+                let reviewer = if unknown_reviewer {
+                    "unlisted-reviewer"
+                } else {
+                    "gpt-6-luna"
+                };
+                let args = ["--classifier-model", reviewer];
+                let mut body = json!({"model":"gpt-6-sol","input":[{"role":"user","content":"frozen primary owner"}],"max_output_tokens":10});
+                let (child, url) = start(f.home.path(), state.path(), f.address, true, &args).await;
+                assert_eq!(send(&url, "independent-contract", &body).await, 200);
+                drop(child);
+                let (path, mut checkpoint) = saved(state.path());
+                checkpoint["model_resolution"]["primary"]["rates"] = if unknown_price {
+                    Value::Null
+                } else {
+                    json!({"input":7.0,"cached":0.7,"write":9.0,"output":21.0})
+                };
+                let primary = checkpoint["model_resolution"]["primary"].clone();
+                let before_cost = checkpoint["primary"]["cost_usd"].as_f64().unwrap();
+                let before_unavailable = checkpoint["primary"]["unavailable_cost_calls"]
+                    .as_u64()
+                    .unwrap();
+                let estimated = checkpoint["last_plan"]["primary_estimated_tokens"]
+                    .as_f64()
+                    .unwrap() as u64;
+                std::fs::write(path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+                if missing_discovery {
+                    *f.metadata.lock().await = json!({"models":[]});
+                } else {
+                    f.metadata.lock().await["models"][0]["context_window"] = json!(60000);
+                }
+                let (_child, url) =
+                    start(f.home.path(), state.path(), f.address, true, &args).await;
+                body["max_output_tokens"] = json!(40001 - estimated);
+                let before_calls = f.primary_calls.load(Ordering::SeqCst);
+                let status = send(&url, "independent-contract", &body).await;
+                let label = format!(
+                    "unknown_reviewer={unknown_reviewer},missing_discovery={missing_discovery},unknown_price={unknown_price}"
+                );
+                if status != 413 || f.primary_calls.load(Ordering::SeqCst) != before_calls {
+                    failures.push(format!(
+                        "{label}: saved primary admission widened; HTTP {status}"
+                    ));
+                }
+                body["max_output_tokens"] = json!(10);
+                assert_eq!(send(&url, "independent-contract", &body).await, 200);
+                let (_, after) = saved(state.path());
+                if after["model_resolution"]["primary"] != primary {
+                    failures.push(format!("{label}: valid primary contract was replaced"));
+                }
+                let delta = after["primary"]["cost_usd"].as_f64().unwrap() - before_cost;
+                let expected = if unknown_price { 0.0 } else { 721.0 / 1e6 };
+                if (delta - expected).abs() > 1e-12
+                    || after["primary"]["unavailable_cost_calls"]
+                        != before_unavailable + u64::from(unknown_price)
+                {
+                    failures.push(format!("{label}: frozen tariff changed"));
+                }
+                if unknown_reviewer {
+                    assert!(after["model_resolution"]["reviewer"]["capacity_tokens"].is_null());
+                    assert_eq!(f.review_calls.load(Ordering::SeqCst), 0);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
 async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
     let f = Fixture::new().await;
     let state = tempfile::tempdir().unwrap();
