@@ -311,6 +311,10 @@ async fn missing_subscription_entry_uses_one_catalog_for_reviewer_plan_dashboard
     let (path, checkpoint) = saved(state.path());
     assert_eq!(checkpoint["last_plan"]["reviewer_context_tokens"], 1050000);
     assert_eq!(
+        checkpoint["last_plan"]["reviewer_ordinary_context_tokens"],
+        272000
+    );
+    assert_eq!(
         checkpoint["model_resolution"]["reviewer"]["rates"],
         c["reviewer"]["rates"]
     );
@@ -424,14 +428,14 @@ async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
     assert_eq!(
         send(&url, "one", &body).await,
         200,
-        "only new provenance absent means contemporaneous legacy capacity, not today's catalog"
+        "missing historical contract resolves forward policy from the catalog without repricing history"
     );
     let (_, checkpoint) = saved(state.path());
-    assert_eq!(checkpoint["last_plan"]["primary_context_tokens"], 272000);
-    assert_dashboard_capacity(&url, 272000, 300000).await;
+    assert_eq!(checkpoint["last_plan"]["primary_context_tokens"], 60000);
+    assert_dashboard_capacity(&url, 60000, 6000).await;
     assert_eq!(
         checkpoint["model_resolution"]["primary"]["provenance"]["capacity"]["status"],
-        "legacy_snapshot_missing"
+        "fresh_at_resolution"
     );
 }
 
@@ -439,7 +443,7 @@ async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
 async fn explicit_same_default_lower_and_alias_limits_retain_provenance() {
     let f = Fixture::new().await;
     for (args, primary, reviewer) in [
-        (vec![], 272000, 300000),
+        (vec![], 1050000, 1050000),
         (
             vec![
                 "--primary-context-tokens",
@@ -521,8 +525,8 @@ async fn reviewer_route_is_independent_in_actual_admission_and_dispatch() {
     .expect("real reviewer must settle after primary, without a production wait");
     assert_eq!(checkpoint["last_plan"]["primary_context_tokens"], 40000);
     assert_eq!(
-        checkpoint["last_plan"]["reviewer_context_tokens"], 300000,
-        "explicit API reviewer URL must not inherit primary subscription limit"
+        checkpoint["last_plan"]["reviewer_context_tokens"], 1050000,
+        "explicit API reviewer URL uses model catalog, not primary subscription metadata"
     );
     assert_eq!(
         checkpoint["model_resolution"]["reviewer"]["route"]["class"],

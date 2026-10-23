@@ -112,7 +112,7 @@ pub struct ProxyCli {
     /// Total primary context budget, including output reserve and estimation margin.
     #[arg(long = "primary-context-tokens", value_parser = clap::value_parser!(u32).range(1024..=2000000))]
     primary_context_override: Option<u32>,
-    #[arg(skip = 272000u32)]
+    #[arg(skip = carry::models::default_context_tokens())]
     primary_context_tokens: u32,
     /// Reserved primary output tokens when the client supplies no output limit.
     #[arg(long, default_value_t = 16384)]
@@ -123,7 +123,7 @@ pub struct ProxyCli {
     /// Total reviewer context budget, including its output reserve and margin.
     #[arg(long = "classifier-max-input-tokens", alias = "reviewer-context-tokens", value_parser = clap::value_parser!(u32).range(1024..=2000000))]
     reviewer_context_override: Option<u32>,
-    #[arg(skip = 300000u32)]
+    #[arg(skip = carry::models::default_context_tokens())]
     classifier_max_input_tokens: u32,
     /// Request-scoped frozen contracts, never a second model table.
     #[arg(skip)]
@@ -276,8 +276,9 @@ fn private_file(path: &Path, append: bool) -> std::io::Result<File> {
 }
 
 pub async fn serve(mut config: ProxyCli) -> Result<()> {
-    config.primary_context_tokens = config.primary_context_override.unwrap_or(272000);
-    config.classifier_max_input_tokens = config.reviewer_context_override.unwrap_or(300000);
+    // Only explicit limits exist before request-scoped catalog resolution.
+    config.primary_context_tokens = config.primary_context_override.unwrap_or(0);
+    config.classifier_max_input_tokens = config.reviewer_context_override.unwrap_or(0);
     if config.codex_login && config.login == Login::ApiKey {
         bail!("--codex-login conflicts with --login api-key");
     }
@@ -894,7 +895,6 @@ async fn resolved_catalog(
         primary_route,
         source,
         config.primary_context_override,
-        272000,
         config.primary_output_reserve_tokens,
         config.context_margin_percent,
     )
@@ -904,7 +904,6 @@ async fn resolved_catalog(
         reviewer_route,
         source,
         config.reviewer_context_override,
-        300000,
         config.classifier_max_output_tokens,
         config.context_margin_percent,
     )
@@ -941,7 +940,7 @@ async fn session_resolution(
     session: &mut Session,
     model: &str,
     processing_tier: &str,
-    fresh_child: bool,
+    _fresh_child: bool,
 ) -> Result<ResolvedPair, Failure> {
     let config = &service.config;
     let mut primary_route = Route::new(&config.upstream_url, config.codex_login);
@@ -955,6 +954,11 @@ async fn session_resolution(
     );
     if let Some(saved) = &session.model_resolution {
         let same = saved.schema_version == 1
+            && [&saved.primary, &saved.reviewer].iter().all(|resolved| {
+                resolved.provenance.get("capacity").is_some_and(|p| {
+                    !matches!(p.status.as_str(), "fallback" | "legacy_snapshot_missing")
+                })
+            })
             && saved.primary.model == model
             && saved.reviewer.model == config.classifier_model
             && saved.primary.route == primary_route
@@ -981,48 +985,9 @@ async fn session_resolution(
             return Ok(saved.clone());
         }
     }
-    let legacy = !fresh_child
-        && session.model_resolution.is_none()
-        && (session.version != 0 || !session.history.is_empty() || session.primary.calls > 0);
-    let (mut primary, mut reviewer) = if legacy {
-        let error = |message| failure(StatusCode::BAD_REQUEST, message);
-        (
-            resolve_model(
-                model,
-                primary_route,
-                None,
-                config.primary_context_override,
-                272000,
-                config.primary_output_reserve_tokens,
-                config.context_margin_percent,
-            )
-            .map_err(error)?,
-            resolve_model(
-                &config.classifier_model,
-                reviewer_route,
-                None,
-                config.reviewer_context_override,
-                300000,
-                config.classifier_max_output_tokens,
-                config.context_margin_percent,
-            )
-            .map_err(error)?,
-        )
-    } else {
-        resolved_catalog(service, model, processing_tier).await?
-    };
-    if legacy {
-        for resolved in [&mut primary, &mut reviewer] {
-            let provenance = resolved
-                .provenance
-                .get_mut("capacity")
-                .expect("capacity provenance");
-            provenance.status = "legacy_snapshot_missing".into();
-            provenance.source = "contemporaneous-legacy-role-capacity-v1".into();
-            provenance.fallback_reason =
-                Some("checkpoint_predates_resolved_contract_no_new_catalog_defaults".into());
-        }
-    }
+    // Resolve forward policy even for checkpoints without a contract. Historical
+    // ledgers remain untouched; missing provenance is not a permanent role cap.
+    let (primary, mut reviewer) = resolved_catalog(service, model, processing_tier).await?;
     freeze_reviewer_cache_policy(config, &mut reviewer);
     let pair = ResolvedPair {
         schema_version: 1,
@@ -1199,6 +1164,8 @@ async fn dashboard_stats(
                 .or_else(|| session.model_resolution.as_ref().map(|pair| pair.primary.capacity_tokens as u64)),
             "reviewer_context_tokens": last_plan["reviewer_context_tokens"].as_u64()
                 .or_else(|| session.model_resolution.as_ref().map(|pair| pair.reviewer.capacity_tokens as u64)),
+            "primary_ordinary_context_tokens": last_plan["primary_ordinary_context_tokens"].as_u64(),
+            "reviewer_ordinary_context_tokens": last_plan["reviewer_ordinary_context_tokens"].as_u64(),
             "candidate": best_candidate.map(|row| json!({
                 "candidate_id": row["candidate_id"].as_str(), "action": row["action"].as_str(),
                 "keep": row["selection_joint"]["keep"].as_f64(),

@@ -483,6 +483,8 @@ fn plan_inner(
         "reviewer_targeted_required_tokens":reviewer_required_tokens(config,&reviewer),
         "primary_context_tokens":config.primary_context_tokens,
         "reviewer_context_tokens":config.classifier_max_input_tokens,
+        "primary_ordinary_context_tokens":config.model_resolution.as_ref().map(|p| p.primary.ordinary.total_budget),
+        "reviewer_ordinary_context_tokens":config.model_resolution.as_ref().map(|p| p.reviewer.ordinary.total_budget),
         "context_margin_percent":config.context_margin_percent,
         "payoff_requests":config.payoff_requests,"min_payback_percent":config.min_payback_percent,
         "future_review_events":keep_calls,"future_reviewer_calls":keep_calls,

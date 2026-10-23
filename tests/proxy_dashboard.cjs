@@ -154,6 +154,12 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   data.sessions[1].title='Unrelated task';
   await vm.runInContext('refresh()', sandbox);
   assert.equal(elements.get('sessions').children.length, 2, 'different titles remain separate');
+  data.sessions = [{...session(1,2), planner:{reviewer_estimated_tokens:350000,
+    reviewer_required_tokens:352048, reviewer_context_tokens:1050000,
+    reviewer_ordinary_context_tokens:272000}}];
+  await vm.runInContext('refresh()', sandbox);
+  assert.ok(walk(elements.get('sessions')).some(n=>n.tagName==='progress' && n.max===1050000), 'physical capacity is the planner denominator, not a role fallback');
+  assert.ok(walk(elements.get('sessions')).some(n=>/272k ordinary economic target/.test(n.textContent)), 'show the separate catalog economic target without turning it into a hard cap');
   data.sessions = [];
   data.cost_estimate = total(null, null, null, null, 0);
   await vm.runInContext('refresh()', sandbox);

@@ -1,45 +1,60 @@
-# GPT-6 catalog sources
+# Shared model catalog
 
-The exact IDs `gpt-6-luna`, `gpt-6-sol`, `gpt-6.1-sol`, and `gpt-6-astra`
-have documented **OpenAI API** specifications. The model pages below were
-checked on 2026-10-22. Their Markdown versions are available by appending `.md`.
+`src/model_catalog.json` is the exact-ID source for Carry's modeled rates,
+context limits, long-input price tiers and cache capabilities. Rust embeds it
+in the executable; Python benchmark reporting and local Pi trial configuration
+read the same file from their pinned source checkout. Adding a model does not
+require separate planner, dashboard, benchmark or native-trial lists.
 
-| Exact model ID / source | Input | Cached input | Cache write | Output |
+## Resolution and consumers
+
+- An explicit context override is used if valid and within the known limit.
+- Fresh, valid, exact-route provider metadata can narrow the catalog context
+  limit. A published maximum override or auto-compaction trigger is not a default.
+- Otherwise a known model uses its catalog limit, regardless of primary/reviewer
+  role or API/subscription/gateway transport. This is Carry's operational model
+  policy, not a claim about an account's entitlement or upstream advertisement.
+- An unknown model needs valid metadata or an explicit context override. There
+  are no silent 272K-primary/300K-reviewer defaults. Unknown prices stay unknown.
+
+The request's resolved contract drives primary admission, reviewer fit and
+compaction planning, per-input-tier economics, receipt pricing and the saved
+plan used by the dashboard. The dashboard separately shows the catalog-derived
+ordinary economic target. **Capacity is a feasibility bound, not a cheap-tier
+truncation ceiling:** crossing an input price threshold changes candidate prices;
+it does not by itself force a rewrite or reject a fitting request.
+
+Old fallback or missing-contract checkpoints resolve current policy on their
+next request. Already recorded paid amounts are not repriced. Valid frozen
+contracts, explicit overrides and dispatch-frozen reviewer receipts retain their
+existing semantics. The dashboard describes the last saved plan, so a historical
+plan is not relabeled as though a new request has already happened.
+
+## GPT-6 documented basis
+
+The four exact model pages below were checked on 2026-10-22. Prices are Standard
+USD per million tokens, not subscription charges or a gateway tariff:
+
+| Model / source | Input | Cached input | Cache write | Output |
 | --- | ---: | ---: | ---: | ---: |
 | [gpt-6-luna](https://developers.openai.com/api/docs/models/gpt-6-luna) | $0.10 | $0.01 | $0.125 | $0.50 |
 | [gpt-6-sol](https://developers.openai.com/api/docs/models/gpt-6-sol) | $2.00 | $0.20 | $2.50 | $10.00 |
 | [gpt-6.1-sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol) | $2.00 | $0.10 | $2.50 | $10.00 |
 | [gpt-6-astra](https://developers.openai.com/api/docs/models/gpt-6-astra) | $10.00 | $1.00 | $12.50 | $50.00 |
 
-Prices are Standard USD per million tokens, not subscription charges or a
-third-party gateway tariff. These rates were already present in Carry; the
-catalog now identifies their public source. All four pages document:
+These pages document 1,050,000 total context tokens, maximum input 922,000,
+maximum output 128,000, and a whole-request price tier above 272,000 input
+tokens (2x input/cache rates, 1.5x output). Total capacity does not guarantee every
+input/output split is accepted. Carry's existing margin/output reservation
+checks and provider enforcement still apply. The conservative ordinary total
+target is 272,000, with output reserve and estimation margin applied separately.
 
-- 1,050,000 total context tokens, maximum input 922,000, maximum output 128,000;
-- a whole-request price tier above **272,000 input** tokens: 2x input/cache
-  rates and 1.5x output rates.
+The three GPT-5.6 catalog context entries preserve the 272,000 operational
+default observed in exact-ID Codex discovery on 2026-10-22, not its larger maximum
+configuration override. Their existing modeled rates are unchanged.
 
-Carry uses the documented total capacity only for the exact official
-`https://api.openai.com/v1/responses` route and default processing tier. The
-ordinary economic policy remains distinct: its conservative total budget is
-still capped at 272,000, with output reserve and estimation margin applied by
-`ordinary_policy`. Catalog capacity does not guarantee every input/output
-split is accepted by the provider.
-
-## Subscription discovery remains authoritative for its own route
-
-Public API specifications do **not** establish a Codex subscription's
-operational default, maximum configuration override, auto-compaction trigger,
-effective-window percentage, or compaction hash. Those raw fields remain
-unknown when the exact subscription ID is absent from fresh route-bound
-metadata. Gateway and unknown-tier capacities also retain their role fallback.
-There is no alias or prefix matching.
-
-The read-only subscription catalog checked during this change advertised only
-`gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` as visible models. Consequently,
-this change does **not** claim that the four GPT-6 IDs are newly advertised by
-`/v1/models`, does not replace a missing subscription capacity with 1,050,000,
-and does not repair that missing upstream metadata. The existing rates remain
-API-equivalent modeling inputs on subscription/gateway routes, not invoices.
-
-Saved checkpoint resolutions and prior accounting are not rewritten.
+Raw Codex default/max/effective-window/compaction fields stay unknown unless
+provided by exact-route metadata. The discovery checked during this change
+listed only GPT-5.6 IDs; this catalog does not invent GPT-6 discovery entries or
+aliases. Cache transport permission remains route-qualified independently of
+model context policy. Provenance is exported by `/carry/catalog?model=<exact-id>`.

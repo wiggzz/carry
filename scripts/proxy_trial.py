@@ -40,10 +40,19 @@ def client_configuration(root, *, client, base_url, model, session_id,
         (home / 'config.toml').write_text(text)
         return {'CODEX_HOME':str(home)}
     home = root / 'pi'; home.mkdir()
+    try:
+        from model_catalog import model_spec
+    except ModuleNotFoundError:
+        from scripts.model_catalog import model_spec
+    spec = model_spec(model)
+    if spec is None or spec.get('context_tokens') is None or spec.get('max_output_tokens') is None:
+        raise ValueError('model needs catalog context and output limits for the Pi provider')
+    rates = spec['rates']
     provider = {'baseUrl':base_url, 'api':'openai-responses', 'apiKey':'$CARRY_TRIAL_GATEWAY_TOKEN',
         'headers':headers, 'models':[{'id':model, 'name':'Local trial', 'reasoning':True,
-        'input':['text','image'], 'contextWindow':1050000 if model == 'gpt-6-luna' else 400000,
-        'maxTokens':128000, 'cost':{'input':0,'output':0,'cacheRead':0,'cacheWrite':0}}]}
+        'input':['text','image'], 'contextWindow':spec['context_tokens'],
+        'maxTokens':spec['max_output_tokens'], 'cost':{'input':rates['input'],'output':rates['output'],
+        'cacheRead':rates['cached'],'cacheWrite':rates['write']}}]}
     (home / 'models.json').write_text(json.dumps({'providers':{'carry-trial':provider}}, indent=2) + '\n')
     return {'PI_CODING_AGENT_DIR':str(home), 'PI_OFFLINE':'1', 'PI_TELEMETRY':'0'}
 

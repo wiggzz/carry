@@ -61,7 +61,6 @@ async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
         Route::new("https://api.openai.com/v1/responses", false),
         None,
         None,
-        272000,
         16384,
         10,
     )

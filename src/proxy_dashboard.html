@@ -135,14 +135,16 @@ async function refresh(){
     section.append(output);
    }
    const capacities=document.createElement('div');capacities.className='capacity-grid';
-   for(const [name,estimated,required,limit] of [['Primary',p.primary_estimated_tokens,p.primary_required_tokens,p.primary_context_tokens],['Reviewer',p.reviewer_estimated_tokens,p.reviewer_required_tokens,p.reviewer_context_tokens]]){
+   for(const [name,estimated,required,limit,ordinary] of [['Primary',p.primary_estimated_tokens,p.primary_required_tokens,p.primary_context_tokens,p.primary_ordinary_context_tokens],['Reviewer',p.reviewer_estimated_tokens,p.reviewer_required_tokens,p.reviewer_context_tokens,p.reviewer_ordinary_context_tokens]]){
     if(required==null||!limit)continue;
     const block=document.createElement('div');block.className='capacity';
     const label=document.createElement('p');label.textContent=name+(estimated!=null?' planned input · est.':' reservation · est.');
     const value=document.createElement('strong');value.className='capacity-value';value.textContent=compact(estimated??required);value.title=fmt(Math.ceil(estimated??required))+' tokens';
     const budget=document.createElement('p');budget.textContent=compact(required)+' reserved of '+compact(limit)+' budget';if(required>limit)budget.className='warning';budget.title=fmt(Math.ceil(required))+' / '+fmt(limit)+' tokens, including margin and output reserve';
     const capacity=document.createElement('progress');capacity.max=limit;capacity.value=Math.min(required,limit);capacity.setAttribute('aria-label',name+' context budget');
-    block.append(label,value,capacity,budget);capacities.append(block);
+    block.append(label,value,capacity,budget);
+    if(ordinary!=null){const target=document.createElement('p');target.className='legend';target.textContent=compact(ordinary)+' ordinary economic target · not a hard limit';block.append(target)}
+    capacities.append(block);
    }
    section.append(capacities);
    if(capacities.children.length){

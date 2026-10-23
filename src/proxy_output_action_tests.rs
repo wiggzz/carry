@@ -36,9 +36,8 @@ fn output_session(retained: usize, disposable: usize) -> Session {
     let route = Route::new("https://api.openai.com/v1/responses", false);
     session.model_resolution = Some(ResolvedPair {
         schema_version: 1,
-        primary: resolve_model("gpt-6-sol", route.clone(), None, None, 1_000_000, 16384, 0)
-            .unwrap(),
-        reviewer: resolve_model("gpt-6-luna", route, None, None, 300000, 16384, 0).unwrap(),
+        primary: resolve_model("gpt-6-sol", route.clone(), None, None, 16384, 0).unwrap(),
+        reviewer: resolve_model("gpt-6-luna", route, None, None, 16384, 0).unwrap(),
     });
     session
 }

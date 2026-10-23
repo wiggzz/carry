@@ -42,21 +42,6 @@ def selected_harnesses(values: Mapping[str, str]) -> tuple[str, ...]:
     return (harness,)
 
 
-MODEL_PRICING_USD_PER_MILLION = {
-    "gpt-5.6-luna": {
-        "input": 0.20,
-        "cached_input": 0.02,
-        "cache_write_input": 0.25,
-        "output": 1.20,
-    },
-    "gpt-6-luna": {
-        "input": 0.10,
-        "cached_input": 0.01,
-        "cache_write_input": 0.125,
-        "output": 0.50,
-        "long_context_threshold": 272_000,
-    },
-}
 USAGE_KEYS = (
     "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
     "output_tokens", "reasoning_tokens", "total_tokens",
@@ -178,8 +163,19 @@ def load_agent_usage(harness: str, output: pathlib.Path) -> dict[str, int]:
 
 
 def pricing_for_model(model: str) -> dict[str, float] | None:
-    pricing = MODEL_PRICING_USD_PER_MILLION.get(model)
-    return dict(pricing) if pricing is not None else None
+    try:
+        from model_catalog import model_spec
+    except ModuleNotFoundError:
+        from scripts.model_catalog import model_spec
+    spec = model_spec(model)
+    if spec is None or spec.get('rates') is None:
+        return None
+    rates = spec['rates']
+    pricing = dict(input=rates['input'], cached_input=rates['cached'],
+                   cache_write_input=rates['write'], output=rates['output'])
+    if spec.get('long_context'):
+        pricing['long_context_threshold'] = spec['long_context']['threshold']
+    return pricing
 
 
 def estimate_cost_usd(
