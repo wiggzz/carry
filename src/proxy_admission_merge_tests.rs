@@ -253,7 +253,7 @@ async fn background_commit_admission_control_for_import(kind: &str, bootstrap: b
         );
         if kind == "partial" {
             assert!(
-                merged.drop_authorized(
+                !merged.drop_authorized(
                     &merged
                         .groups()
                         .into_iter()

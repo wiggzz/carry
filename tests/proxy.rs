@@ -1466,7 +1466,10 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
                     reviewed.lock().await.push(body);
                     let advice = json!({
                         "protected": ["g1"], "removable": ["g2"],
-                        "memories": [{"source_ids": ["g2"], "text": "both tools succeeded"}]
+                        "memories": [
+                            {"source_ids": ["g2"], "text": "both tools succeeded"},
+                            {"source_ids": ["g2"], "text": "Migration unfinished on feat/migration; artifacts/migration.diff; next run fixture B; schema decision unresolved."}
+                        ]
                     });
                     axum::Json(json!({
                         "status": "completed",
@@ -1496,7 +1499,7 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         {"type": "function_call", "call_id": "a", "name": "native", "arguments": "{}"},
         {"type": "function_call", "call_id": "b", "name": "native", "arguments": "{}"},
         {"type": "function_call_output", "call_id": "a", "output": old},
-        {"type": "function_call_output", "call_id": "b", "output": "other output"},
+        {"type": "function_call_output", "call_id": "b", "output": "Migration unfinished on feat/migration; artifacts/migration.diff; next run fixture B; schema decision unresolved."},
         {"role": "user", "content": "finish original task"}
     ]);
     let client = reqwest::Client::new();
@@ -1541,7 +1544,17 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
             .to_string()
             .contains("DISCARD_SOURCE_PAYLOAD_")
     );
-    // The reviewer has now emitted advice; the following request plans against it.
+    // Restart the real proxy: accepted outcome/WIP memories and source opinions
+    // must survive durable loading before the following request selects a rewrite.
+    drop(_proxy);
+    let (_restarted, url) = start_proxy_options(
+        temp.path(),
+        address,
+        "compact",
+        &["--bootstrap-min-input-bytes", "8388608"],
+        "",
+    )
+    .await;
     let third = client
         .post(format!("{url}/v1/responses"))
         .header("x-carry-session", "fixture-session")
@@ -1560,7 +1573,14 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         json!({"role":"user","content":"[Earlier conversation omitted by Carry; retained messages remain in original order.]"})
     );
     assert!(sent.to_string().contains("preserve requirement"));
-    assert_eq!(sent["input"].as_array().unwrap().len(), 5);
+    assert_eq!(sent["input"].as_array().unwrap().len(), 7);
+    let fact = &sent["input"][3]["content"];
+    let fact: serde_json::Value =
+        serde_json::from_str(fact.as_str().unwrap().split_once(": ").unwrap().1).unwrap();
+    assert_eq!(
+        fact["text"],
+        "Migration unfinished on feat/migration; artifacts/migration.diff; next run fixture B; schema decision unresolved."
+    );
     let states = std::fs::read_dir(temp.path())
         .unwrap()
         .filter_map(Result::ok)
@@ -1588,6 +1608,7 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     );
     assert!(active.contains("preserve requirement"));
     assert!(active.contains("both tools succeeded"));
+    assert!(active.contains("schema decision unresolved"));
     let cost_stats: serde_json::Value = reqwest::get(format!("{url}/carry/dashboard/stats"))
         .await
         .unwrap()
@@ -1625,6 +1646,11 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     assert_eq!(
         checkpoint["output"][0]["encrypted_content"],
         "NATIVE_CHECKPOINT"
+    );
+    assert_eq!(
+        primary.lock().await[3]["input"],
+        sent["input"],
+        "repeated projection must preserve notice/fact positions"
     );
     assert!(
         !primary.lock().await[3]
