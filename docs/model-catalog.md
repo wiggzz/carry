@@ -3,8 +3,11 @@
 `src/model_catalog.json` is the exact-ID source for Carry's modeled rates,
 context limits, long-input price tiers and cache capabilities. Rust embeds it
 in the executable; Python benchmark reporting and local Pi trial configuration
-read the same file from their pinned source checkout. Adding a model does not
-require separate planner, dashboard, benchmark or native-trial lists.
+read the same file from their pinned source checkout. The Node benchmark gateway
+uses its keys for privacy-safe telemetry, so a recognized model is not erased
+before receipt pricing. Its packaged worker mounts the same artifact read-only.
+Adding a model does not require separate planner, dashboard, benchmark, gateway
+or native-trial lists.
 
 ## Resolution and consumers
 

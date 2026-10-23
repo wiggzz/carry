@@ -571,6 +571,7 @@ def start_agent_network(*, identity: str, proxy_image: str, proxy_script: pathli
                 "--network", network["egress"], "--read-only", "--cap-drop=ALL",
                 "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,nosuid,nodev,size=16m",
                 "--mount", f"type=bind,src={proxy_script.resolve()},dst=/proxy/openai_proxy.js,readonly",
+                "--mount", f"type=bind,src={pathlib.Path(__file__).resolve().parents[1] / 'src/model_catalog.json'},dst=/proxy/model_catalog.json,readonly",
                 *gateway_env_args,
                 "--entrypoint", "node", proxy_image, "/proxy/openai_proxy.js",
             ],
