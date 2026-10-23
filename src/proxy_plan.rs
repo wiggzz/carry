@@ -215,8 +215,8 @@ fn plan_inner(
     let reserve = body["max_output_tokens"]
         .as_u64()
         .unwrap_or(config.primary_output_reserve_tokens as u64);
-    // A measured prefix plus estimated append is still a prediction. It may
-    // strengthen, never lower, the original local-token capacity reservation.
+    // A measured prefix plus estimated append is still a prediction. Expose
+    // its reservation sensitivity separately; retain the local admission gate.
     let predicted_required = primary_required_tokens(config, body).max(
         prediction.unwrap_or(0) as f64 * (1.0 + f64::from(config.context_margin_percent) / 100.0)
             + reserve as f64,

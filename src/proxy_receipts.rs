@@ -248,9 +248,12 @@ impl Trajectory {
         }
         self.receipts.as_mut().unwrap().configuration = Some(config.clone());
         let previous = self.receipts.as_ref().unwrap().anchor.clone();
-        let compatible = previous
-            .as_ref()
-            .is_some_and(|a| append_compatible(a, body, &config) && native.input_tokens >= a.input);
+        let compatible = previous.as_ref().is_some_and(|a| {
+            append_compatible(a, body, &config)
+                && at >= a.at
+                && native.input_tokens >= a.input
+                && (items.len() > a.items || native.input_tokens == a.input)
+        });
         if previous.is_some() && !compatible && !self.carry_edited {
             // Rewind, edit, configuration switch or negative total-input delta:
             // start a new comparison epoch, not a guessed removal allocation.

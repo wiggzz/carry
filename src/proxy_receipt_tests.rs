@@ -171,12 +171,14 @@ fn receipt_fixed_body_changes_both_branches_and_both_actual_lanes() {
 
 #[test]
 fn receipt_append_delta_uses_total_input_not_cache_or_hidden_output() {
-    let mut t = Trajectory::default();
-    t.scenario = Scenario {
-        context_window: 3000,
-        reserve: 100,
-        keep_recent: 100,
-        summary: 20,
+    let mut t = Trajectory {
+        scenario: Scenario {
+            context_window: 3000,
+            reserve: 100,
+            keep_recent: 100,
+            summary: 20,
+        },
+        ..Trajectory::default()
     };
     let mut b = body();
     t.primary(&b, &terminal(2000, 1000, 0, 100_000), "route", 100, true);

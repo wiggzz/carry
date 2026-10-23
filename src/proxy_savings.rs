@@ -83,16 +83,23 @@ impl Estimate {
     pub fn dashboard(self, pending: bool) -> DashboardEstimate {
         let available = self.priced && !pending;
         DashboardEstimate {
-            observed_primary_cost: (self.accounting_basis == "receipt_anchored_v2")
+            observed_primary_cost: (self.accounting_basis == "receipt_anchored_v2"
+                && self.coverage.primary_responses > self.unavailable_primary_cost_calls)
                 .then_some(self.observed_primary_cost),
-            observed_reviewer_cost: (self.accounting_basis == "receipt_anchored_v2")
+            observed_reviewer_cost: (self.accounting_basis == "receipt_anchored_v2"
+                && self.coverage.reviewer_responses > self.unavailable_reviewer_cost_calls)
                 .then_some(self.observed_reviewer_cost),
+            counterfactual_basis: if self.accounting_basis == "receipt_anchored_v2" {
+                "shared_receipt_input_plus_estimated_restoration_summary_retained_output_conditional_append_cache"
+            } else {
+                "legacy_local_json_projection"
+            },
             accounting_basis: self.accounting_basis,
             matched_primary_responses: self.matched_primary_responses,
             unavailable_primary_cost_calls: self.unavailable_primary_cost_calls,
             unavailable_reviewer_cost_calls: self.unavailable_reviewer_cost_calls,
             legacy_estimate: self.legacy_estimate,
-            counterfactual_basis: "shared_receipt_input_plus_estimated_restoration_summary_retained_output_conditional_append_cache",
+
             carry_cost: available.then_some(self.carry_cost),
             traditional_cost: available.then_some(self.traditional_cost),
             reviewer_cost: available.then_some(self.reviewer_cost),
@@ -111,6 +118,11 @@ impl Estimate {
 #[derive(Default, Debug, Serialize)]
 pub struct DashboardTotals {
     legacy_sessions: u64,
+    observed_primary_cost: Option<f64>,
+    observed_reviewer_cost: Option<f64>,
+    unavailable_primary_cost_calls: u64,
+    unavailable_reviewer_cost_calls: u64,
+    matched_primary_responses: u64,
     carry_cost: Option<f64>,
     traditional_cost: Option<f64>,
     savings: Option<f64>,
@@ -132,12 +144,21 @@ impl DashboardTotals {
             self.excluded_sessions += 1;
             return;
         }
+        self.unavailable_primary_cost_calls += estimate.unavailable_primary_cost_calls;
+        self.unavailable_reviewer_cost_calls += estimate.unavailable_reviewer_cost_calls;
+        if let Some(cost) = estimate.observed_primary_cost {
+            self.observed_primary_cost = Some(self.observed_primary_cost.unwrap_or(0.0) + cost);
+        }
+        if let Some(cost) = estimate.observed_reviewer_cost {
+            self.observed_reviewer_cost = Some(self.observed_reviewer_cost.unwrap_or(0.0) + cost);
+        }
         let (Some(carry), Some(traditional)) = (estimate.carry_cost, estimate.traditional_cost)
         else {
             self.excluded_sessions += 1;
             return;
         };
         self.included_sessions += 1;
+        self.matched_primary_responses += estimate.matched_primary_responses;
         self.excluded_failed_calls += estimate.excluded_failed_calls;
         let carry = self.carry_cost.unwrap_or(0.0) + carry;
         let traditional = self.traditional_cost.unwrap_or(0.0) + traditional;
@@ -189,7 +210,10 @@ impl Default for Trajectory {
         Self {
             receipts: Some(receipts::Receipts::default()),
             scenario: Scenario::default(),
-            result: Estimate::default(),
+            result: Estimate {
+                accounting_basis: "receipt_anchored_v2".into(),
+                ..Estimate::default()
+            },
             previous: None,
             restored: 0,
             retired: 0,
@@ -284,6 +308,9 @@ impl Trajectory {
     }
 
     pub fn unmodeled_call(&mut self) {
+        if self.receipts.is_some() {
+            self.result.unavailable_primary_cost_calls += 1;
+        }
         self.start_priced_subset();
         self.result.coverage.primary_responses += 1;
         self.result.coverage.unmodeled_calls += 1;
