@@ -2173,6 +2173,98 @@ async fn branch_tenant_and_restart_are_explicit_and_credentials_are_not_persiste
 }
 
 #[tokio::test]
+async fn pending_primary_keeps_completed_dashboard_costs_through_restart() {
+    use axum::{Router, routing::post};
+    use std::sync::Arc;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let (gate, signal) = (release.clone(), started.clone());
+    let router = Router::new().route(
+        "/v1/responses",
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let (gate, signal) = (gate.clone(), signal.clone());
+            async move {
+                if body["metadata"]["hold"] == true {
+                    signal.notify_one();
+                    gate.notified().await;
+                }
+                axum::Json(json!({"status":"completed","output":[],"usage":{
+                "input_tokens":2000,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let state = tempfile::tempdir().unwrap();
+    let options = [
+        "--review-every-requests",
+        "100",
+        "--bootstrap-min-input-bytes",
+        "8388608",
+    ];
+    let (proxy, url) = start_proxy_options(state.path(), address, "audit", &options, "").await;
+    let mut request = json!({"model":"gpt-6-luna","input":[{"role":"user","content":"task"}]});
+    send(&url, &request, "held", "main")
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let stats = |url: String| async move {
+        reqwest::get(format!("{url}/carry/dashboard/stats"))
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    };
+    let before = stats(url.clone()).await;
+    assert!(before["cost_estimate"]["carry_cost"].as_f64().unwrap() > 0.0);
+    request["metadata"] = json!({"hold":true});
+    let primary = tokio::spawn({
+        let (url, request) = (url.clone(), request.clone());
+        async move {
+            send(&url, &request, "held", "main")
+                .await
+                .bytes()
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        let pending = stats(url.clone()).await;
+        assert_eq!(pending["sessions"][0]["processing"], true);
+        for field in [
+            "carry_cost",
+            "traditional_cost",
+            "savings",
+            "matched_primary_responses",
+            "included_sessions",
+            "excluded_sessions",
+        ] {
+            assert_eq!(
+                pending["cost_estimate"][field], before["cost_estimate"][field],
+                "held primary: {field}"
+            );
+        }
+    }
+    release.notify_one();
+    primary.await.unwrap();
+    let saved = settled(state.path()).await;
+    assert_eq!(saved[0]["completed_requests"], 2);
+    let after = stats(url).await;
+    drop(proxy);
+    let (_proxy, restarted_url) =
+        start_proxy_options(state.path(), address, "audit", &options, "").await;
+    let restarted = stats(restarted_url).await;
+    assert_eq!(restarted["cost_estimate"], after["cost_estimate"]);
+    server.abort();
+}
+
+#[tokio::test]
 async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
     use axum::{Router, response::IntoResponse, routing::post};
     use std::sync::Arc;
@@ -2267,12 +2359,23 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
             "savings_percent",
         ] {
             assert!(
-                estimate[field].is_null(),
-                "pending reviewer spend cannot be reported as {field}"
+                estimate[field].is_number(),
+                "completed {field} remains available"
             );
         }
-        assert!(stats["cost_estimate"]["savings"].is_null());
-        assert_eq!(stats["cost_estimate"]["excluded_sessions"], 1);
+        assert_eq!(estimate["in_flight_costs_excluded"], true);
+        assert_eq!(stats["cost_estimate"]["savings"], estimate["savings"]);
+        assert_eq!(stats["cost_estimate"]["included_sessions"], 1);
+        assert_eq!(stats["cost_estimate"]["excluded_sessions"], 0);
+        for _ in 0..2 {
+            let repeated: serde_json::Value = reqwest::get(format!("{url}/carry/dashboard/stats"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(repeated["cost_estimate"], stats["cost_estimate"]);
+        }
         request["input"]
             .as_array_mut()
             .unwrap()

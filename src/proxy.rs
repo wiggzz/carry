@@ -895,7 +895,10 @@ async fn resolved_catalog(
                 .is_some_and(|p| p.revision == format!("{:?}", config.classifier_cache_policy))
     });
     if let (Some(primary), Some(reviewer)) = (primary, reviewer) {
-        return Ok((primary.clone(), reviewer.clone()));
+        return Ok((
+            primary.clone().with_scenario_cache_policy(),
+            reviewer.clone().with_scenario_cache_policy(),
+        ));
     }
     let source = if config.codex_login {
         Some(
@@ -957,7 +960,10 @@ async fn resolved_catalog(
         freeze_reviewer_cache_policy(config, &mut resolved);
         resolved
     };
-    Ok((primary, reviewer))
+    Ok((
+        primary.with_scenario_cache_policy(),
+        reviewer.with_scenario_cache_policy(),
+    ))
 }
 
 fn freeze_reviewer_cache_policy(config: &ProxyCli, reviewer: &mut ResolvedModel) {

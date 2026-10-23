@@ -371,6 +371,26 @@ pub fn ordinary_policy(
     }
 }
 
+/// API-equivalent counterfactual assumptions, never transport entitlement.
+/// Frozen beside rates; absence on an old snapshot retains legacy provenance.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScenarioCachePolicy {
+    pub version: u32,
+    pub minimum_prefix_tokens: Option<u64>,
+    pub ttl_seconds: u64,
+}
+impl ScenarioCachePolicy {
+    pub fn for_model(model: &str) -> Self {
+        Self {
+            version: 1,
+            minimum_prefix_tokens: model_spec(model)
+                .and_then(|s| s.cache)
+                .map(|c| c.minimum_prefix_tokens as u64),
+            ttl_seconds: 1800,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ResolvedModel {
     pub schema_version: u32,
@@ -386,11 +406,42 @@ pub struct ResolvedModel {
     pub long_input_multiplier: Option<f64>,
     pub long_output_multiplier: Option<f64>,
     pub cache: Option<PromptCacheCapabilities>,
+    #[serde(default)]
+    pub scenario_cache_policy: Option<ScenarioCachePolicy>,
     pub explicit_cache_transport: bool,
     pub provenance: BTreeMap<String, Provenance>,
     pub raw_field_status: BTreeMap<String, String>,
 }
 impl ResolvedModel {
+    /// Upgrade only prospective assumptions at the resolution boundary. Existing
+    /// tariffs, route capability and historical monetary sums remain frozen.
+    pub fn with_scenario_cache_policy(mut self) -> Self {
+        if self.scenario_cache_policy.is_none() {
+            let policy = ScenarioCachePolicy::for_model(&self.model);
+            let known_model = model_spec(&self.model).is_some();
+            let status = if policy.minimum_prefix_tokens.is_some() {
+                "conditional_api_equivalent_model_policy_not_route_entitlement"
+            } else if known_model {
+                "no_modeled_cache_support"
+            } else {
+                "unknown_model_cache_policy"
+            };
+            self.scenario_cache_policy = Some(policy);
+            self.provenance.insert(
+                "scenario_cache".into(),
+                Provenance {
+                    source: "carry/src/model_catalog.json".into(),
+                    status: status.into(),
+                    revision: "traditional-cache-v1".into(),
+                    fetched_at: None,
+                    fallback_reason: None,
+                    operator_override: None,
+                },
+            );
+        }
+        self
+    }
+
     pub fn rates_for_input(&self, input: f64) -> Option<Rates> {
         let mut rates = self.rates?;
         if self
@@ -539,6 +590,7 @@ pub fn resolve_model(
         long_input_multiplier: long.map(|l| l.input_multiplier),
         long_output_multiplier: long.map(|l| l.output_multiplier),
         cache,
+        scenario_cache_policy: None,
         explicit_cache_transport: cache.is_some()
             && spec.is_some_and(|s| s.explicit_reviewer_cache),
         provenance: BTreeMap::from([
@@ -558,5 +610,6 @@ pub fn resolve_model(
             ),
         ]),
         raw_field_status: entry.map(|e| e.field_status.clone()).unwrap_or_default(),
-    })
+    }
+    .with_scenario_cache_policy())
 }

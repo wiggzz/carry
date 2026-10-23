@@ -45,6 +45,7 @@ const savingsText=e=>e?.savings==null?'Unavailable':money(e.savings)+(e.savings_
 const unpricedText=e=>fmt(e?.excluded_unpriced_calls||0)+(e?.excluded_unpriced_reviewer_calls?' ('+fmt(e.excluded_unpriced_reviewer_calls)+' reviewer-only)':'');
 const unpricedNote=e=>e?.excluded_unpriced_calls?' Priced calls only: '+fmt(e.excluded_unpriced_calls)+' unpriced calls excluded'+(e.excluded_unpriced_reviewer_calls?' ('+fmt(e.excluded_unpriced_reviewer_calls)+' reviewer-only)':'')+'; amounts and percentages are approximate.':'';
 const receiptNote=e=>e?.matched_primary_responses==null?'':' Receipt window: '+fmt(e.matched_primary_responses)+' matched primary responses. Observed v2 subtotal: '+money(e.observed_primary_cost==null&&e.observed_reviewer_cost==null?null:(e.observed_primary_cost||0)+(e.observed_reviewer_cost||0))+'. Unknown actual costs: '+fmt(e.unavailable_primary_cost_calls||0)+' primary, '+fmt(e.unavailable_reviewer_cost_calls||0)+' reviewer.';
+const cachePolicyNote=e=>e?.counterfactual_cache_policy==='legacy_route_cache_v0'?' Legacy route-cache assumptions; historical estimates not repaired.':e?.counterfactual_cache_policy==='mixed_legacy_route_v0_and_model_v1'?' Mixed cache policies: legacy estimates retained unchanged; corrected model policy applies prospectively.':e?.counterfactual_cache_policy==='conditional_model_cache_v1'?' Conditional model cache v1 (not route entitlement).':'';
 const compact=n=>Number(n)>=1000?(Number(n)/1000).toLocaleString(undefined,{maximumFractionDigits:1})+'k':fmt(Math.ceil(Number(n)));
 const backgroundTypes=new Set(['background']);
 const sourceNames={conversation:'Conversation',agent:'Agent',background:'Client background request'};
@@ -68,9 +69,9 @@ async function refresh(){
   const estimate=data.cost_estimate||{};
   const included=estimate.included_sessions||0,excluded=estimate.excluded_sessions||0;
   const excludedFailed=estimate.excluded_failed_calls||0;
-  $('estimate-coverage').textContent='Includes '+fmt(included)+' of '+fmt(included+excluded)+' sessions; '+fmt(excluded)+' excluded because comparable estimates are unavailable.'+(estimate.legacy_sessions?' '+fmt(estimate.legacy_sessions)+' legacy JSON sessions excluded from receipt-anchored totals.':'')+(excludedFailed?' Successful requests only: '+fmt(excludedFailed)+' failed calls excluded.':'')+unpricedNote(estimate)+receiptNote(estimate)+' Totals include conversation histories and client background requests.';
+  $('estimate-coverage').textContent='Includes '+fmt(included)+' of '+fmt(included+excluded)+' sessions; '+fmt(excluded)+' excluded because comparable estimates are unavailable.'+(estimate.legacy_sessions?' '+fmt(estimate.legacy_sessions)+' legacy JSON sessions excluded from receipt-anchored totals.':'')+(estimate.legacy_cache_policy_sessions||estimate.mixed_cache_policy_sessions?' Included cache policies: '+fmt(estimate.legacy_cache_policy_sessions||0)+' legacy, '+fmt(estimate.mixed_cache_policy_sessions||0)+' mixed; historical estimates not repaired.':'')+(estimate.in_flight_sessions?' In-flight costs are not included; completed costs remain visible.':'')+(excludedFailed?' Successful requests only: '+fmt(excludedFailed)+' failed calls excluded.':'')+unpricedNote(estimate)+receiptNote(estimate)+' Totals include conversation histories and client background requests.';
   const scenario=data.cost_scenario;
-  $('assumptions').textContent=scenario?'Receipt-anchored v2: actual primary and reviewer costs use provider-observed input/cache/write/output and dispatch-frozen API-equivalent tariffs, not invoices or measured causal savings. Traditional input shares the receipt basis plus estimated restoration, summaries and retained output. Traditional scenario: '+fmt(scenario.context_window)+'-token assumed window, '+fmt(scenario.reserve)+' reserve; after each completed response crossing the threshold, keep '+fmt(scenario.keep_recent)+' recent tokens plus a '+fmt(scenario.summary)+'-token summary. Counterfactual cache reuse is conditional on compatible append, route/key and 30-minute expiry; unknown cache capability assumes uncached. Discontinuities start a new comparison epoch. Legacy JSON sums are separate.':'';
+  $('assumptions').textContent=scenario?'Receipt-anchored v2: actual primary and reviewer costs use provider-observed input/cache/write/output and dispatch-frozen API-equivalent tariffs, not invoices or measured causal savings. Traditional input shares the receipt basis plus estimated restoration, summaries and retained output. Traditional scenario: '+fmt(scenario.context_window)+'-token assumed window, '+fmt(scenario.reserve)+' reserve; after each completed response crossing the threshold, keep '+fmt(scenario.keep_recent)+' recent tokens plus a '+fmt(scenario.summary)+'-token summary. Counterfactual cache reuse uses the dispatch-frozen API-equivalent model policy (not route entitlement), conditional on compatible append, route/key and 30-minute expiry; unknown model policy assumes uncached. Carry-only rewrites do not clear the traditional cache; traditional summaries make its next request cold. Discontinuities start a new comparison epoch. Old and mixed cache-policy sums are labeled, never retroactively repaired. Legacy JSON sums are separate.':'';
   const recent=sessions.filter(s=>s.updated_at && Date.now()/1000-s.updated_at<300).length;
   $('cards').replaceChildren(...[
    ['Estimated savings · all time',savingsText(estimate)],
@@ -91,7 +92,7 @@ async function refresh(){
   const sorted=[...sessions].sort((a,b)=>(b.updated_at||0)-(a.updated_at||0));
   const renderSession=(s,grouped=false)=>{
    const e=s.cost_estimate;
-   const savings=(e?.accounting_basis==='legacy_json_v1'?'Legacy JSON v1 · ':e?.accounting_basis==='receipt_anchored_v2'?'Receipt-anchored v2 · ':'')+savingsText(e)+(e?.savings!=null&&e.excluded_failed_calls?' · successful requests only ('+fmt(e.excluded_failed_calls)+' failed calls excluded)':'')+(e?.savings!=null?unpricedNote(e):'')+(e?.accounting_basis==='receipt_anchored_v2'?receiptNote(e):'')+(e?.legacy_estimate?' · separate legacy JSON sums retained':'');
+   const savings=(e?.accounting_basis==='legacy_json_v1'?'Legacy JSON v1 · ':e?.accounting_basis==='receipt_anchored_v2'?'Receipt-anchored v2 · ':'')+savingsText(e)+(e?.savings!=null&&e.excluded_failed_calls?' · successful requests only ('+fmt(e.excluded_failed_calls)+' failed calls excluded)':'')+(e?.savings!=null?unpricedNote(e):'')+(e?.accounting_basis==='receipt_anchored_v2'?receiptNote(e):'')+cachePolicyNote(e)+(e?.legacy_estimate?' · separate legacy JSON sums retained':'');
    const issues=[];
    if(e?.savings==null&&e?.excluded_unpriced_calls)issues.push(unpricedNote(e).trim());
    const unknown=[...new Set([...(s.primary.unpriced_models||[]),...(s.shadow.unpriced_models||[])])];
@@ -102,9 +103,9 @@ async function refresh(){
     else if(coverage.unknown_cache_requests)issues.push('Savings exclude this session: unknown model or cache behavior');
     else if(coverage.missing_usage)issues.push('Savings exclude this session: missing usage');
     else if(coverage.prior_untracked_calls)issues.push('Savings exclude this session: earlier calls were not tracked');
-    else if(s.background_review_pending)issues.push('Savings pending reviewer completion');
     else issues.push('Savings estimate incomplete');
    }
+   if(s.processing||s.background_review_pending)issues.push('In-flight costs are not included; completed costs remain visible.');
    const missing=(s.primary.unavailable_cost_calls||0)+(s.shadow.unavailable_cost_calls||0);
    if(missing)issues.push(fmt(missing)+' unpriced calls');
    if(s.failed_primaries)issues.push(fmt(s.failed_primaries)+' incomplete requests'+(s.last_failure?' · '+s.last_failure.reason:' (cancellation or failure; older details unavailable)'));

@@ -133,7 +133,7 @@ fn receipt_restoration_selects_each_branch_tariff_without_repricing_actuals() {
         true,
     );
     let after = t.snapshot();
-    let expected = scenario_input_cost("gpt-6.1-sol", 300_000, 0, Some(1024)).unwrap()
+    let expected = scenario_input_cost("gpt-6.1-sol", 300_000, 200_000, Some(1024)).unwrap()
         + scenario_output_cost_resolved("gpt-6.1-sol", 300_000, 10, None).unwrap();
     assert!(
         (after.traditional_cost - before.traditional_cost - expected).abs() < 1e-12,
@@ -152,7 +152,14 @@ fn receipt_restoration_selects_each_branch_tariff_without_repricing_actuals() {
 
 #[test]
 fn receipt_counterfactual_cache_is_conditional_not_copied_from_actual_hits() {
-    for (input, delay) in [(500, 1), (2000, 1), (2000, 1800)] {
+    for (input, delay) in [
+        (500, 1),
+        (1023, 1),
+        (1024, 1),
+        (2000, 1),
+        (2000, 1799),
+        (2000, 1800),
+    ] {
         let mut t = Trajectory::default();
         t.primary(&body(), &terminal(input, input, 0, 0), "route", 100, true);
         let before = t.snapshot();
@@ -282,6 +289,408 @@ fn receipt_pending_preserves_completed_costs_and_aggregate_scope() {
     assert_eq!(aggregate["carry_cost"], settled["carry_cost"]);
     let empty = serde_json::to_value(Trajectory::default().snapshot().dashboard(true)).unwrap();
     assert!(empty["carry_cost"].is_null());
+}
+
+#[test]
+fn receipt_frozen_scenario_policy_and_tariff_survive_restart_without_route_credit() {
+    use carry::models::{Route, resolve_model};
+    let mut resolved = resolve_model(
+        "gpt-6.1-sol",
+        Route::new("https://chatgpt.com/backend-api/codex/responses", true),
+        None,
+        None,
+        0,
+        0,
+    )
+    .unwrap();
+    assert!(resolved.cache.is_none());
+    assert!(!resolved.explicit_cache_transport);
+    resolved.rates.as_mut().unwrap().input = 7.0;
+    resolved.rates.as_mut().unwrap().write = 9.0;
+    resolved.rates.as_mut().unwrap().cached = 0.1;
+    let policy = resolved.scenario_cache_policy.as_mut().unwrap();
+    policy.minimum_prefix_tokens = Some(1500);
+    policy.ttl_seconds = 7;
+    let mut t = Trajectory::default();
+    t.primary_resolved(
+        &body(),
+        &terminal(2000, 1000, 0, 0),
+        "route",
+        100,
+        true,
+        Some(&resolved),
+    );
+    assert!((t.snapshot().traditional_cost - 0.018).abs() < 1e-12);
+    let checkpoint = json!({"trajectory":t,"resolved":resolved});
+    let mut t: Trajectory = serde_json::from_value(checkpoint["trajectory"].clone()).unwrap();
+    let resolved: ResolvedModel = serde_json::from_value(checkpoint["resolved"].clone()).unwrap();
+    let mut b = body();
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"next"}));
+    t.primary_resolved(
+        &b,
+        &terminal(2100, 0, 0, 0),
+        "route",
+        106,
+        true,
+        Some(&resolved),
+    );
+    assert!((t.snapshot().traditional_cost - 0.0191).abs() < 1e-12);
+    let before = t.snapshot();
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"expired"}));
+    t.primary_resolved(
+        &b,
+        &terminal(2200, 0, 0, 0),
+        "route",
+        113,
+        true,
+        Some(&resolved),
+    );
+    assert!((t.snapshot().traditional_cost - before.traditional_cost - 0.0198).abs() < 1e-12);
+}
+
+#[test]
+fn receipt_policy_upgrade_freezes_legacy_segment_and_starts_cold() {
+    use carry::models::{Route, resolve_model};
+    let current = resolve_model(
+        "gpt-6.1-sol",
+        Route::new("https://chatgpt.com/backend-api/codex/responses", true),
+        None,
+        None,
+        0,
+        0,
+    )
+    .unwrap();
+    let mut old_resolution = serde_json::to_value(&current).unwrap();
+    old_resolution
+        .as_object_mut()
+        .unwrap()
+        .remove("scenario_cache_policy");
+    old_resolution["provenance"]
+        .as_object_mut()
+        .unwrap()
+        .remove("scenario_cache");
+    let old_resolution: ResolvedModel = serde_json::from_value(old_resolution).unwrap();
+    let mut t = Trajectory::default();
+    t.primary_resolved(
+        &body(),
+        &terminal(2000, 1000, 0, 0),
+        "route",
+        100,
+        true,
+        Some(&old_resolution),
+    );
+    let mut old = state(&t);
+    old["receipts"]
+        .as_object_mut()
+        .unwrap()
+        .remove("scenario_cache_policy_version");
+    old["receipts"]
+        .as_object_mut()
+        .unwrap()
+        .remove("traditional_anchor");
+    old["result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("legacy_cache_policy_segment");
+    old["result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("counterfactual_cache_policy");
+    let mut t: Trajectory = serde_json::from_value(old).unwrap();
+    let before = t.snapshot();
+    assert_eq!(before.counterfactual_cache_policy, "legacy_route_cache_v0");
+    let upgraded = old_resolution.with_scenario_cache_policy();
+    assert_eq!(
+        serde_json::to_value(upgraded.rates).unwrap(),
+        serde_json::to_value(current.rates).unwrap()
+    );
+    assert!(upgraded.cache.is_none());
+    let mut b = body();
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"new policy"}));
+    t.primary_resolved(
+        &b,
+        &terminal(2100, 0, 0, 0),
+        "route",
+        101,
+        true,
+        Some(&upgraded),
+    );
+    let mixed = t.snapshot();
+    assert_eq!(
+        mixed.counterfactual_cache_policy,
+        "mixed_legacy_route_v0_and_model_v1"
+    );
+    let segment = mixed.legacy_cache_policy_segment.as_ref().unwrap();
+    assert_eq!(segment.traditional_cost, before.traditional_cost);
+    assert_eq!(segment.carry_cost, before.carry_cost);
+    assert_eq!(
+        segment.matched_primary_responses,
+        before.matched_primary_responses
+    );
+    let cold = scenario_input_cost("gpt-6.1-sol", 2100, 0, Some(1024)).unwrap();
+    assert!((mixed.traditional_cost - before.traditional_cost - cold).abs() < 1e-12);
+    let mut t: Trajectory = serde_json::from_value(state(&t)).unwrap();
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"warm"}));
+    t.primary_resolved(
+        &b,
+        &terminal(2200, 0, 0, 0),
+        "route",
+        102,
+        true,
+        Some(&upgraded),
+    );
+    let after = t.snapshot();
+    let warm = scenario_input_cost("gpt-6.1-sol", 2200, 2100, Some(1024)).unwrap();
+    assert!((after.traditional_cost - mixed.traditional_cost - warm).abs() < 1e-12);
+    assert_eq!(
+        serde_json::to_value(after.legacy_cache_policy_segment).unwrap(),
+        serde_json::to_value(mixed.legacy_cache_policy_segment).unwrap()
+    );
+    assert_eq!(after.coverage.primary_responses, 3);
+    assert_eq!(after.matched_primary_responses, 3);
+}
+
+#[test]
+fn receipt_traditional_cache_invalidations_are_independent_and_conservative() {
+    use carry::models::{Route, resolve_model};
+    for variant in [
+        "instructions",
+        "tools",
+        "cache_key",
+        "route",
+        "auth",
+        "tier",
+        "model",
+        "fork",
+        "unknown_call",
+        "backward_time",
+        "edit",
+    ] {
+        let mut resolved = resolve_model(
+            "gpt-6.1-sol",
+            Route::new("https://api.openai.com/v1/responses", false),
+            None,
+            None,
+            0,
+            0,
+        )
+        .unwrap();
+        let mut t = Trajectory::default();
+        t.primary_resolved(
+            &body(),
+            &terminal(2000, 0, 0, 0),
+            "route",
+            100,
+            true,
+            Some(&resolved),
+        );
+        let before = t.snapshot();
+        let mut b = body();
+        b["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"append"}));
+        let mut route = "route";
+        let mut at = 101;
+        match variant {
+            "instructions" => b["instructions"] = json!("new"),
+            "tools" => b["tools"] = json!([{"type":"function","name":"new"}]),
+            "cache_key" => b["prompt_cache_key"] = json!("new"),
+            "route" => route = "other",
+            "auth" => resolved.route = Route::new("https://api.openai.com/v1/responses", true),
+            "tier" => resolved.route.processing_tier = "priority".into(),
+            "model" => {
+                b["model"] = json!("gpt-6-luna");
+                resolved =
+                    resolve_model("gpt-6-luna", resolved.route.clone(), None, None, 0, 0).unwrap();
+            }
+            "fork" => t.reset_epoch(),
+            "unknown_call" => t.failed_call(),
+            "backward_time" => at = 99,
+            "edit" => b["input"][0]["content"] = json!("unannounced edit"),
+            _ => unreachable!(),
+        }
+        t.primary_resolved(
+            &b,
+            &terminal(2100, 0, 0, 0),
+            route,
+            at,
+            true,
+            Some(&resolved),
+        );
+        let expected = scenario_input_cost_resolved(
+            b["model"].as_str().unwrap(),
+            2100,
+            0,
+            Some(1024),
+            Some(&resolved),
+        )
+        .unwrap();
+        assert!(
+            (t.snapshot().traditional_cost - before.traditional_cost - expected).abs() < 1e-12,
+            "{variant}: must be cold"
+        );
+    }
+}
+
+#[test]
+fn receipt_traditional_summary_is_cold_then_rewarms_its_own_prefix() {
+    let mut t = Trajectory {
+        scenario: Scenario {
+            context_window: 4000,
+            reserve: 100,
+            keep_recent: 1500,
+            summary: 100,
+        },
+        ..Trajectory::default()
+    };
+    let mut r = terminal(3800, 0, 0, 0);
+    r["output"] = json!([{"type":"message", "role":"assistant", "content":[{"type":"output_text","text":"visible ".repeat(1000)}]}]);
+    let mut b = body();
+    t.primary(&b, &r, "route", 100, true);
+    assert_eq!(t.snapshot().traditional_compactions, 1);
+    let before = t.snapshot();
+    for (at, input, traditional_input, cached) in [(101, 3900, 1700, 0), (102, 4000, 1800, 1700)] {
+        b["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"next"}));
+        let prior = t.snapshot();
+        t.primary(&b, &terminal(input, 0, 0, 0), "route", at, true);
+        let expected =
+            scenario_input_cost("gpt-6.1-sol", traditional_input, cached, Some(1024)).unwrap();
+        assert!((t.snapshot().traditional_cost - prior.traditional_cost - expected).abs() < 1e-12);
+        assert_eq!(
+            t.snapshot().traditional_compactions,
+            before.traditional_compactions
+        );
+    }
+}
+
+#[test]
+fn receipt_traditional_summary_is_cold_once_then_warms_its_own_prefix() {
+    let mut t = Trajectory {
+        scenario: Scenario {
+            context_window: 3000,
+            reserve: 100,
+            keep_recent: 1200,
+            summary: 20,
+        },
+        ..Trajectory::default()
+    };
+    let mut b = body();
+    t.primary(&b, &terminal(3000, 3000, 0, 0), "route", 100, true);
+    assert_eq!(t.snapshot().traditional_compactions, 1);
+    let before = t.snapshot();
+    let mut t: Trajectory = serde_json::from_value(state(&t)).unwrap();
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"after summary"}));
+    t.primary(&b, &terminal(3100, 3000, 0, 0), "route", 101, true);
+    let cold = t.snapshot();
+    assert!(
+        (cold.traditional_cost
+            - before.traditional_cost
+            - scenario_input_cost("gpt-6.1-sol", 1320, 0, Some(1024)).unwrap())
+        .abs()
+            < 1e-12
+    );
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"warm summary"}));
+    t.primary(&b, &terminal(3200, 0, 0, 0), "route", 102, true);
+    assert!(
+        (t.snapshot().traditional_cost
+            - cold.traditional_cost
+            - scenario_input_cost("gpt-6.1-sol", 1420, 1320, Some(1024)).unwrap())
+        .abs()
+            < 1e-12
+    );
+    assert_eq!(t.snapshot().traditional_compactions, 1);
+}
+
+#[test]
+fn receipt_unknown_scenario_cache_policy_stays_uncached_and_unknown_rates_stay_unpriced() {
+    use carry::models::{Route, resolve_model};
+    let mut resolved = resolve_model(
+        "gpt-6.1-sol",
+        Route::new("https://api.openai.com/v1/responses", false),
+        None,
+        None,
+        0,
+        0,
+    )
+    .unwrap();
+    resolved
+        .scenario_cache_policy
+        .as_mut()
+        .unwrap()
+        .minimum_prefix_tokens = None;
+    let mut t = Trajectory::default();
+    let mut b = body();
+    for at in 100..102 {
+        b["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"append"}));
+        t.primary_resolved(
+            &b,
+            &terminal(2000, 2000, 0, 0),
+            "route",
+            at,
+            true,
+            Some(&resolved),
+        );
+    }
+    let expected = scenario_input_cost("gpt-6.1-sol", 2000, 0, None).unwrap();
+    assert!((t.snapshot().traditional_cost - 2.0 * expected).abs() < 1e-12);
+    assert_eq!(t.snapshot().coverage.unknown_cache_requests, 2);
+    let unknown = resolve_model(
+        "not-a-known-model",
+        Route::new("https://api.openai.com/v1/responses", false),
+        None,
+        Some(10000),
+        0,
+        0,
+    )
+    .unwrap();
+    assert!(
+        unknown
+            .scenario_cache_policy
+            .as_ref()
+            .unwrap()
+            .minimum_prefix_tokens
+            .is_none()
+    );
+    assert!(unknown.cache.is_none());
+    b["model"] = json!("not-a-known-model");
+    let mut t = Trajectory::default();
+    t.primary_resolved(
+        &b,
+        &terminal(2000, 1000, 0, 0),
+        "route",
+        100,
+        true,
+        Some(&unknown),
+    );
+    let public = serde_json::to_value(t.snapshot().dashboard(true)).unwrap();
+    assert!(public["carry_cost"].is_null());
+    assert!(public["observed_primary_cost"].is_null());
+    assert_eq!(public["coverage"]["unknown_rate_calls"], 1);
 }
 
 #[test]
