@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.14.0](https://github.com/wiggzz/carry/compare/v0.13.0...v0.14.0) (2026-10-23)
+
+
+### Features
+
+* **proxy:** plan reviewer compaction with catalog-aware costs and keep leases ([#163](https://github.com/wiggzz/carry/issues/163)) ([0d440d7](https://github.com/wiggzz/carry/commit/0d440d789ec478321ad41fae293e91be3fa482bd))
+
+
+### Bug Fixes
+
+* **proxy:** deduplicate reviewer control observations ([#164](https://github.com/wiggzz/carry/issues/164)) ([e58478e](https://github.com/wiggzz/carry/commit/e58478e628d787ba4ad77c76c3280beea7d20b47))
+
 ## [0.13.0](https://github.com/wiggzz/carry/compare/v0.12.1...v0.13.0) (2026-10-19)
 
 
