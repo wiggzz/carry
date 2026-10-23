@@ -1366,6 +1366,7 @@ fn parse_group(value: &Value) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("proxy_omission_tests.rs");
 
     #[test]
     fn current_task_is_not_duplicated_in_the_reviewer_nudge() {

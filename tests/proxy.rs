@@ -1555,6 +1555,10 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     assert!(!sent.to_string().contains("DISCARD_SOURCE_PAYLOAD_"));
     assert!(!sent.to_string().contains("opaque-reasoning"));
     assert!(sent.to_string().contains("both tools succeeded"));
+    assert_eq!(
+        sent["input"][1],
+        json!({"role":"user","content":"[Earlier conversation omitted by Carry; retained messages remain in original order.]"})
+    );
     assert!(sent.to_string().contains("preserve requirement"));
     assert_eq!(sent["input"].as_array().unwrap().len(), 5);
     let states = std::fs::read_dir(temp.path())

@@ -205,6 +205,12 @@ async fn background_commit_admission_control_for_import(kind: &str, bootstrap: b
         "merge retains the complete primary suffix and cohorts"
     );
     assert!(merged.memories.is_empty());
+    if kind == "partial" {
+        assert!(
+            !merged.drop_authorized(merged.groups().iter().find(|g| g.id == 2).unwrap()),
+            "rejected background replacement must preserve the supporting source"
+        );
+    }
     assert_eq!(merged.review_feedback["accepted_memories"], 0);
     assert_eq!(
         merged.review_feedback["accepted_opinions"],
