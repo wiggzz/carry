@@ -286,6 +286,10 @@ fn receipt_bounded_anchor_restart_and_legacy_window_do_not_reprice_history() {
     let before = old.snapshot();
     let old_public = serde_json::to_value(old.snapshot().dashboard(false)).unwrap();
     assert_eq!(old_public["accounting_basis"], "legacy_json_v1");
+    assert_eq!(
+        old_public["counterfactual_basis"],
+        "legacy_local_json_projection"
+    );
     let mut totals = DashboardTotals::default();
     totals.observe(&old.snapshot().dashboard(false));
     totals.observe(&t.snapshot().dashboard(false));
