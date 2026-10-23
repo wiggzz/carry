@@ -307,9 +307,9 @@ async fn missing_subscription_entry_uses_one_catalog_for_reviewer_plan_dashboard
     })
     .await
     .expect("reviewer must actually run and settle");
-    assert_dashboard_capacity(&url, 272000, 272000).await;
+    assert_dashboard_capacity(&url, 1050000, 1050000).await;
     let (path, checkpoint) = saved(state.path());
-    assert_eq!(checkpoint["last_plan"]["reviewer_context_tokens"], 272000);
+    assert_eq!(checkpoint["last_plan"]["reviewer_context_tokens"], 1050000);
     assert_eq!(
         checkpoint["model_resolution"]["reviewer"]["rates"],
         c["reviewer"]["rates"]
@@ -333,7 +333,7 @@ async fn missing_subscription_entry_uses_one_catalog_for_reviewer_plan_dashboard
         }
         std::fs::write(&path, serde_json::to_vec(&restored).unwrap()).unwrap();
         let (child, url) = start(f.home.path(), state.path(), f.address, true, &args).await;
-        assert_dashboard_capacity(&url, 272000, 272000).await;
+        assert_dashboard_capacity(&url, 1050000, 1050000).await;
         body["input"]
             .as_array_mut()
             .unwrap()
@@ -344,8 +344,8 @@ async fn missing_subscription_entry_uses_one_catalog_for_reviewer_plan_dashboard
             after["model_resolution"]["reviewer"]["capacity_tokens"],
             1050000
         );
-        assert_eq!(after["last_plan"]["reviewer_context_tokens"], 272000);
-        assert_dashboard_capacity(&url, 272000, 272000).await;
+        assert_eq!(after["last_plan"]["reviewer_context_tokens"], 1050000);
+        assert_dashboard_capacity(&url, 1050000, 1050000).await;
         assert!(
             after["primary"]["cost_usd"].as_f64().unwrap()
                 >= restored["primary"]["cost_usd"].as_f64().unwrap()

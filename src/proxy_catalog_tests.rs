@@ -3,6 +3,39 @@
 use super::*;
 
 #[test]
+fn reviewer_catalog_capacity_and_tier_drive_real_fit_checks_without_role_defaults() {
+    let mut config = reviewer_config();
+    let route = Route::new("https://chatgpt.com/backend-api/codex/responses", true);
+    let reviewer = resolve_model("gpt-6-luna", route.clone(), None, None, 300000, 2048, 0).unwrap();
+    let primary = resolve_model("gpt-6-sol", route, None, None, 272000, 16384, 0).unwrap();
+    config.classifier_max_input_tokens = reviewer.capacity_tokens;
+    config.context_margin_percent = 0;
+    config.classifier_max_output_tokens = 2048;
+    config.model_resolution = Some(ResolvedPair {
+        schema_version: 1,
+        primary,
+        reviewer,
+    });
+    let body =
+        json!({"model":"gpt-6-luna","input":[{"role":"user","content":"word ".repeat(350000)}]});
+    let required = reviewer_required_tokens(&config, &body);
+    assert!(required > 300000.0 && required < 1050000.0);
+    assert!(
+        review_fits(&config, &body),
+        "catalog capacity, not the old reviewer role limit or cheap-tier boundary, controls feasibility"
+    );
+    let short = reviewer_rates(&config, 272000.0).unwrap();
+    let long = reviewer_rates(&config, estimate(&body)).unwrap();
+    assert_eq!(long.input, short.input * 2.0);
+    assert!((long.output - short.output * 1.5).abs() < 1e-18);
+    config.classifier_max_input_tokens = required.floor() as u32 - 1;
+    assert!(
+        !review_fits(&config, &body),
+        "actual resolved capacity remains enforced"
+    );
+}
+
+#[test]
 fn stale_background_receipts_keep_the_dispatched_frozen_tariff_not_current_slug_or_epoch() {
     let (config, mut before, _) = fixture(Rates {
         input: 7.0,
