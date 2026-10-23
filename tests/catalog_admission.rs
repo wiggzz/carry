@@ -359,6 +359,39 @@ async fn missing_subscription_entry_uses_one_catalog_for_reviewer_plan_dashboard
 }
 
 #[tokio::test]
+async fn unknown_reviewer_context_does_not_block_a_fitting_known_primary() {
+    let f = Fixture::new().await;
+    let state = tempfile::tempdir().unwrap();
+    let (_child, url) = start(
+        f.home.path(),
+        state.path(),
+        f.address,
+        true,
+        &[
+            "--classifier-model",
+            "unlisted-reviewer",
+            "--review-replayed-history",
+        ],
+    )
+    .await;
+    let body = json!({"model":"gpt-6-sol","input":[
+        {"role":"user","content":"previous task"},
+        {"role":"assistant","content":"completed source"},
+        {"role":"user","content":"continue"}
+    ],"max_output_tokens":10});
+    assert_eq!(
+        send(&url, "unknown-reviewer", &body).await,
+        200,
+        "missing auxiliary reviewer capacity must not block primary progress"
+    );
+    let (_, checkpoint) = saved(state.path());
+    assert!(checkpoint["model_resolution"]["reviewer"]["capacity_tokens"].is_null());
+    assert!(checkpoint["last_plan"]["reviewer_context_tokens"].is_null());
+    assert_eq!(f.primary_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.review_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
     let f = Fixture::new().await;
     let state = tempfile::tempdir().unwrap();
