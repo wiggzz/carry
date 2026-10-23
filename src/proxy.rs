@@ -2751,7 +2751,7 @@ fn merge_review(
                     resolved,
                 );
             } else {
-                t.failed_call();
+                t.failed_reviewer_call();
             }
         }
     }
@@ -3485,7 +3485,7 @@ async fn review_chunk(
         session.shadow.calls += 1;
         session.shadow.unavailable_cost_calls += 1;
         if let Some(trajectory) = &mut session.cost_trajectory {
-            trajectory.failed_call();
+            trajectory.failed_reviewer_call();
         }
     }
     if valid

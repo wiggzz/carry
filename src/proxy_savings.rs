@@ -364,10 +364,19 @@ impl Trajectory {
 
     pub fn failed_call(&mut self) {
         if let Some(receipts) = &mut self.receipts {
-            // A failed attempt cannot promise reuse, but must not discard the
+            // A failed primary cannot promise reuse, but must not discard the
             // successful scenario's restoration or hypothetical summary.
             receipts.invalidate();
         }
+        self.record_failed_call();
+    }
+
+    pub fn failed_reviewer_call(&mut self) {
+        // Carry-only work did not touch either primary history or its cache.
+        self.record_failed_call();
+    }
+
+    fn record_failed_call(&mut self) {
         self.result.coverage.failed_calls += 1;
         if self.successful_requests_only {
             self.result.excluded_failed_calls += 1;
@@ -426,7 +435,7 @@ impl Trajectory {
         resolved: Option<&ResolvedModel>,
     ) {
         if response["status"] != "completed" {
-            self.failed_call();
+            self.failed_reviewer_call();
             return;
         }
         self.reviewer_usage_resolved(
