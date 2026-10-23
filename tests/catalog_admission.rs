@@ -260,6 +260,101 @@ async fn assert_dashboard_capacity(url: &str, primary: u64, reviewer: u64) {
 }
 
 #[tokio::test]
+async fn missing_subscription_entry_uses_one_catalog_for_reviewer_plan_dashboard_and_restart() {
+    let f = Fixture::new().await;
+    // Reproduce the deployed mismatch: inference uses GPT-6 IDs, while model
+    // discovery lists only the older family. These are not aliases.
+    *f.metadata.lock().await = json!({"models":[
+        {"slug":"gpt-5.6-luna","visibility":"list","context_window":272000}
+    ]});
+    let state = tempfile::tempdir().unwrap();
+    let mut body = json!({"model":"gpt-6.1-sol","input":[
+        {"role":"user","content":"retained goal"},
+        {"role":"assistant","content":"completed synthetic source"},
+        {"role":"user","content":"next task"}
+    ],"max_output_tokens":10});
+    let args = [
+        "--review-replayed-history",
+        "--review-every-requests",
+        "1",
+        "--review-min-primary-tokens",
+        "0",
+        "--review-min-new-tokens",
+        "0",
+    ];
+    let (child, url) = start(f.home.path(), state.path(), f.address, true, &args).await;
+    let c = catalog(&url).await;
+    assert_eq!(
+        c["reviewer"]["capacity_tokens"], 1050000,
+        "known reviewer must resolve its catalog capacity, not the 300K role fallback"
+    );
+    assert!(
+        c["reviewer"]["raw"]["context_window"].is_null(),
+        "catalog policy must not fabricate an upstream discovery fact"
+    );
+    assert_eq!(c["reviewer"]["ordinary"]["total_budget"], 272000);
+    assert_eq!(send(&url, "unified", &body).await, 200);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (_, checkpoint) = saved(state.path());
+            if checkpoint["background_review_pending"] == false
+                && checkpoint["shadow"]["calls"].as_u64().unwrap_or(0) > 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reviewer must actually run and settle");
+    assert_dashboard_capacity(&url, 272000, 272000).await;
+    let (path, checkpoint) = saved(state.path());
+    assert_eq!(checkpoint["last_plan"]["reviewer_context_tokens"], 272000);
+    assert_eq!(
+        checkpoint["model_resolution"]["reviewer"]["rates"],
+        c["reviewer"]["rates"]
+    );
+    assert!(f.review_calls.load(Ordering::SeqCst) > 0);
+    drop(child);
+    // A restart, an old fallback snapshot, and an unresolved legacy checkpoint
+    // must all use the current catalog for FUTURE policy, not reprice the past.
+    for legacy in [false, true] {
+        let mut restored = checkpoint.clone();
+        if legacy {
+            restored.as_object_mut().unwrap().remove("model_resolution");
+        } else {
+            for (role, capacity) in [("primary", 272000), ("reviewer", 300000)] {
+                restored["model_resolution"][role]["capacity_tokens"] = json!(capacity);
+                restored["model_resolution"][role]["provenance"]["capacity"]["status"] =
+                    json!("fallback");
+                restored["model_resolution"][role]["provenance"]["capacity"]["source"] =
+                    json!("conservative-role-capacity-v1");
+            }
+        }
+        std::fs::write(&path, serde_json::to_vec(&restored).unwrap()).unwrap();
+        let (child, url) = start(f.home.path(), state.path(), f.address, true, &args).await;
+        assert_dashboard_capacity(&url, 272000, 272000).await;
+        body["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"continue"}));
+        assert_eq!(send(&url, "unified", &body).await, 200);
+        let (_, after) = saved(state.path());
+        assert_eq!(
+            after["model_resolution"]["reviewer"]["capacity_tokens"],
+            1050000
+        );
+        assert_eq!(after["last_plan"]["reviewer_context_tokens"], 272000);
+        assert_dashboard_capacity(&url, 272000, 272000).await;
+        assert!(
+            after["primary"]["cost_usd"].as_f64().unwrap()
+                >= restored["primary"]["cost_usd"].as_f64().unwrap()
+        );
+        drop(child);
+    }
+}
+
+#[tokio::test]
 async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
     let f = Fixture::new().await;
     let state = tempfile::tempdir().unwrap();
