@@ -1256,7 +1256,8 @@ class StateRegressions(unittest.TestCase):
         saved = proxy.saved()
         self.assertEqual([m["text"] for m in saved["memories"]], [small])
         self.assertEqual(saved["opinions"].get("1"), "keep")
-        self.assertEqual(saved["opinions"].get("2"), "drop")
+        self.assertEqual(saved["opinions"].get("2"), "keep",
+                         "a small sibling does not prove it replaces the rejected fact")
         self.assertEqual(saved["review_feedback"]["rejected_count"], 1)
         self.assertEqual(saved["review_feedback"]["rejected"][0]["index"], 0)
         proxy.close()

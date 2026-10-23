@@ -192,7 +192,14 @@ async fn bootstrap_multichunk_commit_control(memory_first: bool) {
             .is_empty(),
         "the valid-empty chunk still covers its ordinary source"
     );
-    assert_eq!(merged.review_admission.as_ref().unwrap().no_yield_streak, 1);
+    // The rejected replacement now preserves its source: protection progress,
+    // not removal yield. The valid-empty chunk's coverage remains independent.
+    assert_eq!(merged.review_admission.as_ref().unwrap().no_yield_streak, 0);
+    let source = if memory_first { 2 } else { 4 };
+    assert_eq!(
+        merged.opinions.get(&source).map(String::as_str),
+        Some("keep")
+    );
     let restarted = checkpoint_service(directory.path());
     drop(service);
     assert_eq!(

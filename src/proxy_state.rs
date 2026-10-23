@@ -1108,6 +1108,15 @@ impl Session {
             }
         } else {
             reject("memories", 0, "expected an array of at most 64 memories");
+            if let Some(items) = value["memories"].as_array() {
+                rejected_sources.extend(items.iter().flat_map(|memory| {
+                    memory["source_ids"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|raw| parse_group(raw).ok().filter(|id| known.contains(id)))
+                }));
+            }
         }
         let primary_before = (self.cost_trajectory.is_some()
             && (!memories.is_empty() || memory_updates.values().any(|opinion| *opinion == "drop")))
@@ -1195,7 +1204,7 @@ impl Session {
         self.preserve_memory_sources(&rejected_sources.into_iter().collect::<Vec<_>>());
         self.review_feedback = json!({"accepted_opinions":accepted_opinions, "accepted_memories":accepted_memories,
             "rejected_count":rejected_count, "rejected":rejected,
-            "guidance":"Accepted items were applied. Correct rejected items in a future review using the current eligible ledger; do not repeat accepted memories."});
+            "guidance":"Accepted items were applied except supporting sources of rejected replacements remain protected. Correct rejected items in a future review using the current eligible ledger; do not repeat accepted memories."});
         if let Some(before) = primary_before {
             let after = self.render_primary();
             // Visible memory edits belong to Carry, not the traditional

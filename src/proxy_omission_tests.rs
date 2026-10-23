@@ -146,3 +146,23 @@ fn omission_rejected_replacement_preserves_source_without_requiring_every_drop_t
         assert_eq!(restored.render_primary(), input);
     }
 }
+
+#[test]
+fn omission_excess_replacement_count_preserves_only_identifiable_sources() {
+    let (mut state, input) = omission_fixture();
+    let memories = (0..65)
+        .map(|_| json!({"source_ids":["g4"],"text":"unfinished migration"}))
+        .collect::<Vec<_>>();
+    let groups = state.groups();
+    state
+        .apply_advice(
+            &groups,
+            &json!({"protected":[],"removable":["g2","g4"],"memories":memories}),
+        )
+        .unwrap();
+    assert!(state.memories.is_empty());
+    assert_eq!(state.review_feedback["rejected_count"], 1);
+    assert!(!state.drop_authorized(groups.iter().find(|g| g.id == 4).unwrap()));
+    assert!(state.drop_authorized(groups.iter().find(|g| g.id == 2).unwrap()));
+    assert_eq!(state.render_primary(), input);
+}

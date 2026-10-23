@@ -4983,7 +4983,8 @@ mod tests {
         assert_eq!(current.review_feedback["rejected_count"], 1);
         assert_eq!(current.opinions.get(&1).map(String::as_str), Some("keep"));
         assert!(
-            current.drop_authorized(&current.groups().into_iter().find(|g| g.id == 2).unwrap())
+            !current.drop_authorized(&current.groups().into_iter().find(|g| g.id == 2).unwrap()),
+            "rejected current-budget replacement preserves the original source"
         );
         assert_eq!(current.review_context, context);
         assert_eq!(current.last_response_id.as_deref(), Some("latest-success"));
