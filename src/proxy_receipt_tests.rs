@@ -13,6 +13,106 @@ fn state(t: &Trajectory) -> Value {
 }
 
 #[test]
+fn receipt_opaque_output_sizes_do_not_retire_native_input_after_replay_and_restart() {
+    fn episode(ciphertext: &str, metadata: &str) -> Trajectory {
+        let mut t = Trajectory {
+            scenario: Scenario {
+                context_window: 3000,
+                reserve: 100,
+                keep_recent: 100,
+                summary: 20,
+            },
+            ..Trajectory::default()
+        };
+        let output = json!([
+            {"type":"reasoning","id":metadata,"summary":[],"encrypted_content":ciphertext},
+            {"type":"message","id":metadata,"role":"assistant","content":[{"type":"output_text","text":"OK"}]}
+        ]);
+        let mut response = terminal(2000, 0, 0, 10000);
+        response["output"] = output.clone();
+        t.primary(&body(), &response, "route", 100, true);
+        let mut t: Trajectory = serde_json::from_value(state(&t)).unwrap();
+        let mut next = body();
+        next["input"]
+            .as_array_mut()
+            .unwrap()
+            .extend(output.as_array().unwrap().clone());
+        next["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"continue"}));
+        t.primary(&next, &terminal(2100, 0, 0, 0), "route", 101, true);
+        t
+    }
+    let control = episode("short", "native-id");
+    for (ciphertext, metadata) in [
+        ("ciphertext ".repeat(5000), "native-id".into()),
+        ("short".into(), "metadata ".repeat(5000)),
+    ] {
+        let t = episode(&ciphertext, &metadata);
+        assert_eq!(state(&t)["receipts"]["last_appended_input"], 100);
+        assert_eq!(
+            state(&t)["retired"],
+            0,
+            "opaque transport length must not become native retirement"
+        );
+        assert_eq!(state(&t)["last_traditional_input"], 2100);
+        assert_eq!(t.snapshot().traditional_compactions, 0);
+        assert_eq!(
+            t.snapshot().observed_primary_cost,
+            control.snapshot().observed_primary_cost
+        );
+        assert_eq!(t.snapshot().carry_cost, control.snapshot().carry_cost);
+        assert_eq!(
+            t.snapshot().traditional_cost,
+            control.snapshot().traditional_cost
+        );
+    }
+}
+
+#[test]
+fn receipt_visible_output_semantics_still_trigger_conventional_summary() {
+    let payload = "visible output ".repeat(5000);
+    for item in [
+        json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":payload}]}),
+        json!({"type":"reasoning","summary":[{"type":"summary_text","text":payload}]}),
+        json!({"type":"function_call","name":"tool","call_id":"a","arguments":payload}),
+        json!({"type":"custom_tool_call","name":"tool","call_id":"b","input":payload}),
+    ] {
+        let mut t = Trajectory {
+            scenario: Scenario {
+                context_window: 3000,
+                reserve: 100,
+                keep_recent: 100,
+                summary: 20,
+            },
+            ..Trajectory::default()
+        };
+        let mut response = terminal(2000, 0, 0, 10000);
+        response["output"] = json!([item]);
+        t.primary(&body(), &response, "route", 100, true);
+        assert_eq!(t.snapshot().traditional_compactions, 1);
+        assert!(t.snapshot().summary_cost > 0.0);
+        assert!(t.snapshot().observed_primary_cost > 0.0);
+    }
+}
+
+#[test]
+fn receipt_unknown_retained_output_does_not_invent_a_context_measurement() {
+    let mut t = Trajectory::default();
+    let mut response = terminal(2000, 0, 0, 10000);
+    response["output"] = json!([{"type":"unmodeled_native_output","payload":"opaque"}]);
+    t.primary(&body(), &response, "route", 100, true);
+    assert!(
+        t.snapshot().observed_primary_cost > 0.0,
+        "paid receipt remains priced independently of retention"
+    );
+    assert_eq!(t.snapshot().matched_primary_responses, 0);
+    assert_eq!(t.snapshot().excluded_unpriced_calls, 1);
+    assert_eq!(state(&t)["retired"], 0);
+}
+
+#[test]
 fn receipt_restoration_selects_each_branch_tariff_without_repricing_actuals() {
     let mut t = Trajectory::default();
     t.scenario.context_window = 1_000_000;
