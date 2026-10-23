@@ -89,9 +89,43 @@ fn receipt_unmodeled_actuals_are_unknown_and_coverage_reconciles() {
     assert_eq!(public["unavailable_primary_cost_calls"], 1);
     assert_eq!(public["unavailable_reviewer_cost_calls"], 1);
     assert_eq!(public["excluded_unpriced_calls"], 2);
-    assert_eq!(public["observed_reviewer_cost"], 0.0);
+    assert!(public["observed_reviewer_cost"].is_null());
     assert!(t.snapshot().observed_primary_cost > known.observed_primary_cost);
     assert_eq!(t.snapshot().observed_primary_cost, t.snapshot().carry_cost);
+    let mut totals = DashboardTotals::default();
+    totals.observe(&t.snapshot().dashboard(false));
+    let aggregate = serde_json::to_value(totals).unwrap();
+    assert_eq!(aggregate["matched_primary_responses"], 2);
+    assert_eq!(
+        aggregate["observed_primary_cost"],
+        public["observed_primary_cost"]
+    );
+    assert_eq!(aggregate["unavailable_primary_cost_calls"], 1);
+    assert_eq!(aggregate["unavailable_reviewer_cost_calls"], 1);
+    assert!(aggregate["observed_reviewer_cost"].is_null());
+}
+
+#[test]
+fn receipt_same_prompt_usage_drift_does_not_invent_an_appended_block() {
+    let mut t = Trajectory::default();
+    t.primary(&body(), &terminal(2000, 0, 0, 0), "route", 100, true);
+    t.primary(&body(), &terminal(2100, 0, 0, 0), "route", 101, true);
+    assert!(state(&t)["receipts"]["last_appended_input"].is_null());
+    assert!(state(&t)["receipts"]["epochs"].as_u64().unwrap() > 0);
+    assert_eq!(t.snapshot().matched_primary_responses, 2);
+}
+
+#[test]
+fn receipt_unknown_actuals_are_null_and_persistence_declares_its_version() {
+    let mut t = Trajectory::default();
+    t.unmodeled_call();
+    let public = serde_json::to_value(t.snapshot().dashboard(false)).unwrap();
+    assert!(public["observed_primary_cost"].is_null());
+    assert_eq!(public["unavailable_primary_cost_calls"], 1);
+    assert_eq!(
+        state(&t)["result"]["accounting_basis"],
+        "receipt_anchored_v2"
+    );
 }
 
 #[test]
