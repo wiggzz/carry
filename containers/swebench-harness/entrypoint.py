@@ -127,6 +127,17 @@ if args.harness == "codex":
     # Pinned Codex 0.147.0's enum setting; not a feature-toggle alias.
     # Last override also covers fresh/resume and custom AGENT_COMMAND templates.
     command.extend(["--config", 'web_search="disabled"'])
+if args.harness == "pi":
+    catalog_path = pathlib.Path(os.environ.get("PREPARED_HARNESS_ROOT", "/opt/swebench-harness")) / "model_catalog.json"
+    if not catalog_path.is_file():
+        # Source-checkout execution; packaged bundles carry the exact same file.
+        catalog_path = pathlib.Path(__file__).resolve().parents[2] / "src/model_catalog.json"
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    model_spec = catalog.get(args.model)
+    if not model_spec or not model_spec.get("context_tokens") or not model_spec.get("max_output_tokens"):
+        parser.error("Pi model requires catalog context/output limits")
+    model_rates = model_spec["rates"]
+
 workspace = os.environ.get("BENCHMARK_WORKSPACE", "/workspace")
 subprocess.run(
     ["git", "config", "--global", "--add", "safe.directory", workspace],
@@ -150,9 +161,10 @@ if args.harness == "pi":
                     "name": "Benchmark model",
                     "reasoning": True,
                     "input": ["text", "image"],
-                    "contextWindow": 1050000 if args.model == "gpt-6-luna" else 400000,
-                    "maxTokens": 128000,
-                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                    "contextWindow": model_spec["context_tokens"],
+                    "maxTokens": model_spec["max_output_tokens"],
+                    "cost": {"input": model_rates["input"], "output": model_rates["output"],
+                             "cacheRead": model_rates["cached"], "cacheWrite": model_rates["write"]},
                 }],
             }
         }

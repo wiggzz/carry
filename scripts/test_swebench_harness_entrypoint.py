@@ -189,21 +189,28 @@ class HarnessEntrypointTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
             (prompt_dir / "task.md").write_text("fix")
             binary.write_text(
-                "#!/usr/bin/env python3\nimport pathlib,sys\n"
+                "#!/usr/bin/env python3\nimport pathlib,sys,os,json\n"
+                "model=json.loads((pathlib.Path(os.environ['HOME'])/'.pi/agent/models.json').read_text())['providers']['openai-benchmark']['models'][0]\n"
+                "assert model['contextWindow']==1050000, model\n"
+                "assert model['cost']['input']==2.0 and model['cost']['cacheRead']==0.1, model\n"
                 "assert '--no-session' not in sys.argv, sys.argv\n"
                 "assert '--session' in sys.argv and '--session-dir' in sys.argv, sys.argv\n"
                 "pathlib.Path(sys.argv[sys.argv.index('--session')+1]).write_text('{}\\n')\n"
                 "pathlib.Path('file.txt').write_text('after\\n')\n"
             )
             binary.chmod(0o755)
+            adapter = root / 'bin' / 'adapter.py'
+            adapter.write_bytes(ENTRYPOINT.read_bytes())
+            (root / 'model_catalog.json').write_bytes((ENTRYPOINT.parents[2] / 'src/model_catalog.json').read_bytes())
+            (root / 'home').mkdir()
             env = dict(os.environ, OPENAI_API_KEY="unit-test-secret", OPENAI_BASE_URL="http://openai-proxy:8080/v1",
-                       PREPARED_HARNESS_ROOT=str(root), AGENT_TIMEOUT_SECONDS="30", BENCHMARK_WORKSPACE=str(repo))
+                       HOME=str(root / 'home'), PREPARED_HARNESS_ROOT=str(root), AGENT_TIMEOUT_SECONDS="30", BENCHMARK_WORKSPACE=str(repo))
             run = subprocess.run(
-                ["python3", str(ENTRYPOINT), "run", "--harness", "pi", "--model", "model", "--reasoning", "medium",
+                ["python3", str(adapter), "run", "--harness", "pi", "--model", "gpt-6.1-sol", "--reasoning", "medium",
                  "--prompt", str(prompt_dir / "task.md"), "--output", str(output), "--pi-session-dir", str(session)],
                 cwd=repo, env=env, text=True, capture_output=True,
             )
-            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(run.returncode, 0, run.stderr + (output / "trace.log").read_text())
             self.assertTrue((session / "session.jsonl").is_file())
 
     def test_prepared_image_selects_harness_without_image_environment_template(self):

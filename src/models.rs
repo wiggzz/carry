@@ -65,6 +65,17 @@ pub fn default_context_tokens() -> u32 {
         .expect("default reviewer is present in the embedded catalog")
 }
 
+pub fn default_ordinary_context_tokens() -> u32 {
+    let spec = model_spec(DEFAULT_REVIEWER_MODEL).expect("default model catalog entry");
+    ordinary_policy(
+        default_context_tokens(),
+        spec.long_context.map(|tier| tier.threshold as u32),
+        0,
+        0,
+    )
+    .total_budget
+}
+
 pub fn model_spec(model: &str) -> Option<ModelSpec> {
     static CATALOG: std::sync::OnceLock<BTreeMap<String, CatalogEntry>> =
         std::sync::OnceLock::new();

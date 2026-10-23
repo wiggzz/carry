@@ -10,6 +10,7 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/*.sources \
     && cp /usr/local/bin/node /opt/swebench-harness/bin/node \
     && npm install --global --prefix /opt/swebench-harness "${PACKAGE}@${PACKAGE_VERSION}"
 ENV PATH=/opt/swebench-harness/bin:${PATH}
-COPY entrypoint.py /opt/swebench-harness/bin/adapter
+COPY containers/swebench-harness/entrypoint.py /opt/swebench-harness/bin/adapter
+COPY src/model_catalog.json /opt/swebench-harness/model_catalog.json
 RUN chmod 0555 /opt/swebench-harness/bin/adapter
 ENTRYPOINT ["/opt/swebench-harness/bin/adapter"]

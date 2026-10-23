@@ -20,7 +20,7 @@ impl Scenario {
 impl Default for Scenario {
     fn default() -> Self {
         Self {
-            context_window: 272_000,
+            context_window: u64::from(carry::models::default_ordinary_context_tokens()),
             reserve: 16_384,
             keep_recent: 20_000,
             summary: 1_000,

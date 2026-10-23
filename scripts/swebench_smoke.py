@@ -2152,12 +2152,12 @@ def build_images(*, source: pathlib.Path, run_id: str, config: Mapping[str, str]
             "args": [],
         },
         "codex": {
-            "dockerfile": harness_dir / "Dockerfile.node", "context": harness_dir,
+            "dockerfile": harness_dir / "Dockerfile.node", "context": source,
             "base": validated["BASE_IMAGE"], "package_version": validated["CODEX_VERSION"],
             "args": ["PACKAGE=@openai/codex", f"PACKAGE_VERSION={validated['CODEX_VERSION']}"],
         },
         "pi": {
-            "dockerfile": harness_dir / "Dockerfile.node", "context": harness_dir,
+            "dockerfile": harness_dir / "Dockerfile.node", "context": source,
             "base": validated["BASE_IMAGE"], "package_version": validated["PI_VERSION"],
             "args": ["PACKAGE=@earendil-works/pi-coding-agent", f"PACKAGE_VERSION={validated['PI_VERSION']}"],
         },

@@ -728,6 +728,10 @@ class StateRegressions(unittest.TestCase):
 
                 fixture = self.fixture(primary)
                 options = ["--review-every-requests", "100"]
+                if variant == "unknown_model":
+                    # Unknown price remains unknown; capacity is explicitly
+                    # declared instead of silently borrowed from a role default.
+                    options += ["--primary-context-tokens", "272000"]
                 proxy = self.proxy(fixture, options)
                 seed = [{"role": "user", "content": "priced prefix " * 600}]
                 self.assertEqual(proxy.send(seed)[0], 200)

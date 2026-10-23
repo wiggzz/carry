@@ -12,6 +12,16 @@ spec.loader.exec_module(worker)
 
 
 class ProxyBenchmarkTests(unittest.TestCase):
+    def test_native_receipt_pricing_uses_the_shared_model_catalog_and_its_tiers(self):
+        usage = {'input_tokens':100, 'output_tokens':2,
+                 'input_tokens_details':{'cached_tokens':0}}
+        actual = worker.proxy_benchmark.native_cost('gpt-6-astra', usage)
+        self.assertIsNotNone(actual, 'a shared catalog entry must not disappear from benchmark pricing')
+        self.assertAlmostEqual(actual, 0.0011)
+        usage.update(input_tokens=300000, output_tokens=0)
+        self.assertAlmostEqual(worker.proxy_benchmark.native_cost('gpt-5.6-luna', usage), 0.06)
+        self.assertIsNone(worker.proxy_benchmark.native_cost('unknown-model', usage))
+
     def capture_ledger(self, events):
         import json
         def docker(command, **kwargs):
