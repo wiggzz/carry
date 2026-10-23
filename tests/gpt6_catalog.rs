@@ -26,7 +26,7 @@ fn exact_gpt6_entries_share_capacity_and_prices_across_routes() {
             ).unwrap();
             source.route = Some(route.clone());
             let resolved = resolve_model(model, route, Some(&source), None, 2048, 10).unwrap();
-            assert_eq!(resolved.capacity_tokens, 1050000, "{model}");
+            assert_eq!(resolved.capacity_tokens, Some(1050000), "{model}");
             assert_eq!(resolved.ordinary.total_budget, 272000);
             assert_eq!(resolved.cheap_input_boundary, Some(272000));
             let rates = resolved.rates.unwrap();
@@ -75,9 +75,11 @@ fn unknown_models_need_metadata_or_explicit_limits_not_role_fallbacks() {
         "gpt-6-terra",
     ] {
         let route = Route::new("https://api.openai.com/v1/responses", false);
-        assert!(resolve_model(model, route.clone(), None, None, 2048, 10).is_err());
+        let unknown = resolve_model(model, route.clone(), None, None, 2048, 10).unwrap();
+        assert!(unknown.capacity_tokens.is_none());
+        assert!(unknown.rates.is_none());
         let explicit = resolve_model(model, route, None, Some(300000), 2048, 10).unwrap();
-        assert_eq!(explicit.capacity_tokens, 300000);
+        assert_eq!(explicit.capacity_tokens, Some(300000));
         assert!(explicit.rates.is_none());
         assert_eq!(explicit.provenance["capacity"].status, "operator_override");
     }
@@ -89,13 +91,13 @@ fn catalog_capacity_bounds_overrides_without_manufacturing_route_tariffs() {
         let route = Route::new("https://api.openai.com/v1/responses", false);
         assert!(resolve_model(model, route.clone(), None, Some(1050001), 2048, 10).is_err());
         let lower = resolve_model(model, route.clone(), None, Some(500000), 2048, 10).unwrap();
-        assert_eq!(lower.capacity_tokens, 500000);
+        assert_eq!(lower.capacity_tokens, Some(500000));
         assert_eq!(lower.provenance["capacity"].status, "operator_override");
         assert_eq!(lower.provenance["capacity"].operator_override, Some(500000));
         let mut other_tier = route;
         other_tier.processing_tier = "unknown-tier".into();
         let other = resolve_model(model, other_tier, None, None, 2048, 10).unwrap();
-        assert_eq!(other.capacity_tokens, 1050000);
+        assert_eq!(other.capacity_tokens, Some(1050000));
         assert_eq!(
             other.provenance["prices"].status,
             "catalog_api_equivalent_not_route_tariff"

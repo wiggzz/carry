@@ -377,7 +377,7 @@ pub struct ResolvedModel {
     pub model: String,
     pub route: Route,
     pub raw: RawContext,
-    pub capacity_tokens: u32,
+    pub capacity_tokens: Option<u32>,
     pub ordinary: OrdinaryPolicy,
     pub rates: Option<Rates>,
     pub rate_units: String,
@@ -466,9 +466,7 @@ pub fn resolve_model(
     {
         return Err("context override exceeds advertised route capacity");
     }
-    let capacity_tokens = override_tokens
-        .or(capacity.map(|v| v as u32))
-        .ok_or("unknown model context: provide metadata or an explicit context override")?;
+    let capacity_tokens = override_tokens.or(capacity.map(|v| v as u32));
     let rates = spec.and_then(|s| s.rates);
     let long = spec.and_then(|s| s.long_context);
     let provenance = |name: &str, status: &str, override_value| Provenance {
@@ -481,7 +479,11 @@ pub fn resolve_model(
     };
     let mut capacity_provenance = provenance(
         spec.and_then(|s| s.source).unwrap_or("operator_context"),
-        "catalog_model_policy_not_route_entitlement",
+        if capacity_tokens.is_some() {
+            "catalog_model_policy_not_route_entitlement"
+        } else {
+            "unknown"
+        },
         override_tokens,
     );
     capacity_provenance.revision = "shared-model-catalog-v2".into();
@@ -520,7 +522,7 @@ pub fn resolve_model(
         raw,
         capacity_tokens,
         ordinary: ordinary_policy(
-            capacity_tokens,
+            capacity_tokens.unwrap_or(0),
             long.map(|l| l.threshold as u32),
             reserve,
             margin,

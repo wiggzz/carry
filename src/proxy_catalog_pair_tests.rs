@@ -145,7 +145,7 @@ async fn catalog_pair_lease_control(kind: &str, lease: bool) {
             .unwrap()
             .reviewer
             .capacity_tokens,
-        old_capacity
+        Some(old_capacity)
     );
     // Synthetic historical tariff fixture, installed in memory before normal
     // save. No production checkpoint is read or edited by this regression.
@@ -216,7 +216,7 @@ async fn catalog_pair_lease_control(kind: &str, lease: bool) {
             .unwrap()
             .reviewer
             .capacity_tokens,
-        old_capacity
+        Some(old_capacity)
     );
     body["model"] = json!("gpt-6-astra");
     body["input"]
@@ -227,7 +227,7 @@ async fn catalog_pair_lease_control(kind: &str, lease: bool) {
     let current = load(&service, &id).unwrap();
     let pair = current.model_resolution.as_ref().unwrap();
     assert_eq!(pair.primary.model, "gpt-6-astra");
-    assert_eq!(pair.reviewer.capacity_tokens, new_capacity);
+    assert_eq!(pair.reviewer.capacity_tokens, Some(new_capacity));
     assert_eq!(
         metadata_calls.load(Ordering::SeqCst),
         2,

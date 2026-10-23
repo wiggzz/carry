@@ -956,7 +956,10 @@ async fn session_resolution(
         let same = saved.schema_version == 1
             && [&saved.primary, &saved.reviewer].iter().all(|resolved| {
                 resolved.provenance.get("capacity").is_some_and(|p| {
-                    !matches!(p.status.as_str(), "fallback" | "legacy_snapshot_missing")
+                    !matches!(
+                        p.status.as_str(),
+                        "fallback" | "legacy_snapshot_missing" | "unknown"
+                    )
                 })
             })
             && saved.primary.model == model
@@ -994,7 +997,9 @@ async fn session_resolution(
         primary,
         reviewer,
     };
-    if let Some(prior) = session.model_resolution.replace(pair.clone()) {
+    if let Some(prior) = session.model_resolution.replace(pair.clone())
+        && serde_json::to_value(&prior).ok() != serde_json::to_value(&pair).ok()
+    {
         session.model_resolution_history.push(prior);
     }
     Ok(pair)
@@ -1161,9 +1166,9 @@ async fn dashboard_stats(
             // Legacy sessions without a plan can still use their frozen epoch;
             // absent historical contracts remain unknown, not process defaults.
             "primary_context_tokens": last_plan["primary_context_tokens"].as_u64()
-                .or_else(|| session.model_resolution.as_ref().map(|pair| pair.primary.capacity_tokens as u64)),
+                .or_else(|| session.model_resolution.as_ref().and_then(|pair| pair.primary.capacity_tokens.map(u64::from))),
             "reviewer_context_tokens": last_plan["reviewer_context_tokens"].as_u64()
-                .or_else(|| session.model_resolution.as_ref().map(|pair| pair.reviewer.capacity_tokens as u64)),
+                .or_else(|| session.model_resolution.as_ref().and_then(|pair| pair.reviewer.capacity_tokens.map(u64::from))),
             "primary_ordinary_context_tokens": last_plan["primary_ordinary_context_tokens"].as_u64(),
             "reviewer_ordinary_context_tokens": last_plan["reviewer_ordinary_context_tokens"].as_u64(),
             "candidate": best_candidate.map(|row| json!({
@@ -1512,8 +1517,11 @@ async fn forward_request(
             // feasibility, memory and bootstrap check. Locks, metadata epoch,
             // background registry and directory lock remain process-shared.
             let mut effective = (*service).clone();
-            effective.config.primary_context_tokens = resolved.primary.capacity_tokens;
-            effective.config.classifier_max_input_tokens = resolved.reviewer.capacity_tokens;
+            effective.config.primary_context_tokens = resolved.primary.capacity_tokens.ok_or_else(|| {
+                failure(StatusCode::BAD_REQUEST, "unknown primary context: provide model metadata or --primary-context-tokens")
+            })?;
+            effective.config.classifier_max_input_tokens =
+                resolved.reviewer.capacity_tokens.unwrap_or(0);
             effective.config.model_resolution = Some(resolved);
             effective.config.current_review_suppressed = declared_fork;
             service = Arc::new(effective);
@@ -2769,8 +2777,8 @@ fn merge_review(
     // to that old epoch, but new memory must fit the latest saved pair instead.
     let mut admission_config = config.clone();
     if let Some(pair) = &current.model_resolution {
-        admission_config.primary_context_tokens = pair.primary.capacity_tokens;
-        admission_config.classifier_max_input_tokens = pair.reviewer.capacity_tokens;
+        admission_config.primary_context_tokens = pair.primary.capacity_tokens.unwrap_or(0);
+        admission_config.classifier_max_input_tokens = pair.reviewer.capacity_tokens.unwrap_or(0);
         admission_config.model_resolution = Some(pair.clone());
     }
     admission::initialize(current);

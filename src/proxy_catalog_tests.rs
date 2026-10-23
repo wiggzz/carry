@@ -8,7 +8,7 @@ fn reviewer_catalog_capacity_and_tier_drive_real_fit_checks_without_role_default
     let route = Route::new("https://chatgpt.com/backend-api/codex/responses", true);
     let reviewer = resolve_model("gpt-6-luna", route.clone(), None, None, 2048, 0).unwrap();
     let primary = resolve_model("gpt-6-sol", route, None, None, 16384, 0).unwrap();
-    config.classifier_max_input_tokens = reviewer.capacity_tokens;
+    config.classifier_max_input_tokens = reviewer.capacity_tokens.unwrap();
     config.context_margin_percent = 0;
     config.classifier_max_output_tokens = 2048;
     config.model_resolution = Some(ResolvedPair {

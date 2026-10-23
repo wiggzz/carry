@@ -14,8 +14,10 @@ require separate planner, dashboard, benchmark or native-trial lists.
 - Otherwise a known model uses its catalog limit, regardless of primary/reviewer
   role or API/subscription/gateway transport. This is Carry's operational model
   policy, not a claim about an account's entitlement or upstream advertisement.
-- An unknown model needs valid metadata or an explicit context override. There
-  are no silent 272K-primary/300K-reviewer defaults. Unknown prices stay unknown.
+- Unknown models have no context default and unknown prices stay unknown.
+  An active primary request needs valid metadata or an explicit context override;
+  an unknown auxiliary reviewer limit instead disables review without blocking a
+  fitting primary. Catalog exports use null for unknown capacity, not a role cap.
 
 The request's resolved contract drives primary admission, reviewer fit and
 compaction planning, per-input-tier economics, receipt pricing and the saved
