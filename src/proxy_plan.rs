@@ -217,11 +217,11 @@ fn plan_inner(
         .unwrap_or(config.primary_output_reserve_tokens as u64);
     // A measured prefix plus estimated append is still a prediction. It may
     // strengthen, never lower, the original local-token capacity reservation.
-    let required = primary_required_tokens(config, body).max(
+    let predicted_required = primary_required_tokens(config, body).max(
         prediction.unwrap_or(0) as f64 * (1.0 + f64::from(config.context_margin_percent) / 100.0)
             + reserve as f64,
     );
-    let primary_ok = primary_fits(config, body) && required <= config.primary_context_tokens as f64;
+    let primary_ok = primary_fits(config, body);
     let reviewer_ok = review_fits(config, capacity);
     let forced = acquisition.is_none() && !primary_ok;
     let groups = session.groups();
@@ -490,13 +490,14 @@ fn plan_inner(
         "primary_output_allowance_basis":if output_allowance.is_some() {"request_max_output_tokens_cap_sensitivity_not_expected_generation"} else {"legacy_zero_no_explicit_request_cap_not_headroom"},
         "primary_output_tariff_basis":"each_rendered_branch_input_selected_frozen_tariff",
         "primary_receipt_prediction_tokens":prediction,
+        "primary_receipt_predicted_reserved_tokens":prediction.map(|_| predicted_required),
         "primary_receipt_prediction_basis":"compatible_measured_prefix_plus_locally_estimated_appended_block_not_per_message_counts",
         "joint_basis":"legacy_input_only_primary_recurring_reviewer_sensitivity"});
     let mut report = json!({"selected":best.is_some(),"forced":forced,"reason":reason,
         "mode":format!("{:?}",config.mode).to_lowercase(),
         "primary_fits":primary_ok,"reviewer_fits":reviewer_ok,
         "primary_estimated_tokens":estimate(&wire),"reviewer_estimated_tokens":estimate(&reviewer),
-        "primary_required_tokens":required,
+        "primary_required_tokens":primary_required_tokens(config,body),
         "reviewer_required_tokens":reviewer_required_tokens(config,capacity),
         "reviewer_targeted_required_tokens":reviewer_required_tokens(config,&reviewer),
         "primary_context_tokens":config.primary_context_tokens,

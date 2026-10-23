@@ -13,9 +13,92 @@ fn state(t: &Trajectory) -> Value {
 }
 
 #[test]
+fn receipt_restoration_selects_each_branch_tariff_without_repricing_actuals() {
+    let mut t = Trajectory::default();
+    t.scenario.context_window = 1_000_000;
+    t.primary(
+        &body(),
+        &terminal(200_000, 1000, 100, 10),
+        "route",
+        100,
+        true,
+    );
+    let before = t.snapshot();
+    t.compacted(100_100, 100);
+    t.primary(
+        &body(),
+        &terminal(200_000, 1000, 100, 10),
+        "route",
+        101,
+        true,
+    );
+    let after = t.snapshot();
+    let expected = scenario_input_cost("gpt-6.1-sol", 300_000, 0, Some(1024)).unwrap()
+        + scenario_output_cost_resolved("gpt-6.1-sol", 300_000, 10, None).unwrap();
+    assert!(
+        (after.traditional_cost - before.traditional_cost - expected).abs() < 1e-12,
+        "estimated restoration crosses the traditional tariff threshold only"
+    );
+    assert!((after.carry_cost - 2.0 * before.carry_cost).abs() < 1e-12);
+    assert_eq!(after.observed_primary_cost, after.carry_cost);
+    assert!(state(&t)["receipts"]["last_appended_input"].is_null());
+    // A configuration change after a Carry edit cannot retain its restoration.
+    t.compacted(10_000, 0);
+    let mut changed = body();
+    changed["instructions"] = json!("a new configuration");
+    t.primary(&changed, &terminal(200_000, 0, 0, 0), "route", 102, true);
+    assert_eq!(state(&t)["restored"], 0);
+}
+
+#[test]
+fn receipt_counterfactual_cache_is_conditional_not_copied_from_actual_hits() {
+    for (input, delay) in [(500, 1), (2000, 1), (2000, 1800)] {
+        let mut t = Trajectory::default();
+        t.primary(&body(), &terminal(input, input, 0, 0), "route", 100, true);
+        let before = t.snapshot();
+        let mut appended = body();
+        appended["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"append"}));
+        t.primary(
+            &appended,
+            &terminal(input + 100, 0, 0, 0),
+            "route",
+            100 + delay,
+            true,
+        );
+        let cached = if delay < 1800 { input } else { 0 };
+        let expected = scenario_input_cost("gpt-6.1-sol", input + 100, cached, Some(1024)).unwrap();
+        assert!((t.snapshot().traditional_cost - before.traditional_cost - expected).abs() < 1e-12);
+        assert_eq!(state(&t)["receipts"]["last_appended_input"], 100);
+    }
+}
+
+#[test]
+fn receipt_unmodeled_actuals_are_unknown_and_coverage_reconciles() {
+    let mut t = Trajectory::default();
+    let r = terminal(2000, 1000, 0, 10);
+    t.primary(&body(), &r, "route", 100, true);
+    let known = t.snapshot();
+    t.primary(&body(), &r, "route", 101, false);
+    t.reviewer(&body(), &r, false);
+    t.primary(&body(), &terminal(2100, 0, 0, 0), "route", 102, true);
+    let public = serde_json::to_value(t.snapshot().dashboard(false)).unwrap();
+    assert_eq!(public["matched_primary_responses"], 2);
+    assert_eq!(public["unavailable_primary_cost_calls"], 1);
+    assert_eq!(public["unavailable_reviewer_cost_calls"], 1);
+    assert_eq!(public["excluded_unpriced_calls"], 2);
+    assert_eq!(public["observed_reviewer_cost"], 0.0);
+    assert!(t.snapshot().observed_primary_cost > known.observed_primary_cost);
+    assert_eq!(t.snapshot().observed_primary_cost, t.snapshot().carry_cost);
+}
+
+#[test]
 fn receipt_fixed_body_changes_both_branches_and_both_actual_lanes() {
     for input in [2000, 272_001] {
         let mut t = Trajectory::default();
+        t.scenario.context_window = 1_000_000;
         let r = terminal(input, 1000, 100, 10);
         t.primary(&body(), &r, "route", 100, true);
         let primary = t.snapshot();
@@ -55,6 +138,12 @@ fn receipt_fixed_body_changes_both_branches_and_both_actual_lanes() {
 #[test]
 fn receipt_append_delta_uses_total_input_not_cache_or_hidden_output() {
     let mut t = Trajectory::default();
+    t.scenario = Scenario {
+        context_window: 3000,
+        reserve: 100,
+        keep_recent: 100,
+        summary: 20,
+    };
     let mut b = body();
     t.primary(&b, &terminal(2000, 1000, 0, 100_000), "route", 100, true);
     b["input"]
@@ -62,6 +151,11 @@ fn receipt_append_delta_uses_total_input_not_cache_or_hidden_output() {
         .unwrap()
         .push(json!({"role":"user","content":"whole new block"}));
     t.primary(&b, &terminal(2100, 0, 0, 0), "route", 101, true);
+    assert_eq!(
+        t.snapshot().traditional_compactions,
+        0,
+        "billed hidden output is not retained context"
+    );
     assert_eq!(
         state(&t)["receipts"]["last_appended_input"],
         100,
@@ -180,7 +274,15 @@ fn receipt_bounded_anchor_restart_and_legacy_window_do_not_reprice_history() {
 
 #[test]
 fn receipt_missing_conflicting_and_failed_usage_remain_unknown_not_projected() {
-    for variant in ["no_cache", "overlap", "conflict", "missing", "failed"] {
+    for variant in [
+        "no_cache",
+        "overlap",
+        "conflict",
+        "null_write",
+        "invalid_write",
+        "missing",
+        "failed",
+    ] {
         let mut t = Trajectory::default();
         let mut r = terminal(2000, 1000, 100, 10);
         match variant {
@@ -192,6 +294,10 @@ fn receipt_missing_conflicting_and_failed_usage_remain_unknown_not_projected() {
             }
             "overlap" => r["usage"]["input_tokens_details"]["cache_write_tokens"] = json!(1500),
             "conflict" => r["usage"]["input_tokens_details"]["cache_creation_tokens"] = json!(200),
+            "null_write" => r["usage"]["input_tokens_details"]["cache_write_tokens"] = Value::Null,
+            "invalid_write" => {
+                r["usage"]["input_tokens_details"]["cache_write_tokens"] = json!("100")
+            }
             "missing" => r["usage"] = Value::Null,
             _ => r["status"] = json!("failed"),
         }

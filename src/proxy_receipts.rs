@@ -5,6 +5,8 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(super) struct Receipts {
     anchor: Option<Anchor>,
+    #[serde(default)]
+    configuration: Option<String>,
     pub last_appended_input: Option<u64>,
     pub legacy_estimate: Option<Box<Estimate>>,
     epochs: u64,
@@ -57,9 +59,9 @@ fn append_compatible(anchor: &Anchor, body: &Value, configuration: &str) -> bool
 /// reported write (Responses semantics); absent cache-read data is unknown.
 /// Reject contradictory aliases rather than clipping them into a priced call.
 fn receipt(usage: &Value) -> Option<Usage> {
-    fn partition(values: &[&Value], required: bool) -> Option<u64> {
+    fn partition(values: &[Option<&Value>], required: bool) -> Option<u64> {
         let mut found = None;
-        for value in values.iter().filter(|v| !v.is_null()) {
+        for value in values.iter().flatten() {
             let n = value.as_u64()?;
             if found.is_some_and(|prior| prior != n) {
                 return None;
@@ -76,17 +78,17 @@ fn receipt(usage: &Value) -> Option<Usage> {
     let output = usage["output_tokens"].as_u64()?;
     let cached = partition(
         &[
-            &usage["input_tokens_details"]["cached_tokens"],
-            &usage["cached_input_tokens"],
+            usage["input_tokens_details"].get("cached_tokens"),
+            usage.get("cached_input_tokens"),
         ],
         true,
     )?;
     let written = partition(
         &[
-            &usage["input_tokens_details"]["cache_write_tokens"],
-            &usage["input_tokens_details"]["cache_creation_tokens"],
-            &usage["cache_write_input_tokens"],
-            &usage["cache_creation_input_tokens"],
+            usage["input_tokens_details"].get("cache_write_tokens"),
+            usage["input_tokens_details"].get("cache_creation_tokens"),
+            usage.get("cache_write_input_tokens"),
+            usage.get("cache_creation_input_tokens"),
         ],
         false,
     )?;
@@ -147,8 +149,17 @@ impl Trajectory {
     ) {
         self.result.coverage.reviewer_responses += 1;
         let native = receipt(usage);
+        let text = standard
+            && !["input_tokens_details", "output_tokens_details"]
+                .iter()
+                .any(|field| {
+                    usage[*field]["audio_tokens"]
+                        .as_u64()
+                        .is_some_and(|n| n > 0)
+                });
         let cost = native
             .as_ref()
+            .filter(|_| text)
             .and_then(|u| modeled_cost(model, u, resolved));
         if let Some(cost) = cost {
             self.result.observed_reviewer_cost += cost;
@@ -160,11 +171,11 @@ impl Trajectory {
             self.result.excluded_unpriced_reviewer_calls += 1;
             if native.is_none() {
                 self.result.coverage.missing_usage += 1;
-            } else {
+            } else if text {
                 self.result.coverage.unknown_rate_calls += 1;
             }
         }
-        if !standard {
+        if !text {
             self.result.coverage.unmodeled_calls += 1;
         }
     }
@@ -185,19 +196,6 @@ impl Trajectory {
         self.result.coverage.primary_responses += 1;
         let native = receipt(&response["usage"]);
         let model = body["model"].as_str().unwrap_or("");
-        let observed = native
-            .as_ref()
-            .and_then(|u| modeled_cost(model, u, resolved));
-        if let Some(cost) = observed {
-            self.result.observed_primary_cost += cost;
-        } else {
-            self.result.unavailable_primary_cost_calls += 1;
-            if native.is_none() {
-                self.result.coverage.missing_usage += 1;
-            } else {
-                self.result.coverage.unknown_rate_calls += 1;
-            }
-        }
         let projection = crate::savings::prompt_projection(body);
         let text = standard
             && !has_native_modalities(body)
@@ -209,6 +207,23 @@ impl Trajectory {
                         .as_u64()
                         .is_some_and(|n| n > 0)
                 });
+        let observed = native
+            .as_ref()
+            .filter(|_| text)
+            .and_then(|u| modeled_cost(model, u, resolved));
+        if let Some(cost) = observed {
+            self.result.observed_primary_cost += cost;
+        } else {
+            self.result.unavailable_primary_cost_calls += 1;
+            if native.is_none() {
+                self.result.coverage.missing_usage += 1;
+            } else if text {
+                self.result.coverage.unknown_rate_calls += 1;
+            }
+        }
+        if !text {
+            self.result.coverage.unmodeled_calls += 1;
+        }
         let (Some(native), Some(carry), Some((_, _, local)), Some(items), Some(output)) = (
             native,
             observed,
@@ -220,13 +235,18 @@ impl Trajectory {
             self.reset_epoch();
             return;
         };
-        if !text {
-            self.result.coverage.unmodeled_calls += 1;
-            self.result.excluded_unpriced_calls += 1;
-            self.reset_epoch();
-            return;
-        }
         let config = configuration(body, route, resolved);
+        if self
+            .receipts
+            .as_ref()
+            .unwrap()
+            .configuration
+            .as_ref()
+            .is_some_and(|prior| prior != &config)
+        {
+            self.reset_epoch();
+        }
+        self.receipts.as_mut().unwrap().configuration = Some(config.clone());
         let previous = self.receipts.as_ref().unwrap().anchor.clone();
         let compatible = previous
             .as_ref()
@@ -245,19 +265,21 @@ impl Trajectory {
             .saturating_sub(self.retired as i128)
             .saturating_add(self.summary as i128)
             .clamp(0, u64::MAX as i128) as u64;
-        let unchanged = self.restored == 0 && self.retired == 0 && self.summary == 0;
+
         let minimum = resolved
             .map_or_else(|| prompt_cache_capabilities(model), |r| r.cache)
             .map(|c| c.minimum_prefix_tokens as u64);
+        if minimum.is_none() {
+            self.result.coverage.unknown_cache_requests += 1;
+        }
         let warm = previous
             .as_ref()
             .is_some_and(|a| compatible && at >= a.at && at - a.at < 1800)
             && !self.traditional_edited;
-        // Identical branches share the receipt. After a modeled edit/summary,
-        // the alternative uses an explicitly conditional append-cache scenario.
-        let traditional_cost = if unchanged {
-            Some(carry)
-        } else {
+        // The alternative shares total-input units, never observed cache hits:
+        // cache behavior is a conditional append-prefix scenario even before
+        // the first hypothetical edit. The first request of an epoch is cold.
+        let traditional_cost = {
             scenario_input_cost_resolved(
                 model,
                 traditional,

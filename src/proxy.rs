@@ -5104,7 +5104,7 @@ mod tests {
             let mut trajectory = crate::proxy_savings::Trajectory::default();
             trajectory.primary(
                 &json!({"model":"gpt-6-luna","input":[{"role":"user","content":"task"}]}),
-                &json!({"status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":1}}),
+                &json!({"status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}),
                 "route", 100, true,
             );
             before.cost_trajectory = Some(trajectory);

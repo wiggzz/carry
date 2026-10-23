@@ -65,6 +65,8 @@ fn receipt_prediction_uses_measured_prefix_without_relaxing_capacity_reservation
         write: 9.0,
         output: 21.0,
     });
+    let mut config = config;
+    config.model_resolution = session.model_resolution.clone();
     let wire = primary_wire_body(&config, &main);
     let mut trajectory = crate::proxy_savings::Trajectory::default();
     trajectory.primary_resolved(&wire, &json!({"status":"completed","output":[],"usage":{"input_tokens":20000,"output_tokens":0,"input_tokens_details":{"cached_tokens":0}}}), &config.upstream_url, now(), true, config.model_resolution.as_ref().map(|p| &p.primary));
