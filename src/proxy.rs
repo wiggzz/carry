@@ -847,6 +847,7 @@ async fn resolved_catalog(
     service: &Service,
     model: &str,
     processing_tier: &str,
+    saved: Option<&ResolvedPair>,
 ) -> Result<(ResolvedModel, ResolvedModel), Failure> {
     let config = &service.config;
     let mut primary_route = Route::new(&config.upstream_url, config.codex_login);
@@ -858,6 +859,44 @@ async fn resolved_catalog(
             .unwrap_or(&config.upstream_url),
         config.codex_login && config.classifier_url.is_none(),
     );
+    // Route/model changes intentionally establish a joint namespace epoch.
+    // Within that epoch, each role owns its own frozen facts and policy: an
+    // unresolved or legacy peer is not a reason to replace a valid contract.
+    let saved = saved.filter(|pair| {
+        pair.schema_version == 1
+            && pair.primary.model == model
+            && pair.reviewer.model == config.classifier_model
+            && pair.primary.route == primary_route
+            && pair.reviewer.route == reviewer_route
+    });
+    let reusable_capacity = |resolved: &ResolvedModel| {
+        resolved.capacity_tokens.is_some_and(|n| n > 0)
+            && resolved.provenance.get("capacity").is_some_and(|p| {
+                !matches!(
+                    p.status.as_str(),
+                    "fallback" | "legacy_snapshot_missing" | "unknown"
+                )
+            })
+    };
+    let primary = saved.map(|pair| &pair.primary).filter(|resolved| {
+        reusable_capacity(resolved)
+            && resolved.provenance["capacity"].operator_override == config.primary_context_override
+            && resolved.ordinary.output_reserve == config.primary_output_reserve_tokens
+            && resolved.ordinary.estimation_margin_percent == config.context_margin_percent
+    });
+    let reviewer = saved.map(|pair| &pair.reviewer).filter(|resolved| {
+        reusable_capacity(resolved)
+            && resolved.provenance["capacity"].operator_override == config.reviewer_context_override
+            && resolved.ordinary.output_reserve == config.classifier_max_output_tokens
+            && resolved.ordinary.estimation_margin_percent == config.context_margin_percent
+            && resolved
+                .provenance
+                .get("cache_policy")
+                .is_some_and(|p| p.revision == format!("{:?}", config.classifier_cache_policy))
+    });
+    if let (Some(primary), Some(reviewer)) = (primary, reviewer) {
+        return Ok((primary.clone(), reviewer.clone()));
+    }
     let source = if config.codex_login {
         Some(
             service
@@ -890,25 +929,34 @@ async fn resolved_catalog(
         None
     };
     let error = |message| failure(StatusCode::BAD_REQUEST, message);
-    let primary = resolve_model(
-        model,
-        primary_route,
-        source,
-        config.primary_context_override,
-        config.primary_output_reserve_tokens,
-        config.context_margin_percent,
-    )
-    .map_err(error)?;
-    let mut reviewer = resolve_model(
-        &config.classifier_model,
-        reviewer_route,
-        source,
-        config.reviewer_context_override,
-        config.classifier_max_output_tokens,
-        config.context_margin_percent,
-    )
-    .map_err(error)?;
-    freeze_reviewer_cache_policy(config, &mut reviewer);
+    let primary = if let Some(saved) = primary {
+        saved.clone()
+    } else {
+        resolve_model(
+            model,
+            primary_route,
+            source,
+            config.primary_context_override,
+            config.primary_output_reserve_tokens,
+            config.context_margin_percent,
+        )
+        .map_err(error)?
+    };
+    let reviewer = if let Some(saved) = reviewer {
+        saved.clone()
+    } else {
+        let mut resolved = resolve_model(
+            &config.classifier_model,
+            reviewer_route,
+            source,
+            config.reviewer_context_override,
+            config.classifier_max_output_tokens,
+            config.context_margin_percent,
+        )
+        .map_err(error)?;
+        freeze_reviewer_cache_policy(config, &mut resolved);
+        resolved
+    };
     Ok((primary, reviewer))
 }
 
@@ -942,56 +990,13 @@ async fn session_resolution(
     processing_tier: &str,
     _fresh_child: bool,
 ) -> Result<ResolvedPair, Failure> {
-    let config = &service.config;
-    let mut primary_route = Route::new(&config.upstream_url, config.codex_login);
-    primary_route.processing_tier = processing_tier.into();
-    let reviewer_route = Route::new(
-        config
-            .classifier_url
-            .as_deref()
-            .unwrap_or(&config.upstream_url),
-        config.codex_login && config.classifier_url.is_none(),
-    );
-    if let Some(saved) = &session.model_resolution {
-        let same = saved.schema_version == 1
-            && [&saved.primary, &saved.reviewer].iter().all(|resolved| {
-                resolved.provenance.get("capacity").is_some_and(|p| {
-                    !matches!(
-                        p.status.as_str(),
-                        "fallback" | "legacy_snapshot_missing" | "unknown"
-                    )
-                })
-            })
-            && saved.primary.model == model
-            && saved.reviewer.model == config.classifier_model
-            && saved.primary.route == primary_route
-            && saved.reviewer.route == reviewer_route
-            && saved
-                .reviewer
-                .provenance
-                .get("cache_policy")
-                .is_some_and(|p| p.revision == format!("{:?}", config.classifier_cache_policy))
-            && saved
-                .primary
-                .provenance
-                .get("capacity")
-                .is_some_and(|p| p.operator_override == config.primary_context_override)
-            && saved
-                .reviewer
-                .provenance
-                .get("capacity")
-                .is_some_and(|p| p.operator_override == config.reviewer_context_override)
-            && saved.primary.ordinary.output_reserve == config.primary_output_reserve_tokens
-            && saved.reviewer.ordinary.output_reserve == config.classifier_max_output_tokens
-            && saved.primary.ordinary.estimation_margin_percent == config.context_margin_percent;
-        if same {
-            return Ok(saved.clone());
-        }
-    }
-    // Resolve forward policy even for checkpoints without a contract. Historical
-    // ledgers remain untouched; missing provenance is not a permanent role cap.
-    let (primary, mut reviewer) = resolved_catalog(service, model, processing_tier).await?;
-    freeze_reviewer_cache_policy(config, &mut reviewer);
+    let (primary, reviewer) = resolved_catalog(
+        service,
+        model,
+        processing_tier,
+        session.model_resolution.as_ref(),
+    )
+    .await?;
     let pair = ResolvedPair {
         schema_version: 1,
         primary,
@@ -1011,7 +1016,7 @@ async fn catalog(
     axum::extract::Query(query): axum::extract::Query<CatalogQuery>,
 ) -> Result<axum::Json<Value>, Failure> {
     authorize(&service, &headers)?;
-    let (primary, reviewer) = resolved_catalog(&service, &query.model, "default").await?;
+    let (primary, reviewer) = resolved_catalog(&service, &query.model, "default", None).await?;
     Ok(axum::Json(
         json!({"schema_version":1,"primary":primary,"reviewer":reviewer}),
     ))

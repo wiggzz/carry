@@ -128,15 +128,16 @@ if args.harness == "codex":
     # Last override also covers fresh/resume and custom AGENT_COMMAND templates.
     command.extend(["--config", 'web_search="disabled"'])
 if args.harness == "pi":
-    catalog_path = pathlib.Path(os.environ.get("PREPARED_HARNESS_ROOT", "/opt/swebench-harness")) / "model_catalog.json"
-    if not catalog_path.is_file():
-        # Source-checkout execution; packaged bundles carry the exact same file.
-        catalog_path = pathlib.Path(__file__).resolve().parents[2] / "src/model_catalog.json"
-    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-    model_spec = catalog.get(args.model)
-    if not model_spec or not model_spec.get("context_tokens") or not model_spec.get("max_output_tokens"):
-        parser.error("Pi model requires catalog context/output limits")
-    model_rates = model_spec["rates"]
+    try:
+        from model_catalog import pi_model
+    except ModuleNotFoundError:
+        # Source checkout; packaged adapters import their adjacent shared helper.
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "scripts"))
+        from model_catalog import pi_model
+    try:
+        model_record = pi_model(args.model, name="Benchmark model")
+    except ValueError as error:
+        parser.error(str(error))
 
 workspace = os.environ.get("BENCHMARK_WORKSPACE", "/workspace")
 subprocess.run(
@@ -156,16 +157,7 @@ if args.harness == "pi":
                 "baseUrl": os.environ["OPENAI_BASE_URL"],
                 "api": "openai-responses",
                 "apiKey": "$OPENAI_API_KEY",
-                "models": [{
-                    "id": args.model,
-                    "name": "Benchmark model",
-                    "reasoning": True,
-                    "input": ["text", "image"],
-                    "contextWindow": model_spec["context_tokens"],
-                    "maxTokens": model_spec["max_output_tokens"],
-                    "cost": {"input": model_rates["input"], "output": model_rates["output"],
-                             "cacheRead": model_rates["cached"], "cacheWrite": model_rates["write"]},
-                }],
+                "models": [model_record],
             }
         }
     }

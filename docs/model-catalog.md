@@ -47,16 +47,24 @@ USD per million tokens, not subscription charges or a gateway tariff:
 | [gpt-6.1-sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol) | $2.00 | $0.10 | $2.50 | $10.00 |
 | [gpt-6-astra](https://developers.openai.com/api/docs/models/gpt-6-astra) | $10.00 | $1.00 | $12.50 | $50.00 |
 
-These pages document 1,050,000 total context tokens, maximum input 922,000,
-maximum output 128,000, and a whole-request price tier above 272,000 input
-tokens (2x input/cache rates, 1.5x output). Total capacity does not guarantee every
-input/output split is accepted. Carry's existing margin/output reservation
+These pages document 1,050,000 total context tokens, maximum output 128,000,
+and a whole-request price tier above 272,000 input tokens (2x input/cache rates,
+1.5x output). Subtracting maximum output from total context does not establish a
+separately documented maximum-input ceiling. Total capacity does not guarantee
+every input/output split is accepted. Carry's existing margin/output reservation
 checks and provider enforcement still apply. The conservative ordinary total
 target is 272,000, with output reserve and estimation margin applied separately.
 
 The three GPT-5.6 catalog context entries preserve the 272,000 operational
 default observed in exact-ID Codex discovery on 2026-10-22, not its larger maximum
 configuration override. Their existing modeled rates are unchanged.
+
+`client_output_tokens` is an explicit reviewed native-client allowance, separate
+from the provider's `max_output_tokens` fact. It preserves the previous 128,000
+Pi setting for all existing known models without changing unknown GPT-5.6 provider
+maxima into invented facts. The shared `pi_model` projection validates that policy
+against any known output/total bounds; both local trials and packaged adapters use
+it. Adding another model requires an explicit client policy, not a role fallback.
 
 Raw Codex default/max/effective-window/compaction fields stay unknown unless
 provided by exact-route metadata. The discovery checked during this change

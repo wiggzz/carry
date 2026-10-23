@@ -91,15 +91,10 @@ checkout instead of maintaining a second context/pricing list:
 
 ```sh
 python3 - <<'PY'
-from scripts.model_catalog import model_spec
+from scripts.model_catalog import pi_model
 import json
 model = "gpt-6.1-sol"
-spec = model_spec(model)
-rates = spec["rates"]
-entry = {"id": model, "reasoning": True, "input": ["text", "image"],
-         "contextWindow": spec["context_tokens"], "maxTokens": spec["max_output_tokens"],
-         "cost": {"input": rates["input"], "output": rates["output"],
-                  "cacheRead": rates["cached"], "cacheWrite": rates["write"]}}
+entry = pi_model(model, name="Carry model")
 provider = {"baseUrl": "http://127.0.0.1:8787/v1", "api": "openai-responses",
             "apiKey": "carry-local", "models": [entry]}
 print(json.dumps({"providers": {"carry": provider}}, indent=2))
@@ -364,15 +359,10 @@ catalog used by the proxy and benchmark adapters.
 
 ```sh
 python3 - <<'PY'
-from scripts.model_catalog import model_spec
+from scripts.model_catalog import pi_model
 import json
 model = "gpt-6.1-sol"
-spec = model_spec(model)
-rates = spec["rates"]
-entry = {"id": model, "reasoning": True, "input": ["text", "image"],
-         "contextWindow": spec["context_tokens"], "maxTokens": spec["max_output_tokens"],
-         "cost": {"input": rates["input"], "output": rates["output"],
-                  "cacheRead": rates["cached"], "cacheWrite": rates["write"]}}
+entry = pi_model(model, name="Carry model")
 provider = {"baseUrl": "http://127.0.0.1:8787/v1", "api": "openai-responses",
             "apiKey": "$CARRY_PI_TOKEN", "models": [entry],
             "headers": {"x-carry-session": "$CARRY_PI_SESSION", "x-carry-tenant": "local-pi",
