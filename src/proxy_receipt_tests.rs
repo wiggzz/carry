@@ -136,6 +136,48 @@ fn receipt_discontinuities_never_attribute_a_removal_or_sibling_suffix() {
 }
 
 #[test]
+fn receipt_bounded_anchor_restart_and_legacy_window_do_not_reprice_history() {
+    let mut t = Trajectory::default();
+    let mut b = body();
+    for n in 0..32 {
+        b["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"private-canary ".repeat(1000)}));
+        t.primary(&b, &terminal(2000 + n, 0, 0, 0), "route", 100 + n, true);
+    }
+    let receipt = state(&t)["receipts"].clone();
+    assert!(
+        serde_json::to_vec(&receipt).unwrap().len() < 2048,
+        "one bounded numeric anchor, no prompt archive"
+    );
+    assert!(!receipt.to_string().contains("private-canary"));
+    let mut legacy = state(&t);
+    legacy.as_object_mut().unwrap().remove("receipts");
+    let mut old: Trajectory = serde_json::from_value(legacy.clone()).unwrap();
+    let before = old.snapshot();
+    let old_public = serde_json::to_value(old.snapshot().dashboard(false)).unwrap();
+    assert_eq!(old_public["accounting_basis"], "legacy_json_v1");
+    let mut totals = DashboardTotals::default();
+    totals.observe(&old.snapshot().dashboard(false));
+    totals.observe(&t.snapshot().dashboard(false));
+    let current = serde_json::to_value(t.snapshot().dashboard(false)).unwrap();
+    assert_eq!(current["accounting_basis"], "receipt_anchored_v2");
+    let total = serde_json::to_value(totals).unwrap();
+    assert_eq!(total["included_sessions"], 1);
+    assert_eq!(total["legacy_sessions"], 1);
+    assert_eq!(total["carry_cost"], current["carry_cost"]);
+    old.primary(&body(), &terminal(100_000, 0, 0, 3), "route", 200, true);
+    let public = serde_json::to_value(old.snapshot().dashboard(false)).unwrap();
+    assert_eq!(public["accounting_basis"], "receipt_anchored_v2");
+    assert_eq!(
+        public["legacy_estimate"]["carry_cost"], before.carry_cost,
+        "legacy sums remain separate, never repriced or blended"
+    );
+    assert_eq!(public["matched_primary_responses"], 1);
+}
+
+#[test]
 fn receipt_missing_conflicting_and_failed_usage_remain_unknown_not_projected() {
     for variant in ["no_cache", "overlap", "conflict", "missing", "failed"] {
         let mut t = Trajectory::default();
