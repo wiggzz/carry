@@ -1277,7 +1277,8 @@ async fn dashboard_stats(
         "sessions": sessions, "unavailable_sessions": unavailable_sessions,
         "cost_basis": "standard API rate equivalents, not subscription charges or an invoice",
         "cost_scenario": crate::proxy_savings::Scenario::default(),
-        "cost_estimate_basis": "frozen_trajectory_o200k_base_json_inputs_common_metered_output;carry_includes_reviewer;conditional_same_route_30min_append_cache;reviewer_uncached;not_measured_savings",
+        "cost_estimate_basis": crate::proxy_savings::accounting_basis_label(),
+        "cost_estimate_policy": crate::proxy_savings::accounting_policy(),
         "scope": "checkpoints in this proxy state directory; completed/observed usage only"
     }))
     .into_response();

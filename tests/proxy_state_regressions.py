@@ -301,6 +301,25 @@ class StateRegressions(unittest.TestCase):
         if not available:
             self.assertIsNone(estimate["savings_percent"], message)
 
+    def test_accounting_basis_matches_current_and_retained_legacy_policy(self):
+        fixture = self.fixture(lambda _body, _n: (200, completed()))
+        proxy = self.proxy(fixture)
+        status, stats = proxy.request("GET", "/carry/dashboard/stats")
+        self.assertEqual(status, 200)
+        self.assertIn("receipt_anchored_v2", stats["cost_estimate_basis"])
+        self.assertIn("legacy_json_v1", stats["cost_estimate_basis"])
+        self.assertNotIn("reviewer_uncached", stats["cost_estimate_basis"])
+        policy = stats["cost_estimate_policy"]
+        self.assertEqual(policy["default_basis"], "receipt_anchored_v2")
+        self.assertEqual(policy["retained_legacy_basis"], "legacy_json_v1")
+        self.assertEqual(policy["observed_cost_basis"], "provider_native_partitions_with_dispatch_frozen_tariffs")
+        self.assertEqual(proxy.send([{"role":"user","content":"policy fixture"}])[0], 200)
+        _, stats = proxy.request("GET", "/carry/dashboard/stats")
+        estimate = stats["sessions"][0]["cost_estimate"]
+        self.assertEqual(estimate["accounting_basis"], policy["default_basis"])
+        self.assertEqual(estimate["counterfactual_basis"], policy["counterfactual_basis"])
+        self.evidence.update(policy=policy, estimate=estimate)
+
     def test_reviewer_control_observations_once_and_restart(self):
         fixture = self.fixture(lambda _body, _n: (200, completed()))
         options = ["--min-payback-percent", "100"]

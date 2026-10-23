@@ -104,6 +104,51 @@ fn receipt(usage: &Value) -> Option<Usage> {
     })
 }
 
+/// Estimate only semantic text that can be retained in the next input. Native
+/// output billing, IDs and encrypted transport envelopes are different units.
+/// Unknown output kinds have no invented retained-context measurement.
+fn retained_output_tokens(output: &Value) -> Option<u64> {
+    let mut text = Vec::new();
+    for item in output.as_array()? {
+        match item["type"].as_str()? {
+            "message" => {
+                if let Some(content) = item["content"].as_str() {
+                    text.push(content);
+                } else {
+                    for part in item["content"].as_array()? {
+                        text.push(match part["type"].as_str()? {
+                            "output_text" | "input_text" => part["text"].as_str()?,
+                            "refusal" => part["refusal"].as_str()?,
+                            _ => return None,
+                        });
+                    }
+                }
+            }
+            "reasoning" => {
+                if let Some(summary) = item.get("summary") {
+                    for part in summary.as_array()? {
+                        text.push(part["text"].as_str()?);
+                    }
+                }
+            }
+            "function_call" => {
+                text.push(item["name"].as_str()?);
+                text.push(item["arguments"].as_str()?);
+            }
+            "custom_tool_call" => {
+                text.push(item["name"].as_str()?);
+                text.push(item["input"].as_str()?);
+            }
+            _ => return None,
+        }
+    }
+    Some(if text.is_empty() {
+        0
+    } else {
+        token_units(&json!(text))
+    })
+}
+
 impl Trajectory {
     /// Freeze old sums on the first post-upgrade request, never reprice them.
     /// The new window starts from the retained input, not an invented empty chat.
@@ -224,12 +269,16 @@ impl Trajectory {
         if !text {
             self.result.coverage.unmodeled_calls += 1;
         }
-        let (Some(native), Some(carry), Some((_, _, local)), Some(items), Some(output)) = (
+        let retained_output = retained_output_tokens(&response["output"]);
+        if text && retained_output.is_none() {
+            self.result.coverage.unmodeled_calls += 1;
+        }
+        let (Some(native), Some(carry), Some((_, _, local)), Some(items), Some(retained_output)) = (
             native,
             observed,
             projection,
             body["input"].as_array(),
-            response["output"].as_array(),
+            retained_output,
         ) else {
             self.result.excluded_unpriced_calls += 1;
             self.reset_epoch();
@@ -306,8 +355,9 @@ impl Trajectory {
                 )
             })
         };
-        // Retained output is locally estimated, not billed reasoning/output.
-        let total = traditional.saturating_add(token_units(&Value::Array(output.clone())));
+        // Only the explicit semantic projection can enter this estimate;
+        // opaque transport size and billed output are not retained input units.
+        let total = traditional.saturating_add(retained_output);
         let summarize =
             self.scenario.valid() && total > self.scenario.context_window - self.scenario.reserve;
         let discarded = total.saturating_sub(self.scenario.keep_recent);

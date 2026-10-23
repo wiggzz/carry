@@ -87,6 +87,11 @@ fn state_regression(selector: &str) {
 }
 
 #[test]
+fn accounting_basis_matches_current_and_retained_legacy_policy() {
+    state_regression("accounting_basis_matches_current_and_retained_legacy_policy");
+}
+
+#[test]
 fn reviewer_control_observations_once_and_restart() {
     state_regression("reviewer_control_observations_once_and_restart");
 }

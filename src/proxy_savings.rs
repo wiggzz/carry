@@ -5,6 +5,24 @@ use carry::models::ResolvedModel;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub const RECEIPT_BASIS: &str = "receipt_anchored_v2";
+pub const LEGACY_BASIS: &str = "legacy_json_v1";
+const RECEIPT_COUNTERFACTUAL_BASIS: &str = "shared_receipt_input_plus_estimated_restoration_summary_visible_retained_output_conditional_append_cache";
+
+pub fn accounting_policy() -> Value {
+    json!({"default_basis": RECEIPT_BASIS, "retained_legacy_basis": LEGACY_BASIS,
+        "observed_cost_basis": "provider_native_partitions_with_dispatch_frozen_tariffs",
+        "counterfactual_basis": RECEIPT_COUNTERFACTUAL_BASIS,
+        "opaque_output_retention": "unknown_not_ciphertext_length",
+        "claim": "conditional_counterfactual_not_measured_savings"})
+}
+
+pub fn accounting_basis_label() -> String {
+    format!(
+        "versioned_per_session;default={RECEIPT_BASIS};retained={LEGACY_BASIS};not_measured_savings"
+    )
+}
+
 #[path = "proxy_receipts.rs"]
 mod receipts;
 
@@ -83,14 +101,14 @@ impl Estimate {
     pub fn dashboard(self, pending: bool) -> DashboardEstimate {
         let available = self.priced && !pending;
         DashboardEstimate {
-            observed_primary_cost: (self.accounting_basis == "receipt_anchored_v2"
+            observed_primary_cost: (self.accounting_basis == RECEIPT_BASIS
                 && self.coverage.primary_responses > self.unavailable_primary_cost_calls)
                 .then_some(self.observed_primary_cost),
-            observed_reviewer_cost: (self.accounting_basis == "receipt_anchored_v2"
+            observed_reviewer_cost: (self.accounting_basis == RECEIPT_BASIS
                 && self.coverage.reviewer_responses > self.unavailable_reviewer_cost_calls)
                 .then_some(self.observed_reviewer_cost),
-            counterfactual_basis: if self.accounting_basis == "receipt_anchored_v2" {
-                "shared_receipt_input_plus_estimated_restoration_summary_retained_output_conditional_append_cache"
+            counterfactual_basis: if self.accounting_basis == RECEIPT_BASIS {
+                RECEIPT_COUNTERFACTUAL_BASIS
             } else {
                 "legacy_local_json_projection"
             },
@@ -139,7 +157,7 @@ impl DashboardTotals {
         // Diagnostics cover all sessions, even pending/ineligible comparisons.
         self.excluded_unpriced_calls += estimate.excluded_unpriced_calls;
         self.excluded_unpriced_reviewer_calls += estimate.excluded_unpriced_reviewer_calls;
-        if estimate.accounting_basis == "legacy_json_v1" {
+        if estimate.accounting_basis == LEGACY_BASIS {
             self.legacy_sessions += 1;
             self.excluded_sessions += 1;
             return;
@@ -211,7 +229,7 @@ impl Default for Trajectory {
             receipts: Some(receipts::Receipts::default()),
             scenario: Scenario::default(),
             result: Estimate {
-                accounting_basis: "receipt_anchored_v2".into(),
+                accounting_basis: RECEIPT_BASIS.into(),
                 ..Estimate::default()
             },
             previous: None,
@@ -231,9 +249,9 @@ impl Trajectory {
     pub fn snapshot(&self) -> Estimate {
         let mut estimate = self.result.clone();
         estimate.accounting_basis = if self.receipts.is_some() {
-            "receipt_anchored_v2"
+            RECEIPT_BASIS
         } else {
-            "legacy_json_v1"
+            LEGACY_BASIS
         }
         .into();
         estimate.matched_primary_responses = self.priced_primary_responses.unwrap_or(0);
