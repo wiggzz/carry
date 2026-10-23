@@ -562,7 +562,13 @@ fn receipt_traditional_summary_is_cold_then_rewarms_its_own_prefix() {
     t.primary(&b, &r, "route", 100, true);
     assert_eq!(t.snapshot().traditional_compactions, 1);
     let before = t.snapshot();
-    for (at, input, traditional_input, cached) in [(101, 3900, 1700, 0), (102, 4000, 1800, 1700)] {
+    // A real continuation includes the retained visible output in total input.
+    // Keep that measured quantity, rather than an inconsistent nominal 3900.
+    let next_input = t.retired + 1700 - t.summary;
+    for (at, input, traditional_input, cached) in [
+        (101, next_input, 1700, 0),
+        (102, next_input + 100, 1800, 1700),
+    ] {
         b["input"]
             .as_array_mut()
             .unwrap()

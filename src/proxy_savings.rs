@@ -363,8 +363,10 @@ impl Trajectory {
     }
 
     pub fn failed_call(&mut self) {
-        if self.receipts.is_some() {
-            self.reset_epoch();
+        if let Some(receipts) = &mut self.receipts {
+            // A failed attempt cannot promise reuse, but must not discard the
+            // successful scenario's restoration or hypothetical summary.
+            receipts.invalidate();
         }
         self.result.coverage.failed_calls += 1;
         if self.successful_requests_only {
