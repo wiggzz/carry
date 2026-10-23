@@ -182,6 +182,11 @@ fn failed_primary_terminals_do_not_mutate_successful_scenario() {
 }
 
 #[test]
+fn reviewer_only_failures_preserve_primary_cache_continuity() {
+    state_regression("reviewer_only_failures_preserve_primary_cache_continuity");
+}
+
+#[test]
 fn reviewer_completion_classification_survives_background_merge_and_restart() {
     state_regression("reviewer_completion_classification_survives_background_merge_and_restart");
 }

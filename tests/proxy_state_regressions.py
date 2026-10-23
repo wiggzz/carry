@@ -1133,6 +1133,68 @@ class StateRegressions(unittest.TestCase):
                                                  math.ulp(saved_cost)))
                 self.assert_estimate_available(estimate, True, "successful reviewer spend must survive a failed primary")
 
+    def test_reviewer_only_failures_preserve_primary_cache_continuity(self):
+        self.evidence["cases"] = []
+        for background in (False, True):
+            for restart in (False, True):
+                controls = None
+                for outcome in ("no-review", "completed", "failed", "incomplete", "429", "transport"):
+                    with self.subTest(background=background, restart=restart, outcome=outcome):
+                        self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+
+                        def primary(_body, n):
+                            response = completed(response_id=f"resp_{n}")
+                            response["usage"]["input_tokens"] = 2000 + 100 * n
+                            response["usage"]["output_tokens"] = 0
+                            return 200, response
+
+                        def review(_body, n):
+                            if n == 1 and outcome == "transport":
+                                return None
+                            if n == 1 and outcome == "429":
+                                return 429, {"error": "fixture reviewer rate limit"}
+                            response = advice_response({"protected": [], "removable": [], "memories": []})
+                            if n == 1 and outcome in ("failed", "incomplete"):
+                                response["status"] = outcome
+                            return 200, response
+
+                        fixture = self.fixture(primary, review)
+                        options = [f"--background-reviews={'true' if background else 'false'}"]
+                        if outcome == "no-review":
+                            options += ["--review-every-requests", "100"]
+                        proxy = self.proxy(fixture, options)
+                        seed = [{"role": "user", "content": "goal"},
+                                {"role": "assistant", "content": "eligible evidence"},
+                                {"role": "user", "content": "current"}]
+                        costs = []
+                        for n in range(3):
+                            self.assertEqual(proxy.send(seed + [
+                                {"role": "user", "content": f"continue {i}"} for i in range(n)
+                            ])[0], 200)
+                            saved = self.wait_saved(proxy, lambda s: not s.get("background_review_pending", False))
+                            costs.append(saved["cost_trajectory"]["result"]["traditional_cost"])
+                            if restart and n == 1:
+                                proxy.close()
+                                proxy = self.proxy(fixture, ["--review-every-requests", "100"])
+                        estimate = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
+                        proxy.close()
+                        fixture.close()
+                        self.assertEqual(fixture.errors, [])
+                        self.evidence["cases"].append({"background": background, "restart": restart,
+                                                       "outcome": outcome, "costs": costs, "estimate": estimate})
+                        if outcome == "no-review":
+                            self.assertEqual(len(fixture.reviews), 0)
+                            controls = (costs, estimate["observed_primary_cost"])
+                        else:
+                            self.assertGreaterEqual(len(fixture.reviews), 1)
+                        self.assertEqual(estimate["coverage"]["failed_calls"],
+                                         0 if outcome in ("no-review", "completed") else 1)
+                        self.assertEqual(estimate["coverage"]["primary_responses"], 3)
+                        self.assertAlmostEqual(estimate["observed_primary_cost"], controls[1], places=12)
+                        for actual, expected in zip(costs, controls[0]):
+                            self.assertAlmostEqual(actual, expected, places=12,
+                                                   msg="reviewer-only failures must not cool the untouched primary scenario")
+
     def test_restart_orphan_reviewer_is_untracked_not_proven_failed(self):
         def review(_body, _n):
             fixture.held.set()

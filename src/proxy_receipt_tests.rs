@@ -292,6 +292,36 @@ fn receipt_pending_preserves_completed_costs_and_aggregate_scope() {
 }
 
 #[test]
+fn receipt_failed_reviewer_does_not_invalidate_primary_or_traditional_cache() {
+    for status in ["failed", "incomplete"] {
+        for restart in [false, true] {
+            let mut t = Trajectory::default();
+            t.primary(&body(), &terminal(2000, 0, 0, 0), "route", 100, true);
+            let before = t.snapshot();
+            let mut failed = terminal(1000, 0, 0, 10);
+            failed["status"] = json!(status);
+            t.reviewer_resolved(&body(), &failed, true, None);
+            if restart {
+                t = serde_json::from_value(state(&t)).unwrap();
+            }
+            let mut next = body();
+            next["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":"continue"}));
+            assert!(t.receipt_prediction(&next, "route", None).is_some());
+            t.primary(&next, &terminal(2100, 0, 0, 0), "route", 101, true);
+            let after = t.snapshot();
+            let expected = scenario_input_cost("gpt-6.1-sol", 2100, 2000, Some(1024)).unwrap();
+            assert!((after.traditional_cost - before.traditional_cost - expected).abs() < 1e-12);
+            assert_eq!(after.coverage.failed_calls, 1);
+            assert_eq!(after.coverage.primary_responses, 2);
+            assert_eq!(after.reviewer_cost, 0.0);
+        }
+    }
+}
+
+#[test]
 fn receipt_frozen_scenario_policy_and_tariff_survive_restart_without_route_credit() {
     use carry::models::{Route, resolve_model};
     let mut resolved = resolve_model(
