@@ -176,6 +176,64 @@ fn receipt_counterfactual_cache_is_conditional_not_copied_from_actual_hits() {
 }
 
 #[test]
+fn receipt_subscription_traditional_cache_uses_model_policy_not_transport_capability() {
+    use carry::models::{Route, resolve_model};
+
+    let model = "gpt-6.1-sol";
+    for (endpoint, subscription) in [
+        ("https://api.openai.com/v1/responses", false),
+        ("https://chatgpt.com/backend-api/codex/responses", true),
+        ("http://127.0.0.1:12345/responses", true),
+        ("https://example.invalid/responses", false),
+    ] {
+        let resolved =
+            resolve_model(model, Route::new(endpoint, subscription), None, None, 0, 0).unwrap();
+        let route_cache = resolved.cache;
+        let mut t = Trajectory::default();
+        // A real hit does not warm the hypothetical branch's first request.
+        t.primary_resolved(
+            &body(),
+            &terminal(2000, 2000, 0, 0),
+            endpoint,
+            100,
+            true,
+            Some(&resolved),
+        );
+        let cold = t.snapshot();
+        let expected_cold = scenario_input_cost(model, 2000, 0, Some(1024)).unwrap();
+        assert!(
+            (cold.traditional_cost - expected_cold).abs() < 1e-12,
+            "{endpoint}: model-level cache economics must not be disabled by transport uncertainty"
+        );
+        let mut t: Trajectory = serde_json::from_value(state(&t)).unwrap();
+        let mut appended = body();
+        appended["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"append"}));
+        // A real miss does not remove the alternative's conditional prefix reuse.
+        t.primary_resolved(
+            &appended,
+            &terminal(2100, 0, 0, 0),
+            endpoint,
+            101,
+            true,
+            Some(&resolved),
+        );
+        let warm = t.snapshot();
+        let expected_warm = scenario_input_cost(model, 2100, 2000, Some(1024)).unwrap();
+        assert!((warm.traditional_cost - cold.traditional_cost - expected_warm).abs() < 1e-12);
+        assert_eq!(warm.coverage.unknown_cache_requests, 0);
+        assert_eq!(
+            resolved.cache, route_cache,
+            "scenario policy is not a route entitlement"
+        );
+        assert!((warm.observed_primary_cost - 0.0044).abs() < 1e-12);
+        assert_eq!(warm.carry_cost, warm.observed_primary_cost);
+    }
+}
+
+#[test]
 fn receipt_unmodeled_actuals_are_unknown_and_coverage_reconciles() {
     let mut t = Trajectory::default();
     let r = terminal(2000, 1000, 0, 10);
