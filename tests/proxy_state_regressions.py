@@ -301,6 +301,25 @@ class StateRegressions(unittest.TestCase):
         if not available:
             self.assertIsNone(estimate["savings_percent"], message)
 
+    def test_accounting_basis_matches_current_and_retained_legacy_policy(self):
+        fixture = self.fixture(lambda _body, _n: (200, completed()))
+        proxy = self.proxy(fixture)
+        status, stats = proxy.request("GET", "/carry/dashboard/stats")
+        self.assertEqual(status, 200)
+        self.assertIn("receipt_anchored_v2", stats["cost_estimate_basis"])
+        self.assertIn("legacy_json_v1", stats["cost_estimate_basis"])
+        self.assertNotIn("reviewer_uncached", stats["cost_estimate_basis"])
+        policy = stats["cost_estimate_policy"]
+        self.assertEqual(policy["default_basis"], "receipt_anchored_v2")
+        self.assertEqual(policy["retained_legacy_basis"], "legacy_json_v1")
+        self.assertEqual(policy["observed_cost_basis"], "provider_native_partitions_with_dispatch_frozen_tariffs")
+        self.assertEqual(proxy.send([{"role":"user","content":"policy fixture"}])[0], 200)
+        _, stats = proxy.request("GET", "/carry/dashboard/stats")
+        estimate = stats["sessions"][0]["cost_estimate"]
+        self.assertEqual(estimate["accounting_basis"], policy["default_basis"])
+        self.assertEqual(estimate["counterfactual_basis"], policy["counterfactual_basis"])
+        self.evidence.update(policy=policy, estimate=estimate)
+
     def test_reviewer_control_observations_once_and_restart(self):
         fixture = self.fixture(lambda _body, _n: (200, completed()))
         options = ["--min-payback-percent", "100"]
@@ -751,17 +770,15 @@ class StateRegressions(unittest.TestCase):
                 self.assertEqual(fixture.errors, [])
                 self.assertEqual(len(fixture.primaries), 3)
                 if variant == "unknown_cache":
-                    # New route-frozen scenarios explicitly model BOTH branches
-                    # uncached when cache support is unknown. This is not an
-                    # unpriced call: the frozen tariff is known. Snapshot-missing
-                    # legacy scenarios retain their omission policy in native
-                    # Trajectory tests; do not infer cache hits from this control.
+                    # Actuals use the zero-cache receipt; the traditional branch
+                    # assumes uncached when cache capability is unknown. No
+                    # projection is substituted for observed provider input.
                     result = omitted["result"]
                     delta = result["carry_cost"] - before["carry_cost"]
                     self.assertGreater(delta, 0)
                     self.assertAlmostEqual(result["traditional_cost"] - before["traditional_cost"],
                                            delta, delta=1e-12, msg="matched uncached branches, no invented savings")
-                    self.assertIsNotNone(omitted["previous"])
+                    self.assertIsNotNone(omitted["receipts"]["anchor"])
                     self.assertEqual(result["excluded_unpriced_calls"], 0)
                     self.assertGreater(result["coverage"]["unknown_cache_requests"],
                                        before["coverage"]["unknown_cache_requests"])
@@ -774,7 +791,7 @@ class StateRegressions(unittest.TestCase):
                     continue
                 self.assertEqual(omitted["result"]["carry_cost"], before["carry_cost"], "omit both branches, never a partial pair")
                 self.assertEqual(omitted["result"]["traditional_cost"], before["traditional_cost"])
-                self.assertTrue(omitted["previous"] is None, "an omitted primary cannot preserve a stale cache predecessor")
+                self.assertIsNone(omitted["receipts"]["anchor"], "an omitted primary cannot preserve a stale receipt anchor")
                 estimate = stats["sessions"][0]["cost_estimate"]
                 self.assert_estimate_available(estimate, True, "unpriced calls must not hide priced comparisons")
                 self.assertEqual(estimate.get("excluded_unpriced_calls"), 1)
@@ -826,8 +843,13 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(fixture.reviews, [])
 
     def test_successful_request_savings_after_failure_and_restart(self):
-        fixture = self.fixture(lambda _body, n: (429, {"error": "fixture rate limit"})
-                               if n == 2 else (200, completed(response_id=f"resp_{n}")))
+        def primary(_body, n):
+            if n == 2:
+                return 429, {"error": "fixture rate limit"}
+            value = completed(response_id=f"resp_{n}")
+            value["usage"]["input_tokens"] = {1: 100, 3: 2000, 4: 2100}[n]
+            return 200, value
+        fixture = self.fixture(primary)
         options = ["--review-every-requests", "100"]
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send([{"role": "user", "content": "initial task"}])[0], 200)
@@ -867,8 +889,11 @@ class StateRegressions(unittest.TestCase):
     def test_traditional_summary_between_tool_requests_survives_restart(self):
         tool = {"type": "function_call", "name": "lookup", "call_id": "call_2",
                 "arguments": "{}"}
-        fixture = self.fixture(lambda _body, n: (200, completed(
-            [tool] if n == 2 else [], response_id=f"resp_{n}")))
+        def primary(_body, n):
+            value = completed([tool] if n == 2 else [], response_id=f"resp_{n}")
+            value["usage"]["input_tokens"] = {1: 100, 2: 2000, 3: 2100}[n]
+            return 200, value
+        fixture = self.fixture(primary)
         options = ["--review-every-requests", "100"]
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send([{"role": "user", "content": "initial task"}])[0], 200)

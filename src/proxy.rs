@@ -1254,7 +1254,8 @@ async fn dashboard_stats(
         "sessions": sessions, "unavailable_sessions": unavailable_sessions,
         "cost_basis": "standard API rate equivalents, not subscription charges or an invoice",
         "cost_scenario": crate::proxy_savings::Scenario::default(),
-        "cost_estimate_basis": "frozen_trajectory_o200k_base_json_inputs_common_metered_output;carry_includes_reviewer;conditional_same_route_30min_append_cache;reviewer_uncached;not_measured_savings",
+        "cost_estimate_basis": crate::proxy_savings::accounting_basis_label(),
+        "cost_estimate_policy": crate::proxy_savings::accounting_policy(),
         "scope": "checkpoints in this proxy state directory; completed/observed usage only"
     }))
     .into_response();
@@ -1540,6 +1541,9 @@ async fn forward_request(
             let mut trajectory = crate::proxy_savings::Trajectory::default();
             trajectory.prior_untracked(session.primary.calls + session.shadow.calls);
             session.cost_trajectory = Some(trajectory);
+        }
+        if let Some(trajectory) = &mut session.cost_trajectory {
+            trajectory.begin_receipt_window();
         }
         if session.primary_pending {
             // The per-owner primary lock excludes a live predecessor. This is
@@ -2536,9 +2540,17 @@ fn reviewer_view_costs(
 /// Keep receipts numeric and bounded: a provider usage object is untrusted too.
 fn numeric_review_usage(usage: &Value) -> Value {
     let mut result = json!({});
-    for field in ["input_tokens", "output_tokens"] {
-        if let Some(n) = usage[field].as_u64() {
-            result[field] = json!(n);
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "cache_creation_input_tokens",
+    ] {
+        if let Some(value) = usage.get(field) {
+            // Preserve invalid presence as a bounded numeric sentinel. Dropping
+            // an invalid optional partition would falsely turn it into zero.
+            result[field] = value.as_u64().map_or(json!(-1), |n| json!(n));
         }
     }
     for field in ["input_tokens_details", "output_tokens_details"] {
@@ -2548,8 +2560,8 @@ fn numeric_review_usage(usage: &Value) -> Value {
             "cache_creation_tokens",
             "audio_tokens",
         ] {
-            if let Some(n) = usage[field][key].as_u64() {
-                result[field][key] = json!(n);
+            if let Some(value) = usage[field].get(key) {
+                result[field][key] = value.as_u64().map_or(json!(-1), |n| json!(n));
             }
         }
     }
@@ -5075,7 +5087,7 @@ mod tests {
             let mut trajectory = crate::proxy_savings::Trajectory::default();
             trajectory.primary(
                 &json!({"model":"gpt-6-luna","input":[{"role":"user","content":"task"}]}),
-                &json!({"status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":1}}),
+                &json!({"status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}),
                 "route", 100, true,
             );
             before.cost_trajectory = Some(trajectory);
