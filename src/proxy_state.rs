@@ -621,10 +621,17 @@ impl Session {
             .map(|i| i.id)
             .collect::<HashSet<_>>();
         let mut input = Vec::new();
+        let mut in_removed_run = false;
         for item in &self.history {
-            if !item.removed {
+            if item.removed {
+                if !in_removed_run {
+                    input.push((None, json!({"role":"user","content":"[Earlier conversation omitted by Carry; retained messages remain in original order.]"})));
+                }
+            } else {
                 input.push((Some(item.id), item.value.clone()));
             }
+            // Replacement memories do not split a run of removed native items.
+            in_removed_run = item.removed;
             for memory in &self.memories {
                 if memory.source_ids.iter().any(|id| removed.contains(id))
                     && self
@@ -1045,6 +1052,7 @@ impl Session {
                 }
             }
         }
+        let mut rejected_sources = BTreeSet::new();
         let mut memories = Vec::new();
         let mut memory_indexes = Vec::new();
         if let Some(items) = value["memories"].as_array().filter(|a| a.len() <= 64) {
@@ -1084,11 +1092,31 @@ impl Session {
                         memories.push(memory);
                         memory_indexes.push(index);
                     }
-                    Err(error) => reject("memories", index, &error.to_string()),
+                    Err(error) => {
+                        if let Some(sources) = memory["source_ids"].as_array() {
+                            rejected_sources.extend(sources.iter().filter_map(|raw| {
+                                parse_group(raw).ok().filter(|id| known.contains(id))
+                            }));
+                        }
+                        reject(
+                            "memories",
+                            index,
+                            &format!("{error}; supporting sources kept"),
+                        );
+                    }
                 }
             }
         } else {
             reject("memories", 0, "expected an array of at most 64 memories");
+            if let Some(items) = value["memories"].as_array() {
+                rejected_sources.extend(items.iter().flat_map(|memory| {
+                    memory["source_ids"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|raw| parse_group(raw).ok().filter(|id| known.contains(id)))
+                }));
+            }
         }
         let primary_before = (self.cost_trajectory.is_some()
             && (!memories.is_empty() || memory_updates.values().any(|opinion| *opinion == "drop")))
@@ -1123,7 +1151,12 @@ impl Session {
         self.retire_memories(&retired);
         for ((sources, text), index) in memories.into_iter().zip(memory_indexes) {
             if self.memories.len() >= 128 {
-                reject("memories", index, "active memory limit of 128 reached");
+                rejected_sources.extend(&sources);
+                reject(
+                    "memories",
+                    index,
+                    "active memory limit of 128 reached; supporting sources kept",
+                );
                 continue;
             }
             let mut candidate = self.clone();
@@ -1160,16 +1193,18 @@ impl Session {
                 *self = candidate;
                 accepted_memories += 1;
             } else {
+                rejected_sources.extend(&candidate.memories.last().unwrap().source_ids);
                 reject(
                     "memories",
                     index,
-                    "aggregate rendered memory byte or token budget exceeded; cleanup headroom required",
+                    "aggregate rendered memory byte or token budget exceeded; supporting sources kept; cleanup headroom required",
                 );
             }
         }
+        self.preserve_memory_sources(&rejected_sources.into_iter().collect::<Vec<_>>());
         self.review_feedback = json!({"accepted_opinions":accepted_opinions, "accepted_memories":accepted_memories,
             "rejected_count":rejected_count, "rejected":rejected,
-            "guidance":"Accepted items were applied. Correct rejected items in a future review using the current eligible ledger; do not repeat accepted memories."});
+            "guidance":"Accepted items were applied except supporting sources of rejected replacements remain protected. Correct rejected items in a future review using the current eligible ledger; do not repeat accepted memories."});
         if let Some(before) = primary_before {
             let after = self.render_primary();
             // Visible memory edits belong to Carry, not the traditional
@@ -1183,6 +1218,20 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// A proposed replacement that was rejected cannot authorize losing its
+    /// supporting source. This is not a memory requirement for unrelated drops.
+    pub fn preserve_memory_sources(&mut self, sources: &[u64]) {
+        if sources.is_empty() {
+            return;
+        }
+        let groups = self.groups();
+        for group in groups.iter().filter(|group| sources.contains(&group.id)) {
+            self.opinions.insert(group.id, "keep".into());
+            self.drop_members.remove(&group.id);
+            self.renew_group_lease(group);
+        }
     }
 
     /// Shared physical retirement path; callers own authorization and accounting.
@@ -1366,6 +1415,7 @@ fn parse_group(value: &Value) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("proxy_omission_tests.rs");
 
     #[test]
     fn current_task_is_not_duplicated_in_the_reviewer_nudge() {
@@ -1454,7 +1504,7 @@ mod tests {
         let indexed = state.render_primary_with_ids();
         assert_eq!(
             indexed.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            vec![Some(1), None, Some(3), Some(4)]
+            vec![Some(1), None, None, Some(3), Some(4)]
         );
         assert_eq!(
             indexed
@@ -1495,7 +1545,12 @@ mod tests {
         state.remove(&[5], &groups);
         assert_eq!(
             state.render_primary(),
-            [input[..4].to_vec(), input[7..].to_vec()].concat()
+            [
+                input[..4].to_vec(),
+                vec![omission_notice()],
+                input[7..].to_vec()
+            ]
+            .concat()
         );
     }
 
@@ -1713,7 +1768,7 @@ mod tests {
         state.remove(&[2], &groups);
         assert_eq!(
             state.render_primary(),
-            vec![complete[0].clone(), complete[4].clone()]
+            vec![complete[0].clone(), omission_notice(), complete[4].clone()]
         );
     }
 
@@ -1999,8 +2054,20 @@ mod tests {
         assert_eq!(state.render_primary(), input);
         state.history[1].removed = true;
         let rendered = state.render_primary();
+        assert_eq!(rendered.len(), 5);
+        assert_eq!(rendered[1], omission_notice());
+        assert_eq!(rendered[2], input[2]);
+        assert!(
+            rendered[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("small fact")
+        );
+        assert_eq!(rendered[4], input[3]);
+        state.history[2].removed = true;
+        let rendered = state.render_primary();
         assert_eq!(rendered.len(), 4);
-        assert_eq!(rendered[1], input[2]);
+        assert_eq!(rendered[1], omission_notice());
         assert!(
             rendered[2]["content"]
                 .as_str()
@@ -2008,16 +2075,6 @@ mod tests {
                 .contains("small fact")
         );
         assert_eq!(rendered[3], input[3]);
-        state.history[2].removed = true;
-        let rendered = state.render_primary();
-        assert_eq!(rendered.len(), 3);
-        assert!(
-            rendered[1]["content"]
-                .as_str()
-                .unwrap()
-                .contains("small fact")
-        );
-        assert_eq!(rendered[2], input[3]);
     }
 
     #[test]
