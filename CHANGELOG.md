@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.14.1](https://github.com/wiggzz/carry/compare/v0.14.0...v0.14.1) (2026-10-23)
+
+
+### Bug Fixes
+
+* **models:** unify reviewer limits and pricing through the shared catalog ([#172](https://github.com/wiggzz/carry/issues/172)) ([956ef74](https://github.com/wiggzz/carry/commit/956ef741c481523dcc00325d57bbf33a3cabf4e2))
+* **proxy:** preserve continuity across history omissions ([#173](https://github.com/wiggzz/carry/issues/173)) ([c57efc2](https://github.com/wiggzz/carry/commit/c57efc25f8a34659f98f470177d28d65a6aa21a9))
+* **savings:** anchor both comparison lanes to provider receipts ([#175](https://github.com/wiggzz/carry/issues/175)) ([05e746b](https://github.com/wiggzz/carry/commit/05e746b735144066f552f22446b3e959cc4b0543))
+
 ## [0.14.0](https://github.com/wiggzz/carry/compare/v0.13.0...v0.14.0) (2026-10-23)
 
 
