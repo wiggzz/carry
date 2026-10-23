@@ -73,6 +73,18 @@ pub fn model_spec(model: &str) -> Option<ModelSpec> {
     })
 }
 
+/// Public API facts, not subscription defaults or gateway entitlement.
+/// Checked 2026-10-22; see docs/model-catalog.md for the capacity/price contract.
+fn documented_api_source(model: &str) -> Option<&'static str> {
+    match model {
+        "gpt-6-luna" => Some("https://developers.openai.com/api/docs/models/gpt-6-luna"),
+        "gpt-6-sol" => Some("https://developers.openai.com/api/docs/models/gpt-6-sol"),
+        "gpt-6.1-sol" => Some("https://developers.openai.com/api/docs/models/gpt-6.1-sol"),
+        "gpt-6-astra" => Some("https://developers.openai.com/api/docs/models/gpt-6-astra"),
+        _ => None,
+    }
+}
+
 impl ModelSpec {
     pub fn rates_for_input(self, input_tokens: f64) -> Option<Rates> {
         let mut rates = self.rates?;
@@ -410,6 +422,9 @@ pub fn resolve_model(
     let source = source.filter(|s| subscribed && s.route.as_ref() == Some(&route));
     let entry = source.and_then(|s| s.models.iter().find(|entry| entry.model == model));
     let raw = entry.map(|e| e.raw.clone()).unwrap_or_default();
+    let documented_source = documented_api_source(model);
+    let api_capacity_source = documented_source
+        .filter(|_| route.class == RouteClass::OfficialApi && route.processing_tier == "default");
     let capacity = entry
         .filter(|e| {
             e.field_status
@@ -417,7 +432,8 @@ pub fn resolve_model(
                 .is_some_and(|s| s == "valid")
         })
         .and_then(|e| e.raw.context_window)
-        .filter(|_| source.is_some_and(|s| s.status == "fresh_at_resolution"));
+        .filter(|_| source.is_some_and(|s| s.status == "fresh_at_resolution"))
+        .or(api_capacity_source.map(|_| 1_050_000));
     if override_tokens.is_some_and(|v| v == 0 || v > 2_000_000) {
         return Err("invalid context override");
     }
@@ -453,8 +469,27 @@ pub fn resolve_model(
             capacity_provenance.status = source.status.clone();
         }
     }
+    if let Some(url) = api_capacity_source {
+        capacity_provenance.source = url.into();
+        capacity_provenance.status = "documented_official_api".into();
+        capacity_provenance.revision = "openai-api-model-docs-2026-10-22".into();
+    }
     if override_tokens.is_some() {
         capacity_provenance.status = "operator_override".into();
+    }
+    let mut price_provenance = provenance(
+        "carry/src/models.rs:legacy-table",
+        if rates.is_some() {
+            "legacy_modeling_basis_not_route_tariff"
+        } else {
+            "unknown"
+        },
+        None,
+    );
+    if let Some(url) = documented_source {
+        price_provenance.source = url.into();
+        price_provenance.status = "documented_api_equivalent_not_route_tariff".into();
+        price_provenance.revision = "openai-api-model-docs-2026-10-22".into();
     }
     let cache = matches!(route.class, RouteClass::OfficialApi)
         .then(|| legacy.and_then(|s| s.cache))
@@ -487,18 +522,7 @@ pub fn resolve_model(
             && legacy.is_some_and(|s| s.explicit_reviewer_cache),
         provenance: BTreeMap::from([
             ("capacity".into(), capacity_provenance),
-            (
-                "prices".into(),
-                provenance(
-                    "carry/src/models.rs:legacy-table",
-                    if rates.is_some() {
-                        "legacy_modeling_basis_not_route_tariff"
-                    } else {
-                        "unknown"
-                    },
-                    None,
-                ),
-            ),
+            ("prices".into(), price_provenance),
             (
                 "cache".into(),
                 provenance(
