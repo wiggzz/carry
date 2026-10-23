@@ -209,7 +209,9 @@ class Fixture:
         self.compact_calls = []
         self.summary_calls = []
         self.calls = []
+        self.responses = []
         self.errors = []
+        self.state_directory = None
         outer = self
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -265,6 +267,9 @@ class Fixture:
                             'text':json.dumps({'protected':[], 'removable':sorted(targets), 'memories':[]})}]}],
                             'usage':{'input_tokens':100,'output_tokens':10,
                             'input_tokens_details':{'cached_tokens':0,'cache_write_tokens':0}}}
+                        if outer.case == 'fork':
+                            advice = outer.fork_advice(body, targets, records, eligible)
+                            value['output'][0]['content'][0]['text'] = json.dumps(advice)
                         raw=json.dumps(value).encode(); content_type='application/json'
                     else:
                         legacy=self.path == '/v1/responses/compact'
@@ -274,7 +279,7 @@ class Fixture:
                         cache_key = body.get('prompt_cache_key')
                         summary=outer.case=='pi-checkpoint' and cache_key is None
                         coding=[c for c in outer.calls if c.get('prompt_cache_key')]
-                        if not summary and (not isinstance(cache_key, str) or not cache_key or (coding and
+                        if not summary and (not isinstance(cache_key, str) or not cache_key or (coding and outer.case != 'fork' and
                                 cache_key != coding[0].get('prompt_cache_key'))):
                             raise ValueError('native cache namespace missing or changed')
                         outer.calls.append(body)
@@ -298,7 +303,7 @@ class Fixture:
                             arguments = ({'cmd':'printf FIXTURE_TOOL_OK > proxy-fixture.txt; cat proxy-fixture.txt',
                                           'yield_time_ms':1000,'max_output_tokens':128} if outer.client == 'codex'
                                          else {'command':'printf FIXTURE_TOOL_OK > proxy-fixture.txt; cat proxy-fixture.txt'})
-                            if outer.case in ('compact','pi-checkpoint'):
+                            if outer.case in ('compact','pi-checkpoint','fork'):
                                 commands=['printf FIXTURE_TOOL_OK > proxy-fixture.txt; python3 -c '+
                                     '\"print(\'DROP_COHORT_PAYLOAD_A \' * 1400)\"',
                                     'printf FIXTURE_TOOL_OK_B > proxy-fixture-b.txt; python3 -c '+
@@ -318,8 +323,16 @@ class Fixture:
                                        for item in body.get('input', []) if isinstance(item,dict)) and not (
                                            outer.case=='pi-checkpoint' and 'FIXTURE_PI_CHECKPOINT' in json.dumps(body['input'])):
                                 raise ValueError('native full-history tool-result echo missing')
-                            if outer.case == 'compact' and count < 5:
+                            if (outer.case == 'compact' and count < 5) or (outer.case == 'fork' and count == 2):
                                 command='printf SMALL_COHORT_'+str(count)
+                                if outer.state_directory is not None:
+                                    # The primary has already completed. Sequence this
+                                    # fixture's next native turn after durable reviewer
+                                    # merge, never by waiting inside Carry forwarding.
+                                    import shlex
+                                    command += '; ' + shlex.join(['python3',
+                                        str(Path(__file__).with_name('proxy_native_settle.py').resolve()),
+                                        str(outer.state_directory), str(count)])
                                 args=({'cmd':command,'yield_time_ms':1000,'max_output_tokens':128}
                                       if outer.client == 'codex' else {'command':command})
                                 output=[{'type':'function_call','id':f'fc_fixture_{count}',
@@ -337,6 +350,7 @@ class Fixture:
                             value['usage']['input_tokens']=50000
                             value['usage']['total_tokens']=50010
                             value['usage']['input_tokens_details']['cache_write_tokens']=50000
+                        outer.responses.append(value)
                         events = [{'type':'response.created','response':{**value,'output':[],'status':'in_progress'}}]
                         for index, item in enumerate(output):
                             initial = {**item,'status':'in_progress'}
@@ -456,6 +470,7 @@ def main():
     parser.add_argument('--codex')
     parser.add_argument('--pi')
     parser.add_argument('--client', choices=('codex','pi'), help='Run only one installed pinned client')
+    parser.add_argument('--case', choices=('fork',), help='Run only the isolated Pi fork tracer')
     parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args()
     for client in ([args.client] if args.client else ['codex','pi']):
@@ -464,7 +479,9 @@ def main():
         parser.error('fixture output must be fresh')
     args.output.mkdir(parents=True)
     results=[]
+    if args.case and args.client != 'pi': parser.error('--case fork requires --client pi')
     for client,case in [('codex','off'),('codex','compact'),('pi','off'),('pi','compact'),('codex','v1'),('codex','v2'),('pi','pi-checkpoint-strict'),('pi','pi-checkpoint'),('pi','pi-checkpoint-off')]:
+        if args.case: continue
         if args.client and client != args.client: continue
         label=client+'-'+case
         workspace=args.output / (label+'-workspace'); workspace.mkdir()
@@ -479,6 +496,7 @@ def main():
         with Fixture(client,'pi-checkpoint' if case.startswith('pi-checkpoint') else case) as fixture, socket.socket() as sock:
             sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]; sock.close()
             trial=args.output / (label+'-trial')
+            fixture.state_directory = (trial / 'state').resolve()
             command=['python3',str(Path(__file__).with_name('proxy_trial.py')),
                 '--client',client,'--carry-binary',args.carry,'--client-binary',getattr(args,client),
                 '--workspace',str(workspace),'--trial-dir',str(trial),'--mode','off' if case in ('off','pi-checkpoint-off') else 'compact',
@@ -547,6 +565,11 @@ def main():
     compact=[r for r in results if r['case']=='compact']
     if len({r['classifier_cache_namespace_sha256'] for r in compact}) != len(compact):
         raise RuntimeError('fresh native clients reused a classifier cache namespace')
+    if args.client in (None, 'pi'):
+        from proxy_pi_fork_fixture import run_case
+        results.append(run_case(carry=args.carry, pi=args.pi, output=args.output/'pi-fork',
+            fixture_class=Fixture, observer_class=ClientObserver))
+        (args.output/'results.json').write_text(json.dumps(results,indent=2)+'\n')
     print(json.dumps(results,indent=2))
 
 

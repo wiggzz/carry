@@ -1,5 +1,9 @@
 // ADMISSION-001: execute dispatch, concurrent primary commit, merge and restart.
 async fn background_commit_admission_control(kind: &str) {
+    background_commit_admission_control_for_import(kind, false).await;
+}
+
+async fn background_commit_admission_control_for_import(kind: &str, bootstrap: bool) {
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -42,6 +46,10 @@ async fn background_commit_admission_control(kind: &str) {
     service.config.classifier_url = Some(format!("http://{address}/review"));
     service.config.upstream_url = format!("http://{address}/primary");
     let mut session = admission_session(100, 4);
+    if bootstrap {
+        session.import_replayed_prefix();
+        assert_eq!(session.bootstrap_end_id, 2);
+    }
     // Explicitly initialize BEFORE observations: the source really is uncovered.
     admission::initialize(&mut session);
     let frontier = serde_json::to_value(&session.review_admission).unwrap();
@@ -170,6 +178,18 @@ async fn background_commit_admission_control(kind: &str) {
         (100, 10, 40)
     );
     assert!(merged.shadow.cost_usd > 0.0);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    if bootstrap {
+        assert!(merged.bootstrap_estimated_cost_usd > 0.0);
+        assert_eq!(
+            merged.bootstrap_reviewed_ids.contains(&2),
+            kind != "rejected",
+            "RI-001: current-budget wholly rejected bootstrap advice must not consume source"
+        );
+        assert_eq!(merged.bootstrap_review_complete, kind != "rejected");
+        assert_eq!(merged.bootstrap_review_pending, kind == "rejected");
+        assert_eq!(merged.bootstrap_end_id, before.bootstrap_end_id);
+    }
     assert_eq!(
         merged.last_review_request, 4,
         "dispatch attempt consumes ordinary cadence, not merge-time age"
@@ -179,6 +199,11 @@ async fn background_commit_admission_control(kind: &str) {
     assert_eq!(merged.last_response_id, current.last_response_id);
     assert_eq!(merged.response_frontier, current.response_frontier);
     assert_eq!(merged.review_context, current.review_context);
+    assert_eq!(
+        serde_json::to_value(&merged.history).unwrap(),
+        serde_json::to_value(&current.history).unwrap(),
+        "merge retains the complete primary suffix and cohorts"
+    );
     assert!(merged.memories.is_empty());
     assert_eq!(merged.review_feedback["accepted_memories"], 0);
     assert_eq!(
@@ -244,7 +269,7 @@ async fn background_commit_admission_control(kind: &str) {
         serde_json::to_value(&resumed).unwrap(),
         serde_json::to_value(&merged).unwrap()
     );
-    if kind == "rejected" {
+    if kind == "rejected" && !bootstrap {
         let mut run = ReviewRun::default();
         let main = admission_main(&resumed);
         assert!(!review(&restarted, &id, &mut resumed, &main, false, &mut run).await);
@@ -278,4 +303,19 @@ async fn adaptive_background_valid_empty_still_covers_source_and_backs_off() {
 #[tokio::test]
 async fn adaptive_background_partial_valid_still_covers_source_and_resets_backoff() {
     background_commit_admission_control("partial").await;
+}
+
+#[tokio::test]
+async fn bootstrap_background_all_rejected_memory_keeps_source_pending_after_restart() {
+    background_commit_admission_control_for_import("rejected", true).await;
+}
+
+#[tokio::test]
+async fn bootstrap_background_valid_empty_covers_source_after_restart() {
+    background_commit_admission_control_for_import("empty", true).await;
+}
+
+#[tokio::test]
+async fn bootstrap_background_partial_valid_covers_source_after_restart() {
+    background_commit_admission_control_for_import("partial", true).await;
 }

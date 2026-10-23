@@ -112,7 +112,7 @@ class Fixture:
 
 
 class Proxy:
-    def __init__(self, state, fixture, extra=()):
+    def __init__(self, state, fixture, extra=(), extra_env=None, mode="compact", environment=None):
         binary = os.environ["CARRY_TEST_BINARY"]
         # Explicit minimal environment prevents ambient provider/auth/refresh
         # configuration from entering even this loopback-only fixture.
@@ -125,19 +125,23 @@ class Proxy:
                "CARRY_PROXY_REVIEW_MIN_NEW_TOKENS": "0",
                "CARRY_PROXY_REVIEW_BACKOFF_FACTOR": "1",
                "CARRY_PROXY_REVIEW_EVERY_REQUESTS": "1"}
+        env.update(extra_env or {})
+        env.update(environment or {})
         args = [binary, "proxy", "--listen", "127.0.0.1:0", "--no-open-dashboard",
-                "--state-dir", str(state), "--mode", "compact",
+                "--state-dir", str(state), "--mode", mode,
                 "--upstream-url", fixture.url + "/v1/responses",
                 "--classifier-url", fixture.url + "/review",
                 "--classifier-model", "gpt-6-luna",
                 *([] if "--min-payback-percent" in extra else ["--min-payback-percent", "0"]),
                 "--bootstrap-min-input-bytes", "8388608",
-                "--request-timeout-secs", "5", "--classifier-timeout-secs", "10",
+                *([] if "--request-timeout-secs" in extra else ["--request-timeout-secs", "5"]),
+                *([] if "--classifier-timeout-secs" in extra else ["--classifier-timeout-secs", "10"]),
                 *extra]
         if not any(arg.startswith("--background-reviews") for arg in args):
             args += ["--background-reviews=false"]
         if "--payoff-requests" not in args:
             args += ["--payoff-requests", "5"]
+        self._captures = []
         self.process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if not select.select([self.process.stdout], [], [], 5)[0]:
@@ -150,8 +154,24 @@ class Proxy:
         host, port = banner.split(" ", 1)[1].rsplit(":", 1)
         self.address = (host, int(port))
         self.state = Path(state)
+        # Legacy synchronous fixtures inspect accepted advice immediately after
+        # a response. Synchronize *after reading the primary response*, never in
+        # production admission. Background/concurrency fixtures opt out.
+        self.wait_reviews = "--background-reviews=false" in args
+        # Long loopback tracers must not deadlock the actual binary on a full
+        # unread diagnostic pipe. Spool both streams; never discard evidence.
+        for name, stream in (("stdout", self.process.stdout), ("stderr", self.process.stderr)):
+            capture = (self.state / f"fixture-{self.process.pid}-{name}.log").open("ab", buffering=0)
+            drain = threading.Thread(target=self.drain_output, args=(stream, capture), daemon=True)
+            self._captures.append((drain, capture))
+            drain.start()
         status, _ = self.request("GET", "/health")
         assert status == 200, "real Carry health route is required"
+
+    @staticmethod
+    def drain_output(stream, capture):
+        while chunk := stream.read1(16384):
+            capture.write(chunk)
 
     def request(self, method, path, body=None):
         # Bootstrap import runs a dozen sequential review round-trips before
@@ -169,8 +189,14 @@ class Proxy:
             connection.close()
 
     def send(self, input_items, **fields):
-        return self.request("POST", "/v1/responses",
-                            {"model": "gpt-6-luna", "input": input_items, **fields})
+        response = self.request("POST", "/v1/responses",
+                                {"model": "gpt-6-luna", "input": input_items, **fields})
+        if self.wait_reviews:
+            deadline = time.monotonic() + 15
+            while self.saved().get("background_review_pending"):
+                assert time.monotonic() < deadline, "post-response reviewer did not settle"
+                time.sleep(0.01)
+        return response
 
     def saved(self):
         files = list(self.state.glob("*.json"))
@@ -181,6 +207,11 @@ class Proxy:
         if self.process.poll() is None:
             self.process.kill()
         self.process.wait(timeout=5)
+        for drain, capture in self._captures:
+            drain.join(timeout=5)
+            if drain.is_alive():
+                raise AssertionError("fixture diagnostic stream did not reach EOF")
+            capture.close()
         self.process.stdout.close()
         self.process.stderr.close()
 
@@ -208,8 +239,8 @@ class StateRegressions(unittest.TestCase):
         self.stack.callback(fixture.close)
         return fixture
 
-    def proxy(self, fixture, extra=()):
-        proxy = Proxy(self.state, fixture, extra)
+    def proxy(self, fixture, extra=(), environment=None):
+        proxy = Proxy(self.state, fixture, extra, environment)
         self.stack.callback(proxy.close)
         return proxy
 
@@ -360,7 +391,7 @@ class StateRegressions(unittest.TestCase):
                 self.evidence[change] = {"settled": saved, "restarted": restarted, "reviews": fixture.reviews}
                 proxy.close()
 
-    def capacity_wait_direction(self, change):
+    def capacity_rejection_direction(self, change, publication_failure=False):
         def review(body, n):
             if n == 1:
                 self.assertIn("g2", ledger(body)["eligible_group_ids"])
@@ -392,6 +423,13 @@ class StateRegressions(unittest.TestCase):
         direction = "ORIGINAL_DIRECTION" if change == "unchanged" else (
             "CHANGED_DIRECTION" if change == "changed" else "")
         result, errors = [], []
+        checkpoint = next(self.state.glob("*.json"))
+        original_bytes = checkpoint.read_bytes()
+        blocked_temporary = self.state / f".{checkpoint.stem}.tmp"
+        if publication_failure:
+            # Fail the real explicit-authority staging open, not its reader or
+            # the provider. The old checkpoint remains readable byte-for-byte.
+            blocked_temporary.mkdir()
 
         def send_pressure():
             try:
@@ -400,60 +438,62 @@ class StateRegressions(unittest.TestCase):
                 errors.append(repr(error))
 
         waiter = threading.Thread(target=send_pressure, daemon=True)
-        restorer, restore_results = None, []
         waiter.start()
         try:
-            deadline = time.monotonic() + 4
-            while time.monotonic() < deadline:
-                entries = [json.loads(line) for path in (self.state / "diagnostics").glob("*.jsonl")
-                           for line in path.read_bytes().splitlines()]
-                if any(e["event"] == "review_waiting" and
-                       e["data"].get("reason") == "background_capacity" for e in entries):
-                    break
-                time.sleep(0.01)
-            else:
-                self.fail("new input must reach the real forced-capacity background wait")
-            self.assertTrue(waiter.is_alive(), "pressure request must still be waiting for held review")
+            # #163 rejects overflow using already accepted authority; it never
+            # waits for a reviewer or buys rescue advice on the primary path.
+            waiter.join(timeout=3)
+            self.assertFalse(waiter.is_alive(), "capacity rejection must not wait for held review")
+            self.assertEqual(errors, [])
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0][0], 413)
             self.assertEqual(len(fixture.primaries), 2, "no capacity-overflow input may reach upstream")
             at_wait = proxy.saved()
             if change == "clear_then_restore":
-                # The published input is now growing. Restore A at that same
-                # frontier; both over-capacity requests wait for the held review.
-                restorer = threading.Thread(target=lambda: restore_results.append(
-                    proxy.send(growing, **fields)), daemon=True)
-                restorer.start()
-                deadline = time.monotonic() + 4
-                while time.monotonic() < deadline:
-                    events = [json.loads(line) for path in (self.state / "diagnostics").glob("*.jsonl")
-                              for line in path.read_bytes().splitlines()]
-                    if sum(e["event"] == "review_waiting" for e in events) >= 2:
-                        break
-                    time.sleep(0.01)
-                else:
-                    self.fail("restored direction must reach its own capacity wait before release")
+                # Even two rejected requests must publish both invalidations.
+                self.assertEqual(proxy.send(growing, **fields)[0], 413)
+                direction = "ORIGINAL_DIRECTION"
             before_release = proxy.saved()
+            if publication_failure:
+                self.assertEqual(checkpoint.read_bytes(), original_bytes,
+                                 "fault must preserve the old readable authority")
+                self.evidence["failed_publication"] = {
+                    "checkpoint_unchanged": True, "temporary": blocked_temporary.name,
+                    "old_epoch": before["review_epoch"],
+                    "readable_epoch": before_release["review_epoch"]}
+                blocked_temporary.rmdir()
+                if change == "clear_then_restore":
+                    # Recover storage and persist A again before releasing A's
+                    # old worker. A same-input ingress must not erase the fence.
+                    self.assertEqual(proxy.send(growing, **fields)[0], 413)
+                    before_release = proxy.saved()
         finally:
+            if publication_failure and blocked_temporary.is_dir():
+                blocked_temporary.rmdir()
             fixture.release.set()
             waiter.join(timeout=20)
-            if restorer is not None:
-                restorer.join(timeout=20)
-        if restorer is not None:
-            self.assertFalse(restorer.is_alive())
-            self.assertEqual(len(restore_results), 1)
-            self.assertEqual(restore_results[0][0], 413)
-        self.assertFalse(waiter.is_alive(), "capacity retry must finish after reviewer settlement")
-        self.assertEqual(errors, [])
-        self.assertEqual(len(result), 1)
         settled = self.wait_saved(proxy, lambda s: not s["background_review_pending"])
-        entries = [json.loads(line) for path in (self.state / "diagnostics").glob("*.jsonl")
-                   for line in path.read_bytes().splitlines()]
-        merges = [e for e in entries if e["event"] in (
-            "background_review_merged", "background_review_discarded")]
+        if change == "unchanged":
+            # Compatible advice may help only the next request, never turn the
+            # earlier rejected primary into a blocking reviewer-dependent call.
+            self.assertEqual(proxy.send(growing, instructions=direction, max_output_tokens=1)[0], 200)
+            settled = proxy.saved()
+        # Checkpoint replacement precedes its settlement journal append. Wait
+        # for that actual event rather than racing the worker's final logging.
+        deadline = time.monotonic() + 3
+        while True:
+            entries = [json.loads(line) for path in (self.state / "diagnostics").glob("*.jsonl")
+                       for line in path.read_bytes().splitlines()]
+            merges = [e for e in entries if e["event"] in (
+                "background_review_merged", "background_review_discarded")]
+            if merges or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
         self.evidence.update(change=change, before=before, at_wait=at_wait,
                              before_release=before_release, settled=settled, result=result,
                              reviews=fixture.reviews, primaries=fixture.primaries, events=entries)
         print("CAPACITY_EPOCH_SETTLED " + json.dumps({
-            "change": change, "wait_seen": True, "status": result[0][0],
+            "change": change, "capacity_rejected_without_wait": True, "status": result[0][0],
             "before_epoch": before["review_epoch"], "wait_epoch": at_wait["review_epoch"],
             "release_epoch": before_release["review_epoch"],
             "settled_epoch": settled["review_epoch"],
@@ -475,14 +515,14 @@ class StateRegressions(unittest.TestCase):
         # accepted advice, not just an early capacity/fixture error.
         self.assertEqual(any(m["text"] == "CAPACITY_HELD_A_FACT"
                              for m in settled.get("memories", [])), accepted,
-                         "capacity yield must not admit old-direction A memory")
+                         "capacity rejection must not admit old-direction A memory")
         self.assertEqual(any(item["id"] == 2 and item["removed"] for item in settled["history"]),
                          accepted, "only compatible A drop advice may retire its source")
         self.assertNotIn("2", settled.get("opinions", {}),
                          "retired-source opinions are pruned; rejected advice grants none")
         self.assertEqual(merges[0]["event"], "background_review_merged" if accepted
                          else "background_review_discarded")
-        self.assertEqual(result[0][0], 200 if accepted else 413)
+        self.assertEqual(result[0][0], 413, "pending advice cannot rescue this primary")
         if accepted:
             self.assertIn(b"CAPACITY_HELD_A_FACT", wire(fixture.primaries[-1]))
             self.assertNotIn(b"old evidence", wire(fixture.primaries[-1]))
@@ -511,17 +551,29 @@ class StateRegressions(unittest.TestCase):
               "memory_accepted": any(m["text"] == "CAPACITY_HELD_A_FACT"
                                      for m in restarted.get("memories", []))}), flush=True)
 
-    def test_capacity_wait_unchanged_direction_accepts_held_advice(self):
-        self.capacity_wait_direction("unchanged")
+    def test_capacity_rejection_unchanged_direction_accepts_held_advice(self):
+        self.capacity_rejection_direction("unchanged")
 
-    def test_capacity_wait_changed_direction_rejects_held_advice(self):
-        self.capacity_wait_direction("changed")
+    def test_capacity_rejection_changed_direction_rejects_held_advice(self):
+        self.capacity_rejection_direction("changed")
 
-    def test_capacity_wait_cleared_direction_rejects_held_advice(self):
-        self.capacity_wait_direction("cleared")
+    def test_capacity_rejection_cleared_direction_rejects_held_advice(self):
+        self.capacity_rejection_direction("cleared")
 
-    def test_capacity_wait_clear_restore_rejects_held_advice(self):
-        self.capacity_wait_direction("clear_then_restore")
+    def test_capacity_rejection_clear_restore_rejects_held_advice(self):
+        self.capacity_rejection_direction("clear_then_restore")
+
+    def test_capacity_rejection_failed_save_unchanged_accepts_held_advice(self):
+        self.capacity_rejection_direction("unchanged", publication_failure=True)
+
+    def test_capacity_rejection_failed_save_changed_rejects_held_advice(self):
+        self.capacity_rejection_direction("changed", publication_failure=True)
+
+    def test_capacity_rejection_failed_save_cleared_rejects_held_advice(self):
+        self.capacity_rejection_direction("cleared", publication_failure=True)
+
+    def test_capacity_rejection_failed_save_restore_rejects_held_advice(self):
+        self.capacity_rejection_direction("clear_then_restore", publication_failure=True)
 
     def test_reviewer_wire_fingerprints_are_content_free_and_join_usage(self):
         def review(_body, n):
@@ -694,6 +746,28 @@ class StateRegressions(unittest.TestCase):
                 fixture.close()
                 self.assertEqual(fixture.errors, [])
                 self.assertEqual(len(fixture.primaries), 3)
+                if variant == "unknown_cache":
+                    # New route-frozen scenarios explicitly model BOTH branches
+                    # uncached when cache support is unknown. This is not an
+                    # unpriced call: the frozen tariff is known. Snapshot-missing
+                    # legacy scenarios retain their omission policy in native
+                    # Trajectory tests; do not infer cache hits from this control.
+                    result = omitted["result"]
+                    delta = result["carry_cost"] - before["carry_cost"]
+                    self.assertGreater(delta, 0)
+                    self.assertAlmostEqual(result["traditional_cost"] - before["traditional_cost"],
+                                           delta, delta=1e-12, msg="matched uncached branches, no invented savings")
+                    self.assertIsNotNone(omitted["previous"])
+                    self.assertEqual(result["excluded_unpriced_calls"], 0)
+                    self.assertGreater(result["coverage"]["unknown_cache_requests"],
+                                       before["coverage"]["unknown_cache_requests"])
+                    estimate = stats["sessions"][0]["cost_estimate"]
+                    self.assert_estimate_available(estimate, True)
+                    self.assertEqual(estimate["excluded_unpriced_calls"], 0)
+                    self.assertAlmostEqual(estimate["carry_cost"], 2 * before["carry_cost"] + delta,
+                                           delta=1e-12, msg="restart preserves frozen totals without repricing")
+                    self.assertEqual(stats["cost_estimate"]["excluded_unpriced_calls"], 0)
+                    continue
                 self.assertEqual(omitted["result"]["carry_cost"], before["carry_cost"], "omit both branches, never a partial pair")
                 self.assertEqual(omitted["result"]["traditional_cost"], before["traditional_cost"])
                 self.assertTrue(omitted["previous"] is None, "an omitted primary cannot preserve a stale cache predecessor")

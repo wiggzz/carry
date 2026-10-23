@@ -21,7 +21,8 @@ use axum::{
     routing::{get, post},
 };
 use carry::core::{Rates, ViewCosts, horizon_cost, input_cost, joint_decision, select_removals};
-use clap::{Parser, ValueEnum};
+use carry::models::{ResolvedModel, ResolvedPair, Route, RouteClass, SourceCatalog, resolve_model};
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, oneshot};
@@ -55,9 +56,12 @@ pub enum Login {
     Codex,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(name = "carry proxy", about = "Opaque native Responses HTTP proxy")]
 pub struct ProxyCli {
+    /// Ephemeral current-request dispatch policy; future ordinary requests remain forecastable.
+    #[arg(skip)]
+    current_review_suppressed: bool,
     /// Auto prefers a configured API key, then Carry's saved subscription.
     /// API-key mode requires a configured upstream environment key.
     #[arg(long, value_enum, default_value = "auto")]
@@ -106,7 +110,9 @@ pub struct ProxyCli {
     #[arg(long)]
     review_replayed_history: bool,
     /// Total primary context budget, including output reserve and estimation margin.
-    #[arg(long, default_value_t = 272000, value_parser = clap::value_parser!(u32).range(1024..=2000000))]
+    #[arg(long = "primary-context-tokens", value_parser = clap::value_parser!(u32).range(1024..=2000000))]
+    primary_context_override: Option<u32>,
+    #[arg(skip = 272000u32)]
     primary_context_tokens: u32,
     /// Reserved primary output tokens when the client supplies no output limit.
     #[arg(long, default_value_t = 16384)]
@@ -115,8 +121,13 @@ pub struct ProxyCli {
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=100))]
     context_margin_percent: u8,
     /// Total reviewer context budget, including its output reserve and margin.
-    #[arg(long, alias = "reviewer-context-tokens", default_value_t = 300000, value_parser = clap::value_parser!(u32).range(1024..=2000000))]
+    #[arg(long = "classifier-max-input-tokens", alias = "reviewer-context-tokens", value_parser = clap::value_parser!(u32).range(1024..=2000000))]
+    reviewer_context_override: Option<u32>,
+    #[arg(skip = 300000u32)]
     classifier_max_input_tokens: u32,
+    /// Request-scoped frozen contracts, never a second model table.
+    #[arg(skip)]
+    model_resolution: Option<ResolvedPair>,
     /// Serialized transport guard; token budget controls reviewer context size.
     #[arg(long, default_value_t = 8388608, value_parser = clap::value_parser!(u32).range(4096..=8388608))]
     classifier_max_input_bytes: u32,
@@ -131,9 +142,15 @@ pub struct ProxyCli {
     /// Explicit replay declarations override this threshold.
     #[arg(long, default_value_t = 16384)]
     bootstrap_min_input_bytes: usize,
-    /// Run ordinary reviews in the background; bootstrap remains synchronous.
+    /// Compatibility flag; reviewer work is always nonblocking. Recurring
+    /// completion sensitivity is diagnostic, never selection credit.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     background_reviews: bool,
+    /// Successful primary completions before temporary keeps may be revalidated.
+    #[arg(long, env = "CARRY_PROXY_KEEP_LEASE_TURNS", default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..))]
+    keep_lease_turns: u64,
+    #[arg(skip)]
+    keep_lease_source: Option<String>,
     /// Ordinary reviews require this many completed primary requests AND native-source growth.
     #[arg(long, env = "CARRY_PROXY_REVIEW_EVERY_REQUESTS", default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=100))]
     review_every_requests: u64,
@@ -157,21 +174,66 @@ pub struct ProxyCli {
     classifier_reasoning_effort: String,
     #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=16384))]
     classifier_max_output_tokens: u32,
+    /// Retained historical review evidence per explicit parent lineage. Zero
+    /// disables new fork guarantees; eviction never alters active tombstones.
+    #[arg(long, env = "CARRY_PROXY_FORK_MAX_NODES", default_value_t = 8, value_parser = clap::value_parser!(u32).range(0..=32))]
+    fork_max_nodes: u32,
+    /// Global transparent canonical-node bound; shared prefixes count once.
+    #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_NODES", default_value_t = 16384, value_parser = clap::value_parser!(u32).range(1..=65536))]
+    history_max_nodes: u32,
+    /// Global tip/review-frontier/transcript index reference bound.
+    #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_REFERENCES", default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    history_max_references: u32,
+    /// Global canonical index, selected metadata and transcript byte bound.
+    #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_BYTES", default_value_t = 33554432, value_parser = clap::value_parser!(u32).range(2..=67108864))]
+    history_max_bytes: u32,
+    #[arg(long, env = "CARRY_PROXY_FORK_MAX_BYTES", default_value_t = 262144, value_parser = clap::value_parser!(u32).range(2..=1048576))]
+    fork_max_bytes: u32,
+    #[arg(long, env = "CARRY_PROXY_FORK_MAX_AGE_SECS", default_value_t = 86400, value_parser = clap::value_parser!(u64).range(0..=604800))]
+    fork_max_age_secs: u64,
 }
 
+impl ProxyCli {
+    pub fn parse_with_sources(argv: Vec<std::ffi::OsString>) -> Self {
+        let matches = Self::command().get_matches_from(argv);
+        let mut config = Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+        config.keep_lease_source = Some(
+            match matches.value_source("keep_lease_turns") {
+                Some(clap::parser::ValueSource::CommandLine) => "command_line",
+                Some(clap::parser::ValueSource::EnvVariable) => "environment",
+                Some(clap::parser::ValueSource::DefaultValue) => "default",
+                _ => "unknown",
+            }
+            .into(),
+        );
+        config
+    }
+}
+
+#[derive(Clone)]
 struct Service {
+    catalog: Arc<tokio::sync::OnceCell<SourceCatalog>>,
     config: ProxyCli,
     client: reqwest::Client,
     upstream_key: Option<String>,
     classifier_key: Option<String>,
     auth_token: Option<String>,
-    locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
-    background_reviews: Mutex<HashSet<String>>,
-    _directory_lock: File,
+    locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    background_reviews: Arc<Mutex<HashSet<String>>>,
+    // Advice authority belongs to the live worker, independently of whether a
+    // changed-direction checkpoint can be published. Cleared on settlement.
+    invalidated_reviews: Arc<Mutex<HashSet<String>>>,
+    #[cfg(test)]
+    lock_waits: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    _directory_lock: Arc<File>,
 }
 
 #[path = "proxy_admission.rs"]
 mod admission;
+#[path = "proxy_fork.rs"]
+pub(crate) mod forking;
+#[path = "proxy_history.rs"]
+mod history;
 #[path = "proxy_plan.rs"]
 mod planning;
 use planning::plan;
@@ -214,6 +276,8 @@ fn private_file(path: &Path, append: bool) -> std::io::Result<File> {
 }
 
 pub async fn serve(mut config: ProxyCli) -> Result<()> {
+    config.primary_context_tokens = config.primary_context_override.unwrap_or(272000);
+    config.classifier_max_input_tokens = config.reviewer_context_override.unwrap_or(300000);
     if config.codex_login && config.login == Login::ApiKey {
         bail!("--codex-login conflicts with --login api-key");
     }
@@ -274,6 +338,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
     if !config.bootstrap_max_cost_usd.is_finite() || config.bootstrap_max_cost_usd < 0.0 {
         bail!("bootstrap cost limit must be finite and nonnegative");
     }
+    history::validate_capacity(&config)?;
     validate_url(&config.upstream_url)?;
     if let Some(url) = &config.classifier_url {
         validate_url(url)?;
@@ -313,6 +378,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         }
     }
     let service = Arc::new(Service {
+        catalog: Arc::new(tokio::sync::OnceCell::new()),
         upstream_key: std::env::var("CARRY_PROXY_UPSTREAM_KEY")
             .ok()
             .filter(|key| !key.trim().is_empty())
@@ -336,9 +402,12 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
             .connect_timeout(Duration::from_secs(15))
             .build()?,
         config,
-        locks: Mutex::new(HashMap::new()),
-        background_reviews: Mutex::new(HashSet::new()),
-        _directory_lock: directory_lock,
+        locks: Arc::new(Mutex::new(HashMap::new())),
+        background_reviews: Arc::new(Mutex::new(HashSet::new())),
+        invalidated_reviews: Arc::new(Mutex::new(HashSet::new())),
+        #[cfg(test)]
+        lock_waits: Arc::new(std::sync::Mutex::new(None)),
+        _directory_lock: Arc::new(directory_lock),
     });
     logging::maintain(&service);
     let listener = tokio::net::TcpListener::bind(service.config.listen).await?;
@@ -380,6 +449,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
             get(|| async { axum::Json(json!({"status": "ok"})) }),
         )
         .route("/v1/models", get(models))
+        .route("/carry/catalog", get(catalog))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(native_compact))
         .route("/v1/responses/{id}", get(unsupported).delete(unsupported))
@@ -460,6 +530,12 @@ async fn session_lock(service: &Service, id: &str) -> OwnedMutexGuard<()> {
             lock
         }
     };
+    #[cfg(test)]
+    if let Some(sender) = service.lock_waits.lock().unwrap().as_ref() {
+        // On the single-threaded regression runtime the next poll registers the
+        // waiter before the observer runs. No sleep or production scheduling hook.
+        let _ = sender.send(id.to_owned());
+    }
     lock.lock_owned().await
 }
 
@@ -470,11 +546,19 @@ fn load(service: &Service, id: &str) -> Result<Session, Failure> {
     match std::fs::read(path) {
         Ok(bytes) if bytes.len() <= CHECKPOINT_MAX_BYTES => {
             serde_json::from_slice::<Session>(&bytes)
+                .and_then(|session| {
+                    if session.history_shared {
+                        history::restore(service, id).map_err(serde_json::Error::io)
+                    } else {
+                        Ok(session)
+                    }
+                })
                 .map(|mut session| {
                     for evidence in &mut session.primary_cache {
                         evidence.compact();
                     }
                     session.shadow_cache.clear();
+                    forking::prune(&service.config, &mut session);
                     session
                 })
                 .map_err(|_| {
@@ -492,8 +576,86 @@ fn load(service: &Service, id: &str) -> Result<Session, Failure> {
     }
 }
 
+fn load_existing(service: &Service, id: &str) -> Result<Session, Failure> {
+    // A paid worker already has an owner. Missing authority is an error, never
+    // permission to merge its receipt into a newly defaulted logical session.
+    if !service.config.state_dir.join(format!("{id}.json")).exists() {
+        return Err(failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "active history owner unavailable",
+        ));
+    }
+    load(service, id)
+}
+
 fn save(service: &Service, id: &str, session: &Session) -> std::io::Result<()> {
-    save_with_limit(service, id, session, CHECKPOINT_MAX_BYTES)
+    save_observed(service, id, session, None)
+}
+
+/// Settle paid accounting without the material whose publication failed. Start
+/// from authority, not the failed candidate/mirror: no new response ID, replay,
+/// advice, or removal state may leak through this fallback. The normal hard
+/// limits still apply. If even this cannot publish, the predispatch pending
+/// marker remains canonical and restart conservatively censors the attempt.
+fn save_paid_accounting(service: &Service, id: &str, paid: &Session) -> std::io::Result<()> {
+    let mut durable = load_existing(service, id)
+        .map_err(|_| std::io::Error::other("paid accounting authority unavailable"))?;
+    let calls = paid.primary.calls.saturating_sub(durable.primary.calls)
+        + paid.shadow.calls.saturating_sub(durable.shadow.calls);
+    durable.primary = paid.primary.clone();
+    durable.shadow = paid.shadow.clone();
+    durable.completed_requests = paid.completed_requests;
+    durable.failed_primaries = paid.failed_primaries;
+    durable.primary_pending = paid.primary_pending;
+    durable.background_review_pending = paid.background_review_pending;
+    if let Some(state) = &mut durable.keep_leases {
+        state.pending = paid
+            .keep_leases
+            .as_ref()
+            .and_then(|state| state.pending.clone());
+    }
+    durable.refresh_bootstrap_progress();
+    durable.bootstrap_estimated_cost_usd = paid.bootstrap_estimated_cost_usd;
+    durable.cost_trajectory = paid.cost_trajectory.clone();
+    if calls > 0
+        && let Some(trajectory) = &mut durable.cost_trajectory
+    {
+        // Receipts remain exact, but the lost observation/replay cannot
+        // support a complete counterfactual savings comparison.
+        trajectory.prior_untracked(calls);
+    }
+    save(service, id, &durable)
+}
+
+fn save_observed(
+    service: &Service,
+    id: &str,
+    session: &Session,
+    observation: Option<(&[Value], &Value)>,
+) -> std::io::Result<()> {
+    if !session.history_shared {
+        // The explicit checkpoint is authority, not a diagnostic mirror. Stage
+        // its exact bounded bytes first, then admit history before replacing it.
+        // A rejected reservation must never become an abandoned paid attempt.
+        return save_checkpoint(service, id, session, CHECKPOINT_MAX_BYTES, || {
+            history::committed(service, id, session, observation)
+        });
+    }
+    let mirror = service.config.state_dir.join(format!("{id}.json"));
+    let new_shared_mirror = !mirror.exists();
+    save_with_limit(
+        service,
+        id,
+        &history::compact(session),
+        CHECKPOINT_MAX_BYTES,
+    )?;
+    let published = history::committed(service, id, session, observation);
+    if published.is_err() && new_shared_mirror {
+        // A rejected fresh admission owns no authoritative state. Repeated
+        // capacity backpressure must not accumulate unindexed diagnostics.
+        let _ = std::fs::remove_file(mirror);
+    }
+    published
 }
 
 fn save_with_limit(
@@ -501,6 +663,16 @@ fn save_with_limit(
     id: &str,
     session: &Session,
     max_bytes: usize,
+) -> std::io::Result<()> {
+    save_checkpoint(service, id, session, max_bytes, || Ok(()))
+}
+
+fn save_checkpoint(
+    service: &Service,
+    id: &str,
+    session: &Session,
+    max_bytes: usize,
+    admit: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let path = service.config.state_dir.join(format!("{id}.json"));
     let temporary = service.config.state_dir.join(format!(".{id}.tmp"));
@@ -516,6 +688,11 @@ fn save_with_limit(
         ));
     }
     file.sync_all()?;
+    if let Err(error) = admit() {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
     std::fs::rename(temporary, path)?;
     File::open(&service.config.state_dir)?.sync_all()
 }
@@ -576,7 +753,7 @@ async fn models(
 // openai/codex rust-v0.147.0, codex-api/src/endpoint/models.rs.
 const CODEX_MODELS_CLIENT_VERSION: &str = "0.147.0";
 
-async fn codex_models(service: &Service) -> Result<Response, Failure> {
+async fn fetch_codex_models(service: &Service) -> Result<Value, Failure> {
     let unavailable = || {
         failure(
             StatusCode::BAD_GATEWAY,
@@ -606,6 +783,7 @@ async fn codex_models(service: &Service) -> Result<Response, Failure> {
     let response = service
         .client
         .get(format!("{endpoint}/models"))
+        .timeout(Duration::from_secs(15))
         .query(&[("client_version", CODEX_MODELS_CLIENT_VERSION)])
         .bearer_auth(&credential.access_token)
         .header("chatgpt-account-id", &credential.account_id)
@@ -623,7 +801,17 @@ async fn codex_models(service: &Service) -> Result<Response, Failure> {
     let bytes = bounded(response, 8 * 1024 * 1024)
         .await
         .map_err(|_| unavailable())?;
-    let catalog: Value = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
+    serde_json::from_slice(&bytes).map_err(|_| unavailable())
+}
+
+async fn codex_models(service: &Service) -> Result<Response, Failure> {
+    let catalog = fetch_codex_models(service).await?;
+    let unavailable = || {
+        failure(
+            StatusCode::BAD_GATEWAY,
+            "Codex model discovery unavailable; configure models explicitly",
+        )
+    };
     let models = catalog["models"].as_array().ok_or_else(unavailable)?;
     let mut seen = HashSet::new();
     let mut data = Vec::new();
@@ -649,6 +837,216 @@ async fn codex_models(service: &Service) -> Result<Response, Failure> {
     Ok(axum::Json(json!({"object": "list", "data": data})).into_response())
 }
 
+#[derive(serde::Deserialize)]
+struct CatalogQuery {
+    model: String,
+}
+
+async fn resolved_catalog(
+    service: &Service,
+    model: &str,
+    processing_tier: &str,
+) -> Result<(ResolvedModel, ResolvedModel), Failure> {
+    let config = &service.config;
+    let mut primary_route = Route::new(&config.upstream_url, config.codex_login);
+    primary_route.processing_tier = processing_tier.into();
+    let reviewer_route = Route::new(
+        config
+            .classifier_url
+            .as_deref()
+            .unwrap_or(&config.upstream_url),
+        config.codex_login && config.classifier_url.is_none(),
+    );
+    let source = if config.codex_login {
+        Some(
+            service
+                .catalog
+                .get_or_init(|| async {
+                    // Fetch once per process route epoch, including failed resolution.
+                    // Checkpoints freeze the resulting facts rather than refreshing age.
+                    match tokio::time::timeout(Duration::from_secs(20), fetch_codex_models(service))
+                        .await
+                    {
+                        Ok(Ok(value)) => SourceCatalog::from_codex(
+                            &value,
+                            now(),
+                            matches!(primary_route.class, RouteClass::SyntheticSubscription),
+                        )
+                        .map(|mut source| {
+                            // Metadata was fetched for the default service, not an
+                            // arbitrary requested processing tier.
+                            source.route =
+                                Some(Route::new(&config.upstream_url, config.codex_login));
+                            source
+                        })
+                        .unwrap_or_else(|_| SourceCatalog::unavailable(now())),
+                        _ => SourceCatalog::unavailable(now()),
+                    }
+                })
+                .await,
+        )
+    } else {
+        None
+    };
+    let error = |message| failure(StatusCode::BAD_REQUEST, message);
+    let primary = resolve_model(
+        model,
+        primary_route,
+        source,
+        config.primary_context_override,
+        272000,
+        config.primary_output_reserve_tokens,
+        config.context_margin_percent,
+    )
+    .map_err(error)?;
+    let mut reviewer = resolve_model(
+        &config.classifier_model,
+        reviewer_route,
+        source,
+        config.reviewer_context_override,
+        300000,
+        config.classifier_max_output_tokens,
+        config.context_margin_percent,
+    )
+    .map_err(error)?;
+    freeze_reviewer_cache_policy(config, &mut reviewer);
+    Ok((primary, reviewer))
+}
+
+fn freeze_reviewer_cache_policy(config: &ProxyCli, reviewer: &mut ResolvedModel) {
+    let explicit_override = config.classifier_cache_policy == ClassifierCachePolicy::OpenaiExplicit
+        && !(config.codex_login && config.classifier_url.is_none());
+    if explicit_override {
+        // This existing CLI option is an operator attestation, NOT certification
+        // that a compatible gateway is the official API.
+        reviewer.cache = carry::models::model_spec(&reviewer.model).and_then(|s| s.cache);
+        reviewer.explicit_cache_transport = reviewer.cache.is_some();
+        if let Some(p) = reviewer.provenance.get_mut("cache") {
+            p.source = "operator_openai_explicit_transport_attestation".into();
+            p.status = "operator_override_not_provider_certification".into();
+        }
+    }
+    if config.classifier_cache_policy == ClassifierCachePolicy::Disabled {
+        reviewer.explicit_cache_transport = false;
+    }
+    let mut provenance = reviewer.provenance["cache"].clone();
+    provenance.revision = format!("{:?}", config.classifier_cache_policy);
+    reviewer
+        .provenance
+        .insert("cache_policy".into(), provenance);
+}
+
+async fn session_resolution(
+    service: &Service,
+    session: &mut Session,
+    model: &str,
+    processing_tier: &str,
+    fresh_child: bool,
+) -> Result<ResolvedPair, Failure> {
+    let config = &service.config;
+    let mut primary_route = Route::new(&config.upstream_url, config.codex_login);
+    primary_route.processing_tier = processing_tier.into();
+    let reviewer_route = Route::new(
+        config
+            .classifier_url
+            .as_deref()
+            .unwrap_or(&config.upstream_url),
+        config.codex_login && config.classifier_url.is_none(),
+    );
+    if let Some(saved) = &session.model_resolution {
+        let same = saved.schema_version == 1
+            && saved.primary.model == model
+            && saved.reviewer.model == config.classifier_model
+            && saved.primary.route == primary_route
+            && saved.reviewer.route == reviewer_route
+            && saved
+                .reviewer
+                .provenance
+                .get("cache_policy")
+                .is_some_and(|p| p.revision == format!("{:?}", config.classifier_cache_policy))
+            && saved
+                .primary
+                .provenance
+                .get("capacity")
+                .is_some_and(|p| p.operator_override == config.primary_context_override)
+            && saved
+                .reviewer
+                .provenance
+                .get("capacity")
+                .is_some_and(|p| p.operator_override == config.reviewer_context_override)
+            && saved.primary.ordinary.output_reserve == config.primary_output_reserve_tokens
+            && saved.reviewer.ordinary.output_reserve == config.classifier_max_output_tokens
+            && saved.primary.ordinary.estimation_margin_percent == config.context_margin_percent;
+        if same {
+            return Ok(saved.clone());
+        }
+    }
+    let legacy = !fresh_child
+        && session.model_resolution.is_none()
+        && (session.version != 0 || !session.history.is_empty() || session.primary.calls > 0);
+    let (mut primary, mut reviewer) = if legacy {
+        let error = |message| failure(StatusCode::BAD_REQUEST, message);
+        (
+            resolve_model(
+                model,
+                primary_route,
+                None,
+                config.primary_context_override,
+                272000,
+                config.primary_output_reserve_tokens,
+                config.context_margin_percent,
+            )
+            .map_err(error)?,
+            resolve_model(
+                &config.classifier_model,
+                reviewer_route,
+                None,
+                config.reviewer_context_override,
+                300000,
+                config.classifier_max_output_tokens,
+                config.context_margin_percent,
+            )
+            .map_err(error)?,
+        )
+    } else {
+        resolved_catalog(service, model, processing_tier).await?
+    };
+    if legacy {
+        for resolved in [&mut primary, &mut reviewer] {
+            let provenance = resolved
+                .provenance
+                .get_mut("capacity")
+                .expect("capacity provenance");
+            provenance.status = "legacy_snapshot_missing".into();
+            provenance.source = "contemporaneous-legacy-role-capacity-v1".into();
+            provenance.fallback_reason =
+                Some("checkpoint_predates_resolved_contract_no_new_catalog_defaults".into());
+        }
+    }
+    freeze_reviewer_cache_policy(config, &mut reviewer);
+    let pair = ResolvedPair {
+        schema_version: 1,
+        primary,
+        reviewer,
+    };
+    if let Some(prior) = session.model_resolution.replace(pair.clone()) {
+        session.model_resolution_history.push(prior);
+    }
+    Ok(pair)
+}
+
+async fn catalog(
+    State(service): State<Arc<Service>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<CatalogQuery>,
+) -> Result<axum::Json<Value>, Failure> {
+    authorize(&service, &headers)?;
+    let (primary, reviewer) = resolved_catalog(&service, &query.model, "default").await?;
+    Ok(axum::Json(
+        json!({"schema_version":1,"primary":primary,"reviewer":reviewer}),
+    ))
+}
+
 async fn metrics(
     State(service): State<Arc<Service>>,
     headers: HeaderMap,
@@ -668,6 +1066,16 @@ async fn metrics(
             "every_requests":service.config.review_every_requests,
             "backoff_factor":service.config.review_backoff_factor,
             "backoff_max":service.config.review_backoff_max
+        },
+        "keep_lease_policy": {
+            "turns":service.config.keep_lease_turns,
+            "source":service.config.keep_lease_source,
+            "round_basis":"completed_primary_responses",
+            "initialized":session.keep_leases.is_some(),
+            "historical_policy":session.keep_leases.as_ref().map(|s| s.version),
+            "due_targets":session.due_keep_target_count(),
+            "pending_targets":session.keep_leases.as_ref().and_then(|s| s.pending.as_ref()).map_or(0, |p| p.targets.len()),
+            "released_targets":session.keep_leases.as_ref().map_or(0, |s| s.entries.values().filter(|l| l.released_at_round.is_some()).count())
         },
         "scope": "explicit_session", "primary": session.primary, "shadow": session.shadow,
         "completed_requests": session.completed_requests, "compactions": session.compactions,
@@ -749,20 +1157,32 @@ async fn dashboard_stats(
             .map(|g| g.members.len())
             .sum::<usize>();
         let last_plan = &session.last_plan;
-        let best_candidate = last_plan["candidates"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|candidate| candidate.get("joint"))
-            .filter(|joint| joint["savings"].as_f64().is_some())
-            .max_by(|a, b| {
-                a["savings"]
-                    .as_f64()
-                    .partial_cmp(&b["savings"].as_f64())
-                    .unwrap()
-            });
+        let rows = last_plan["candidates"].as_array();
+        let selected_id = last_plan["selected_candidate_id"].as_str();
+        let best_candidate = if last_plan["selected"] == true {
+            // Forced selection minimizes feasible cost, not the largest recurring
+            // savings row. Older selected reports have no recoverable identity.
+            rows.into_iter()
+                .flatten()
+                .find(|row| selected_id.is_some() && row["candidate_id"].as_str() == selected_id)
+        } else {
+            rows.into_iter()
+                .flatten()
+                .filter(|row| row["feasible"] == true)
+                .filter(|row| row["selection_joint"]["savings"].as_f64().is_some())
+                .max_by(|a, b| {
+                    a["selection_joint"]["savings"]
+                        .as_f64()
+                        .partial_cmp(&b["selection_joint"]["savings"].as_f64())
+                        .unwrap()
+                })
+        };
         let planner = json!({
             "selected": last_plan["selected"].as_bool().unwrap_or(false),
+            "selected_candidate_id": selected_id,
+            "selected_action": last_plan["selected_action"].as_str(),
+            "primary_output_allowance_tokens": last_plan["primary_output_allowance_tokens"].as_u64(),
+            "primary_output_allowance_basis": last_plan["primary_output_allowance_basis"].as_str(),
             "mode": last_plan["mode"].as_str().unwrap_or("unknown"),
             "reason": last_plan["reason"].as_str(),
             "payoff_requests": last_plan["payoff_requests"].as_u64(),
@@ -772,11 +1192,18 @@ async fn dashboard_stats(
             "reviewer_required_tokens": last_plan["reviewer_required_tokens"].as_f64(),
             "primary_estimated_tokens": last_plan["primary_estimated_tokens"].as_f64(),
             "reviewer_estimated_tokens": last_plan["reviewer_estimated_tokens"].as_f64(),
-            "primary_context_tokens": service.config.primary_context_tokens,
-            "reviewer_context_tokens": service.config.classifier_max_input_tokens,
-            "candidate": best_candidate.map(|joint| json!({
-                "keep": joint["keep"].as_f64(), "compact": joint["compact"].as_f64(),
-                "savings": joint["savings"].as_f64(),
+            // Numerators and denominators describe the same saved request.
+            // Legacy sessions without a plan can still use their frozen epoch;
+            // absent historical contracts remain unknown, not process defaults.
+            "primary_context_tokens": last_plan["primary_context_tokens"].as_u64()
+                .or_else(|| session.model_resolution.as_ref().map(|pair| pair.primary.capacity_tokens as u64)),
+            "reviewer_context_tokens": last_plan["reviewer_context_tokens"].as_u64()
+                .or_else(|| session.model_resolution.as_ref().map(|pair| pair.reviewer.capacity_tokens as u64)),
+            "candidate": best_candidate.map(|row| json!({
+                "candidate_id": row["candidate_id"].as_str(), "action": row["action"].as_str(),
+                "keep": row["selection_joint"]["keep"].as_f64(),
+                "compact": row["selection_joint"]["compact"].as_f64(),
+                "savings": row["selection_joint"]["savings"].as_f64(),
             })),
         });
         let estimate = session
@@ -784,7 +1211,7 @@ async fn dashboard_stats(
             .as_ref()
             .map(|t| t.snapshot())
             .unwrap_or_default()
-            .dashboard(session.background_review_pending);
+            .dashboard(session.background_review_pending || session.primary_pending);
         cost_estimate.observe(&estimate);
         let updated_at = entry
             .metadata()
@@ -884,12 +1311,24 @@ async fn native_compact(
 #[derive(Default)]
 struct ReviewRun {
     background: bool,
+    advice_invalidated: bool,
     pressure: bool,
-    valid_admission: bool,
-    successful_sources: Vec<Group>,
+    batches: Vec<ReviewBatch>,
     request_id: String,
     receipts: Vec<ReviewReceipt>,
     reviewed_sources: Vec<Group>,
+    keep_review: Option<crate::proxy_state::PendingKeepReview>,
+    lease_only: bool,
+    // Portable evidence requires every chunk to be fully accepted. Ordinary
+    // partial advice and its coverage remain independently usable.
+    publication_rejected: bool,
+}
+
+struct ReviewBatch {
+    sources: Vec<Group>,
+    bootstrap_ids: Vec<u64>,
+    valid_without_memories: bool,
+    memory_ids: Vec<u64>,
 }
 
 struct ReviewReceipt {
@@ -909,8 +1348,12 @@ struct Commit {
     candidate: Session,
     reviewed: Session,
     submitted_ids: Vec<u64>,
+    // Canonical caller ancestry is independent of the selected context. Native
+    // compaction can clear the latter before this observation is committed.
+    observed_input: Vec<Value>,
     outbound: Value,
     native: bool,
+    _history_pin: history::Pin,
     _lock: OwnedMutexGuard<()>,
 }
 
@@ -931,7 +1374,7 @@ async fn forward(
 }
 
 async fn forward_request(
-    service: Arc<Service>,
+    mut service: Arc<Service>,
     headers: HeaderMap,
     bytes: Bytes,
     legacy_native: bool,
@@ -948,13 +1391,19 @@ async fn forward_request(
     }
     authorize(&service, &headers)?;
     let mut id = identity(&headers)?;
+    if headers.contains_key("x-carry-fork-parent") || headers.contains_key("x-carry-fork-point") {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "fork headers are obsolete; send ordinary history",
+        ));
+    }
     if service.config.codex_login && legacy_native {
         return Err(failure(
             StatusCode::NOT_IMPLEMENTED,
             "Codex subscription native /compact is not supported; Pi summary requests use /responses",
         ));
     }
-    let body: Value = serde_json::from_slice(&bytes)
+    let mut body: Value = serde_json::from_slice(&bytes)
         .map_err(|_| failure(StatusCode::BAD_REQUEST, "invalid JSON request"))?;
     if !body.is_object() {
         return Err(failure(
@@ -962,40 +1411,29 @@ async fn forward_request(
             "request must be an object",
         ));
     }
-    if service.config.mode != Mode::Off
-        && (body["background"] == true
-            || body["conversation"].is_object()
-            || body["conversation"].is_string())
-    {
+    let original_body = body.clone();
+    if service.config.mode != Mode::Off && body["background"] == true {
         return Err(failure(
             StatusCode::BAD_REQUEST,
-            "review modes do not support conversation/background",
+            "review modes do not support background",
         ));
     }
     let implicit = service.config.mode != Mode::Off && id.is_none();
+    let mut automatic_point = None;
+    let mut history_pin = None;
+    let mut history_namespace = None;
+    let requested_conversation = history::conversation(&body).map(str::to_owned);
+    if service.config.mode != Mode::Off {
+        let namespace = history::namespace(&service, &headers, &body)?;
+        history::expand(&service, &namespace, &mut body)?;
+        history_namespace = Some(namespace);
+    }
     if implicit {
-        if body
-            .get("previous_response_id")
-            .is_some_and(|v| !v.is_null())
-        {
-            return Err(failure(
-                StatusCode::BAD_REQUEST,
-                "previous_response_id requires an explicit session; use full history otherwise",
-            ));
-        }
-        // One active prefix per owner/settings scope, NOT a fork index or a
-        // search by response ID. A divergent or shorter history replaces it.
-        let mut scope_headers = headers.clone();
-        scope_headers.insert("x-carry-session", "carry-active-prefix".parse().unwrap());
-        let owner = identity(&scope_headers)?.unwrap();
-        id = Some(
-            reviewer_serialized_identity(&json!({
-                "domain": "carry-active-prefix-v1", "owner": owner,
-                "settings": cache_base(&body),
-                "client_scope": stable_client_scope(&body)
-            }))
-            .1,
-        );
+        let namespace = history_namespace.as_ref().unwrap();
+        let (selected, point, pin) = history::resolve(&service, namespace, &body)?;
+        id = Some(selected);
+        automatic_point = point;
+        history_pin = Some(pin);
     }
     let native = legacy_native
         || body["input"].as_array().is_some_and(|items| {
@@ -1026,15 +1464,93 @@ async fn forward_request(
     };
     let mut outbound = body.clone();
     let mut commit = None;
-    if let Some(id) = id {
+    if let Some(mut id) = id {
+        let mut history_pin = match history_pin {
+            Some(pin) => pin,
+            None => history::pin(&service, &id)?,
+        };
+        let mut fork = if let Some(point) = automatic_point {
+            Some((format!("automatic/{}", point.id), point))
+        } else {
+            None
+        };
+        let mut lock = session_lock(&service, &id).await;
+        let mut session = load(&service, &id)?;
+        if implicit {
+            loop {
+                // Every selected mutable tip can advance while its lock is awaited,
+                // including a replacement selected after an earlier wait.
+                let mut check = session.clone();
+                if session.history.is_empty()
+                    || check.ingest(body["input"].as_array().unwrap()).is_ok()
+                {
+                    break;
+                }
+                drop(lock);
+                let (selected, point, pin) =
+                    history::resolve(&service, history_namespace.as_ref().unwrap(), &body)?;
+                if selected == id {
+                    // A stable exact tip rejected ingest for another reason (for
+                    // example its opaque checkpoint/item limit). Never spin.
+                    return Err(failure(
+                        StatusCode::BAD_REQUEST,
+                        "history incompatible with retained tip",
+                    ));
+                }
+                id = selected;
+                history_pin = pin;
+                fork = point.map(|p| (format!("automatic/{}", p.id), p));
+                lock = session_lock(&service, &id).await;
+                session = load(&service, &id)?;
+            }
+        }
         if service.config.codex_login && outbound.get("prompt_cache_key").is_none() {
             outbound["prompt_cache_key"] = json!(format!(
                 "{:x}",
                 Sha256::digest(format!("carry-primary-{id}").as_bytes())
             ));
         }
-        let lock = session_lock(&service, &id).await;
-        let mut session = load(&service, &id)?;
+        let declared_fork = fork.is_some();
+        // Hydration creates a cold branch, not a legacy unpriced checkpoint.
+        // Resolve its own current epoch only after the replacement; never copy
+        // parent contracts, cache receipts or paid usage into the new session.
+        let fresh_child = if let Some((origin, point)) = &fork {
+            forking::hydrate(&service.config, &mut session, origin, point, &body)?
+        } else {
+            false
+        };
+        if session.history_namespace != history_namespace {
+            // Conversation IDs belong to the observation's settings namespace,
+            // not to a reusable explicit session file.
+            session.history_conversation = None;
+        }
+        session.history_namespace = history_namespace;
+        session.history_shared = implicit;
+        if requested_conversation.is_some() {
+            session.history_conversation = requested_conversation;
+        }
+        if service.config.mode != Mode::Off {
+            let model = body["model"]
+                .as_str()
+                .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "model is required"))?;
+            let resolved = session_resolution(
+                &service,
+                &mut session,
+                model,
+                body["service_tier"].as_str().unwrap_or("default"),
+                fresh_child,
+            )
+            .await?;
+            // One request-scoped contract drives every existing primary/reviewer
+            // feasibility, memory and bootstrap check. Locks, metadata epoch,
+            // background registry and directory lock remain process-shared.
+            let mut effective = (*service).clone();
+            effective.config.primary_context_tokens = resolved.primary.capacity_tokens;
+            effective.config.classifier_max_input_tokens = resolved.reviewer.capacity_tokens;
+            effective.config.model_resolution = Some(resolved);
+            effective.config.current_review_suppressed = declared_fork;
+            service = Arc::new(effective);
+        }
         let prior_reviewer_compactions = session.reviewer_compactions;
         let (kind, agent_name) = client_provenance(&body);
         if kind.is_some() || agent_name.is_some() {
@@ -1045,12 +1561,32 @@ async fn forward_request(
             trajectory.prior_untracked(session.primary.calls + session.shadow.calls);
             session.cost_trajectory = Some(trajectory);
         }
+        if session.primary_pending {
+            // The per-owner primary lock excludes a live predecessor. This is
+            // an abandoned transport or a settlement that could not publish.
+            session.primary_pending = false;
+            session.primary.calls += 1;
+            session.primary.unavailable_cost_calls += 1;
+            if let Some(trajectory) = &mut session.cost_trajectory {
+                trajectory.prior_untracked(1);
+            }
+            journal(
+                &service,
+                &id,
+                &request_id,
+                "primary_censored",
+                &json!({"reason":"unsettled_primary_attempt","cost_censored":true}),
+            );
+        }
         if session.background_review_pending
             && !service.background_reviews.lock().await.contains(&id)
         {
             // A prior process exited with an unobserved reviewer attempt. Never
             // resurrect its snapshot or pretend its usage was zero.
             session.background_review_pending = false;
+            if let Some(state) = &mut session.keep_leases {
+                state.pending = None;
+            }
             journal(
                 &service,
                 &id,
@@ -1058,6 +1594,11 @@ async fn forward_request(
                 "background_review_censored",
                 &json!({"reason":"restart_with_pending_review","cost_censored":true}),
             );
+            // There is no receipt for an interrupted import. Do not grant a
+            // fresh spend allowance on restart while its actual spend is unknown.
+            if session.bootstrap_review_pending && !session.bootstrap_review_complete {
+                session.bootstrap_estimated_cost_usd = service.config.bootstrap_max_cost_usd;
+            }
             session.shadow.calls += 1;
             session.shadow.unavailable_cost_calls += 1;
             if let Some(trajectory) = &mut session.cost_trajectory {
@@ -1153,129 +1694,30 @@ async fn forward_request(
             "primary_received",
             &json!({"native_compaction":native}),
         );
-        set_review_context(&mut session, cache_base(&body));
+        let context = cache_base(&body);
+        if primary_direction(&session.review_context) != primary_direction(&context)
+            && service.background_reviews.lock().await.contains(&id)
+        {
+            // The owner lock orders this fence before worker settlement. Never
+            // roll it back on failed publication or a later same-input/ABA
+            // ingress. A restart kills the worker and censors its pending spend.
+            service.invalidated_reviews.lock().await.insert(id.clone());
+        }
+        set_review_context(&mut session, context);
+        session.initialize_keep_leases(service.config.keep_lease_turns);
         let active = !native && service.config.mode != Mode::Off;
-        let primary_priced = Rates::for_model(body["model"].as_str().unwrap_or(""), 0.0).is_some();
-        if active
-            && session.bootstrap_review_pending
-            && !session.bootstrap_review_complete
-            && !service.background_reviews.lock().await.contains(&id)
-            && primary_priced
-            && standard(&body)
-        {
-            review(
-                &service,
-                &id,
-                &mut session,
-                &body,
-                true,
-                &mut ReviewRun {
-                    request_id: request_id.clone(),
-                    ..ReviewRun::default()
-                },
-            )
-            .await;
-        }
-        // This existing rejection cannot be rescued by a plan. Avoid pricing
-        // the whole unfinished import, but let an in-flight reviewer merge first.
-        if active
-            && !session.background_review_pending
-            && !service.background_reviews.lock().await.contains(&id)
-            && session.bootstrap_review_pending
-            && !session.bootstrap_review_complete
-            && !review_fits(&service.config, &review_body(&service.config, &session))
-        {
-            let _ = save(&service, &id, &session);
-            return Err(failure(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "history import is incomplete; protected context exceeds capacity or the bootstrap call/spend limit was reached",
-            ));
-        }
+        let primary_priced =
+            primary_rates(&service.config, body["model"].as_str().unwrap_or(""), 0.0).is_some();
+        // Accepted advice is optional input to planning. Never acquire new
+        // advice (including bootstrap/pressure rescue) on the primary path.
         if active {
             outbound["input"] = json!(session.render_primary());
         }
-        let (mut candidate, mut report) = if active {
+        let (candidate, report) = if active {
             plan(&service.config, &session, &outbound)
         } else {
             (None, Value::Null)
         };
-        if active && report["forced"] == true && session.background_review_pending {
-            // Settlement reloads the checkpoint after acquiring this lock. Publish
-            // ingress invalidation before yielding, even if instructions are later
-            // restored; the pending review still owns its receipt, not new advice.
-            save(&service, &id, &session).map_err(|_| {
-                failure(StatusCode::INTERNAL_SERVER_ERROR, "checkpoint write failed")
-            })?;
-            journal(
-                &service,
-                &id,
-                &request_id,
-                "review_waiting",
-                &json!({"reason":"background_capacity"}),
-            );
-            // Let the in-flight snapshot merge before deciding capacity. Never
-            // wait while holding the lock its completion needs.
-            drop(lock);
-            let wait = async {
-                while service.background_reviews.lock().await.contains(&id) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            };
-            tokio::time::timeout(
-                Duration::from_secs(service.config.classifier_timeout_secs + 1),
-                wait,
-            )
-            .await
-            .map_err(|_| {
-                failure(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "waiting for reviewer capacity advice timed out",
-                )
-            })?;
-            return Box::pin(forward_request(
-                service,
-                headers,
-                bytes,
-                legacy_native,
-                request_id,
-            ))
-            .await;
-        }
-        if active
-            && session.bootstrap_review_pending
-            && !session.bootstrap_review_complete
-            && !review_fits(&service.config, &review_body(&service.config, &session))
-        {
-            let _ = save(&service, &id, &session);
-            return Err(failure(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "history import is incomplete; protected context exceeds capacity or the bootstrap call/spend limit was reached",
-            ));
-        }
-        if active && report["forced"] == true && candidate.is_none() {
-            // Capacity may require a blocking update even with background reviews.
-            // Drop only disposable control turns before asking for new advice.
-            session.compact_reviewer();
-            if standard(&body)
-                && primary_priced
-                && review_fits(&service.config, &review_body(&service.config, &session))
-            {
-                review(
-                    &service,
-                    &id,
-                    &mut session,
-                    &body,
-                    false,
-                    &mut ReviewRun {
-                        request_id: request_id.clone(),
-                        pressure: true,
-                        ..ReviewRun::default()
-                    },
-                )
-                .await;
-            }
-            (candidate, report) = plan(&service.config, &session, &outbound);
-        }
         let reviewed = session.clone();
         if active {
             session.last_plan = report.clone();
@@ -1319,45 +1761,7 @@ async fn forward_request(
                         &json!({"reason":"main_rewrite_selected"}),
                     );
                 }
-                if before == after
-                    && standard(&body)
-                    && primary_priced
-                    && !session.bootstrap_review_pending
-                {
-                    if service.config.background_reviews {
-                        dispatch_review_for(
-                            service.clone(),
-                            id.clone(),
-                            &mut session,
-                            body.clone(),
-                            request_id.clone(),
-                        )
-                        .await;
-                    } else {
-                        review(
-                            &service,
-                            &id,
-                            &mut session,
-                            &body,
-                            false,
-                            &mut ReviewRun {
-                                request_id: request_id.clone(),
-                                ..ReviewRun::default()
-                            },
-                        )
-                        .await;
-                    }
-                }
-            } else if report["forced"] == true {
-                let _ = save(&service, &id, &session);
-                let message = if service.config.mode == Mode::Audit {
-                    "context budget exceeded in audit mode; use --mode compact or increase the configured budgets"
-                } else {
-                    "retained protected context or incoming material exceeds the primary or reviewer budget; increase the configured budget or start a new conversation"
-                };
-                return Err(failure(StatusCode::PAYLOAD_TOO_LARGE, message));
-            } else if standard(&body) && primary_priced && !session.bootstrap_review_pending {
-                if service.config.background_reviews {
+                if before == after && standard(&body) && primary_priced && !declared_fork {
                     dispatch_review_for(
                         service.clone(),
                         id.clone(),
@@ -1366,20 +1770,24 @@ async fn forward_request(
                         request_id.clone(),
                     )
                     .await;
-                } else {
-                    review(
-                        &service,
-                        &id,
-                        &mut session,
-                        &body,
-                        false,
-                        &mut ReviewRun {
-                            request_id: request_id.clone(),
-                            ..ReviewRun::default()
-                        },
-                    )
-                    .await;
                 }
+            } else if report["forced"] == true {
+                let _ = save(&service, &id, &session);
+                let message = if service.config.mode == Mode::Audit {
+                    "context budget exceeded in audit mode; use --mode compact or increase the configured budgets"
+                } else {
+                    "retained protected context or incoming material exceeds the primary budget; increase the configured budget or start a new conversation"
+                };
+                return Err(failure(StatusCode::PAYLOAD_TOO_LARGE, message));
+            } else if standard(&body) && primary_priced && !declared_fork {
+                dispatch_review_for(
+                    service.clone(),
+                    id.clone(),
+                    &mut session,
+                    body.clone(),
+                    request_id.clone(),
+                )
+                .await;
             }
         }
         let reviewed = if session.compactions == reviewed.compactions {
@@ -1395,8 +1803,18 @@ async fn forward_request(
         }
         // Persist completed shadow work before starting the primary. New native
         // input remains unexposed even when the reviewer already observed it.
-        save(&service, &id, &reviewed)
-            .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "checkpoint write failed"))?;
+        let mut reserved = reviewed.clone();
+        reserved.primary_pending = true;
+        save(&service, &id, &reserved).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::StorageFull {
+                failure(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "history capacity unavailable",
+                )
+            } else {
+                failure(StatusCode::INTERNAL_SERVER_ERROR, "checkpoint write failed")
+            }
+        })?;
         journal(
             &service,
             &id,
@@ -1445,8 +1863,10 @@ async fn forward_request(
             candidate: session,
             reviewed,
             submitted_ids,
+            observed_input: body["input"].as_array().cloned().unwrap_or_default(),
             outbound: outbound.clone(),
             native,
+            _history_pin: history_pin,
             _lock: lock,
         });
     }
@@ -1465,7 +1885,7 @@ async fn forward_request(
         .client
         .post(&endpoint)
         .header("content-type", "application/json");
-    request = if outbound == body {
+    request = if outbound == original_body {
         request.body(bytes)
     } else {
         request.json(&outbound)
@@ -1483,6 +1903,7 @@ async fn forward_request(
         outbound["model"].as_str().unwrap_or(""),
         native,
         standard(&outbound),
+        service.config.model_resolution.as_ref().map(|p| &p.primary),
     );
     let response = if service.config.codex_login {
         send_codex(&service, &endpoint, &outbound, false, None).await
@@ -1531,7 +1952,9 @@ async fn forward_request(
                 }
                 commit.reviewed.primary.calls += 1;
                 commit.reviewed.primary.unavailable_cost_calls += 1;
-                let _ = save(&service, &commit.id, &commit.reviewed);
+                if save(&service, &commit.id, &commit.reviewed).is_err() {
+                    let _ = save_paid_accounting(&service, &commit.id, &commit.reviewed);
+                }
                 logging::usage(
                     &service,
                     &commit.id,
@@ -1579,6 +2002,8 @@ As the primary moves past detailed work on a code section or implementation, mar
 Return only the strict JSON advice object: protected, removable, and memories with source_ids and text. Empty arrays are valid. Do not speculate about token budgets, prices, or savings."#;
 
 fn review_body(config: &ProxyCli, session: &Session) -> Value {
+    #[cfg(test)]
+    planner_work::record("review_renders");
     review_body_for_groups(config, session, &session.groups())
 }
 
@@ -1820,6 +2245,14 @@ fn review_body_with_input(config: &ProxyCli, session: &Session, input: Vec<Value
 }
 
 fn classifier_cache_enabled(config: &ProxyCli) -> Result<bool> {
+    if let Some(pair) = &config.model_resolution {
+        return Ok(
+            config.classifier_cache_policy != ClassifierCachePolicy::Disabled
+                && pair.reviewer.model == config.classifier_model
+                && pair.reviewer.cache.is_some()
+                && pair.reviewer.explicit_cache_transport,
+        );
+    }
     let supported = carry::models::model_spec(&config.classifier_model)
         .is_some_and(|spec| spec.explicit_reviewer_cache);
     match config.classifier_cache_policy {
@@ -1944,6 +2377,9 @@ fn reviewer_reusable_credit(
     cache: &[ReviewerCacheBoundary],
     body: &Value,
 ) -> f64 {
+    if config.model_resolution.is_some() && reviewer_cache_capabilities(config).is_none() {
+        return 0.0;
+    }
     let Some(input) = reviewer_input(body) else {
         return 0.0;
     };
@@ -1980,6 +2416,8 @@ fn observe_reviewer_cache(
     body: &Value,
     usage: &Value,
 ) {
+    // Preserve observed native read evidence even when the route's future
+    // cache contract is unknown. Forecast eligibility is checked separately.
     let Some(input) = reviewer_input(body) else {
         return;
     };
@@ -2069,7 +2507,7 @@ fn reviewer_view_costs(
 ) -> Option<ViewCosts> {
     let cost = |body: &Value| {
         let tokens = estimate(body);
-        let rates = Rates::for_model(&config.classifier_model, tokens)?;
+        let rates = reviewer_rates(config, tokens)?;
         reviewer_input(body)?;
         let prefix = reviewer_prefix_estimate(body, reviewer_stable_end(body));
         let uncached = if classifier_cache_enabled(config).unwrap_or(false) {
@@ -2088,7 +2526,7 @@ fn reviewer_view_costs(
         // evidence that a prefix meets the provider's cache minimum.
         let future = input_cost(
             tokens,
-            if crate::openai::prompt_cache_capabilities(&config.classifier_model)
+            if reviewer_cache_capabilities(config)
                 .is_some_and(|cap| prefix >= cap.minimum_prefix_tokens as f64)
             {
                 prefix
@@ -2150,13 +2588,17 @@ async fn dispatch_review_for(
     main: Value,
     request_id: String,
 ) {
+    let bootstrap = session.bootstrap_review_pending && !session.bootstrap_review_complete;
     let decision = admission::decision(&service.config, session, &main, false);
     journal(&service, &id, &request_id, "review_admission", &decision);
-    if decision["admitted"] != true {
+    if !bootstrap && decision["admitted"] != true {
         journal(&service, &id, &request_id, "review_skipped", &decision);
         return;
     }
-    if !session.groups().iter().any(|g| g.exposed && !g.pinned) && session.memories.is_empty() {
+    if !bootstrap
+        && !session.groups().iter().any(|g| g.exposed && !g.pinned)
+        && session.memories.is_empty()
+    {
         journal(
             &service,
             &id,
@@ -2176,10 +2618,28 @@ async fn dispatch_review_for(
         );
         return;
     }
+    let Ok(history_pin) = history::pin(&service, &id) else {
+        service.background_reviews.lock().await.remove(&id);
+        return;
+    };
+    let prior_background_review_pending = session.background_review_pending;
+    let prior_keep_leases = session.keep_leases.clone();
     session.background_review_pending = true;
+    session.initialize_keep_leases(service.config.keep_lease_turns);
+    let lease_only = decision["reason"] == "keep_lease_economic";
+    session.reserve_extra_keep_attempt();
+    let targets = session.due_keep_targets();
+    session.keep_leases.as_mut().unwrap().pending =
+        (!targets.is_empty()).then(|| crate::proxy_state::PendingKeepReview {
+            request_id: request_id.clone(),
+            targets,
+        });
     // Reserve the pending marker before dispatch so a restart censors unknown spend.
     if save(&service, &id, session).is_err() {
-        session.background_review_pending = false;
+        // No worker or paid attempt owns this reservation. Roll back only our
+        // provisional lease state, including the extra-attempt allowance.
+        session.background_review_pending = prior_background_review_pending;
+        session.keep_leases = prior_keep_leases;
         service.background_reviews.lock().await.remove(&id);
         journal(
             &service,
@@ -2199,25 +2659,29 @@ async fn dispatch_review_for(
         &json!({}),
     );
     tokio::spawn(async move {
+        let _history_pin = history_pin;
         let mut reviewed = before.clone();
         let mut run = ReviewRun {
             background: true,
+            lease_only,
             request_id,
             ..ReviewRun::default()
         };
-        review(&service, &id, &mut reviewed, &main, false, &mut run).await;
+        review(&service, &id, &mut reviewed, &main, bootstrap, &mut run).await;
         // Primary transport/checkpoint owns this lock until its commit finishes.
         // Never save the snapshot: merge only reviewer fields into the latest state.
         let _lock = session_lock(&service, &id).await;
-        if let Ok(mut current) = load(&service, &id) {
+        run.advice_invalidated = service.invalidated_reviews.lock().await.remove(&id);
+        if let Ok(mut current) = load_existing(&service, &id) {
             let merged = merge_review(&service.config, &mut current, &before, &reviewed, &run);
             if save(&service, &id, &current).is_err() {
+                let accounting_committed = save_paid_accounting(&service, &id, &current).is_ok();
                 journal(
                     &service,
                     &id,
                     &run.request_id,
                     "background_review_checkpoint_failed",
-                    &json!({}),
+                    &json!({"accounting_committed":accounting_committed}),
                 );
                 let _ = trace(
                     &service,
@@ -2259,24 +2723,34 @@ fn merge_review(
     run: &ReviewRun,
 ) -> bool {
     current.background_review_pending = false;
+    if let Some(state) = &mut current.keep_leases {
+        state.pending = None;
+    }
     // Spend survives stale advice, rebases and primary failures. Price reviewer
     // receipts against the current trajectory, never replace its primary history.
     for receipt in &run.receipts {
+        // The review snapshot is the dispatch epoch. The live session may have
+        // changed routes/contracts while this already-paid work was in flight.
+        let resolved = before.model_resolution.as_ref().map(|p| &p.reviewer);
         if let Some(usage) = &receipt.usage {
-            current
-                .shadow
-                .observe(&receipt.model, usage, receipt.standard);
+            current.shadow.observe_with_rates(
+                &receipt.model,
+                usage,
+                receipt.standard,
+                receipt_rates(&receipt.model, usage, resolved),
+            );
         } else {
             current.shadow.calls += 1;
             current.shadow.unavailable_cost_calls += 1;
         }
         if let Some(t) = &mut current.cost_trajectory {
             if receipt.completed {
-                t.reviewer_usage(
+                t.reviewer_usage_resolved(
                     &receipt.model,
                     receipt.input,
                     receipt.usage.as_ref().unwrap_or(&Value::Null),
                     receipt.standard,
+                    resolved,
                 );
             } else {
                 t.failed_call();
@@ -2294,8 +2768,8 @@ fn merge_review(
         .into_iter()
         .map(|g| (g.id, g))
         .collect::<HashMap<_, _>>();
-    let compatible = primary_direction(&current.review_context)
-        == primary_direction(&before.review_context)
+    let compatible = !run.advice_invalidated
+        && primary_direction(&current.review_context) == primary_direction(&before.review_context)
         && current.review_epoch == before.review_epoch
         && before.history.len() <= current.history.len()
         && before
@@ -2316,9 +2790,21 @@ fn merge_review(
                     && (!new.pinned || old.pinned)
             })
         });
+    // Import spend is unavoidable even if newer primary progress invalidates
+    // the snapshot. Never replace its primary state with the worker's copy.
+    current.bootstrap_estimated_cost_usd +=
+        (reviewed.bootstrap_estimated_cost_usd - before.bootstrap_estimated_cost_usd).max(0.0);
     if !compatible {
         current.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"background advice discarded: main lineage, source membership or eligibility changed; review current sources again"}]});
         return false;
+    }
+    // In-flight work carries dispatch-scoped config. Receipt prices above belong
+    // to that old epoch, but new memory must fit the latest saved pair instead.
+    let mut admission_config = config.clone();
+    if let Some(pair) = &current.model_resolution {
+        admission_config.primary_context_tokens = pair.primary.capacity_tokens;
+        admission_config.classifier_max_input_tokens = pair.reviewer.capacity_tokens;
+        admission_config.model_resolution = Some(pair.clone());
     }
     admission::initialize(current);
     let before_admission = current.clone();
@@ -2335,6 +2821,18 @@ fn merge_review(
         if current.opinions.get(&id) != before.opinions.get(&id) {
             continue;
         }
+        let key = format!("g{id}");
+        if current
+            .keep_leases
+            .as_ref()
+            .and_then(|s| s.entries.get(&key))
+            != before
+                .keep_leases
+                .as_ref()
+                .and_then(|s| s.entries.get(&key))
+        {
+            continue;
+        }
         if let Some(opinion) = reviewed.opinions.get(&id) {
             current.opinions.insert(id, opinion.clone());
         } else {
@@ -2346,7 +2844,17 @@ fn merge_review(
         }
     }
     current.reconcile_opinions(&current.groups());
+    let live_leases = current.keep_leases.as_ref();
     current.memories.retain(|memory| {
+        let key = format!("m{}", memory.id);
+        if live_leases.and_then(|s| s.entries.get(&key))
+            != before
+                .keep_leases
+                .as_ref()
+                .and_then(|s| s.entries.get(&key))
+        {
+            return true; // A newer same-value protection also beats stale retirement.
+        }
         !before.memories.iter().any(|old| {
             old.id == memory.id && old.text == memory.text && old.source_ids == memory.source_ids
         }) || reviewed.memories.iter().any(|new| new.id == memory.id)
@@ -2376,7 +2884,7 @@ fn merge_review(
         }
         candidate.refresh_memory_shadow();
         // The latest task/settings, not the dispatched snapshot, own admission.
-        if candidate.memories.len() <= 128 && memory_admission_fits(config, &candidate) {
+        if candidate.memories.len() <= 128 && memory_admission_fits(&admission_config, &candidate) {
             *current = candidate;
         } else {
             budget_rejections += 1;
@@ -2428,24 +2936,75 @@ fn merge_review(
         .saturating_sub(before.reviewer_compactions);
     current.review_epoch = reviewed.review_epoch;
     current.last_review_request = reviewed.last_review_request;
-    // Snapshot validity is insufficient: current-budget revalidation can reject
-    // every accepted memory. Only committed valid advice may cover sources or
-    // update no-yield backoff; valid-empty and partially accepted batches count.
-    let committed_valid = run.valid_admission
-        && (current.review_feedback["rejected_count"] == 0
-            || current.review_feedback["accepted_opinions"]
-                .as_u64()
-                .unwrap_or(0)
-                > 0
-            || current.review_feedback["accepted_memories"]
-                .as_u64()
-                .unwrap_or(0)
-                > 0);
+    // Current-budget admission may reject all memories from any import chunk.
+    // Its final feedback describes only the last chunk, not the whole worker.
+    let committed_batches = run
+        .batches
+        .iter()
+        .filter(|batch| {
+            batch.valid_without_memories
+                || batch
+                    .memory_ids
+                    .iter()
+                    .any(|id| current.memories.iter().any(|memory| memory.id == *id))
+        })
+        .collect::<Vec<_>>();
+    let committed_valid = !committed_batches.is_empty();
+    let successful_sources = committed_batches
+        .iter()
+        .flat_map(|batch| batch.sources.iter().cloned())
+        .collect::<Vec<_>>();
+    if before.bootstrap_review_pending && !before.bootstrap_review_complete {
+        for batch in &committed_batches {
+            current.bootstrap_reviewed_ids.extend(&batch.bootstrap_ids);
+        }
+        current.refresh_bootstrap_progress();
+    }
+    if let (Some(old), Some(new), Some(live)) = (
+        &before.keep_leases,
+        &reviewed.keep_leases,
+        &mut current.keep_leases,
+    ) {
+        let keys = old
+            .entries
+            .keys()
+            .chain(new.entries.keys())
+            .cloned()
+            .collect::<HashSet<_>>();
+        for key in keys {
+            if live.entries.get(&key) != old.entries.get(&key) {
+                continue;
+            }
+            if new.entries.get(&key) == old.entries.get(&key) {
+                continue;
+            }
+            if let Some(lease) = new.entries.get(&key) {
+                let mut lease = lease.clone();
+                lease.renewed_at_round = current.completed_requests;
+                live.entries.insert(key, lease);
+            } else {
+                live.entries.remove(&key);
+            }
+        }
+        live.next_generation = live.next_generation.max(new.next_generation);
+    }
+    if committed_valid
+        && current.review_feedback["rejected_count"] == 0
+        && let Some(pending) = &run.keep_review
+    {
+        current.resolve_keep_targets(pending);
+    }
     admission::complete(
         &before_admission,
         current,
         committed_valid,
-        &run.successful_sources,
+        &successful_sources,
+    );
+    forking::publish(
+        config,
+        current,
+        before,
+        committed_valid && !run.publication_rejected,
     );
     true
 }
@@ -2461,7 +3020,7 @@ async fn review(
     if run.request_id.is_empty() {
         run.request_id = logging::request_id();
     }
-    if !bootstrap {
+    if !bootstrap && !run.lease_only {
         let decision = admission::decision(&service.config, session, main, run.pressure);
         journal(service, id, &run.request_id, "review_admission", &decision);
         if decision["admitted"] != true {
@@ -2470,6 +3029,7 @@ async fn review(
         }
     }
     admission::initialize(session);
+    session.initialize_keep_leases(service.config.keep_lease_turns);
     session.review_cache_key = format!("{:x}", Sha256::digest(format!("carry-review-{id}")));
     set_review_context(session, cache_base(main));
     if bootstrap {
@@ -2486,10 +3046,8 @@ async fn review(
         );
         return false;
     }
-    prepare_review_history(session, &groups);
-    let body = review_body_for_groups(&service.config, session, &groups);
-    // Ordinary reviews are one incremental update. The live planner makes room
-    // first; only oversized imports use multiple bounded admission rounds.
+    let prior_keep_review = session.keep_leases.as_ref().unwrap().pending.clone();
+    let body = prepare_ordinary_review(&service.config, session, &groups, &run.request_id);
     if !review_fits(&service.config, &body) {
         journal(
             service,
@@ -2498,20 +3056,39 @@ async fn review(
             "review_skipped",
             &json!({"reason":"reviewer_capacity","background":run.background,"required_tokens":reviewer_required_tokens(&service.config,&body),"context_tokens":service.config.classifier_max_input_tokens}),
         );
-        for group in &groups {
-            let mut clean = session.clone();
-            clean.compact_reviewer();
-            if !review_fits(
-                &service.config,
-                &review_body_for_groups(&service.config, &clean, std::slice::from_ref(group)),
-            ) {
-                session.opinions.insert(group.id, "keep".into());
-            }
-        }
+        // These targets were rendered but never sent. Do not leave an active
+        // annotation, or cancel a pending generation owned by another attempt.
+        session.keep_leases.as_mut().unwrap().pending = prior_keep_review;
         return false;
     }
     session.observe_groups(&groups);
     review_chunk(service, id, session, &body, &groups, run).await
+}
+
+/// Render the actual ordinary request, including target annotations and the
+/// dispatcher's replay-only capacity cleanup. Forecasts use a private clone;
+/// the caller owns reservation/cancellation of any installed pending targets.
+fn prepare_ordinary_review(
+    config: &ProxyCli,
+    session: &mut Session,
+    groups: &[Group],
+    request_id: &str,
+) -> Value {
+    prepare_review_history(session, groups);
+    let targets = session.due_keep_targets();
+    session.keep_leases.as_mut().unwrap().pending =
+        (!targets.is_empty()).then(|| crate::proxy_state::PendingKeepReview {
+            request_id: request_id.into(),
+            targets,
+        });
+    let mut body = review_body_for_groups(config, session, groups);
+    // Dispose of reviewer replay independently; never rewrite primary source
+    // or accepted protection merely to admit another reviewer request.
+    if !review_fits(config, &body) && session.review_history.is_some() {
+        session.compact_reviewer();
+        body = review_body_for_groups(config, session, groups);
+    }
+    body
 }
 
 async fn review_import(
@@ -2576,45 +3153,20 @@ async fn review_import(
                 );
                 continue;
             }
-            let removed = admitted
-                .iter()
-                .filter(|g| session.drop_authorized(g))
-                .map(|g| g.id)
-                .collect::<Vec<_>>();
-            if removed.is_empty() || service.config.mode != Mode::Compact {
-                session.opinions.insert(remaining[0].id, "keep".into());
-                session.review_feedback = json!({"reason":"import_capacity_exceeded","rejected_count":1,
-                    "rejected":[{"field":"capacity","reason":"protected or indivisible source cannot fit the reviewer context budget"}]});
-                journal(
-                    service,
-                    id,
-                    &run.request_id,
-                    "review_skipped",
-                    &json!({"reason":"import_capacity_exceeded"}),
-                );
-                return false;
-            }
-            let before = session.render_primary();
-            session.remove(&removed, &groups);
-            if session.render_primary() != before {
-                session.compactions += 1;
-            }
-            if save(service, id, session).is_err() {
-                return false;
-            }
+            session.review_feedback = json!({"reason":"import_capacity_exceeded","rejected_count":1,
+                "rejected":[{"field":"capacity","reason":"remaining source cannot fit the reviewer context budget; primary retained unchanged"}]});
             journal(
                 service,
                 id,
                 &run.request_id,
-                "compaction_committed",
-                &json!({"reason":"bootstrap_capacity","main_changed":session.render_primary() != before,"removed_group_count":removed.len()}),
+                "review_skipped",
+                &json!({"reason":"import_capacity_exceeded"}),
             );
-            continue;
+            return false;
         }
         prepare_review_history(session, &admitted);
         let body = review_body_for_groups(&service.config, session, &admitted);
-        let Some(rates) = Rates::for_model(&service.config.classifier_model, estimate(&body))
-        else {
+        let Some(rates) = reviewer_rates(&service.config, estimate(&body)) else {
             journal(
                 service,
                 id,
@@ -2643,16 +3195,19 @@ async fn review_import(
         }
         session.bootstrap_estimated_cost_usd += cost;
         session.observe_groups(&admitted);
-        if save(service, id, session).is_err() {
+        if !run.background && save(service, id, session).is_err() {
             return false;
         }
         calls += 1;
         if !review_chunk(service, id, session, &body, &admitted, run).await {
-            let _ = save(service, id, session);
+            if !run.background {
+                let _ = save(service, id, session);
+            }
             return false;
         }
+        run.batches.last_mut().unwrap().bootstrap_ids = added.clone();
         session.bootstrap_reviewed_ids.extend(added);
-        if save(service, id, session).is_err() {
+        if !run.background && save(service, id, session).is_err() {
             return false;
         }
     }
@@ -2723,7 +3278,18 @@ async fn review_chunk(
     );
     let _ = trace(service, id, "shadow_submitted", body);
     session.last_review_request = session.completed_requests;
-    let attempt = Attempt::start("shadow", &service.config.classifier_model, false, true);
+    let resolved = service
+        .config
+        .model_resolution
+        .as_ref()
+        .map(|p| &p.reviewer);
+    let attempt = Attempt::start(
+        "shadow",
+        &service.config.classifier_model,
+        false,
+        true,
+        resolved,
+    );
     let codex_reviewer = service.config.codex_login && service.config.classifier_url.is_none();
     let wire_log = logging::ReviewWire {
         id,
@@ -2805,16 +3371,18 @@ async fn review_chunk(
                 completed: value["status"] == "completed",
             });
         }
-        session.shadow.observe(
+        session.shadow.observe_with_rates(
             &service.config.classifier_model,
             &value["usage"],
             value.get("service_tier").is_none_or(|v| v == "default"),
+            receipt_rates(&service.config.classifier_model, &value["usage"], resolved),
         );
         if let Some(trajectory) = &mut session.cost_trajectory {
-            trajectory.reviewer(
+            trajectory.reviewer_resolved(
                 body,
                 &value,
                 value.get("service_tier").is_none_or(|v| v == "default"),
+                resolved,
             );
         }
         if value["status"] == "completed" {
@@ -2837,6 +3405,7 @@ async fn review_chunk(
                 Some(&value),
                 &service.config.classifier_model,
                 true,
+                resolved,
             ),
         );
         if value["status"] != "completed" {
@@ -2865,6 +3434,15 @@ async fn review_chunk(
                             .as_u64()
                             .unwrap_or(0)
                             > 0;
+                    if valid && session.review_feedback["rejected_count"] == 0 {
+                        run.keep_review =
+                            session.keep_leases.as_ref().and_then(|s| s.pending.clone());
+                        if !run.background
+                            && let Some(pending) = &run.keep_review
+                        {
+                            session.resolve_keep_targets(pending);
+                        }
+                    }
                 }
                 Err(error) => {
                     session.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":error.to_string()}]});
@@ -2888,7 +3466,13 @@ async fn review_chunk(
             &run.request_id,
             &review_attempt_id,
             "usage",
-            &logging::usage_data("shadow", None, &service.config.classifier_model, true),
+            &logging::usage_data(
+                "shadow",
+                None,
+                &service.config.classifier_model,
+                true,
+                resolved,
+            ),
         );
         if run.background {
             run.receipts.push(ReviewReceipt {
@@ -2927,9 +3511,32 @@ async fn review_chunk(
     {
         session.partial_reviews += 1;
     }
-    run.valid_admission |= valid;
+    run.publication_rejected |= !valid || session.review_feedback["rejected_count"] != 0;
+    if let Some(state) = &mut session.keep_leases {
+        state.pending = None;
+    }
     if valid {
-        run.successful_sources.extend(groups.iter().cloned());
+        run.batches.push(ReviewBatch {
+            sources: groups.to_vec(),
+            bootstrap_ids: Vec::new(),
+            valid_without_memories: (session.review_feedback["rejected_count"] == 0
+                && session.review_feedback["accepted_memories"] == 0)
+                || session.review_feedback["accepted_opinions"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0,
+            memory_ids: session
+                .memories
+                .iter()
+                .filter(|memory| {
+                    !before_admission
+                        .memories
+                        .iter()
+                        .any(|old| old.id == memory.id)
+                })
+                .map(|memory| memory.id)
+                .collect(),
+        });
     }
     let outcome = admission::complete(&before_admission, session, valid, groups);
     journal(
@@ -3168,6 +3775,8 @@ fn cache_base(body: &Value) -> Value {
             "client_metadata",
             "include",
             "max_output_tokens",
+            "previous_response_id",
+            "conversation",
         ] {
             object.remove(key);
         }
@@ -3176,6 +3785,8 @@ fn cache_base(body: &Value) -> Value {
 }
 
 fn estimate(body: &Value) -> f64 {
+    #[cfg(test)]
+    planner_work::record("estimates");
     crate::proxy_savings::token_units(body) as f64
 }
 
@@ -3237,20 +3848,43 @@ fn review_fits(config: &ProxyCli, body: &Value) -> bool {
         && reviewer_required_tokens(config, body) <= config.classifier_max_input_tokens as f64
 }
 
+#[cfg(test)]
 fn reusable(cache: &[CacheEvidence], body: &Value) -> f64 {
+    primary_reusable(cache, body, None)
+}
+
+fn primary_reusable(
+    cache: &[CacheEvidence],
+    body: &Value,
+    resolved: Option<&ResolvedModel>,
+) -> f64 {
     let Some(input) = body["input"].as_array() else {
         return 0.0;
     };
     let base = cache_base(body);
     cache
         .iter()
-        .filter(|e| now().saturating_sub(e.at) <= 1800 && e.matches(&base, input))
+        .filter(|e| {
+            e.matches_route(resolved.map(|r| &r.route))
+                && now().saturating_sub(e.at) <= 1800
+                && e.matches(&base, input)
+        })
         .map(|e| e.estimated_tokens() * e.native_cached_fraction)
         .fold(0.0, f64::max)
         .min(estimate(body))
 }
 
+#[cfg(test)]
 fn observe_cache(cache: &mut Vec<CacheEvidence>, body: &Value, usage: &Value) {
+    observe_primary_cache(cache, body, usage, None);
+}
+
+fn observe_primary_cache(
+    cache: &mut Vec<CacheEvidence>,
+    body: &Value,
+    usage: &Value,
+    resolved: Option<&ResolvedModel>,
+) {
     let Some(input) = body["input"].as_array() else {
         return;
     };
@@ -3268,17 +3902,48 @@ fn observe_cache(cache: &mut Vec<CacheEvidence>, body: &Value, usage: &Value) {
     for evidence in cache.iter_mut() {
         evidence.compact();
     }
-    cache.push(CacheEvidence::new(
+    let mut evidence = CacheEvidence::new(
         &cache_base(body),
         input,
         now(),
         cached as f64 / total as f64,
-    ));
+    );
+    evidence.route = resolved.map(|r| r.route.clone());
+    cache.push(evidence);
     if cache.len() > 8 {
         cache.remove(0);
     }
 }
 
+fn primary_rates(config: &ProxyCli, model: &str, input: f64) -> Option<Rates> {
+    match &config.model_resolution {
+        Some(pair) if pair.primary.model == model => pair.primary.rates_for_input(input),
+        Some(_) => None,
+        None => Rates::for_model(model, input), // Explicit legacy, snapshot-missing caller.
+    }
+}
+
+fn reviewer_rates(config: &ProxyCli, input: f64) -> Option<Rates> {
+    match &config.model_resolution {
+        Some(pair) if pair.reviewer.model == config.classifier_model => {
+            pair.reviewer.rates_for_input(input)
+        }
+        Some(_) => None,
+        None => Rates::for_model(&config.classifier_model, input),
+    }
+}
+
+fn reviewer_cache_capabilities(
+    config: &ProxyCli,
+) -> Option<carry::models::PromptCacheCapabilities> {
+    match &config.model_resolution {
+        Some(pair) if pair.reviewer.model == config.classifier_model => pair.reviewer.cache,
+        Some(_) => None,
+        None => crate::openai::prompt_cache_capabilities(&config.classifier_model),
+    }
+}
+
+#[cfg(test)]
 fn view_costs(
     keep: &Value,
     compact: &Value,
@@ -3286,10 +3951,30 @@ fn view_costs(
     model: &str,
     requests: u64,
 ) -> Option<ViewCosts> {
+    resolved_view_costs(keep, compact, cache, model, requests, None)
+}
+
+fn resolved_view_costs(
+    keep: &Value,
+    compact: &Value,
+    cache: &[CacheEvidence],
+    model: &str,
+    requests: u64,
+    resolved: Option<&ResolvedModel>,
+) -> Option<ViewCosts> {
     let kt = estimate(keep);
     let ct = estimate(compact);
-    let kr = Rates::for_model(model, kt)?;
-    let cr = Rates::for_model(model, ct)?;
+    let rates = |tokens| match resolved {
+        Some(r) if r.model == model => r.rates_for_input(tokens),
+        Some(_) => None,
+        None => Rates::for_model(model, tokens),
+    };
+    let kr = rates(kt)?;
+    let cr = rates(ct)?;
+    let capability = match resolved {
+        Some(r) => r.cache,
+        None => crate::openai::prompt_cache_capabilities(model),
+    };
     let first = |body: &Value, tokens: f64, rates: Rates| {
         let explicit_write = body["input"].as_array().into_iter().flatten().any(|item| {
             item["content"]
@@ -3300,8 +3985,12 @@ fn view_costs(
         });
         input_cost(
             tokens,
-            reusable(cache, body),
-            if explicit_write {
+            if resolved.is_none() || capability.is_some() {
+                primary_reusable(cache, body, resolved)
+            } else {
+                0.0
+            },
+            if explicit_write && resolved.is_none_or(|r| r.explicit_cache_transport) {
                 rates.write
             } else {
                 rates.input
@@ -3312,8 +4001,7 @@ fn view_costs(
     let keep_first = first(keep, kt, kr);
     let compact_first = first(compact, ct, cr);
     // Native evidence can price the first call even when future cache support is unknown.
-    let minimum =
-        crate::openai::prompt_cache_capabilities(model).map(|cap| cap.minimum_prefix_tokens as f64);
+    let minimum = capability.map(|cap| cap.minimum_prefix_tokens as f64);
     // Future hits are a fixed-history sensitivity assumption, not guaranteed.
     Some(ViewCosts {
         keep: horizon_cost(
@@ -3341,6 +4029,15 @@ fn view_costs(
 
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
+fn receipt_rates(model: &str, usage: &Value, resolved: Option<&ResolvedModel>) -> Option<Rates> {
+    let input = usage["input_tokens"].as_u64()? as f64;
+    match resolved {
+        Some(r) if r.model == model => r.rates_for_input(input),
+        Some(_) => None,
+        None => Rates::for_model(model, input), // Explicit snapshot-missing legacy path.
+    }
+}
+
 struct Attempt {
     id: String,
     actor: &'static str,
@@ -3348,10 +4045,17 @@ struct Attempt {
     native: bool,
     started: Instant,
     standard: bool,
+    resolved: Option<ResolvedModel>,
 }
 
 impl Attempt {
-    fn start(actor: &'static str, model: &str, native: bool, standard: bool) -> Self {
+    fn start(
+        actor: &'static str,
+        model: &str,
+        native: bool,
+        standard: bool,
+        resolved: Option<&ResolvedModel>,
+    ) -> Self {
         let attempt = Self {
             id: format!(
                 "{}-{}-{}",
@@ -3364,6 +4068,7 @@ impl Attempt {
             native,
             started: Instant::now(),
             standard,
+            resolved: resolved.cloned(),
         };
         attempt.emit("started", json!({}));
         attempt
@@ -3426,10 +4131,11 @@ impl Attempt {
             }
         }
         let mut priced = carry::core::UsageLedger::default();
-        priced.observe(
+        priced.observe_with_rates(
             &self.model,
             usage,
             self.standard && response.get("service_tier").is_none_or(|v| v == "default"),
+            receipt_rates(&self.model, usage, self.resolved.as_ref()),
         );
         let tools = response["output"]
             .as_array()
@@ -3547,23 +4253,31 @@ async fn relay(
             if complete_transport && status.is_success() && completed {
                 let value = observed.unwrap();
                 let model = commit.outbound["model"].as_str().unwrap_or("");
-                commit.candidate.primary.observe(
+                let resolved = commit
+                    .service
+                    .config
+                    .model_resolution
+                    .as_ref()
+                    .map(|p| &p.primary);
+                commit.candidate.primary.observe_with_rates(
                     model,
                     &value["usage"],
                     standard(&commit.outbound)
                         && value.get("service_tier").is_none_or(|v| v == "default"),
+                    receipt_rates(model, &value["usage"], resolved),
                 );
                 if let Some(trajectory) = &mut commit.candidate.cost_trajectory {
                     if commit.native {
                         trajectory.unmodeled_call();
                     } else {
-                        trajectory.primary(
+                        trajectory.primary_resolved(
                             &commit.outbound,
                             &value,
                             &commit.service.config.upstream_url,
                             now(),
                             standard(&commit.outbound)
                                 && value.get("service_tier").is_none_or(|v| v == "default"),
+                            resolved,
                         );
                     }
                 }
@@ -3584,13 +4298,22 @@ async fn relay(
                         }
                     }
                     commit.candidate.last_response_id = value["id"].as_str().map(str::to_owned);
+                    if let Some(conversation) = history::conversation(&value) {
+                        commit.candidate.history_conversation = Some(conversation.into());
+                    }
                     commit.candidate.response_frontier = Some(commit.candidate.next_id);
                     commit.candidate.pending_output =
                         value["output"].as_array().cloned().unwrap_or_default();
-                    observe_cache(
+                    observe_primary_cache(
                         &mut commit.candidate.primary_cache,
                         &commit.outbound,
                         &value["usage"],
+                        commit
+                            .service
+                            .config
+                            .model_resolution
+                            .as_ref()
+                            .map(|p| &p.primary),
                     );
                     if commit.candidate.bootstrap_review_complete {
                         commit.candidate.bootstrap_review_pending = false;
@@ -3598,13 +4321,23 @@ async fn relay(
                     commit.candidate.completed_requests += 1;
                 }
                 let _ = trace(&commit.service, &commit.id, "primary_completed", &value);
-                if save(&commit.service, &commit.id, &commit.candidate).is_err() {
+                if save_observed(
+                    &commit.service,
+                    &commit.id,
+                    &commit.candidate,
+                    Some((&commit.observed_input, &value)),
+                )
+                .is_err()
+                {
+                    let accounting_committed =
+                        save_paid_accounting(&commit.service, &commit.id, &commit.candidate)
+                            .is_ok();
                     journal(
                         &commit.service,
                         &commit.id,
                         &commit.request_id,
                         "primary_checkpoint_failed",
-                        &json!({"candidate_committed":false}),
+                        &json!({"candidate_committed":false,"accounting_committed":accounting_committed}),
                     );
                     converted_value = None;
                     let _ = sender
@@ -3638,16 +4371,30 @@ async fn relay(
                     trajectory.failed_call();
                 }
                 if let Some(value) = &observed {
-                    commit.reviewed.primary.observe(
-                        commit.outbound["model"].as_str().unwrap_or(""),
+                    let model = commit.outbound["model"].as_str().unwrap_or("");
+                    commit.reviewed.primary.observe_with_rates(
+                        model,
                         &value["usage"],
-                        standard(&commit.outbound),
+                        standard(&commit.outbound)
+                            && value.get("service_tier").is_none_or(|v| v == "default"),
+                        receipt_rates(
+                            model,
+                            &value["usage"],
+                            commit
+                                .service
+                                .config
+                                .model_resolution
+                                .as_ref()
+                                .map(|p| &p.primary),
+                        ),
                     );
                 } else {
                     commit.reviewed.primary.calls += 1;
                     commit.reviewed.primary.unavailable_cost_calls += 1;
                 }
-                let _ = save(&commit.service, &commit.id, &commit.reviewed);
+                if save(&commit.service, &commit.id, &commit.reviewed).is_err() {
+                    let _ = save_paid_accounting(&commit.service, &commit.id, &commit.reviewed);
+                }
                 let _ = trace(
                     &commit.service,
                     &commit.id,
@@ -3701,6 +4448,14 @@ mod control_tests;
 mod pr144_regressions;
 
 #[cfg(test)]
+#[path = "proxy_catalog_tests.rs"]
+mod catalog_regressions;
+
+#[cfg(test)]
+#[path = "proxy_planner_work_tests.rs"]
+pub(crate) mod planner_work;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use carry::core::prefix_compatible;
@@ -3743,24 +4498,43 @@ mod tests {
         let mut config = reviewer_config();
         config.state_dir = directory.to_path_buf();
         Service {
-            _directory_lock: private_file(&directory.join(".lock"), true).unwrap(),
+            catalog: Arc::new(tokio::sync::OnceCell::new()),
+            _directory_lock: Arc::new(private_file(&directory.join(".lock"), true).unwrap()),
             config,
             client: reqwest::Client::new(),
             upstream_key: None,
             classifier_key: None,
             auth_token: None,
-            locks: Mutex::new(HashMap::new()),
-            background_reviews: Mutex::new(HashSet::new()),
+            locks: Arc::new(Mutex::new(HashMap::new())),
+            background_reviews: Arc::new(Mutex::new(HashSet::new())),
+            invalidated_reviews: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            lock_waits: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
     // PR154 tests only: use the current trace/checkpoint seam, not new APIs.
     include!("proxy_pr154_tests.rs");
     include!("proxy_pr154_controls.rs");
+    include!("proxy_catalog_isolation_tests.rs");
+    include!("proxy_catalog_pair_tests.rs");
+    include!("proxy_lease_join_tests.rs");
+    include!("proxy_history_repair_tests.rs");
+    mod output_action_tests {
+        include!("proxy_output_action_tests.rs");
+    }
     mod admission_tests {
         include!("proxy_admission_tests.rs");
         include!("proxy_admission_controls.rs");
         include!("proxy_admission_merge_tests.rs");
+        include!("proxy_bootstrap_merge_tests.rs");
+    }
+    mod lease_tests {
+        include!("proxy_lease_tests.rs");
+        include!("proxy_lease_review_tests.rs");
+        include!("proxy_lease_acceptance_tests.rs");
+        include!("proxy_lease_performance_tests.rs");
+        include!("proxy_primary_render_reuse_tests.rs");
     }
 
     #[test]
@@ -3801,7 +4575,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_capacity_forces_shared_compaction_despite_economic_margin() {
+    fn reviewer_capacity_never_forces_primary_compaction_past_economic_margin() {
         let mut config = reviewer_config();
         config.classifier_cache_policy = ClassifierCachePolicy::Disabled;
         config.classifier_max_input_tokens = 5000;
@@ -3820,14 +4594,16 @@ mod tests {
         let body = json!({"model":"gpt-6-luna","input":session.render_primary()});
         let (candidate, report) = plan(&config, &session, &body);
         assert!(
-            candidate.is_some(),
-            "capacity must override the savings margin"
+            candidate.is_none(),
+            "reviewer pressure is not a primary emergency"
         );
-        assert_eq!(report["forced"], true);
+        assert_eq!(report["forced"], false);
+        assert_eq!(report["reviewer_fits"], false);
         assert!(
-            !json!(candidate.unwrap().render_primary())
-                .to_string()
-                .contains("discardable output")
+            session
+                .render_primary()
+                .iter()
+                .any(|item| item.to_string().contains("discardable output"))
         );
     }
 
@@ -4486,7 +5262,10 @@ mod tests {
             .await
         );
         assert_eq!(session.invalid_reviews, 0);
-        assert_eq!(session.opinions.get(&1).map(String::as_str), Some("keep"));
+        assert!(
+            !session.opinions.contains_key(&1),
+            "capacity is not reviewer advice"
+        );
         assert_eq!(
             session.shadow.calls, 0,
             "an oversized atomic group must not dispatch a paid review"
@@ -5150,14 +5929,18 @@ mod tests {
             "save must not amplify valid source into a permanently unloadable checkpoint"
         );
         let service = Service {
-            _directory_lock: private_file(&directory.path().join(".lock"), true).unwrap(),
+            catalog: Arc::new(tokio::sync::OnceCell::new()),
+            _directory_lock: Arc::new(private_file(&directory.path().join(".lock"), true).unwrap()),
             config,
             client: reqwest::Client::new(),
             upstream_key: None,
             classifier_key: None,
             auth_token: None,
-            locks: Mutex::new(HashMap::new()),
-            background_reviews: Mutex::new(HashSet::new()),
+            locks: Arc::new(Mutex::new(HashMap::new())),
+            background_reviews: Arc::new(Mutex::new(HashSet::new())),
+            invalidated_reviews: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            lock_waits: Arc::new(std::sync::Mutex::new(None)),
         };
         save(&service, "large-missing-usage", &session).unwrap();
         assert_eq!(
@@ -5354,9 +6137,13 @@ mod tests {
             output_joint["savings"].as_f64().unwrap()
                 <= output_joint["keep"].as_f64().unwrap() * 0.25
         );
+        assert_eq!(
+            output_joint["accepted"], false,
+            "recurring completion sensitivity retains its output allowance and margin: {output_report}"
+        );
         assert!(
-            candidate.is_none(),
-            "future review output cap belongs to both payoff costs and the minimum joint payback margin: {output_report}"
+            candidate.is_some(),
+            "hypothetical repeated output completions must not veto primary savings when no review is due"
         );
     }
 }

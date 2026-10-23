@@ -91,7 +91,22 @@ pub struct UsageLedger {
 
 impl UsageLedger {
     pub fn observe(&mut self, model: &str, usage: &Value, standard: bool) {
-        if Rates::for_model(model, 0.0).is_none() {
+        let rates = usage["input_tokens"]
+            .as_u64()
+            .and_then(|input| Rates::for_model(model, input as f64));
+        self.observe_with_rates(model, usage, standard, rates);
+    }
+
+    /// Rates already selected from the dispatched frozen contract using native
+    /// input count. None remains unknown: do not silently re-resolve the slug.
+    pub fn observe_with_rates(
+        &mut self,
+        model: &str,
+        usage: &Value,
+        standard: bool,
+        rates: Option<Rates>,
+    ) {
+        if rates.is_none() {
             self.unpriced_models.insert(model.to_owned());
         }
         let mut complete = self.calls.checked_add(1).is_some();
@@ -117,12 +132,9 @@ impl UsageLedger {
         } else {
             complete = false;
         }
-        if let (Some(input), Some(output), Some(cached), Some(rates)) = (
-            input,
-            output,
-            cached,
-            input.and_then(|i| Rates::for_model(model, i as f64)),
-        ) && standard
+        if let (Some(input), Some(output), Some(cached), Some(rates)) =
+            (input, output, cached, rates)
+            && standard
             && !["input_tokens_details", "output_tokens_details"]
                 .iter()
                 .any(|field| {
