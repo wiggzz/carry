@@ -234,6 +234,57 @@ fn receipt_subscription_traditional_cache_uses_model_policy_not_transport_capabi
 }
 
 #[test]
+fn receipt_carry_only_rewrite_preserves_traditional_cache_after_restart() {
+    let mut t = Trajectory::default();
+    t.primary(&body(), &terminal(2000, 1500, 0, 0), "route", 100, true);
+    let before = t.snapshot();
+    t.compacted(1500, 500);
+    assert!(state(&t)["receipts"]["anchor"].is_null());
+    let mut t: Trajectory = serde_json::from_value(state(&t)).unwrap();
+    let rewritten =
+        json!({"model":"gpt-6.1-sol", "input":[{"role":"user","content":"Carry memory"}]});
+    t.primary(&rewritten, &terminal(1100, 0, 0, 0), "route", 101, true);
+    let after = t.snapshot();
+    let expected = scenario_input_cost("gpt-6.1-sol", 2100, 2000, Some(1024)).unwrap();
+    assert!(
+        (after.traditional_cost - before.traditional_cost - expected).abs() < 1e-12,
+        "Carry's edit must not cold-price the untouched traditional prefix"
+    );
+    assert!(state(&t)["receipts"]["last_appended_input"].is_null());
+    assert_eq!(state(&t)["restored"], 1000);
+}
+
+#[test]
+fn receipt_pending_preserves_completed_costs_and_aggregate_scope() {
+    let mut t = Trajectory::default();
+    t.primary(&body(), &terminal(2000, 1500, 0, 0), "route", 100, true);
+    let settled = serde_json::to_value(t.snapshot().dashboard(false)).unwrap();
+    let mut totals = DashboardTotals::default();
+    for _ in 0..3 {
+        let pending = t.snapshot().dashboard(true);
+        let public = serde_json::to_value(&pending).unwrap();
+        for field in [
+            "carry_cost",
+            "traditional_cost",
+            "savings",
+            "observed_primary_cost",
+        ] {
+            assert_eq!(
+                public[field], settled[field],
+                "pending work must not censor completed {field}"
+            );
+        }
+        totals = DashboardTotals::default();
+        totals.observe(&pending);
+    }
+    let aggregate = serde_json::to_value(totals).unwrap();
+    assert_eq!(aggregate["included_sessions"], 1);
+    assert_eq!(aggregate["carry_cost"], settled["carry_cost"]);
+    let empty = serde_json::to_value(Trajectory::default().snapshot().dashboard(true)).unwrap();
+    assert!(empty["carry_cost"].is_null());
+}
+
+#[test]
 fn receipt_unmodeled_actuals_are_unknown_and_coverage_reconciles() {
     let mut t = Trajectory::default();
     let r = terminal(2000, 1000, 0, 10);
