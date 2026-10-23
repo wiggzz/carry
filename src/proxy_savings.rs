@@ -585,6 +585,10 @@ fn projection(body: &Value, route: &str, at: u64) -> Option<Prompt> {
 }
 
 #[cfg(test)]
+#[path = "proxy_receipt_tests.rs"]
+mod receipt_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
