@@ -275,7 +275,7 @@ async fn catalog_pair_lease_control(kind: &str, lease: bool) {
         (merged.shadow.cost_usd - (60.0 * 7.0 + 40.0 * 0.7 + 10.0 * 21.0) / 1e6).abs() < 1e-12,
         "paid receipt uses OLD frozen tariff"
     );
-    let input = estimate(&review_wire.lock().await.clone());
+
     assert!(
         (merged
             .cost_trajectory
@@ -283,7 +283,7 @@ async fn catalog_pair_lease_control(kind: &str, lease: bool) {
             .unwrap()
             .snapshot()
             .reviewer_cost
-            - (input * 7.0 + 10.0 * 21.0) / 1e6)
+            - (60.0 * 7.0 + 40.0 * 0.7 + 10.0 * 21.0) / 1e6)
             .abs()
             < 1e-12
     );
@@ -330,6 +330,18 @@ async fn catalog_pair_lease_control(kind: &str, lease: bool) {
         "restart must not settle receipt twice"
     );
     assert_eq!(restored.shadow.cost_usd, merged.shadow.cost_usd);
+    let observed = merged.cost_trajectory.as_ref().unwrap().snapshot();
+    let resumed = restored.cost_trajectory.as_ref().unwrap().snapshot();
+    assert_eq!(observed.observed_reviewer_cost, merged.shadow.cost_usd);
+    assert_eq!(
+        resumed.observed_reviewer_cost,
+        observed.observed_reviewer_cost
+    );
+    assert_eq!(resumed.reviewer_cost, observed.reviewer_cost);
+    assert_eq!(
+        resumed.coverage.reviewer_responses, 1,
+        "asynchronous receipt settles exactly once across restart"
+    );
     if lease {
         assert_eq!(
             serde_json::to_value(&restored.keep_leases).unwrap(),

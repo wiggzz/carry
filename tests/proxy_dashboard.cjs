@@ -179,5 +179,23 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   data.sessions[0].planner.primary_output_allowance_basis='legacy_zero_no_explicit_request_cap_not_headroom';
   await vm.runInContext('refresh()', sandbox);
   assert.ok(walk(elements.get('sessions')).some(n=>/zero.*no explicit.*cap/i.test(n.textContent)), 'missing request cap must not silently mean expected headroom output');
+  data.sessions = [session(1, 2)];
+  data.sessions[0].cost_estimate.accounting_basis = 'legacy_json_v1';
+  data.cost_estimate = {...total(null, null, null, null, 0, 1), legacy_sessions: 1};
+  await vm.runInContext('refresh()', sandbox);
+  assert.match(walk(elements.get('sessions')).map(n=>n.textContent).join('\n'), /legacy.*JSON/i, 'old monetary sums need an explicit legacy label');
+  assert.match(elements.get('estimate-coverage').textContent, /1 legacy/i, 'do not blend legacy and receipt-anchored windows');
+  data.sessions[0].cost_estimate.accounting_basis = 'receipt_anchored_v2';
+  Object.assign(data.sessions[0].cost_estimate, {matched_primary_responses:7,
+    observed_primary_cost:0.125, observed_reviewer_cost:null,
+    unavailable_primary_cost_calls:2, unavailable_reviewer_cost_calls:1});
+  data.cost_estimate = {...total(1, 2, 1, 50, 1), matched_primary_responses:42,
+    unavailable_primary_cost_calls:3, unavailable_reviewer_cost_calls:4};
+  await vm.runInContext('refresh()', sandbox);
+  assert.match(walk(elements.get('sessions')).map(n=>n.textContent).join('\n'), /7 matched primary.*observed.*subtotal.*\$0.125000.*2 primary.*1 reviewer/i);
+  assert.match(elements.get('estimate-coverage').textContent, /42 matched primary.*3 primary.*4 reviewer/i, 'backend owns aggregate observed-cost completeness and matched coverage too');
+  assert.match(elements.get('assumptions').textContent, /provider.*input/i);
+  assert.match(elements.get('assumptions').textContent, /estimated.*restor/i);
+  assert.ok(!/non-tool|reviewer inputs priced uncached/.test(elements.get('assumptions').textContent));
   console.log('proxy dashboard scenarios: ok');
 })().catch(error => { console.error(error); process.exitCode = 1; });
