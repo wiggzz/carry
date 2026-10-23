@@ -176,6 +176,13 @@ class HarnessEntrypointTests(unittest.TestCase):
             self.assertIn("+after", (output / "final.patch").read_text())
 
     def test_pi_native_session_does_not_include_no_session(self):
+        import json
+        catalog = json.loads((ENTRYPOINT.parents[2] / 'src/model_catalog.json').read_text())
+        for model, spec in catalog.items():
+            with self.subTest(model=model):
+                self._assert_pi_native_session_config(model, spec)
+
+    def _assert_pi_native_session_config(self, model, spec):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             repo, prompt_dir, output, session = (root / "repo", root / "input", root / "output", root / "pi-session")
@@ -189,21 +196,31 @@ class HarnessEntrypointTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
             (prompt_dir / "task.md").write_text("fix")
             binary.write_text(
-                "#!/usr/bin/env python3\nimport pathlib,sys\n"
+                "#!/usr/bin/env python3\nimport pathlib,sys,os,json\n"
+                "model=json.loads((pathlib.Path(os.environ['HOME'])/'.pi/agent/models.json').read_text())['providers']['openai-benchmark']['models'][0]\n"
+                f"assert model['contextWindow']=={spec['context_tokens']}, model\n"
+                f"assert model['cost']['input']=={spec['rates']['input']} and model['cost']['cacheRead']=={spec['rates']['cached']}, model\n"
+                "assert model['maxTokens']==128000, model\n"
                 "assert '--no-session' not in sys.argv, sys.argv\n"
                 "assert '--session' in sys.argv and '--session-dir' in sys.argv, sys.argv\n"
                 "pathlib.Path(sys.argv[sys.argv.index('--session')+1]).write_text('{}\\n')\n"
                 "pathlib.Path('file.txt').write_text('after\\n')\n"
             )
             binary.chmod(0o755)
+            adapter = root / 'bin' / 'adapter.py'
+            adapter.write_bytes(ENTRYPOINT.read_bytes())
+            (root / 'bin/model_catalog.py').write_bytes((ENTRYPOINT.parents[2] / 'scripts/model_catalog.py').read_bytes())
+            (root / 'model_catalog.json').write_bytes((ENTRYPOINT.parents[2] / 'src/model_catalog.json').read_bytes())
+            (root / 'home').mkdir()
             env = dict(os.environ, OPENAI_API_KEY="unit-test-secret", OPENAI_BASE_URL="http://openai-proxy:8080/v1",
-                       PREPARED_HARNESS_ROOT=str(root), AGENT_TIMEOUT_SECONDS="30", BENCHMARK_WORKSPACE=str(repo))
+                       HOME=str(root / 'home'), PREPARED_HARNESS_ROOT=str(root), AGENT_TIMEOUT_SECONDS="30", BENCHMARK_WORKSPACE=str(repo))
             run = subprocess.run(
-                ["python3", str(ENTRYPOINT), "run", "--harness", "pi", "--model", "model", "--reasoning", "medium",
+                ["python3", str(adapter), "run", "--harness", "pi", "--model", model, "--reasoning", "medium",
                  "--prompt", str(prompt_dir / "task.md"), "--output", str(output), "--pi-session-dir", str(session)],
                 cwd=repo, env=env, text=True, capture_output=True,
             )
-            self.assertEqual(run.returncode, 0, run.stderr)
+            trace = output / "trace.log"
+            self.assertEqual(run.returncode, 0, run.stderr + (trace.read_text() if trace.exists() else ""))
             self.assertTrue((session / "session.jsonl").is_file())
 
     def test_prepared_image_selects_harness_without_image_environment_template(self):

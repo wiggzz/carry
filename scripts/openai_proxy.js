@@ -6,8 +6,13 @@ const https = require('node:https');
 const MAX_TELEMETRY_BYTES = 8 * 1024 * 1024;
 // Match Carry's existing HTTP body admission; telemetry is a separate capture budget.
 const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
-// Fixed public vocabulary, not arbitrary caller/provider strings or object keys.
-const TELEMETRY_MODELS = new Set(['gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol']);
+// Fixed reviewed catalog vocabulary, never arbitrary caller/provider strings.
+const fs = require('node:fs');
+const path = require('node:path');
+const packagedCatalog = path.join(__dirname, 'model_catalog.json');
+const catalogPath = fs.existsSync(packagedCatalog) ? packagedCatalog :
+  path.join(__dirname, '../src/model_catalog.json');
+const TELEMETRY_MODELS = new Set(Object.keys(require(catalogPath)));
 const TELEMETRY_TIERS = new Set(['auto', 'default', 'standard', 'flex', 'priority', 'scale']);
 function telemetryModel(value) {
   return TELEMETRY_MODELS.has(value) ? value : 'unrecognized';

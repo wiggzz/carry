@@ -49,6 +49,57 @@ class Provider:
 
 
 class TrustedGatewayTests(unittest.TestCase):
+    def test_catalog_model_identity_survives_telemetry_and_native_pricing(self):
+        from scripts import proxy_benchmark
+        import shutil
+        catalog = json.loads((ROOT / 'src/model_catalog.json').read_text())
+        usage = {'input_tokens': 100, 'output_tokens': 2,
+                 'input_tokens_details': {'cached_tokens': 0}}
+        with tempfile.TemporaryDirectory() as directory:
+            packaged = Path(directory) / 'openai_proxy.js'
+            shutil.copyfile(ROOT / 'scripts/openai_proxy.js', packaged)
+            shutil.copyfile(ROOT / 'src/model_catalog.json', packaged.with_name('model_catalog.json'))
+            for module in (ROOT / 'scripts/openai_proxy.js', packaged):
+                for model in (*catalog, CANARY + '-unlisted-model'):
+                    with self.subTest(layout=module.parent, model=model), Provider(value={
+                            'model': model, 'status': 'completed', 'output': [], 'usage': usage}) as provider:
+                        gateway = Gateway(provider.server.server_port, provider.server.server_port,
+                                          module_path=module)
+                        body = json.dumps({'model': model, 'input': []}).encode()
+                        try:
+                            status, raw = gateway.request(body)
+                            self.assertEqual(status, 200)
+                            self.assertEqual(json.loads(raw)['model'], model)
+                            self.assertEqual(provider.calls[0]['body'], body)
+                        finally:
+                            gateway.close()
+                        completed = [e for e in gateway.events if e['event'] == 'completed']
+                        self.assertEqual(len(completed), 1)
+                        self.assertEqual(completed[0]['model'], model if model in catalog else 'unrecognized')
+                        summary = proxy_benchmark.summarize_events(gateway.events)
+                        self.assertTrue(summary['ledger_complete'])
+                        if model in catalog:
+                            self.assertAlmostEqual(summary['estimated_total_cost_usd'],
+                                proxy_benchmark.native_cost(model, usage))
+                        else:
+                            self.assertIsNone(summary['estimated_total_cost_usd'])
+                            self.assertNotIn(model, json.dumps(gateway.events))
+
+    def test_packaged_gateway_requires_its_catalog_before_startup(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as directory, Provider() as provider:
+            module = Path(directory) / 'openai_proxy.js'
+            shutil.copyfile(ROOT / 'scripts/openai_proxy.js', module)
+            gateway = None
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'model_catalog'):
+                    gateway = Gateway(provider.server.server_port, provider.server.server_port,
+                                      module_path=module)
+            finally:
+                if gateway is not None:
+                    gateway.close()
+            self.assertFalse(provider.calls)
+
     def test_v2_native_compaction_classification_preserves_forwarded_bytes(self):
         from scripts import proxy_benchmark
         usage = {'input_tokens': 100, 'output_tokens': 2,

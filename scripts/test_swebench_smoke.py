@@ -1666,6 +1666,8 @@ class SmokeWorkerTests(unittest.TestCase):
         )
         proxy_run = next(command for command in commands if command[:3] == ["docker", "run", "--detach"])
         self.assertEqual(proxy_run[proxy_run.index("--network") + 1], network["egress"])
+        catalog = SCRIPT.resolve().parents[1] / "src/model_catalog.json"
+        self.assertIn(f"type=bind,src={catalog},dst=/proxy/model_catalog.json,readonly", proxy_run)
         self.assertIn("no-new-privileges", proxy_run)
         self.assertIn("--cap-drop=ALL", proxy_run)
         self.assertEqual(network["api_base"], "http://openai-proxy:8080/v1")

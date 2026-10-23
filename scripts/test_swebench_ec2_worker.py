@@ -226,9 +226,13 @@ class Ec2WorkerBootstrapTests(unittest.TestCase):
             (payload / "scripts").mkdir(parents=True)
             import shutil
             shutil.copyfile(SCRIPT.with_name('proxy_benchmark.py'),payload/'scripts/proxy_benchmark.py')
+            shutil.copyfile(SCRIPT.with_name('model_catalog.py'),payload/'scripts/model_catalog.py')
+            (payload/'src').mkdir()
+            shutil.copyfile(SCRIPT.parents[1]/'src/model_catalog.json',payload/'src/model_catalog.json')
             archive = root / "source.tar.gz"
             with tarfile.open(archive, "w:gz") as stream:
                 stream.add(payload / "scripts", arcname="scripts")
+                stream.add(payload / "src", arcname="src")
 
             capability = base64.b64encode(b"https://example.invalid/object").decode()
             config = root / "worker-config"

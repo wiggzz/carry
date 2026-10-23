@@ -17,6 +17,8 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/*.sources \
     && mkdir -p /opt/swebench-harness/bin
 COPY --from=build /source/target/x86_64-unknown-linux-musl/release/carry /opt/swebench-harness/bin/carry
 COPY containers/swebench-harness/entrypoint.py /opt/swebench-harness/bin/adapter
+COPY src/model_catalog.json /opt/swebench-harness/model_catalog.json
+COPY scripts/model_catalog.py /opt/swebench-harness/bin/model_catalog.py
 RUN chmod 0555 /opt/swebench-harness/bin/carry /opt/swebench-harness/bin/adapter
 # The runner supplies the selected benchmark command; this bundle contains only
 # Carry and the adapter so it can be mounted onto a neutral prepared task image.

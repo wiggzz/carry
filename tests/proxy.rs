@@ -2680,7 +2680,14 @@ async fn reviewer_timeout_fails_closed_while_primary_can_complete() {
 async fn native_codex_and_pi_echo_shapes_preserve_settings_and_unknown_model_passthrough() {
     let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
     let state = tempfile::tempdir().unwrap();
-    let (_proxy, url) = start_proxy(state.path(), fixture.address, "compact").await;
+    let (_proxy, url) = start_proxy_options(
+        state.path(),
+        fixture.address,
+        "compact",
+        &["--primary-context-tokens", "272000"],
+        "",
+    )
+    .await;
     for (branch, model) in [("codex", "gpt-6-luna"), ("pi", "unknown-provider-model")] {
         let request = json!({
             "model": model, "input": [{"role": "user", "content": [{"type": "input_text", "text": "use native tools"}]}],
@@ -2803,7 +2810,14 @@ async fn client_continuation_is_expanded_but_never_forwarded_upstream() {
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let state = tempfile::tempdir().unwrap();
-    let (proxy, url) = start_proxy(state.path(), address, "compact").await;
+    let (proxy, url) = start_proxy_options(
+        state.path(),
+        address,
+        "compact",
+        &["--primary-context-tokens", "272000"],
+        "",
+    )
+    .await;
     let first = json!({"model": "fixture-model", "input": [{"role": "user", "content": "goal"}]});
     let response = send(&url, &first, "a", "main").await;
     assert!(response.status().is_success());
@@ -2838,7 +2852,14 @@ async fn client_continuation_is_expanded_but_never_forwarded_upstream() {
         assert_eq!(captured[2]["input"], captured[1]["input"]);
     }
     drop(proxy);
-    let (_proxy, url) = start_proxy(state.path(), address, "compact").await;
+    let (_proxy, url) = start_proxy_options(
+        state.path(),
+        address,
+        "compact",
+        &["--primary-context-tokens", "272000"],
+        "",
+    )
+    .await;
     let resumed = json!({"model": "fixture-model", "previous_response_id": "resp_2", "input": [{"role": "user", "content": "after restart"}]});
     let response = send(&url, &resumed, "a", "main").await;
     assert!(response.status().is_success());
@@ -3209,7 +3230,11 @@ async fn unknown_primary_pricing_skips_reviews_that_cannot_produce_a_plan() {
         state.path(),
         fixture.address,
         "compact",
-        &["--review-replayed-history"],
+        &[
+            "--review-replayed-history",
+            "--primary-context-tokens",
+            "272000",
+        ],
         "",
     )
     .await;

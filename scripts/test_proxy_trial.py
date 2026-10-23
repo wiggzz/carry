@@ -10,6 +10,50 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ProxyTrialTests(unittest.TestCase):
+    def test_native_output_policy_cannot_exceed_known_model_bounds(self):
+        from scripts import model_catalog
+        from unittest.mock import patch
+        model = 'gpt-6-luna'
+        original = model_catalog.model_spec(model)
+        for changes in ({'client_output_tokens': 128001}, {'context_tokens': 1000}):
+            with self.subTest(changes=changes), patch.dict(model_catalog._CATALOG, {model: {**original, **changes}}):
+                with self.assertRaises(ValueError):
+                    model_catalog.pi_model(model, name='fixture')
+
+    def test_known_legacy_pi_models_use_explicit_client_output_policy_not_a_fabricated_maximum(self):
+        from scripts import proxy_trial
+        catalog = json.loads((ROOT / 'src/model_catalog.json').read_text())
+        for model, spec in catalog.items():
+            if spec['max_output_tokens'] is not None:
+                continue
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as directory:
+                try:
+                    proxy_trial.client_configuration(Path(directory), client='pi',
+                        base_url='http://127.0.0.1:1/v1', model=model, session_id=None)
+                except ValueError as error:
+                    self.fail(f'previously supported catalog model rejected: {error}')
+                row = json.loads((Path(directory) / 'pi/models.json').read_text())['providers']['carry-trial']['models'][0]
+                self.assertEqual(row['contextWindow'], spec['context_tokens'])
+                self.assertEqual(row['maxTokens'], 128000)
+                self.assertIsNone(spec['max_output_tokens'])
+
+    def test_native_trial_and_benchmark_share_all_known_catalog_entries(self):
+        from scripts import proxy_trial, swebench_smoke
+        for model in ('gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-astra'):
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as directory:
+                proxy_trial.client_configuration(Path(directory), client='pi',
+                    base_url='http://127.0.0.1:1/v1', model=model, session_id=None)
+                row = json.loads((Path(directory)/'pi/models.json').read_text())['providers']['carry-trial']['models'][0]
+                self.assertEqual(row['contextWindow'], 1050000)
+                self.assertEqual(row['maxTokens'], 128000)
+                self.assertIsNotNone(swebench_smoke.pricing_for_model(model))
+                self.assertEqual(swebench_smoke.pricing_for_model(model)['long_context_threshold'], 272000)
+        self.assertIsNone(swebench_smoke.pricing_for_model('unknown-model'))
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                proxy_trial.client_configuration(Path(directory), client='pi',
+                    base_url='http://127.0.0.1:1/v1', model='unknown-model', session_id=None)
+
     def test_fixture_observer_rejects_remote_tls_and_credential_urls_before_side_effects(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); workspace=root/'workspace'; workspace.mkdir()

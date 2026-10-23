@@ -86,20 +86,19 @@ only that scoped gateway token. Loopback model endpoints also enforce it when
 configured; token-free local dashboard access does not relax API authorization.
 
 Pi needs only an ordinary Responses provider in `models.json` (merge, do not
-replace other providers):
+replace other providers). Generate the example from the shared catalog in a Carry
+checkout instead of maintaining a second context/pricing list:
 
-```json
-{
-  "providers": {
-    "carry": {
-      "baseUrl": "http://127.0.0.1:8787/v1",
-      "api": "openai-responses",
-      "apiKey": "carry-local",
-
-      "models": [{"id": "gpt-6.1-sol", "reasoning": true, "input": ["text", "image"], "contextWindow": 272000, "maxTokens": 128000}]
-    }
-  }
-}
+```sh
+python3 - <<'PY'
+from scripts.model_catalog import pi_model
+import json
+model = "gpt-6.1-sol"
+entry = pi_model(model, name="Carry model")
+provider = {"baseUrl": "http://127.0.0.1:8787/v1", "api": "openai-responses",
+            "apiKey": "carry-local", "models": [entry]}
+print(json.dumps({"providers": {"carry": provider}}, indent=2))
+PY
 ```
 
 `carry-local` is a placeholder for a loopback proxy **without** a gateway token.
@@ -156,11 +155,14 @@ when their sources are removed; unmaterialized facts remain in the current ledge
 Primary tool descriptions are not duplicated into the reviewer instructions.
 
 Before dispatch, the planner checks the actual rendered next primary and reviewer
-requests, including incoming material. Defaults are a 272,000-token primary
-budget and a 300,000-token reviewer budget. Configure these with
-`--primary-context-tokens` and `--classifier-max-input-tokens` (also named
-`--reviewer-context-tokens`). These are configurable planning budgets, not a
-claim about the provider's model limits. The default 10% `--context-margin-percent`
+requests, including incoming material. Both capacity bounds resolve through the
+[shared model catalog](model-catalog.md), constrained by fresh exact-route metadata
+when available. Explicit `--primary-context-tokens` and
+`--classifier-max-input-tokens` (also named `--reviewer-context-tokens`) overrides
+remain supported within known capacity. There are no separate primary/reviewer
+role defaults. The ordinary economic target is not a hard capacity ceiling. An
+unknown reviewer capacity disables review rather than blocking a fitting primary.
+The default 10% `--context-margin-percent`
 margin is added to estimated inputs, with an output reserve: the client's
 `max_output_tokens` or `--primary-output-reserve-tokens` (16,384) for primary,
 and `--classifier-max-output-tokens` (2,048) for reviewer. Serialized reviewer
@@ -351,33 +353,22 @@ carry login
 Merge the following provider into your Pi agent-directory `models.json`
 (default `~/.pi/agent/models.json`); do not overwrite other providers. This is
 an OpenAI Responses endpoint, not an OpenAI Codex OAuth provider. Carry owns
-the subscription authentication. Choose a model available to your account.
+the subscription authentication. Choose a model available to your account. Run
+this generator from a Carry checkout; model limits and prices come from the same
+catalog used by the proxy and benchmark adapters.
 
-```json
-{
-  "providers": {
-    "carry": {
-      "baseUrl": "http://127.0.0.1:8787/v1",
-      "api": "openai-responses",
-      "apiKey": "$CARRY_PI_TOKEN",
-      "headers": {
-        "x-carry-session": "$CARRY_PI_SESSION",
-        "x-carry-tenant": "local-pi",
-        "x-carry-branch": "main",
-        "x-carry-history-policy": "reset-on-divergence"
-      },
-      "models": [
-        {
-          "id": "gpt-6.1-sol",
-          "reasoning": true,
-          "input": ["text", "image"],
-          "contextWindow": 272000,
-          "maxTokens": 128000
-        }
-      ]
-    }
-  }
-}
+```sh
+python3 - <<'PY'
+from scripts.model_catalog import pi_model
+import json
+model = "gpt-6.1-sol"
+entry = pi_model(model, name="Carry model")
+provider = {"baseUrl": "http://127.0.0.1:8787/v1", "api": "openai-responses",
+            "apiKey": "$CARRY_PI_TOKEN", "models": [entry],
+            "headers": {"x-carry-session": "$CARRY_PI_SESSION", "x-carry-tenant": "local-pi",
+                        "x-carry-branch": "main", "x-carry-history-policy": "reset-on-divergence"}}
+print(json.dumps({"providers": {"carry": provider}}, indent=2))
+PY
 ```
 
 `pi-carry --check` checks authenticated proxy readiness and Pi’s model listing;
@@ -563,7 +554,7 @@ The benchmark sidecar explicitly opts in to `--verbose` session tracing. Each ac
 
 Native provider usage is used directly. Completed but invalid reviews still cost money. Missing, truncated, failed or unanswered usage is censored, not filled with synthetic tokens or zero cost. Ledger integrity requires one ordered start and terminal per request, with an unambiguous actor; orphan, duplicate, conflicting or malformed records cannot certify a complete ledger. Orphan completions remain counted, and independently known unique receipt costs—including missing-start receipts—remain in `observed_cost_lower_bound_usd`. Duplicate receipts are priced once; conflicting model/tier/usage receipts are not arbitrarily selected. A valid censored terminal can close a lifecycle without providing a price. The total is unavailable if the ledger or required pricing is incomplete; the lower bound is only the observed priced subtotal. Original native client usage remains in the record, with its old estimate labeled `client_estimated_cost_usd`; the treatment's primary and total estimates use trusted native accounting. A missing metric is unknown, not zero. Latency is completed-call latency, not total task wall time. Native-compaction request classification covers the legacy compact path and V2 `input` trigger items; it is separate from the collected Rust `native_compactions` metric.
 
-[The rate table](../benchmarks/proxy-standard-rates.json) records the reviewed exact model IDs, separate cache-write/read rates, and the strictly-greater-than-272000 whole-request surcharge. Unknown aliases, nonstandard tiers and unsupported input billing categories have no estimated price. These are modeled standard API costs, not an invoice or infrastructure bill.
+[The shared catalog](../src/model_catalog.json) records exact model IDs, separate cache-write/read rates, and each model's long-input threshold and whole-request multipliers. Models without a tier are not given another model's surcharge. Unknown aliases, nonstandard tiers and unsupported input billing categories have no estimated price. These are modeled standard API costs, not an invoice or infrastructure bill.
 
 ## Verification boundary
 

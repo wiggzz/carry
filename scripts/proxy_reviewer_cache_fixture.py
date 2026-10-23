@@ -326,6 +326,9 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
             cmd = [str(Path(binary).resolve()), 'proxy', '--login', 'api-key', '--listen', f'127.0.0.1:{port}',
                    '--upstream-url', provider.url + '/v1/responses', '--classifier-url', provider.url + '/classifier',
                    '--classifier-model', model, '--state-dir', str(directory / 'state'),
+                   # Synthetic cache/replay budget, including the deliberately
+                   # unlisted-model control; never depend on a model-role default.
+                   '--classifier-max-input-tokens', '300000',
                    '--mode', 'compact' if case == 'coupled' else 'audit', '--background-reviews=false']
             if case == 'coupled':
                 cmd += ['--payoff-requests', '1', '--min-payback-percent', '0']

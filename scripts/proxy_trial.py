@@ -39,11 +39,14 @@ def client_configuration(root, *, client, base_url, model, session_id,
         ])
         (home / 'config.toml').write_text(text)
         return {'CODEX_HOME':str(home)}
+    try:
+        from model_catalog import pi_model
+    except ModuleNotFoundError:
+        from scripts.model_catalog import pi_model
+    model_record = pi_model(model, name='Local trial')
     home = root / 'pi'; home.mkdir()
     provider = {'baseUrl':base_url, 'api':'openai-responses', 'apiKey':'$CARRY_TRIAL_GATEWAY_TOKEN',
-        'headers':headers, 'models':[{'id':model, 'name':'Local trial', 'reasoning':True,
-        'input':['text','image'], 'contextWindow':1050000 if model == 'gpt-6-luna' else 400000,
-        'maxTokens':128000, 'cost':{'input':0,'output':0,'cacheRead':0,'cacheWrite':0}}]}
+                'headers':headers, 'models':[model_record]}
     (home / 'models.json').write_text(json.dumps({'providers':{'carry-trial':provider}}, indent=2) + '\n')
     return {'PI_CODING_AGENT_DIR':str(home), 'PI_OFFLINE':'1', 'PI_TELEMETRY':'0'}
 

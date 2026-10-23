@@ -27,7 +27,7 @@ pub struct Rates {
     pub output: f64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 pub struct LongContext {
     pub threshold: f64,
     pub input_multiplier: f64,
@@ -36,6 +36,8 @@ pub struct LongContext {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModelSpec {
+    pub context_tokens: Option<u32>,
+    pub source: Option<&'static str>,
     /// Standard USD rates per million tokens.
     pub rates: Option<Rates>,
     pub long_context: Option<LongContext>,
@@ -43,33 +45,62 @@ pub struct ModelSpec {
     pub explicit_reviewer_cache: bool,
 }
 
+#[derive(Deserialize)]
+struct CatalogEntry {
+    context_tokens: u32,
+    rates: Rates,
+    long_context: Option<LongContext>,
+    cache: bool,
+    explicit_reviewer_cache: bool,
+    source: String,
+}
+
+pub const DEFAULT_REVIEWER_MODEL: &str = "gpt-6-luna";
+
+/// Initial scratch configuration only; requests resolve their actual model.
+/// Even this initial value is read from the shared catalog, not a role default.
+pub fn default_context_tokens() -> u32 {
+    model_spec(DEFAULT_REVIEWER_MODEL)
+        .and_then(|s| s.context_tokens)
+        .expect("default reviewer is present in the embedded catalog")
+}
+
+pub fn default_ordinary_context_tokens() -> u32 {
+    let spec = model_spec(DEFAULT_REVIEWER_MODEL).expect("default model catalog entry");
+    ordinary_policy(
+        default_context_tokens(),
+        spec.long_context.map(|tier| tier.threshold as u32),
+        0,
+        0,
+    )
+    .total_budget
+}
+
 pub fn model_spec(model: &str) -> Option<ModelSpec> {
-    let (rates, long_context, cache, explicit_reviewer_cache) = match model {
-        "gpt-5.6-luna" => (Some((0.20, 0.02, 0.25, 1.20)), false, true, false),
-        "gpt-5.6-sol" => (Some((4.00, 0.40, 5.00, 20.00)), false, true, false),
-        "gpt-5.6-terra" => (Some((2.00, 0.20, 2.50, 12.00)), false, true, false),
-        "gpt-6-astra" => (Some((10.00, 1.00, 12.50, 50.00)), true, false, false),
-        "gpt-6-luna" => (Some((0.10, 0.01, 0.125, 0.50)), true, true, true),
-        "gpt-6-sol" => (Some((2.00, 0.20, 2.50, 10.00)), true, true, true),
-        "gpt-6.1-sol" => (Some((2.00, 0.10, 2.50, 10.00)), true, true, true),
-        // Existing family cache support does not imply a known price.
-        name if name.starts_with("gpt-5.6-") => (None, false, true, false),
-        _ => return None,
-    };
-    Some(ModelSpec {
-        rates: rates.map(|(input, cached, write, output)| Rates {
-            input,
-            cached,
-            write,
-            output,
-        }),
-        long_context: long_context.then_some(LongContext {
-            threshold: 272_000.0,
-            input_multiplier: 2.0,
-            output_multiplier: 1.5,
-        }),
-        cache: cache.then_some(OPENAI_CACHE),
-        explicit_reviewer_cache,
+    static CATALOG: std::sync::OnceLock<BTreeMap<String, CatalogEntry>> =
+        std::sync::OnceLock::new();
+    let catalog = CATALOG.get_or_init(|| {
+        serde_json::from_str(include_str!("model_catalog.json"))
+            .expect("valid embedded model catalog")
+    });
+    if let Some(entry) = catalog.get(model) {
+        return Some(ModelSpec {
+            context_tokens: Some(entry.context_tokens),
+            source: Some(&entry.source),
+            rates: Some(entry.rates),
+            long_context: entry.long_context,
+            cache: entry.cache.then_some(OPENAI_CACHE),
+            explicit_reviewer_cache: entry.explicit_reviewer_cache,
+        });
+    }
+    // Historical family-level cache support is not a context or price guess.
+    model.starts_with("gpt-5.6-").then_some(ModelSpec {
+        context_tokens: None,
+        source: None,
+        rates: None,
+        long_context: None,
+        cache: Some(OPENAI_CACHE),
+        explicit_reviewer_cache: false,
     })
 }
 
@@ -346,7 +377,7 @@ pub struct ResolvedModel {
     pub model: String,
     pub route: Route,
     pub raw: RawContext,
-    pub capacity_tokens: u32,
+    pub capacity_tokens: Option<u32>,
     pub ordinary: OrdinaryPolicy,
     pub rates: Option<Rates>,
     pub rate_units: String,
@@ -396,7 +427,6 @@ pub fn resolve_model(
     route: Route,
     source: Option<&SourceCatalog>,
     override_tokens: Option<u32>,
-    fallback: u32,
     reserve: u32,
     margin: u8,
 ) -> Result<ResolvedModel, &'static str> {
@@ -410,7 +440,9 @@ pub fn resolve_model(
     let source = source.filter(|s| subscribed && s.route.as_ref() == Some(&route));
     let entry = source.and_then(|s| s.models.iter().find(|entry| entry.model == model));
     let raw = entry.map(|e| e.raw.clone()).unwrap_or_default();
-    let capacity = entry
+    let spec = model_spec(model);
+    let catalog_capacity = spec.and_then(|s| s.context_tokens).map(u64::from);
+    let advertised_capacity = entry
         .filter(|e| {
             e.field_status
                 .get("context_window")
@@ -418,6 +450,12 @@ pub fn resolve_model(
         })
         .and_then(|e| e.raw.context_window)
         .filter(|_| source.is_some_and(|s| s.status == "fresh_at_resolution"));
+    // Discovery may constrain a model's operational window. Its absence does
+    // not select a different primary/reviewer default or fabricate raw facts.
+    let capacity = match (advertised_capacity, catalog_capacity) {
+        (Some(advertised), Some(known)) => Some(advertised.min(known)),
+        (advertised, known) => advertised.or(known),
+    };
     if override_tokens.is_some_and(|v| v == 0 || v > 2_000_000) {
         return Err("invalid context override");
     }
@@ -428,10 +466,9 @@ pub fn resolve_model(
     {
         return Err("context override exceeds advertised route capacity");
     }
-    let capacity_tokens = override_tokens.unwrap_or(capacity.map(|v| v as u32).unwrap_or(fallback));
-    let legacy = model_spec(model);
-    let rates = legacy.and_then(|s| s.rates);
-    let long = legacy.and_then(|s| s.long_context);
+    let capacity_tokens = override_tokens.or(capacity.map(|v| v as u32));
+    let rates = spec.and_then(|s| s.rates);
+    let long = spec.and_then(|s| s.long_context);
     let provenance = |name: &str, status: &str, override_value| Provenance {
         source: name.into(),
         status: status.into(),
@@ -440,24 +477,43 @@ pub fn resolve_model(
         fallback_reason: None,
         operator_override: override_value,
     };
-    let mut capacity_provenance =
-        provenance("conservative-role-capacity-v1", "fallback", override_tokens);
-    capacity_provenance.fallback_reason = capacity
-        .is_none()
-        .then(|| "no_valid_fresh_exact_route_advertised_default".into());
-    if let Some(source) = source {
+    let mut capacity_provenance = provenance(
+        spec.and_then(|s| s.source).unwrap_or("operator_context"),
+        if capacity_tokens.is_some() {
+            "catalog_model_policy_not_route_entitlement"
+        } else {
+            "unknown"
+        },
+        override_tokens,
+    );
+    capacity_provenance.revision = "shared-model-catalog-v2".into();
+    if let Some(source) = source
+        && advertised_capacity.is_some()
+        && capacity == advertised_capacity
+    {
         capacity_provenance.revision = source.revision.clone();
         capacity_provenance.fetched_at = Some(source.fetched_at);
-        if capacity.is_some() {
-            capacity_provenance.source = source.source.clone();
-            capacity_provenance.status = source.status.clone();
-        }
+        capacity_provenance.source = source.source.clone();
+        capacity_provenance.status = source.status.clone();
     }
     if override_tokens.is_some() {
         capacity_provenance.status = "operator_override".into();
     }
+    let mut price_provenance = provenance(
+        "carry/src/model_catalog.json",
+        if rates.is_some() {
+            "catalog_api_equivalent_not_route_tariff"
+        } else {
+            "unknown"
+        },
+        None,
+    );
+    if let Some(source) = spec.and_then(|s| s.source) {
+        price_provenance.source = source.into();
+        price_provenance.revision = "shared-model-catalog-v2".into();
+    }
     let cache = matches!(route.class, RouteClass::OfficialApi)
-        .then(|| legacy.and_then(|s| s.cache))
+        .then(|| spec.and_then(|s| s.cache))
         .flatten();
     Ok(ResolvedModel {
         schema_version: 1,
@@ -466,7 +522,7 @@ pub fn resolve_model(
         raw,
         capacity_tokens,
         ordinary: ordinary_policy(
-            capacity_tokens,
+            capacity_tokens.unwrap_or(0),
             long.map(|l| l.threshold as u32),
             reserve,
             margin,
@@ -484,21 +540,10 @@ pub fn resolve_model(
         long_output_multiplier: long.map(|l| l.output_multiplier),
         cache,
         explicit_cache_transport: cache.is_some()
-            && legacy.is_some_and(|s| s.explicit_reviewer_cache),
+            && spec.is_some_and(|s| s.explicit_reviewer_cache),
         provenance: BTreeMap::from([
             ("capacity".into(), capacity_provenance),
-            (
-                "prices".into(),
-                provenance(
-                    "carry/src/models.rs:legacy-table",
-                    if rates.is_some() {
-                        "legacy_modeling_basis_not_route_tariff"
-                    } else {
-                        "unknown"
-                    },
-                    None,
-                ),
-            ),
+            ("prices".into(), price_provenance),
             (
                 "cache".into(),
                 provenance(

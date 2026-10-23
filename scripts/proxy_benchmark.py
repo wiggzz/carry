@@ -1,6 +1,11 @@
 """Opt-in Carry proxy contracts; no provider secrets in public configuration."""
 from decimal import Decimal, InvalidOperation
 
+try:
+    from model_catalog import model_spec
+except ModuleNotFoundError:
+    from scripts.model_catalog import model_spec
+
 DEFAULTS = {
     'CARRY_PROXY_MODE': 'disabled',
     'CARRY_PROXY_HISTORY_POLICY': 'strict',
@@ -32,7 +37,8 @@ def validate_config(values):
     policy = config['CARRY_PROXY_CLASSIFIER_CACHE_POLICY']
     if policy not in {'auto', 'disabled', 'openai-explicit'}:
         raise ValueError('CARRY_PROXY_CLASSIFIER_CACHE_POLICY must be auto, disabled, or openai-explicit')
-    if policy == 'openai-explicit' and model not in {'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol'}:
+    spec = model_spec(model) if isinstance(model, str) else None
+    if policy == 'openai-explicit' and not (spec and spec['explicit_reviewer_cache']):
         raise ValueError('openai-explicit requires a supported classifier model')
     if not model or not model.isascii() or any(c.isspace() or c in '\x00\r\n' for c in model):
         raise ValueError('invalid CARRY_PROXY_CLASSIFIER_MODEL')
@@ -72,14 +78,12 @@ def sidecar_command(*, image, name, network, state_dir, config):
 
 
 def native_cost(model, usage, *, service_tier='default'):
-    import json
-    from pathlib import Path
-    table = json.loads((Path(__file__).resolve().parents[1] / 'benchmarks/proxy-standard-rates.json').read_text())
     if not isinstance(model, str) or service_tier not in ('default', 'standard', None):
         return None
-    rates = table['models'].get(model)
-    if rates is None:
+    spec = model_spec(model)
+    if spec is None or spec.get('rates') is None:
         return None
+    rates = spec['rates']
     if not isinstance(usage, dict):
         return None
     details = usage.get('input_tokens_details', {})
@@ -103,11 +107,13 @@ def native_cost(model, usage, *, service_tier='default'):
     ordinary = usage['input_tokens'] - cached - writes
     if ordinary < 0:
         return None
-    multiplier = Decimal(2) if usage['input_tokens'] > 272000 else Decimal(1)
-    output_multiplier = Decimal('1.5') if multiplier == 2 else Decimal(1)
-    return float((multiplier * (ordinary * Decimal(rates['ordinary_input']) +
-        cached * Decimal(rates['cached_input']) + writes * Decimal(rates['cache_write_input'])) +
-        output_multiplier * usage['output_tokens'] * Decimal(rates['output'])) / Decimal(1000000))
+    long = spec.get('long_context')
+    above = long is not None and usage['input_tokens'] > long['threshold']
+    multiplier = Decimal(str(long['input_multiplier'])) if above else Decimal(1)
+    output_multiplier = Decimal(str(long['output_multiplier'])) if above else Decimal(1)
+    return float((multiplier * (ordinary * Decimal(str(rates['input'])) +
+        cached * Decimal(str(rates['cached'])) + writes * Decimal(str(rates['write']))) +
+        output_multiplier * usage['output_tokens'] * Decimal(str(rates['output']))) / Decimal(1000000))
 
 
 def summarize_events(events, *, metrics=None):

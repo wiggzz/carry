@@ -260,6 +260,213 @@ async fn assert_dashboard_capacity(url: &str, primary: u64, reviewer: u64) {
 }
 
 #[tokio::test]
+async fn missing_subscription_entry_uses_one_catalog_for_reviewer_plan_dashboard_and_restart() {
+    let f = Fixture::new().await;
+    // Reproduce the deployed mismatch: inference uses GPT-6 IDs, while model
+    // discovery lists only the older family. These are not aliases.
+    *f.metadata.lock().await = json!({"models":[
+        {"slug":"gpt-5.6-luna","visibility":"list","context_window":272000}
+    ]});
+    let state = tempfile::tempdir().unwrap();
+    let mut body = json!({"model":"gpt-6.1-sol","input":[
+        {"role":"user","content":"retained goal"},
+        {"role":"assistant","content":"completed synthetic source"},
+        {"role":"user","content":"next task"}
+    ],"max_output_tokens":10});
+    let args = [
+        "--review-replayed-history",
+        "--review-every-requests",
+        "1",
+        "--review-min-primary-tokens",
+        "0",
+        "--review-min-new-tokens",
+        "0",
+    ];
+    let (child, url) = start(f.home.path(), state.path(), f.address, true, &args).await;
+    let c = catalog(&url).await;
+    assert_eq!(
+        c["reviewer"]["capacity_tokens"], 1050000,
+        "known reviewer must resolve its catalog capacity, not the 300K role fallback"
+    );
+    assert!(
+        c["reviewer"]["raw"]["context_window"].is_null(),
+        "catalog policy must not fabricate an upstream discovery fact"
+    );
+    assert_eq!(c["reviewer"]["ordinary"]["total_budget"], 272000);
+    assert_eq!(send(&url, "unified", &body).await, 200);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (_, checkpoint) = saved(state.path());
+            if checkpoint["background_review_pending"] == false
+                && checkpoint["shadow"]["calls"].as_u64().unwrap_or(0) > 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reviewer must actually run and settle");
+    assert_dashboard_capacity(&url, 1050000, 1050000).await;
+    let (path, checkpoint) = saved(state.path());
+    assert_eq!(checkpoint["last_plan"]["reviewer_context_tokens"], 1050000);
+    assert_eq!(
+        checkpoint["last_plan"]["reviewer_ordinary_context_tokens"],
+        272000
+    );
+    assert_eq!(
+        checkpoint["model_resolution"]["reviewer"]["rates"],
+        c["reviewer"]["rates"]
+    );
+    assert!(f.review_calls.load(Ordering::SeqCst) > 0);
+    drop(child);
+    // A restart, an old fallback snapshot, and an unresolved legacy checkpoint
+    // must all use the current catalog for FUTURE policy, not reprice the past.
+    for legacy in [false, true] {
+        let mut restored = checkpoint.clone();
+        if legacy {
+            restored.as_object_mut().unwrap().remove("model_resolution");
+        } else {
+            for (role, capacity) in [("primary", 272000), ("reviewer", 300000)] {
+                restored["model_resolution"][role]["capacity_tokens"] = json!(capacity);
+                restored["model_resolution"][role]["provenance"]["capacity"]["status"] =
+                    json!("fallback");
+                restored["model_resolution"][role]["provenance"]["capacity"]["source"] =
+                    json!("conservative-role-capacity-v1");
+            }
+        }
+        std::fs::write(&path, serde_json::to_vec(&restored).unwrap()).unwrap();
+        let (child, url) = start(f.home.path(), state.path(), f.address, true, &args).await;
+        assert_dashboard_capacity(&url, 1050000, 1050000).await;
+        body["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"continue"}));
+        assert_eq!(send(&url, "unified", &body).await, 200);
+        let (_, after) = saved(state.path());
+        assert_eq!(
+            after["model_resolution"]["reviewer"]["capacity_tokens"],
+            1050000
+        );
+        assert_eq!(after["last_plan"]["reviewer_context_tokens"], 1050000);
+        assert_dashboard_capacity(&url, 1050000, 1050000).await;
+        assert!(
+            after["primary"]["cost_usd"].as_f64().unwrap()
+                >= restored["primary"]["cost_usd"].as_f64().unwrap()
+        );
+        drop(child);
+    }
+}
+
+#[tokio::test]
+async fn unknown_reviewer_context_does_not_block_a_fitting_known_primary() {
+    let f = Fixture::new().await;
+    let state = tempfile::tempdir().unwrap();
+    let (_child, url) = start(
+        f.home.path(),
+        state.path(),
+        f.address,
+        true,
+        &[
+            "--classifier-model",
+            "unlisted-reviewer",
+            "--review-replayed-history",
+        ],
+    )
+    .await;
+    let body = json!({"model":"gpt-6-sol","input":[
+        {"role":"user","content":"previous task"},
+        {"role":"assistant","content":"completed source"},
+        {"role":"user","content":"continue"}
+    ],"max_output_tokens":10});
+    assert_eq!(
+        send(&url, "unknown-reviewer", &body).await,
+        200,
+        "missing auxiliary reviewer capacity must not block primary progress"
+    );
+    let (_, checkpoint) = saved(state.path());
+    assert!(checkpoint["model_resolution"]["reviewer"]["capacity_tokens"].is_null());
+    assert!(checkpoint["last_plan"]["reviewer_context_tokens"].is_null());
+    assert_eq!(f.primary_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.review_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn frozen_primary_is_independent_of_unresolved_reviewer_after_restart() {
+    let mut failures = Vec::new();
+    for unknown_reviewer in [false, true] {
+        for missing_discovery in [false, true] {
+            for unknown_price in [false, true] {
+                let f = Fixture::new().await;
+                let state = tempfile::tempdir().unwrap();
+                let reviewer = if unknown_reviewer {
+                    "unlisted-reviewer"
+                } else {
+                    "gpt-6-luna"
+                };
+                let args = ["--classifier-model", reviewer];
+                let mut body = json!({"model":"gpt-6-sol","input":[{"role":"user","content":"frozen primary owner"}],"max_output_tokens":10});
+                let (child, url) = start(f.home.path(), state.path(), f.address, true, &args).await;
+                assert_eq!(send(&url, "independent-contract", &body).await, 200);
+                drop(child);
+                let (path, mut checkpoint) = saved(state.path());
+                checkpoint["model_resolution"]["primary"]["rates"] = if unknown_price {
+                    Value::Null
+                } else {
+                    json!({"input":7.0,"cached":0.7,"write":9.0,"output":21.0})
+                };
+                let primary = checkpoint["model_resolution"]["primary"].clone();
+                let before_cost = checkpoint["primary"]["cost_usd"].as_f64().unwrap();
+                let before_unavailable = checkpoint["primary"]["unavailable_cost_calls"]
+                    .as_u64()
+                    .unwrap();
+                let estimated = checkpoint["last_plan"]["primary_estimated_tokens"]
+                    .as_f64()
+                    .unwrap() as u64;
+                std::fs::write(path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+                if missing_discovery {
+                    *f.metadata.lock().await = json!({"models":[]});
+                } else {
+                    f.metadata.lock().await["models"][0]["context_window"] = json!(60000);
+                }
+                let (_child, url) =
+                    start(f.home.path(), state.path(), f.address, true, &args).await;
+                body["max_output_tokens"] = json!(40001 - estimated);
+                let before_calls = f.primary_calls.load(Ordering::SeqCst);
+                let status = send(&url, "independent-contract", &body).await;
+                let label = format!(
+                    "unknown_reviewer={unknown_reviewer},missing_discovery={missing_discovery},unknown_price={unknown_price}"
+                );
+                if status != 413 || f.primary_calls.load(Ordering::SeqCst) != before_calls {
+                    failures.push(format!(
+                        "{label}: saved primary admission widened; HTTP {status}"
+                    ));
+                }
+                body["max_output_tokens"] = json!(10);
+                assert_eq!(send(&url, "independent-contract", &body).await, 200);
+                let (_, after) = saved(state.path());
+                if after["model_resolution"]["primary"] != primary {
+                    failures.push(format!("{label}: valid primary contract was replaced"));
+                }
+                let delta = after["primary"]["cost_usd"].as_f64().unwrap() - before_cost;
+                let expected = if unknown_price { 0.0 } else { 721.0 / 1e6 };
+                if (delta - expected).abs() > 1e-12
+                    || after["primary"]["unavailable_cost_calls"]
+                        != before_unavailable + u64::from(unknown_price)
+                {
+                    failures.push(format!("{label}: frozen tariff changed"));
+                }
+                if unknown_reviewer {
+                    assert!(after["model_resolution"]["reviewer"]["capacity_tokens"].is_null());
+                    assert_eq!(f.review_calls.load(Ordering::SeqCst), 0);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
 async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
     let f = Fixture::new().await;
     let state = tempfile::tempdir().unwrap();
@@ -329,14 +536,14 @@ async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
     assert_eq!(
         send(&url, "one", &body).await,
         200,
-        "only new provenance absent means contemporaneous legacy capacity, not today's catalog"
+        "missing historical contract resolves forward policy from the catalog without repricing history"
     );
     let (_, checkpoint) = saved(state.path());
-    assert_eq!(checkpoint["last_plan"]["primary_context_tokens"], 272000);
-    assert_dashboard_capacity(&url, 272000, 300000).await;
+    assert_eq!(checkpoint["last_plan"]["primary_context_tokens"], 60000);
+    assert_dashboard_capacity(&url, 60000, 6000).await;
     assert_eq!(
         checkpoint["model_resolution"]["primary"]["provenance"]["capacity"]["status"],
-        "legacy_snapshot_missing"
+        "fresh_at_resolution"
     );
 }
 
@@ -344,7 +551,7 @@ async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
 async fn explicit_same_default_lower_and_alias_limits_retain_provenance() {
     let f = Fixture::new().await;
     for (args, primary, reviewer) in [
-        (vec![], 272000, 300000),
+        (vec![], 1050000, 1050000),
         (
             vec![
                 "--primary-context-tokens",
@@ -426,8 +633,8 @@ async fn reviewer_route_is_independent_in_actual_admission_and_dispatch() {
     .expect("real reviewer must settle after primary, without a production wait");
     assert_eq!(checkpoint["last_plan"]["primary_context_tokens"], 40000);
     assert_eq!(
-        checkpoint["last_plan"]["reviewer_context_tokens"], 300000,
-        "explicit API reviewer URL must not inherit primary subscription limit"
+        checkpoint["last_plan"]["reviewer_context_tokens"], 1050000,
+        "explicit API reviewer URL uses model catalog, not primary subscription metadata"
     );
     assert_eq!(
         checkpoint["model_resolution"]["reviewer"]["route"]["class"],

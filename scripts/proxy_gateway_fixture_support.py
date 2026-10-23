@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Gateway:
-    def __init__(self, carry_port, provider_port, policy=None):
+    def __init__(self, carry_port, provider_port, policy=None, *, module_path=None):
         env = {k:v for k,v in os.environ.items() if not k.startswith(('OPENAI_', 'CARRY_PROXY_', 'BENCHMARK_'))}
         env.update(BENCHMARK_CONTEXT_PROXY='1', BENCHMARK_CLIENT_TOKEN='fixture-client',
             CARRY_PROXY_AUTH_TOKEN='fixture-trusted', BENCHMARK_SESSION_ID='fixture-session',
@@ -24,7 +24,7 @@ class Gateway:
         self.log = tempfile.TemporaryFile()
         self.error_log = tempfile.TemporaryFile()
         self.process = subprocess.Popen(['node', '--require', str(ROOT/'scripts/proxy_gateway_fixture_transport.cjs'),
-            '-e', script, str(ROOT/'scripts/openai_proxy.js')], env=env,
+            '-e', script, str(module_path or ROOT/'scripts/openai_proxy.js')], env=env,
             stdout=self.log, stderr=self.error_log)
         deadline = time.monotonic()+20
         while True:

@@ -127,6 +127,18 @@ if args.harness == "codex":
     # Pinned Codex 0.147.0's enum setting; not a feature-toggle alias.
     # Last override also covers fresh/resume and custom AGENT_COMMAND templates.
     command.extend(["--config", 'web_search="disabled"'])
+if args.harness == "pi":
+    try:
+        from model_catalog import pi_model
+    except ModuleNotFoundError:
+        # Source checkout; packaged adapters import their adjacent shared helper.
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "scripts"))
+        from model_catalog import pi_model
+    try:
+        model_record = pi_model(args.model, name="Benchmark model")
+    except ValueError as error:
+        parser.error(str(error))
+
 workspace = os.environ.get("BENCHMARK_WORKSPACE", "/workspace")
 subprocess.run(
     ["git", "config", "--global", "--add", "safe.directory", workspace],
@@ -145,15 +157,7 @@ if args.harness == "pi":
                 "baseUrl": os.environ["OPENAI_BASE_URL"],
                 "api": "openai-responses",
                 "apiKey": "$OPENAI_API_KEY",
-                "models": [{
-                    "id": args.model,
-                    "name": "Benchmark model",
-                    "reasoning": True,
-                    "input": ["text", "image"],
-                    "contextWindow": 1050000 if args.model == "gpt-6-luna" else 400000,
-                    "maxTokens": 128000,
-                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-                }],
+                "models": [model_record],
             }
         }
     }
