@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.2](https://github.com/wiggzz/carry/compare/v0.14.1...v0.14.2) (2026-10-23)
+
+
+### Bug Fixes
+
+* **savings:** model traditional cache independently of transport ([#178](https://github.com/wiggzz/carry/issues/178)) ([fdbee29](https://github.com/wiggzz/carry/commit/fdbee292388eaa4106066422e58eff2c5afc0778))
+
 ## [0.14.1](https://github.com/wiggzz/carry/compare/v0.14.0...v0.14.1) (2026-10-23)
 
 
