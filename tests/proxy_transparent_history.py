@@ -777,7 +777,14 @@ class TransparentHistory(unittest.TestCase):
         child = history + [{"role": "user", "content": "C_ONLY"}]
         self.assertEqual(proxy.send(child)[0], 200)
         self.assertIn("RAW_A", json.dumps(fixture.primaries[-1]))
-        self.assertEqual(json.loads((self.state / "history.index").read_text())["reviews"], {})
+        points = [p for ps in json.loads((self.state / "history.index").read_text())["reviews"].values()
+                  for p in ps]
+        self.assertTrue(points, "empty committed selections are retained, not failed-review advice")
+        for point in points:
+            self.assertEqual(point["memories"], [])
+            self.assertEqual(point["drop_members"], {})
+            self.assertNotIn("drop", point["opinions"].values())
+            self.assertFalse(any(source["removed"] for source in point["sources"]))
 
     def test_index_byte_node_age_limits_and_evicted_ids_fail_closed(self):
         env = {"CARRY_PROXY_HISTORY_MAX_BYTES": "4096", "CARRY_PROXY_HISTORY_MAX_NODES": "4",

@@ -587,17 +587,11 @@ pub(super) fn committed(
             selection: Some(selection.clone()),
         },
     );
-    // Version committed selection at its full dependency frontier, regardless
-    // of whether a reviewer just published a portable receipt. Replacing the
-    // version at the same cut preserves later accepted cleanup, not sibling
-    // suffix decisions. Raw/unselected history needs no portability evidence.
-    if !session.opinions.is_empty()
-        || !session.memories.is_empty()
-        || session.history.iter().any(|i| i.removed)
-    {
-        let key = keys.last().unwrap_or(namespace);
-        index.reviews.insert(key.clone(), vec![selection]);
-    }
+    // Version every committed selection at its full dependency frontier. Empty
+    // state is authority too: retirement must supersede an older nonempty
+    // version at the same cut before an auxiliary branch displaces the live tip.
+    let key = keys.last().unwrap_or(namespace);
+    index.reviews.insert(key.clone(), vec![selection]);
     if session.history_shared {
         index.snapshots.insert(id.into(), compact(session));
     }

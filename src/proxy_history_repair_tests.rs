@@ -137,7 +137,12 @@ async fn history_two_tip_interleaving_with_evidence(selected_frontier: bool, por
     let first_bytes = std::fs::read(directory.path().join(format!("{first}.json"))).unwrap();
     drop(second_lock);
     winner_two.await.unwrap();
+    let second_bytes = std::fs::read(directory.path().join(format!("{second}.json"))).unwrap();
     waiter.await.unwrap();
+    assert_eq!(
+        std::fs::read(directory.path().join(format!("{second}.json"))).unwrap(),
+        second_bytes
+    );
     *service.lock_waits.lock().unwrap() = None;
     if portable {
         let child = load(&service, &next).unwrap();
