@@ -34,6 +34,7 @@ fn config() -> ProxyCli {
 
 fn replay(config: &ProxyCli, retained: usize, disposable: usize) -> (Session, Value) {
     let mut session = Session::default();
+    session.initialize_keep_leases(config.keep_lease_turns);
     session
         .ingest(&[
             json!({"role":"user","content":"durable ".repeat(retained)}),
@@ -57,6 +58,13 @@ fn replay(config: &ProxyCli, retained: usize, disposable: usize) -> (Session, Va
         .unwrap();
     session.completed_requests = 1;
     let main = json!({"model":"gpt-6-luna","input":session.render_primary(),"store":false});
+    let primary_tokens = estimate(&main) as u64;
+    observe_cache(
+        &mut session.primary_cache,
+        &main,
+        &json!({"input_tokens":primary_tokens,"input_tokens_details":{"cached_tokens":primary_tokens}}),
+    );
+    assert!(!session.primary_cache.is_empty());
     session.review_context = cache_base(&main);
     session.reviewer_controls = Some(review_control_state(&session));
     let mut sources = review_source_input(&session, &groups);
@@ -189,7 +197,7 @@ fn reviewer_only148_output_allowance_moves_strict_break_even() {
     let mut config = config();
     let (session, main) = replay(&config, 800, 4_000);
     let mut ratios = Vec::new();
-    for output in [0, 100_000] {
+    for output in [1, 16_384] {
         config.classifier_max_output_tokens = output;
         let (_, report) = plan(&config, &session, &main);
         let row = only_row(&report);
@@ -200,7 +208,7 @@ fn reviewer_only148_output_allowance_moves_strict_break_even() {
     let margin = ((ratios[0] + ratios[1]) / 2.0).floor() as u8;
     assert!(ratios[1] < f64::from(margin) && f64::from(margin) < ratios[0]);
     config.min_payback_percent = margin;
-    for (output, accepted) in [(0, true), (100_000, false)] {
+    for (output, accepted) in [(1, true), (16_384, false)] {
         config.classifier_max_output_tokens = output;
         let (selected, report) = plan(&config, &session, &main);
         assert_eq!(selected.is_some(), accepted, "{report}");
