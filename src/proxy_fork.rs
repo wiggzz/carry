@@ -25,6 +25,8 @@ pub(crate) struct Point {
     groups: Value,
     opinions: BTreeMap<u64, String>,
     drop_members: BTreeMap<u64, Vec<u64>>,
+    #[serde(default)]
+    retired_members: BTreeMap<u64, Vec<u64>>,
     memories: Vec<Memory>,
     memory_anchors: BTreeMap<u64, u64>,
 }
@@ -103,23 +105,28 @@ pub(super) fn publish(config: &ProxyCli, current: &mut Session, before: &Session
     {
         return;
     }
-    let values = current.history.iter().map(|i| &i.value).collect::<Vec<_>>();
-    let id = format!(
-        "{}:{}",
-        current.review_epoch,
-        digest(&(values, &current.opinions, &current.memories))
-    );
-    if current.fork_points.iter().any(|p| p.id == id) || current.fork_expired.contains(&id) {
-        return; // immutable: a later review cannot replace the historical cut
+    let point = selection(config, current);
+    if current.fork_points.iter().any(|p| p.id == point.id)
+        || current.fork_expired.contains(&point.id)
+    {
+        return;
     }
+    current.fork_points.push(point);
+    prune(config, current);
+}
+
+/// The committed branch selection, not a reviewer receipt. Capture only
+/// transferable state, at its entire canonical dependency frontier. Both live
+/// continuation and historical hydration resolve this same representation.
+pub(super) fn selection(config: &ProxyCli, current: &Session) -> Point {
     let mut opinions = current.opinions.clone();
     // Preserve historical pins even if adding C makes the former latest user
     // no longer automatically pinned. Current child pins still apply as well.
     for group in current.groups().into_iter().filter(|g| g.pinned) {
         opinions.insert(group.id, "keep".into());
     }
-    let point = Point {
-        id,
+    let mut point = Point {
+        id: String::new(),
         at: now(),
         scope: scope(config, &current.review_context),
         sources: current
@@ -136,19 +143,21 @@ pub(super) fn publish(config: &ProxyCli, current: &mut Session, before: &Session
         groups: groups(current),
         opinions,
         drop_members: current.drop_members.clone(),
+        retired_members: current.retired_members.clone(),
         memories: current.memories.clone(),
         memory_anchors: current.memory_anchors.clone(),
     };
-    current.fork_points.push(point);
-    prune(config, current);
-}
-
-pub(super) fn matches_sources(point: &Point, input: &[Value]) -> bool {
-    input.len() >= point.sources.len()
-        && input
-            .iter()
-            .zip(&point.sources)
-            .all(|(v, s)| digest(v) == s.sha256)
+    // Time is retention metadata, not selection identity. Physical removals,
+    // exposure, cohort membership and accepted facts all participate in identity.
+    point.id = format!(
+        "selection-v1:{}:{}",
+        current.review_epoch,
+        digest(&Point {
+            at: 0,
+            ..point.clone()
+        })
+    );
+    point
 }
 
 pub(super) fn conflict(code: &str) -> Failure {
@@ -198,17 +207,47 @@ pub(super) fn compatible_child(
     if groups(&child) != point.groups {
         return Err(conflict("fork_incompatible"));
     }
+    // A tombstone is not dependency provenance. Old checkpoints may decode,
+    // but cannot transfer selected removals whose closure was not retained.
+    let retired = point
+        .retired_members
+        .values()
+        .flatten()
+        .copied()
+        .collect::<HashSet<_>>();
+    if point
+        .sources
+        .iter()
+        .any(|s| s.removed && !retired.contains(&s.id))
+    {
+        return Err(conflict("fork_incompatible"));
+    }
+    let frontier = child.next_id;
     child
         .ingest(input)
         .map_err(|_| conflict("fork_incompatible"))?;
-    // A suffix must not grow a supposedly complete authorized cohort.
-    if point.drop_members.iter().any(|(id, members)| {
-        !child
-            .groups()
+    // Active advice requires exact current topology. A retired dependency owns
+    // its recorded prefix component even if later separator removal put another
+    // live group next to it; that group must not become retired authority. All
+    // suffix edges remain live, so actual dependency growth rejects reuse.
+    let dependencies = point
+        .drop_members
+        .iter()
+        .map(|(id, members)| (id, members, 0))
+        .chain(
+            point
+                .retired_members
+                .iter()
+                .map(|(id, members)| (id, members, frontier)),
+        );
+    for (id, members, frozen) in dependencies {
+        if !child
+            .groups_restoring(members, frozen)
             .iter()
             .any(|g| g.id == *id && g.members == *members)
-    }) {
-        return Err(conflict("fork_incompatible"));
+        {
+            return Err(conflict("fork_incompatible"));
+        }
     }
     Ok(child)
 }
@@ -250,6 +289,7 @@ pub(super) fn hydrate(
     }
     child.opinions = point.opinions.clone();
     child.drop_members = point.drop_members.clone();
+    child.retired_members = point.retired_members.clone();
     child.memories = point.memories.clone();
     child.memory_anchors = point.memory_anchors.clone();
     child.next_memory_id = child

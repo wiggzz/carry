@@ -107,6 +107,10 @@ pub(super) struct Session {
     /// Legacy opinions without this provenance remain protective, never drops.
     #[serde(default)]
     pub drop_members: BTreeMap<u64, Vec<u64>>,
+    /// Selected removals retain their actual dependency topology independently
+    /// of active reviewer advice. Missing legacy provenance never grants reuse.
+    #[serde(default)]
+    pub retired_members: BTreeMap<u64, Vec<u64>>,
     #[serde(default)]
     pub keep_leases: Option<KeepLeases>,
     pub memories: Vec<Memory>,
@@ -424,6 +428,7 @@ impl Session {
         self.native_checkpoint.clear();
         self.opinions.clear();
         self.drop_members.clear();
+        self.retired_members.clear();
         self.keep_leases = None;
         self.memories.clear();
         self.memory_anchors.clear();
@@ -439,10 +444,19 @@ impl Session {
     }
 
     pub fn groups(&self) -> Vec<Group> {
+        self.groups_restoring(&[], 0)
+    }
+
+    /// Project one retired dependency without reviving unrelated separators or
+    /// cloning payloads, receipts and reviewer state into a temporary Session.
+    /// Its recorded members do not gain adjacency to other selected prefix
+    /// groups when a separator is later removed. Suffix adjacency and all named
+    /// call/result and persisted-cohort edges still extend the dependency.
+    pub fn groups_restoring(&self, members: &[u64], frontier: u64) -> Vec<Group> {
         let live = self
             .history
             .iter()
-            .filter(|i| !i.removed)
+            .filter(|i| !i.removed || members.contains(&i.id))
             .collect::<Vec<_>>();
         let mut parent = (0..live.len()).collect::<Vec<_>>();
         fn root(parent: &[usize], mut index: usize) -> usize {
@@ -459,7 +473,7 @@ impl Session {
         let mut cohorts = BTreeMap::new();
         let mut calls = BTreeMap::<String, Vec<usize>>::new();
         let mut results = BTreeMap::<String, Vec<usize>>::new();
-        let mut native_assistant = None;
+        let mut native_assistant: Option<usize> = None;
         for (index, item) in live.iter().enumerate() {
             let ty = item.value["type"].as_str().unwrap_or("message");
             // Reconstruct known native cohorts as well as using persisted ones:
@@ -467,7 +481,11 @@ impl Session {
             if matches!(ty, "reasoning" | "function_call" | "custom_tool_call")
                 || item.value["role"] == "assistant"
             {
-                if let Some(prior) = native_assistant {
+                if let Some(prior) = native_assistant
+                    && !(live[prior].id <= frontier
+                        && item.id <= frontier
+                        && members.contains(&live[prior].id) != members.contains(&item.id))
+                {
                     join(&mut parent, prior, index);
                 }
                 native_assistant = Some(index);
@@ -1298,6 +1316,9 @@ impl Session {
         // Released facts are candidates, never automatic expiry deletions. This
         // method runs on planner clones; the selected action owns the debit.
         self.retire_memories(&self.released_memory_ids().into_iter().collect());
+        for group in groups.iter().filter(|g| ids.contains(&g.id)) {
+            self.retired_members.insert(group.id, group.members.clone());
+        }
         let members = groups
             .iter()
             .filter(|g| ids.contains(&g.id))

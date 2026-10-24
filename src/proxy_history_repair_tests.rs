@@ -31,12 +31,33 @@ fn history_race_owner(service: &Service, marker: &str) -> String {
 
 #[tokio::test]
 async fn history_two_advanced_lock_selections_never_reset_sibling() {
-    tokio::time::timeout(Duration::from_secs(15), history_two_tip_interleaving())
+    tokio::time::timeout(Duration::from_secs(15), history_two_tip_interleaving(false))
         .await
         .expect("controlled two-lock interleaving must finish");
 }
 
-async fn history_two_tip_interleaving() {
+#[tokio::test]
+async fn history_waiter_prefers_committed_shared_selection_over_shorter_live_tip() {
+    tokio::time::timeout(Duration::from_secs(15), history_two_tip_interleaving(true))
+        .await
+        .expect("committed shared selection interleaving must finish");
+}
+
+#[tokio::test]
+async fn history_two_advanced_selected_locks_without_portable_evidence_preserve_siblings() {
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        history_two_tip_interleaving_with_evidence(true, false),
+    )
+    .await
+    .expect("selected two-lock interleaving must finish");
+}
+
+async fn history_two_tip_interleaving(selected_frontier: bool) {
+    history_two_tip_interleaving_with_evidence(selected_frontier, selected_frontier).await;
+}
+
+async fn history_two_tip_interleaving_with_evidence(selected_frontier: bool, portable: bool) {
     use std::sync::atomic::AtomicUsize;
     let directory = tempfile::tempdir().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -60,6 +81,11 @@ async fn history_two_tip_interleaving() {
     service.config.upstream_url = endpoint;
     service.config.review_every_requests = 100;
     service.config.bootstrap_min_input_bytes = usize::MAX;
+    if !portable {
+        // Two bytes fits only the empty evidence vector. Live selected owners
+        // remain authoritative, but neither lock can be bypassed via a checkpoint.
+        service.config.fork_max_bytes = 2;
+    }
     let service = Arc::new(service);
     let a = json!({"role":"user","content":"race common goal"});
     let b = json!({"role":"assistant","content":"race B"});
@@ -68,16 +94,18 @@ async fn history_two_tip_interleaving() {
     let c = json!({"role":"user","content":"waiting divergent C"});
     history_race_send(service.clone(), json!([a, b])).await;
     let first = history_race_owner(&service, "race common goal");
-    // Explicit selected-state fixture: primary receipts came from ingress;
-    // nonempty removal/memory authority must survive the lock race as well.
-    let mut selected = load(&service, &first).unwrap();
-    selected.history[1].removed = true;
-    selected.memories.push(crate::proxy_state::Memory {
-        id: 99,
-        source_ids: vec![selected.history[1].id],
-        text: "first branch selected fact".into(),
-    });
-    save(&service, &first, &selected).unwrap();
+    // Only retained evidence permits bypassing the shorter second owner.
+    // Both raw and selected/no-evidence arms must revalidate both locks.
+    if selected_frontier {
+        let mut selected = load(&service, &first).unwrap();
+        selected.remove(&[2], &selected.groups());
+        selected.memories.push(crate::proxy_state::Memory {
+            id: 99,
+            source_ids: vec![selected.history[1].id],
+            text: "first branch selected fact".into(),
+        });
+        save(&service, &first, &selected).unwrap();
+    }
     let first_lock = session_lock(&service, &first).await;
     let (sender, mut waits) = tokio::sync::mpsc::unbounded_channel();
     *service.lock_waits.lock().unwrap() = Some(sender);
@@ -95,20 +123,52 @@ async fn history_two_tip_interleaving() {
     assert_eq!(waits.recv().await.unwrap(), second);
     drop(first_lock);
     winner_one.await.unwrap();
-    // Waiter has re-resolved and actually queued behind the second winner.
-    assert_eq!(waits.recv().await.unwrap(), second);
+    let next = waits.recv().await.unwrap();
+    if portable {
+        assert_ne!(next, first);
+        assert_ne!(
+            next, second,
+            "shared selection outranks shorter raw live tip"
+        );
+    } else {
+        // No selected shared version: re-resolve behind the second live owner.
+        assert_eq!(next, second);
+    }
     let first_bytes = std::fs::read(directory.path().join(format!("{first}.json"))).unwrap();
     drop(second_lock);
     winner_two.await.unwrap();
+    let second_bytes = std::fs::read(directory.path().join(format!("{second}.json"))).unwrap();
     waiter.await.unwrap();
+    assert_eq!(
+        std::fs::read(directory.path().join(format!("{second}.json"))).unwrap(),
+        second_bytes
+    );
     *service.lock_waits.lock().unwrap() = None;
+    if portable {
+        let child = load(&service, &next).unwrap();
+        assert_eq!(
+            child
+                .history
+                .iter()
+                .map(|i| i.value.clone())
+                .collect::<Vec<_>>(),
+            vec![a.clone(), b.clone(), c.clone()]
+        );
+        assert!(child.history[1].removed);
+        assert_eq!(child.memories[0].text, "first branch selected fact");
+        assert_eq!(child.primary.calls, 1);
+        assert_eq!(child.shadow.calls, 0);
+        assert_eq!(child.history_rebases, 0);
+    }
     assert_eq!(
         std::fs::read(directory.path().join(format!("{first}.json"))).unwrap(),
         first_bytes
     );
     let saved_first = load(&service, &first).unwrap();
-    assert!(saved_first.history[1].removed);
-    assert_eq!(saved_first.memories[0].text, "first branch selected fact");
+    assert_eq!(saved_first.history[1].removed, selected_frontier);
+    if selected_frontier {
+        assert_eq!(saved_first.memories[0].text, "first branch selected fact");
+    }
     assert_eq!(saved_first.completed_requests, 2);
     assert_eq!(saved_first.primary.calls, 2);
     let saved_second = load(&service, &second).unwrap();
@@ -528,7 +588,7 @@ async fn history_paid_growth(reviewer: bool, growth: usize, bootstrap: bool) {
     service.config.history_max_bytes = budget;
     let service = Arc::new(service);
     let input = json!([{"role":"user","content":"paid growth goal"},
-        {"role":"assistant","content":"already removed source"},
+        {"role":"user","content":"already removed source"},
         {"role":"assistant","content":"still eligible source"},
         {"role":"user","content":"paid growth boundary"}]);
     let response = forward_request(
@@ -552,7 +612,9 @@ async fn history_paid_growth(reviewer: bool, growth: usize, bootstrap: bool) {
     );
     if reviewer {
         let mut selected = load(&service, &owner).unwrap();
-        selected.history[1].removed = true; // Explicit prior removal authority.
+        // Stage an independent selected cohort through the real removal seam,
+        // including durable provenance, not a legacy tombstone without closure.
+        selected.remove(&[2], &selected.groups());
         if bootstrap {
             // Seed an imported prefix on real ingress authority, then execute the
             // actual bootstrap worker/paid settlement (not a synthetic merge).
