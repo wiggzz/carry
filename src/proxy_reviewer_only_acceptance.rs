@@ -115,7 +115,7 @@ fn preserve(before: &Session, after: &Session) {
 #[test]
 fn reviewer_only148_tier_crossing_prices_each_rendering_and_output() {
     let config = config();
-    let (session, main) = replay(&config, 800, 55_000);
+    let (session, main) = replay(&config, 800, 100_000);
     let keep = review_body(&config, &session);
     let mut clean = session.clone();
     clean.compact_reviewer();
