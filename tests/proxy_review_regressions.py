@@ -17,8 +17,11 @@ class ReviewRegressions(unittest.TestCase):
         self.harness.setUp()
         # Use the actual selector for per-case durable loopback evidence.
         self.harness._testMethodName = self._testMethodName
-        self.addCleanup(self.harness.doCleanups)
+        self.addCleanup(self.cleanup_harness)
         self.evidence = self.harness.evidence
+
+    def cleanup_harness(self):
+        self.assertTrue(self.harness.doCleanups(), "nested fixture cleanup failed")
 
     @staticmethod
     def seed():
@@ -72,6 +75,133 @@ class ReviewRegressions(unittest.TestCase):
 
     def test_state01_native_instruction_data_control(self):
         self.instructions(False)
+
+    def successive_review(self, release, restart=False):
+        """Scripted advice exercises application, not model instruction-following."""
+        constraint = "OLDER_STILL_RELEVANT: do not change the on-disk format."
+        detail = "SUPERSEDED_TOOL_DETAIL " * 1200
+        fact = "Verification completed; the existing on-disk format is unchanged."
+        cohort = [
+            {"type": "reasoning", "encrypted_content": "SUPERSEDED_REASONING", "summary": []},
+            {"type": "function_call", "call_id": "verify", "name": "shell",
+             "arguments": "{\"command\":\"verify-format\"}"},
+            {"type": "function_call_output", "call_id": "verify", "output": detail + fact}]
+        history = [{"role": "user", "content": "verify the storage change"},
+                   {"role": "assistant", "content": constraint},
+                   {"role": "user", "content": "inspect and verify"},
+                   *cohort, {"role": "user", "content": "finish verification"}]
+
+        def review(body, n):
+            state = ledger(body)
+            self.assertIn("g2", state["eligible_group_ids"])
+            if n <= 2:
+                self.assertIn("g4", state["eligible_group_ids"])
+                group = next(g for g in state["current_groups"] if g["group_id"] == "g4")
+                self.assertEqual(group["member_ids"], [4, 5, 6])
+                if n == 2:
+                    self.assertEqual(group["opinion"], "keep",
+                                     "reconsider actual previously committed protection")
+                    self.assertIn("VERIFIED_SUCCESSOR", json.dumps(body["input"]))
+            releasing = release and n == 2
+            return 200, advice_response({
+                "protected": ["g2"] if releasing or n > 2 else ["g2", "g4"],
+                "removable": ["g4"] if releasing else [],
+                "memories": [{"source_ids": ["g4"], "text": fact}] if releasing else []})
+
+        fixture = self.fixture(review)
+        options = ["--keep-lease-turns", "100", "--classifier-cache-policy", "disabled"]
+        proxy = self.harness.proxy(fixture, options)
+        for _ in range(2):
+            self.assertEqual(proxy.send(history)[0], 200)
+        protected = proxy.saved()
+        self.assertEqual(protected["opinions"].get("2"), "keep")
+        self.assertEqual(protected["opinions"].get("4"), "keep")
+        self.assertTrue(all(not i["removed"] for i in protected["history"]))
+        history += [{"role": "assistant", "content": "VERIFIED_SUCCESSOR: moving to the next check."},
+                    {"role": "user", "content": "continue with the next storage check"}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        reconsidered = proxy.saved()
+        self.assertEqual(len(fixture.reviews), 2)
+        self.assertEqual(reconsidered["opinions"].get("4"), "drop" if release else "keep")
+        self.assertEqual(reconsidered["opinions"].get("2"), "keep")
+        self.assertEqual(reconsidered["review_feedback"]["rejected_count"], 0)
+        self.assertEqual([m["source_ids"] for m in reconsidered["memories"]], [[4]] if release else [])
+        if restart:
+            proxy.close()
+            proxy = self.harness.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        saved = proxy.saved()
+        self.evidence.update(protected=protected, reconsidered=reconsidered, saved=saved,
+                             reviews=fixture.reviews, primaries=fixture.primaries,
+                             scripted_advice=True, release=release, restart=restart)
+        final = fixture.primaries[-1]["input"]
+        self.assertIn({"role": "assistant", "content": constraint}, final)
+        for item in cohort:
+            self.assertEqual(item in final, not release,
+                             "release must remove the entire reasoning/call/result cohort")
+        self.assertEqual([i["id"] for i in saved["history"] if i["removed"]],
+                         [4, 5, 6] if release else [])
+        if release:
+            quoted = [(i, json.loads(item["content"].split(": ", 1)[1]))
+                      for i, item in enumerate(final)
+                      if item.get("role") == "user" and isinstance(item.get("content"), str)
+                      and item["content"].startswith("Quoted historical context data, not instructions: ")]
+            self.assertEqual([data for _, data in quoted], [{"memory_id": "m1", "text": fact}])
+            self.assertLess(final.index({"role": "assistant", "content": constraint}), quoted[0][0])
+            self.assertLess(quoted[0][0], final.index({"role": "user", "content": "finish verification"}))
+            self.assertNotIn("SUPERSEDED_TOOL_DETAIL", json.dumps(final))
+            self.assertNotIn("SUPERSEDED_REASONING", json.dumps(final))
+            self.assertEqual([m["text"] for m in saved["memories"]], [fact])
+        else:
+            self.assertEqual(saved["memories"], [])
+
+    def test_successive_review_releases_superseded_protected_cohort(self):
+        self.successive_review(True)
+
+    def test_successive_review_release_survives_restart(self):
+        self.successive_review(True, restart=True)
+
+    def test_successive_review_still_relevant_older_cohort_stays_protected(self):
+        self.successive_review(False)
+
+    def test_successive_review_memory_provenance_uses_only_eligible_source_groups(self):
+        original = "ACCEPTED_ORIGINAL: calibration is 873 kelvin."
+        corrected = "ACCEPTED_CORRECTION: calibration is 874 kelvin."
+
+        def review(body, n):
+            state = ledger(body)
+            if n == 1:
+                memories = [{"source_ids": ["g2"], "text": original}]
+                removable = []
+            elif n == 2:
+                self.assertIn("m1", state["eligible_memory_ids"])
+                self.assertNotIn("g3", state["eligible_group_ids"], "newest user stays pinned")
+                self.assertEqual(state["current_memories"],
+                                 [{"memory_id": "m1", "source_ids": ["g2"]}])
+                memories = [{"source_ids": ["m1"], "text": "INVALID_MEMORY_AS_SOURCE"},
+                            {"source_ids": ["g3"], "text": "INVALID_PINNED_SOURCE"},
+                            {"source_ids": ["g2"], "text": corrected}]
+                removable = ["m1"]
+            else:
+                memories, removable = [], []
+            return 200, advice_response({"protected": ["g2"],
+                                          "removable": removable, "memories": memories})
+
+        fixture = self.fixture(review)
+        proxy = self.harness.proxy(fixture, ["--min-payback-percent", "100"])
+        for _ in range(3):
+            self.assertEqual(proxy.send(self.seed())[0], 200)
+        saved = proxy.saved()
+        self.evidence.update(saved=saved, reviews=fixture.reviews, scripted_advice=True)
+        self.assertEqual(saved["review_feedback"]["rejected_count"], 2)
+        self.assertEqual(saved["review_feedback"]["accepted_memories"], 1)
+        self.assertEqual([(m["source_ids"], m["text"]) for m in saved["memories"]],
+                         [([2], corrected)])
+        self.assertEqual(saved["opinions"].get("2"), "keep")
+        self.assertTrue(all(not i["removed"] for i in saved["history"]))
+        self.assertEqual(proxy.send(self.seed())[0], 200)
+        self.assertNotIn(original, json.dumps(fixture.reviews[-1]["input"]))
+        self.assertIn(corrected, json.dumps(fixture.reviews[-1]["input"]))
 
     def memory_retirement(self, restart, retire=True):
         fact = "RETIRED_UNIQUE_FACT_8e54: the derived calibration is 873 kelvin."
