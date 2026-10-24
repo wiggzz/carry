@@ -222,34 +222,29 @@ pub(super) fn compatible_child(
     {
         return Err(conflict("fork_incompatible"));
     }
-    // Project retired dependencies at this selected cut before ingesting the
-    // suffix. Later cleanup may have removed a separator next to an older
-    // retired group; that legitimate selected topology must not be mistaken for
-    // suffix growth. Active advice still requires its exact reviewed members.
-    let mut dependencies = point
-        .drop_members
-        .iter()
-        .map(|(id, members)| (*id, members, members.clone()))
-        .collect::<Vec<_>>();
-    for members in point.retired_members.values() {
-        let selected = child
-            .groups_restoring(members)
-            .into_iter()
-            .find(|g| members.iter().all(|id| g.members.contains(id)))
-            .ok_or_else(|| conflict("fork_incompatible"))?;
-        dependencies.push((selected.id, members, selected.members));
-    }
+    let frontier = child.next_id;
     child
         .ingest(input)
         .map_err(|_| conflict("fork_incompatible"))?;
-    // Restore only each dependency's members, never all tombstones. The same
-    // projection must have the same closure after suffix ingestion; extending
-    // a retired call/result cohort therefore cannot inherit its removal/facts.
-    for (id, members, expected) in dependencies {
+    // Active advice requires exact current topology. A retired dependency owns
+    // its recorded prefix component even if later separator removal put another
+    // live group next to it; that group must not become retired authority. All
+    // suffix edges remain live, so actual dependency growth rejects reuse.
+    let dependencies = point
+        .drop_members
+        .iter()
+        .map(|(id, members)| (id, members, 0))
+        .chain(
+            point
+                .retired_members
+                .iter()
+                .map(|(id, members)| (id, members, frontier)),
+        );
+    for (id, members, frozen) in dependencies {
         if !child
-            .groups_restoring(members)
+            .groups_restoring(members, frozen)
             .iter()
-            .any(|g| g.id == id && g.members == expected)
+            .any(|g| g.id == *id && g.members == *members)
         {
             return Err(conflict("fork_incompatible"));
         }

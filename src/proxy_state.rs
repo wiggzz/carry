@@ -444,12 +444,15 @@ impl Session {
     }
 
     pub fn groups(&self) -> Vec<Group> {
-        self.groups_restoring(&[])
+        self.groups_restoring(&[], 0)
     }
 
     /// Project one retired dependency without reviving unrelated separators or
     /// cloning payloads, receipts and reviewer state into a temporary Session.
-    pub fn groups_restoring(&self, members: &[u64]) -> Vec<Group> {
+    /// Its recorded members do not gain adjacency to other selected prefix
+    /// groups when a separator is later removed. Suffix adjacency and all named
+    /// call/result and persisted-cohort edges still extend the dependency.
+    pub fn groups_restoring(&self, members: &[u64], frontier: u64) -> Vec<Group> {
         let live = self
             .history
             .iter()
@@ -470,7 +473,7 @@ impl Session {
         let mut cohorts = BTreeMap::new();
         let mut calls = BTreeMap::<String, Vec<usize>>::new();
         let mut results = BTreeMap::<String, Vec<usize>>::new();
-        let mut native_assistant = None;
+        let mut native_assistant: Option<usize> = None;
         for (index, item) in live.iter().enumerate() {
             let ty = item.value["type"].as_str().unwrap_or("message");
             // Reconstruct known native cohorts as well as using persisted ones:
@@ -478,7 +481,11 @@ impl Session {
             if matches!(ty, "reasoning" | "function_call" | "custom_tool_call")
                 || item.value["role"] == "assistant"
             {
-                if let Some(prior) = native_assistant {
+                if let Some(prior) = native_assistant
+                    && !(live[prior].id <= frontier
+                        && item.id <= frontier
+                        && members.contains(&live[prior].id) != members.contains(&item.id))
+                {
                     join(&mut parent, prior, index);
                 }
                 native_assistant = Some(index);
