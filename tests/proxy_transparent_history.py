@@ -1174,6 +1174,84 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(settled["primary"]["calls"], restored["primary"]["calls"] + 1)
         self.assertEqual(settled["shadow"]["calls"], shadow)
 
+    def removed_cohort_branch(self, *, extended=False, background=True):
+        history = [{"role": "user", "content": "GOAL"},
+            {"role": "assistant", "content": "RAW_A " + "payload " * 1000},
+            {"type": "function_call", "call_id": "a1", "name": "one", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "a1", "output": "OLD_RESULT"},
+            {"role": "user", "content": "BOUNDARY"}]
+
+        def review(body, n):
+            ids = ledger(body)["eligible_group_ids"]
+            return 200, advice_response({"protected": [i for i in ids if i == "g1"],
+                "removable": [i for i in ids if i != "g1"],
+                "memories": [{"source_ids": ["g2"], "text": "COHORT_FACT"}] if n == 1 else []})
+
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"removed_{n}")), review)
+        options = ["--review-replayed-history", "--payoff-requests", "1",
+                   "--classifier-cache-policy", "disabled"]
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        cut = history + [{"role": "user", "content": "AFTER_REMOVAL"}]
+        self.assertEqual(proxy.send(cut)[0], 200)
+        owner, removed = proxy.checkpoint(cut)
+        self.assertEqual([i["id"] for i in removed["history"] if i["removed"]], [2, 3, 4])
+        self.assertEqual(removed["drop_members"], {}, "active drop advice has been consumed")
+        self.assertEqual([m["text"] for m in removed["memories"]], ["COHORT_FACT"])
+        self.assertNotIn("OLD_RESULT", json.dumps(fixture.primaries[-1]["input"]))
+        if background:
+            self.assertEqual(proxy.send(cut + [{"role": "user", "content": "AUX"}])[0], 200)
+        sibling_bytes = owner.read_bytes()
+        proxy.close()
+        proxy = self.proxy(fixture, ["--review-every-requests", "100", "--payoff-requests", "1",
+                                     "--classifier-cache-policy", "disabled"])
+        suffix = ([{"type": "function_call_output", "call_id": "a1", "output": "NEW_RESULT"}]
+                  if extended else [
+                      {"type": "function_call", "call_id": "b1", "name": "two", "arguments": "{}"},
+                      {"type": "function_call_output", "call_id": "b1", "output": "VALID_RESULT"}])
+        grown = cut + suffix + [{"role": "user", "content": "GROWN"}]
+        reviews = len(fixture.reviews)
+        self.assertEqual(proxy.send(grown)[0], 200)
+        child_owner, child = proxy.checkpoint(grown)
+        sent = fixture.primaries[-1]["input"]
+        self.evidence.update(extended=extended, background=background, removed=removed,
+                             child=child, primary=fixture.primaries[-1],
+                             reviewer_requests=fixture.reviews)
+        self.assertEqual(len(fixture.reviews), reviews, "no recovery review")
+        for item in [cut[0], cut[-1], *suffix, grown[-1]]:
+            self.assertIn(item, sent)
+        self.assertNotIn("AUX", json.dumps(sent))
+        if extended:
+            for item in [*history[2:4], history[1]]:
+                self.assertIn(item, sent,
+                              "extended retired cohort must retain original call and result")
+            self.assertNotIn("COHORT_FACT", json.dumps(sent))
+            self.assertEqual(child["memories"], [])
+            self.assertFalse(any(i["removed"] for i in child["history"]))
+        else:
+            for item in history[1:4]:
+                self.assertNotIn(item, sent, "valid continuation preserves selected removal")
+            self.assertIn("COHORT_FACT", json.dumps(sent))
+            self.assertEqual([m["text"] for m in child["memories"]], ["COHORT_FACT"])
+        if background or extended:
+            self.assertNotEqual(child_owner, owner)
+            self.assertEqual(child["primary"]["calls"], 1, "new owner is cold")
+            self.assertEqual(child["shadow"]["calls"], 0, "no inherited reviewer receipts")
+            self.assertEqual(owner.read_bytes(), sibling_bytes)
+        else:
+            self.assertEqual(child_owner, owner, "valid ordinary continuation keeps live owner")
+            self.assertEqual(child["primary"]["calls"], removed["primary"]["calls"] + 1)
+            self.assertEqual(child["shadow"], removed["shadow"])
+
+    def test_extended_removed_tool_cohort_rejects_selection_after_restart(self):
+        self.removed_cohort_branch(extended=True)
+
+    def test_removed_tool_cohort_valid_sibling_after_restart(self):
+        self.removed_cohort_branch()
+
+    def test_removed_tool_cohort_valid_live_continuation_after_restart(self):
+        self.removed_cohort_branch(background=False)
+
     def test_extended_tool_cohort_cannot_inherit_partial_review_authority(self):
         history = [{"role": "user", "content": "PROTECTED_GOAL"},
             {"role": "assistant", "content": "RAW_A " + "payload " * 6000},
