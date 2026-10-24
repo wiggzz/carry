@@ -43,7 +43,21 @@ async fn history_waiter_prefers_committed_shared_selection_over_shorter_live_tip
         .expect("committed shared selection interleaving must finish");
 }
 
+#[tokio::test]
+async fn history_two_advanced_selected_locks_without_portable_evidence_preserve_siblings() {
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        history_two_tip_interleaving_with_evidence(true, false),
+    )
+    .await
+    .expect("selected two-lock interleaving must finish");
+}
+
 async fn history_two_tip_interleaving(selected_frontier: bool) {
+    history_two_tip_interleaving_with_evidence(selected_frontier, selected_frontier).await;
+}
+
+async fn history_two_tip_interleaving_with_evidence(selected_frontier: bool, portable: bool) {
     use std::sync::atomic::AtomicUsize;
     let directory = tempfile::tempdir().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -67,6 +81,11 @@ async fn history_two_tip_interleaving(selected_frontier: bool) {
     service.config.upstream_url = endpoint;
     service.config.review_every_requests = 100;
     service.config.bootstrap_min_input_bytes = usize::MAX;
+    if !portable {
+        // Two bytes fits only the empty evidence vector. Live selected owners
+        // remain authoritative, but neither lock can be bypassed via a checkpoint.
+        service.config.fork_max_bytes = 2;
+    }
     let service = Arc::new(service);
     let a = json!({"role":"user","content":"race common goal"});
     let b = json!({"role":"assistant","content":"race B"});
@@ -75,8 +94,8 @@ async fn history_two_tip_interleaving(selected_frontier: bool) {
     let c = json!({"role":"user","content":"waiting divergent C"});
     history_race_send(service.clone(), json!([a, b])).await;
     let first = history_race_owner(&service, "race common goal");
-    // Selected versions must win over shorter live tips. The raw-history arm
-    // has no portable selection, so it still exercises both advancing locks.
+    // Only retained evidence permits bypassing the shorter second owner.
+    // Both raw and selected/no-evidence arms must revalidate both locks.
     if selected_frontier {
         let mut selected = load(&service, &first).unwrap();
         selected.history[1].removed = true;
@@ -105,7 +124,7 @@ async fn history_two_tip_interleaving(selected_frontier: bool) {
     drop(first_lock);
     winner_one.await.unwrap();
     let next = waits.recv().await.unwrap();
-    if selected_frontier {
+    if portable {
         assert_ne!(next, first);
         assert_ne!(
             next, second,
@@ -120,7 +139,7 @@ async fn history_two_tip_interleaving(selected_frontier: bool) {
     winner_two.await.unwrap();
     waiter.await.unwrap();
     *service.lock_waits.lock().unwrap() = None;
-    if selected_frontier {
+    if portable {
         let child = load(&service, &next).unwrap();
         assert_eq!(
             child

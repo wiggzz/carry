@@ -174,6 +174,72 @@ class TransparentHistory(unittest.TestCase):
         else:
             self.assertEqual(child_owner, owner)
 
+    def test_post_compaction_merged_cohort_keeps_live_selection(self):
+        def review(body, n):
+            ids = ledger(body)["eligible_group_ids"]
+            return 200, advice_response({
+                "protected": [i for i in ids if i != ("g3" if n == 1 else "g2")],
+                "removable": [i for i in ids if i == ("g3" if n == 1 else "g2")],
+                "memories": []})
+
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"merged_{n}")), review)
+        proxy = self.proxy(fixture, ["--review-replayed-history", "--payoff-requests", "1",
+                                     "--classifier-cache-policy", "disabled"])
+        history = [{"role": "user", "content": "GOAL"},
+                   {"role": "assistant", "content": "LEFT " * 20},
+                   {"role": "user", "content": "SEPARATOR " * 1000},
+                   {"role": "assistant", "content": "RIGHT " * 20},
+                   {"role": "user", "content": "BOUNDARY"}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        history += [{"role": "user", "content": "ADVANCE"}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(proxy.send(history)[0], 200)
+        owner, before = proxy.checkpoint(history)
+        self.assertEqual(before["drop_members"]["2"], [2, 4], "real merged review authorization")
+        self.assertEqual([i["id"] for i in before["history"] if i["removed"]], [3])
+        self.assertEqual(before["primary"]["calls"], 3)
+        self.assertEqual(proxy.send(history)[0], 200)
+        after_owner, after = proxy.checkpoint(history)
+        self.evidence.update(before=before, after=after, primary=fixture.primaries[-1])
+        self.assertEqual(after_owner, owner, "valid post-compaction topology must retain its owner")
+        self.assertEqual(after["primary"]["calls"], 4)
+        self.assertNotIn("SEPARATOR", json.dumps(fixture.primaries[-1]["input"]))
+
+    def test_empty_selection_retires_historical_memory_authority(self):
+        def review(_body, n):
+            return 200, advice_response({"protected": [], "removable": ["m1"] if n == 2 else [],
+                "memories": [{"source_ids": ["g2"], "text": "RETIRED_FACT"}] if n == 1 else []})
+
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"retire_{n}")), review)
+        options = ["--review-replayed-history", "--payoff-requests", "1",
+                   "--classifier-cache-policy", "disabled"]
+        proxy = self.proxy(fixture, options)
+        history = [{"role": "user", "content": "GOAL"},
+                   {"role": "assistant", "content": "SOURCE"},
+                   {"role": "user", "content": "BOUNDARY"}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(proxy.checkpoint(history)[1]["memories"][0]["text"], "RETIRED_FACT")
+        self.assertEqual(proxy.send(history)[0], 200)
+        owner, retired = proxy.checkpoint(history)
+        self.assertEqual(retired["memories"], [])
+        self.assertEqual(retired["opinions"], {})
+        self.assertFalse(any(i["removed"] for i in retired["history"]))
+        auxiliary = history + [{"role": "user", "content": "AUX"}]
+        self.assertEqual(proxy.send(auxiliary)[0], 200)
+        sibling_bytes = owner.read_bytes()
+        proxy.close()
+        proxy = self.proxy(fixture, options)
+        foreground = history + [{"role": "user", "content": "FOREGROUND"}]
+        self.assertEqual(proxy.send(foreground)[0], 200)
+        child_owner, child = proxy.checkpoint(foreground)
+        self.evidence.update(retired=retired, child=child, primary=fixture.primaries[-1])
+        self.assertEqual(child["memories"], [], "empty committed selection must supersede retired facts")
+        self.assertNotIn("RETIRED_FACT", json.dumps(fixture.primaries[-1]["input"]))
+        self.assertNotEqual(child_owner, owner)
+        self.assertEqual(child["primary"]["calls"], 1)
+        self.assertEqual(child["shadow"]["calls"], 0)
+        self.assertEqual(owner.read_bytes(), sibling_bytes)
+
     def test_shared_selection_legacy_tip_reconstruction_after_restart(self):
         self.branch_selection(background=False, restart=True, legacy_tip=True)
 
