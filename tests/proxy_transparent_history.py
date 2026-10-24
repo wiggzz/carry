@@ -1305,6 +1305,49 @@ class TransparentHistory(unittest.TestCase):
         self.assertNotIn("LEFT", json.dumps(sent))
         self.assertIn(history[3], sent)
 
+    def test_later_separator_removal_preserves_unrelated_live_tool_growth(self):
+        def review(body, n):
+            ids = ledger(body)["eligible_group_ids"]
+            removable = "g2" if n == 1 else "g3"
+            return 200, advice_response({"protected": [i for i in ids if i != removable],
+                "removable": [i for i in ids if i == removable], "memories": []})
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"live_growth_{n}")), review)
+        proxy = self.proxy(fixture, ["--review-replayed-history", "--payoff-requests", "1",
+                                     "--classifier-cache-policy", "disabled"])
+        history = [{"role": "user", "content": "GOAL"},
+                   {"role": "assistant", "content": "LEFT " * 1000},
+                   {"role": "user", "content": "SEPARATOR " * 1000},
+                   {"type": "function_call", "call_id": "live", "name": "live", "arguments": "{}"},
+                   {"role": "user", "content": "BOUNDARY"}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        history += [{"role": "user", "content": "ADVANCE"}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        history += [{"role": "assistant", "content": "EXTRA " * 1000},
+                    {"role": "user", "content": "NEXT"}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(proxy.send(history)[0], 200)
+        owner, before = proxy.checkpoint(history)
+        self.assertEqual([i["id"] for i in before["history"] if i["removed"]], [2, 3])
+        proxy.close()
+        proxy = self.proxy(fixture, ["--review-every-requests", "100",
+                                     "--classifier-cache-policy", "disabled"])
+        result = {"type": "function_call_output", "call_id": "live", "output": "LIVE_RESULT"}
+        history += [result, {"role": "user", "content": "GROWN"}]
+        reviews = len(fixture.reviews)
+        self.assertEqual(proxy.send(history)[0], 200)
+        after_owner, after = proxy.checkpoint(history)
+        self.evidence.update(before=before, after=after, primary=fixture.primaries[-1])
+        self.assertEqual(after_owner, owner,
+                         "unrelated retired assistant must not capture the live tool dependency")
+        self.assertEqual(after["primary"]["calls"], before["primary"]["calls"] + 1)
+        self.assertEqual(len(fixture.reviews), reviews)
+        self.assertEqual(after["shadow"], before["shadow"])
+        sent = fixture.primaries[-1]["input"]
+        self.assertNotIn("SEPARATOR", json.dumps(sent))
+        self.assertNotIn("LEFT", json.dumps(sent))
+        self.assertIn(history[3], sent)
+        self.assertIn(result, sent)
+
     def test_extended_tool_cohort_cannot_inherit_partial_review_authority(self):
         history = [{"role": "user", "content": "PROTECTED_GOAL"},
             {"role": "assistant", "content": "RAW_A " + "payload " * 6000},
