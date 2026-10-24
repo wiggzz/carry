@@ -25,6 +25,8 @@ pub(crate) struct Point {
     groups: Value,
     opinions: BTreeMap<u64, String>,
     drop_members: BTreeMap<u64, Vec<u64>>,
+    #[serde(default)]
+    retired_members: BTreeMap<u64, Vec<u64>>,
     memories: Vec<Memory>,
     memory_anchors: BTreeMap<u64, u64>,
 }
@@ -141,6 +143,7 @@ pub(super) fn selection(config: &ProxyCli, current: &Session) -> Point {
         groups: groups(current),
         opinions,
         drop_members: current.drop_members.clone(),
+        retired_members: current.retired_members.clone(),
         memories: current.memories.clone(),
         memory_anchors: current.memory_anchors.clone(),
     };
@@ -204,25 +207,49 @@ pub(super) fn compatible_child(
     if groups(&child) != point.groups {
         return Err(conflict("fork_incompatible"));
     }
+    // A tombstone is not dependency provenance. Old checkpoints may decode,
+    // but cannot transfer selected removals whose closure was not retained.
+    let retired = point
+        .retired_members
+        .values()
+        .flatten()
+        .copied()
+        .collect::<HashSet<_>>();
+    if point
+        .sources
+        .iter()
+        .any(|s| s.removed && !retired.contains(&s.id))
+    {
+        return Err(conflict("fork_incompatible"));
+    }
+    // Project retired dependencies at this selected cut before ingesting the
+    // suffix. Later cleanup may have removed a separator next to an older
+    // retired group; that legitimate selected topology must not be mistaken for
+    // suffix growth. Active advice still requires its exact reviewed members.
+    let mut dependencies = point
+        .drop_members
+        .iter()
+        .map(|(id, members)| (*id, members, members.clone()))
+        .collect::<Vec<_>>();
+    for members in point.retired_members.values() {
+        let selected = child
+            .groups_restoring(members)
+            .into_iter()
+            .find(|g| members.iter().all(|id| g.members.contains(id)))
+            .ok_or_else(|| conflict("fork_incompatible"))?;
+        dependencies.push((selected.id, members, selected.members));
+    }
     child
         .ingest(input)
         .map_err(|_| conflict("fork_incompatible"))?;
-    // Validate each authorization in the selected topology. Restore only that
-    // cohort's members if already removed: reviving unrelated tombstones (such
-    // as a removed user separator) would undo legitimate post-compaction merges.
-    // Ingested suffix members remain live, so extending an authorized tool
-    // cohort still changes its dependency closure and rejects the selection.
-    for (id, members) in &point.drop_members {
-        let mut topology = child.clone();
-        for item in &mut topology.history {
-            if members.contains(&item.id) {
-                item.removed = false;
-            }
-        }
-        if !topology
-            .groups()
+    // Restore only each dependency's members, never all tombstones. The same
+    // projection must have the same closure after suffix ingestion; extending
+    // a retired call/result cohort therefore cannot inherit its removal/facts.
+    for (id, members, expected) in dependencies {
+        if !child
+            .groups_restoring(members)
             .iter()
-            .any(|g| g.id == *id && g.members == *members)
+            .any(|g| g.id == id && g.members == expected)
         {
             return Err(conflict("fork_incompatible"));
         }
@@ -267,6 +294,7 @@ pub(super) fn hydrate(
     }
     child.opinions = point.opinions.clone();
     child.drop_members = point.drop_members.clone();
+    child.retired_members = point.retired_members.clone();
     child.memories = point.memories.clone();
     child.memory_anchors = point.memory_anchors.clone();
     child.next_memory_id = child

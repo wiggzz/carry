@@ -1174,7 +1174,7 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(settled["primary"]["calls"], restored["primary"]["calls"] + 1)
         self.assertEqual(settled["shadow"]["calls"], shadow)
 
-    def removed_cohort_branch(self, *, extended=False, background=True):
+    def removed_cohort_branch(self, *, extended=False, background=True, legacy=False):
         history = [{"role": "user", "content": "GOAL"},
             {"role": "assistant", "content": "RAW_A " + "payload " * 1000},
             {"type": "function_call", "call_id": "a1", "name": "one", "arguments": "{}"},
@@ -1203,6 +1203,23 @@ class TransparentHistory(unittest.TestCase):
             self.assertEqual(proxy.send(cut + [{"role": "user", "content": "AUX"}])[0], 200)
         sibling_bytes = owner.read_bytes()
         proxy.close()
+        if legacy:
+            # Owned synthetic legacy store: retain only post-removal versions,
+            # then remove the new provenance field, not tombstones or facts.
+            path = self.state / "history.index"
+            index = json.loads(path.read_text())
+            index["reviews"] = {key: points for key, points in index["reviews"].items()
+                                if all(len(p["sources"]) >= len(cut) for p in points)}
+            def strip_provenance(value):
+                if isinstance(value, dict):
+                    value.pop("retired_members", None)
+                    for child in value.values():
+                        strip_provenance(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        strip_provenance(child)
+            strip_provenance(index)
+            path.write_text(json.dumps(index))
         proxy = self.proxy(fixture, ["--review-every-requests", "100", "--payoff-requests", "1",
                                      "--classifier-cache-policy", "disabled"])
         suffix = ([{"type": "function_call_output", "call_id": "a1", "output": "NEW_RESULT"}]
@@ -1214,14 +1231,14 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(grown)[0], 200)
         child_owner, child = proxy.checkpoint(grown)
         sent = fixture.primaries[-1]["input"]
-        self.evidence.update(extended=extended, background=background, removed=removed,
+        self.evidence.update(extended=extended, background=background, legacy=legacy, removed=removed,
                              child=child, primary=fixture.primaries[-1],
                              reviewer_requests=fixture.reviews)
         self.assertEqual(len(fixture.reviews), reviews, "no recovery review")
         for item in [cut[0], cut[-1], *suffix, grown[-1]]:
             self.assertIn(item, sent)
         self.assertNotIn("AUX", json.dumps(sent))
-        if extended:
+        if extended or legacy:
             for item in [*history[2:4], history[1]]:
                 self.assertIn(item, sent,
                               "extended retired cohort must retain original call and result")
@@ -1251,6 +1268,42 @@ class TransparentHistory(unittest.TestCase):
 
     def test_removed_tool_cohort_valid_live_continuation_after_restart(self):
         self.removed_cohort_branch(background=False)
+
+    def test_legacy_removed_tool_cohort_without_provenance_starts_cold(self):
+        self.removed_cohort_branch(legacy=True)
+
+    def test_sequential_removal_keeps_selected_post_compaction_topology(self):
+        def review(body, n):
+            ids = ledger(body)["eligible_group_ids"]
+            removable = "g2" if n == 1 else "g3"
+            return 200, advice_response({"protected": [i for i in ids if i != removable],
+                "removable": [i for i in ids if i == removable], "memories": []})
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"sequential_{n}")), review)
+        proxy = self.proxy(fixture, ["--review-replayed-history", "--payoff-requests", "1",
+                                     "--classifier-cache-policy", "disabled"])
+        history = [{"role": "user", "content": "GOAL"},
+                   {"role": "assistant", "content": "LEFT " * 1000},
+                   {"role": "user", "content": "SEPARATOR " * 1000},
+                   {"role": "assistant", "content": "RIGHT " * 20},
+                   {"role": "user", "content": "BOUNDARY"}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        history += [{"role": "user", "content": "ADVANCE"}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        history += [{"role": "assistant", "content": "EXTRA " * 1000},
+                    {"role": "user", "content": "NEXT"}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(proxy.send(history)[0], 200)
+        owner, before = proxy.checkpoint(history)
+        self.assertEqual([i["id"] for i in before["history"] if i["removed"]], [2, 3])
+        self.assertEqual(proxy.send(history)[0], 200)
+        after_owner, after = proxy.checkpoint(history)
+        self.evidence.update(before=before, after=after, primary=fixture.primaries[-1])
+        self.assertEqual(after_owner, owner, "later separator retirement must not invalidate earlier removal")
+        self.assertEqual(after["primary"]["calls"], before["primary"]["calls"] + 1)
+        sent = fixture.primaries[-1]["input"]
+        self.assertNotIn("SEPARATOR", json.dumps(sent))
+        self.assertNotIn("LEFT", json.dumps(sent))
+        self.assertIn(history[3], sent)
 
     def test_extended_tool_cohort_cannot_inherit_partial_review_authority(self):
         history = [{"role": "user", "content": "PROTECTED_GOAL"},
