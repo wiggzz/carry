@@ -31,12 +31,19 @@ fn history_race_owner(service: &Service, marker: &str) -> String {
 
 #[tokio::test]
 async fn history_two_advanced_lock_selections_never_reset_sibling() {
-    tokio::time::timeout(Duration::from_secs(15), history_two_tip_interleaving())
+    tokio::time::timeout(Duration::from_secs(15), history_two_tip_interleaving(false))
         .await
         .expect("controlled two-lock interleaving must finish");
 }
 
-async fn history_two_tip_interleaving() {
+#[tokio::test]
+async fn history_waiter_prefers_committed_shared_selection_over_shorter_live_tip() {
+    tokio::time::timeout(Duration::from_secs(15), history_two_tip_interleaving(true))
+        .await
+        .expect("committed shared selection interleaving must finish");
+}
+
+async fn history_two_tip_interleaving(selected_frontier: bool) {
     use std::sync::atomic::AtomicUsize;
     let directory = tempfile::tempdir().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -68,16 +75,18 @@ async fn history_two_tip_interleaving() {
     let c = json!({"role":"user","content":"waiting divergent C"});
     history_race_send(service.clone(), json!([a, b])).await;
     let first = history_race_owner(&service, "race common goal");
-    // Explicit selected-state fixture: primary receipts came from ingress;
-    // nonempty removal/memory authority must survive the lock race as well.
-    let mut selected = load(&service, &first).unwrap();
-    selected.history[1].removed = true;
-    selected.memories.push(crate::proxy_state::Memory {
-        id: 99,
-        source_ids: vec![selected.history[1].id],
-        text: "first branch selected fact".into(),
-    });
-    save(&service, &first, &selected).unwrap();
+    // Selected versions must win over shorter live tips. The raw-history arm
+    // has no portable selection, so it still exercises both advancing locks.
+    if selected_frontier {
+        let mut selected = load(&service, &first).unwrap();
+        selected.history[1].removed = true;
+        selected.memories.push(crate::proxy_state::Memory {
+            id: 99,
+            source_ids: vec![selected.history[1].id],
+            text: "first branch selected fact".into(),
+        });
+        save(&service, &first, &selected).unwrap();
+    }
     let first_lock = session_lock(&service, &first).await;
     let (sender, mut waits) = tokio::sync::mpsc::unbounded_channel();
     *service.lock_waits.lock().unwrap() = Some(sender);
@@ -95,20 +104,47 @@ async fn history_two_tip_interleaving() {
     assert_eq!(waits.recv().await.unwrap(), second);
     drop(first_lock);
     winner_one.await.unwrap();
-    // Waiter has re-resolved and actually queued behind the second winner.
-    assert_eq!(waits.recv().await.unwrap(), second);
+    let next = waits.recv().await.unwrap();
+    if selected_frontier {
+        assert_ne!(next, first);
+        assert_ne!(
+            next, second,
+            "shared selection outranks shorter raw live tip"
+        );
+    } else {
+        // No selected shared version: re-resolve behind the second live owner.
+        assert_eq!(next, second);
+    }
     let first_bytes = std::fs::read(directory.path().join(format!("{first}.json"))).unwrap();
     drop(second_lock);
     winner_two.await.unwrap();
     waiter.await.unwrap();
     *service.lock_waits.lock().unwrap() = None;
+    if selected_frontier {
+        let child = load(&service, &next).unwrap();
+        assert_eq!(
+            child
+                .history
+                .iter()
+                .map(|i| i.value.clone())
+                .collect::<Vec<_>>(),
+            vec![a.clone(), b.clone(), c.clone()]
+        );
+        assert!(child.history[1].removed);
+        assert_eq!(child.memories[0].text, "first branch selected fact");
+        assert_eq!(child.primary.calls, 1);
+        assert_eq!(child.shadow.calls, 0);
+        assert_eq!(child.history_rebases, 0);
+    }
     assert_eq!(
         std::fs::read(directory.path().join(format!("{first}.json"))).unwrap(),
         first_bytes
     );
     let saved_first = load(&service, &first).unwrap();
-    assert!(saved_first.history[1].removed);
-    assert_eq!(saved_first.memories[0].text, "first branch selected fact");
+    assert_eq!(saved_first.history[1].removed, selected_frontier);
+    if selected_frontier {
+        assert_eq!(saved_first.memories[0].text, "first branch selected fact");
+    }
     assert_eq!(saved_first.completed_requests, 2);
     assert_eq!(saved_first.primary.calls, 2);
     let saved_second = load(&service, &second).unwrap();
