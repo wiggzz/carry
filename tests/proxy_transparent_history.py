@@ -71,6 +71,83 @@ class TransparentHistory(unittest.TestCase):
         self.stack.callback(proxy.close)
         return proxy
 
+    def branch_selection(self, background=True, partial=True, restart=False):
+        def primary(body, n):
+            value = completed(response_id=f"selection_{n}")
+            value["usage"]["input_tokens"] = max(100, len(wire(body["input"])) // 4)
+            return 200, value
+
+        def review(body, n):
+            ids = ledger(body)["eligible_group_ids"]
+            removable = [i for i in ids if i != "g1"]
+            if n > 1 and partial:
+                removable.append("g999999")
+            return 200, advice_response({
+                "protected": [i for i in ids if i == "g1"], "removable": removable,
+                "memories": [{"source_ids": ["g2"], "text": "SHARED_FACT"}] if n == 1 else []})
+
+        fixture = self.fixture(primary, review)
+        options = ["--review-replayed-history", "--payoff-requests", "1",
+                   "--classifier-cache-policy", "disabled"]
+        proxy = self.proxy(fixture, options)
+        history = [{"role": "user", "content": "GOAL"},
+                   {"role": "assistant", "content": "RAW_A " + "alpha " * 500},
+                   {"role": "user", "content": "A_BOUNDARY"}]
+        def send(items):
+            status, result = proxy.send(items)
+            self.assertEqual(status, 200, result)
+            return proxy.checkpoint(items)
+        send(history)
+        history += [{"role": "assistant", "content": "RAW_B " + "beta " * 1500},
+                    {"role": "user", "content": "MAIN_CONTINUE"}]
+        send(history)
+        history += [{"role": "assistant", "content": "OK"},
+                    {"role": "user", "content": "MAIN_FINISH"}]
+        send(history)
+        history += [{"role": "assistant", "content": "DONE"},
+                    {"role": "user", "content": "READY"}]
+        owner, shared = send(history)
+        self.assertNotIn("RAW_B", json.dumps(fixture.primaries[-1]["input"]),
+                         "fixture must actually compact the later payload before branching")
+        if partial:
+            self.assertGreater(shared["partial_reviews"], 0)
+            self.assertTrue(all(len(p["sources"]) < len(history)
+                                for p in shared["fork_points"]), "portable review is stale")
+        if background:
+            auxiliary = history + [{"role": "user", "content": "BACKGROUND_ONLY"}]
+            auxiliary_owner, _ = send(auxiliary)
+            self.assertEqual(auxiliary_owner, owner)
+        if restart:
+            proxy.close()
+            proxy = self.proxy(fixture, options)
+        foreground = history + [{"role": "user", "content": "NEXT_HUMAN"}]
+        child_owner, child = send(foreground)
+        sent = json.dumps(fixture.primaries[-1]["input"])
+        self.evidence.update(background=background, partial=partial, restart=restart,
+                             foreground=fixture.primaries[-1], parent=shared, child=child)
+        self.assertNotIn("RAW_B", sent,
+                         "shared-frontier selection must survive auxiliary tip advancement")
+        self.assertNotIn("BACKGROUND_ONLY", sent)
+        self.assertIn("SHARED_FACT", sent)
+        if background:
+            self.assertNotEqual(child_owner, owner)
+            self.assertEqual(child["primary"]["calls"], 1, "historical child is cold")
+            self.assertEqual(child["shadow"]["calls"], 0, "no paid recovery or inherited receipts")
+        else:
+            self.assertEqual(child_owner, owner)
+
+    def test_shared_selection_survives_partial_review_background_sibling(self):
+        self.branch_selection()
+
+    def test_shared_selection_survives_partial_review_background_restart(self):
+        self.branch_selection(restart=True)
+
+    def test_shared_selection_no_background_control(self):
+        self.branch_selection(background=False)
+
+    def test_shared_selection_fresh_review_control(self):
+        self.branch_selection(partial=False)
+
     def test_no_header_fork_reuses_committed_ancestor_after_cleanup_and_restart(self):
         history = [{"role": "user", "content": "ANCESTOR_GOAL"},
                    {"role": "assistant", "content": "RAW_A " + "payload " * 6000},
