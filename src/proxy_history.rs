@@ -116,6 +116,10 @@ struct Reference {
     session: String,
     namespace: String,
     at: u64,
+    /// Same selection contract as historical versions. The mutable owner is
+    /// routing/accounting only; it cannot supply a different cleanup policy.
+    #[serde(default)]
+    selection: Option<forking::Point>,
 }
 #[derive(Serialize, Deserialize)]
 struct Transcript {
@@ -156,7 +160,27 @@ pub(super) fn validate_capacity(config: &ProxyCli) -> std::io::Result<()> {
 fn read(service: &Service) -> std::io::Result<Index> {
     match std::fs::read(service.config.state_dir.join("history.index")) {
         Ok(bytes) if bytes.len() <= service.config.history_max_bytes as usize => {
-            Ok(serde_json::from_slice(&bytes)?)
+            let mut index: Index = serde_json::from_slice(&bytes)?;
+            // Decode old live owners into the same selection representation.
+            // Old reviewed versions remain valid only at their recorded cuts;
+            // never reconstruct newer historical cleanup from a current sibling.
+            let legacy = index
+                .tips
+                .iter()
+                .filter_map(|(key, r)| {
+                    r.selection
+                        .is_none()
+                        .then(|| (key.clone(), r.session.clone()))
+                })
+                .collect::<Vec<_>>();
+            for (key, id) in legacy {
+                if let Some(snapshot) = index.snapshots.get(&id) {
+                    let session = canonical(&index, snapshot.clone())?;
+                    index.tips.get_mut(&key).unwrap().selection =
+                        Some(forking::selection(&service.config, &session));
+                }
+            }
+            Ok(index)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Index::default()),
         _ => Err(std::io::Error::other("history index unavailable")),
@@ -419,29 +443,31 @@ pub(super) fn resolve(
         .as_array()
         .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "array input required"))?;
     let keys = path(namespace, input);
-    // Empty observations are published at the namespace root. They still have
-    // a real selected owner: do not mistake a retained empty tip for a miss.
-    if keys.is_empty()
-        && let Some(reference) = index.tips.get(namespace)
-    {
-        return Ok((
-            reference.session.clone(),
-            None,
-            pin(service, &reference.session)?,
-        ));
-    }
-    for key in keys.iter().rev() {
-        if let Some(r) = index.tips.get(key) {
-            return Ok((r.session.clone(), None, pin(service, &r.session)?));
-        }
-        if let Some(points) = index.reviews.get(key) {
-            for point in points.iter().rev() {
-                if forking::compatible_child(&service.config, point, body).is_ok() {
-                    let id = hash(&(namespace, "reviewed-child", &point.id, keys.last()));
-                    let (id, pin) = reserve(service, id, &occupied)?;
-                    return Ok((id, Some(point.clone()), pin));
-                }
+    // Resolve one complete selection version at the deepest compatible cut.
+    // Whether that version still has a mutable owner affects routing only.
+    let root = namespace.to_owned();
+    for key in keys.iter().rev().chain(keys.is_empty().then_some(&root)) {
+        let live = index
+            .tips
+            .get(key)
+            .and_then(|r| r.selection.as_ref().map(|p| (p, Some(r.session.as_str()))));
+        let historical = index
+            .reviews
+            .get(key)
+            .into_iter()
+            .flatten()
+            .rev()
+            .map(|p| (p, None));
+        for (point, owner) in live.into_iter().chain(historical) {
+            if forking::compatible_child(&service.config, point, body).is_err() {
+                continue;
             }
+            if let Some(id) = owner {
+                return Ok((id.into(), None, pin(service, id)?));
+            }
+            let id = hash(&(namespace, "reviewed-child", &point.id, keys.last()));
+            let (id, pin) = reserve(service, id, &occupied)?;
+            return Ok((id, Some(point.clone()), pin));
         }
     }
     let (id, pin) = reserve(service, hash(&(namespace, keys.last())), &occupied)?;
@@ -471,10 +497,14 @@ pub(super) fn restore(service: &Service, id: &str) -> std::io::Result<Session> {
     let _guard = IO.lock().unwrap();
     let mut index = read(service)?;
     prune(service, &mut index);
-    let mut session = index
+    let session = index
         .snapshots
         .remove(id)
         .ok_or_else(|| std::io::Error::other("selected history unavailable"))?;
+    canonical(&index, session)
+}
+
+fn canonical(index: &Index, mut session: Session) -> std::io::Result<Session> {
     let mut key = session.history_frontier.as_deref();
     for item in session.history.iter_mut().rev() {
         let node = key
@@ -548,6 +578,7 @@ pub(super) fn committed(
             }
         }
     }
+    let selection = forking::selection(&service.config, session);
     index.tips.retain(|_, r| r.session != id);
     let key = observed_keys.last().unwrap_or(namespace);
     index.tips.insert(
@@ -556,18 +587,19 @@ pub(super) fn committed(
             session: id.into(),
             namespace: namespace.clone(),
             at: now(),
+            selection: Some(selection.clone()),
         },
     );
-    for point in &session.fork_points {
-        if !forking::matches_sources(point, &input) {
-            continue;
-        }
-        if let Some(key) = keys.get(point.sources.len().saturating_sub(1)) {
-            let points = index.reviews.entry(key.clone()).or_default();
-            if !points.iter().any(|p| p.id == point.id) {
-                points.push(point.clone());
-            }
-        }
+    // Version committed selection at its full dependency frontier, regardless
+    // of whether a reviewer just published a portable receipt. Replacing the
+    // version at the same cut preserves later accepted cleanup, not sibling
+    // suffix decisions. Raw/unselected history needs no portability evidence.
+    if !session.opinions.is_empty()
+        || !session.memories.is_empty()
+        || session.history.iter().any(|i| i.removed)
+    {
+        let key = keys.last().unwrap_or(namespace);
+        index.reviews.insert(key.clone(), vec![selection]);
     }
     if session.history_shared {
         index.snapshots.insert(id.into(), compact(session));

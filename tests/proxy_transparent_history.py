@@ -71,13 +71,20 @@ class TransparentHistory(unittest.TestCase):
         self.stack.callback(proxy.close)
         return proxy
 
-    def branch_selection(self, background=True, partial=True, restart=False):
+    def branch_selection(self, background=True, partial=True, restart=False, held_review=False,
+                         auxiliary_requests=1, legacy_tip=False):
+        import threading
+        held, release = threading.Event(), threading.Event()
+        self.stack.callback(release.set)
         def primary(body, n):
             value = completed(response_id=f"selection_{n}")
             value["usage"]["input_tokens"] = max(100, len(wire(body["input"])) // 4)
             return 200, value
 
         def review(body, n):
+            if held_review and n == 2:
+                held.set()
+                self.assertTrue(release.wait(10), "held valid review must be released")
             ids = ledger(body)["eligible_group_ids"]
             removable = [i for i in ids if i != "g1"]
             if n > 1 and partial:
@@ -98,12 +105,35 @@ class TransparentHistory(unittest.TestCase):
             self.assertEqual(status, 200, result)
             return proxy.checkpoint(items)
         send(history)
+        if held_review:
+            proxy.close()
+            proxy = self.proxy(fixture, [*options, "--background-reviews=true"])
         history += [{"role": "assistant", "content": "RAW_B " + "beta " * 1500},
                     {"role": "user", "content": "MAIN_CONTINUE"}]
         send(history)
+        if held_review:
+            if not held.wait(.1):
+                history += [{"role": "user", "content": "B_REVIEW_BOUNDARY"}]
+                send(history)
+            self.assertTrue(held.wait(3), "second review must actually be held")
         history += [{"role": "assistant", "content": "OK"},
                     {"role": "user", "content": "MAIN_FINISH"}]
         send(history)
+        if held_review:
+            release.set()
+            deadline = time.monotonic() + 5
+            while proxy.checkpoint(history)[1].get("background_review_pending"):
+                self.assertLess(time.monotonic(), deadline, "held review settlement")
+                time.sleep(.01)
+            settled = proxy.checkpoint(history)[1]
+            self.assertEqual(settled["review_feedback"]["rejected_count"], 0)
+            self.assertEqual(settled["partial_reviews"], 0)
+            self.assertTrue(all(len(p["sources"]) < len(history) for p in settled["fork_points"]),
+                            "valid held review must not publish a grown frontier")
+            proxy.close()
+            options = ["--review-every-requests", "100", "--payoff-requests", "1",
+                       "--classifier-cache-policy", "disabled"]
+            proxy = self.proxy(fixture, options)
         history += [{"role": "assistant", "content": "DONE"},
                     {"role": "user", "content": "READY"}]
         owner, shared = send(history)
@@ -114,11 +144,19 @@ class TransparentHistory(unittest.TestCase):
             self.assertTrue(all(len(p["sources"]) < len(history)
                                 for p in shared["fork_points"]), "portable review is stale")
         if background:
-            auxiliary = history + [{"role": "user", "content": "BACKGROUND_ONLY"}]
-            auxiliary_owner, _ = send(auxiliary)
-            self.assertEqual(auxiliary_owner, owner)
+            auxiliary = list(history)
+            for n in range(auxiliary_requests):
+                auxiliary += [{"role": "user", "content": f"BACKGROUND_ONLY_{n}"}]
+                auxiliary_owner, _ = send(auxiliary)
+                self.assertEqual(auxiliary_owner, owner)
         if restart:
             proxy.close()
+            if legacy_tip:
+                path = self.state / "history.index"
+                index = json.loads(path.read_text())
+                for reference in index["tips"].values():
+                    reference.pop("selection", None)
+                path.write_text(json.dumps(index))
             proxy = self.proxy(fixture, options)
         foreground = history + [{"role": "user", "content": "NEXT_HUMAN"}]
         child_owner, child = send(foreground)
@@ -135,6 +173,15 @@ class TransparentHistory(unittest.TestCase):
             self.assertEqual(child["shadow"]["calls"], 0, "no paid recovery or inherited receipts")
         else:
             self.assertEqual(child_owner, owner)
+
+    def test_shared_selection_legacy_tip_reconstruction_after_restart(self):
+        self.branch_selection(background=False, restart=True, legacy_tip=True)
+
+    def test_shared_selection_multiple_auxiliary_requests_and_restart(self):
+        self.branch_selection(auxiliary_requests=3, restart=True)
+
+    def test_shared_selection_survives_held_valid_review_live_growth(self):
+        self.branch_selection(partial=False, held_review=True)
 
     def test_shared_selection_survives_partial_review_background_sibling(self):
         self.branch_selection()
