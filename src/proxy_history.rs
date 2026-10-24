@@ -167,11 +167,8 @@ fn read(service: &Service) -> std::io::Result<Index> {
             let legacy = index
                 .tips
                 .iter()
-                .filter_map(|(key, r)| {
-                    r.selection
-                        .is_none()
-                        .then(|| (key.clone(), r.session.clone()))
-                })
+                .filter(|(_, r)| r.selection.is_none())
+                .map(|(key, r)| (key.clone(), r.session.clone()))
                 .collect::<Vec<_>>();
             for (key, id) in legacy {
                 if let Some(snapshot) = index.snapshots.get(&id) {
