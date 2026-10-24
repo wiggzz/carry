@@ -4447,6 +4447,10 @@ mod control_tests;
 mod pr144_regressions;
 
 #[cfg(test)]
+#[path = "proxy_reviewer_only_acceptance.rs"]
+mod reviewer_only_acceptance;
+
+#[cfg(test)]
 #[path = "proxy_catalog_tests.rs"]
 mod catalog_regressions;
 
