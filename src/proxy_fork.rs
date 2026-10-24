@@ -207,20 +207,25 @@ pub(super) fn compatible_child(
     child
         .ingest(input)
         .map_err(|_| conflict("fork_incompatible"))?;
-    // Validate dependency closure against canonical cohorts, including sources
-    // already removed in this version. Selection tombstones must not make an
-    // authorized cohort disappear from the compatibility check.
-    let mut topology = child.clone();
-    for item in &mut topology.history {
-        item.removed = false;
-    }
-    let cohorts = topology.groups();
-    if point
-        .drop_members
-        .iter()
-        .any(|(id, members)| !cohorts.iter().any(|g| g.id == *id && g.members == *members))
-    {
-        return Err(conflict("fork_incompatible"));
+    // Validate each authorization in the selected topology. Restore only that
+    // cohort's members if already removed: reviving unrelated tombstones (such
+    // as a removed user separator) would undo legitimate post-compaction merges.
+    // Ingested suffix members remain live, so extending an authorized tool
+    // cohort still changes its dependency closure and rejects the selection.
+    for (id, members) in &point.drop_members {
+        let mut topology = child.clone();
+        for item in &mut topology.history {
+            if members.contains(&item.id) {
+                item.removed = false;
+            }
+        }
+        if !topology
+            .groups()
+            .iter()
+            .any(|g| g.id == *id && g.members == *members)
+        {
+            return Err(conflict("fork_incompatible"));
+        }
     }
     Ok(child)
 }
