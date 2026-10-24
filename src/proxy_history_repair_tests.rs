@@ -98,7 +98,7 @@ async fn history_two_tip_interleaving_with_evidence(selected_frontier: bool, por
     // Both raw and selected/no-evidence arms must revalidate both locks.
     if selected_frontier {
         let mut selected = load(&service, &first).unwrap();
-        selected.history[1].removed = true;
+        selected.remove(&[2], &selected.groups());
         selected.memories.push(crate::proxy_state::Memory {
             id: 99,
             source_ids: vec![selected.history[1].id],
@@ -588,7 +588,7 @@ async fn history_paid_growth(reviewer: bool, growth: usize, bootstrap: bool) {
     service.config.history_max_bytes = budget;
     let service = Arc::new(service);
     let input = json!([{"role":"user","content":"paid growth goal"},
-        {"role":"assistant","content":"already removed source"},
+        {"role":"user","content":"already removed source"},
         {"role":"assistant","content":"still eligible source"},
         {"role":"user","content":"paid growth boundary"}]);
     let response = forward_request(
@@ -612,7 +612,9 @@ async fn history_paid_growth(reviewer: bool, growth: usize, bootstrap: bool) {
     );
     if reviewer {
         let mut selected = load(&service, &owner).unwrap();
-        selected.history[1].removed = true; // Explicit prior removal authority.
+        // Stage an independent selected cohort through the real removal seam,
+        // including durable provenance, not a legacy tombstone without closure.
+        selected.remove(&[2], &selected.groups());
         if bootstrap {
             // Seed an imported prefix on real ingress authority, then execute the
             // actual bootstrap worker/paid settlement (not a synthetic merge).
