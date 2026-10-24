@@ -103,23 +103,28 @@ pub(super) fn publish(config: &ProxyCli, current: &mut Session, before: &Session
     {
         return;
     }
-    let values = current.history.iter().map(|i| &i.value).collect::<Vec<_>>();
-    let id = format!(
-        "{}:{}",
-        current.review_epoch,
-        digest(&(values, &current.opinions, &current.memories))
-    );
-    if current.fork_points.iter().any(|p| p.id == id) || current.fork_expired.contains(&id) {
-        return; // immutable: a later review cannot replace the historical cut
+    let point = selection(config, current);
+    if current.fork_points.iter().any(|p| p.id == point.id)
+        || current.fork_expired.contains(&point.id)
+    {
+        return;
     }
+    current.fork_points.push(point);
+    prune(config, current);
+}
+
+/// The committed branch selection, not a reviewer receipt. Capture only
+/// transferable state, at its entire canonical dependency frontier. Both live
+/// continuation and historical hydration resolve this same representation.
+pub(super) fn selection(config: &ProxyCli, current: &Session) -> Point {
     let mut opinions = current.opinions.clone();
     // Preserve historical pins even if adding C makes the former latest user
     // no longer automatically pinned. Current child pins still apply as well.
     for group in current.groups().into_iter().filter(|g| g.pinned) {
         opinions.insert(group.id, "keep".into());
     }
-    let point = Point {
-        id,
+    let mut point = Point {
+        id: String::new(),
         at: now(),
         scope: scope(config, &current.review_context),
         sources: current
@@ -139,16 +144,17 @@ pub(super) fn publish(config: &ProxyCli, current: &mut Session, before: &Session
         memories: current.memories.clone(),
         memory_anchors: current.memory_anchors.clone(),
     };
-    current.fork_points.push(point);
-    prune(config, current);
-}
-
-pub(super) fn matches_sources(point: &Point, input: &[Value]) -> bool {
-    input.len() >= point.sources.len()
-        && input
-            .iter()
-            .zip(&point.sources)
-            .all(|(v, s)| digest(v) == s.sha256)
+    // Time is retention metadata, not selection identity. Physical removals,
+    // exposure, cohort membership and accepted facts all participate in identity.
+    point.id = format!(
+        "selection-v1:{}:{}",
+        current.review_epoch,
+        digest(&Point {
+            at: 0,
+            ..point.clone()
+        })
+    );
+    point
 }
 
 pub(super) fn conflict(code: &str) -> Failure {
@@ -201,13 +207,19 @@ pub(super) fn compatible_child(
     child
         .ingest(input)
         .map_err(|_| conflict("fork_incompatible"))?;
-    // A suffix must not grow a supposedly complete authorized cohort.
-    if point.drop_members.iter().any(|(id, members)| {
-        !child
-            .groups()
-            .iter()
-            .any(|g| g.id == *id && g.members == *members)
-    }) {
+    // Validate dependency closure against canonical cohorts, including sources
+    // already removed in this version. Selection tombstones must not make an
+    // authorized cohort disappear from the compatibility check.
+    let mut topology = child.clone();
+    for item in &mut topology.history {
+        item.removed = false;
+    }
+    let cohorts = topology.groups();
+    if point
+        .drop_members
+        .iter()
+        .any(|(id, members)| !cohorts.iter().any(|g| g.id == *id && g.members == *members))
+    {
         return Err(conflict("fork_incompatible"));
     }
     Ok(child)
