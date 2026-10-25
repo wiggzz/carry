@@ -65,6 +65,10 @@ impl Record {
 
     pub fn apply(&self, session: &mut Session) {
         session.completed_review_len = self.len;
+        session.bootstrap_review_pending &= session
+            .history
+            .iter()
+            .any(|item| item.exposed && item.id as usize > self.len);
         let groups = session.groups();
         // Original member unions may span several canonical groups after a
         // projected separator omission. Require the entire native closure now;

@@ -63,7 +63,8 @@ impl CacheEvidence {
         let Some(input) = body["input"].as_array() else {
             return false;
         };
-        self.at <= at
+        resolved.is_some_and(|model| model.cache.is_some())
+            && self.at <= at
             && at - self.at < self.ttl_seconds
             && self.route.as_ref() == resolved.map(|r| &r.route)
             && self.credential_sha256 == credential

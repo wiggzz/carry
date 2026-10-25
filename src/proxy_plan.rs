@@ -148,7 +148,7 @@ pub(super) fn plan(
             }
         }
     }
-    let report = json!({"selected":best.is_some(),"forced":forced,"primary_fits":!forced,
+    let mut report = json!({"selected":best.is_some(),"forced":forced,"primary_fits":!forced,
         "primary_cached_estimated_tokens":crate::proxy_cache::reusable(&session.upstream_cache,&wire,config.model_resolution.as_ref().map(|p|&p.primary),&config.primary_cache_auth,now()),
         "reviewer_fits":review_fits(config,&review),"primary_estimated_tokens":estimate(&wire),
         "primary_required_tokens":primary_required_tokens(config,&retained),"primary_receipt_prediction_tokens":prediction,
@@ -159,6 +159,17 @@ pub(super) fn plan(
         "cache_basis":"actual_compatible_wire_terminal_receipts_30_minute_ttl",
         "estimate_basis":"frozen_primary_horizon_and_actual_current_review_schedule",
         "candidates":reports});
+    if primary_rates(
+        config,
+        wire["model"].as_str().unwrap_or(""),
+        estimate(&wire),
+    )
+    .is_none()
+    {
+        report["reason"] = json!("unsupported_model_or_tier");
+    }
+    report["reviewer_context_tokens"] = json!(config.classifier_max_input_tokens);
+    report["model_resolution"] = json!(config.model_resolution);
     (best.map(|(projection, _, _)| projection), report)
 }
 

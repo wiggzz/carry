@@ -83,7 +83,7 @@ class Fixture:
                         raise AssertionError("fixture only accepts tiny request bodies")
                     raw = self.rfile.read(length)
                     body = json.loads(raw)
-                    review = body.get("prompt_cache_key") != "transport-main"
+                    review = body.get("text", {}).get("format", {}).get("name") == "carry_review"
                     with fixture.lock:
                         fixture.requests.append((review, body))
                         fixture.wire_requests.append((review, raw))
@@ -272,7 +272,7 @@ class Proxy:
         # synchronize here without restoring production reviewer blocking.
         deadline = time.monotonic() + 120
         while any(json.loads(p.read_bytes()).get("background_review_pending")
-                  for p in (Path(self.temp.name) / "state").glob("*.json")):
+                  for p in (Path(self.temp.name) / "state").glob("*.checkpoint")):
             if time.monotonic() >= deadline:
                 raise AssertionError("post-response transport review did not settle")
             time.sleep(0.01)

@@ -396,7 +396,11 @@ pub(super) fn resolve(
     let keys = path(namespace, input);
     // Routing has no semantic authority. Reuse only a compatible live owner;
     // every request independently looks up completed advice below.
-    for key in keys.iter().rev() {
+    for key in keys
+        .iter()
+        .rev()
+        .chain(std::iter::once(&namespace.to_owned()))
+    {
         if let Some(reference) = index.tips.get(key) {
             if let Some(snapshot) = index.snapshots.get(&reference.session) {
                 if snapshot.history.len() <= input.len() {
@@ -526,7 +530,7 @@ pub(super) fn committed(
     if session.history_shared {
         index.snapshots.insert(id.into(), compact(session));
     }
-    persist(service, index, prior, Some(id))
+    persist(service, index, prior, session.history_shared.then_some(id))
 }
 
 pub(super) fn advice(

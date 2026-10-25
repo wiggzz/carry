@@ -1640,6 +1640,7 @@ async fn forward_request(
         // This is the only semantic lookup. Owner checkpoints have no selection
         // authority, even after a previous request omitted this exact H.
         session.opinions.clear();
+        session.completed_review_len = 0;
         session.drop_members.clear();
         session.memories.clear();
         session.memory_anchors.clear();

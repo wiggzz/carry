@@ -759,7 +759,7 @@ async fn codex_login_authenticates_primary_and_streamed_reviewer_with_shared_cre
             assert!(body.get("max_output_tokens").is_none());
             assert!(body.get("prompt_cache_options").is_none());
             assert!(!body.to_string().contains("prompt_cache_breakpoint"));
-            let reviewer = body["prompt_cache_key"] != "fixture-main";
+            let reviewer = body["text"]["format"]["name"] == "carry_review";
             let text = if reviewer {
                 assert_eq!(body["text"]["format"]["type"], "json_schema");
                 assert_eq!(body["text"]["format"]["strict"], true);
@@ -1330,7 +1330,10 @@ async fn classifier_cache_affinity_is_bounded_stable_and_identity_isolated() {
                 "classifier cache key exceeds provider's 64-character bound: {}",
                 key.len()
             );
-            assert_ne!(key, id, "review/main cache domains must remain separate");
+            assert_eq!(
+                key, id,
+                "purpose does not partition actual upstream cache affinity"
+            );
             assert!(
                 !review["input"].to_string().contains(session),
                 "raw session owner is not model prompt data"
@@ -1601,24 +1604,14 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         })
         .collect::<Vec<_>>();
     assert_eq!(states.len(), 1);
-    let active = states[0]["active_shadow"].to_string();
-    assert!(!active.contains("DISCARD_SOURCE_PAYLOAD_"));
-    assert!(!active.contains("opaque-reasoning"));
+    // Completed facts live in the semantic map, not a hidden active replay.
+    let record = advice_for_checkpoint(temp.path(), &states[0]);
     assert!(
-        states[0]["active_shadow"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|record| {
-                let data: serde_json::Value =
-                    serde_json::from_str(record["value"]["content"].as_str().unwrap()).unwrap();
-                data["group_id"] != "g2"
-            }),
-        "removed observation/opinion must not survive as actionable group data"
+        record["memories"]
+            .to_string()
+            .contains("schema decision unresolved")
     );
-    assert!(active.contains("preserve requirement"));
-    assert!(active.contains("both tools succeeded"));
-    assert!(active.contains("schema decision unresolved"));
+    assert!(states[0].get("active_shadow").is_none());
     let cost_stats: serde_json::Value = reqwest::get(format!("{url}/carry/dashboard/stats"))
         .await
         .unwrap()
@@ -1629,7 +1622,10 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     assert!(estimate.get("priced").is_none());
     assert!(estimate["carry_cost"].is_number());
     assert_eq!(estimate["coverage"]["primary_responses"], 3);
-    assert_eq!(estimate["coverage"]["reviewer_responses"], 1);
+    assert_eq!(
+        estimate["coverage"]["reviewer_responses"],
+        fixture.reviews.lock().await.len()
+    );
     assert!(estimate["reviewer_cost"].as_f64().unwrap() > 0.0);
     assert_eq!(estimate["traditional_compactions"], 0);
     let carry = estimate["carry_cost"].as_f64().unwrap();
@@ -2472,23 +2468,16 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
             "merge must preserve the newer continuation"
         );
         if scenario == "rebase" {
-            assert_eq!(saved["opinions"], json!({}));
-            assert_eq!(saved["memories"], json!([]));
-            assert!(
-                saved["review_feedback"]["rejected"][0]["reason"]
-                    .as_str()
-                    .unwrap()
-                    .contains("discarded")
-            );
+            assert!(advice_for_checkpoint(state.path(), &saved).is_null());
         } else if scenario == "reviewer_failure" {
-            assert_eq!(saved["opinions"], json!({}));
-            assert_eq!(saved["memories"], json!([]));
+            assert!(advice_for_checkpoint(state.path(), &saved).is_null());
             assert_eq!(saved["shadow"]["unavailable_cost_calls"], 1);
             assert_eq!(saved["invalid_reviews"], 1);
             assert_eq!(saved["background_review_pending"], false);
         } else {
-            assert_eq!(saved["opinions"]["2"], "drop");
-            assert_eq!(saved["memories"][0]["text"], "background fact");
+            let advice = advice_for_checkpoint(state.path(), &saved);
+            assert_eq!(advice["opinions"]["2"], "drop");
+            assert_eq!(advice["memories"][0]["text"], "background fact");
         }
         assert_eq!(
             saved["cost_trajectory"]["result"]["coverage"]["reviewer_responses"],
@@ -2535,8 +2524,9 @@ async fn mixed_advice_applies_valid_items_and_failed_primary_keeps_feedback() {
     assert_eq!(saved["invalid_reviews"], 0);
     assert_eq!(saved["partial_reviews"], 1);
     assert_eq!(saved["shadow"]["calls"], 1);
-    assert_eq!(saved["memories"][0]["text"], "valid sourced fact");
-    assert_eq!(saved["opinions"]["2"], "keep");
+    let advice = advice_for_checkpoint(state.path(), &saved);
+    assert_eq!(advice["memories"][0]["text"], "valid sourced fact");
+    assert_eq!(advice["opinions"]["2"], "keep");
     assert_eq!(saved["review_feedback"]["rejected_count"], 1);
     assert_eq!(
         saved["review_feedback"]["rejected"][0]["field"],
@@ -3044,8 +3034,7 @@ async fn implicit_history_reuses_removals_and_keeps_divergent_history_separate()
         .find(|s| s["history"].as_array().unwrap().len() == 1)
         .unwrap();
     assert_eq!(fresh["history_rebases"], 0);
-    assert!(fresh["memories"].as_array().unwrap().is_empty());
-    assert!(fresh["opinions"].as_object().unwrap().is_empty());
+    assert!(advice_for_checkpoint(state.path(), fresh).is_null());
 }
 
 #[tokio::test]
@@ -3584,4 +3573,22 @@ async fn api_key_model_discovery_remains_an_authenticated_upstream_relay() {
         json!({"object":"list", "data":[{"id":"fixture-api", "custom":true}]})
     );
     server.abort();
+}
+
+fn advice_for_checkpoint(path: &std::path::Path, state: &serde_json::Value) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("history.index")).unwrap()).unwrap();
+    let mut key = state["history_namespace"].as_str().unwrap().to_owned();
+    let mut found = serde_json::Value::Null;
+    for item in state["history"].as_array().unwrap() {
+        key = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&json!([key, item["value"]])).unwrap())
+        );
+        if let Some(record) = index["reviews"].get(key.as_str()) {
+            found = record.clone();
+        }
+    }
+    found
 }

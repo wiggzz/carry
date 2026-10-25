@@ -218,3 +218,62 @@ async fn exact_prefix_empty_completion_supersedes_old_fact_and_stale_generation(
             .is_none()
     );
 }
+
+#[test]
+fn explicit_review_cache_boundary_excludes_current_ledger_and_preserves_native_source() {
+    let config = reviewer_config();
+    let mut session = semantic_subject();
+    let body = review_body(&config, &session);
+    let input = body["input"].as_array().unwrap();
+    for source in session.render_primary() {
+        assert!(
+            input.contains(&source),
+            "cache controls cannot alter native source values"
+        );
+    }
+    let boundaries: Vec<usize> = input
+        .iter()
+        .enumerate()
+        .filter_map(|(n, item)| {
+            item["content"]
+                .as_array()
+                .is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|block| block.get("prompt_cache_breakpoint").is_some())
+                })
+                .then_some(n + 1)
+        })
+        .collect();
+    assert_eq!(
+        boundaries,
+        vec![input.len() - 1],
+        "write stable observations, never the current ledger"
+    );
+    session.review_feedback = json!({"accepted":1});
+    let changed = review_body(&config, &session);
+    assert_ne!(body["input"], changed["input"]);
+    let model = resolve_model(
+        &config.classifier_model,
+        Route::new("https://api.openai.com/v1/responses", false),
+        None,
+        None,
+        2048,
+        0,
+    )
+    .unwrap()
+    .with_scenario_cache_policy();
+    let mut cache = Vec::new();
+    crate::proxy_cache::observe(
+        &mut cache,
+        &body,
+        &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":9000}}),
+        Some(&model),
+        "same-auth",
+        100,
+    );
+    assert!(
+        crate::proxy_cache::reusable(&cache, &changed, Some(&model), "same-auth", 101) > 0.0,
+        "actual stable-prefix receipt remains usable after ledger-only changes"
+    );
+}

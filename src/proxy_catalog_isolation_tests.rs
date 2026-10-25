@@ -12,6 +12,7 @@ async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
     service.config.classifier_cache_policy = ClassifierCachePolicy::Disabled;
     service.config.review_min_primary_tokens = 1000000;
     service.config.review_every_requests = 100;
+    service.config.bootstrap_min_input_bytes = 8388608;
     service.config.payoff_requests = 1;
     let service = Arc::new(service);
     let mut body = json!({"model":"gpt-6-sol","input":[
@@ -23,7 +24,7 @@ async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
     headers.insert("x-carry-session", "catalog-cache".parse().unwrap());
     let response = forward_request(
         service.clone(),
-        headers,
+        headers.clone(),
         Bytes::from(serde_json::to_vec(&body).unwrap()),
         false,
         "cache-receipt".into(),
@@ -43,6 +44,38 @@ async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
     assert_eq!(session.primary.calls, 1);
     assert_eq!(session.primary.cached_tokens, 9000);
     session.upstream_cache = history::cache(&service).unwrap();
+    assert!(
+        session.upstream_cache.is_empty(),
+        "unknown route capability is not cache evidence"
+    );
+    let capability = resolve_model(
+        "gpt-6-sol",
+        Route::new("https://api.openai.com/v1/responses", false),
+        None,
+        None,
+        16384,
+        10,
+    )
+    .unwrap()
+    .cache;
+    session.model_resolution.as_mut().unwrap().primary.cache = capability;
+    let id = identity(&headers).unwrap().unwrap();
+    save(&service, &id, &session).unwrap();
+    let response = forward_request(
+        service.clone(),
+        headers.clone(),
+        Bytes::from(serde_json::to_vec(&body).unwrap()),
+        false,
+        "known-synthetic-capability".into(),
+    )
+    .await
+    .unwrap();
+    axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    session = load(&service, &id).unwrap();
+    session.upstream_cache = history::cache(&service).unwrap();
+    assert_eq!(session.primary.calls, 2);
     assert_eq!(session.upstream_cache.len(), 1);
     body["input"].as_array_mut().unwrap().extend([
         json!({"role":"assistant","content":"new disposable result ".repeat(300)}),
