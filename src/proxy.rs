@@ -1477,7 +1477,7 @@ async fn forward_request(
                 &mut session,
                 model,
                 body["service_tier"].as_str().unwrap_or("default"),
-                session.history.is_empty(),
+                false,
             )
             .await?;
             // One request-scoped contract drives every existing primary/reviewer

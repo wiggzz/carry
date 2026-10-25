@@ -201,6 +201,54 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.saved()["shadow"]["calls"],1)
         self.evidence.update(primaries=fixture.primaries,reviews=fixture.reviews,state=proxy.saved())
 
+    def test_projected_merged_members_publish_under_original_cut_after_advancement(self):
+        import threading
+        held, release = threading.Event(), threading.Event()
+        self.stack.callback(release.set)
+        def review(body,n):
+            if n == 1:
+                return 200,advice_response({"protected":[],"removable":["g3"],"memories":[]})
+            if n == 2:
+                group = next(g for g in ledger(body)["current_groups"] if g["group_id"] == "g2")
+                self.assertEqual(group["member_ids"],[2,4])
+                held.set()
+                self.assertTrue(release.wait(10))
+                return 200,advice_response({"protected":[],"removable":["g2"],"memories":[{"source_ids":["g2"],"text":"MERGED_ORIGINAL_FACT"}]})
+            self.fail("no extra review while captured projection is held")
+        fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"merged_{n}")),review)
+        h = [{"role":"user","content":"original goal"},
+             {"role":"assistant","content":"LEFT_SOURCE " * 3000},
+             {"role":"user","content":"OLD_SEPARATOR " * 10000},
+             {"role":"assistant","content":"RIGHT_SOURCE " * 3000},
+             {"role":"user","content":"original H boundary"}]
+        options = ["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled"]
+        proxy = self.proxy(fixture,options)
+        self.assertEqual(proxy.send(h)[0],200)
+        proxy.wait_reviews = False
+        self.assertEqual(proxy.send(h)[0],200)
+        self.assertTrue(held.wait(3),"selected source projection must still dispatch the next async review")
+        advanced = h + [{"role":"user","content":"A_ONLY"}]
+        self.assertEqual(proxy.send(advanced)[0],200)
+        release.set()
+        deadline = time.monotonic()+5
+        while proxy.checkpoint(advanced)[1].get("background_review_pending"):
+            self.assertLess(time.monotonic(),deadline)
+            time.sleep(.01)
+        proxy.close()
+        proxy = self.proxy(fixture,["--review-every-requests","100","--payoff-requests","1","--classifier-cache-policy","disabled"])
+        for suffix in ("B_ONLY","C_ONLY"):
+            child = h + [{"role":"user","content":suffix}]
+            self.assertEqual(proxy.send(child)[0],200)
+            sent = fixture.primaries[-1]["input"]
+            for source in h[1:4]: self.assertNotIn(source,sent)
+            self.assertIn("MERGED_ORIGINAL_FACT",json.dumps(sent))
+            self.assertNotIn("A_ONLY",json.dumps(sent))
+            self.assertIn(h[0],sent)
+            fact_at = next(i for i,x in enumerate(sent) if "MERGED_ORIGINAL_FACT" in json.dumps(x))
+            self.assertLess(fact_at,sent.index(h[4]),"fact belongs after original member 4, before original H direction")
+        self.evidence.update(primaries=fixture.primaries,reviews=fixture.reviews)
+        self.assertEqual(len(fixture.reviews),2)
+
     def test_exact_original_review_survives_advanced_owner_and_restart(self):
         """Completed H advice belongs to H, not its worker's now-advanced owner."""
         import threading
