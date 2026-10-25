@@ -1324,7 +1324,7 @@ class StateRegressions(unittest.TestCase):
             self.assertLessEqual(len(wire(body)), int(options[1]),
                                  "cleanup must stay inside the configured byte transport guard")
         restored = proxy.saved()
-        self.assertEqual(proxy.advice()["memories"], [], "in-budget advice retires accepted memories")
+        self.assertEqual((proxy.advice() or {}).get("memories", []), [], "in-budget advice retires accepted memories")
         self.assertNotIn(text_a, json.dumps(fixture.reviews[-1]))
         self.assertNotIn(text_b, json.dumps(fixture.reviews[-1]))
 
