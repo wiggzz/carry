@@ -36,9 +36,9 @@ fn planner_prices_only_scheduled_review_views_including_output_cap() {
     let body = json!({"model":"gpt-6-luna","input":session.render_primary()});
     for compact_only in [true, false] {
         config.classifier_max_input_tokens = if compact_only {
-            reviewer_required_tokens(&config, &compact).ceil() as u64
+            reviewer_required_tokens(&config, &compact).ceil() as u32
         } else {
-            reviewer_required_tokens(&config, &keep).ceil() as u64
+            reviewer_required_tokens(&config, &keep).ceil() as u32
         };
         assert!(review_fits(&config, &compact));
         assert_eq!(review_fits(&config, &keep), !compact_only);
