@@ -71,6 +71,61 @@ class TransparentHistory(unittest.TestCase):
         self.stack.callback(proxy.close)
         return proxy
 
+    def test_all_rejected_background_feedback_reaches_real_retry_after_restart(self):
+        root = self.state
+        for prior in (False, True):
+            with self.subTest(prior_feedback=prior):
+                self.state = root / ("prior" if prior else "fresh")
+                self.state.mkdir()
+                def review(_body, n):
+                    value = {"protected": ["g2"] if prior and n == 1 else ["g999"],
+                             "removable": [], "memories": []}
+                    return 200, advice_response(value)
+                fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"rejected_{prior}_{n}")), review)
+                options = ["--review-replayed-history", "--payoff-requests", "1",
+                           "--classifier-cache-policy", "disabled"]
+                h = [{"role":"user","content":"FEEDBACK_GOAL"},
+                     {"role":"assistant","content":"FEEDBACK_SOURCE " + "payload " * 2000},
+                     {"role":"user","content":"FEEDBACK_TASK"}]
+                proxy = self.proxy(fixture, options)
+                if prior:
+                    self.assertEqual(proxy.send(h)[0], 200)
+                    self.assertEqual(len(fixture.reviews), 1)
+                    self.assertEqual(proxy.advice()["feedback"]["rejected_count"], 0)
+                self.assertEqual(proxy.send(h)[0], 200)
+                count = 2 if prior else 1
+                self.assertEqual(len(fixture.reviews), count)
+                _, settled = proxy.checkpoint(h)
+                self.assertFalse(settled["background_review_pending"])
+                self.assertEqual(settled["shadow"]["calls"], count)
+                self.assertEqual(settled["shadow"]["input_tokens"], 100 * count)
+                self.assertEqual(settled["shadow"]["output_tokens"], count)
+                self.assertEqual(settled["shadow"]["unavailable_cost_calls"], 0)
+                index = json.loads((self.state / "history.index").read_text())
+                self.assertEqual(len(index["reviews"]), int(prior), "rejection is not a semantic completion")
+                self.assertNotIn("999", settled["opinions"], "unknown protection must gain no authority")
+                self.assertEqual(settled["completed_review_len"], len(h) if prior else 0)
+                proxy.close()
+                proxy = self.proxy(fixture, options)
+                self.assertEqual(proxy.send(h)[0], 200)
+                self.assertEqual(len(fixture.reviews), count + 1, "invalid advice must leave retry scheduling live")
+                retry = ledger(fixture.reviews[-1])
+                feedback = retry["previous_review_feedback"]
+                self.evidence[str(prior)] = {"settled": settled, "retry_ledger": retry}
+                self.assertIsNotNone(feedback, "all-rejected paid background diagnostics must survive restart")
+                self.assertEqual(feedback["rejected_count"], 1, "old accepted-record feedback must not overwrite the rejection")
+                self.assertEqual(feedback["accepted_opinions"], 0)
+                self.assertEqual(feedback["accepted_memories"], 0)
+                self.assertEqual(len(feedback["rejected"]), 1)
+                self.assertEqual(feedback["rejected"][0]["field"], "protected")
+                self.assertEqual(feedback["rejected"][0]["index"], 0)
+                self.assertLess(len(wire(feedback)), 2048)
+                self.assertIn(h[1], fixture.primaries[-1]["input"], "rejection must not omit canonical source")
+                print("ALL_REJECTED_FEEDBACK=" + json.dumps({"prior":prior,"calls_before_restart":count,
+                      "retry_feedback":feedback,"semantic_records_before_retry":len(index["reviews"])}), flush=True)
+                proxy.close()
+        self.state = root
+
     def test_successive_memory_acceptances_then_retire_only_one_same_source_fact_on_raw_wires(self):
         facts = ["RETIRED_SAME_SOURCE_FACT", "SURVIVING_SAME_SOURCE_FACT", "LATER_CUMULATIVE_FACT"]
         def review(body,n):
