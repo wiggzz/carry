@@ -71,6 +71,43 @@ class TransparentHistory(unittest.TestCase):
         self.stack.callback(proxy.close)
         return proxy
 
+    def test_successive_memory_acceptances_then_retire_only_one_same_source_fact_on_raw_wires(self):
+        facts = ["RETIRED_SAME_SOURCE_FACT", "SURVIVING_SAME_SOURCE_FACT", "LATER_CUMULATIVE_FACT"]
+        def review(body,n):
+            if n == 1:
+                value = {"protected":[],"removable":["g2"],"memories":[
+                    {"source_ids":["g2"],"text":facts[0]}, {"source_ids":["g2"],"text":facts[1]}]}
+            elif n == 2:
+                value = {"protected":[],"removable":["g4"],"memories":[{"source_ids":["g4"],"text":facts[2]}]}
+            elif n == 3:
+                value = {"protected":[],"removable":["m1"],"memories":[]}
+            else:
+                value = {"protected":[],"removable":[],"memories":[]}
+            return 200,advice_response(value)
+        fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"selective_{n}")),review)
+        options = ["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled"]
+        proxy = self.proxy(fixture,options)
+        h = [{"role":"user","content":"goal"},{"role":"assistant","content":"original source " * 3000},{"role":"user","content":"task 1"}]
+        for n in range(1,4):
+            self.assertEqual(proxy.send(h)[0],200)
+            self.assertEqual(len(fixture.reviews),n)
+            if n == 2:
+                raw = json.dumps(fixture.primaries[-1])
+                self.assertIn(facts[0],raw); self.assertIn(facts[1],raw)
+            if n < 3:
+                h += [{"role":"assistant","content":f"source {n+1} " * 3000},{"role":"user","content":f"task {n+1}"}]
+        proxy.close()
+        proxy = self.proxy(fixture,options)
+        h += [{"role":"assistant","content":"last source " * 3000},{"role":"user","content":"task 4"}]
+        self.assertEqual(proxy.send(h)[0],200)
+        self.assertEqual(len(fixture.reviews),4)
+        for body in (fixture.primaries[-1],fixture.reviews[-1]):
+            raw = json.dumps(body)
+            self.assertNotIn(facts[0],raw)
+            self.assertIn(facts[1],raw)
+            self.assertIn(facts[2],raw)
+        self.evidence.update(primary=fixture.primaries[-1],review=fixture.reviews[-1],canonical=proxy.saved())
+
     def test_paid_primary_output_outgrows_index_preserves_exact_receipt_without_publishing_id(self):
         def primary(_body, n):
             response = completed(response_id=f"paid_growth_{n}")

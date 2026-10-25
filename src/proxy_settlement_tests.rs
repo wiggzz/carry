@@ -1,5 +1,5 @@
 // Test-only process-exit/fault seams. The release executable has neither hook.
-fn publication_crash_barrier(service: &Service, stage: &str) {
+pub(super) fn publication_crash_barrier(service: &Service, stage: &str) {
     if std::env::var_os("CARRY_TEST_PUBLICATION_ROOT").as_deref()
         == Some(service.config.state_dir.as_os_str())
     {
@@ -134,6 +134,59 @@ async fn completed_h_crash_before_after_publication_and_failed_publication_keep_
                 .is_some()
         );
     }
+    provider.abort();
+}
+
+#[tokio::test]
+async fn failed_known_receipt_settlement_releases_live_owner_pin_without_publishing_h() {
+    let (url, mut captures, provider) = review_capture_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.classifier_url = Some(url);
+    service.config.history_max_references = 1;
+    let service = Arc::new(service);
+    let id = "failed-receipt-owner";
+    let mut session = semantic_subject();
+    session.history_shared = true;
+    session.bootstrap_review_pending = true;
+    let h = session.render_primary();
+    let lock = session_lock(&service, id).await;
+    let (sender, mut waits) = tokio::sync::mpsc::unbounded_channel();
+    *service.lock_waits.lock().unwrap() = Some(sender);
+    let projection = planning::Projection::canonical(&session);
+    dispatch_review_for(
+        service.clone(),
+        id.into(),
+        &mut session,
+        projection,
+        "failed-receipt".into(),
+    )
+    .await;
+    captures.recv().await.unwrap();
+    assert_eq!(waits.recv().await.unwrap(), id);
+    let fault = directory.path().join(".history-index.tmp");
+    std::fs::create_dir(&fault).unwrap();
+    drop(lock);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while service.background_reviews.lock().await.contains(id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let durable = history::restore(&service, id).unwrap();
+    assert!(
+        durable.background_review_pending,
+        "known but uncommitted attempt remains explicitly unknown for restart censorship"
+    );
+    assert_eq!(durable.shadow.calls, 0);
+    assert!(
+        history::advice(&service, "fixture-owner", &h)
+            .unwrap()
+            .is_none()
+    );
+    drop(history::pin(&service, "other-live-owner").unwrap());
+    std::fs::remove_dir(fault).unwrap();
     provider.abort();
 }
 
