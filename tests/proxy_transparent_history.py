@@ -87,7 +87,10 @@ class TransparentHistory(unittest.TestCase):
         fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"selective_{n}")),review)
         options = ["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled"]
         proxy = self.proxy(fixture,options)
-        h = [{"role":"user","content":"goal"},{"role":"assistant","content":"original source " * 3000},{"role":"user","content":"task 1"}]
+        # Both sources are consumed replay, not fresh unconsumed additions.
+        h = [{"role":"user","content":"goal"},{"role":"assistant","content":"original source " * 3000},
+             {"role":"user","content":"historical separator"},{"role":"assistant","content":"second original source " * 3000},
+             {"role":"user","content":"task 1"}]
         for n in range(1,4):
             self.assertEqual(proxy.send(h)[0],200)
             self.assertEqual(len(fixture.reviews),n)
@@ -152,10 +155,11 @@ class TransparentHistory(unittest.TestCase):
         self.evidence.update(before_restart=snapshots[0],after_restart=proxy.saved())
 
     def test_terminal_reviewer_receipt_write_failure_restarts_unknown_without_advice_or_double_charge(self):
-        def review(_body, _n):
+        def review(_body, n):
             fixture.held.set()
             self.assertTrue(fixture.release.wait(10))
-            return 200, advice_response({"protected":[],"removable":["g2"],"memories":[{"source_ids":["g2"],"text":"MUST_NOT_PUBLISH_UNSETTLED_FACT"}]})
+            value = {"protected":[],"removable":["g2"],"memories":[{"source_ids":["g2"],"text":"MUST_NOT_PUBLISH_UNSETTLED_FACT"}]} if n == 1 else {"protected":[],"removable":[],"memories":[]}
+            return 200, advice_response(value)
         fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"receipt_fault_{n}")),review)
         options = ["--review-replayed-history","--classifier-cache-policy","disabled","--payoff-requests","1"]
         h = [{"role":"user","content":"goal"},{"role":"assistant","content":"source " * 1000},{"role":"user","content":"task"}]
@@ -181,17 +185,17 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(paid["shadow"]["calls"],0, "uncommitted receipt is explicitly unknown, never silently known-zero")
         proxy.close()
         fault.rmdir()
-        # Make new reviewer work infeasible while reading the orphan's unknown
-        # receipt; a bootstrap retry would otherwise be a legitimate new spend.
-        proxy = self.proxy(fixture,["--review-every-requests","100",
-            "--classifier-max-input-tokens","1024","--classifier-max-output-tokens","1"])
+        # Preserve the exact settings namespace. A bootstrap retry is a new
+        # paid call, separate from the single explicitly censored orphan.
+        proxy = self.proxy(fixture,options)
         self.assertEqual(proxy.send(h)[0],200)
         stats = proxy.request("GET","/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
         self.assertGreaterEqual(stats["coverage"]["prior_untracked_calls"],1)
         self.assertIsNone(stats["carry_cost"])
-        self.assertEqual(len(fixture.reviews),1)
+        self.assertEqual(len(fixture.reviews),2)
         self.assertNotIn("MUST_NOT_PUBLISH_UNSETTLED_FACT",json.dumps(fixture.primaries[-1]))
-        self.assertEqual(proxy.saved()["shadow"]["calls"],1)
+        self.assertEqual(proxy.saved()["shadow"]["calls"],2)
+        self.assertEqual(proxy.saved()["shadow"]["input_tokens"],100)
         self.assertEqual(proxy.saved()["shadow"]["unavailable_cost_calls"],1)
         self.assertEqual(proxy.saved()["primary"]["calls"],2)
         self.evidence.update(canonical_unknown=paid,restarted=proxy.saved(),stats=stats)
@@ -203,7 +207,9 @@ class TransparentHistory(unittest.TestCase):
                                  "input_tokens_details": {"cached_tokens": 9000}}
             return 200, response
         fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"auth_{n}")), review)
-        history = [{"role": "user", "content": "synthetic credential control " * 3000}]
+        history = [{"role": "user", "content": "goal"},
+                   {"role": "assistant", "content": "synthetic credential control " * 3000},
+                   {"role": "user", "content": "current"}]
         identities = []
         for default, override in (("default-B", ""), ("default-C", ""),
                                   ("default-C", "  "), ("default-C", "explicit-D")):
@@ -212,7 +218,9 @@ class TransparentHistory(unittest.TestCase):
                 extra_env={"CARRY_PROXY_UPSTREAM_KEY": "upstream-A",
                            "CARRY_PROXY_CLASSIFIER_KEY": override, "OPENAI_API_KEY": default})
             self.stack.callback(proxy.close)
+            before = len(fixture.reviews)
             self.assertEqual(proxy.send(history)[0], 200)
+            self.assertEqual(len(fixture.reviews), before + 1, "each credential control must dispatch an actual reviewer")
             index = json.loads((self.state / "history.index").read_text())
             latest = [entry for entry in index["upstream_cache"]
                       if entry["credential_sha256"] == fixture.review_auth_hashes[-1]]
@@ -1179,7 +1187,9 @@ class TransparentHistory(unittest.TestCase):
             path, before = proxy.checkpoint(parent)
             owner = path.stem
             for n in range(12):
-                self.assertIn(proxy.send([{"role": "user", "content": f"PRIMARY_PRESSURE_{n}"}])[0], (200, 500, 507))
+                # Do not wait on the fixture-wide barrier while another owner's
+                # primary intentionally holds that owner's reviewer settlement.
+                self.assertIn(proxy.send([{"role": "user", "content": f"PRIMARY_PRESSURE_{n}"}], wait=False)[0], (200, 500, 507))
             try:
                 index = json.loads((self.state / "history.index").read_text())
                 self.assertIn(owner, index["snapshots"], "primary transport owns its selected snapshot")

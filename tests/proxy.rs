@@ -3389,7 +3389,11 @@ async fn reviewer_transport_preserves_encrypted_reasoning_and_native_tool_pairs(
             state.path(),
             fixture.address,
             "audit",
-            &["--classifier-cache-policy", "openai-explicit"],
+            &[
+                "--classifier-cache-policy",
+                "openai-explicit",
+                "--review-replayed-history",
+            ],
             "",
         )
         .await;
