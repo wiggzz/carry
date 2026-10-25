@@ -1244,7 +1244,7 @@ class StateRegressions(unittest.TestCase):
 
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
         proxy = self.proxy(fixture, ["--payoff-requests", "1",
-                                     "--min-payback-percent", "99"])
+                                     "--min-payback-percent", "99"], wait_reviews=False)
         seed = [{"role": "user", "content": "goal"},
                 {"role": "assistant", "content": "old"}]
         self.assertEqual(proxy.send(seed)[0], 200)

@@ -980,13 +980,19 @@ class TransparentHistory(unittest.TestCase):
                 # The age policy may legitimately expire a settled branch. The
                 # durable receipt is checked above; non-age restart must retain it.
                 if pressure != "age":
+                    reviews_before = len(fixture.reviews)
                     proxy = TransparentProxy(self.state, fixture, options, env)
                     self.stack.callback(proxy.close)
+                    restarted = json.loads((self.state / "history.index").read_text())
+                    self.assertEqual(restarted["snapshots"][owner]["shadow"]["calls"], 1,
+                                     "restart must retain the exact settled paid receipt")
                     followup = history + [{"role": "user", "content": "PINNED_CONTINUE"}]
                     self.assertEqual(proxy.send(followup)[0], 200)
                     _, resumed = proxy.checkpoint(followup)
                     self.assertEqual(resumed["primary"]["calls"], 2)
-                    self.assertEqual(resumed["shadow"]["calls"], 1)
+                    self.assertEqual(resumed["shadow"]["calls"],
+                                     1 + len(fixture.reviews) - reviews_before,
+                                     "only actual fresh native reviews can add another paid call")
                     sent = fixture.primaries[-1]["input"]
                     self.assertIn(history[0], sent, "direction survives advice eviction")
                     self.assertEqual(history[1] in sent, not any(
