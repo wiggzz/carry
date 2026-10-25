@@ -28,93 +28,121 @@ pub(super) fn serialized_identity<T: Serialize + ?Sized>(value: &T) -> (usize, S
     (writer.bytes, format!("{:x}", writer.digest.finalize()))
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct PrefixEvidence {
-    base_sha256: String,
-    input_sha256: String,
-    input_len: usize,
-    estimated_tokens: f64,
-}
-
+/// Actual dispatched wire identity. Purpose is deliberately absent.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct CacheEvidence {
-    // Destination, auth class and processing tier of the dispatched receipt.
-    // Missing historical qualification is unknown, never a frozen-route hit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<carry::models::Route>,
-    // Decode former full-prompt checkpoints; compact them before using state.
-    #[serde(default, skip_serializing_if = "Value::is_null")]
-    pub base: Value,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub input: Vec<Value>,
+    pub credential_sha256: String,
+    pub base_sha256: String,
+    pub input_sha256: String,
+    pub input_len: usize,
+    pub estimated_tokens: f64,
     pub at: u64,
     pub native_cached_fraction: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    prefix: Option<PrefixEvidence>,
 }
+
+pub(super) fn base(body: &Value) -> Value {
+    let mut base = body.clone();
+    if let Some(object) = base.as_object_mut() {
+        for key in [
+            "input",
+            "stream",
+            "store",
+            "metadata",
+            "client_metadata",
+            "include",
+        ] {
+            object.remove(key);
+        }
+    }
+    base
+}
+
 impl CacheEvidence {
-    pub fn new(base: &Value, input: &[Value], at: u64, native_cached_fraction: f64) -> Self {
-        Self {
-            route: None,
-            base: Value::Null,
-            input: Vec::new(),
-            at,
-            native_cached_fraction,
-            prefix: Some(PrefixEvidence {
-                base_sha256: serialized_identity(base).1,
-                input_sha256: serialized_identity(input).1,
-                input_len: input.len(),
-                estimated_tokens: crate::proxy_savings::token_units(&json!(input)) as f64,
-            }),
-        }
-    }
-    pub fn compact(&mut self) {
-        if self.prefix.is_none() {
-            let mut compact = Self::new(
-                &self.base,
-                &self.input,
-                self.at,
-                self.native_cached_fraction,
-            );
-            compact.route = self.route.clone();
-            *self = compact;
-        }
-    }
-    pub fn input_len(&self) -> usize {
-        self.prefix
-            .as_ref()
-            .map_or(self.input.len(), |p| p.input_len)
-    }
-    pub fn estimated_tokens(&self) -> f64 {
-        self.prefix.as_ref().map_or_else(
-            || crate::proxy_savings::token_units(&json!(self.input)) as f64,
-            |p| p.estimated_tokens,
-        )
-    }
-    pub fn matches(&self, base: &Value, input: &[Value]) -> bool {
-        if !(0.0..=1.0).contains(&self.native_cached_fraction) {
+    pub fn matches(
+        &self,
+        body: &Value,
+        resolved: Option<&carry::models::ResolvedModel>,
+        credential: &str,
+        at: u64,
+    ) -> bool {
+        let Some(input) = body["input"].as_array() else {
             return false;
-        }
-        if let Some(prefix) = &self.prefix {
-            input.len() >= prefix.input_len
-                && serialized_identity(base).1 == prefix.base_sha256
-                && serialized_identity(&input[..prefix.input_len]).1 == prefix.input_sha256
-        } else {
-            self.base == *base && input.starts_with(&self.input)
-        }
+        };
+        self.at <= at
+            && at - self.at < 1800
+            && self.route.as_ref() == resolved.map(|r| &r.route)
+            && self.credential_sha256 == credential
+            && self.input_len <= input.len()
+            && self.base_sha256 == serialized_identity(&base(body)).1
+            && self.input_sha256 == serialized_identity(&input[..self.input_len]).1
+            && (0.0..=1.0).contains(&self.native_cached_fraction)
     }
-    pub fn matches_route(&self, route: Option<&carry::models::Route>) -> bool {
-        self.route.as_ref() == route
+}
+
+pub(super) fn reusable(
+    cache: &[CacheEvidence],
+    body: &Value,
+    resolved: Option<&carry::models::ResolvedModel>,
+    credential: &str,
+    at: u64,
+) -> f64 {
+    if resolved.is_none_or(|r| r.cache.is_none()) {
+        return 0.0;
     }
-    #[cfg(test)]
-    pub fn legacy(base: Value, input: Vec<Value>, at: u64, native_cached_fraction: f64) -> Self {
-        Self {
-            route: None,
-            base,
-            input,
-            at,
-            native_cached_fraction,
-            prefix: None,
-        }
+    cache
+        .iter()
+        .filter(|e| e.matches(body, resolved, credential, at))
+        .map(|e| e.estimated_tokens * e.native_cached_fraction)
+        .fold(0.0, f64::max)
+        .min(crate::proxy_savings::token_units(body) as f64)
+}
+
+pub(super) fn observe(
+    cache: &mut Vec<CacheEvidence>,
+    body: &Value,
+    usage: &Value,
+    resolved: Option<&carry::models::ResolvedModel>,
+    credential: &str,
+    at: u64,
+) {
+    let Some(input) = body["input"].as_array() else {
+        return;
+    };
+    let (Some(total), Some(cached)) = (
+        usage["input_tokens"].as_u64(),
+        usage["input_tokens_details"]["cached_tokens"].as_u64(),
+    ) else {
+        return;
+    };
+    if total == 0 || cached > total {
+        return;
+    }
+    let e = CacheEvidence {
+        route: resolved.map(|r| r.route.clone()),
+        credential_sha256: credential.into(),
+        base_sha256: serialized_identity(&base(body)).1,
+        input_sha256: serialized_identity(input).1,
+        input_len: input.len(),
+        estimated_tokens: crate::proxy_savings::token_units(&json!(input)) as f64,
+        at,
+        native_cached_fraction: cached as f64 / total as f64,
+    };
+    // A zero read records potential history, never confirmed cache activity.
+    cache.retain(|old| {
+        old.base_sha256 != e.base_sha256
+            || old.input_sha256 != e.input_sha256
+            || old.route != e.route
+            || old.credential_sha256 != e.credential_sha256
+    });
+    cache.push(e);
+    trim(cache, at);
+}
+
+pub(super) fn trim(cache: &mut Vec<CacheEvidence>, at: u64) {
+    cache.retain(|e| e.at <= at && at - e.at < 1800);
+    cache.sort_by_key(|e| e.at);
+    while cache.len() > 128 || serde_json::to_vec(cache).unwrap().len() > 65536 {
+        cache.remove(0);
     }
 }

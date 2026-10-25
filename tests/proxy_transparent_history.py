@@ -71,6 +71,117 @@ class TransparentHistory(unittest.TestCase):
         self.stack.callback(proxy.close)
         return proxy
 
+    def test_request_projection_can_restore_genuinely_rewarmed_original_source(self):
+        """A past cold omission is an audit event, never semantic removal authority."""
+        def primary(body, n):
+            value = completed(response_id=f"reversible_{n}")
+            value["usage"]["input_tokens"] = max(100, len(wire(body["input"])) // 4)
+            value["usage"]["input_tokens_details"]["cached_tokens"] = (
+                value["usage"]["input_tokens"] * 99 // 100)
+            return 200, value
+
+        def review(_body, _n):
+            return 200, advice_response({"protected": [], "removable": ["g2"], "memories": []})
+
+        fixture = self.fixture(primary, review)
+        options = ["--payoff-requests", "1", "--classifier-cache-policy", "disabled"]
+        proxy = self.proxy(fixture, [*options, "--review-replayed-history"])
+        history = [{"role": "user", "content": "PROTECTED_ORIGINAL_GOAL " + "direction " * 10000},
+                   {"role": "assistant", "content": "REVERSIBLE_ORIGINAL_SOURCE " + "payload " * 6000},
+                   {"role": "user", "content": "CURRENT_H_DIRECTION"}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        proxy.close()
+        # The loopback destination cannot advertise official provider semantics.
+        # Attest only this synthetic fixture's cache capability on the frozen
+        # pair; native cache activity still comes solely from actual HTTP usage.
+        path = self.state / "history.index"
+        index = json.loads(path.read_text())
+        for snapshot in index["snapshots"].values():
+            snapshot["model_resolution"]["primary"]["cache"] = {
+                "minimum_prefix_tokens": 1024, "max_read_breakpoints": 50,
+                "max_write_breakpoints": 4, "implicit_breakpoint_uses_write_slot": True}
+        path.write_bytes(wire(index))
+        options += ["--review-every-requests", "100"]
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertIn(history[1], fixture.primaries[-1]["input"], "warm prefix favors original source")
+        proxy.close()
+        # Stage elapsed provider TTL only, not semantic advice, a receipt or a
+        # planner result. Every outgoing body is still rendered by the real CLI.
+        path = self.state / "history.index"
+        index = json.loads(path.read_text())
+        for snapshot in index["snapshots"].values():
+            for field in ("primary_cache", "reviewer_cache", "upstream_cache"):
+                for entry in snapshot.get(field, []):
+                    entry["at"] = 1
+                    if "read_confirmed_at" in entry:
+                        entry["read_confirmed_at"] = 1
+        path.write_bytes(wire(index))
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertNotIn(history[1], fixture.primaries[-1]["input"], "expired prefix permits cold omission")
+        cold = fixture.primaries[-1]
+        proxy.close()
+        # Audit mode genuinely dispatches canonical H. Only its terminal provider
+        # receipt may re-warm that exact shape; no invented saved cache entries.
+        proxy = TransparentProxy(self.state, fixture, options, mode="audit")
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(history)[0], 200)
+        rewarmed = fixture.primaries[-1]
+        self.evidence.update(cold=cold, actual_rewarm=rewarmed, upstream=fixture.primaries)
+        self.assertIn(history[1], rewarmed["input"], "audit must dispatch canonical original H after prior omission")
+        proxy.close()
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.evidence["restored"] = fixture.primaries[-1]
+        self.assertIn(history[1], fixture.primaries[-1]["input"],
+                      "genuine compatible cache evidence must make the same original H retainable again")
+        self.assertIn(history[0], fixture.primaries[-1]["input"])
+        self.assertEqual(len(fixture.reviews), 1, "reversibility needs no paid semantic recovery")
+
+
+    def test_repeated_projections_do_not_starve_async_review(self):
+        def review(body, n):
+            eligible = ledger(body)["eligible_group_ids"]
+            return 200, advice_response({"protected": [], "removable": eligible, "memories": []})
+        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"starve_{n}")), review)
+        proxy = self.proxy(fixture,["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled"])
+        h = [{"role":"user","content":"goal"},
+             {"role":"assistant","content":"old output " * 6000},
+             {"role":"user","content":"next"}]
+        self.assertEqual(proxy.send(h)[0],200)
+        self.assertEqual(len(fixture.reviews),1)
+        for n in range(3):
+            h += [{"role":"assistant","content":f"later {n} " * 3000},
+                  {"role":"user","content":f"continue {n}"}]
+            self.assertEqual(proxy.send(h)[0],200)
+        self.evidence.update(primaries=fixture.primaries,reviews=fixture.reviews)
+        self.assertGreater(len(fixture.reviews),1,"selected projections must not suppress ordinary async review")
+
+    def test_completed_advice_survives_two_days_and_more_than_eight_cuts(self):
+        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"retained_{n}")),
+            lambda body,n: (200,advice_response({"protected":[],"removable":["g2"],"memories":[]})))
+        proxy = self.proxy(fixture,["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled"])
+        h = [{"role":"user","content":"goal"},{"role":"assistant","content":"reviewed source " * 6000},
+             {"role":"user","content":"cut 0"}]
+        self.assertEqual(proxy.send(h)[0],200)
+        original = list(h)
+        for n in range(10):
+            h += [{"role":"user","content":f"cut {n+1}"}]
+            self.assertEqual(proxy.send(h)[0],200)
+        proxy.close()
+        path = self.state / "history.index"
+        index = json.loads(path.read_text())
+        # Clock seam only: no manufactured advice, wire/cache receipt or plan.
+        for records in index["reviews"].values():
+            for record in (records if isinstance(records,list) else [records]):
+                record["at"] = int(time.time()) - 2*86400
+        path.write_bytes(wire(index))
+        proxy = self.proxy(fixture,["--review-every-requests","100","--payoff-requests","1","--classifier-cache-policy","disabled"])
+        self.assertEqual(proxy.send(original+[{"role":"user","content":"sibling"}])[0],200)
+        self.evidence.update(index=index,primaries=fixture.primaries)
+        self.assertNotIn(original[1],fixture.primaries[-1]["input"],"seven-day review retention must not expire after one day")
+
     def test_exact_original_review_survives_advanced_owner_and_restart(self):
         """Completed H advice belongs to H, not its worker's now-advanced owner."""
         import threading

@@ -1,5 +1,5 @@
 //! Server-owned exact-prefix index. Immutable nodes share canonical wire values;
-//! mutable sessions retain selection, workers, cache receipts and accounting.
+//! Completed advice is prefix-bound; owners hold transport and paid accounting only.
 use super::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -97,10 +97,12 @@ fn pinned(service: &Service) -> HashSet<String> {
 }
 
 #[derive(Default, Serialize, Deserialize)]
+#[serde(tag = "format", rename = "carry-prefix-history-v3")]
 struct Index {
     nodes: BTreeMap<String, Node>,
+    upstream_cache: Vec<CacheEvidence>,
     tips: BTreeMap<String, Reference>,
-    reviews: BTreeMap<String, Vec<forking::Point>>,
+    reviews: BTreeMap<String, semantic::Record>,
     #[serde(default)]
     transcripts: BTreeMap<String, Transcript>,
     #[serde(default)]
@@ -116,10 +118,6 @@ struct Reference {
     session: String,
     namespace: String,
     at: u64,
-    /// Same selection contract as historical versions. The mutable owner is
-    /// routing/accounting only; it cannot supply a different cleanup policy.
-    #[serde(default)]
-    selection: Option<forking::Point>,
 }
 #[derive(Serialize, Deserialize)]
 struct Transcript {
@@ -160,24 +158,7 @@ pub(super) fn validate_capacity(config: &ProxyCli) -> std::io::Result<()> {
 fn read(service: &Service) -> std::io::Result<Index> {
     match std::fs::read(service.config.state_dir.join("history.index")) {
         Ok(bytes) if bytes.len() <= service.config.history_max_bytes as usize => {
-            let mut index: Index = serde_json::from_slice(&bytes)?;
-            // Decode old live owners into the same selection representation.
-            // Old reviewed versions remain valid only at their recorded cuts;
-            // never reconstruct newer historical cleanup from a current sibling.
-            let legacy = index
-                .tips
-                .iter()
-                .filter(|(_, r)| r.selection.is_none())
-                .map(|(key, r)| (key.clone(), r.session.clone()))
-                .collect::<Vec<_>>();
-            for (key, id) in legacy {
-                if let Some(snapshot) = index.snapshots.get(&id) {
-                    let session = canonical(&index, snapshot.clone())?;
-                    index.tips.get_mut(&key).unwrap().selection =
-                        Some(forking::selection(&service.config, &session));
-                }
-            }
-            Ok(index)
+            serde_json::from_slice(&bytes).map_err(std::io::Error::other)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Index::default()),
         _ => Err(std::io::Error::other("history index unavailable")),
@@ -229,47 +210,22 @@ fn gc(index: &mut Index, pins: &HashSet<String>) {
 }
 fn prune(service: &Service, index: &mut Index) -> bool {
     let at = now();
+    crate::proxy_cache::trim(&mut index.upstream_cache, at);
     let pins = pinned(service);
     index.tips.retain(|_, r| {
-        pins.contains(&r.session) || (r.at <= at && at - r.at < service.config.fork_max_age_secs)
-    });
-    index.reviews.retain(|_, points| {
-        points.retain(|p| !forking::expired(&service.config, p, at));
-        !points.is_empty()
+        pins.contains(&r.session) || (r.at <= at && at - r.at < service.config.history_max_age_secs)
     });
     index
+        .reviews
+        .retain(|_, r| r.at <= at && at - r.at < service.config.history_max_age_secs);
+    index
         .transcripts
-        .retain(|_, r| r.at <= at && at - r.at < service.config.fork_max_age_secs);
+        .retain(|_, r| r.at <= at && at - r.at < service.config.history_max_age_secs);
     loop {
         gc(index, &pins);
-        // The shared index is an additional aggregate portability bound. Count
-        // the exact flattened JSON vector (including delimiters), not only the
-        // points' individual lengths. Retire evidence, not selected state, when
-        // this budget alone is exceeded.
-        let reviews = index.reviews.values().flatten().collect::<Vec<_>>();
-        let reviews_fit = reviews.len() <= service.config.fork_max_nodes as usize
-            && serde_json::to_vec(&reviews).unwrap().len()
-                <= service.config.fork_max_bytes as usize;
-        if !reviews_fit {
-            let (_, key, id) = index
-                .reviews
-                .iter()
-                .flat_map(|(key, points)| {
-                    points
-                        .iter()
-                        .map(move |p| (p.at, key.clone(), p.id.clone()))
-                })
-                .min()
-                .unwrap();
-            index.reviews.get_mut(&key).unwrap().retain(|p| p.id != id);
-            index.reviews.retain(|_, points| !points.is_empty());
-            continue;
-        }
         if index.nodes.len() <= service.config.history_max_nodes as usize
             && index.tips.len() + index.reviews.len() + index.transcripts.len()
                 <= service.config.history_max_references as usize
-            && index.reviews.values().map(Vec::len).sum::<usize>()
-                <= service.config.fork_max_nodes as usize
             && serde_json::to_vec(index).unwrap().len() <= service.config.history_max_bytes as usize
         {
             return true;
@@ -277,7 +233,7 @@ fn prune(service: &Service, index: &mut Index) -> bool {
         let review = index
             .reviews
             .iter()
-            .flat_map(|(k, ps)| ps.iter().map(move |p| (p.at, k.clone(), p.id.clone())))
+            .map(|(key, r)| (r.at, key.clone()))
             .min();
         let tip = index
             .tips
@@ -303,16 +259,14 @@ fn prune(service: &Service, index: &mut Index) -> bool {
             continue;
         }
         match (review, tip) {
-            (Some((at, k, id)), Some((t, _))) if at <= t => {
-                index.reviews.get_mut(&k).unwrap().retain(|p| p.id != id);
-                index.reviews.retain(|_, ps| !ps.is_empty());
+            (Some((at, key)), Some((t, _))) if at <= t => {
+                index.reviews.remove(&key);
             }
-            (_, Some((_, k))) => {
-                index.tips.remove(&k);
+            (_, Some((_, key))) => {
+                index.tips.remove(&key);
             }
-            (Some((_, k, id)), None) => {
-                index.reviews.get_mut(&k).unwrap().retain(|p| p.id != id);
-                index.reviews.retain(|_, ps| !ps.is_empty());
+            (Some((_, key)), None) => {
+                index.reviews.remove(&key);
             }
             _ => return false,
         }
@@ -331,8 +285,8 @@ pub(super) fn namespace(
         owner.insert("x-carry-session", "carry-active-prefix".parse().unwrap());
     }
     Ok(hash(
-        &json!({"policy":"carry-transparent-history-v1", "owner":identity(&owner)?,
-        "settings":forking::scope(&service.config, &cache_base(body)),
+        &json!({"policy":"carry-prefix-history-v3", "owner":identity(&owner)?,
+        "settings":semantic::scope(&service.config, &cache_base(body)),
         "client_scope":stable_client_scope(body)}),
     ))
 }
@@ -423,7 +377,7 @@ pub(super) fn resolve(
     service: &Service,
     namespace: &str,
     body: &Value,
-) -> Result<(String, Option<forking::Point>, Pin), Failure> {
+) -> Result<(String, Pin), Failure> {
     let _guard = IO.lock().unwrap();
     let mut index = read(service).map_err(|_| {
         failure(
@@ -440,35 +394,18 @@ pub(super) fn resolve(
         .as_array()
         .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "array input required"))?;
     let keys = path(namespace, input);
-    // Resolve one complete selection version at the deepest compatible cut.
-    // Whether that version still has a mutable owner affects routing only.
-    let root = namespace.to_owned();
-    for key in keys.iter().rev().chain(keys.is_empty().then_some(&root)) {
-        let live = index
-            .tips
-            .get(key)
-            .and_then(|r| r.selection.as_ref().map(|p| (p, Some(r.session.as_str()))));
-        let historical = index
-            .reviews
-            .get(key)
-            .into_iter()
-            .flatten()
-            .rev()
-            .map(|p| (p, None));
-        for (point, owner) in live.into_iter().chain(historical) {
-            if forking::compatible_child(&service.config, point, body).is_err() {
-                continue;
+    // Routing has no semantic authority. Reuse only a compatible live owner;
+    // every request independently looks up completed advice below.
+    for key in keys.iter().rev() {
+        if let Some(reference) = index.tips.get(key) {
+            if let Some(snapshot) = index.snapshots.get(&reference.session) {
+                if snapshot.history.len() <= input.len() {
+                    return Ok((reference.session.clone(), pin(service, &reference.session)?));
+                }
             }
-            if let Some(id) = owner {
-                return Ok((id.into(), None, pin(service, id)?));
-            }
-            let id = hash(&(namespace, "reviewed-child", &point.id, keys.last()));
-            let (id, pin) = reserve(service, id, &occupied)?;
-            return Ok((id, Some(point.clone()), pin));
         }
     }
-    let (id, pin) = reserve(service, hash(&(namespace, keys.last())), &occupied)?;
-    Ok((id, None, pin))
+    reserve(service, hash(&(namespace, keys.last())), &occupied)
 }
 
 /// Selected checkpoints reference canonical nodes; the atomic index is their
@@ -536,6 +473,7 @@ pub(super) fn committed(
         .map(|i| i.value.clone())
         .collect::<Vec<_>>();
     let prior = index.snapshots.keys().cloned().collect::<HashSet<_>>();
+    merge_cache(&mut index.upstream_cache, &session.upstream_cache);
     let keys = insert(&mut index, namespace, &input);
     let observed_keys = observation
         .map(|(input, _)| insert(&mut index, namespace, input))
@@ -575,7 +513,6 @@ pub(super) fn committed(
             }
         }
     }
-    let selection = forking::selection(&service.config, session);
     index.tips.retain(|_, r| r.session != id);
     let key = observed_keys.last().unwrap_or(namespace);
     index.tips.insert(
@@ -584,32 +521,70 @@ pub(super) fn committed(
             session: id.into(),
             namespace: namespace.clone(),
             at: now(),
-            selection: Some(selection.clone()),
         },
     );
-    // Version every committed selection at its full dependency frontier. Empty
-    // state is authority too: retirement must supersede an older nonempty
-    // version at the same cut before an auxiliary branch displaces the live tip.
-    let key = keys.last().unwrap_or(namespace);
-    index.reviews.insert(key.clone(), vec![selection]);
-    // Completed workers retain their own exact original cut. An owner may now
-    // be at H+A, but its H record must remain discoverable by H+B/H+C.
-    for point in &session.fork_points {
-        let mut subject = session.review_context.clone();
-        subject["input"] = json!(input);
-        if forking::compatible_child(&service.config, point, &subject).is_ok() {
-            let cut = point
-                .sources
-                .len()
-                .checked_sub(1)
-                .map(|end| &keys[end])
-                .unwrap_or(namespace);
-            index.reviews.insert(cut.clone(), vec![point.clone()]);
-        }
-    }
     if session.history_shared {
         index.snapshots.insert(id.into(), compact(session));
     }
+    persist(service, index, prior, Some(id))
+}
+
+pub(super) fn advice(
+    service: &Service,
+    namespace: &str,
+    input: &[Value],
+) -> std::io::Result<Option<semantic::Record>> {
+    let _guard = IO.lock().unwrap();
+    let mut index = read(service)?;
+    prune(service, &mut index);
+    // Select the newest record at the longest cut FIRST. Invalid individual
+    // actions fail closed; never fall back to an older record/fact.
+    Ok(path(namespace, input)
+        .iter()
+        .rev()
+        .find_map(|key| index.reviews.get(key).cloned()))
+}
+
+pub(super) fn publish(
+    service: &Service,
+    subject: &Session,
+    reviewed: &Session,
+) -> std::io::Result<()> {
+    let namespace = subject
+        .history_namespace
+        .as_deref()
+        .ok_or_else(|| std::io::Error::other("review namespace missing"))?;
+    let _guard = IO.lock().unwrap();
+    let mut index = read(service)?;
+    let input = subject
+        .history
+        .iter()
+        .map(|i| i.value.clone())
+        .collect::<Vec<_>>();
+    let keys = insert(&mut index, namespace, &input);
+    let key = keys
+        .last()
+        .unwrap_or(&subject.history_namespace.clone().unwrap())
+        .clone();
+    merge_cache(&mut index.upstream_cache, &reviewed.upstream_cache);
+    let record = semantic::Record::capture(reviewed);
+    if index
+        .reviews
+        .get(&key)
+        .is_none_or(|old| old.generation < record.generation)
+    {
+        index.reviews.insert(key, record);
+    }
+    let prior = index.snapshots.keys().cloned().collect();
+    persist(service, index, prior, None)
+}
+
+fn persist(
+    service: &Service,
+    mut index: Index,
+    prior: HashSet<String>,
+    owner: Option<&str>,
+) -> std::io::Result<()> {
     if !prune(service, &mut index) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::StorageFull,
@@ -631,10 +606,32 @@ pub(super) fn committed(
     file.sync_all()?;
     std::fs::rename(temporary, service.config.state_dir.join("history.index"))?;
     File::open(&service.config.state_dir)?.sync_all()?;
-    for stale in prior.into_iter().chain(std::iter::once(id.to_owned())) {
-        if !index.snapshots.contains_key(&stale) && (stale != id || session.history_shared) {
+    for stale in prior.into_iter().chain(owner.map(str::to_owned)) {
+        if !index.snapshots.contains_key(&stale) {
             let _ = std::fs::remove_file(service.config.state_dir.join(format!("{stale}.json")));
         }
     }
     Ok(())
+}
+
+fn merge_cache(cache: &mut Vec<CacheEvidence>, incoming: &[CacheEvidence]) {
+    for entry in incoming {
+        if !cache.iter().any(|e| {
+            e.base_sha256 == entry.base_sha256
+                && e.input_sha256 == entry.input_sha256
+                && e.route == entry.route
+                && e.credential_sha256 == entry.credential_sha256
+                && e.at >= entry.at
+        }) {
+            cache.push(entry.clone());
+        }
+    }
+    crate::proxy_cache::trim(cache, now());
+}
+
+pub(super) fn cache(service: &Service) -> std::io::Result<Vec<CacheEvidence>> {
+    let _guard = IO.lock().unwrap();
+    let mut index = read(service)?;
+    crate::proxy_cache::trim(&mut index.upstream_cache, now());
+    Ok(index.upstream_cache)
 }

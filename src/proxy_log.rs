@@ -485,7 +485,6 @@ pub(super) fn changes(
         &json!({
         "main_changed":after.compactions > before.compactions || after.native_compactions > before.native_compactions,
         "main_compactions":after.compactions.saturating_sub(before.compactions),
-        "reviewer_compactions":after.reviewer_compactions.saturating_sub(before.reviewer_compactions),
         "native_compactions":after.native_compactions.saturating_sub(before.native_compactions)}),
     );
 }

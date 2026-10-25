@@ -34,10 +34,11 @@ async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
     axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    let mut session = load(&service, &pr154_session_id("catalog-cache")).unwrap();
+    let mut session = load(&service, &{ let mut h = HeaderMap::new(); h.insert("x-carry-session","catalog-cache".parse().unwrap()); identity(&h).unwrap().unwrap() }).unwrap();
     assert_eq!(session.primary.calls, 1);
     assert_eq!(session.primary.cached_tokens, 9000);
-    assert_eq!(session.primary_cache.len(), 1);
+    session.upstream_cache = history::cache(&service).unwrap();
+    assert_eq!(session.upstream_cache.len(), 1);
     body["input"].as_array_mut().unwrap().extend([
         json!({"role":"assistant","content":"new disposable result ".repeat(300)}),
         json!({"role":"user","content":"current task"}),
@@ -47,7 +48,6 @@ async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
         item.exposed = true;
     }
     let groups = session.groups();
-    session.observe_groups(&groups);
     session
         .apply_advice(
             &groups,
@@ -66,7 +66,10 @@ async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
     )
     .unwrap()
     .cache;
-    let restored: Session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+    let record = semantic::Record::capture(&session);
+    let mut restored: Session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+    record.apply(&mut restored);
+    restored.upstream_cache = history::cache(&service).unwrap();
     assert_eq!(restored.primary.cost_usd, session.primary.cost_usd);
     provider.abort();
     (service.config.clone(), restored, body)
@@ -77,12 +80,12 @@ async fn catalog_r1_receipt_credit_is_bound_to_route_auth_class_and_restart() {
     let (_config, session, body) = catalog_cache_receipt().await;
     let exact = &session.model_resolution.as_ref().unwrap().primary;
     let cost = |cache: &[CacheEvidence], model: &ResolvedModel| {
-        resolved_view_costs(&body, &body, cache, "gpt-6-sol", 1, Some(model))
+        resolved_view_costs(&body, &body, cache, "gpt-6-sol", 1, Some(model), "")
             .unwrap()
             .keep
     };
     assert!(
-        cost(&session.primary_cache, exact) < cost(&[], exact),
+        cost(&session.upstream_cache, exact) < cost(&[], exact),
         "exact-route receipt survives restart"
     );
     for route in [
@@ -94,32 +97,23 @@ async fn catalog_r1_receipt_credit_is_bound_to_route_auth_class_and_restart() {
         let mut changed = exact.clone();
         changed.route = route;
         assert_eq!(
-            cost(&session.primary_cache, &changed),
+            cost(&session.upstream_cache, &changed),
             cost(&[], &changed),
             "CATALOG-R1: another destination/auth namespace must start cold"
         );
     }
     let mut changed = exact.clone();
     changed.route.processing_tier = "priority".into();
-    assert_eq!(cost(&session.primary_cache, &changed), cost(&[], &changed));
-    let legacy = vec![CacheEvidence::legacy(
-        cache_base(&body),
-        body["input"].as_array().unwrap().clone(),
-        now(),
-        0.9,
-    )];
-    assert_eq!(
-        cost(&legacy, exact),
-        cost(&[], exact),
-        "unqualified legacy evidence is unknown to a frozen route"
-    );
+    assert_eq!(cost(&session.upstream_cache, &changed), cost(&[], &changed));
+
 }
 
 #[tokio::test]
 async fn catalog_r1_cache_preserving_candidates_require_the_exact_receipt_namespace() {
-    let (config, mut session, body) = catalog_cache_receipt().await;
+    let (mut config, mut session, body) = catalog_cache_receipt().await;
+    config.model_resolution = session.model_resolution.clone();
     let mut cold = session.clone();
-    cold.primary_cache.clear();
+    cold.upstream_cache.clear();
     let (_, exact) = plan(&config, &session, &body);
     let (_, empty) = plan(&config, &cold, &body);
     assert!(
