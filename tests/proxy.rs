@@ -1581,7 +1581,10 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
                 .filter_map(Result::ok)
                 .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
                 .map(|entry| {
-                    serde_json::from_slice::<Value>(&std::fs::read(entry.path()).unwrap()).unwrap()
+                    serde_json::from_slice::<serde_json::Value>(
+                        &std::fs::read(entry.path()).unwrap(),
+                    )
+                    .unwrap()
                 })
                 .collect::<Vec<_>>();
             if states.len() == 1 && states[0]["background_review_pending"] != true {
