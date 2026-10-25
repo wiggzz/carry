@@ -4,6 +4,7 @@ pub(super) fn publication_crash_barrier(service: &Service, stage: &str) {
         == Some(service.config.state_dir.as_os_str())
     {
         let action = std::env::var("CARRY_TEST_PUBLICATION_STAGE").unwrap();
+        eprintln!("completed-H crash hook: action={action}, stage={stage}");
         if action == stage {
             std::process::exit(73);
         }
@@ -25,6 +26,7 @@ async fn paid_publication_crash_child() {
     session.history_shared = true;
     session.bootstrap_review_pending = true;
     let projection = planning::Projection::canonical(&session);
+    eprintln!("completed-H child: dispatching actual reviewer");
     dispatch_review_for(
         service.clone(),
         "crash-owner".into(),
@@ -56,7 +58,7 @@ async fn completed_h_crash_before_after_publication_and_failed_publication_keep_
         let root = directory.path().to_owned();
         let endpoint = url.clone();
         let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new(std::env::current_exe().unwrap())
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "proxy::tests::paid_publication_crash_child",
@@ -65,8 +67,19 @@ async fn completed_h_crash_before_after_publication_and_failed_publication_keep_
                 .env("CARRY_TEST_PUBLICATION_ROOT", root)
                 .env("CARRY_TEST_PUBLICATION_PROVIDER", endpoint)
                 .env("CARRY_TEST_PUBLICATION_STAGE", stage)
-                .output()
-                .unwrap()
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child.wait_with_output().unwrap()
         })
         .await
         .unwrap();
