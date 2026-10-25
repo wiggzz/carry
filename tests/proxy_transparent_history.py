@@ -126,6 +126,46 @@ class TransparentHistory(unittest.TestCase):
                 proxy.close()
         self.state = root
 
+    def test_rejected_feedback_does_not_cross_direction_or_namespace_on_same_paid_owner(self):
+        root = self.state
+        for boundary, fields in (("direction", {"instructions":"NEW_DIRECTION"}),
+                                 ("namespace", {"client_metadata":{"tenant_id":"other-tenant"}})):
+            with self.subTest(boundary=boundary):
+                self.state = root / boundary
+                self.state.mkdir()
+                fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"isolation_{boundary}_{n}")),
+                    lambda _b,_n:(200,advice_response({"protected":["g999"],"removable":[],"memories":[]})))
+                options = ["--review-replayed-history", "--payoff-requests", "1",
+                           "--classifier-cache-policy", "disabled"]
+                h = [{"role":"user","content":"ISOLATION_GOAL"},
+                     {"role":"assistant","content":"ISOLATION_SOURCE " + "payload " * 2000},
+                     {"role":"user","content":"ISOLATION_TASK"}]
+                # Explicit identity deliberately reuses the paid owner across a
+                # settings boundary; diagnostic compatibility is not owner ID.
+                proxy = Proxy(self.state, fixture, options)
+                self.stack.callback(proxy.close)
+                self.assertEqual(proxy.send(h)[0], 200)
+                self.assertEqual(proxy.send(h)[0], 200)
+                self.assertEqual(len(fixture.reviews), 2)
+                self.assertEqual(ledger(fixture.reviews[-1])["previous_review_feedback"]["rejected_count"], 1)
+                old_namespace = proxy.saved()["history_namespace"]
+                proxy.close()
+                proxy = Proxy(self.state, fixture, options)
+                self.stack.callback(proxy.close)
+                self.assertEqual(proxy.send(h, **fields)[0], 200)
+                self.assertEqual(len(fixture.reviews), 3)
+                retry = ledger(fixture.reviews[-1])
+                self.assertIsNone(retry["previous_review_feedback"], "another observation's diagnostic is private")
+                self.assertNotEqual(proxy.saved()["history_namespace"], old_namespace)
+                self.assertEqual(proxy.saved()["shadow"]["calls"], 3)
+                self.assertEqual(proxy.saved()["shadow"]["unavailable_cost_calls"], 0)
+                self.assertIn(h[1], fixture.primaries[-1]["input"])
+                self.evidence[boundary] = {"retry_ledger":retry,"settled":proxy.saved()}
+                print("REJECTED_FEEDBACK_ISOLATION=" + json.dumps({"boundary":boundary,
+                      "feedback":retry["previous_review_feedback"],"paid_calls":3}), flush=True)
+                proxy.close()
+        self.state = root
+
     def test_successive_memory_acceptances_then_retire_only_one_same_source_fact_on_raw_wires(self):
         facts = ["RETIRED_SAME_SOURCE_FACT", "SURVIVING_SAME_SOURCE_FACT", "LATER_CUMULATIVE_FACT"]
         def review(body,n):

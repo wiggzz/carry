@@ -67,7 +67,10 @@ impl Record {
 
     pub fn apply(&self, session: &mut Session) {
         session.completed_review_len = self.len;
-        session.review_feedback = self.feedback.clone();
+        if self.generation >= session.review_feedback_generation {
+            session.review_feedback = self.feedback.clone();
+            session.review_feedback_generation = self.generation;
+        }
         session.bootstrap_review_pending &= session
             .history
             .iter()

@@ -107,6 +107,9 @@ pub(super) struct Session {
     /// Only bounded item indexes/reasons, never rejected source text or raw advice.
     #[serde(default)]
     pub review_feedback: Value,
+    /// Diagnostics may advance without accepting a semantic advice record.
+    #[serde(default)]
+    pub review_feedback_generation: u64,
     #[serde(default)]
     pub review_epoch: u64,
     #[serde(default)]
@@ -345,6 +348,7 @@ impl Session {
         self.memory_anchors.clear();
         self.upstream_cache.clear();
         self.review_feedback = Value::Null;
+        self.review_feedback_generation = 0;
     }
 
     pub fn groups(&self) -> Vec<Group> {

@@ -1438,6 +1438,8 @@ async fn forward_request(
             // Conversation IDs belong to the observation's settings namespace,
             // not to a reusable explicit session file.
             session.history_conversation = None;
+            session.review_feedback = Value::Null;
+            session.review_feedback_generation = 0;
         }
         session.history_namespace = history_namespace;
         session.history_shared = implicit;
@@ -2254,6 +2256,12 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
         current.last_review_request = before.last_review_request;
         current.review_admission = reviewed.review_admission.clone();
         current.bootstrap_review_pending = false;
+        // A paid observation owns its bounded diagnostics even if every item
+        // was rejected. This does not publish a semantic completion at H.
+        if reviewed.review_feedback_generation > current.review_feedback_generation {
+            current.review_feedback = reviewed.review_feedback.clone();
+            current.review_feedback_generation = reviewed.review_feedback_generation;
+        }
     }
 }
 
@@ -2414,6 +2422,7 @@ async fn review_chunk(
     .ok()
     .flatten();
     let mut valid = false;
+    session.review_feedback_generation = session.review_epoch;
     session.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"review did not complete with a valid JSON advice object; return the required schema"}]});
     if let Some(value) = value {
         for (field, token) in crate::proxy_sse::safe_error(&value["error"])
