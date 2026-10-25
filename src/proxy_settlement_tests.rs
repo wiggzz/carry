@@ -75,7 +75,10 @@ async fn completed_h_crash_before_after_publication_and_failed_publication_keep_
             Some(if stage == "fault" { 0 } else { 73 }),
             "{output:?}"
         );
-        captures.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), captures.recv())
+            .await
+            .expect("reviewer transport capture deadline")
+            .unwrap();
         let mut service = checkpoint_service(directory.path());
         service.config.classifier_url = Some(url.clone());
         let durable = history::restore(&service, "crash-owner").unwrap();
@@ -109,7 +112,10 @@ async fn completed_h_crash_before_after_publication_and_failed_publication_keep_
             "retry".into(),
         )
         .await;
-        captures.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), captures.recv())
+            .await
+            .expect("reviewer transport capture deadline")
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while service
                 .background_reviews
@@ -162,8 +168,17 @@ async fn failed_known_receipt_settlement_releases_live_owner_pin_without_publish
         "failed-receipt".into(),
     )
     .await;
-    captures.recv().await.unwrap();
-    assert_eq!(waits.recv().await.unwrap(), id);
+    tokio::time::timeout(Duration::from_secs(10), captures.recv())
+        .await
+        .expect("reviewer transport capture deadline")
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), waits.recv())
+            .await
+            .expect("paid owner settlement wait deadline")
+            .unwrap(),
+        id
+    );
     let fault = directory.path().join(".history-index.tmp");
     std::fs::create_dir(&fault).unwrap();
     drop(lock);

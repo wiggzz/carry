@@ -35,7 +35,10 @@ async fn prospective_review_affinity_equals_actual_dispatch_after_restart_and_ke
         let prospective = review_body_projected(&service.config, &session, &projection);
         let mut run = ReviewRun::default();
         assert!(run_review(&service, "affinity", &mut session, &projection, &mut run).await);
-        let dispatched = captures.recv().await.unwrap();
+        let dispatched = tokio::time::timeout(Duration::from_secs(10), captures.recv())
+            .await
+            .expect("reviewer transport capture deadline")
+            .unwrap();
         assert_eq!(
             prospective, dispatched,
             "fit/pricing must use the actual affinity body"
@@ -72,7 +75,10 @@ async fn completed_review_waits_for_durable_paid_owner_before_publishing_capture
         "paid-boundary".into(),
     )
     .await;
-    captures.recv().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), captures.recv())
+        .await
+        .expect("reviewer transport capture deadline")
+        .unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(3), waits.recv())
             .await
