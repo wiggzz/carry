@@ -2761,6 +2761,23 @@ fn merge_review(
     current.partial_reviews += reviewed
         .partial_reviews
         .saturating_sub(before.partial_reviews);
+    // Publication owns the immutable dispatch subject, not whichever history
+    // the accounting owner reached while HTTP was in flight. Keep the complete
+    // observed frontier even when only an older source was cited by a fact.
+    let mut completed = reviewed.clone();
+    completed.fork_points.clear();
+    forking::publish(
+        config,
+        &mut completed,
+        before,
+        !run.batches.is_empty() && !run.publication_rejected,
+    );
+    for point in completed.fork_points {
+        if !current.fork_points.iter().any(|old| old.id == point.id) {
+            current.fork_points.push(point);
+        }
+    }
+    forking::prune(config, current);
     let groups = current
         .groups()
         .into_iter()

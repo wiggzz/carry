@@ -71,6 +71,61 @@ class TransparentHistory(unittest.TestCase):
         self.stack.callback(proxy.close)
         return proxy
 
+    def test_exact_original_review_survives_advanced_owner_and_restart(self):
+        """Completed H advice belongs to H, not its worker's now-advanced owner."""
+        import threading
+        held, release = threading.Event(), threading.Event()
+        self.stack.callback(release.set)
+
+        def review(body, n):
+            self.assertEqual(n, 1, "one captured-H worker, no synchronous rescue")
+            held.set()
+            self.assertTrue(release.wait(10), "release the actual held HTTP review")
+            self.assertIn("g2", ledger(body)["eligible_group_ids"])
+            return 200, advice_response({"protected": [], "removable": ["g2"],
+                "memories": [{"source_ids": ["g2"], "text": "EXACT_H_FACT"}]})
+
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"exact_h_{n}")), review)
+        options = ["--review-replayed-history", "--payoff-requests", "1",
+                   "--classifier-cache-policy", "disabled", "--background-reviews=true"]
+        proxy = self.proxy(fixture, options)
+        history = [{"role": "user", "content": "KEEP_ORIGINAL_GOAL"},
+                   {"role": "assistant", "content": "EXACT_H_SOURCE " + "payload " * 6000},
+                   {"role": "user", "content": "H_BOUNDARY"}]
+        self.assertEqual(proxy.send(history)[0], 200, "ordinary primary cannot wait for review")
+        self.assertTrue(held.wait(3), "real reviewer must be held before advancement")
+        advanced = history + [{"role": "user", "content": "A_ONLY"}]
+        self.assertEqual(proxy.send(advanced)[0], 200)
+        self.assertEqual(len(fixture.primaries), 2, "H+A completed before H review release")
+        release.set()
+        deadline = time.monotonic() + 5
+        while proxy.checkpoint(advanced)[1].get("background_review_pending"):
+            self.assertLess(time.monotonic(), deadline, "captured H completion must settle")
+            time.sleep(.01)
+        settled = proxy.checkpoint(advanced)[1]
+        self.assertEqual(settled["shadow"]["calls"], 1, "paid review settles once")
+        proxy.close()
+        options = ["--review-every-requests", "100", "--payoff-requests", "1",
+                   "--classifier-cache-policy", "disabled"]
+        proxy = self.proxy(fixture, options)
+        wires = []
+        for suffix in ("B_ONLY", "C_ONLY"):
+            child = history + [{"role": "user", "content": suffix}]
+            self.assertEqual(proxy.send(child)[0], 200)
+            sent = fixture.primaries[-1]["input"]
+            wires.append(sent)
+            self.evidence.update(settled=settled, primary_inputs=wires,
+                                 reviewer_requests=fixture.reviews)
+            self.assertNotIn(history[1], sent,
+                "exact original H advice must be reusable after H+A advancement/restart")
+            self.assertIn("EXACT_H_FACT", json.dumps(sent))
+            self.assertNotIn("A_ONLY", json.dumps(sent))
+            self.assertIn(history[0], sent)
+            _, state = proxy.checkpoint(child)
+            self.assertEqual(state["primary"]["calls"], 1)
+            self.assertEqual(state["shadow"]["calls"], 0, "no sibling billed receipt inheritance")
+        self.assertEqual(len(fixture.reviews), 1)
+
     def branch_selection(self, background=True, partial=True, restart=False, held_review=False,
                          auxiliary_requests=1, legacy_tip=False):
         import threading

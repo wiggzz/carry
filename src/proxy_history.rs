@@ -592,6 +592,19 @@ pub(super) fn committed(
     // version at the same cut before an auxiliary branch displaces the live tip.
     let key = keys.last().unwrap_or(namespace);
     index.reviews.insert(key.clone(), vec![selection]);
+    // Completed workers retain their own exact original cut. An owner may now
+    // be at H+A, but its H record must remain discoverable by H+B/H+C.
+    for point in &session.fork_points {
+        if point.sources.len() <= keys.len() {
+            let cut = point
+                .sources
+                .len()
+                .checked_sub(1)
+                .map(|end| &keys[end])
+                .unwrap_or(namespace);
+            index.reviews.insert(cut.clone(), vec![point.clone()]);
+        }
+    }
     if session.history_shared {
         index.snapshots.insert(id.into(), compact(session));
     }
