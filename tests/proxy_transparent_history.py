@@ -71,6 +71,80 @@ class TransparentHistory(unittest.TestCase):
         self.stack.callback(proxy.close)
         return proxy
 
+    def test_paid_primary_output_outgrows_index_preserves_exact_receipt_without_publishing_id(self):
+        def primary(_body, n):
+            response = completed(response_id=f"paid_growth_{n}")
+            if n == 1:
+                response["output"] = [{"type":"message","role":"assistant","content":[
+                    {"type":"output_text","text":"UNPUBLISHED_LARGE_RESULT_" + "x" * 200000}]}]
+            return 200, response
+        fixture = self.fixture(primary, lambda _b,_n: (200,advice_response({"protected":[],"removable":[],"memories":[]})))
+        options = ["--history-max-bytes","100000","--review-every-requests","100"]
+        h = [{"role":"user","content":"fit before paid dispatch"}]
+        proxy = self.proxy(fixture,options)
+        self.assertEqual(proxy.send(h)[0],200)
+        deadline = time.monotonic() + 5
+        while True:
+            index = json.loads((self.state / "history.index").read_text())
+            snapshots = list(index["snapshots"].values())
+            if snapshots and not snapshots[0]["primary_pending"]: break
+            self.assertLess(time.monotonic(),deadline)
+            time.sleep(.01)
+        self.assertEqual(snapshots[0]["primary"]["calls"],1)
+        self.assertEqual(snapshots[0]["primary"]["input_tokens"],100)
+        self.assertNotIn("UNPUBLISHED_LARGE_RESULT_",json.dumps(index))
+        self.assertNotIn("paid_growth_1",[v["external_id"] for v in index["transcripts"].values()])
+        self.assertEqual(proxy.request("POST","/v1/responses",{"model":"gpt-6-luna","previous_response_id":"paid_growth_1","input":[]})[0],409)
+        proxy.close()
+        proxy = self.proxy(fixture,options)
+        self.assertEqual(proxy.send(h)[0],200)
+        self.assertEqual(proxy.saved()["primary"]["calls"],2)
+        self.assertEqual(proxy.saved()["primary"]["input_tokens"],200)
+        self.assertEqual(len(fixture.primaries),2)
+        self.evidence.update(before_restart=snapshots[0],after_restart=proxy.saved())
+
+    def test_terminal_reviewer_receipt_write_failure_restarts_unknown_without_advice_or_double_charge(self):
+        def review(_body, _n):
+            fixture.held.set()
+            self.assertTrue(fixture.release.wait(10))
+            return 200, advice_response({"protected":[],"removable":["g2"],"memories":[{"source_ids":["g2"],"text":"MUST_NOT_PUBLISH_UNSETTLED_FACT"}]})
+        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"receipt_fault_{n}")),review)
+        options = ["--review-replayed-history","--classifier-cache-policy","disabled","--payoff-requests","1"]
+        h = [{"role":"user","content":"goal"},{"role":"assistant","content":"source " * 1000},{"role":"user","content":"task"}]
+        proxy = self.proxy(fixture,options,wait_reviews=False)
+        self.assertEqual(proxy.send(h,wait=False)[0],200)
+        self.assertTrue(fixture.held.wait(5))
+        # Primary is complete and canonical before breaking only the completed
+        # review's receipt publication. The provider then sends its real terminal.
+        deadline = time.monotonic()+5
+        while proxy.saved().get("primary_pending"):
+            self.assertLess(time.monotonic(),deadline); time.sleep(.01)
+        fault = self.state / ".history-index.tmp"
+        fault.mkdir()
+        fixture.release.set()
+        deadline = time.monotonic()+5
+        while not any('"background_review_merged"' in p.read_text() and '"receipt_durable":false' in p.read_text()
+                      for p in (self.state / "diagnostics").glob("*.jsonl")):
+            self.assertLess(time.monotonic(),deadline); time.sleep(.01)
+        index = json.loads((self.state / "history.index").read_text())
+        self.assertFalse(index["reviews"])
+        paid = list(index["snapshots"].values())[0]
+        self.assertTrue(paid["background_review_pending"])
+        self.assertEqual(paid["shadow"]["calls"],0, "uncommitted receipt is explicitly unknown, never silently known-zero")
+        proxy.close()
+        fault.rmdir()
+        proxy = self.proxy(fixture,["--review-every-requests","100"])
+        self.assertEqual(proxy.send(h)[0],200)
+        stats = proxy.request("GET","/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
+        self.assertGreaterEqual(stats["coverage"]["prior_untracked_calls"],1)
+        self.assertIsNone(stats["carry_cost"])
+        self.assertEqual(len(fixture.reviews),1)
+        self.assertNotIn("MUST_NOT_PUBLISH_UNSETTLED_FACT",json.dumps(fixture.primaries[-1]))
+        self.assertEqual(proxy.saved()["shadow"]["calls"],1)
+        self.assertEqual(proxy.saved()["shadow"]["unavailable_cost_calls"],1)
+        self.assertEqual(proxy.saved()["primary"]["calls"],2)
+        self.evidence.update(canonical_unknown=paid,restarted=proxy.saved(),stats=stats)
+
     def test_reviewer_cache_identity_tracks_actual_fallback_credential_after_restart(self):
         def review(_body, _n):
             response = advice_response({"protected": [], "removable": [], "memories": []})

@@ -1571,6 +1571,27 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     assert!(!sent.to_string().contains("DISCARD_SOURCE_PAYLOAD_"));
     assert!(!sent.to_string().contains("opaque-reasoning"));
     assert!(sent.to_string().contains("both tools succeeded"));
+    // The primary response is deliberately independent of its reviewer. Wait
+    // for this owner's paid settlement before comparing completed coverage to
+    // the provider's inbound call count; do not make forwarding synchronous.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let states = std::fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .map(|entry| {
+                    serde_json::from_slice::<Value>(&std::fs::read(entry.path()).unwrap()).unwrap()
+                })
+                .collect::<Vec<_>>();
+            if states.len() == 1 && states[0]["background_review_pending"] != true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(
         sent["input"][1],
         json!({"role":"user","content":"[Earlier conversation omitted by Carry; retained messages remain in original order.]"})
@@ -3274,37 +3295,101 @@ async fn client_turn_metadata_preserves_proxy_session_and_reviewer_affinity() {
 
 #[tokio::test]
 async fn reviewer_transport_preserves_encrypted_reasoning_and_native_tool_pairs() {
-    let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
-    let state = tempfile::tempdir().unwrap();
-    let (_proxy, url) = start_proxy_options(
-        state.path(),
-        fixture.address,
-        "audit",
-        &["--classifier-cache-policy", "openai-explicit"],
-        "",
-    )
-    .await;
     let reasoning = json!({"type":"reasoning","id":"rs_fixture","encrypted_content":"ENCRYPTED_NATIVE_FIXTURE","summary":[]});
     let call = json!({"type":"function_call","id":"fc_fixture","call_id":"native_pair","name":"inspect","arguments":"{}"});
     let result = json!({"type":"function_call_output","call_id":"native_pair","output":"native evidence ".repeat(3000)});
-    let request = json!({"model":"gpt-6.1-sol","input":[{"role":"user","content":"goal"},reasoning.clone(),call.clone(),result.clone(),{"role":"user","content":"current"}]});
-    let response = reqwest::Client::new()
-        .post(format!("{url}/v1/responses"))
-        .json(&request)
-        .send()
-        .await
-        .unwrap();
-    assert!(response.status().is_success());
-    response.bytes().await.unwrap();
-    settled(state.path()).await;
-    let reviews = fixture.reviews.lock().await;
-    assert_eq!(reviews[0]["model"], "gpt-6-luna");
-    let input = reviews[0]["input"].as_array().unwrap();
-    assert!(input.contains(&reasoning));
-    assert!(input.contains(&call));
-    assert!(input.contains(&result));
-    let forwarded = fixture.requests.lock().await;
-    assert_eq!(forwarded[0]["input"], request["input"]);
+    let custom = json!({"type":"custom_tool_call","id":"custom_fixture","call_id":"custom_pair","name":"inspect_custom","input":"unaltered source\n雪"});
+    let custom_result = json!({"type":"custom_tool_call_output","call_id":"custom_pair","output":"custom evidence \"quoted\""});
+    let opaque = json!({"type":"future_native_payload","id":"opaque_fixture","payload":{"nested":["retain",3]}});
+    for (native, visible, withheld) in [
+        (
+            vec![reasoning.clone(), call.clone(), result.clone()],
+            vec![reasoning.clone(), call.clone(), result.clone()],
+            vec![],
+        ),
+        (
+            vec![
+                reasoning.clone(),
+                call.clone(),
+                custom.clone(),
+                result.clone(),
+                custom_result.clone(),
+            ],
+            vec![
+                reasoning.clone(),
+                call.clone(),
+                custom.clone(),
+                result.clone(),
+                custom_result.clone(),
+            ],
+            vec![],
+        ),
+        (
+            vec![
+                reasoning.clone(),
+                call.clone(),
+                custom.clone(),
+                result.clone(),
+            ],
+            vec![],
+            vec![
+                reasoning.clone(),
+                call.clone(),
+                custom.clone(),
+                result.clone(),
+            ],
+        ),
+        (
+            vec![opaque.clone()],
+            vec![json!({"role":"user","content":json!({"quoted_opaque_item":opaque}).to_string()})],
+            vec![opaque.clone()],
+        ),
+    ] {
+        let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
+        let state = tempfile::tempdir().unwrap();
+        let (_proxy, url) = start_proxy_options(
+            state.path(),
+            fixture.address,
+            "audit",
+            &["--classifier-cache-policy", "openai-explicit"],
+            "",
+        )
+        .await;
+        let mut input = vec![json!({"role":"user","content":"goal"})];
+        input.extend(native);
+        input.push(json!({"role":"user","content":"current"}));
+        let request = json!({"model":"gpt-6.1-sol","input":input});
+        let response = reqwest::Client::new()
+            .post(format!("{url}/v1/responses"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        response.bytes().await.unwrap();
+        settled(state.path()).await;
+        let reviews = fixture.reviews.lock().await;
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0]["model"], "gpt-6-luna");
+        let wire_input = reviews[0]["input"].as_array().unwrap();
+        let mut offset = 0;
+        for item in visible {
+            let position = wire_input[offset..]
+                .iter()
+                .position(|v| *v == item)
+                .expect("native/quoted item must reach actual reviewer unchanged and in order")
+                + offset;
+            offset = position + 1;
+        }
+        for item in withheld {
+            assert!(
+                !wire_input.contains(&item),
+                "incomplete cohort/opaque native item cannot be replayed"
+            );
+        }
+        let forwarded = fixture.requests.lock().await;
+        assert_eq!(forwarded[0]["input"], request["input"]);
+    }
 }
 
 #[tokio::test]

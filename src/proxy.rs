@@ -310,18 +310,20 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
     if let Some(url) = &config.classifier_url {
         validate_url(url)?;
     }
-    fn key_identity(name: &str, fallback: Option<&str>) -> String {
-        let value = std::env::var(name)
+    // Resolve each transport credential once. Cache identity must describe the
+    // credential actually sent, including blank overrides and custom reviewers.
+    let key = |name| {
+        std::env::var(name)
             .ok()
-            .or_else(|| fallback.and_then(|n| std::env::var(n).ok()))
-            .unwrap_or_default();
-        format!("{:x}", Sha256::digest(value.as_bytes()))
-    }
-    config.primary_cache_auth = key_identity("CARRY_PROXY_UPSTREAM_KEY", Some("OPENAI_API_KEY"));
-    config.reviewer_cache_auth = std::env::var("CARRY_PROXY_CLASSIFIER_KEY")
-        .ok()
-        .map(|key| format!("{:x}", Sha256::digest(key.as_bytes())))
-        .unwrap_or_else(|| config.primary_cache_auth.clone());
+            .filter(|key| !key.trim().is_empty())
+    };
+    let default_key = key("OPENAI_API_KEY");
+    let upstream_key = key("CARRY_PROXY_UPSTREAM_KEY").or_else(|| default_key.clone());
+    let classifier_key = key("CARRY_PROXY_CLASSIFIER_KEY").or(default_key);
+    let key_identity =
+        |key: Option<&str>| format!("{:x}", Sha256::digest(key.unwrap_or("").as_bytes()));
+    config.primary_cache_auth = key_identity(upstream_key.as_deref());
+    config.reviewer_cache_auth = key_identity(classifier_key.as_deref());
     if config.codex_login {
         let credential = crate::auth::load_auth(config.codex_home.as_ref().unwrap())
             .await?
@@ -368,22 +370,8 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
     }
     let service = Arc::new(Service {
         catalog: Arc::new(tokio::sync::OnceCell::new()),
-        upstream_key: std::env::var("CARRY_PROXY_UPSTREAM_KEY")
-            .ok()
-            .filter(|key| !key.trim().is_empty())
-            .or_else(|| {
-                std::env::var("OPENAI_API_KEY")
-                    .ok()
-                    .filter(|key| !key.trim().is_empty())
-            }),
-        classifier_key: std::env::var("CARRY_PROXY_CLASSIFIER_KEY")
-            .ok()
-            .filter(|key| !key.trim().is_empty())
-            .or_else(|| {
-                std::env::var("OPENAI_API_KEY")
-                    .ok()
-                    .filter(|key| !key.trim().is_empty())
-            }),
+        upstream_key,
+        classifier_key,
         auth_token,
         client: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -1679,9 +1667,6 @@ async fn forward_request(
             if run.accepted {
                 session.completed_review_len = session.history.len();
             }
-            if run.accepted {
-                let _ = history::publish(&bounded, &session, &session);
-            }
             journal(
                 &service,
                 &id,
@@ -1697,6 +1682,9 @@ async fn forward_request(
                     "review settlement failed",
                 )
             })?;
+            if run.accepted {
+                let _ = history::publish(&bounded, &session, &session);
+            }
             (candidate, report) = plan(&service.config, &session, &outbound);
             acquired = true;
             let _ = before;
@@ -2005,7 +1993,7 @@ fn review_body_with_input(config: &ProxyCli, session: &Session, input: Vec<Value
         // Keep the stable preamble for checkpoint/cache-prefix compatibility.
         "input": std::iter::once(json!({"role": "user", "content": "Return JSON."})).chain(input).collect::<Vec<_>>(),
         "store": false, "stream": false,
-        "prompt_cache_key": session.review_cache_key,
+        "prompt_cache_key": session.review_context["prompt_cache_key"].as_str().unwrap_or("carry-review"),
         "reasoning": {"effort": config.classifier_reasoning_effort},
         "max_output_tokens": config.classifier_max_output_tokens,
         "text": {"format": {
@@ -2165,31 +2153,41 @@ async fn dispatch_review_for(
             ..ReviewRun::default()
         };
         run_review(&service, &id, &mut reviewed, &projection, &mut run).await;
-        // Publish exact H independently of the paid owner's current frontier.
-        // Even an empty accepted record supersedes older facts at this cut.
-        if run.accepted
-            && let Err(error) = history::publish(&service, &before, &reviewed)
-        {
-            journal(
-                &service,
-                &id,
-                &run.request_id,
-                "review_publication_failed",
-                &json!({"kind":format!("{:?}",error.kind())}),
-            );
-        }
         let _lock = session_lock(&service, &id).await;
         if let Ok(mut current) = load_existing(&service, &id) {
             settle_review(&mut current, &before, &reviewed, &run);
-            if save(&service, &id, &current).is_err() {
-                let _ = save_paid_accounting(&service, &id, &current);
-            }
+            let settled = save(&service, &id, &current)
+                .or_else(|_| save_paid_accounting(&service, &id, &current))
+                .is_ok();
+            // Reusable completion cannot precede its known durable receipt.
+            // The paid owner may have advanced; semantic authority still keys H.
+            #[cfg(test)]
+            tests::publication_crash_barrier(&service, "before");
+            let published = if run.accepted && settled {
+                match history::publish(&service, &before, &reviewed) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        journal(
+                            &service,
+                            &id,
+                            &run.request_id,
+                            "review_publication_failed",
+                            &json!({"kind":format!("{:?}",error.kind())}),
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            #[cfg(test)]
+            tests::publication_crash_barrier(&service, "after");
             journal(
                 &service,
                 &id,
                 &run.request_id,
                 "background_review_merged",
-                &json!({"exact_prefix_published":run.accepted,"receipt_count":run.receipts.len()}),
+                &json!({"exact_prefix_published":published,"receipt_durable":settled,"receipt_count":run.receipts.len()}),
             );
         }
         service.background_reviews.lock().await.remove(&id);
@@ -2258,10 +2256,6 @@ async fn run_review(
     projection: &planning::Projection,
     run: &mut ReviewRun,
 ) -> bool {
-    session.review_cache_key = session.review_context["prompt_cache_key"]
-        .as_str()
-        .unwrap_or("carry-review")
-        .to_owned();
     let body = review_body_projected(&service.config, session, projection);
     if !review_fits(&service.config, &body) {
         return false;
@@ -3723,7 +3717,11 @@ mod tests {
         assert!(!directory.path().join(format!(".{id}.tmp")).exists());
     }
 
+    mod catalog_controls {
+        include!("proxy_catalog_tests.rs");
+    }
     include!("proxy_catalog_isolation_tests.rs");
+    include!("proxy_settlement_tests.rs");
     include!("proxy_semantic_tests.rs");
     include!("proxy_pr154_tests.rs");
     include!("proxy_log_controls.rs");

@@ -47,10 +47,14 @@ pub(super) fn plan(
             &config.primary_cache_auth,
             now(),
         ) {
+            // The subscription adapter moves leading native direction items
+            // into instructions. Include those base-bound members plus the
+            // actual wire prefix, not the same count of canonical positions.
+            let leading = canonical.input.len() - wire["input"].as_array().unwrap().len();
             let ids = session
                 .history
                 .iter()
-                .take(entry.input_len)
+                .take(leading + entry.input_len)
                 .map(|i| i.id)
                 .collect::<HashSet<_>>();
             options.push(ids);

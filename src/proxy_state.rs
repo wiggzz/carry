@@ -127,7 +127,6 @@ pub(super) struct Session {
     /// historical ledgers/scenarios keep their original legacy interpretation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_resolution_history: Vec<carry::models::ResolvedPair>,
-    pub review_cache_key: String,
     pub review_context: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_namespace: Option<String>,
