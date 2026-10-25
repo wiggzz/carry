@@ -72,9 +72,8 @@ async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
     .unwrap()
     .cache;
     let record = semantic::Record::capture(&session);
-    let mut restored: Session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap())
-        .unwrap()
-        .with_scenario_cache_policy();
+    let mut restored: Session =
+        serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
     record.apply(&mut restored);
     restored.upstream_cache = history::cache(&service).unwrap();
     assert_eq!(restored.primary.cost_usd, session.primary.cost_usd);
