@@ -64,6 +64,7 @@ impl Record {
     }
 
     pub fn apply(&self, session: &mut Session) {
+        session.completed_review_len = self.len;
         let groups = session.groups();
         // Original member unions may span several canonical groups after a
         // projected separator omission. Require the entire native closure now;

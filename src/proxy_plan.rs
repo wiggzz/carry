@@ -158,7 +158,10 @@ pub(super) fn plan(
 /// One genuine no-fit acquisition, never an ordinary primary wait. The
 /// optimistic fit is only an admission test; it grants no removal authority.
 pub(super) fn acquisition_plausible(config: &ProxyCli, session: &Session, body: &Value) -> bool {
-    if primary_fits(config, body) || session.background_review_pending {
+    if primary_fits(config, body)
+        || session.background_review_pending
+        || session.completed_review_len >= session.history.len()
+    {
         return false;
     }
     let omitted = session

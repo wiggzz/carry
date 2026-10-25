@@ -1679,12 +1679,23 @@ async fn forward_request(
             bounded.config.classifier_timeout_secs = bounded.config.classifier_timeout_secs.min(5);
             let before = session.clone();
             session.review_epoch = next_review_generation();
+            session.background_review_pending = true;
+            save(&service, &id, &session).map_err(|_| {
+                failure(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "cannot reserve exceptional review",
+                )
+            })?;
             let mut run = ReviewRun {
                 request_id: request_id.clone(),
                 ..ReviewRun::default()
             };
             let projection = planning::Projection::canonical(&session);
             run_review(&bounded, &id, &mut session, &projection, &mut run).await;
+            session.background_review_pending = false;
+            if run.accepted {
+                session.completed_review_len = session.history.len();
+            }
             if run.accepted {
                 let _ = history::publish(&bounded, &session, &session);
             }
@@ -2107,7 +2118,6 @@ fn numeric_review_usage(usage: &Value) -> Value {
     result
 }
 
-#[cfg(test)]
 static REVIEW_GENERATION: AtomicU64 = AtomicU64::new(0);
 fn next_review_generation() -> u64 {
     let clock = SystemTime::now()
@@ -2824,7 +2834,6 @@ fn review_fits(config: &ProxyCli, body: &Value) -> bool {
         && reviewer_required_tokens(config, body) <= config.classifier_max_input_tokens as f64
 }
 
-#[cfg(test)]
 fn primary_rates(config: &ProxyCli, model: &str, input: f64) -> Option<Rates> {
     match &config.model_resolution {
         Some(pair) if pair.primary.model == model => pair.primary.rates_for_input(input),

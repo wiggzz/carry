@@ -71,6 +71,8 @@ pub(super) struct Session {
     pub native_checkpoint: Vec<Value>,
     #[serde(skip)]
     pub opinions: BTreeMap<u64, String>,
+    #[serde(skip)]
+    pub completed_review_len: usize,
     /// A drop authorizes exactly the native membership actually reviewed.
     /// Legacy opinions without this provenance remain protective, never drops.
     #[serde(default)]

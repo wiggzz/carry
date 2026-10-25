@@ -110,6 +110,8 @@ class TransparentHistory(unittest.TestCase):
         # planner result. Every outgoing body is still rendered by the real CLI.
         path = self.state / "history.index"
         index = json.loads(path.read_text())
+        for entry in index.get("upstream_cache", []):
+            entry["at"] = 1
         for snapshot in index["snapshots"].values():
             for field in ("primary_cache", "reviewer_cache", "upstream_cache"):
                 for entry in snapshot.get(field, []):
@@ -181,6 +183,23 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(original+[{"role":"user","content":"sibling"}])[0],200)
         self.evidence.update(index=index,primaries=fixture.primaries)
         self.assertNotIn(original[1],fixture.primaries[-1]["input"],"seven-day review retention must not expire after one day")
+
+    def test_no_fit_acquires_one_bounded_review_before_primary(self):
+        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"fit_{n}")),
+            lambda _b,n: (200,advice_response({"protected":[],"removable":["g2"],"memories":[]})))
+        h = [{"role":"user","content":"goal"},{"role":"assistant","content":"bulky output " * 12000},
+             {"role":"user","content":"current task"}]
+        proxy = self.proxy(fixture,["--review-every-requests","100","--classifier-cache-policy","disabled"])
+        self.assertEqual(proxy.send(h)[0],200)
+        self.assertEqual(len(fixture.reviews),0)
+        proxy.close()
+        proxy = self.proxy(fixture,["--review-every-requests","100","--classifier-cache-policy","disabled",
+            "--primary-context-tokens","5000","--primary-output-reserve-tokens","1","--context-margin-percent","0"])
+        self.assertEqual(proxy.send(h)[0],200,"genuine no-fit may acquire one useful review before primary")
+        self.assertEqual(len(fixture.reviews),1)
+        self.assertNotIn(h[1],fixture.primaries[-1]["input"])
+        self.assertEqual(proxy.saved()["shadow"]["calls"],1)
+        self.evidence.update(primaries=fixture.primaries,reviews=fixture.reviews,state=proxy.saved())
 
     def test_exact_original_review_survives_advanced_owner_and_restart(self):
         """Completed H advice belongs to H, not its worker's now-advanced owner."""
