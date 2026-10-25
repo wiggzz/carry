@@ -54,6 +54,7 @@ class Fixture:
         self.review = review
         self.primaries = []
         self.reviews = []
+        self.review_auth_hashes = []
         self.errors = []
         self.release = threading.Event()
         self.held = threading.Event()
@@ -69,6 +70,9 @@ class Fixture:
                 try:
                     body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                     if self.path == "/review":
+                        import hashlib
+                        credential = self.headers.get("Authorization", "").removeprefix("Bearer ")
+                        fixture.review_auth_hashes.append(hashlib.sha256(credential.encode()).hexdigest())
                         fixture.reviews.append(body)
                         result = fixture.review(body, len(fixture.reviews))
                     elif self.path == "/v1/responses":

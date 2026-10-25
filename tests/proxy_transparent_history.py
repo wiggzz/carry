@@ -71,6 +71,34 @@ class TransparentHistory(unittest.TestCase):
         self.stack.callback(proxy.close)
         return proxy
 
+    def test_reviewer_cache_identity_tracks_actual_fallback_credential_after_restart(self):
+        def review(_body, _n):
+            response = advice_response({"protected": [], "removable": [], "memories": []})
+            response["usage"] = {"input_tokens": 10000, "output_tokens": 1,
+                                 "input_tokens_details": {"cached_tokens": 9000}}
+            return 200, response
+        fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"auth_{n}")), review)
+        history = [{"role": "user", "content": "synthetic credential control " * 3000}]
+        identities = []
+        for default, override in (("default-B", ""), ("default-C", ""),
+                                  ("default-C", "  "), ("default-C", "explicit-D")):
+            proxy = TransparentProxy(self.state, fixture,
+                ["--review-replayed-history", "--classifier-cache-policy", "openai-explicit"],
+                extra_env={"CARRY_PROXY_UPSTREAM_KEY": "upstream-A",
+                           "CARRY_PROXY_CLASSIFIER_KEY": override, "OPENAI_API_KEY": default})
+            self.stack.callback(proxy.close)
+            self.assertEqual(proxy.send(history)[0], 200)
+            index = json.loads((self.state / "history.index").read_text())
+            latest = [entry for entry in index["upstream_cache"]
+                      if entry["credential_sha256"] == fixture.review_auth_hashes[-1]]
+            self.evidence.update(cache=index["upstream_cache"], actual_auth_hashes=fixture.review_auth_hashes)
+            self.assertTrue(latest, "cache identity must hash the credential actually sent, not primary fallback")
+            identities.append(fixture.review_auth_hashes[-1])
+            proxy.close()
+        self.assertNotEqual(identities[0], identities[1])
+        self.assertEqual(identities[1], identities[2], "blank override uses the actual default")
+        self.assertNotEqual(identities[2], identities[3])
+
     def test_request_projection_can_restore_genuinely_rewarmed_original_source(self):
         """A past cold omission is an audit event, never semantic removal authority."""
         def primary(body, n):

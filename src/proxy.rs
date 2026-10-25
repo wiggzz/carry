@@ -310,13 +310,13 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
     if let Some(url) = &config.classifier_url {
         validate_url(url)?;
     }
-    let key_identity = |name: &str, fallback: Option<&str>| {
+    fn key_identity(name: &str, fallback: Option<&str>) -> String {
         let value = std::env::var(name)
             .ok()
             .or_else(|| fallback.and_then(|n| std::env::var(n).ok()))
             .unwrap_or_default();
         format!("{:x}", Sha256::digest(value.as_bytes()))
-    };
+    }
     config.primary_cache_auth = key_identity("CARRY_PROXY_UPSTREAM_KEY", Some("OPENAI_API_KEY"));
     config.reviewer_cache_auth = std::env::var("CARRY_PROXY_CLASSIFIER_KEY")
         .ok()
@@ -1627,8 +1627,8 @@ async fn forward_request(
         session.drop_members.clear();
         session.memories.clear();
         session.memory_anchors.clear();
-        if let Some(namespace) = &session.history_namespace {
-            if let Some(record) =
+        if let Some(namespace) = &session.history_namespace
+            && let Some(record) =
                 history::advice(&service, namespace, body["input"].as_array().unwrap()).map_err(
                     |_| {
                         failure(
@@ -1637,9 +1637,8 @@ async fn forward_request(
                         )
                     },
                 )?
-            {
-                record.apply(&mut session);
-            }
+        {
+            record.apply(&mut session);
         }
         let active = !native && service.config.mode != Mode::Off;
         if active {
@@ -2035,13 +2034,12 @@ fn review_body_with_input(config: &ProxyCli, session: &Session, input: Vec<Value
         let input = body["input"].as_array_mut().unwrap();
         // The final ledger is mutable advice state, not a stable observation.
         let boundary = input.len().saturating_sub(2);
-        if let Some(last) = input.get_mut(boundary) {
-            if let Some(block) = last["content"]
+        if let Some(last) = input.get_mut(boundary)
+            && let Some(block) = last["content"]
                 .as_array_mut()
                 .and_then(|blocks| blocks.last_mut())
-            {
-                block["prompt_cache_breakpoint"] = json!({"mode":"explicit"});
-            }
+        {
+            block["prompt_cache_breakpoint"] = json!({"mode":"explicit"});
         }
     }
     if config.codex_login && config.classifier_url.is_none() {
@@ -2169,16 +2167,16 @@ async fn dispatch_review_for(
         run_review(&service, &id, &mut reviewed, &projection, &mut run).await;
         // Publish exact H independently of the paid owner's current frontier.
         // Even an empty accepted record supersedes older facts at this cut.
-        if run.accepted {
-            if let Err(error) = history::publish(&service, &before, &reviewed) {
-                journal(
-                    &service,
-                    &id,
-                    &run.request_id,
-                    "review_publication_failed",
-                    &json!({"kind":format!("{:?}",error.kind())}),
-                );
-            }
+        if run.accepted
+            && let Err(error) = history::publish(&service, &before, &reviewed)
+        {
+            journal(
+                &service,
+                &id,
+                &run.request_id,
+                "review_publication_failed",
+                &json!({"kind":format!("{:?}",error.kind())}),
+            );
         }
         let _lock = session_lock(&service, &id).await;
         if let Ok(mut current) = load_existing(&service, &id) {

@@ -1,4 +1,5 @@
 // Direct controls for the prefix-advice/request-projection model.
+include!("proxy_review_boundary_tests.rs");
 #[tokio::test]
 async fn reviewer_deadline_includes_subscription_auth_wait_and_censors_spend() {
     let directory = tempfile::tempdir().unwrap();

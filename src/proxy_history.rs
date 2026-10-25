@@ -401,12 +401,11 @@ pub(super) fn resolve(
         .rev()
         .chain(std::iter::once(&namespace.to_owned()))
     {
-        if let Some(reference) = index.tips.get(key) {
-            if let Some(snapshot) = index.snapshots.get(&reference.session) {
-                if snapshot.history.len() <= input.len() {
-                    return Ok((reference.session.clone(), pin(service, &reference.session)?));
-                }
-            }
+        if let Some(reference) = index.tips.get(key)
+            && let Some(snapshot) = index.snapshots.get(&reference.session)
+            && snapshot.history.len() <= input.len()
+        {
+            return Ok((reference.session.clone(), pin(service, &reference.session)?));
         }
     }
     reserve(service, hash(&(namespace, keys.last())), &occupied)
