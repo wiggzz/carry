@@ -1825,8 +1825,42 @@ fn checkpoint_states(path: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-// Legacy advice/receipt assertions run only after the primary body is read.
-// This is fixture synchronization, not primary admission or a rescue review.
+// A receipt clears paid-pending before H publication. Synchronize on the real
+// worker completion event, then assert authority only from the canonical store.
+fn worker_publications_finished(path: &std::path::Path) -> bool {
+    let Ok(files) = std::fs::read_dir(path.join("diagnostics")) else {
+        return true; // fail-open diagnostic-I/O fixtures have no event lane
+    };
+    let events: Vec<serde_json::Value> = files
+        .filter_map(Result::ok)
+        .filter_map(|file| std::fs::read_to_string(file.path()).ok())
+        .flat_map(|text| {
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let current = events
+        .iter()
+        .filter_map(|event| event["request_id"].as_str())
+        .max_by_key(|id| id.split('-').nth(1).and_then(|v| v.parse::<u128>().ok()));
+    let Some(pid) = current.and_then(|id| id.split('-').next()) else {
+        return true;
+    };
+    let merged: std::collections::HashSet<_> = events
+        .iter()
+        .filter(|event| event["event"] == "background_review_merged")
+        .filter_map(|event| event["request_id"].as_str())
+        .collect();
+    events
+        .iter()
+        .filter(|event| event["event"] == "background_review_dispatched")
+        .filter_map(|event| event["request_id"].as_str())
+        .filter(|id| id.split('-').next() == Some(pid))
+        .all(|id| merged.contains(id))
+}
+
+// Advice/receipt assertions run only after the primary body is consumed.
 async fn settled(path: &std::path::Path) -> Vec<serde_json::Value> {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -1834,6 +1868,7 @@ async fn settled(path: &std::path::Path) -> Vec<serde_json::Value> {
             if states
                 .iter()
                 .all(|s| s["background_review_pending"] != true)
+                && worker_publications_finished(path)
             {
                 break states;
             }
@@ -3358,7 +3393,11 @@ async fn reviewer_transport_preserves_encrypted_reasoning_and_native_tool_pairs(
             "",
         )
         .await;
-        let mut input = vec![json!({"role":"user","content":"goal"})];
+        let mut input = vec![
+            json!({"role":"user","content":"goal"}),
+            json!({"role":"assistant","content":"independent complete eligible source"}),
+            json!({"role":"user","content":"native tool step starts"}),
+        ];
         input.extend(native);
         input.push(json!({"role":"user","content":"current"}));
         let request = json!({"model":"gpt-6.1-sol","input":input});

@@ -94,6 +94,9 @@ async fn completed_h_crash_before_after_publication_and_failed_publication_keep_
             .unwrap();
         let mut service = checkpoint_service(directory.path());
         service.config.classifier_url = Some(url.clone());
+        service.config.review_min_primary_tokens = 0;
+        service.config.review_min_new_tokens = 0;
+        service.config.review_backoff_factor = 1;
         let durable = history::restore(&service, "crash-owner").unwrap();
         assert_eq!(durable.shadow.calls, 1);
         assert_eq!(durable.shadow.input_tokens, 10000);
@@ -116,6 +119,9 @@ async fn completed_h_crash_before_after_publication_and_failed_publication_keep_
         service.config.history_max_references = 10000;
         let service = Arc::new(service);
         let mut restored = load_existing(&service, "crash-owner").unwrap();
+        // A settled owner with no new turn is deliberately not due. Advance the
+        // ordinary request cadence before retrying this same original H.
+        restored.completed_requests += service.config.review_every_requests;
         let projection = planning::Projection::canonical(&restored);
         dispatch_review_for(
             service.clone(),

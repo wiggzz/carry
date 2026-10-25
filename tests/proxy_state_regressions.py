@@ -194,10 +194,32 @@ class Proxy:
                                 {"model": "gpt-6-luna", "input": input_items, **fields})
         if self.wait_reviews and response[0] == 200:
             deadline = time.monotonic() + 15
-            while self.saved().get("background_review_pending"):
+            while not self.reviewers_settled():
                 assert time.monotonic() < deadline, "post-response reviewer did not settle"
                 time.sleep(0.01)
         return response
+
+    def reviewers_settled(self):
+        # Paid receipt persistence deliberately precedes H publication. This is
+        # only a worker-completion barrier; every authority/receipt assertion
+        # still reads the canonical index, never this fail-open diagnostic lane.
+        if self.saved().get("background_review_pending"):
+            return False
+        dispatched, merged = set(), set()
+        for path in (self.state / "diagnostics").glob("*.jsonl"):
+            for line in path.read_text().splitlines():
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue  # concurrent append has not finished this line
+                request = event.get("request_id", "")
+                if not request.startswith(f"{self.process.pid}-"):
+                    continue  # an orphan from another process cannot settle here
+                if event.get("event") == "background_review_dispatched":
+                    dispatched.add(request)
+                elif event.get("event") == "background_review_merged":
+                    merged.add(request)
+        return dispatched <= merged
 
     def saved(self):
         files = list(self.state.glob("*.json"))
@@ -270,7 +292,7 @@ class StateRegressions(unittest.TestCase):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             saved = proxy.saved()
-            if predicate(saved):
+            if predicate(saved) and (saved.get("background_review_pending") or proxy.reviewers_settled()):
                 return saved
             time.sleep(0.01)
         self.fail("review checkpoint did not reach the required state")

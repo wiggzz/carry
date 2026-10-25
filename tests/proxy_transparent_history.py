@@ -45,7 +45,7 @@ class TransparentProxy(Proxy):
         self.response_id = response[1].get("id")
         if wait and self.wait_reviews:
             deadline = time.monotonic() + 15
-            while self.saved().get("background_review_pending"):
+            while not self.reviewers_settled():
                 assert time.monotonic() < deadline, "post-response reviewer did not settle"
                 time.sleep(0.01)
         return response
@@ -119,7 +119,18 @@ class TransparentHistory(unittest.TestCase):
         options = ["--history-max-bytes","100000","--review-every-requests","100"]
         h = [{"role":"user","content":"fit before paid dispatch"}]
         proxy = self.proxy(fixture,options)
-        self.assertEqual(proxy.send(h)[0],200)
+        # A known-paid result that cannot be published terminates the already
+        # started HTTP stream. Observe that failure rather than demand a false
+        # successful terminal/ID from the ordinary JSON helper.
+        import http.client
+        connection = http.client.HTTPConnection(*proxy.address, timeout=30)
+        connection.request("POST", "/v1/responses", json.dumps({"model":"gpt-6-luna","input":h}),
+                           headers={"Content-Type":"application/json"})
+        response = connection.getresponse()
+        self.assertEqual(response.status,200)
+        with self.assertRaises(http.client.IncompleteRead):
+            response.read()
+        connection.close()
         deadline = time.monotonic() + 5
         while True:
             index = json.loads((self.state / "history.index").read_text())
@@ -170,7 +181,10 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(paid["shadow"]["calls"],0, "uncommitted receipt is explicitly unknown, never silently known-zero")
         proxy.close()
         fault.rmdir()
-        proxy = self.proxy(fixture,["--review-every-requests","100"])
+        # Make new reviewer work infeasible while reading the orphan's unknown
+        # receipt; a bootstrap retry would otherwise be a legitimate new spend.
+        proxy = self.proxy(fixture,["--review-every-requests","100",
+            "--classifier-max-input-tokens","1024","--classifier-max-output-tokens","1"])
         self.assertEqual(proxy.send(h)[0],200)
         stats = proxy.request("GET","/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
         self.assertGreaterEqual(stats["coverage"]["prior_untracked_calls"],1)
@@ -419,7 +433,7 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(advanced)[0],200)
         release.set()
         deadline = time.monotonic()+5
-        while proxy.checkpoint(advanced)[1].get("background_review_pending"):
+        while not proxy.reviewers_settled():
             self.assertLess(time.monotonic(),deadline)
             time.sleep(.01)
         proxy.close()
@@ -465,7 +479,7 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(len(fixture.primaries), 2, "H+A completed before H review release")
         release.set()
         deadline = time.monotonic() + 5
-        while proxy.checkpoint(advanced)[1].get("background_review_pending"):
+        while not proxy.reviewers_settled():
             self.assertLess(time.monotonic(), deadline, "captured H completion must settle")
             time.sleep(.01)
         settled = proxy.checkpoint(advanced)[1]
@@ -1109,7 +1123,7 @@ class TransparentHistory(unittest.TestCase):
                 while True:
                     index = json.loads((self.state / "history.index").read_text())
                     settled = index["snapshots"].get(owner, {})
-                    if not settled.get("background_review_pending", True):
+                    if not settled.get("background_review_pending", True) and proxy.reviewers_settled():
                         break
                     self.assertLess(time.monotonic(), deadline, "held review must durably settle")
                     time.sleep(.01)
@@ -1310,7 +1324,8 @@ class TransparentHistory(unittest.TestCase):
                 self.assertEqual(saved["shadow"]["calls"], 0)
                 self.assertEqual(saved["completed_requests"], 0)
                 self.assertFalse(saved["background_review_pending"])
-                self.assertEqual(saved["review_cache_key"], "", "cold child has no reviewer affinity yet")
+                self.assertNotIn("prompt_cache_key", saved["review_context"],
+                                 "cold child cannot inherit a parent's reviewer namespace")
             finally:
                 release.set()
             self.assertEqual(pending.result()[0], 200)

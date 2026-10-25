@@ -2154,7 +2154,7 @@ async fn dispatch_review_for(
         };
         run_review(&service, &id, &mut reviewed, &projection, &mut run).await;
         let _lock = session_lock(&service, &id).await;
-        if let Ok(mut current) = load_existing(&service, &id) {
+        let completion = if let Ok(mut current) = load_existing(&service, &id) {
             settle_review(&mut current, &before, &reviewed, &run);
             let settled = save(&service, &id, &current)
                 .or_else(|_| save_paid_accounting(&service, &id, &current))
@@ -2182,15 +2182,23 @@ async fn dispatch_review_for(
             };
             #[cfg(test)]
             tests::publication_crash_barrier(&service, "after");
+            Some(
+                json!({"exact_prefix_published":published,"receipt_durable":settled,"receipt_count":run.receipts.len()}),
+            )
+        } else {
+            None
+        };
+        drop(_pin);
+        service.background_reviews.lock().await.remove(&id);
+        if let Some(data) = completion {
             journal(
                 &service,
                 &id,
                 &run.request_id,
                 "background_review_merged",
-                &json!({"exact_prefix_published":published,"receipt_durable":settled,"receipt_count":run.receipts.len()}),
+                &data,
             );
         }
-        service.background_reviews.lock().await.remove(&id);
     });
 }
 
