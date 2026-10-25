@@ -502,15 +502,18 @@ class TransparentHistory(unittest.TestCase):
             with self.subTest(restart=restart):
                 self.state = root / ("restart" if restart else "same_process")
                 self.state.mkdir()
-                proxy, fixture, history, _ = self.seed(extra=["--history-max-age-secs", "1",
+                # Whole-second retention timestamps need setup slack: a one-second
+                # TTL can expire a real review during its first primary publication.
+                ttl = 5
+                proxy, fixture, history, _ = self.seed(extra=["--history-max-age-secs", str(ttl),
                                                              "--review-every-requests", "100"])
                 old_path, old = proxy.checkpoint(history)
                 self.assertEqual(old["primary"]["calls"], 1)
                 self.assertTrue(json.loads((self.state / "history.index").read_text())["reviews"], "real completed advice supplies old authority")
-                time.sleep(2.05)
+                time.sleep(ttl + 1.05)
                 if restart:
                     proxy.close()
-                    proxy = self.proxy(fixture, ["--history-max-age-secs", "1",
+                    proxy = self.proxy(fixture, ["--history-max-age-secs", str(ttl),
                         "--review-every-requests", "100", "--classifier-cache-policy", "disabled"])
                 status, result = proxy.send(history)
                 self.assertEqual(status, 200, result)
