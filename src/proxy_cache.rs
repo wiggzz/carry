@@ -52,6 +52,23 @@ pub(super) fn base(body: &Value) -> Value {
     base
 }
 
+fn input_identity(input: &[Value]) -> String {
+    let mut input = input.to_vec();
+    for item in &mut input {
+        if let Some(blocks) = item["content"].as_array_mut() {
+            for block in blocks {
+                if block["prompt_cache_breakpoint"]["mode"] == "explicit" {
+                    block
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("prompt_cache_breakpoint");
+                }
+            }
+        }
+    }
+    serialized_identity(&input).1
+}
+
 impl CacheEvidence {
     pub fn matches(
         &self,
@@ -70,7 +87,7 @@ impl CacheEvidence {
             && self.credential_sha256 == credential
             && self.input_len <= input.len()
             && self.base_sha256 == serialized_identity(&base(body)).1
-            && self.input_sha256 == serialized_identity(&input[..self.input_len]).1
+            && self.input_sha256 == input_identity(&input[..self.input_len])
             && (0.0..=1.0).contains(&self.native_cached_fraction)
     }
 }
@@ -126,11 +143,26 @@ pub(super) fn observe(
     if total < capability.minimum_prefix_tokens as u64 || cached > total {
         return;
     }
+    let end = if body["prompt_cache_options"]["mode"] == "explicit" {
+        input
+            .iter()
+            .rposition(|item| {
+                item["content"].as_array().is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|block| block["prompt_cache_breakpoint"]["mode"] == "explicit")
+                })
+            })
+            .map_or(input.len(), |i| i + 1)
+    } else {
+        input.len()
+    };
+    let input = &input[..end];
     let e = CacheEvidence {
         route: resolved.map(|r| r.route.clone()),
         credential_sha256: credential.into(),
         base_sha256: serialized_identity(&base(body)).1,
-        input_sha256: serialized_identity(input).1,
+        input_sha256: input_identity(input),
         input_len: input.len(),
         estimated_tokens: crate::proxy_savings::token_units(&json!(input)) as f64,
         at,

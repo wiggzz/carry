@@ -558,7 +558,7 @@ class StateRegressions(unittest.TestCase):
         self.assertGreaterEqual(restarted["shadow"]["cost_usd"], settled["shadow"]["cost_usd"])
         self.assertEqual(any(m["text"] == "CAPACITY_HELD_A_FACT"
                              for m in (proxy.advice() or {}).get("memories", [])), accepted)
-        self.assertEqual(len(fixture.reviews), 1 if accepted else 2)
+        self.assertEqual(len(fixture.reviews), 1 if accepted or publication_failure else 2)
         self.evidence["restarted"] = restarted
         print("CAPACITY_EPOCH_RESTART " + json.dumps({"change": change,
               "shadow": restarted["shadow"], "review_calls": len(fixture.reviews),
@@ -1301,7 +1301,7 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(len(fixture.reviews), 1, "initial source must fit the configured review budget")
         saved = proxy.saved()
         accepted = len((proxy.advice() or {}).get("memories", []))
-        feedback = (proxy.advice() or {}).get("feedback", {})
+        feedback = (proxy.advice() or {}).get("feedback", saved["review_feedback"])
         if accepted < 2:
             self.assertGreater(feedback["rejected_count"], 0,
                                "budget admission may reject facts only with explicit feedback")

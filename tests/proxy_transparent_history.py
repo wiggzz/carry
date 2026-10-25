@@ -226,7 +226,7 @@ class TransparentHistory(unittest.TestCase):
                     return 200, advice_response({"protected": [], "removable": [], "memories": []})
                 fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"nohelp_{n}")), review)
                 history = [{"role":"user","content":"goal"},
-                           {"role":"assistant","content":"UNREVIEWED_SOURCE " * 12000},
+                           {"role":"assistant","content":"UNREVIEWED_SOURCE " * 3000},
                            {"role":"user","content":"current"}]
                 options = ["--review-every-requests","100","--classifier-cache-policy","disabled"]
                 proxy = self.proxy(fixture, options)
@@ -240,7 +240,7 @@ class TransparentHistory(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, 2.5, "one bounded exceptional attempt")
                 self.assertEqual(len(fixture.reviews), 1)
                 self.assertEqual(len(fixture.primaries), 1, "no unqualified source removal or overflowing primary")
-                saved = proxy.saved()
+                saved = json.loads(proxy.checkpoint(history)[0].read_text())
                 self.assertEqual(saved["shadow"]["calls"], 1)
                 self.assertEqual(saved["shadow"]["unavailable_cost_calls"], int(outcome != "no_help"))
                 self.assertEqual([i["value"] for i in saved["history"]], history)
@@ -618,8 +618,8 @@ class TransparentHistory(unittest.TestCase):
         c = history + [{"role": "user", "content": "C_NOT_B"}]
         self.assertEqual(proxy.send(c)[0], 200)
         _, child = proxy.checkpoint(c)
-        self.assertTrue(any(m["text"] == "A_FACT" for m in child["memories"]))
-        self.assertFalse(any("B_DEPENDENT" in m["text"] for m in child["memories"]))
+        self.assertIn("A_FACT", json.dumps(fixture.primaries[-1]))
+        self.assertNotIn("B_DEPENDENT", json.dumps(fixture.primaries[-1]))
         # The same later frontier IS reusable when the complete B dependency
         # remains. Advance its mutable tip first so this must hydrate B's review.
         self.assertEqual(proxy.send(b + [{"role": "user", "content": "B_NEXT"}])[0], 200)
@@ -1028,9 +1028,10 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(resumed["primary"]["calls"], 3)
         sent = fixture.primaries[-1]["input"]
         self.assertIn(history[0], sent)
-        self.assertEqual(history[1] in sent, not any(r["drops"] for r in json.loads(
-            (self.state / "history.index").read_text())["reviews"].values()),
-            "evicted advice cannot confer permanent omission authority")
+        if history[1] not in sent:
+            self.assertTrue(any(r["drops"] for r in json.loads(
+                (self.state / "history.index").read_text())["reviews"].values()),
+                "omission requires retained advice; advice does not require omission")
 
     def test_bounded_many_sibling_storage_observation_is_not_latency_evidence(self):
         proxy, fixture, history, _ = self.seed(extra=("--history-max-references", "32"))

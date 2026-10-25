@@ -1986,11 +1986,11 @@ fn review_body_projected(
         input.push(value);
         for group in groups.iter().filter(|g| g.members.last() == Some(&item.id)) {
             let data = json!({"group_id":format!("g{}",group.id),"member_ids":group.members,"human":group.human});
-            input.push(json!({"role":"user","content":format!("[carry context] {data}")}));
+            input.push(json!({"role":"user","content":[{"type":"input_text","text":format!("[carry context] {data}")}]}));
         }
     }
     for memory in &session.memories {
-        input.push(json!({"role":"user","content":json!({"memory_id":format!("m{}",memory.id),"source_ids":memory.source_ids,"text":memory.text}).to_string()}));
+        input.push(json!({"role":"user","content":[{"type":"input_text","text":json!({"memory_id":format!("m{}",memory.id),"source_ids":memory.source_ids,"text":memory.text}).to_string()}]}));
     }
     let ledger = json!({
         "eligible_group_ids":groups.iter().filter(|g|g.exposed && !g.pinned && g.replayable).map(|g|format!("g{}",g.id)).collect::<Vec<_>>(),
@@ -2039,8 +2039,11 @@ fn review_body_with_input(config: &ProxyCli, session: &Session, input: Vec<Value
         // The final ledger is mutable advice state, not a stable observation.
         let boundary = input.len().saturating_sub(2);
         if let Some(last) = input.get_mut(boundary) {
-            if let Some(text) = last["content"].as_str() {
-                last["content"] = json!([{"type":"input_text","text":text,"prompt_cache_breakpoint":{"mode":"explicit"}}]);
+            if let Some(block) = last["content"]
+                .as_array_mut()
+                .and_then(|blocks| blocks.last_mut())
+            {
+                block["prompt_cache_breakpoint"] = json!({"mode":"explicit"});
             }
         }
     }
@@ -2349,59 +2352,70 @@ async fn review_chunk(
         epoch: session.review_epoch,
         reason: Some("fresh_prefix_projection"),
     };
-    let response = if codex_reviewer {
-        send_codex(
-            service,
-            &service.config.upstream_url,
-            body,
-            true,
-            Some(&wire_log),
-        )
-        .await
-    } else {
-        match request.build() {
-            Ok(request) => {
-                logging::review_wire(service, &wire_log, &request, body, 0);
-                service
-                    .client
-                    .execute(request)
-                    .await
-                    .map_err(anyhow::Error::from)
-            }
-            Err(error) => Err(error.into()),
-        }
-    };
     let mut diagnostic = json!({"reason": "review_transport_or_protocol_failure"});
-    let value = match response {
-        Ok(response) => {
-            let status = response.status();
-            diagnostic["http_status"] = json!(status.as_u16());
-            if status.is_success() {
-                if codex_reviewer {
-                    observed_sse(response).await.ok().flatten()
-                } else {
-                    bounded(response, 4 * 1024 * 1024)
+    let observed = async {
+        let response = if codex_reviewer {
+            send_codex(
+                service,
+                &service.config.upstream_url,
+                body,
+                true,
+                Some(&wire_log),
+            )
+            .await
+        } else {
+            match request.build() {
+                Ok(request) => {
+                    logging::review_wire(service, &wire_log, &request, body, 0);
+                    service
+                        .client
+                        .execute(request)
                         .await
-                        .ok()
-                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .map_err(anyhow::Error::from)
                 }
-            } else {
-                // Private trace gets only bounded identifier tokens, never provider prose or raw bodies.
-                if let Ok(bytes) = bounded(response, 16 * 1024).await
-                    && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
-                {
-                    for (field, token) in crate::proxy_sse::safe_error(&value["error"])
-                        .as_object()
-                        .unwrap()
-                    {
-                        diagnostic[format!("error_{field}")] = token.clone();
-                    }
-                }
-                None
+                Err(error) => Err(error.into()),
             }
+        };
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                diagnostic["http_status"] = json!(status.as_u16());
+                if status.is_success() {
+                    if codex_reviewer {
+                        observed_sse(response).await.ok().flatten()
+                    } else {
+                        bounded(response, 4 * 1024 * 1024)
+                            .await
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    }
+                } else {
+                    // Private trace gets only bounded identifier tokens, never provider prose or raw bodies.
+                    if let Ok(bytes) = bounded(response, 16 * 1024).await
+                        && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+                    {
+                        for (field, token) in crate::proxy_sse::safe_error(&value["error"])
+                            .as_object()
+                            .unwrap()
+                        {
+                            diagnostic[format!("error_{field}")] = token.clone();
+                        }
+                    }
+                    None
+                }
+            }
+            Err(_) => None,
         }
-        Err(_) => None,
     };
+    // A single budget includes auth-lock waits, refresh/retry and body reads.
+    // Cancelling this future still reaches the censored receipt path below.
+    let value = tokio::time::timeout(
+        Duration::from_secs(service.config.classifier_timeout_secs),
+        observed,
+    )
+    .await
+    .ok()
+    .flatten();
     let mut valid = false;
     session.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"review did not complete with a valid JSON advice object; return the required schema"}]});
     if let Some(value) = value {

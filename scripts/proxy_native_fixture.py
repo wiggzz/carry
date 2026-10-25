@@ -148,12 +148,8 @@ def review_records(body):
         content = item.get('content', '')
         text = content if isinstance(content, str) else ''.join(
             block.get('text', '') for block in content if isinstance(block, dict)) if isinstance(content, list) else ''
-        if '\n\n[carry context] ' in text:
-            source, annotation = text.rsplit('\n\n[carry context] ', 1)
-            if source:
-                native = dict(item)
-                native['content'] = source
-                pending.append(native)
+        if text.startswith('[carry context] '):
+            annotation = text[len('[carry context] '):]
             data = json.loads(annotation)
             count = len(data['member_ids'])
             data['items'] = pending[-count:]
@@ -175,6 +171,9 @@ def review_records(body):
             pending.append(item)
             continue
         if isinstance(data, dict):
+            if {'memory_id', 'source_ids', 'text'} <= data.keys():
+                memory_observations[data['memory_id']] = data
+                continue
             records.append(data)
     # Reviewer nudges/answers now remain in the append-only transcript. Grade
     # source observations against the current ledger rather than treating old

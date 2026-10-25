@@ -748,6 +748,7 @@ impl Session {
             .collect::<HashSet<_>>();
         self.memories.retain(|m| !retired.contains(&m.id));
         self.memory_anchors.retain(|id, _| !retired.contains(id));
+        let first_new_memory_id = self.next_memory_id;
         for ((sources, text), index) in memories.into_iter().zip(memory_indexes) {
             if self.memories.len() >= 128 {
                 rejected_sources.extend(&sources);
@@ -800,6 +801,34 @@ impl Session {
         self.review_feedback = json!({"accepted_opinions":accepted_opinions, "accepted_memories":accepted_memories,
             "rejected_count":rejected_count, "rejected":rejected,
             "guidance":"Accepted items were applied except supporting sources of rejected replacements remain protected. Correct rejected items in a future review using the current eligible ledger; do not repeat accepted memories."});
+        // Admission includes the actual final feedback, not a smaller transient
+        // ledger. Detailed diagnostics cannot consume the review's whole budget.
+        while !admit(self) {
+            if self.review_feedback["rejected"]
+                .as_array()
+                .is_some_and(|r| !r.is_empty())
+            {
+                self.review_feedback["rejected"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+            } else if self
+                .memories
+                .last()
+                .is_some_and(|m| m.id >= first_new_memory_id)
+            {
+                let memory = self.memories.pop().unwrap();
+                self.memory_anchors.remove(&memory.id);
+                self.preserve_memory_sources(&memory.source_ids);
+                accepted_memories -= 1;
+                rejected_count += 1;
+                self.review_feedback["accepted_memories"] = json!(accepted_memories);
+                self.review_feedback["rejected_count"] = json!(rejected_count);
+                self.review_feedback["rejected"] = json!([{"field":"memories","reason":"final rendered review budget exceeded; supporting sources kept"}]);
+            } else {
+                break;
+            }
+        }
         if let Some(before) = primary_before {
             let after = self.render_primary();
             // Visible memory edits belong to Carry, not the traditional
