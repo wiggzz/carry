@@ -595,7 +595,9 @@ pub(super) fn committed(
     // Completed workers retain their own exact original cut. An owner may now
     // be at H+A, but its H record must remain discoverable by H+B/H+C.
     for point in &session.fork_points {
-        if point.sources.len() <= keys.len() {
+        let mut subject = session.review_context.clone();
+        subject["input"] = json!(input);
+        if forking::compatible_child(&service.config, point, &subject).is_ok() {
             let cut = point
                 .sources
                 .len()
