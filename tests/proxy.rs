@@ -2300,10 +2300,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
             state.path(),
             address,
             "audit",
-            &[
-                                "--bootstrap-min-input-bytes",
-                "8388608",
-            ],
+            &["--bootstrap-min-input-bytes", "8388608"],
             "",
         )
         .await;
@@ -2395,7 +2392,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
                 address,
                 "audit",
                 &[
-                                        "--bootstrap-min-input-bytes",
+                    "--bootstrap-min-input-bytes",
                     "8388608",
                     "--review-every-requests",
                     "100",

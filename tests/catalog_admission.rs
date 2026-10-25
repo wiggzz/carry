@@ -46,7 +46,7 @@ async fn start(
         .args([
             "--context-margin-percent",
             "0",
-                        "--bootstrap-min-input-bytes",
+            "--bootstrap-min-input-bytes",
             "999999",
         ])
         .env_remove("OPENAI_API_KEY")
