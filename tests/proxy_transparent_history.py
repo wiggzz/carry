@@ -103,8 +103,8 @@ class TransparentHistory(unittest.TestCase):
                 self.assertEqual(settled["shadow"]["unavailable_cost_calls"], 0)
                 index = json.loads((self.state / "history.index").read_text())
                 self.assertEqual(len(index["reviews"]), int(prior), "rejection is not a semantic completion")
-                self.assertNotIn("999", settled["opinions"], "unknown protection must gain no authority")
-                self.assertEqual(settled["completed_review_len"], len(h) if prior else 0)
+                self.assertTrue(all("999" not in record["opinions"] for record in index["reviews"].values()),
+                                "unknown protection must gain no authority")
                 proxy.close()
                 proxy = self.proxy(fixture, options)
                 self.assertEqual(proxy.send(h)[0], 200)
@@ -1225,12 +1225,26 @@ class TransparentHistory(unittest.TestCase):
         held, release = threading.Event(), threading.Event()
         self.stack.callback(release.set)
         proxy, fixture, history, options = self.seed()
-        def primary(_b, n):
-            if n == 2:
-                held.set()
-                assert release.wait(20), "held primary release"
+        owner_primaries, owner_receipts = [], []
+        review_seen = threading.Event()
+        original_review = fixture.review
+        def primary(body, n):
+            if {"role":"user","content":"HELD_PRIMARY"} in body["input"]:
+                owner_primaries.append(body)
+                if len(owner_primaries) == 1:
+                    held.set()
+                    assert release.wait(20), "held primary release"
             return 200, completed(response_id=f"primary_pin_{n}")
+        def review(body, n):
+            result = original_review(body, n)
+            if any("HELD_PRIMARY" in json.dumps(item) for item in body["input"]):
+                owner_receipts.append(result[1]["usage"])
+                review_seen.set()
+            return result
         fixture.primary = primary
+        fixture.review = review
+        seeded_reviews = len(fixture.reviews)
+        self.assertEqual(seeded_reviews, 1)
         proxy.close()
         env = {"CARRY_PROXY_HISTORY_MAX_REFERENCES": "6"}
         proxy = TransparentProxy(self.state, fixture, [*options, "--request-timeout-secs", "30"], env)
@@ -1239,8 +1253,11 @@ class TransparentHistory(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor() as pool:
             pending = pool.submit(proxy.send, parent)
             self.assertTrue(held.wait(2))
+            self.assertTrue(review_seen.wait(5), "join this owner's actual second reviewer dispatch")
             path, before = proxy.checkpoint(parent)
             owner = path.stem
+            self.assertEqual(before["shadow"]["calls"], 1, "new receipt cannot settle while primary holds owner lock")
+            self.assertEqual(len(owner_receipts), 1)
             for n in range(12):
                 # Do not wait on the fixture-wide barrier while another owner's
                 # primary intentionally holds that owner's reviewer settlement.
@@ -1253,20 +1270,50 @@ class TransparentHistory(unittest.TestCase):
             self.assertEqual(pending.result()[0], 200)
         _, after = proxy.checkpoint(parent)
         self.assertEqual(after["primary"]["calls"], 2)
-        self.assertEqual(after["shadow"]["calls"], before["shadow"]["calls"])
-        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
+        self.assertEqual(after["primary"]["input_tokens"], 200)
+        self.assertEqual(after["primary"]["output_tokens"], 2)
+        self.assertEqual(after["primary"]["unavailable_cost_calls"], 0)
+        self.assertFalse(after["background_review_pending"])
+        self.assertEqual(after["shadow"]["calls"], 2)
+        self.assertEqual(after["shadow"]["calls"], before["shadow"]["calls"] + len(owner_receipts))
+        self.assertEqual(after["shadow"]["input_tokens"], before["shadow"]["input_tokens"] + sum(u["input_tokens"] for u in owner_receipts))
+        self.assertEqual(after["shadow"]["output_tokens"], before["shadow"]["output_tokens"] + sum(u["output_tokens"] for u in owner_receipts))
+        self.assertEqual(after["shadow"]["unavailable_cost_calls"], 0)
+        self.assertEqual(len(owner_primaries), 1)
+        self.assertNotIn("RAW_A", json.dumps(owner_primaries[0]["input"]))
+        self.assertIn(history[0], owner_primaries[0]["input"])
         proxy.close()
         proxy = TransparentProxy(self.state, fixture, options, env)
         self.stack.callback(proxy.close)
+        restarted = json.loads((self.state / "history.index").read_text())["snapshots"][owner]
+        self.assertEqual(restarted["primary"], after["primary"], "restart must not duplicate a settled primary")
+        self.assertEqual(restarted["shadow"], after["shadow"], "restart must not duplicate a settled review")
+        receipts_before = len(owner_receipts)
         self.assertEqual(proxy.send(parent)[0], 200)
         _, resumed = proxy.checkpoint(parent)
         self.assertEqual(resumed["primary"]["calls"], 3)
-        sent = fixture.primaries[-1]["input"]
+        self.assertEqual(resumed["primary"]["input_tokens"], 300)
+        self.assertEqual(resumed["primary"]["output_tokens"], 3)
+        self.assertEqual(resumed["primary"]["unavailable_cost_calls"], 0)
+        owner_wires = [body for body in fixture.reviews if any("HELD_PRIMARY" in json.dumps(item) for item in body["input"])]
+        self.assertEqual(len(owner_wires), len(owner_receipts), "only this owner's actual paid requests enter its total")
+        self.assertEqual(resumed["shadow"]["calls"], seeded_reviews + len(owner_wires))
+        self.assertEqual(resumed["shadow"]["input_tokens"], 100 + sum(u["input_tokens"] for u in owner_receipts))
+        self.assertEqual(resumed["shadow"]["output_tokens"], 1 + sum(u["output_tokens"] for u in owner_receipts))
+        self.assertEqual(resumed["shadow"]["unavailable_cost_calls"], 0)
+        self.assertFalse(resumed["background_review_pending"])
+        self.assertEqual(len(owner_primaries), 2)
+        sent = owner_primaries[-1]["input"]
         self.assertIn(history[0], sent)
         if history[1] not in sent:
             self.assertTrue(any(r["drops"] for r in json.loads(
                 (self.state / "history.index").read_text())["reviews"].values()),
                 "omission requires retained advice; advice does not require omission")
+        self.evidence.update(before=before, after=after, restarted=restarted, resumed=resumed,
+                             owner_primaries=owner_primaries, owner_review_wires=owner_wires, owner_receipts=owner_receipts)
+        print("HELD_PRIMARY_RECEIPTS=" + json.dumps({"settled_calls":after["shadow"]["calls"],
+              "resumed_calls":resumed["shadow"]["calls"],"new_restart_calls":len(owner_receipts)-receipts_before,
+              "owner_paid_usage":owner_receipts,"primary_calls":resumed["primary"]["calls"]}), flush=True)
 
     def test_bounded_many_sibling_storage_observation_is_not_latency_evidence(self):
         proxy, fixture, history, _ = self.seed(extra=("--history-max-references", "32"))
