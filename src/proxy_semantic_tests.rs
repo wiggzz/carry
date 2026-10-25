@@ -16,6 +16,55 @@ fn semantic_subject() -> Session {
 }
 
 #[test]
+fn planner_prices_only_scheduled_review_views_including_output_cap() {
+    let mut config = reviewer_config();
+    config.classifier_cache_policy = ClassifierCachePolicy::Disabled;
+    let mut session = semantic_subject();
+    session.bootstrap_review_pending = true;
+    session
+        .apply_advice(
+            &session.groups(),
+            &json!({"protected":[],"removable":["g2"],"memories":[]}),
+        )
+        .unwrap();
+    let projection = planning::Projection {
+        omitted: HashSet::from([2]),
+        input: session.render_projection(&HashSet::from([2])),
+    };
+    let keep = review_body(&config, &session);
+    let compact = review_body_projected(&config, &session, &projection);
+    let body = json!({"model":"gpt-6-luna","input":session.render_primary()});
+    for compact_only in [true, false] {
+        config.classifier_max_input_tokens = if compact_only {
+            reviewer_required_tokens(&config, &compact).ceil() as u64
+        } else {
+            reviewer_required_tokens(&config, &keep).ceil() as u64
+        };
+        assert!(review_fits(&config, &compact));
+        assert_eq!(review_fits(&config, &keep), !compact_only);
+        let (_, report) = plan(&config, &session, &body);
+        let joint = &report["candidates"][0]["selection_joint"];
+        for (view, field, scheduled) in [
+            (&keep, "future_shadow_keep", !compact_only),
+            (&compact, "future_shadow_compact", true),
+        ] {
+            let rates = reviewer_rates(&config, estimate(view)).unwrap();
+            let expected = if scheduled {
+                estimate(view) * rates.input
+                    + config.classifier_max_output_tokens as f64 * rates.output
+            } else {
+                0.0
+            };
+            let actual = joint[field].as_f64().unwrap();
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "{field}: scheduled={scheduled}, actual={actual}, expected={expected}"
+            );
+        }
+    }
+}
+
+#[test]
 fn canonical_source_survives_disposable_projection_and_owner_serialization() {
     let config = reviewer_config();
     let mut s = semantic_subject();

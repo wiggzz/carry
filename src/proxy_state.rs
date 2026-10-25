@@ -101,14 +101,6 @@ pub(super) struct Session {
     /// primary completes. Persist this across failed calls and process restarts.
     #[serde(default)]
     pub bootstrap_review_pending: bool,
-    #[serde(default)]
-    pub bootstrap_end_id: u64,
-    #[serde(default)]
-    pub bootstrap_reviewed_ids: BTreeSet<u64>,
-    #[serde(default)]
-    pub bootstrap_review_complete: bool,
-    #[serde(default)]
-    pub bootstrap_estimated_cost_usd: f64,
     pub invalid_reviews: u64,
     #[serde(default)]
     pub partial_reviews: u64,
@@ -330,8 +322,6 @@ impl Session {
             item.exposed = true;
         }
         self.bootstrap_review_pending = true;
-        self.bootstrap_end_id = self.history[end - 1].id;
-        self.bootstrap_review_complete = false;
     }
 
     pub fn reset_active(&mut self) {
@@ -340,10 +330,6 @@ impl Session {
             trajectory.reset_epoch();
         }
         self.bootstrap_review_pending = false;
-        self.bootstrap_end_id = 0;
-        self.bootstrap_reviewed_ids.clear();
-        self.bootstrap_review_complete = false;
-        self.bootstrap_estimated_cost_usd = 0.0;
         self.review_admission = Some(ReviewAdmission::default());
         self.last_review_request = self.completed_requests;
         self.history.clear();

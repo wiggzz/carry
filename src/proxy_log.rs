@@ -252,8 +252,6 @@ fn append(
                 config.classifier_max_input_tokens,
                 config.classifier_max_input_bytes,
                 config.review_every_requests,
-                config.review_max_calls,
-                config.bootstrap_max_cost_usd,
                 config.payoff_requests,
                 config.min_payback_percent,
                 config.context_margin_percent,

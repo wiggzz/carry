@@ -130,13 +130,6 @@ pub struct ProxyCli {
     /// Serialized transport guard; token budget controls reviewer context size.
     #[arg(long, default_value_t = 8388608, value_parser = clap::value_parser!(u32).range(4096..=8388608))]
     classifier_max_input_bytes: u32,
-    /// Maximum bounded reviewer calls per primary request, including bootstrap.
-    /// Unfinished windows resume on later requests. bootstrap-max-calls is an alias.
-    #[arg(long, alias = "bootstrap-max-calls", default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=100))]
-    review_max_calls: u32,
-    /// Cumulative estimated bootstrap spend per active history, including output cap.
-    #[arg(long, default_value_t = 1.0)]
-    bootstrap_max_cost_usd: f64,
     /// Skip automatic unseen-history bootstrap below this serialized input size.
     /// Explicit replay declarations override this threshold.
     #[arg(long, default_value_t = 16384)]
@@ -314,9 +307,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
             config.classifier_cache_policy = ClassifierCachePolicy::Disabled;
         }
     }
-    if !config.bootstrap_max_cost_usd.is_finite() || config.bootstrap_max_cost_usd < 0.0 {
-        bail!("bootstrap cost limit must be finite and nonnegative");
-    }
+
     history::validate_capacity(&config)?;
     validate_url(&config.upstream_url)?;
     if let Some(url) = &config.classifier_url {
@@ -1534,11 +1525,6 @@ async fn forward_request(
                 "background_review_censored",
                 &json!({"reason":"restart_with_pending_review","cost_censored":true}),
             );
-            // There is no receipt for an interrupted import. Do not grant a
-            // fresh spend allowance on restart while its actual spend is unknown.
-            if session.bootstrap_review_pending && !session.bootstrap_review_complete {
-                session.bootstrap_estimated_cost_usd = service.config.bootstrap_max_cost_usd;
-            }
             session.shadow.calls += 1;
             session.shadow.unavailable_cost_calls += 1;
             if let Some(trajectory) = &mut session.cost_trajectory {
@@ -2262,7 +2248,6 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
         current.last_review_request = before.last_review_request;
         current.review_admission = reviewed.review_admission.clone();
         current.bootstrap_review_pending = false;
-        current.bootstrap_review_complete = run.accepted;
     }
 }
 
@@ -3227,9 +3212,6 @@ async fn relay(
                         &commit.service.config.primary_cache_auth,
                         now(),
                     );
-                    if commit.candidate.bootstrap_review_complete {
-                        commit.candidate.bootstrap_review_pending = false;
-                    }
                     commit.candidate.completed_requests += 1;
                 }
                 let _ = trace(&commit.service, &commit.id, "primary_completed", &value);

@@ -196,7 +196,7 @@ class Proxy:
                 "--upstream-url", fixture.endpoint, "--state-dir", str(home / "state"),
                 "--no-open-dashboard", "--mode", mode, "--background-reviews=false",
                 "--request-timeout-secs", "60", "--classifier-timeout-secs", "60",
-                "--bootstrap-min-input-bytes", "8388608", "--review-max-calls", "1"]
+                "--bootstrap-min-input-bytes", "8388608"]
         if fixture.codex:
             args += ["--codex-login", "--codex-home", str(home)]
         if replay:
@@ -272,7 +272,7 @@ class Proxy:
         # synchronize here without restoring production reviewer blocking.
         deadline = time.monotonic() + 120
         while any(json.loads(p.read_bytes()).get("background_review_pending")
-                  for p in (Path(self.temp.name) / "state").glob("*.checkpoint")):
+                  for p in (Path(self.temp.name) / "state").glob("*.json")):
             if time.monotonic() >= deadline:
                 raise AssertionError("post-response transport review did not settle")
             time.sleep(0.01)
