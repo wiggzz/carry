@@ -3729,4 +3729,5 @@ mod tests {
     include!("proxy_semantic_tests.rs");
     include!("proxy_pr154_tests.rs");
     include!("proxy_log_controls.rs");
+    include!("proxy_admission_tests.rs");
 }
