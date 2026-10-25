@@ -937,8 +937,8 @@ class TransparentHistory(unittest.TestCase):
                     {"CARRY_PROXY_HISTORY_MAX_AGE_SECS": "1"}))
                 options = ["--review-replayed-history", "--payoff-requests", "1",
                            "--classifier-cache-policy", "disabled",
-                                                       "--classifier-timeout-secs", "60"]
-                                           proxy = TransparentProxy(self.state, fixture, options, env, wait_reviews=False)
+                           "--classifier-timeout-secs", "60"]
+                proxy = TransparentProxy(self.state, fixture, options, env, wait_reviews=False)
                 self.stack.callback(proxy.close)
                 history = [{"role": "user", "content": "PINNED_GOAL"},
                            {"role": "assistant", "content": "PINNED_RAW " + "payload " * 2000},
