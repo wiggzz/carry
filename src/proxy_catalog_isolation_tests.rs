@@ -34,7 +34,12 @@ async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
     axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    let mut session = load(&service, &{ let mut h = HeaderMap::new(); h.insert("x-carry-session","catalog-cache".parse().unwrap()); identity(&h).unwrap().unwrap() }).unwrap();
+    let mut session = load(&service, &{
+        let mut h = HeaderMap::new();
+        h.insert("x-carry-session", "catalog-cache".parse().unwrap());
+        identity(&h).unwrap().unwrap()
+    })
+    .unwrap();
     assert_eq!(session.primary.calls, 1);
     assert_eq!(session.primary.cached_tokens, 9000);
     session.upstream_cache = history::cache(&service).unwrap();
@@ -67,7 +72,9 @@ async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
     .unwrap()
     .cache;
     let record = semantic::Record::capture(&session);
-    let mut restored: Session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+    let mut restored: Session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap())
+        .unwrap()
+        .with_scenario_cache_policy();
     record.apply(&mut restored);
     restored.upstream_cache = history::cache(&service).unwrap();
     assert_eq!(restored.primary.cost_usd, session.primary.cost_usd);
@@ -105,7 +112,6 @@ async fn catalog_r1_receipt_credit_is_bound_to_route_auth_class_and_restart() {
     let mut changed = exact.clone();
     changed.route.processing_tier = "priority".into();
     assert_eq!(cost(&session.upstream_cache, &changed), cost(&[], &changed));
-
 }
 
 #[tokio::test]

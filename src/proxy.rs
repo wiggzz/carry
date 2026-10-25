@@ -1949,6 +1949,7 @@ fn primary_direction(context: &Value) -> &Value {
         .unwrap_or(&Value::Null)
 }
 
+#[cfg(test)]
 fn review_body(config: &ProxyCli, session: &Session) -> Value {
     review_body_projected(config, session, &planning::Projection::canonical(session))
 }
@@ -3472,7 +3473,8 @@ mod tests {
             2048,
             0,
         )
-        .unwrap();
+        .unwrap()
+        .with_scenario_cache_policy();
         crate::proxy_cache::observe(
             &mut cache,
             &first,

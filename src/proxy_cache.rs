@@ -38,20 +38,14 @@ pub(super) struct CacheEvidence {
     pub input_len: usize,
     pub estimated_tokens: f64,
     pub at: u64,
+    pub ttl_seconds: u64,
     pub native_cached_fraction: f64,
 }
 
 pub(super) fn base(body: &Value) -> Value {
     let mut base = body.clone();
     if let Some(object) = base.as_object_mut() {
-        for key in [
-            "input",
-            "stream",
-            "store",
-            "metadata",
-            "client_metadata",
-            "include",
-        ] {
+        for key in ["input", "stream"] {
             object.remove(key);
         }
     }
@@ -70,7 +64,7 @@ impl CacheEvidence {
             return false;
         };
         self.at <= at
-            && at - self.at < 1800
+            && at - self.at < self.ttl_seconds
             && self.route.as_ref() == resolved.map(|r| &r.route)
             && self.credential_sha256 == credential
             && self.input_len <= input.len()
@@ -87,7 +81,7 @@ pub(super) fn reusable(
     credential: &str,
     at: u64,
 ) -> f64 {
-    if resolved.is_none_or(|r| r.cache.is_none()) {
+    if resolved.is_none() {
         return 0.0;
     }
     cache
@@ -109,13 +103,26 @@ pub(super) fn observe(
     let Some(input) = body["input"].as_array() else {
         return;
     };
+    let Some(model) = resolved else {
+        return;
+    };
+    let Some(capability) = model.cache else {
+        return;
+    };
+    let ttl_seconds = model
+        .scenario_cache_policy
+        .as_ref()
+        .map_or(0, |p| p.ttl_seconds);
+    if ttl_seconds == 0 {
+        return;
+    }
     let (Some(total), Some(cached)) = (
         usage["input_tokens"].as_u64(),
         usage["input_tokens_details"]["cached_tokens"].as_u64(),
     ) else {
         return;
     };
-    if total == 0 || cached > total {
+    if total < capability.minimum_prefix_tokens as u64 || cached > total {
         return;
     }
     let e = CacheEvidence {
@@ -126,6 +133,7 @@ pub(super) fn observe(
         input_len: input.len(),
         estimated_tokens: crate::proxy_savings::token_units(&json!(input)) as f64,
         at,
+        ttl_seconds,
         native_cached_fraction: cached as f64 / total as f64,
     };
     // A zero read records potential history, never confirmed cache activity.
@@ -140,7 +148,7 @@ pub(super) fn observe(
 }
 
 pub(super) fn trim(cache: &mut Vec<CacheEvidence>, at: u64) {
-    cache.retain(|e| e.at <= at && at - e.at < 1800);
+    cache.retain(|e| e.at <= at && at - e.at < e.ttl_seconds);
     cache.sort_by_key(|e| e.at);
     while cache.len() > 128 || serde_json::to_vec(cache).unwrap().len() > 65536 {
         cache.remove(0);
