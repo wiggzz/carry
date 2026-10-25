@@ -177,7 +177,6 @@ fn fixture(rates: Rates) -> (ProxyCli, Session, Value) {
         "3",
         "--review-every-requests",
         "100",
-        "--background-reviews=false",
         "--mode",
         "compact",
     ])

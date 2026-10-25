@@ -66,8 +66,8 @@ class TransparentHistory(unittest.TestCase):
     record_evidence = regressions.StateRegressions.record_evidence
     fixture = regressions.StateRegressions.fixture
 
-    def proxy(self, fixture, options):
-        proxy = TransparentProxy(self.state, fixture, options)
+    def proxy(self, fixture, options, *, wait_reviews=True):
+        proxy = TransparentProxy(self.state, fixture, options, wait_reviews=wait_reviews)
         self.stack.callback(proxy.close)
         return proxy
 
@@ -314,8 +314,8 @@ class TransparentHistory(unittest.TestCase):
 
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"exact_h_{n}")), review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
-                   "--classifier-cache-policy", "disabled", "--background-reviews=true"]
-        proxy = self.proxy(fixture, options)
+                   "--classifier-cache-policy", "disabled"]
+        proxy = self.proxy(fixture, options, wait_reviews=False)
         history = [{"role": "user", "content": "KEEP_ORIGINAL_GOAL"},
                    {"role": "assistant", "content": "EXACT_H_SOURCE " + "payload " * 6000},
                    {"role": "user", "content": "H_BOUNDARY"}]
@@ -890,7 +890,7 @@ class TransparentHistory(unittest.TestCase):
                               "text": "A_FACT" if n == 1 else "UNCOMMITTED_B_FACT"}]})
         proxy, fixture, history, options = self.seed(review=review)
         proxy.close()
-        proxy = TransparentProxy(self.state, fixture, [*options, "--background-reviews=true"])
+        proxy = TransparentProxy(self.state, fixture, options, wait_reviews=False)
         self.stack.callback(proxy.close)
         b = [*history, {"role": "assistant", "content": "B_ONLY " + "payload " * 6000},
              {"role": "user", "content": "B_BOUNDARY"}]
@@ -936,9 +936,9 @@ class TransparentHistory(unittest.TestCase):
                     {"CARRY_PROXY_HISTORY_MAX_BYTES": "300000"} if pressure == "bytes" else
                     {"CARRY_PROXY_HISTORY_MAX_AGE_SECS": "1"}))
                 options = ["--review-replayed-history", "--payoff-requests", "1",
-                           "--classifier-cache-policy", "disabled", "--background-reviews=true",
-                           "--classifier-timeout-secs", "60"]
-                proxy = TransparentProxy(self.state, fixture, options, env)
+                           "--classifier-cache-policy", "disabled",
+                                                       "--classifier-timeout-secs", "60"]
+                                           proxy = TransparentProxy(self.state, fixture, options, env, wait_reviews=False)
                 self.stack.callback(proxy.close)
                 history = [{"role": "user", "content": "PINNED_GOAL"},
                            {"role": "assistant", "content": "PINNED_RAW " + "payload " * 2000},

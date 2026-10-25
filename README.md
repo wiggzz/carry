@@ -174,28 +174,28 @@ compatible committed reviewed prefixes across forks, rewinds and restart, withou
 a client adapter or fork-discovery API. Server-owned response/conversation indexes
 also expand observed delta histories; unknown ancestry is never fabricated.
 See [transparent history](docs/proxy-fork-continuity.md) for boundaries and limits.
-The reviewer retains the same sources and memories as the primary, appending new
-material and review updates between compactions. Oversized imports are admitted
-in bounded chunks, pruning approved sources as needed, with restart-safe progress
-and configurable call and estimated-spend limits. Before each primary request,
-Carry checks both context budgets, including incoming material, estimation margin,
-and output reserves; required compaction takes precedence over economics.
-Defaults are `--mode compact --login auto --background-reviews --payoff-requests 5`.
-Auto authentication prefers `CARRY_PROXY_UPSTREAM_KEY` or `OPENAI_API_KEY`, then a
-valid saved Carry subscription. Use `--login codex` or `--login api-key` to choose
-explicitly. Ordinary reviews run in the background; use `--background-reviews=false`
-for synchronous reviews. Bootstrap remains synchronous. Ordinary review defaults
-require a 150,000-token retained-primary estimate, four completed requests **and**
-25,000 newly reviewable native-source tokens, with capped no-yield backoff.
-These experimental defaults are configurable; see
-[admission and batching](docs/proxy-benchmarking.md#ordinary-review-admission-and-batching).
-They do not guarantee savings or a reviewer cache-hit percentage.
-`--review-replayed-history` explicitly declares that history before the latest user
-message has already been consumed, allowing review before the first request; large
-unseen histories bootstrap automatically without this flag. Invalid reviewer items are isolated,
-and rejection feedback in the next review lets the model self-correct.
-Carry skips paid reviews when the primary model has no known rate, since its
-economic planner cannot select a compaction for that model.
+Canonical native history and completed prefix advice are separate from disposable
+primary/reviewer projections. Every request replans from the original history and
+current exact-wire cache evidence; a past omission is not permanent removal.
+Reviewers receive a fresh source/fact/ledger view, never prior reviewer answers.
+Ordinary review is asynchronous, including replay imports. A fitting primary
+never waits. Only a no-fit primary can acquire one bounded review when complete,
+exposed, unprotected source could make it fit; failure or no helpful advice leaves
+it locally rejected. Oversized reviewer inputs are skipped, not partially reviewed.
+
+Defaults are `--mode compact --login auto --payoff-requests 5`. Auto authentication
+prefers `CARRY_PROXY_UPSTREAM_KEY` or `OPENAI_API_KEY`, then a valid saved Carry
+subscription; `--login codex` or `--login api-key` selects explicitly. Ordinary
+review defaults require a 150,000-token retained-primary estimate, four completed
+requests **and** 25,000 newly reviewable native-source tokens, with bounded no-yield
+backoff. `--review-replayed-history` declares prior completed exposure; it does not
+bypass protection or create synchronous review. Invalid advice items are isolated,
+and budget-rejected replacement facts preserve their supporting sources.
+Unknown primary pricing suppresses ordinary paid review. These are experimental
+planning assumptions, not demonstrated savings or cache-hit guarantees. See the
+[history contract](docs/proxy-fork-continuity.md) for exact safety, capacity,
+retention and fresh-state boundaries; this redesign requires a new empty state
+directory and has no legacy checkpoint or synchronous-review compatibility.
 
 Authenticated `GET /v1/models` also works with `--login codex`: Carry queries the
 subscription catalog using the pinned Codex 0.147.0 discovery contract and returns

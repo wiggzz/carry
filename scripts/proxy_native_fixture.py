@@ -502,7 +502,6 @@ def main():
                 '--codex-sandbox','danger-full-access',
                 '--codex-native-compaction',case if case in ('v1','v2') else 'disabled',
                 '--payoff-requests','5','--min-payback-percent','0',
-                '--synchronous-reviews',
                 '--listen',f'127.0.0.1:{port}','--upstream-url',fixture.url+'/v1/responses',
                 '--classifier-url',fixture.url+'/classifier','--timeout','60',
                 '--prompt','Run the supplied tool once and finish. This is a scripted offline fixture.']

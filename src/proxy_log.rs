@@ -239,7 +239,6 @@ fn append(
             (
                 config.mode,
                 config.classifier_cache_policy,
-                config.background_reviews,
                 &config.classifier_reasoning_effort,
                 config.review_replayed_history,
                 config.bootstrap_min_input_bytes

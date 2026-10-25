@@ -112,8 +112,7 @@ def run_case(args,case):
         try:
             command=[args.carry,'proxy','--verbose','--listen',f'127.0.0.1:{port}',
                 '--upstream-url',fixture.url+'/v1/responses','--classifier-url',gateway.url+'/v1/responses',
-                '--state-dir',str(state_dir),'--mode',mode,'--payoff-requests','5','--min-payback-percent','0',
-                '--background-reviews=false']
+                '--state-dir',str(state_dir),'--mode',mode,'--payoff-requests','5','--min-payback-percent','0']
             proxy=subprocess.Popen(command,env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
             deadline=time.monotonic()+20
             while True:

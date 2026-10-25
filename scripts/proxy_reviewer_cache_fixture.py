@@ -295,7 +295,7 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
                    # Synthetic cache/replay budget, including the deliberately
                    # unlisted-model control; never depend on a model-role default.
                    '--classifier-max-input-tokens', '300000',
-                   '--mode', 'compact' if case == 'coupled' else 'audit', '--background-reviews=false']
+                   '--mode', 'compact' if case == 'coupled' else 'audit']
             if case == 'coupled':
                 cmd += ['--payoff-requests', '1', '--min-payback-percent', '0']
             if policy_arg != 'none':

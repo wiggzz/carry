@@ -1183,17 +1183,7 @@ async fn start_proxy_options_env(
                     format!("http://{upstream}/review"),
                 ]
             })
-            // These fixtures exercise synchronous review with a five-request horizon.
-            .args(
-                if extra
-                    .iter()
-                    .any(|arg| arg.starts_with("--background-reviews"))
-                {
-                    vec![]
-                } else {
-                    vec!["--background-reviews=false"]
-                },
-            )
+            // Receipt assertions settle the background review after the primary.
             .args(if extra.contains(&"--payoff-requests") {
                 vec![]
             } else {
@@ -1857,7 +1847,7 @@ async fn explicit_replay_reviews_after_first_primary_without_exposing_fresh_tool
             state.path(),
             fixture.address,
             mode,
-            &["--review-every-requests", "5", "--background-reviews"],
+            &["--review-every-requests", "5"],
             "",
         )
         .await;
@@ -2311,8 +2301,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
             address,
             "audit",
             &[
-                "--background-reviews",
-                "--bootstrap-min-input-bytes",
+                                "--bootstrap-min-input-bytes",
                 "8388608",
             ],
             "",
@@ -2406,8 +2395,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
                 address,
                 "audit",
                 &[
-                    "--background-reviews",
-                    "--bootstrap-min-input-bytes",
+                                        "--bootstrap-min-input-bytes",
                     "8388608",
                     "--review-every-requests",
                     "100",

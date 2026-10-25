@@ -71,7 +71,7 @@ def contract_proxy(test, provider, state_dir, mode='audit', binary=None, classif
                '--upstream-url', provider.url + '/v1/responses',
                '--classifier-url', provider.url + classifier_path, '--mode', mode,
                '--min-payback-percent', '0', '--payoff-requests', '5',
-               '--state-dir', state_dir, '--background-reviews=false']
+               '--state-dir', state_dir]
     process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, text=True)
     assert process.stdout is not None
@@ -848,7 +848,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                        '--upstream-url', fixture.url + '/v1/responses',
                        '--classifier-url', fixture.url + '/classifier',
                        '--classifier-model', 'gpt-6-luna', '--mode', 'audit',
-                       '--state-dir', directory, '--background-reviews=false']
+                       '--state-dir', directory]
             process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                        stderr=subprocess.DEVNULL, text=True)
             assert process.stdout is not None

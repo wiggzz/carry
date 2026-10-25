@@ -134,10 +134,7 @@ pub struct ProxyCli {
     /// Explicit replay declarations override this threshold.
     #[arg(long, default_value_t = 16384)]
     bootstrap_min_input_bytes: usize,
-    /// Compatibility flag; reviewer work is always nonblocking. Recurring
-    /// completion sensitivity is diagnostic, never selection credit.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
-    background_reviews: bool,
+
     /// Ordinary reviews require this many completed primary requests AND native-source growth.
     #[arg(long, env = "CARRY_PROXY_REVIEW_EVERY_REQUESTS", default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=100))]
     review_every_requests: u64,
@@ -1220,7 +1217,7 @@ async fn dashboard_stats(
         "mode": format!("{:?}", service.config.mode).to_lowercase(),
         "auth": if service.config.codex_login { "codex" } else { "api-key" },
         "classifier_model": service.config.classifier_model,
-        "background_reviews": service.config.background_reviews,
+        "background_reviews": true,
         "classifier_effort": service.config.classifier_reasoning_effort,
         "classifier_cache_policy": match service.config.classifier_cache_policy {
             ClassifierCachePolicy::Auto => "auto",
@@ -2500,7 +2497,10 @@ async fn review_chunk(
                 memory_admission_fits(&service.config, candidate, &omitted)
             }) {
                 Ok(()) => {
-                    valid = session.review_feedback["rejected_count"] == 0
+                    // Budget-rejected facts still protect their known sources.
+                    // Publish that validated safety decision and feedback at H.
+                    valid = session.opinions != before_admission.opinions
+                        || session.review_feedback["rejected_count"] == 0
                         || session.review_feedback["accepted_opinions"]
                             .as_u64()
                             .unwrap_or(0)
@@ -3369,7 +3369,6 @@ mod tests {
             "openai-explicit",
             "--payoff-requests",
             "5",
-            "--background-reviews=false",
         ])
         .unwrap()
     }
@@ -3728,4 +3727,6 @@ mod tests {
 
     include!("proxy_catalog_isolation_tests.rs");
     include!("proxy_semantic_tests.rs");
+    include!("proxy_pr154_tests.rs");
+    include!("proxy_log_controls.rs");
 }

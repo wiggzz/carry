@@ -112,7 +112,7 @@ class Fixture:
 
 
 class Proxy:
-    def __init__(self, state, fixture, extra=(), extra_env=None, mode="compact", environment=None):
+    def __init__(self, state, fixture, extra=(), extra_env=None, mode="compact", environment=None, *, wait_reviews=True):
         binary = os.environ["CARRY_TEST_BINARY"]
         # Explicit minimal environment prevents ambient provider/auth/refresh
         # configuration from entering even this loopback-only fixture.
@@ -137,8 +137,6 @@ class Proxy:
                 *([] if "--request-timeout-secs" in extra else ["--request-timeout-secs", "5"]),
                 *([] if "--classifier-timeout-secs" in extra else ["--classifier-timeout-secs", "10"]),
                 *extra]
-        if not any(arg.startswith("--background-reviews") for arg in args):
-            args += ["--background-reviews=false"]
         if "--payoff-requests" not in args:
             args += ["--payoff-requests", "5"]
         self._captures = []
@@ -154,10 +152,9 @@ class Proxy:
         host, port = banner.split(" ", 1)[1].rsplit(":", 1)
         self.address = (host, int(port))
         self.state = Path(state)
-        # Legacy synchronous fixtures inspect accepted advice immediately after
-        # a response. Synchronize *after reading the primary response*, never in
-        # production admission. Background/concurrency fixtures opt out.
-        self.wait_reviews = "--background-reviews=false" in args
+        # Fixture settlement happens only after consuming the primary response.
+        # Held-review tests opt out; production admission is always asynchronous.
+        self.wait_reviews = wait_reviews
         # Long loopback tracers must not deadlock the actual binary on a full
         # unread diagnostic pipe. Spool both streams; never discard evidence.
         for name, stream in (("stdout", self.process.stdout), ("stderr", self.process.stderr)):
@@ -260,8 +257,8 @@ class StateRegressions(unittest.TestCase):
         self.stack.callback(fixture.close)
         return fixture
 
-    def proxy(self, fixture, extra=(), environment=None):
-        proxy = Proxy(self.state, fixture, extra, environment)
+    def proxy(self, fixture, extra=(), environment=None, *, wait_reviews=True):
+        proxy = Proxy(self.state, fixture, extra, environment, wait_reviews=wait_reviews)
         self.stack.callback(proxy.close)
         return proxy
 
@@ -394,8 +391,8 @@ class StateRegressions(unittest.TestCase):
                         "memories": [{"text": "HELD_DIRECTION_FACT", "source_ids": ["g2"]}]})
 
                 fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
-                options = ["--background-reviews=true", "--min-payback-percent", "100"]
-                proxy = Proxy(self.state / change, fixture, options)
+                options = ["--min-payback-percent", "100"]
+                proxy = Proxy(self.state / change, fixture, options, wait_reviews=False)
                 self.addCleanup(proxy.close)
                 seed = [{"role": "user", "content": "goal"},
                         {"role": "assistant", "content": "eligible evidence"},
@@ -441,10 +438,10 @@ class StateRegressions(unittest.TestCase):
             return 200, advice_response({"protected": [], "removable": [], "memories": []})
 
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
-        options = ["--background-reviews=true", "--primary-context-tokens", "4096",
+        options = ["--primary-context-tokens", "4096",
                    "--min-payback-percent", "100", "--payoff-requests", "1",
                    "--review-replayed-history", "--review-every-requests", "100"]
-        proxy = self.proxy(fixture, options)
+        proxy = self.proxy(fixture, options, wait_reviews=False)
         seed = [{"role": "user", "content": "goal"},
                 {"role": "assistant", "content": "old evidence " * 1500},
                 {"role": "user", "content": "current"}]
@@ -691,7 +688,7 @@ class StateRegressions(unittest.TestCase):
                 if unreadable:
                     (self.state / ("f" * 64 + ".json")).write_text("not a checkpoint")
                 checkpoint_bytes = {path.name: path.read_bytes() for path in self.state.glob("*.json")}
-                proxy = self.proxy(fixture, ["--background-reviews=true"])
+                proxy = self.proxy(fixture, wait_reviews=False)
                 status, stats = proxy.request("GET", "/carry/dashboard/stats")
                 proxy.close()
                 self.evidence["cases"].append({"case": name, "status": status, "stats": stats})
@@ -826,7 +823,7 @@ class StateRegressions(unittest.TestCase):
         self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         for n, saved in enumerate(entries, 1):
             (self.state / f"{n:064x}.json").write_text(json.dumps(saved))
-        proxy = self.proxy(fixture, ["--background-reviews=true"])
+        proxy = self.proxy(fixture, wait_reviews=False)
         stats = proxy.request("GET", "/carry/dashboard/stats")[1]
         self.evidence.update(all_unpriced=null_stats, aggregate=stats, partial=partial)
         estimate = null_stats["sessions"][0]["cost_estimate"]
@@ -1030,8 +1027,8 @@ class StateRegressions(unittest.TestCase):
                         return 200, value
 
                     fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
-                    options = [f"--background-reviews={'true' if background else 'false'}"]
-                    proxy = self.proxy(fixture, options)
+                    options = []
+                    proxy = self.proxy(fixture, options, wait_reviews=not background)
                     seed = [{"role": "user", "content": "goal"},
                             {"role": "assistant", "content": "eligible evidence"},
                             {"role": "user", "content": "current"}]
@@ -1095,7 +1092,7 @@ class StateRegressions(unittest.TestCase):
 
                 fixture = self.fixture(lambda _body, n: (429, {"error": "fixture rate limit"})
                                        if n == 2 else (200, completed(response_id=f"resp_{n}")), review)
-                proxy = self.proxy(fixture, [f"--background-reviews={'true' if background else 'false'}"])
+                proxy = self.proxy(fixture, wait_reviews=not background)
                 seed = [{"role": "user", "content": "goal"},
                         {"role": "assistant", "content": "eligible evidence"},
                         {"role": "user", "content": "current"}]
@@ -1154,10 +1151,10 @@ class StateRegressions(unittest.TestCase):
                             return 200, response
 
                         fixture = self.fixture(primary, review)
-                        options = [f"--background-reviews={'true' if background else 'false'}"]
+                        options = []
                         if outcome == "no-review":
                             options += ["--review-every-requests", "100"]
-                        proxy = self.proxy(fixture, options)
+                        proxy = self.proxy(fixture, options, wait_reviews=not background)
                         seed = [{"role": "user", "content": "goal"},
                                 {"role": "assistant", "content": "eligible evidence"},
                                 {"role": "user", "content": "current"}]
@@ -1198,8 +1195,7 @@ class StateRegressions(unittest.TestCase):
             return 200, advice_response({"protected": [], "removable": [], "memories": []})
 
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
-        options = ["--background-reviews=true"]
-        proxy = self.proxy(fixture, options)
+        proxy = self.proxy(fixture, wait_reviews=False)
         seed = [{"role": "user", "content": "goal"},
                 {"role": "assistant", "content": "eligible evidence"},
                 {"role": "user", "content": "current"}]
@@ -1247,7 +1243,7 @@ class StateRegressions(unittest.TestCase):
             return 200, advice_response({"protected": ["g2"], "removable": [], "memories": []})
 
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
-        proxy = self.proxy(fixture, ["--background-reviews", "--payoff-requests", "1",
+        proxy = self.proxy(fixture, ["--payoff-requests", "1",
                                      "--min-payback-percent", "99"])
         seed = [{"role": "user", "content": "goal"},
                 {"role": "assistant", "content": "old"}]

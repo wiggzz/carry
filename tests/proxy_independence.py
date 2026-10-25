@@ -39,7 +39,7 @@ class ReviewerIndependence(unittest.TestCase):
             fixture.release.wait(15)
             return 200, advice_response({"protected": [], "removable": [], "memories": []})
         fixture = self.fixture(review)
-        options = ["--background-reviews=false", "--min-payback-percent", "100"]
+        options = ["--min-payback-percent", "100"]
         if bootstrap:
             options += ["--review-replayed-history"]
         proxy = self.proxy(fixture, options)
@@ -90,7 +90,7 @@ class ReviewerIndependence(unittest.TestCase):
             return 503, {"error": "unavailable"}
         fixture = self.fixture(review)
         proxy = self.proxy(fixture, ["--classifier-timeout-secs", "1",
-            "--background-reviews=false", "--min-payback-percent", "100"])
+            "--min-payback-percent", "100"])
         history = self.seed()
         self.assertEqual(proxy.send(history)[0], 200)
         self.assertEqual(proxy.send(history)[0], 200)
