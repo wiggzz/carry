@@ -347,6 +347,8 @@ impl Session {
         self.review_admission = Some(ReviewAdmission::default());
         self.last_review_request = self.completed_requests;
         self.history.clear();
+        self.last_submitted_ids.clear();
+        self.completed_review_len = 0;
         self.next_id = 0;
         self.pending_output.clear();
         self.last_response_id = None;
@@ -881,15 +883,14 @@ mod tests {
                 &json!({"protected":["g2"],"removable":["g5"],"memories":[]}),
             )
             .unwrap();
-        state.remove(&[5], &groups);
+        let projected = state.render_projection(&HashSet::from([5, 6, 7]));
+        assert_eq!(&projected[..4], &input[..4]);
+        assert_eq!(&projected[5..], &input[7..]);
+        assert_eq!(projected.len(), input.len() - 2);
         assert_eq!(
             state.render_primary(),
-            [
-                input[..4].to_vec(),
-                vec![omission_notice()],
-                input[7..].to_vec()
-            ]
-            .concat()
+            input,
+            "planning never edits original source"
         );
     }
 

@@ -2484,8 +2484,18 @@ async fn review_chunk(
             );
         }
         if let Some(advice) = reviewer_advice(&value) {
+            let reviewed = groups
+                .iter()
+                .flat_map(|g| g.members.iter().copied())
+                .collect::<HashSet<_>>();
+            let omitted = session
+                .history
+                .iter()
+                .filter(|i| !reviewed.contains(&i.id))
+                .map(|i| i.id)
+                .collect::<HashSet<_>>();
             match session.apply_advice_with_memory_admission(groups, &advice, |candidate| {
-                memory_admission_fits(&service.config, candidate)
+                memory_admission_fits(&service.config, candidate, &omitted)
             }) {
                 Ok(()) => {
                     valid = session.review_feedback["rejected_count"] == 0
@@ -2803,10 +2813,14 @@ fn estimate(body: &Value) -> f64 {
     crate::proxy_savings::token_units(body) as f64
 }
 
-fn memory_admission_fits(config: &ProxyCli, session: &Session) -> bool {
+fn memory_admission_fits(config: &ProxyCli, session: &Session, omitted: &HashSet<u64>) -> bool {
     let bytes = serde_json::to_vec(&session.memories).unwrap().len();
+    let projection = planning::Projection {
+        omitted: omitted.clone(),
+        input: session.render_projection(omitted),
+    };
     bytes <= config.classifier_max_input_bytes as usize / 2
-        && review_fits(config, &review_body(config, session))
+        && review_fits(config, &review_body_projected(config, session, &projection))
 }
 
 fn primary_required_tokens(config: &ProxyCli, body: &Value) -> f64 {
@@ -3450,12 +3464,27 @@ mod tests {
                 .starts_with(first["input"].as_array().unwrap())
         );
         let mut cache = Vec::new();
-        observe_cache(
+        let model = resolve_model(
+            "gpt-6-luna",
+            Route::new("https://api.openai.com/v1/responses", false),
+            None,
+            None,
+            2048,
+            0,
+        )
+        .unwrap();
+        crate::proxy_cache::observe(
             &mut cache,
             &first,
-            &json!({"input_tokens":100,"input_tokens_details":{"cached_tokens":50}}),
+            &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":5000}}),
+            Some(&model),
+            "fixture-auth",
+            now(),
         );
-        assert!(reusable(&cache, &appended) > 0.0);
+        assert!(
+            crate::proxy_cache::reusable(&cache, &appended, Some(&model), "fixture-auth", now())
+                > 0.0
+        );
         config.codex_login = false;
         assert_eq!(
             primary_wire_body(&config, &raw),

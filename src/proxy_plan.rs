@@ -25,6 +25,13 @@ pub(super) fn plan(
     retained["input"] = json!(canonical.input);
     let wire = primary_wire_body(config, &retained);
     let forced = !primary_fits(config, &retained);
+    let prediction = session.cost_trajectory.as_ref().and_then(|t| {
+        t.receipt_prediction(
+            &wire,
+            &config.upstream_url,
+            config.model_resolution.as_ref().map(|p| &p.primary),
+        )
+    });
     let groups = session.groups();
     let eligible = groups
         .iter()
@@ -144,7 +151,7 @@ pub(super) fn plan(
     let report = json!({"selected":best.is_some(),"forced":forced,"primary_fits":!forced,
         "primary_cached_estimated_tokens":crate::proxy_cache::reusable(&session.upstream_cache,&wire,config.model_resolution.as_ref().map(|p|&p.primary),&config.primary_cache_auth,now()),
         "reviewer_fits":review_fits(config,&review),"primary_estimated_tokens":estimate(&wire),
-        "primary_required_tokens":primary_required_tokens(config,&retained),
+        "primary_required_tokens":primary_required_tokens(config,&retained),"primary_receipt_prediction_tokens":prediction,
         "reviewer_estimated_tokens":estimate(&review),"primary_context_tokens":config.primary_context_tokens,
         "selected_candidate_id":best.as_ref().map(|(_,_,id)|id.as_str()).or(if forced {None} else {Some("keep")}),
         "selected_action":if best.is_some() {"projection"} else {"keep"},
