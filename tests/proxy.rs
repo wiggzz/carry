@@ -1624,7 +1624,7 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     assert_eq!(estimate["coverage"]["primary_responses"], 3);
     assert_eq!(
         estimate["coverage"]["reviewer_responses"],
-        fixture.reviews.lock().await.len()
+        shadow.lock().await.len()
     );
     assert!(estimate["reviewer_cost"].as_f64().unwrap() > 0.0);
     assert_eq!(estimate["traditional_compactions"], 0);
