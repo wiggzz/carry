@@ -15,6 +15,7 @@ pub(super) struct Record {
     pub anchors: BTreeMap<u64, u64>,
     pub exposed: Vec<u64>,
     pub next_memory_id: u64,
+    pub feedback: Value,
 }
 
 pub(super) fn scope(config: &ProxyCli, context: &Value) -> String {
@@ -54,6 +55,7 @@ impl Record {
             memories: session.memories.clone(),
             anchors: session.memory_anchors.clone(),
             next_memory_id: session.next_memory_id,
+            feedback: session.review_feedback.clone(),
             exposed: session
                 .history
                 .iter()
@@ -65,6 +67,7 @@ impl Record {
 
     pub fn apply(&self, session: &mut Session) {
         session.completed_review_len = self.len;
+        session.review_feedback = self.feedback.clone();
         session.bootstrap_review_pending &= session
             .history
             .iter()

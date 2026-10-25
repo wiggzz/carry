@@ -1,4 +1,36 @@
 // Direct controls for the prefix-advice/request-projection model.
+#[tokio::test]
+async fn reviewer_deadline_includes_subscription_auth_wait_and_censors_spend() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.codex_login = true;
+    service.config.classifier_url = None;
+    service.config.codex_home = Some(directory.path().to_path_buf());
+    service.config.classifier_timeout_secs = 1;
+    let mut session = semantic_subject();
+    let projection = planning::Projection::canonical(&session);
+    let mut run = ReviewRun::default();
+    // The auth lock is also taken during a 401 refresh. No network or real
+    // credential is involved: this exercises the production subscription wait.
+    let _auth = session_lock(&service, "codex-auth").await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_review(&service, "deadline", &mut session, &projection, &mut run),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "review deadline must include subscription auth waits"
+    );
+    assert!(!result.unwrap());
+    assert_eq!(session.shadow.calls, 1);
+    assert_eq!(
+        session.shadow.unavailable_cost_calls, 1,
+        "cancelled work is not free"
+    );
+    assert!(!run.accepted);
+}
+
 fn semantic_subject() -> Session {
     let mut s = Session::default();
     s.ingest(&[

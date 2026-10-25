@@ -2036,7 +2036,9 @@ fn review_body_with_input(config: &ProxyCli, session: &Session, input: Vec<Value
         body["prompt_cache_options"] = json!({"mode":"explicit"});
         // One actual current boundary, never a second reviewer cache registry.
         let input = body["input"].as_array_mut().unwrap();
-        if let Some(last) = input.last_mut() {
+        // The final ledger is mutable advice state, not a stable observation.
+        let boundary = input.len().saturating_sub(2);
+        if let Some(last) = input.get_mut(boundary) {
             if let Some(text) = last["content"].as_str() {
                 last["content"] = json!([{"type":"input_text","text":text,"prompt_cache_breakpoint":{"mode":"explicit"}}]);
             }

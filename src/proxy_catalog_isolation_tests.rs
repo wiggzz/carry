@@ -163,6 +163,7 @@ async fn catalog_r1_cache_preserving_candidates_require_the_exact_receipt_namesp
     session.model_resolution.as_mut().unwrap().primary.route =
         Route::new("https://api.openai.com/v1/responses", false);
     cold.model_resolution = session.model_resolution.clone();
+    config.model_resolution = session.model_resolution.clone();
     let (_, changed) = plan(&config, &session, &body);
     let (_, control) = plan(&config, &cold, &body);
     assert_eq!(

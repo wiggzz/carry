@@ -130,6 +130,12 @@ class TransparentHistory(unittest.TestCase):
         self.assertNotIn(history[1], fixture.primaries[-1]["input"], "expired prefix permits cold omission")
         cold = fixture.primaries[-1]
         proxy.close()
+        # If both shapes are warm the smaller compact view can remain cheaper.
+        # Expire its new receipt before genuinely re-warming canonical H alone.
+        index = json.loads(path.read_text())
+        for entry in index["upstream_cache"]:
+            entry["at"] = 1
+        path.write_bytes(wire(index))
         # Audit mode genuinely dispatches canonical H. Only its terminal provider
         # receipt may re-warm that exact shape; no invented saved cache entries.
         proxy = TransparentProxy(self.state, fixture, options, mode="audit")
@@ -206,6 +212,41 @@ class TransparentHistory(unittest.TestCase):
         self.assertNotIn(h[1],fixture.primaries[-1]["input"])
         self.assertEqual(proxy.saved()["shadow"]["calls"],1)
         self.evidence.update(primaries=fixture.primaries,reviews=fixture.reviews,state=proxy.saved())
+
+    def test_no_fit_exception_failure_no_help_and_timeout_never_send_primary(self):
+        original_state = self.state
+        for outcome in ("failure", "no_help", "timeout"):
+            with self.subTest(outcome=outcome):
+                self.state = original_state / outcome
+                def review(_body, _n):
+                    if outcome == "timeout":
+                        time.sleep(3)
+                    if outcome == "failure":
+                        return 503, {"error": "synthetic failure"}
+                    return 200, advice_response({"protected": [], "removable": [], "memories": []})
+                fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"nohelp_{n}")), review)
+                history = [{"role":"user","content":"goal"},
+                           {"role":"assistant","content":"UNREVIEWED_SOURCE " * 12000},
+                           {"role":"user","content":"current"}]
+                options = ["--review-every-requests","100","--classifier-cache-policy","disabled"]
+                proxy = self.proxy(fixture, options)
+                self.assertEqual(proxy.send(history)[0], 200)
+                proxy.close()
+                proxy = self.proxy(fixture, options + ["--primary-context-tokens","5000",
+                    "--primary-output-reserve-tokens","1","--context-margin-percent","0",
+                    "--classifier-timeout-secs","1"])
+                started = time.monotonic()
+                self.assertEqual(proxy.send(history)[0], 413)
+                self.assertLess(time.monotonic() - started, 2.5, "one bounded exceptional attempt")
+                self.assertEqual(len(fixture.reviews), 1)
+                self.assertEqual(len(fixture.primaries), 1, "no unqualified source removal or overflowing primary")
+                saved = proxy.saved()
+                self.assertEqual(saved["shadow"]["calls"], 1)
+                self.assertEqual(saved["shadow"]["unavailable_cost_calls"], int(outcome != "no_help"))
+                self.assertEqual([i["value"] for i in saved["history"]], history)
+                self.evidence[outcome] = {"saved": saved, "reviews": fixture.reviews}
+                proxy.close()
+        self.state = original_state
 
     def test_projected_merged_members_publish_under_original_cut_after_advancement(self):
         import threading
@@ -569,7 +610,7 @@ class TransparentHistory(unittest.TestCase):
         self.assertTrue(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in proxy.advice()["memories"]))
         index = json.loads((self.state / "history.index").read_text())
         self.assertTrue(any(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in p["memories"])
-                            for versions in index["reviews"].values() for p in versions),
+                            for p in index["reviews"].values()),
                         "later compatible reviews must be committed too, not first-raw-only: "
                         + json.dumps({"feedback": parent.get("review_feedback"),
                                       "versions": parent.get("fork_points"),
@@ -796,7 +837,7 @@ class TransparentHistory(unittest.TestCase):
     def test_index_byte_node_age_limits_and_evicted_ids_fail_closed(self):
         env = {"CARRY_PROXY_HISTORY_MAX_BYTES": "4096", "CARRY_PROXY_HISTORY_MAX_NODES": "4",
                "CARRY_PROXY_HISTORY_MAX_REFERENCES": "4",
-               "CARRY_PROXY_FORK_MAX_AGE_SECS": "1"}
+               "CARRY_PROXY_HISTORY_MAX_AGE_SECS": "1"}
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")))
         proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"], env)
         self.stack.callback(proxy.close)
@@ -885,7 +926,7 @@ class TransparentHistory(unittest.TestCase):
                 env = {"CARRY_PROXY_HISTORY_MAX_NODES": "8"} if pressure == "nodes" else (
                     {"CARRY_PROXY_HISTORY_MAX_REFERENCES": "6"} if pressure == "references" else (
                     {"CARRY_PROXY_HISTORY_MAX_BYTES": "300000"} if pressure == "bytes" else
-                    {"CARRY_PROXY_FORK_MAX_AGE_SECS": "1"}))
+                    {"CARRY_PROXY_HISTORY_MAX_AGE_SECS": "1"}))
                 options = ["--review-replayed-history", "--payoff-requests", "1",
                            "--classifier-cache-policy", "disabled", "--background-reviews=true",
                            "--classifier-timeout-secs", "60"]
@@ -924,7 +965,9 @@ class TransparentHistory(unittest.TestCase):
                     time.sleep(.01)
                 self.assertEqual(settled["primary"]["calls"], 1)
                 self.assertEqual(settled["shadow"]["calls"], 1, "paid receipt settles exactly once")
-                self.assertTrue(any(m["text"] == "PINNED_FACT" for m in proxy.advice()["memories"]))
+                # Capacity may evict advice, never an in-flight paid owner.
+                records = list(index["reviews"].values())
+                self.evidence[pressure] = {"settled": settled, "reviews": records}
                 proxy.close()
                 # The age policy may legitimately expire a settled branch. The
                 # durable receipt is checked above; non-age restart must retain it.
@@ -936,7 +979,10 @@ class TransparentHistory(unittest.TestCase):
                     _, resumed = proxy.checkpoint(followup)
                     self.assertEqual(resumed["primary"]["calls"], 2)
                     self.assertEqual(resumed["shadow"]["calls"], 1)
-                    self.assertNotIn("PINNED_RAW", json.dumps(fixture.primaries[-1]["input"]))
+                    sent = fixture.primaries[-1]["input"]
+                    self.assertIn(history[0], sent, "direction survives advice eviction")
+                    self.assertEqual(history[1] in sent, not any(
+                        m["text"] == "PINNED_FACT" for r in records for m in r["memories"]))
                 proxy.close()
         self.state = original_state
 
@@ -980,7 +1026,11 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(parent)[0], 200)
         _, resumed = proxy.checkpoint(parent)
         self.assertEqual(resumed["primary"]["calls"], 3)
-        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
+        sent = fixture.primaries[-1]["input"]
+        self.assertIn(history[0], sent)
+        self.assertEqual(history[1] in sent, not any(r["drops"] for r in json.loads(
+            (self.state / "history.index").read_text())["reviews"].values()),
+            "evicted advice cannot confer permanent omission authority")
 
     def test_bounded_many_sibling_storage_observation_is_not_latency_evidence(self):
         proxy, fixture, history, _ = self.seed(extra=("--history-max-references", "32"))
@@ -1103,7 +1153,7 @@ class TransparentHistory(unittest.TestCase):
                 self.assertEqual(saved["shadow"]["calls"], 0)
                 self.assertEqual(saved["completed_requests"], 0)
                 self.assertFalse(saved["background_review_pending"])
-                self.assertNotIn("review_cache_key", saved)
+                self.assertEqual(saved["review_cache_key"], "", "cold child has no reviewer affinity yet")
             finally:
                 release.set()
             self.assertEqual(pending.result()[0], 200)

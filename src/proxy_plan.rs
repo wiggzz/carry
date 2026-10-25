@@ -92,23 +92,25 @@ pub(super) fn plan(
         let compact_review = review_body_projected(config, session, &projection);
         // Same actual scheduling on both views: a selected rewrite does not
         // suppress the review. No hypothetical repeated reviewer savings.
-        let shadow = if due && review_fits(config, &review) && review_fits(config, &compact_review)
-        {
-            resolved_view_costs(
-                &review,
-                &compact_review,
+        let review_cost = |view: &Value| {
+            if !due || !review_fits(config, view) {
+                return Some(0.0);
+            }
+            let input = resolved_view_costs(
+                view,
+                view,
                 &session.upstream_cache,
                 &config.classifier_model,
                 1,
                 config.model_resolution.as_ref().map(|p| &p.reviewer),
                 &config.reviewer_cache_auth,
-            )
-        } else {
-            Some(ViewCosts {
-                keep: 0.0,
-                compact: 0.0,
-            })
+            )?;
+            let rates = reviewer_rates(config, estimate(view))?;
+            Some(input.keep + config.classifier_max_output_tokens as f64 * rates.output)
         };
+        let shadow = review_cost(&review)
+            .zip(review_cost(&compact_review))
+            .map(|(keep, compact)| ViewCosts { keep, compact });
         let output =
             body["max_output_tokens"].as_u64().unwrap_or(0) as f64 * config.payoff_requests as f64;
         let primary = primary.and_then(|cost| {
@@ -168,7 +170,26 @@ pub(super) fn plan(
     {
         report["reason"] = json!("unsupported_model_or_tier");
     }
-    report["reviewer_context_tokens"] = json!(config.classifier_max_input_tokens);
+    report["reviewer_context_tokens"] = json!(
+        config
+            .model_resolution
+            .as_ref()
+            .map_or(Some(config.classifier_max_input_tokens), |p| p
+                .reviewer
+                .capacity_tokens)
+    );
+    report["reviewer_ordinary_context_tokens"] = json!(
+        config
+            .model_resolution
+            .as_ref()
+            .map(|p| p.reviewer.ordinary.total_budget)
+    );
+    report["primary_ordinary_context_tokens"] = json!(
+        config
+            .model_resolution
+            .as_ref()
+            .map(|p| p.primary.ordinary.total_budget)
+    );
     report["model_resolution"] = json!(config.model_resolution);
     (best.map(|(projection, _, _)| projection), report)
 }

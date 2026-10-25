@@ -1655,14 +1655,14 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     );
     assert_eq!(
         primary.lock().await[3]["input"],
-        sent["input"],
-        "repeated projection must preserve notice/fact positions"
+        second["input"],
+        "native compaction is a separate canonical-history operation"
     );
     assert!(
-        !primary.lock().await[3]
+        primary.lock().await[3]
             .to_string()
             .contains("DISCARD_SOURCE_PAYLOAD_"),
-        "native compaction must operate on the same retained main view, not resurrect removed echo source"
+        "canonical source stays available to native compaction, with complete cohorts"
     );
     let stale = client
         .post(format!("{url}/v1/responses"))
@@ -2052,7 +2052,7 @@ async fn failed_rebase_primary_reuses_successful_bootstrap_before_review_cadence
         );
         assert_eq!(saved["history"][2]["exposed"], false);
         assert_eq!(saved["bootstrap_review_pending"], false);
-        assert_eq!(saved["bootstrap_review_complete"], true);
+        assert_eq!(advice_for_checkpoint(state.path(), &saved)["len"], 3);
         if attempt == 1 {
             drop(proxy);
             let restarted = start_proxy(state.path(), fixture.address, "compact").await;
@@ -2425,7 +2425,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
             assert_eq!(saved["shadow"]["calls"], 1);
             assert_eq!(saved["shadow"]["unavailable_cost_calls"], 1);
             assert_eq!(saved["background_review_pending"], false);
-            assert_eq!(saved["memories"], json!([]));
+            assert!(advice_for_checkpoint(state.path(), &saved).is_null());
             server.abort();
             continue;
         } else {
@@ -2527,13 +2527,10 @@ async fn mixed_advice_applies_valid_items_and_failed_primary_keeps_feedback() {
     let advice = advice_for_checkpoint(state.path(), &saved);
     assert_eq!(advice["memories"][0]["text"], "valid sourced fact");
     assert_eq!(advice["opinions"]["2"], "keep");
-    assert_eq!(saved["review_feedback"]["rejected_count"], 1);
-    assert_eq!(
-        saved["review_feedback"]["rejected"][0]["field"],
-        "removable"
-    );
+    assert_eq!(advice["feedback"]["rejected_count"], 1);
+    assert_eq!(advice["feedback"]["rejected"][0]["field"], "removable");
     assert!(
-        saved["review_feedback"]["rejected"][0]["reason"]
+        advice["feedback"]["rejected"][0]["reason"]
             .as_str()
             .unwrap()
             .contains("conflicting")
@@ -2720,8 +2717,9 @@ async fn valid_completed_shadow_and_shared_memory_survive_a_failed_primary() {
     let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["invalid_reviews"], 0);
     assert_eq!(saved["shadow"]["calls"], 1);
-    assert_eq!(saved["memories"][0]["text"], "remember tested outcome");
-    assert_eq!(saved["opinions"]["2"], "drop");
+    let advice = advice_for_checkpoint(state.path(), &saved);
+    assert_eq!(advice["memories"][0]["text"], "remember tested outcome");
+    assert_eq!(advice["opinions"]["2"], "drop");
     assert_eq!(
         saved["compactions"], 0,
         "failed primary does not commit a speculative removal"
@@ -2734,7 +2732,7 @@ async fn valid_completed_shadow_and_shared_memory_survive_a_failed_primary() {
         saved["cost_trajectory"]["restored"], 0,
         "failed rewrites must not restore hypothetical context"
     );
-    assert_eq!(saved["history"][1]["removed"], false);
+    assert_eq!(saved["history"][1]["value"], next["input"][1]);
     assert_eq!(saved["history"][4]["exposed"], false);
 }
 
@@ -3112,7 +3110,7 @@ async fn oversized_replay_groups_are_kept_whole_without_reviewer_dispatch() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|item| item["removed"] == false)
+            .all(|item| item.get("removed").is_none())
     );
     assert_eq!(saved["bootstrap_review_pending"], true);
 }

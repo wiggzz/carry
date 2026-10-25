@@ -252,7 +252,7 @@ class ReviewRegressions(unittest.TestCase):
         self.assertIn(b"BOOTSTRAP_DIRECTION", wire(body["input"][1]),
                       "disposable bootstrap/import must carry primary direction before sources")
         self.assertNotIn("primary_instruction_version", ledger(body))
-        self.assertEqual(before["completed_review_len"], len(self.seed()))
+        self.assertEqual(proxy.advice()["len"], len(self.seed()))
         proxy.close()
         proxy = self.harness.proxy(fixture, options)
         self.assertEqual(proxy.send(self.seed(), instructions="BOOTSTRAP_DIRECTION")[0], 200)
