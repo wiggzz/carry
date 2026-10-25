@@ -358,3 +358,10 @@ fn explicit_review_cache_boundary_excludes_current_ledger_and_preserves_native_s
         "actual stable-prefix receipt remains usable after ledger-only changes"
     );
 }
+#[test]
+fn removed_synchronous_compatibility_flag_is_rejected() {
+    assert!(
+        ProxyCli::try_parse_from(["carry proxy", "--background-reviews=false"]).is_err(),
+        "ordinary review is always asynchronous; do not retain a no-op synchronous compatibility mode"
+    );
+}

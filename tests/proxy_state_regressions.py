@@ -1303,6 +1303,8 @@ class StateRegressions(unittest.TestCase):
         accepted = len((proxy.advice() or {}).get("memories", []))
         feedback = (proxy.advice() or {}).get("feedback", saved["review_feedback"])
         if accepted < 2:
+            self.assertIsInstance(feedback, dict,
+                "completed known-source replacement rejection must retain H-scoped feedback and source protection")
             self.assertGreater(feedback["rejected_count"], 0,
                                "budget admission may reject facts only with explicit feedback")
         self.evidence.update(limit=limit, accepted_memories=accepted,
