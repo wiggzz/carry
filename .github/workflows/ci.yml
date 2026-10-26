@@ -166,7 +166,91 @@ jobs:
           terraform -chdir=infra init -backend=false -input=false
           terraform -chdir=infra validate
 
+  # These contracts do not consume a Rust binary; run them alongside Rust,
+  # rather than adding their install/test time to its critical path.
+  python:
+    name: Python and benchmark contracts
+    if: github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Identify installed Python version
+        id: python-version
+        run: |
+          python3 -c 'import sys; print("version=" + ".".join(map(str, sys.version_info[:2])))' >> "$GITHUB_OUTPUT"
+
+      # Cache downloads, never a venv, model weights, or fixture evidence.
+      - name: Cache public Python package downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: ci-pip-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.python-version.outputs.version }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ci-pip-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.python-version.outputs.version }}-
+
+      - name: Benchmark planner, runner, worker, and lifecycle tests
+        run: >-
+          python3 -m unittest -v
+          scripts/test_benchmark_progress.py
+          scripts/test_benchmark_preparation_telemetry.py
+          scripts/test_benchmark_worker_diagnostics.py
+          scripts/test_render_swebench_worker_user_data.py
+          scripts/test_swebench_benchmark.py
+          scripts/test_swebench_live_runner.py
+          scripts/test_swebench_smoke.py
+          scripts/test_swebench_preparation_compat.py
+          scripts/test_probe_matplotlib_solver.py
+          scripts/test_probe_matplotlib_preparation.py
+          scripts/test_probe_pylint_evaluator.py scripts/test_probe_pylint_gold.py
+          scripts/test_build_long_swebench_selection.py
+          scripts/test_merge_swebench_attempts.py
+          scripts/test_swebench_harness_entrypoint.py
+          scripts/test_proxy_benchmark.py
+          scripts/test_proxy_workflow.py
+          scripts/test_proxy_trial.py
+          scripts/test_pi_carry.py
+          scripts/test_proxy_reviewer_cache_fixture.py
+          scripts/test_proxy_gateway.py
+          scripts/test_proxy_gateway_native_fixture.py
+          scripts/test_prepared_swebench_image.py
+          scripts/test_swebench_ec2_worker.py
+          scripts/test_docker_registry_login.py
+          scripts/test_presign_s3.py
+          scripts/test_validate_pr_title.py
+          scripts/test_wait_for_ec2_termination.py
+          scripts/test_ci_workflow.py
+
+      - name: Verify preparation against pinned SWE-bench recipes
+        run: |
+          python3 -m venv "$RUNNER_TEMP/swebench-contract"
+          "$RUNNER_TEMP/swebench-contract/bin/python" -m pip install 'swebench==4.1.0'
+          "$RUNNER_TEMP/swebench-contract/bin/python" -m unittest -v \
+            scripts.test_swebench_preparation_compat scripts.test_swebench_smoke \
+            scripts.test_probe_matplotlib_preparation scripts.test_probe_pylint_evaluator scripts.test_probe_pylint_gold
+
+  # Preserve the existing required check name while making either lane's
+  # failure, cancellation, or unexpected skip block the final check.
+  ci-status:
+    name: test
+    if: always() && (github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe)
+    needs: [test, python, infra]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every CI lane to succeed
+        env:
+          RUST_RESULT: ${{ needs.test.result }}
+          PYTHON_RESULT: ${{ needs.python.result }}
+          INFRA_RESULT: ${{ needs.infra.result }}
+        run: |
+          test "$RUST_RESULT" = success
+          test "$PYTHON_RESULT" = success
+          test "$INFRA_RESULT" = success
+
   test:
+    name: Rust and native fixtures
     if: github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -200,7 +284,7 @@ jobs:
       # restore this cache. Cache only public dependencies and CI build output.
       - name: Restore Rust dependencies and build output
         id: rust-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/cache
@@ -215,6 +299,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Build terminal editor binary
+        id: rust-build
         run: cargo build --locked
 
       - name: Checkpoint size guard behavioral RED and GREEN
@@ -259,45 +344,12 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Benchmark planner, runner, worker, and lifecycle tests
-        run: >-
-          python3 -m unittest -v
-          scripts/test_benchmark_progress.py
-          scripts/test_benchmark_preparation_telemetry.py
-          scripts/test_benchmark_worker_diagnostics.py
-          scripts/test_render_swebench_worker_user_data.py
-          scripts/test_swebench_benchmark.py
-          scripts/test_swebench_live_runner.py
-          scripts/test_swebench_smoke.py
-          scripts/test_swebench_preparation_compat.py
-          scripts/test_probe_matplotlib_solver.py
-          scripts/test_probe_matplotlib_preparation.py
-          scripts/test_probe_pylint_evaluator.py scripts/test_probe_pylint_gold.py
-          scripts/test_build_long_swebench_selection.py
-          scripts/test_merge_swebench_attempts.py
-          scripts/test_swebench_harness_entrypoint.py
-          scripts/test_proxy_benchmark.py
-          scripts/test_proxy_workflow.py
-          scripts/test_proxy_trial.py
-          scripts/test_pi_carry.py
-          scripts/test_proxy_native_fixture.py
-          scripts/test_proxy_reviewer_cache_fixture.py
-          scripts/test_proxy_gateway.py
-          scripts/test_proxy_gateway_native_fixture.py
-          scripts/test_prepared_swebench_image.py
-          scripts/test_swebench_ec2_worker.py
-          scripts/test_docker_registry_login.py
-          scripts/test_presign_s3.py
-          scripts/test_validate_pr_title.py
-          scripts/test_wait_for_ec2_termination.py
-
-      - name: Verify preparation against pinned SWE-bench recipes
+      # These Python contracts launch the debug binary and must not move to
+      # the source-only lane (where they would silently skip).
+      - name: Proxy native binary contract tests
         run: |
-          python3 -m venv "$RUNNER_TEMP/swebench-contract"
-          "$RUNNER_TEMP/swebench-contract/bin/python" -m pip install 'swebench==4.1.0'
-          "$RUNNER_TEMP/swebench-contract/bin/python" -m unittest -v \
-            scripts.test_swebench_preparation_compat scripts.test_swebench_smoke \
-            scripts.test_probe_matplotlib_preparation scripts.test_probe_pylint_evaluator scripts.test_probe_pylint_gold
+          test -x target/debug/carry
+          python3 -m unittest -v scripts/test_proxy_native_fixture.py
 
       - name: Build one portable release binary
         run: |
@@ -406,3 +458,16 @@ jobs:
         run: |
           docker build --tag carry:dev --file containers/ci/Dockerfile.fixture .
           ./scripts/run-fixture.sh clamp scripted
+
+      # A test/fixture failure must not discard successful compilation work.
+      # The cache is only a build accelerator; every check still executes.
+      - name: Save Rust build output even when later checks fail
+        if: ${{ !cancelled() && steps.rust-build.outcome == 'success' && steps.rust-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
