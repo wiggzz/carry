@@ -2,7 +2,7 @@
 import json
 import time
 import unittest
-from proxy_state_regressions import advice_response, completed, wire
+from proxy_state_regressions import Proxy, advice_response, completed, wire
 import proxy_transparent_history as history_fixture
 from proxy_transparent_history import TransparentProxy
 
@@ -72,6 +72,76 @@ class NoodleRegressions(unittest.TestCase):
         self.assertGreater(after["cost_trajectory"]["result"]["summary_cost"], 0)
         self.assertGreater(after["cost_trajectory"]["result"]["observed_primary_cost"],
                            before["cost_trajectory"]["result"]["observed_primary_cost"])
+
+    def test_compact_to_passthrough_measures_current_projection_on_repeat_and_restart(self):
+        root = self.state
+        for mode in ("off", "audit"):
+            with self.subTest(mode=mode):
+                self.state = root / mode
+                self.state.mkdir()
+                fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"mode_{mode}_{n}")),
+                    lambda _b,_n: (200, advice_response({"protected":[],"removable":[2],"memories":[]})))
+                h = self.history()
+                options = ["--payoff-requests","1","--classifier-cache-policy","disabled"]
+                def start(mode, extra=()):
+                    proxy = Proxy(self.state, fixture, [*options,*extra], mode=mode)
+                    self.stack.callback(proxy.close)
+                    return proxy
+                proxy = start("compact", ["--review-replayed-history"])
+                self.assertEqual(proxy.send(h, max_output_tokens=1)[0],200)
+                proxy.close()
+                options += ["--review-every-requests","100"]
+                proxy = start("compact")
+                self.assertEqual(proxy.send(h, max_output_tokens=1)[0],200)
+                compact = proxy.saved()
+                self.assertGreater(compact["cost_trajectory"]["restored"],0)
+                self.assertNotIn(h[1],fixture.primaries[-1]["input"])
+                proxy.close()
+                # Execute every repeat/restart before grading restoration, so
+                # a stale first receipt cannot hide the later lifetime seam.
+                proxy = start(mode)
+                snapshots = []
+                for _ in range(2):
+                    self.assertEqual(proxy.send(h, max_output_tokens=1)[0],200)
+                    snapshots.append(proxy.saved())
+                    self.assertEqual(fixture.primaries[-1]["input"],h)
+                proxy.close()
+                proxy = start(mode)
+                self.assertEqual(proxy.send(h, max_output_tokens=1)[0],200)
+                snapshots.append(proxy.saved())
+                self.assertEqual(fixture.primaries[-1]["input"],h)
+                proxy.close()
+                # Returning to compact must measure a real current omission;
+                # globally clearing restoration would fail this positive arm.
+                proxy = start("compact")
+                self.assertEqual(proxy.send(h, max_output_tokens=2)[0],200)
+                resumed = proxy.saved()
+                self.assertNotIn(h[1],fixture.primaries[-1]["input"])
+                self.evidence[mode] = {"compact":compact,"passthrough":snapshots,"resumed":resumed,
+                                       "primaries":fixture.primaries,"reviews":fixture.reviews}
+                self.assertEqual(len(fixture.reviews),1)
+                for n, saved in enumerate(snapshots,3):
+                    self.assertEqual(saved["primary"]["calls"],n)
+                    self.assertEqual(saved["primary"]["input_tokens"],100*n)
+                    self.assertEqual(saved["primary"]["output_tokens"],n)
+                    self.assertEqual(saved["shadow"],compact["shadow"])
+                    result = saved["cost_trajectory"]["result"]
+                    self.assertAlmostEqual(result["observed_primary_cost"],
+                        compact["cost_trajectory"]["result"]["observed_primary_cost"]*n/2,places=12)
+                    self.assertEqual(result["traditional_compactions"],0)
+                # Grade each current quantity independently, retaining all wire
+                # and paid evidence even on the intentionally failing baseline.
+                for label, saved in zip(("first","repeat","restart"),snapshots):
+                    with self.subTest(mode=mode,request=label):
+                        self.assertEqual(saved["cost_trajectory"]["restored"],0,
+                                         "full current wire must replace prior compact restoration")
+                        self.assertEqual(saved["cost_trajectory"]["last_traditional_input"],100)
+                self.assertEqual(resumed["cost_trajectory"]["restored"],compact["cost_trajectory"]["restored"])
+                self.assertEqual(resumed["primary"]["calls"],6)
+                self.assertEqual(resumed["primary"]["input_tokens"],600)
+                self.assertEqual(resumed["shadow"],compact["shadow"])
+                proxy.close()
+        self.state = root
 
     def test_cold_extension_revokes_old_warm_prefix_through_repeat_restart_and_rewarm(self):
         def primary(_body, n):

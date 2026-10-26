@@ -1712,14 +1712,6 @@ async fn forward_request(
             if !projection.omitted.is_empty() {
                 session.compactions += 1;
             }
-            let canonical = session.render_primary();
-            if let Some(t) = &mut session.cost_trajectory {
-                t.projected(
-                    estimate(&json!(canonical)) as u64,
-                    estimate(&json!(projection.input)) as u64,
-                    canonical != projection.input,
-                );
-            }
             if !acquired
                 && standard(&body)
                 && primary_rates(&service.config, body["model"].as_str().unwrap_or(""), 0.0)
@@ -1738,6 +1730,17 @@ async fn forward_request(
         }
         if native && service.config.mode != Mode::Off {
             outbound["input"] = json!(session.render_primary());
+        }
+        // Projection belongs to this primary attempt, not the planner's mode.
+        // Measure after choosing its actual input, including a zero delta for
+        // pass-through. Receipt compatibility may preserve only this quantity.
+        let canonical = json!(session.render_primary());
+        if let Some(t) = &mut session.cost_trajectory {
+            t.projected(
+                estimate(&canonical) as u64,
+                estimate(&outbound["input"]) as u64,
+                canonical != outbound["input"],
+            );
         }
         let reviewed = session.clone();
         session.last_submitted_ids = session
