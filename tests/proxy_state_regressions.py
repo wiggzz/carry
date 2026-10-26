@@ -567,7 +567,11 @@ class StateRegressions(unittest.TestCase):
         else:
             self.assertNotIn(b"CAPACITY_HELD_A_FACT", wire(fixture.primaries))
         proxy.close()
-        proxy = self.proxy(fixture, ["--review-every-requests", "100",
+        # Bootstrap retries now obey cadence after their first attempt. Make
+        # the independently required replacement review due explicitly rather
+        # than relying on the old unconditional replay-bootstrap bypass.
+        restart_cadence = "1" if not accepted and not publication_failure else "100"
+        proxy = self.proxy(fixture, ["--review-every-requests", restart_cadence,
                                      "--primary-context-tokens", "16384",
                                      "--min-payback-percent", "100"])
         self.assertEqual(proxy.send(growing, instructions=direction, max_output_tokens=1)[0], 200)

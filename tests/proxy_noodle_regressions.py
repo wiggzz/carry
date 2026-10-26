@@ -101,10 +101,13 @@ class NoodleRegressions(unittest.TestCase):
         self.stack.callback(proxy.close)
         self.assertEqual(proxy.send(extended)[0],200)
         _, restarted = proxy.checkpoint(extended)
-        self.assertEqual(proxy.send(h)[0],200)  # genuine later rewarm H
+        self.assertEqual(proxy.send(extended)[0],200)  # genuine later rewarm of the current wire
+        _, positive = proxy.checkpoint(extended)
+        self.assertEqual(positive["primary"]["cached_tokens"],7800,
+                         "prove the provider's later positive receipt was observed")
         self.assertEqual(proxy.send(extended)[0],200)
         _, rewarmed = proxy.checkpoint(extended)
-        self.evidence.update(cold=cold,repeated=repeated,restarted=restarted,rewarmed=rewarmed,
+        self.evidence.update(cold=cold,repeated=repeated,restarted=restarted,positive=positive,rewarmed=rewarmed,
                              actual_wires=fixture.primaries,events=self.events())
         self.assertEqual(repeated["last_plan"]["primary_cached_estimated_tokens"],0,
                          "newer cold extension supersedes old covered warmth")

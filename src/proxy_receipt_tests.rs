@@ -271,12 +271,14 @@ fn receipt_restoration_selects_each_branch_tariff_without_repricing_actuals() {
     assert!((after.carry_cost - 2.0 * before.carry_cost).abs() < 1e-12);
     assert_eq!(after.observed_primary_cost, after.carry_cost);
     assert!(state(&t)["receipts"]["last_appended_input"].is_null());
-    // A configuration change after a Carry edit cannot retain its restoration.
+    // The new request's complete projection survives a receipt-config reset;
+    // only historical anchors/summary assumptions belong to the old epoch.
     t.projected(10_000, 0, true);
     let mut changed = body();
     changed["instructions"] = json!("a new configuration");
     t.primary(&changed, &terminal(200_000, 0, 0, 0), "route", 102, true);
-    assert_eq!(state(&t)["restored"], 0);
+    assert_eq!(state(&t)["restored"], 10_000);
+    assert_eq!(state(&t)["last_traditional_input"], 210_000);
 }
 
 #[test]
