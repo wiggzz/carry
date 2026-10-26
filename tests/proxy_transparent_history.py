@@ -611,7 +611,7 @@ class TransparentHistory(unittest.TestCase):
 
 
     def test_empty_selection_retires_historical_memory_authority(self):
-        def review(_body, n):
+        def review(body, n):
             return 200, advice_response({"protected": [], "removable": [ledger(body)["eligible_memory_ids"][0]] if n == 2 else [],
                 "memories": [{"source_ids": [2], "text": "RETIRED_FACT"}] if n == 1 else []})
 
@@ -1254,8 +1254,17 @@ class TransparentHistory(unittest.TestCase):
                                      "only actual fresh native reviews can add another paid call")
                     sent = fixture.primaries[-1]["input"]
                     self.assertIn(history[0], sent, "direction survives advice eviction")
-                    self.assertEqual(history[1] in sent, not any(
-                        m["text"] == "PINNED_FACT" for r in records for m in r["memories"]))
+                    # The follow-up can acquire fresh bounded advice after
+                    # quota eviction. Compare source retention with the fact
+                    # on THAT actual wire, not the stale pre-restart index.
+                    materialized = any("PINNED_FACT" in json.dumps(item) for item in sent)
+                    self.evidence[pressure]["followup"] = {
+                        "primary": fixture.primaries[-1],
+                        "fresh_review_count": len(fixture.reviews) - reviews_before,
+                        "materialized_fact": materialized,
+                    }
+                    self.assertEqual(history[1] in sent, not materialized,
+                                     "retain original source unless its replacement is on this actual wire")
                 proxy.close()
         self.state = original_state
 
