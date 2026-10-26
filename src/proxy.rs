@@ -2139,6 +2139,12 @@ async fn dispatch_review_for(
     main["input"] = json!(projection.input);
     let decision = admission::decision(&service.config, session, &main, false);
     journal(&service, &id, &request_id, "review_admission", &decision);
+    // Replay can bypass cadence/floors, not create an actionable review when
+    // every original group is pinned and there is no existing fact to revise.
+    if decision["reason"] == "no_eligible_sources" {
+        session.bootstrap_review_pending = false;
+        return;
+    }
     if !session.bootstrap_review_pending && decision["admitted"] != true {
         return;
     }

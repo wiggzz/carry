@@ -3171,13 +3171,14 @@ async fn unseen_history_with_only_pinned_sources_skips_bootstrap_calls() {
     let response = send(&url, &request, "a", "main").await;
     assert!(response.status().is_success());
     response.bytes().await.unwrap();
+    let saved = settled(state.path()).await.remove(0);
     assert!(
         fixture.reviews.lock().await.is_empty(),
         "nothing is safely removable"
     );
     assert_eq!(fixture.requests.lock().await[0], request);
-    let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["bootstrap_review_pending"], false);
+    assert_eq!(saved["shadow"]["calls"], 0, "no paid nonactionable review");
 }
 
 #[tokio::test]
