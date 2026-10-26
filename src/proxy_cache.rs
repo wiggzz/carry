@@ -169,12 +169,16 @@ pub(super) fn observe(
         ttl_seconds,
         native_cached_fraction: cached as f64 / total as f64,
     };
-    // A zero read records potential history, never confirmed cache activity.
+    // This terminal covers every compatible older prefix, not only an equal
+    // input hash. Mutation order (under history::observe_cache), not TTL clock
+    // ties, decides which observation owns its forecast. Unrelated branches and
+    // namespaces remain independent; a later genuine rewarm can replace this.
     cache.retain(|old| {
         old.base_sha256 != e.base_sha256
-            || old.input_sha256 != e.input_sha256
             || old.route != e.route
             || old.credential_sha256 != e.credential_sha256
+            || old.input_len > input.len()
+            || old.input_sha256 != input_identity(&input[..old.input_len])
     });
     cache.push(e);
     trim(cache, at);

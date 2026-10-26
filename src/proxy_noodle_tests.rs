@@ -157,3 +157,28 @@ fn undispatched_review_cannot_subsidize_a_warm_primary_losing_rewrite() {
             > 0.0
     );
 }
+
+#[test]
+fn settled_old_review_cannot_resurrect_bootstrap_across_reset_or_namespace() {
+    let mut before = semantic_subject();
+    before.bootstrap_review_pending = true;
+    before.last_review_request = 7;
+    for boundary in ["completed", "direction", "namespace"] {
+        let mut current = before.clone();
+        current.bootstrap_review_pending = false;
+        match boundary {
+            "direction" => current.reset_active(),
+            "namespace" => current.history_namespace = Some("other-namespace".into()),
+            _ => {}
+        }
+        current.last_review_request = 20;
+        settle_review(&mut current, &before, &before, &ReviewRun::default());
+        assert!(
+            !current.bootstrap_review_pending,
+            "stale {boundary} settlement cannot recreate retry authority"
+        );
+        if boundary != "completed" {
+            assert_eq!(current.last_review_request, 20);
+        }
+    }
+}

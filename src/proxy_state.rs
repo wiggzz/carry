@@ -206,10 +206,13 @@ pub(super) struct Session {
     pub last_review_request: u64,
     #[serde(default)]
     pub review_admission: Option<ReviewAdmission>,
-    /// A replay import still needs pre-primary review until that epoch's first
-    /// primary completes. Persist this across failed calls and process restarts.
+    /// Replay intent closes only when indexed, durably published advice is
+    /// applied. Failed/rejected attempts retain it across primary and restart.
     #[serde(default)]
     pub bootstrap_review_pending: bool,
+    /// Initial replay bypasses cadence; subsequent attempts use normal cadence.
+    #[serde(default)]
+    pub bootstrap_review_attempted: bool,
     pub invalid_reviews: u64,
     #[serde(default)]
     pub partial_reviews: u64,
@@ -433,6 +436,7 @@ impl Session {
             item.exposed = true;
         }
         self.bootstrap_review_pending = true;
+        self.bootstrap_review_attempted = false;
     }
 
     pub fn reset_active(&mut self) {
@@ -441,6 +445,7 @@ impl Session {
             trajectory.reset_epoch();
         }
         self.bootstrap_review_pending = false;
+        self.bootstrap_review_attempted = false;
         self.review_admission = Some(ReviewAdmission::default());
         self.last_review_request = self.completed_requests;
         self.history.clear();

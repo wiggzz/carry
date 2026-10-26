@@ -2121,7 +2121,9 @@ async fn failed_rebase_primary_reuses_successful_bootstrap_before_review_cadence
             "successful bootstrap chunks survive failed primaries and restarts without replay"
         );
         assert_eq!(saved["history"][2]["exposed"], false);
-        assert_eq!(saved["bootstrap_review_pending"], false);
+        // Settlement preserves intent; only applying the durably indexed
+        // completion on the next ingress closes it. No second paid review.
+        assert_eq!(saved["bootstrap_review_pending"], attempt == 1);
         assert_eq!(advice_for_checkpoint(state.path(), &saved)["len"], 3);
         if attempt == 1 {
             drop(proxy);

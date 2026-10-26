@@ -94,7 +94,7 @@ async fn completed_h_crash_before_after_publication_and_failed_publication_keep_
             .unwrap();
         let mut service = checkpoint_service(directory.path());
         service.config.classifier_url = Some(url.clone());
-        service.config.review_min_primary_tokens = 0;
+        service.config.review_min_primary_tokens = if stage == "after" { 0 } else { 100_000 };
         service.config.review_min_new_tokens = 0;
         service.config.review_backoff_factor = 1;
         let durable = history::restore(&service, "crash-owner").unwrap();
@@ -102,17 +102,21 @@ async fn completed_h_crash_before_after_publication_and_failed_publication_keep_
         assert_eq!(durable.shadow.input_tokens, 10000);
         assert_eq!(durable.shadow.output_tokens, 7);
         assert!(!durable.background_review_pending);
-        assert_eq!(
+        assert!(
             durable.bootstrap_review_pending,
-            stage != "after",
-            "receipt settlement cannot consume bootstrap before durable semantic publication"
+            "paid settlement alone cannot consume bootstrap intent, even for accepted advice"
         );
         let h = semantic_subject().render_primary();
+        let record = history::advice(&service, "fixture-owner", &h).unwrap();
+        assert_eq!(record.is_some(), stage == "after");
+        let mut admitted = durable.clone();
+        if let Some(record) = record {
+            record.apply(&mut admitted);
+        }
         assert_eq!(
-            history::advice(&service, "fixture-owner", &h)
-                .unwrap()
-                .is_some(),
-            stage == "after"
+            admitted.bootstrap_review_pending,
+            stage != "after",
+            "only durably indexed advice closes intent at the existing ingress boundary"
         );
         if stage == "fault" {
             std::fs::remove_dir(directory.path().join(".history-index.tmp")).unwrap();
@@ -124,6 +128,9 @@ async fn completed_h_crash_before_after_publication_and_failed_publication_keep_
         service.config.history_max_references = 10000;
         let service = Arc::new(service);
         let mut restored = load_existing(&service, "crash-owner").unwrap();
+        if let Some(record) = history::advice(&service, "fixture-owner", &h).unwrap() {
+            record.apply(&mut restored);
+        }
         // A settled owner with no new turn is deliberately not due. Advance the
         // ordinary request cadence before retrying this same original H.
         restored.completed_requests += service.config.review_every_requests;

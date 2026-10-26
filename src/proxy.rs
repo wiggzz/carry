@@ -2138,10 +2138,7 @@ async fn dispatch_review_for(
     projection: planning::Projection,
     request_id: String,
 ) {
-    let main = session.review_context.clone();
-    let mut main = main;
-    main["input"] = json!(projection.input);
-    let decision = admission::decision(&service.config, session, &main, false);
+    let decision = admission::scheduled(&service.config, session);
     journal(&service, &id, &request_id, "review_admission", &decision);
     // Replay can bypass cadence/floors, not create an actionable review when
     // every original group is pinned and there is no existing fact to revise.
@@ -2149,7 +2146,7 @@ async fn dispatch_review_for(
         session.bootstrap_review_pending = false;
         return;
     }
-    if !session.bootstrap_review_pending && decision["admitted"] != true {
+    if decision["admitted"] != true {
         return;
     }
     let view =
@@ -2165,6 +2162,7 @@ async fn dispatch_review_for(
         return;
     };
     session.background_review_pending = true;
+    session.bootstrap_review_attempted |= session.bootstrap_review_pending;
     session.last_review_request = session.completed_requests;
     session.review_epoch = next_review_generation();
     if save(&service, &id, session).is_err() {
@@ -2285,7 +2283,8 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
     {
         current.last_review_request = before.last_review_request;
         current.review_admission = reviewed.review_admission.clone();
-        current.bootstrap_review_pending = false;
+        // Only Record::apply at ingress closes replay intent, after successful
+        // durable publication. Paid settlement (even accepted advice) cannot.
         // A paid observation owns its bounded diagnostics even if every item
         // was rejected. This does not publish a semantic completion at H.
         if reviewed.review_feedback_generation > current.review_feedback_generation {

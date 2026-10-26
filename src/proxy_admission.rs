@@ -35,6 +35,28 @@ pub(super) fn multiplier(config: &ProxyCli, session: &Session) -> u64 {
     value
 }
 
+/// One request-boundary scheduling decision for both candidate pricing and
+/// dispatch. Caller metadata/output caps are not reviewer admission context;
+/// primary_tokens renders canonical source, independent of selected omission.
+pub(super) fn scheduled(config: &ProxyCli, session: &Session) -> Value {
+    let mut result = decision(config, session, &session.review_context, false);
+    if session.background_review_pending {
+        result["admitted"] = json!(false);
+        result["reason"] = json!("review_pending");
+    } else if session.bootstrap_review_pending && result["reason"] != "no_eligible_sources" {
+        let initial = !session.bootstrap_review_attempted;
+        let due = result["completed_requests_since_review"].as_u64().unwrap()
+            >= result["required_requests"].as_u64().unwrap();
+        result["admitted"] = json!(initial || due);
+        result["reason"] = json!(if initial || due {
+            "replay_bootstrap"
+        } else {
+            "cadence"
+        });
+    }
+    result
+}
+
 pub(super) fn decision(
     config: &ProxyCli,
     session: &Session,

@@ -279,7 +279,7 @@ impl Trajectory {
                     coverage: prior.coverage,
                 });
             }
-            self.reset_epoch();
+            self.reset_receipt_epoch();
             self.receipts
                 .as_mut()
                 .unwrap()
@@ -345,7 +345,7 @@ impl Trajectory {
             .as_ref()
             .is_some_and(|prior| prior != &config)
         {
-            self.reset_epoch();
+            self.reset_receipt_epoch();
         }
         self.receipts.as_mut().unwrap().configuration = Some(config.clone());
         let previous = self.receipts.as_ref().unwrap().anchor.clone();
@@ -363,8 +363,8 @@ impl Trajectory {
             || (traditional_previous.is_some() && !traditional_compatible)
         {
             // Rewind, edit, configuration switch or negative total-input delta:
-            // start a new comparison epoch, not a guessed removal allocation.
-            self.reset_epoch();
+            // invalidate historical assumptions, not the current projection.
+            self.reset_receipt_epoch();
         }
         self.receipts.as_mut().unwrap().last_appended_input = previous
             .as_ref()

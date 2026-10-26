@@ -412,6 +412,16 @@ impl Trajectory {
         self.traditional_edited = false;
     }
 
+    /// Receipt compatibility invalidates historical anchors and summary state,
+    /// not the already measured current request's signed disposable projection.
+    pub(super) fn reset_receipt_epoch(&mut self) {
+        let restored = self.restored;
+        let edited = self.carry_edited;
+        self.reset_epoch();
+        self.restored = restored;
+        self.carry_edited = edited;
+    }
+
     /// Complete current canonical-minus-sent projection, not an additive edit.
     /// Historical charges and the alternative's own summary remain untouched.
     pub fn projected(&mut self, before: u64, after: u64, edited: bool) {

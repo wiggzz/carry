@@ -61,9 +61,7 @@ pub(super) fn plan(
         }
     }
     let review = review_body(config, session);
-    let due = !session.background_review_pending
-        && (session.bootstrap_review_pending
-            || admission::decision(config, session, body, false)["admitted"] == true);
+    let due = admission::scheduled(config, session)["admitted"] == true;
     let mut best: Option<(Projection, f64, String)> = None;
     let mut reports = Vec::new();
     let mut seen = HashSet::new();

@@ -115,6 +115,41 @@ class NoodleRegressions(unittest.TestCase):
         self.assertEqual(rewarmed["primary"]["cached_tokens"],7800)
         self.assertFalse(fixture.reviews)
 
+    def test_cold_extension_changes_actual_disposable_selection_after_restart(self):
+        def primary(_body,n):
+            value = completed(response_id=f"selection_{n}")
+            value["usage"]["input_tokens"] = 40000
+            value["usage"]["input_tokens_details"]["cached_tokens"] = 39600 if n == 2 else 0
+            return 200,value
+        fixture = self.fixture(primary,lambda _b,_n:(200,advice_response({"protected":[],"removable":[2],"memories":[]})))
+        h = self.history()
+        h[0]["content"] += " protected direction " * 10000
+        extended = h + [{"role":"user","content":"APPENDED_CURRENT_TASK"}]
+        options = ["--payoff-requests","1","--classifier-cache-policy","disabled"]
+        proxy = self.proxy(fixture,[*options,"--review-replayed-history"])
+        self.assertEqual(proxy.send(h)[0],200)
+        proxy.close(); self.attest_cache()
+        options += ["--review-every-requests","100"]
+        proxy = TransparentProxy(self.state,fixture,options,mode="audit")
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(h)[0],200)
+        proxy.close()
+        proxy = self.proxy(fixture,options)
+        self.assertEqual(proxy.send(extended)[0],200)
+        self.assertIn(h[1],fixture.primaries[-1]["input"],"confirmed warm H makes retaining original cheaper on first append")
+        _, warm = proxy.checkpoint(extended)
+        proxy.close()
+        proxy = self.proxy(fixture,options)
+        self.assertEqual(proxy.send(extended)[0],200)
+        _, cold = proxy.checkpoint(extended)
+        self.evidence.update(warm=warm,cold=cold,primaries=fixture.primaries,reviews=fixture.reviews)
+        self.assertNotIn(h[1],fixture.primaries[-1]["input"],"new cold extension must change real selection, not only a diagnostic")
+        self.assertFalse(warm["last_plan"]["selected"])
+        self.assertTrue(cold["last_plan"]["selected"])
+        self.assertEqual(len(fixture.reviews),1)
+        self.assertEqual(cold["primary"]["calls"],4)
+        self.assertEqual(cold["primary"]["cached_tokens"],39600)
+
     def test_planning_and_dispatch_share_metadata_stripped_floor(self):
         fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"floor_{n}")),
             lambda _b,_n:(200,advice_response({"protected":[],"removable":[2],"memories":[]})))
@@ -157,6 +192,8 @@ class NoodleRegressions(unittest.TestCase):
         self.assertEqual(failed["shadow"]["calls"],1)
         self.assertEqual(failed["shadow"]["unavailable_cost_calls"],int(not rejected))
         self.assertEqual(failed["shadow"]["input_tokens"],100 if rejected else 0)
+        self.assertTrue(failed["bootstrap_review_pending"])
+        self.assertTrue(failed["bootstrap_review_attempted"])
         # Failed bootstrap must honor normal request cadence on its retries,
         # even though the initial replay acquisition bypassed ordinary floors.
         self.assertEqual(proxy.send(h)[0],200)
@@ -169,7 +206,9 @@ class NoodleRegressions(unittest.TestCase):
         _, accepted = proxy.checkpoint(h)
         self.evidence.update(failed=failed,accepted=accepted,events=self.events(),reviews=fixture.reviews)
         self.assertEqual(len(fixture.reviews),2,"below-floor intent must retry after failure/rejection and restart")
-        self.assertFalse(accepted["bootstrap_review_pending"])
+        # Settlement does not decide semantic completion. The next ingress
+        # applies the indexed accepted-empty record and closes replay intent.
+        self.assertTrue(accepted["bootstrap_review_pending"])
         self.assertEqual(accepted["shadow"]["calls"],2)
         self.assertEqual(accepted["shadow"]["input_tokens"],200 if rejected else 100)
         self.assertEqual(accepted["shadow"]["unavailable_cost_calls"],int(not rejected))
@@ -180,6 +219,7 @@ class NoodleRegressions(unittest.TestCase):
         for _ in range(4): self.assertEqual(proxy.send(h)[0],200)
         self.assertEqual(len(fixture.reviews),2,"accepted empty completion closes below-floor retries")
         self.assertEqual(proxy.checkpoint(h)[1]["shadow"],accepted["shadow"])
+        self.assertFalse(proxy.checkpoint(h)[1]["bootstrap_review_pending"])
 
     def test_failed_bootstrap_retries_below_floor_with_cadence_and_once_only_censorship(self):
         self.bootstrap_retry(False)
