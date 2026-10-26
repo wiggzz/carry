@@ -117,31 +117,31 @@ pub(super) fn observe(
     resolved: Option<&carry::models::ResolvedModel>,
     credential: &str,
     at: u64,
-) {
+) -> bool {
     let Some(input) = body["input"].as_array() else {
-        return;
+        return false;
     };
     let Some(model) = resolved else {
-        return;
+        return false;
     };
     let Some(capability) = model.cache else {
-        return;
+        return false;
     };
     let ttl_seconds = model
         .scenario_cache_policy
         .as_ref()
         .map_or(0, |p| p.ttl_seconds);
     if ttl_seconds == 0 {
-        return;
+        return false;
     }
     let (Some(total), Some(cached)) = (
         usage["input_tokens"].as_u64(),
         usage["input_tokens_details"]["cached_tokens"].as_u64(),
     ) else {
-        return;
+        return false;
     };
     if total < capability.minimum_prefix_tokens as u64 || cached > total {
-        return;
+        return false;
     }
     let end = if body["prompt_cache_options"]["mode"] == "explicit" {
         input
@@ -178,6 +178,7 @@ pub(super) fn observe(
     });
     cache.push(e);
     trim(cache, at);
+    true
 }
 
 pub(super) fn trim(cache: &mut Vec<CacheEvidence>, at: u64) {

@@ -407,8 +407,109 @@ class TransparentHistory(unittest.TestCase):
         self.assertIn(history[1], fixture.primaries[-1]["input"],
                       "genuine compatible cache evidence must make the same original H retainable again")
         self.assertIn(history[0], fixture.primaries[-1]["input"])
+        self.assertEqual(proxy.checkpoint(history)[1]["cost_trajectory"]["restored"], 0,
+                         "retaining canonical source replaces the old omission quantity with zero")
         self.assertEqual(len(fixture.reviews), 1, "reversibility needs no paid semantic recovery")
 
+
+    def test_actual_cache_receipts_replace_cold_warm_cold_without_stale_owner_replay(self):
+        def primary(_body, n):
+            value = completed(response_id=f"cache_latest_{n}")
+            value["usage"]["input_tokens"] = 4000
+            value["usage"]["input_tokens_details"]["cached_tokens"] = 3000 if n == 3 else 0
+            return 200, value
+        fixture = self.fixture(primary)
+        history = [{"role":"user","content":"CACHE_WIRE " + "prefix " * 2000}]
+        options = ["--review-every-requests","100","--classifier-cache-policy","disabled"]
+        proxy = TransparentProxy(self.state, fixture, options, mode="audit")
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(history)[0], 200)
+        proxy.close()
+        path = self.state / "history.index"
+        index = json.loads(path.read_text())
+        for snapshot in index["snapshots"].values():
+            snapshot["model_resolution"]["primary"]["cache"] = {
+                "minimum_prefix_tokens":1024,"max_read_breakpoints":50,
+                "max_write_breakpoints":4,"implicit_breakpoint_uses_write_slot":True}
+        path.write_bytes(wire(index))
+        proxy = TransparentProxy(self.state, fixture, options, mode="audit")
+        self.stack.callback(proxy.close)
+        snapshots = []
+        self.evidence["observations"] = snapshots
+        # No sleep, clock change, receipt injection, or increasing request body.
+        for fraction in (0, .75, 0):
+            self.assertEqual(proxy.send(history)[0], 200)
+            index = json.loads(path.read_text())
+            records = index["upstream_cache"]
+            snapshots.append({"expected":fraction,"records":records,
+                              "paid":proxy.checkpoint(history)[1]["primary"]})
+        self.evidence["primary_wires"] = fixture.primaries
+        self.assertTrue(all(body == fixture.primaries[0] for body in fixture.primaries))
+        self.assertEqual(len(fixture.reviews), 0)
+        self.assertEqual(snapshots[-1]["paid"]["calls"], 4)
+        self.assertEqual(snapshots[-1]["paid"]["input_tokens"], 16000)
+        self.assertEqual(snapshots[-1]["paid"]["cached_tokens"], 3000)
+        for snapshot in snapshots:
+            self.assertEqual(len(snapshot["records"]), 1, "one latest actual receipt per exact wire identity")
+            self.assertEqual(snapshot["records"][0]["native_cached_fraction"], snapshot["expected"],
+                             "actual warm receipt must replace cold; later cold must revoke warm evidence")
+        proxy.close()
+        proxy = TransparentProxy(self.state, fixture, options, mode="audit")
+        self.stack.callback(proxy.close)
+        self.assertEqual(json.loads(path.read_text())["upstream_cache"], snapshots[-1]["records"])
+
+    def test_repeated_projection_prices_current_omission_once_after_restart(self):
+        """Real advice/planner/receipts: identical H and N must not invent growth."""
+        fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"projection_{n}")),
+            lambda _b,_n: (200, advice_response({"protected":[], "removable":[2], "memories":[]})))
+        history = [{"role":"user","content":"PROJECTION_GOAL"},
+                   {"role":"assistant","content":"REMOVABLE_SOURCE " + "payload " * 3000},
+                   {"role":"user","content":"PROJECTION_TASK"}]
+        options = ["--payoff-requests","1","--classifier-cache-policy","disabled"]
+        proxy = self.proxy(fixture, [*options, "--review-replayed-history"])
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(len(fixture.reviews), 1)
+        proxy.close()
+        options += ["--review-every-requests","100"]
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertNotIn(history[1], fixture.primaries[-1]["input"])
+        first_wire = fixture.primaries[-1]
+        _, first = proxy.checkpoint(history)
+        before = first["cost_trajectory"]
+        self.assertGreater(before["restored"], 0)
+        self.assertEqual(before["last_traditional_input"], 100 + before["restored"])
+        proxy.close()
+        # Owned synthetic scenario only: one legitimate restoration fits, two
+        # copies cross. No receipt, source, tariff, or semantic advice is staged.
+        path = self.state / "history.index"
+        index = json.loads(path.read_text())
+        owner = next(k for k,v in index["snapshots"].items() if v["primary"]["calls"] == 2)
+        threshold = 100 + before["restored"] + before["restored"] // 2
+        index["snapshots"][owner]["cost_trajectory"]["scenario"] = {
+            "context_window":threshold + 100,"reserve":100,"keep_recent":100,"summary":50}
+        path.write_bytes(wire(index))
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        _, second = proxy.checkpoint(history)
+        after = second["cost_trajectory"]
+        self.evidence.update(first=first, second=second, threshold=threshold,
+                             primary_wires=fixture.primaries, review_wires=fixture.reviews)
+        self.assertEqual(fixture.primaries[-1], first_wire, "same canonical H chooses the same omission")
+        self.assertEqual(second["primary"]["calls"], 3)
+        self.assertEqual(second["primary"]["input_tokens"], 300)
+        self.assertEqual(second["shadow"]["calls"], 1)
+        self.assertEqual(after["last_traditional_input"], before["last_traditional_input"],
+                         "repeated disposable omission must not accumulate restoration")
+        self.assertEqual(after["result"]["traditional_compactions"], 0,
+                         "duplicate restoration must not cross the modeled summary boundary")
+        self.assertEqual(after["result"]["summary_cost"], 0)
+        self.assertEqual(after["restored"], before["restored"])
+        rates = first["model_resolution"]["primary"]["rates"]
+        expected = (before["last_traditional_input"] * rates["cached"] + rates["output"]) / 1_000_000
+        self.assertAlmostEqual(after["result"]["traditional_cost"] - before["result"]["traditional_cost"],
+                               expected, delta=1e-12, msg="the repeated request uses one current restoration at frozen rates")
+        self.assertEqual(second["model_resolution"], first["model_resolution"])
 
     def test_repeated_projections_do_not_starve_async_review(self):
         def review(body, n):

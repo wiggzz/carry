@@ -13,6 +13,108 @@ fn state(t: &Trajectory) -> Value {
 }
 
 #[test]
+fn receipt_current_projection_repeats_changes_and_retains_without_accumulation() {
+    let mut projected = Trajectory {
+        scenario: Scenario {
+            context_window: 3600,
+            reserve: 100,
+            keep_recent: 100,
+            summary: 50,
+        },
+        ..Trajectory::default()
+    };
+    let mut retained = projected.clone();
+    // Two copies of the original 1000-unit omission would cross 3500;
+    // neither the real 3000-unit original nor any current projection does.
+    for (i, difference) in [1000_i128, 1000, 500, 1500, -200, 0]
+        .into_iter()
+        .enumerate()
+    {
+        projected.projected(5000, (5000_i128 - difference) as u64, difference != 0);
+        projected.primary(
+            &body(),
+            &terminal((3000_i128 - difference) as u64, 0, 0, 0),
+            "route",
+            100 + i as u64,
+            true,
+        );
+        retained.projected(5000, 5000, false);
+        retained.primary(
+            &body(),
+            &terminal(3000, 0, 0, 0),
+            "route",
+            100 + i as u64,
+            true,
+        );
+        assert_eq!(state(&projected)["restored"], json!(difference));
+        assert_eq!(state(&projected)["last_traditional_input"], 3000);
+        assert_eq!(projected.snapshot().traditional_compactions, 0);
+        assert_eq!(projected.snapshot().summary_cost, 0.0);
+        assert!(
+            (projected.snapshot().traditional_cost - retained.snapshot().traditional_cost).abs()
+                < 1e-12,
+            "current omission, partial/grown omission, signed memory growth and canonical retention share the no-omission alternative"
+        );
+        projected = serde_json::from_value(state(&projected)).unwrap();
+    }
+    assert_eq!(projected.snapshot().coverage.primary_responses, 6);
+    assert_eq!(projected.snapshot().matched_primary_responses, 6);
+    assert!(projected.snapshot().observed_primary_cost > 0.0);
+}
+
+#[test]
+fn receipt_projection_preserves_legitimate_summary_retirement_and_failed_paid_scope() {
+    let mut t = Trajectory {
+        scenario: Scenario {
+            context_window: 3600,
+            reserve: 100,
+            keep_recent: 100,
+            summary: 50,
+        },
+        ..Trajectory::default()
+    };
+    t.primary(&body(), &terminal(4000, 0, 0, 0), "route", 100, true);
+    assert_eq!(t.snapshot().traditional_compactions, 1);
+    let retired = t.retired;
+    let summary = t.summary;
+    for at in [101, 102, 103] {
+        t.projected(5000, 4000, true);
+        let before = t.snapshot();
+        if at == 102 {
+            let mut failed = terminal(3500, 0, 0, 0);
+            failed["status"] = json!("failed");
+            t.primary(&body(), &failed, "route", at, true);
+            assert_eq!(t.snapshot().traditional_cost, before.traditional_cost);
+            assert_eq!(t.snapshot().carry_cost, before.carry_cost);
+            assert_eq!(t.snapshot().coverage.failed_calls, 1);
+        }
+        t.primary(&body(), &terminal(3500, 0, 0, 0), "route", at, true);
+        assert_eq!(t.retired, retired);
+        assert_eq!(t.summary, summary);
+        assert_eq!(t.last_traditional_input, 4500 - retired + summary);
+        assert_eq!(t.snapshot().traditional_compactions, 1);
+        t = serde_json::from_value(state(&t)).unwrap();
+    }
+    assert_eq!(t.snapshot().coverage.primary_responses, 4);
+    assert_eq!(t.snapshot().excluded_failed_calls, 1);
+}
+
+#[test]
+fn receipt_equal_size_projection_edit_invalidates_actual_not_traditional_anchor() {
+    let mut t = Trajectory::default();
+    t.primary(&body(), &terminal(2000, 0, 0, 0), "route", 100, true);
+    t.projected(100, 100, true);
+    assert_eq!(t.restored, 0);
+    assert!(state(&t)["receipts"]["anchor"].is_null());
+    assert!(state(&t)["receipts"]["traditional_anchor"].is_object());
+    let mut edited = body();
+    edited["input"][0]["content"] = json!("different equal-size synthetic memory");
+    t.primary(&edited, &terminal(2000, 0, 0, 0), "route", 101, true);
+    assert_eq!(t.last_traditional_input, 2000);
+    assert!(state(&t)["receipts"]["last_appended_input"].is_null());
+}
+
+#[test]
 fn receipt_opaque_output_sizes_do_not_retire_native_input_after_replay_and_restart() {
     fn episode(ciphertext: &str, metadata: &str) -> Trajectory {
         let mut t = Trajectory {
@@ -124,7 +226,7 @@ fn receipt_restoration_selects_each_branch_tariff_without_repricing_actuals() {
         true,
     );
     let before = t.snapshot();
-    t.compacted(100_100, 100);
+    t.projected(100_100, 100, true);
     t.primary(
         &body(),
         &terminal(200_000, 1000, 100, 10),
@@ -143,7 +245,7 @@ fn receipt_restoration_selects_each_branch_tariff_without_repricing_actuals() {
     assert_eq!(after.observed_primary_cost, after.carry_cost);
     assert!(state(&t)["receipts"]["last_appended_input"].is_null());
     // A configuration change after a Carry edit cannot retain its restoration.
-    t.compacted(10_000, 0);
+    t.projected(10_000, 0, true);
     let mut changed = body();
     changed["instructions"] = json!("a new configuration");
     t.primary(&changed, &terminal(200_000, 0, 0, 0), "route", 102, true);
@@ -245,7 +347,7 @@ fn receipt_carry_only_rewrite_preserves_traditional_cache_after_restart() {
     let mut t = Trajectory::default();
     t.primary(&body(), &terminal(2000, 1500, 0, 0), "route", 100, true);
     let before = t.snapshot();
-    t.compacted(1500, 500);
+    t.projected(1500, 500, true);
     assert!(state(&t)["receipts"]["anchor"].is_null());
     let mut t: Trajectory = serde_json::from_value(state(&t)).unwrap();
     let rewritten =
@@ -893,7 +995,7 @@ fn receipt_discontinuities_never_attribute_a_removal_or_sibling_suffix() {
             "rewind" => b["input"] = json!([]),
             "negative" => r = terminal(1900, 0, 0, 0),
             "missing" => r["usage"] = Value::Null,
-            "memory" => t.compacted(10, 20),
+            "memory" => t.projected(10, 20, true),
             _ => (),
         }
         t.primary(

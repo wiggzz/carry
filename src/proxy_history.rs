@@ -476,7 +476,6 @@ pub(super) fn committed(
         .map(|i| i.value.clone())
         .collect::<Vec<_>>();
     let prior = index.snapshots.keys().cloned().collect::<HashSet<_>>();
-    merge_cache(&mut index.upstream_cache, &session.upstream_cache);
     let keys = insert(&mut index, namespace, &input);
     let observed_keys = observation
         .map(|(input, _)| insert(&mut index, namespace, input))
@@ -569,7 +568,6 @@ pub(super) fn publish(
         .last()
         .unwrap_or(&subject.history_namespace.clone().unwrap())
         .clone();
-    merge_cache(&mut index.upstream_cache, &reviewed.upstream_cache);
     let record = semantic::Record::capture(reviewed);
     if index
         .reviews
@@ -617,19 +615,34 @@ fn persist(
     Ok(())
 }
 
-fn merge_cache(cache: &mut Vec<CacheEvidence>, incoming: &[CacheEvidence]) {
-    for entry in incoming {
-        if !cache.iter().any(|e| {
-            e.base_sha256 == entry.base_sha256
-                && e.input_sha256 == entry.input_sha256
-                && e.route == entry.route
-                && e.credential_sha256 == entry.credential_sha256
-                && e.at >= entry.at
-        }) {
-            cache.push(entry.clone());
-        }
+/// Only actual terminal observations mutate cache evidence. Session/reviewer
+/// snapshots are disposable read views, never sources to merge back. The IO
+/// transaction orders receipts even when TTL timestamps have the same second.
+pub(super) fn observe_cache(
+    service: &Service,
+    body: &Value,
+    usage: &Value,
+    resolved: Option<&ResolvedModel>,
+    credential: &str,
+    at: u64,
+) -> std::io::Result<Vec<CacheEvidence>> {
+    let _guard = IO.lock().unwrap();
+    let mut index = read(service)?;
+    if crate::proxy_cache::observe(
+        &mut index.upstream_cache,
+        body,
+        usage,
+        resolved,
+        credential,
+        at,
+    ) {
+        let cache = index.upstream_cache.clone();
+        let prior = index.snapshots.keys().cloned().collect();
+        persist(service, index, prior, None)?;
+        Ok(cache)
+    } else {
+        Ok(index.upstream_cache)
     }
-    crate::proxy_cache::trim(cache, now());
 }
 
 pub(super) fn cache(service: &Service) -> std::io::Result<Vec<CacheEvidence>> {

@@ -1711,10 +1711,14 @@ async fn forward_request(
             }
             if !projection.omitted.is_empty() {
                 session.compactions += 1;
-                let before_tokens = estimate(&json!(session.render_primary())) as u64;
-                if let Some(t) = &mut session.cost_trajectory {
-                    t.compacted(before_tokens, estimate(&json!(projection.input)) as u64);
-                }
+            }
+            let canonical = session.render_primary();
+            if let Some(t) = &mut session.cost_trajectory {
+                t.projected(
+                    estimate(&json!(canonical)) as u64,
+                    estimate(&json!(projection.input)) as u64,
+                    canonical != projection.input,
+                );
             }
             if !acquired
                 && standard(&body)
@@ -2269,10 +2273,6 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
     current.partial_reviews += reviewed
         .partial_reviews
         .saturating_sub(before.partial_reviews);
-    current
-        .upstream_cache
-        .extend(reviewed.upstream_cache.iter().cloned());
-    crate::proxy_cache::trim(&mut current.upstream_cache, now());
     // Scheduling coverage is not semantic authority. Only transfer it while the
     // exact original observation remains a prefix of this owner's history.
     if current.history_namespace == before.history_namespace
@@ -2486,15 +2486,17 @@ async fn review_chunk(
                 resolved,
             );
         }
-        if value["status"] == "completed" {
-            crate::proxy_cache::observe(
-                &mut session.upstream_cache,
+        if value["status"] == "completed"
+            && let Ok(cache) = history::observe_cache(
+                service,
                 body,
                 &value["usage"],
                 resolved,
                 &service.config.reviewer_cache_auth,
                 now(),
-            );
+            )
+        {
+            session.upstream_cache = cache;
         }
         let _ = trace(service, id, "shadow_completed", &value);
         logging::journal_attempt(
@@ -3261,14 +3263,16 @@ async fn relay(
                     commit.candidate.response_frontier = Some(commit.candidate.next_id);
                     commit.candidate.pending_output =
                         value["output"].as_array().cloned().unwrap_or_default();
-                    crate::proxy_cache::observe(
-                        &mut commit.candidate.upstream_cache,
+                    if let Ok(cache) = history::observe_cache(
+                        &commit.service,
                         &commit.outbound,
                         &value["usage"],
                         resolved,
                         &commit.service.config.primary_cache_auth,
                         now(),
-                    );
+                    ) {
+                        commit.candidate.upstream_cache = cache;
+                    }
                     commit.candidate.completed_requests += 1;
                 }
                 let _ = trace(&commit.service, &commit.id, "primary_completed", &value);
@@ -3442,6 +3446,76 @@ mod tests {
             background_reviews: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             lock_waits: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_cache_owner_orders_same_second_receipts_not_stale_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = checkpoint_service(directory.path());
+        let model = resolve_model(
+            "gpt-6-luna",
+            Route::new("https://api.openai.com/v1/responses", false),
+            None,
+            None,
+            16384,
+            0,
+        )
+        .unwrap()
+        .with_scenario_cache_policy();
+        let body = json!({"model":"gpt-6-luna","prompt_cache_key":"affinity",
+            "input":[{"role":"user","content":"stable source ".repeat(500)}]});
+        let mut owner = Session {
+            history_namespace: Some("cache-owner".into()),
+            ..Session::default()
+        };
+        owner.ingest(body["input"].as_array().unwrap()).unwrap();
+        let at = now();
+        let mut stale = owner.clone();
+        for cached in [0, 3000, 0] {
+            owner.upstream_cache = history::observe_cache(
+                &service,
+                &body,
+                &json!({"input_tokens":4000,"input_tokens_details":{"cached_tokens":cached}}),
+                Some(&model),
+                "same-auth",
+                at,
+            )
+            .unwrap();
+            assert_eq!(owner.upstream_cache.len(), 1);
+            let evidence = &owner.upstream_cache[0];
+            assert_eq!(evidence.at, at, "TTL seconds are not receipt ordering");
+            assert_eq!(evidence.native_cached_fraction, cached as f64 / 4000.0);
+            let read = crate::proxy_cache::reusable(
+                &owner.upstream_cache,
+                &body,
+                Some(&model),
+                "same-auth",
+                at,
+            );
+            assert_eq!(read > 0.0, cached > 0);
+            // Stale owner save AND semantic publication cannot replay a whole
+            // old cache view over the latest actual terminal receipt.
+            save(&service, "cache-owner", &stale).unwrap();
+            history::publish(&service, &stale, &stale).unwrap();
+            assert_eq!(
+                serde_json::to_value(history::cache(&service).unwrap()).unwrap(),
+                serde_json::to_value(&owner.upstream_cache).unwrap()
+            );
+            stale.upstream_cache = owner.upstream_cache.clone();
+        }
+        // Unknown/missing receipts cannot become positive evidence; native
+        // known cold above already revoked the prior genuine positive.
+        for usage in [
+            Value::Null,
+            json!({"input_tokens":4000}),
+            json!({"input_tokens":4000,"input_tokens_details":{"cached_tokens":4001}}),
+        ] {
+            history::observe_cache(&service, &body, &usage, Some(&model), "same-auth", at).unwrap();
+            assert_eq!(
+                history::cache(&service).unwrap()[0].native_cached_fraction,
+                0.0
+            );
         }
     }
 

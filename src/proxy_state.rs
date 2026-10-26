@@ -857,9 +857,6 @@ impl Session {
                 }));
             }
         }
-        let primary_before = (self.cost_trajectory.is_some()
-            && (!memories.is_empty() || memory_updates.values().any(|opinion| *opinion == "drop")))
-        .then(|| self.render_primary());
         let accepted_opinions = updates.len() + memory_updates.len();
         let mut accepted_memories = 0;
         for (id, opinion) in updates {
@@ -951,18 +948,6 @@ impl Session {
                 self.review_feedback["rejected"] = json!([{"field":"memories","reason":"final rendered review budget exceeded; supporting sources kept"}]);
             } else {
                 break;
-            }
-        }
-        if let Some(before) = primary_before {
-            let after = self.render_primary();
-            // Visible memory edits belong to Carry, not the traditional
-            // counterfactual. Even an equal-size edit breaks prefix reuse.
-            if before != after
-                && let Some(trajectory) = &mut self.cost_trajectory
-            {
-                let before = crate::proxy_savings::token_units(&json!(before));
-                let after = crate::proxy_savings::token_units(&json!(after));
-                trajectory.compacted(before, after);
             }
         }
         Ok(())
