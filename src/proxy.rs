@@ -2599,7 +2599,8 @@ async fn review_chunk(
         session.partial_reviews += 1;
     }
     run.accepted = valid;
-    let outcome = admission::complete(&before_admission, session, valid, groups);
+    let groups = view.groups().cloned().collect::<Vec<_>>();
+    let outcome = admission::complete(&before_admission, session, valid, &groups);
     journal(
         service,
         id,
