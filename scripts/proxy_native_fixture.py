@@ -200,6 +200,14 @@ def review_records(body):
     return sources + [current]
 
 
+def checkpoint_continuation_clean(state, body):
+    """A completed reset forwards the fresh native summary, not old tool replay."""
+    return state['background_review_pending'] is False and not any(
+        item.get('type') in ('function_call', 'function_call_output',
+                            'custom_tool_call', 'custom_tool_call_output')
+        for item in body['input'])
+
+
 class Fixture:
     def __init__(self, client, case="off"):
         self.client = client
@@ -546,7 +554,8 @@ def main():
                     result['pi_checkpoint_verified']=bool(len(received)==len(submitted) and received and len(fixture.calls)-len(fixture.summary_calls)==3 and fixture.calls[-1].get('prompt_cache_key') and fixture.summary_calls and compact and compact[0].get('success') is True and
                         'FIXTURE_PI_CHECKPOINT' in json.dumps(fixture.calls[-1]['input']) and
                         received[-1]==submitted[-1] and state['history_rebases']>=1 and
-                        not state['active_shadow'] and sum(e.get('type')=='agent_settled' for e in rpc)>=2)
+                        checkpoint_continuation_clean(state, received[-1]) and
+                        sum(e.get('type')=='agent_settled' for e in rpc)>=2)
                     result['pi_summary_calls']=len(fixture.summary_calls)
                     result['history_rebases']=state['history_rebases']
                     if not result['pi_checkpoint_verified']: result['acceptance_failure']='Pi checkpoint reset/continuation failed'
