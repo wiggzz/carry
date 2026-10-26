@@ -32,6 +32,28 @@ fn transparent_server_owned_history() {
     );
 }
 
+#[test]
+fn noodle_review_regressions() {
+    let output = Command::new("python3")
+        .args([
+            "-B",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/proxy_noodle_regressions.py"
+            ),
+            "-v",
+        ])
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("review regression loopback fixture");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 struct Proxy(Child);
 
 impl Drop for Proxy {

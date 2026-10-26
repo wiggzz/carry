@@ -13,6 +13,33 @@ fn state(t: &Trajectory) -> Value {
 }
 
 #[test]
+fn changed_receipt_configuration_preserves_signed_current_projection_not_old_summary() {
+    for difference in [1000_i128, -200, 0] {
+        let mut t = Trajectory::default();
+        let mut request = body();
+        request["max_output_tokens"] = json!(1);
+        t.projected(5000, (5000_i128 - difference) as u64, difference != 0);
+        t.primary(&request, &terminal(3000, 0, 0, 0), "route", 100, true);
+        let paid = t.snapshot().observed_primary_cost;
+        t = serde_json::from_value(state(&t)).unwrap();
+        request["max_output_tokens"] = json!(2);
+        t.projected(5000, (5000_i128 - difference) as u64, difference != 0);
+        t.primary(&request, &terminal(3000, 0, 0, 0), "route", 101, true);
+        assert_eq!(
+            state(&t)["restored"],
+            json!(difference),
+            "a receipt epoch is not the lifetime of the current projection"
+        );
+        assert_eq!(
+            state(&t)["last_traditional_input"],
+            json!(3000_i128 + difference)
+        );
+        assert!(t.snapshot().observed_primary_cost > paid);
+        assert_eq!(t.snapshot().matched_primary_responses, 2);
+    }
+}
+
+#[test]
 fn receipt_current_projection_repeats_changes_and_retains_without_accumulation() {
     let mut projected = Trajectory {
         scenario: Scenario {

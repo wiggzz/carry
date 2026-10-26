@@ -102,6 +102,11 @@ async fn completed_h_crash_before_after_publication_and_failed_publication_keep_
         assert_eq!(durable.shadow.input_tokens, 10000);
         assert_eq!(durable.shadow.output_tokens, 7);
         assert!(!durable.background_review_pending);
+        assert_eq!(
+            durable.bootstrap_review_pending,
+            stage != "after",
+            "receipt settlement cannot consume bootstrap before durable semantic publication"
+        );
         let h = semantic_subject().render_primary();
         assert_eq!(
             history::advice(&service, "fixture-owner", &h)

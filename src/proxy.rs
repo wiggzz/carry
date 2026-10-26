@@ -3888,6 +3888,7 @@ mod tests {
     include!("proxy_catalog_isolation_tests.rs");
     include!("proxy_settlement_tests.rs");
     include!("proxy_semantic_tests.rs");
+    include!("proxy_noodle_tests.rs");
     include!("proxy_pr154_tests.rs");
     include!("proxy_log_controls.rs");
     include!("proxy_admission_tests.rs");
