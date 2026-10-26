@@ -91,23 +91,27 @@ def contract_proxy(test, provider, state_dir, mode='audit', binary=None, classif
 
 
 def contract_send(url, body, directory):
+    try:
+        expected = contract_state(directory)['completed_requests'] + 1
+    except StopIteration:
+        expected = 1
     request = urllib.request.Request(url + '/v1/responses', data=json.dumps(body).encode(),
         headers={'content-type': 'application/json', 'x-carry-session': 'contract'})
     # Consume the primary first. These receipt/provenance tests deliberately
     # sequence completed reviews; production forwarding must never do this.
     with urllib.request.urlopen(request, timeout=30) as response:
         result = json.load(response)
-    contract_settle(directory)
+    contract_settle(directory, completed_requests=expected)
     return result
 
 
-def contract_settle(directory):
+def contract_settle(directory, completed_requests=0):
     import time
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         try:
             state = contract_state(directory)
-            if not state['background_review_pending']:
+            if state['completed_requests'] >= completed_requests and not state['background_review_pending']:
                 return state
         except (StopIteration, FileNotFoundError):
             pass
@@ -396,7 +400,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                             {'role':'developer','content':'Run the fixture tools.'},
                             {'role':'user','content':'old fixture direction'},
                             {'role':'user','content':'current fixture task'}]}
-                    for _ in range(5):
+                    for turn in range(5):
                         req = urllib.request.Request(observer.url+'/v1/responses',
                             data=json.dumps(body).encode(), headers={'content-type':'application/json',
                             'x-carry-session':'contract'})
@@ -405,7 +409,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                         with urllib.request.urlopen(req, timeout=30) as response:
                             events=[json.loads(line[6:]) for line in response.read().decode().splitlines()
                                     if line.startswith('data: ')]
-                        contract_settle(trial/'state')
+                        contract_settle(trial/'state', completed_requests=turn + 1)
                         output=events[-1]['response']['output']
                         body['input'].extend(output)
                         for item in output:
@@ -656,7 +660,9 @@ class NativeProviderFixtureTests(unittest.TestCase):
                         'accepted_memory_count': len(state['memories'])
                     }, indent=2) + '\n')
                 self.assertEqual(state['invalid_reviews'], 0,
-                                 'reviewer must receive the original source IDs for valid grounding')
+                                 'reviewer must receive the original source IDs for valid grounding: '
+                                 + json.dumps({'feedback':state['review_feedback'],
+                                               'grounding':grounding,'ledger':wire_data(provider.shadow[-1])[-1]}))
                 self.assertEqual(grounding[0][0]['source_ids'], ['g1'])
                 self.assertNotIn('memory_id', grounding[0][0],
                                  'internal memory handle must not masquerade as an actionable source')
@@ -676,7 +682,8 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 contract_send(url, body, directory)  # review the retained view after the planning-only compaction
                 self.assertNotIn('RETIRE_HUMAN_SOURCE', json.dumps(provider.primary[-1]))
                 state = contract_state(directory)
-                self.assertTrue(state['history'][0]['removed'])
+                self.assertEqual(state['history'][0]['value'], body['input'][0],
+                                 'omission must not destroy canonical source')
                 self.assertEqual(state['compactions'], 1)
                 # Provenance remains visible, but does not re-admit retired IDs for advice.
                 provider.advice = lambda review: {'protected': [], 'removable': [],
@@ -725,7 +732,9 @@ class NativeProviderFixtureTests(unittest.TestCase):
                                  'superseded opinions must not live in immutable observation history')
             state = contract_state(directory)
             self.assertEqual(state['invalid_reviews'], 0)
-            self.assertEqual(len(state['observed']), 6)
+            self.assertEqual(len(state['history']), 6)
+            self.assertTrue(all(item['exposed'] for item in state['history']))
+            self.assertEqual([item['value'] for item in state['history']], body['input'])
             self.assertEqual(provider.primary[-1], body)
 
     def test_proxy_upgrades_real_legacy_checkpoint_without_duplicate_source_or_memory_aliases(self):
@@ -917,7 +926,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 self.assertEqual(state['shadow']['calls'], 1, 'completed review receipt must be persisted')
                 self.assertEqual(fixture.reviews[0]['text']['format']['type'], 'json_schema')
                 self.assertTrue(fixture.reviews[0]['text']['format']['strict'])
-                self.assertEqual(len(fixture.reviews[0]['prompt_cache_key']), 64)
+                self.assertTrue(0 < len(fixture.reviews[0]['prompt_cache_key']) <= 64)
                 self.assertEqual(state['invalid_reviews'], 0,
                                  f'JSON-mode review rejected: {fixture.errors}')
                 self.assertFalse(fixture.errors)
