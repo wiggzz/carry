@@ -1,5 +1,152 @@
 // Direct controls for the prefix-advice/request-projection model.
 include!("proxy_review_boundary_tests.rs");
+#[test]
+fn shared_review_indices_are_integers_and_disjoint_across_sources_and_memories() {
+    let s = provenance_tool_subject();
+    let body = review_body(&reviewer_config(), &s);
+    let ledger: Value = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| {
+            i["content"]
+                .as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        })
+        .find(|v| v["current_groups"].is_array())
+        .unwrap();
+    let groups = ledger["current_groups"].as_array().unwrap();
+    let memories = ledger["current_memories"].as_array().unwrap();
+    let ids = groups
+        .iter()
+        .map(|g| &g["group_id"])
+        .chain(memories.iter().map(|m| &m["memory_id"]))
+        .collect::<Vec<_>>();
+    assert!(
+        ids.iter().all(|v| v.as_u64().is_some()),
+        "actual review references must be JSON integers: {ledger}"
+    );
+    assert_eq!(
+        ids.iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect::<HashSet<_>>()
+            .len(),
+        ids.len()
+    );
+    assert_eq!(memories[0]["source_ids"], json!([groups[1]["group_id"]]));
+}
+
+#[test]
+fn numeric_review_admission_rejects_memory_authority_and_invalid_refs_but_keeps_valid_siblings() {
+    let mut s = semantic_subject();
+    s.apply_advice(&s.groups(), &json!({"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"numeric fact"}]})).unwrap();
+    assert_eq!(
+        s.memories.len(),
+        1,
+        "a numeric original-source reference must admit"
+    );
+    assert_eq!(s.memories[0].source_ids, vec![2]);
+    let body = review_body(&reviewer_config(), &s);
+    let ledger: Value = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| {
+            i["content"]
+                .as_str()
+                .and_then(|t| serde_json::from_str::<Value>(t).ok())
+        })
+        .find(|v| v["current_memories"].is_array())
+        .unwrap();
+    let memory = ledger["current_memories"][0]["memory_id"].clone();
+    s.apply_advice(&s.groups(), &json!({"protected":[2,memory],"removable":[2,memory,999,true,"2",2.5],"memories":[{"source_ids":[memory],"text":"forged authority"},{"source_ids":[2],"text":"valid sibling"}]})).unwrap();
+    assert_eq!(s.memories.len(), 2);
+    assert!(s.memories.iter().all(|m| m.text != "forged authority"));
+    assert!(!s.drop_authorized(&s.groups()[1]));
+    assert!(s.review_feedback["rejected_count"].as_u64().unwrap() >= 7);
+}
+
+#[tokio::test]
+async fn numeric_background_review_keeps_captured_projection_after_owner_advances_and_restarts() {
+    let (sender, mut captures) = tokio::sync::mpsc::unbounded_channel();
+    let router = Router::new().route("/review", post(move |axum::Json(body): axum::Json<Value>| {
+        let sender = sender.clone();
+        async move {
+            sender.send(body).unwrap();
+            axum::Json(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":json!({"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"captured joined sources"}]}).to_string()}]}],"usage":{"input_tokens":10000,"output_tokens":7}}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/review", listener.local_addr().unwrap());
+    let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.classifier_url = Some(url);
+    let service = Arc::new(service);
+    let mut s = semantic_subject();
+    let mut h = s.render_primary();
+    h.extend([
+        json!({"role":"assistant","content":"second evidence"}),
+        json!({"role":"user","content":"new task"}),
+    ]);
+    s.ingest(&h).unwrap();
+    for item in &mut s.history {
+        item.exposed = true;
+    }
+    s.history_shared = true;
+    s.bootstrap_review_pending = true;
+    let id = "numeric-captured";
+    let owner = session_lock(&service, id).await;
+    let (waiter, mut waits) = tokio::sync::mpsc::unbounded_channel();
+    *service.lock_waits.lock().unwrap() = Some(waiter);
+    let omitted = HashSet::from([3]);
+    let projection = planning::Projection {
+        input: s.render_projection(&omitted),
+        omitted,
+    };
+    dispatch_review_for(
+        service.clone(),
+        id.into(),
+        &mut s,
+        projection,
+        "numeric-capture".into(),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), captures.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), waits.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    observe_source(&mut s, "advanced owner");
+    save(&service, id, &s).unwrap();
+    drop(owner);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while service.background_reviews.lock().await.contains(id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let record = history::advice(&service, "fixture-owner", &h)
+        .unwrap()
+        .expect("numeric review must publish at captured H");
+    let mut restored: Session = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+    record.apply(&mut restored);
+    assert_eq!(
+        restored.memories[0].source_ids,
+        vec![2, 4],
+        "index 2 must not retarget to the current unmerged source"
+    );
+    assert_eq!(restored.memory_anchors[&restored.memories[0].id], 4);
+    let paid = history::restore(&service, id).unwrap();
+    assert_eq!(paid.shadow.calls, 1);
+    assert_eq!(paid.shadow.input_tokens, 10000);
+    provider.abort();
+}
+
 #[tokio::test]
 async fn reviewer_deadline_includes_subscription_auth_wait_and_censors_spend() {
     let directory = tempfile::tempdir().unwrap();
