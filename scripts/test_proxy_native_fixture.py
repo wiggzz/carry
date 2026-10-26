@@ -130,6 +130,29 @@ def contract_state(directory):
     return json.loads(next(Path(directory).glob('*.json')).read_text())
 
 
+def contract_advice(directory):
+    """Read the completed original-prefix record, not its paid-owner mirror."""
+    import hashlib
+    state = contract_state(directory)
+    index = json.loads((Path(directory) / 'history.index').read_text())
+    values = [item['value'] for item in state['history']]
+    if state.get('history_frontier'):
+        values, frontier = [], state['history_frontier']
+        while frontier in index['nodes']:
+            node = index['nodes'][frontier]
+            values.append(node['value'])
+            frontier = node['parent']
+        values.reverse()
+    key, found = state['history_namespace'], None
+    for value in values:
+        key = hashlib.sha256(json.dumps([key, value], ensure_ascii=False,
+                                       separators=(',', ':')).encode()).hexdigest()
+        if key in index['reviews']:
+            found = index['reviews'][key]
+    assert found is not None, 'actual completed-prefix advice must be published'
+    return found
+
+
 class NativeProviderFixtureTests(unittest.TestCase):
     def test_exact_checkpoint_settlement_ignores_malformed_decoy_and_unrelated_pending(self):
         from scripts.proxy_native_settle import wait_settled
@@ -659,7 +682,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                         'fixture_only': True, 'shown_fact_fields': sorted(grounding[0][0]),
                         'shown_source_ids': grounding[0][0].get('source_ids'),
                         'invalid_reviews': state['invalid_reviews'],
-                        'accepted_memory_count': len(state['memories'])
+                        'accepted_memory_count': len(contract_advice(directory)['memories'])
                     }, indent=2) + '\n')
                 self.assertEqual(state['invalid_reviews'], 0,
                                  'reviewer must receive the original source IDs for valid grounding: '
@@ -668,7 +691,10 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 self.assertEqual(grounding[0][0]['source_ids'], [1])
                 self.assertNotIn('memory_id', grounding[0][0],
                                  'internal memory handle must not masquerade as an actionable source')
-                self.assertEqual(len(state['memories']), 2)
+                self.assertEqual(len(contract_advice(directory)['memories']), 2)
+                self.assertTrue(all(m['source_ids'] == [1]
+                                    for m in contract_advice(directory)['memories']),
+                                'accepted facts persist canonical original member provenance')
                 # Keep provenance strict while applying the valid removable group independently.
                 provider.advice = lambda review: {'protected': [], 'removable': [1],
                     'memories': [{'source_ids': [wire_data(review)[-1]['eligible_memory_ids'][0]], 'text': 'invalid source'}]}
@@ -676,7 +702,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 state = contract_state(directory)
                 self.assertEqual(state['invalid_reviews'], 0)
                 self.assertEqual(state['partial_reviews'], 1)
-                self.assertEqual(len(state['memories']), 2)
+                self.assertEqual(len(contract_advice(directory)['memories']), 2)
                 self.assertEqual(state['compactions'], 0, 'new advice is considered by the next request planner')
                 # Repeating a retired source action cannot revive its evidence.
                 provider.advice = lambda review: {'protected': [], 'removable': [1], 'memories': []}
@@ -686,18 +712,30 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 state = contract_state(directory)
                 self.assertEqual(state['history'][0]['value'], body['input'][0],
                                  'omission must not destroy canonical source')
-                self.assertEqual(state['compactions'], 1)
+                self.assertEqual(state['compactions'], sum(
+                    'RETIRE_HUMAN_SOURCE' not in json.dumps(primary)
+                    for primary in provider.primary),
+                    'count actual disposable projected requests, not permanent deletions')
                 # Provenance remains visible, but does not re-admit retired IDs for advice.
-                provider.advice = lambda review: {'protected': [], 'removable': [],
-                    'memories': [{'source_ids': [1], 'text': 'retired source is not newly eligible'}]}
+                def retired(review):
+                    shown = next(r for r in wire_data(review) if r.get('text') == fact)
+                    return {'protected': [], 'removable': [], 'memories': [
+                        {'source_ids': shown['source_ids'], 'text': 'retired source is not newly eligible'}]}
+                provider.advice = retired
+                partial_before = state['partial_reviews']
                 body['input'].append({'role': 'user', 'content': 'next task'})
                 contract_send(url, body, directory)
                 later = provider.shadow[-1]
                 self.assertNotIn('RETIRE_HUMAN_SOURCE', json.dumps(later))
-                self.assertEqual([r for r in wire_data(later) if r.get('text') == fact][0]['source_ids'], [1])
-                self.assertNotIn(1, wire_data(later)[-1]['eligible_group_ids'])
-                self.assertEqual(contract_state(directory)['invalid_reviews'], 2)
-                self.assertEqual(len(contract_state(directory)['memories']), 2)
+                sources = next(r for r in wire_data(later) if r.get('text') == fact)['source_ids']
+                ledger = wire_data(later)[-1]
+                retained = {g['group_id']: g['member_ids'] for g in ledger['retained_source_groups']}
+                self.assertEqual([member for ref in sources for member in retained[ref]], [1])
+                self.assertTrue(set(sources).isdisjoint(ledger['eligible_group_ids']))
+                self.assertEqual(contract_state(directory)['invalid_reviews'], 0,
+                                 'valid envelope with invalid references uses partial validation')
+                self.assertEqual(contract_state(directory)['partial_reviews'], partial_before + 1)
+                self.assertEqual(len(contract_advice(directory)['memories']), 2)
 
     def test_proxy_parallel_cohort_extension_observes_only_new_members_and_current_opinion(self):
         with ShadowContractProvider() as provider, tempfile.TemporaryDirectory() as directory:
