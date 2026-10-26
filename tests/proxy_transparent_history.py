@@ -78,7 +78,7 @@ class TransparentHistory(unittest.TestCase):
                 self.state = root / ("prior" if prior else "fresh")
                 self.state.mkdir()
                 def review(_body, n):
-                    value = {"protected": ["g2"] if prior and n == 1 else ["g999"],
+                    value = {"protected": [2] if prior and n == 1 else [999],
                              "removable": [], "memories": []}
                     return 200, advice_response(value)
                 fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"rejected_{prior}_{n}")), review)
@@ -134,7 +134,7 @@ class TransparentHistory(unittest.TestCase):
                 self.state = root / boundary
                 self.state.mkdir()
                 fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"isolation_{boundary}_{n}")),
-                    lambda _b,_n:(200,advice_response({"protected":["g999"],"removable":[],"memories":[]})))
+                    lambda _b,_n:(200,advice_response({"protected":[999],"removable":[],"memories":[]})))
                 options = ["--review-replayed-history", "--payoff-requests", "1",
                            "--classifier-cache-policy", "disabled"]
                 h = [{"role":"user","content":"ISOLATION_GOAL"},
@@ -170,12 +170,12 @@ class TransparentHistory(unittest.TestCase):
         facts = ["RETIRED_SAME_SOURCE_FACT", "SURVIVING_SAME_SOURCE_FACT", "LATER_CUMULATIVE_FACT"]
         def review(body,n):
             if n == 1:
-                value = {"protected":[],"removable":["g2"],"memories":[
-                    {"source_ids":["g2"],"text":facts[0]}, {"source_ids":["g2"],"text":facts[1]}]}
+                value = {"protected":[],"removable":[2],"memories":[
+                    {"source_ids":[2],"text":facts[0]}, {"source_ids":[2],"text":facts[1]}]}
             elif n == 2:
-                value = {"protected":[],"removable":["g4"],"memories":[{"source_ids":["g4"],"text":facts[2]}]}
+                value = {"protected":[],"removable":[4],"memories":[{"source_ids":[4],"text":facts[2]}]}
             elif n == 3:
-                value = {"protected":[],"removable":["m1"],"memories":[]}
+                value = {"protected":[],"removable":[ledger(body)["eligible_memory_ids"][0]],"memories":[]}
             else:
                 value = {"protected":[],"removable":[],"memories":[]}
             return 200,advice_response(value)
@@ -253,7 +253,7 @@ class TransparentHistory(unittest.TestCase):
         def review(_body, n):
             fixture.held.set()
             self.assertTrue(fixture.release.wait(10))
-            value = {"protected":[],"removable":["g2"],"memories":[{"source_ids":["g2"],"text":"MUST_NOT_PUBLISH_UNSETTLED_FACT"}]} if n == 1 else {"protected":[],"removable":[],"memories":[]}
+            value = {"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"MUST_NOT_PUBLISH_UNSETTLED_FACT"}]} if n == 1 else {"protected":[],"removable":[],"memories":[]}
             return 200, advice_response(value)
         fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"receipt_fault_{n}")),review)
         options = ["--review-replayed-history","--classifier-cache-policy","disabled","--payoff-requests","1"]
@@ -337,7 +337,7 @@ class TransparentHistory(unittest.TestCase):
             return 200, value
 
         def review(_body, _n):
-            return 200, advice_response({"protected": [], "removable": ["g2"], "memories": []})
+            return 200, advice_response({"protected": [], "removable": [2], "memories": []})
 
         fixture = self.fixture(primary, review)
         options = ["--payoff-requests", "1", "--classifier-cache-policy", "disabled"]
@@ -430,7 +430,7 @@ class TransparentHistory(unittest.TestCase):
 
     def test_completed_advice_survives_two_days_and_more_than_eight_cuts(self):
         fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"retained_{n}")),
-            lambda body,n: (200,advice_response({"protected":[],"removable":["g2"],"memories":[]})))
+            lambda body,n: (200,advice_response({"protected":[],"removable":[2],"memories":[]})))
         proxy = self.proxy(fixture,["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled"])
         h = [{"role":"user","content":"goal"},{"role":"assistant","content":"reviewed source " * 6000},
              {"role":"user","content":"cut 0"}]
@@ -454,7 +454,7 @@ class TransparentHistory(unittest.TestCase):
 
     def test_no_fit_acquires_one_bounded_review_before_primary(self):
         fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"fit_{n}")),
-            lambda _b,n: (200,advice_response({"protected":[],"removable":["g2"],"memories":[]})))
+            lambda _b,n: (200,advice_response({"protected":[],"removable":[2],"memories":[]})))
         h = [{"role":"user","content":"goal"},{"role":"assistant","content":"bulky output " * 12000},
              {"role":"user","content":"current task"}]
         proxy = self.proxy(fixture,["--review-every-requests","100","--classifier-cache-policy","disabled"])
@@ -512,13 +512,13 @@ class TransparentHistory(unittest.TestCase):
         self.stack.callback(release.set)
         def review(body,n):
             if n == 1:
-                return 200,advice_response({"protected":[],"removable":["g3"],"memories":[]})
+                return 200,advice_response({"protected":[],"removable":[3],"memories":[]})
             if n == 2:
-                group = next(g for g in ledger(body)["current_groups"] if g["group_id"] == "g2")
+                group = next(g for g in ledger(body)["current_groups"] if g["group_id"] == 2)
                 self.assertEqual(group["member_ids"],[2,4])
                 held.set()
                 self.assertTrue(release.wait(10))
-                return 200,advice_response({"protected":[],"removable":["g2"],"memories":[{"source_ids":["g2"],"text":"MERGED_ORIGINAL_FACT"}]})
+                return 200,advice_response({"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"MERGED_ORIGINAL_FACT"}]})
             self.fail("no extra review while captured projection is held")
         fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"merged_{n}")),review)
         h = [{"role":"user","content":"original goal"},
@@ -564,9 +564,9 @@ class TransparentHistory(unittest.TestCase):
             self.assertEqual(n, 1, "one captured-H worker, no synchronous rescue")
             held.set()
             self.assertTrue(release.wait(10), "release the actual held HTTP review")
-            self.assertIn("g2", ledger(body)["eligible_group_ids"])
-            return 200, advice_response({"protected": [], "removable": ["g2"],
-                "memories": [{"source_ids": ["g2"], "text": "EXACT_H_FACT"}]})
+            self.assertIn(2, ledger(body)["eligible_group_ids"])
+            return 200, advice_response({"protected": [], "removable": [2],
+                "memories": [{"source_ids": [2], "text": "EXACT_H_FACT"}]})
 
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"exact_h_{n}")), review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
@@ -612,8 +612,8 @@ class TransparentHistory(unittest.TestCase):
 
     def test_empty_selection_retires_historical_memory_authority(self):
         def review(_body, n):
-            return 200, advice_response({"protected": [], "removable": ["m1"] if n == 2 else [],
-                "memories": [{"source_ids": ["g2"], "text": "RETIRED_FACT"}] if n == 1 else []})
+            return 200, advice_response({"protected": [], "removable": [ledger(body)["eligible_memory_ids"][0]] if n == 2 else [],
+                "memories": [{"source_ids": [2], "text": "RETIRED_FACT"}] if n == 1 else []})
 
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"retire_{n}")), review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
@@ -653,8 +653,8 @@ class TransparentHistory(unittest.TestCase):
                    {"role": "user", "content": "A_BOUNDARY"}]
         def review(body, n):
             ids = ledger(body)["eligible_group_ids"]
-            return 200, advice_response({"protected": [i for i in ids if i == "g1"], "removable": [i for i in ids if i != "g1"],
-                "memories": [{"source_ids": ["g2"], "text": "A_FACT"}] if n == 1 else []})
+            return 200, advice_response({"protected": [i for i in ids if i == 1], "removable": [i for i in ids if i != 1],
+                "memories": [{"source_ids": [2], "text": "A_FACT"}] if n == 1 else []})
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")), review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
                    "--classifier-cache-policy", "disabled"]
@@ -740,9 +740,9 @@ class TransparentHistory(unittest.TestCase):
                    {"role": "user", "content": "A_BOUNDARY"}]
         def default_review(body, n):
             ids = ledger(body)["eligible_group_ids"]
-            return 200, advice_response({"protected": [i for i in ids if i == "g1"],
-                "removable": [i for i in ids if i != "g1"],
-                "memories": [{"source_ids": ["g2"], "text": "A_FACT"}] if n == 1 else []})
+            return 200, advice_response({"protected": [i for i in ids if i == 1],
+                "removable": [i for i in ids if i != 1],
+                "memories": [{"source_ids": [2], "text": "A_FACT"}] if n == 1 else []})
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")), review or default_review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
                    "--classifier-cache-policy", "disabled", *extra]
@@ -859,8 +859,8 @@ class TransparentHistory(unittest.TestCase):
     def test_later_review_closure_never_exports_b_dependent_fact_to_a_c(self):
         def review(body, n):
             ids = ledger(body)["eligible_group_ids"]
-            return 200, advice_response({"protected": [i for i in ids if i == "g2"],
-                "removable": [], "memories": [{"source_ids": ["g2"],
+            return 200, advice_response({"protected": [i for i in ids if i == 2],
+                "removable": [], "memories": [{"source_ids": [2],
                 "text": "A_FACT" if n == 1 else "B_DEPENDENT_FACT_CLAIMS_A"}]})
         proxy, fixture, history, _ = self.seed(review=review, extra=["--min-payback-percent", "100"])
         b = history + [{"role": "assistant", "content": "B_OBSERVED " + "payload " * 100},
@@ -1143,9 +1143,9 @@ class TransparentHistory(unittest.TestCase):
             if n == 2:
                 held.set()
                 assert release.wait(10), "held review release"
-            return 200, advice_response({"protected": [i for i in ids if i == "g1"],
-                "removable": [i for i in ids if i != "g1"],
-                "memories": [{"source_ids": ["g2"] if n == 1 else [i for i in ids if i != "g1"][:1],
+            return 200, advice_response({"protected": [i for i in ids if i == 1],
+                "removable": [i for i in ids if i != 1],
+                "memories": [{"source_ids": [2] if n == 1 else [i for i in ids if i != 1][:1],
                               "text": "A_FACT" if n == 1 else "UNCOMMITTED_B_FACT"}]})
         proxy, fixture, history, options = self.seed(review=review)
         proxy.close()
@@ -1186,9 +1186,9 @@ class TransparentHistory(unittest.TestCase):
                     held.set()
                     assert release.wait(45), "held reviewer release"
                     ids = ledger(body)["eligible_group_ids"]
-                    return 200, advice_response({"protected": ["g1"],
-                        "removable": [i for i in ids if i != "g1"],
-                        "memories": [{"source_ids": ["g2"], "text": "PINNED_FACT"}]})
+                    return 200, advice_response({"protected": [1],
+                        "removable": [i for i in ids if i != 1],
+                        "memories": [{"source_ids": [2], "text": "PINNED_FACT"}]})
                 fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"pin_{pressure}_{n}")), review)
                 env = {"CARRY_PROXY_HISTORY_MAX_NODES": "8"} if pressure == "nodes" else (
                     {"CARRY_PROXY_HISTORY_MAX_REFERENCES": "6"} if pressure == "references" else (

@@ -1468,10 +1468,10 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
                 async move {
                     reviewed.lock().await.push(body);
                     let advice = json!({
-                        "protected": ["g1"], "removable": ["g2"],
+                        "protected": [1], "removable": [2],
                         "memories": [
-                            {"source_ids": ["g2"], "text": "both tools succeeded"},
-                            {"source_ids": ["g2"], "text": "Migration unfinished on feat/migration; artifacts/migration.diff; next run fixture B; schema decision unresolved."}
+                            {"source_ids": [2], "text": "both tools succeeded"},
+                            {"source_ids": [2], "text": "Migration unfinished on feat/migration; artifacts/migration.diff; next run fixture B; schema decision unresolved."}
                         ]
                     });
                     axum::Json(json!({
@@ -1899,8 +1899,7 @@ async fn send(
 #[tokio::test]
 async fn explicit_replay_reviews_after_first_primary_without_exposing_fresh_tool_results() {
     for mode in ["compact", "audit", "off"] {
-        let fixture =
-            fixture(json!({"protected": ["g1"], "removable": ["g2"], "memories": []})).await;
+        let fixture = fixture(json!({"protected": [1], "removable": [2], "memories": []})).await;
         let state = tempfile::tempdir().unwrap();
         let (proxy, url) = start_proxy_options(
             state.path(),
@@ -2018,7 +2017,7 @@ async fn replay_opt_in_does_not_review_a_fresh_system_and_user_request() {
 
 #[tokio::test]
 async fn replay_import_does_not_reclassify_fresh_suffix_on_failed_primary_retry() {
-    let fixture = fixture(json!({"protected": ["g1"], "removable": ["g2"], "memories": []})).await;
+    let fixture = fixture(json!({"protected": [1], "removable": [2], "memories": []})).await;
     let state = tempfile::tempdir().unwrap();
     let (_proxy, url) = start_proxy(state.path(), fixture.address, "compact").await;
     let request = json!({"model": "gpt-6-luna", "input": [
@@ -2346,7 +2345,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
                 if scenario == "reviewer_failure" {
                     return (axum::http::StatusCode::SERVICE_UNAVAILABLE,"review unavailable").into_response();
                 }
-                let advice = json!({"protected":[],"removable":["g2"],"memories":[{"source_ids":["g2"],"text":"background fact"}]});
+                let advice = json!({"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"background fact"}]});
                 axum::Json(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":advice.to_string()}]}],"usage":{
                     "input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}})).into_response()
             }
@@ -2533,7 +2532,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
 
 #[tokio::test]
 async fn mixed_advice_applies_valid_items_and_failed_primary_keeps_feedback() {
-    let fixture = fixture(json!({"protected": ["g2"], "removable": ["g2"], "memories": [{"source_ids": ["g2"], "text": "valid sourced fact"}]})).await;
+    let fixture = fixture(json!({"protected": [2], "removable": [2], "memories": [{"source_ids": [2], "text": "valid sourced fact"}]})).await;
     let state = tempfile::tempdir().unwrap();
     // Preserve the live-primary exposure boundary rather than importing replay.
     let (_proxy, url) = start_proxy_options(
@@ -2729,7 +2728,7 @@ async fn gateway_token_is_separate_and_not_an_upstream_credential() {
 
 #[tokio::test]
 async fn valid_completed_shadow_and_shared_memory_survive_a_failed_primary() {
-    let fixture = fixture(json!({"protected": ["g1"], "removable": ["g2"], "memories": [{"source_ids": ["g2"], "text": "remember tested outcome"}]})).await;
+    let fixture = fixture(json!({"protected": [1], "removable": [2], "memories": [{"source_ids": [2], "text": "remember tested outcome"}]})).await;
     let state = tempfile::tempdir().unwrap();
     // Preserve the live-primary exposure boundary rather than importing replay.
     let (_proxy, url) = start_proxy_options(
@@ -3019,7 +3018,7 @@ async fn client_continuation_is_expanded_but_never_forwarded_upstream() {
 
 #[tokio::test]
 async fn implicit_history_reuses_removals_and_keeps_divergent_history_separate() {
-    let fixture = fixture(json!({"protected": ["g1"], "removable": ["g2"], "memories": []})).await;
+    let fixture = fixture(json!({"protected": [1], "removable": [2], "memories": []})).await;
     let state = tempfile::tempdir().unwrap();
     let (proxy, url) = start_proxy(state.path(), fixture.address, "compact").await;
     let original = json!({"model": "gpt-6-luna", "input": [
@@ -3082,7 +3081,7 @@ async fn implicit_history_reuses_removals_and_keeps_divergent_history_separate()
 #[tokio::test]
 async fn unseen_explicit_history_bootstraps_but_small_histories_skip_replay() {
     for (size, calls) in [(10, 0), (30_000, 1)] {
-        let fixture = fixture(json!({"protected": [], "removable": ["g2"], "memories": []})).await;
+        let fixture = fixture(json!({"protected": [], "removable": [2], "memories": []})).await;
         let state = tempfile::tempdir().unwrap();
         let (_proxy, url) = start_proxy(state.path(), fixture.address, "compact").await;
         let request = json!({"model": "gpt-6-luna", "input": [
@@ -3183,7 +3182,7 @@ async fn unseen_history_with_only_pinned_sources_skips_bootstrap_calls() {
 
 #[tokio::test]
 async fn implicit_prefix_state_is_isolated_by_tenant_branch_and_settings() {
-    let fixture = fixture(json!({"protected": [], "removable": ["g2"], "memories": []})).await;
+    let fixture = fixture(json!({"protected": [], "removable": [2], "memories": []})).await;
     let state = tempfile::tempdir().unwrap();
     let (_proxy, url) = start_proxy(state.path(), fixture.address, "compact").await;
     let original = json!({"model": "gpt-6-luna", "input": [

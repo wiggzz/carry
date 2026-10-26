@@ -89,7 +89,7 @@ async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
     session
         .apply_advice(
             &groups,
-            &json!({"protected":["g1"],"removable":["g2","g4"],"memories":[]}),
+            &json!({"protected":[1],"removable":[2,4],"memories":[]}),
         )
         .unwrap();
     // The gateway has no forecast capability. A deliberately enabled synthetic

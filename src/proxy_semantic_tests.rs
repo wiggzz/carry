@@ -59,7 +59,7 @@ fn numeric_review_admission_rejects_memory_authority_and_invalid_refs_but_keeps_
         .find(|v| v["current_memories"].is_array())
         .unwrap();
     let memory = ledger["current_memories"][0]["memory_id"].clone();
-    s.apply_advice(&s.groups(), &json!({"protected":[2,memory],"removable":[2,memory,999,true,"2",2.5],"memories":[{"source_ids":[memory],"text":"forged authority"},{"source_ids":[2],"text":"valid sibling"}]})).unwrap();
+    s.apply_advice(&s.groups(), &json!({"protected":[2,memory],"removable":[2,memory,999,true,"2",2.5,"g2","m1",0,-1,2.0],"memories":[{"source_ids":[memory],"text":"forged authority"},{"source_ids":[2],"text":"valid sibling"}]})).unwrap();
     assert_eq!(s.memories.len(), 2);
     assert!(s.memories.iter().all(|m| m.text != "forged authority"));
     assert!(!s.drop_authorized(&s.groups()[1]));
@@ -204,7 +204,7 @@ fn planner_prices_only_scheduled_review_views_including_output_cap() {
     session
         .apply_advice(
             &session.groups(),
-            &json!({"protected":[],"removable":["g2"],"memories":[]}),
+            &json!({"protected":[],"removable":[2],"memories":[]}),
         )
         .unwrap();
     let projection = planning::Projection {
@@ -249,7 +249,11 @@ fn canonical_source_survives_disposable_projection_and_owner_serialization() {
     let config = reviewer_config();
     let mut s = semantic_subject();
     let canonical = s.render_primary();
-    s.apply_advice(&s.groups(),&json!({"protected":[],"removable":["g2"],"memories":[{"source_ids":["g2"],"text":"fact"}]})).unwrap();
+    s.apply_advice(
+        &s.groups(),
+        &json!({"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"fact"}]}),
+    )
+    .unwrap();
     let record = semantic::Record::capture(&s);
     let omitted = HashSet::from([2]);
     let projection = s.render_projection(&omitted);
@@ -284,7 +288,7 @@ fn merged_projected_group_authorizes_original_member_union_not_separator() {
         groups.iter().find(|g| g.id == 2).unwrap().members,
         vec![2, 4]
     );
-    s.apply_advice(&groups,&json!({"protected":[],"removable":["g2"],"memories":[{"source_ids":["g2"],"text":"union fact"}]})).unwrap();
+    s.apply_advice(&groups,&json!({"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"union fact"}]})).unwrap();
     assert_eq!(s.memories[0].source_ids, vec![2, 4]);
     assert_eq!(s.memory_anchors[&s.memories[0].id], 4);
     let r = semantic::Record::capture(&s);
@@ -311,7 +315,7 @@ fn merged_projected_group_authorizes_original_member_union_not_separator() {
     );
 }
 
-fn memory_provenance_on_wire(body: &Value, id: &str) -> (Value, Value) {
+fn memory_provenance_on_wire(body: &Value, id: u64) -> (Value, Value) {
     let records: Vec<Value> = body["input"]
         .as_array()
         .unwrap()
@@ -355,7 +359,7 @@ fn provenance_tool_subject() -> Session {
     for i in &mut s.history {
         i.exposed = true;
     }
-    s.apply_advice(&s.groups(), &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g2"],"text":"complete native fact"}]})).unwrap();
+    s.apply_advice(&s.groups(), &json!({"protected":[],"removable":[],"memories":[{"source_ids":[2],"text":"complete native fact"}]})).unwrap();
     assert_eq!(s.memories[0].source_ids, vec![2, 3, 4, 5, 6]);
     s
 }
@@ -365,10 +369,10 @@ fn reviewer_memory_provenance_names_complete_native_group_and_preserves_strict_e
     let config = reviewer_config();
     let mut s = provenance_tool_subject();
     let original = s.render_primary();
-    let (sources, ledger) = memory_provenance_on_wire(&review_body(&config, &s), "m1");
+    let (sources, ledger) = memory_provenance_on_wire(&review_body(&config, &s), 8);
     assert_eq!(
         sources,
-        json!(["g2"]),
+        json!([2]),
         "members are not independently actionable groups"
     );
     assert_eq!(ledger, sources);
@@ -382,10 +386,10 @@ fn reviewer_memory_provenance_names_complete_native_group_and_preserves_strict_e
     };
     let body = review_body_projected(&config, &s, &projection);
     assert_eq!(
-        memory_provenance_on_wire(&body, "m1"),
-        (json!(["g2"]), json!(["g2"]))
+        memory_provenance_on_wire(&body, 8),
+        (json!([2]), json!([2]))
     );
-    for ids in [json!(["g2"]), json!([2]), json!(["m1"]), json!(["g999"])] {
+    for ids in [json!([2]), json!(["2"]), json!([8]), json!([999])] {
         s.apply_advice(&s.groups_for(&projection.omitted), &json!({"protected":[],"removable":[],"memories":[{"source_ids":ids,"text":"not newly eligible"}]})).unwrap();
         assert_eq!(s.review_feedback["rejected_count"], 1);
         assert_eq!(s.memories.len(), 2);
@@ -409,16 +413,16 @@ fn reviewer_memory_provenance_resolves_merged_split_and_omitted_original_groups(
         i.exposed = true;
     }
     let original = s.render_primary();
-    s.apply_advice(&s.groups_for(&HashSet::from([3])), &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g2"],"text":"joined fact"}]})).unwrap();
+    s.apply_advice(&s.groups_for(&HashSet::from([3])), &json!({"protected":[],"removable":[],"memories":[{"source_ids":[2],"text":"joined fact"}]})).unwrap();
     assert_eq!(s.memories[0].source_ids, vec![2, 4]);
     let record = semantic::Record::capture(&s);
     let mut restored: Session = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
     record.apply(&mut restored);
     for (omitted, expected) in [
-        (HashSet::new(), json!(["g2", "g4"])),
-        (HashSet::from([3]), json!(["g2"])),
-        (HashSet::from([2]), json!(["g2", "g4"])),
-        (HashSet::from([2, 4]), json!(["g2", "g4"])),
+        (HashSet::new(), json!([2, 4])),
+        (HashSet::from([3]), json!([2])),
+        (HashSet::from([2]), json!([2, 4])),
+        (HashSet::from([2, 4]), json!([2, 4])),
     ] {
         let projection = planning::Projection {
             input: restored.render_projection(&omitted),
@@ -426,7 +430,7 @@ fn reviewer_memory_provenance_resolves_merged_split_and_omitted_original_groups(
         };
         let body = review_body_projected(&config, &restored, &projection);
         assert_eq!(
-            memory_provenance_on_wire(&body, "m1"),
+            memory_provenance_on_wire(&body, 6),
             (expected.clone(), expected.clone())
         );
         let mut candidate = restored.clone();
@@ -447,7 +451,7 @@ fn reviewer_memory_provenance_resolves_merged_split_and_omitted_original_groups(
 fn repeated_native_fact_is_deduplicated_in_original_member_coordinates() {
     let mut s = provenance_tool_subject();
     let next = s.next_memory_id;
-    s.apply_advice(&s.groups(), &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g2"],"text":"complete native fact"}]})).unwrap();
+    s.apply_advice(&s.groups(), &json!({"protected":[],"removable":[],"memories":[{"source_ids":[2],"text":"complete native fact"}]})).unwrap();
     assert_eq!(s.review_feedback["rejected_count"], 0);
     assert_eq!(
         s.memories.len(),
@@ -471,7 +475,11 @@ fn native_suffix_dependency_extension_rejects_drop_and_fact_but_unrelated_growth
         for i in &mut s.history {
             i.exposed = true;
         }
-        s.apply_advice(&s.groups(),&json!({"protected":[],"removable":["g2"],"memories":[{"source_ids":["g2"],"text":"fact"}]})).unwrap();
+        s.apply_advice(
+            &s.groups(),
+            &json!({"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"fact"}]}),
+        )
+        .unwrap();
         let r = semantic::Record::capture(&s);
         h.push(json!({"role":"user","content":"unrelated"}));
         s.ingest(&h).unwrap();
@@ -563,11 +571,32 @@ async fn exact_prefix_empty_completion_supersedes_old_fact_and_stale_generation(
     let service = checkpoint_service(dir.path());
     let mut s = semantic_subject();
     s.review_epoch = 10;
-    s.apply_advice(&s.groups(),&json!({"protected":[],"removable":["g2"],"memories":[{"source_ids":["g2"],"text":"retire me"}]})).unwrap();
+    s.apply_advice(
+        &s.groups(),
+        &json!({"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"retire me"}]}),
+    )
+    .unwrap();
     history::publish(&service, &s, &s).unwrap();
     let mut latest = s.clone();
     latest.review_epoch = 11;
-    latest.apply_advice(&latest.groups(),&json!({"protected":[],"removable":[format!("m{}",latest.memories[0].id)],"memories":[]})).unwrap();
+    let body = review_body(&reviewer_config(), &latest);
+    let ledger: Value = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| {
+            i["content"]
+                .as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        })
+        .find(|v| v["eligible_memory_ids"].is_array())
+        .unwrap();
+    latest
+        .apply_advice(
+            &latest.groups(),
+            &json!({"protected":[],"removable":[ledger["eligible_memory_ids"][0]],"memories":[]}),
+        )
+        .unwrap();
     history::publish(&service, &s, &latest).unwrap();
     history::publish(&service, &s, &s).unwrap();
     let h = s.render_primary();

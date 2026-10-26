@@ -43,8 +43,8 @@ class ReviewRegressions(unittest.TestCase):
         requirement = "ONLY_TASK_DIRECTION preserve calibration delta ZQK7"
         def review(body, _n):
             observed = requirement in json.dumps(body["input"])
-            return 200, advice_response({"protected": ["g2"] if observed else [],
-                "removable": [] if observed else ["g2"], "memories": []})
+            return 200, advice_response({"protected": [2] if observed else [],
+                "removable": [] if observed else [2], "memories": []})
         fixture = self.fixture(review)
         proxy = self.harness.proxy(fixture, ["--min-payback-percent", "100"])
         history = self.seed()
@@ -77,10 +77,10 @@ class ReviewRegressions(unittest.TestCase):
         fact = "RETIRED_UNIQUE_FACT_8e54: the derived calibration is 873 kelvin."
         def review(body, n):
             if n == 1:
-                advice = {"protected": ["g2"], "removable": ["g1"],
-                          "memories": [{"source_ids": ["g2"], "text": fact}]}
+                advice = {"protected": [2], "removable": [1],
+                          "memories": [{"source_ids": [2], "text": fact}]}
             else:
-                advice = {"protected": [], "removable": ["m1"] if retire and n == 2 else [],
+                advice = {"protected": [], "removable": [ledger(body)["eligible_memory_ids"][0]] if retire and n == 2 else [],
                           "memories": []}
             return 200, advice_response(advice)
         fixture = self.fixture(review)
@@ -199,7 +199,7 @@ class ReviewRegressions(unittest.TestCase):
 
     def test_selected_source_removal_does_not_starve_due_review(self):
         def review(_body, _n):
-            return 200, advice_response({"protected": ["g1"], "removable": ["g2"], "memories": []})
+            return 200, advice_response({"protected": [1], "removable": [2], "memories": []})
         fixture = self.fixture(review)
         proxy = self.harness.proxy(fixture, ["--payoff-requests", "1"])
         history = self.seed()

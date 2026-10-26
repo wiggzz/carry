@@ -241,7 +241,7 @@ fn cumulative_memory_acceptances_enforce_reserve_and_hard_token_limits_then_reti
         item.exposed = true;
     }
     let add = |state: &mut Session, n| {
-        state.apply_advice_with_memory_admission(&state.groups(), &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g2"],"text":format!("fact-{n}:{}", "x".repeat(3980))}]}), |candidate| memory_admission_fits(&config,candidate,&HashSet::new())).unwrap();
+        state.apply_advice_with_memory_admission(&state.groups(), &json!({"protected":[],"removable":[],"memories":[{"source_ids":[2],"text":format!("fact-{n}:{}", "x".repeat(3980))}]}), |candidate| memory_admission_fits(&config,candidate,&HashSet::new())).unwrap();
     };
     for n in 0..4 {
         add(&mut session, n);
@@ -259,7 +259,7 @@ fn cumulative_memory_acceptances_enforce_reserve_and_hard_token_limits_then_reti
     );
     assert!(!memory_admission_fits(&config, &candidate, &HashSet::new()));
     let mut bounded = prior.clone();
-    bounded.apply_advice_with_memory_admission(&bounded.groups(), &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g2"],"text":candidate.memories[4].text}]}), |s| memory_admission_fits(&config,s,&HashSet::new())).unwrap();
+    bounded.apply_advice_with_memory_admission(&bounded.groups(), &json!({"protected":[],"removable":[],"memories":[{"source_ids":[2],"text":candidate.memories[4].text}]}), |s| memory_admission_fits(&config,s,&HashSet::new())).unwrap();
     assert_eq!(bounded.memories.len(), 4);
     assert_eq!(bounded.memories[0].text, prior.memories[0].text);
     config.classifier_max_input_bytes = u32::MAX;
@@ -274,7 +274,7 @@ fn cumulative_memory_acceptances_enforce_reserve_and_hard_token_limits_then_reti
     session
         .apply_advice(
             &session.groups(),
-            &json!({"protected":[],"removable":["m1","g2"],"memories":[]}),
+            &json!({"protected":[],"removable":[4,2],"memories":[]}),
         )
         .unwrap();
     let raw = review_body(&config, &session).to_string();

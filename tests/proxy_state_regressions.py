@@ -413,8 +413,8 @@ class StateRegressions(unittest.TestCase):
                     fixture.held.set()
                     if not fixture.release.wait(8):
                         raise AssertionError("held reviewer was not released")
-                    return 200, advice_response({"protected": ["g2"], "removable": [],
-                        "memories": [{"text": "HELD_DIRECTION_FACT", "source_ids": ["g2"]}]})
+                    return 200, advice_response({"protected": [2], "removable": [],
+                        "memories": [{"text": "HELD_DIRECTION_FACT", "source_ids": [2]}]})
 
                 fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
                 options = ["--min-payback-percent", "100"]
@@ -453,12 +453,12 @@ class StateRegressions(unittest.TestCase):
     def capacity_rejection_direction(self, change, publication_failure=False):
         def review(body, n):
             if n == 1:
-                self.assertIn("g2", ledger(body)["eligible_group_ids"])
+                self.assertIn(2, ledger(body)["eligible_group_ids"])
                 fixture.held.set()
                 if not fixture.release.wait(8):
                     raise AssertionError("capacity waiter did not release the held A reviewer")
-                return 200, advice_response({"protected": [], "removable": ["g2"],
-                    "memories": [{"text": "CAPACITY_HELD_A_FACT", "source_ids": ["g2"]}]})
+                return 200, advice_response({"protected": [], "removable": [2],
+                    "memories": [{"text": "CAPACITY_HELD_A_FACT", "source_ids": [2]}]})
             # A rejected old review may need a fresh blocking capacity review.
             # That actual B review grants no removal or memory authority.
             return 200, advice_response({"protected": [], "removable": [], "memories": []})
@@ -1262,11 +1262,11 @@ class StateRegressions(unittest.TestCase):
     def test_old_drop_does_not_remove_grown_group_during_held_review(self):
         def review(_body, n):
             if n == 1:
-                return 200, advice_response({"protected": [], "removable": ["g2"], "memories": []})
+                return 200, advice_response({"protected": [], "removable": [2], "memories": []})
             fixture.held.set()
             if not fixture.release.wait(8):
                 raise AssertionError("held reviewer was not released during teardown")
-            return 200, advice_response({"protected": ["g2"], "removable": [], "memories": []})
+            return 200, advice_response({"protected": [2], "removable": [], "memories": []})
 
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
         proxy = self.proxy(fixture, ["--payoff-requests", "1",
@@ -1301,8 +1301,8 @@ class StateRegressions(unittest.TestCase):
     def memory_progress(self, limit):
         text_a = ("a0b1c2d3e4f5g6h7i8j9" * 205)[:4096]
         text_b = ("k9l8m7n6o5p4q3r2s1t0" * 205)[:4096]
-        facts = [{"source_ids": ["g2"], "text": text_a},
-                 {"source_ids": ["g2"], "text": text_b}]
+        facts = [{"source_ids": [2], "text": text_a},
+                 {"source_ids": [2], "text": text_b}]
 
         def review(body, n):
             data = ledger(body)
@@ -1358,9 +1358,9 @@ class StateRegressions(unittest.TestCase):
 
         def review(body, n):
             data = ledger(body)
-            advice = {"protected": ["g1"], "removable": ["g2"], "memories": [
-                {"source_ids": ["g2"], "text": large},
-                {"source_ids": ["g2"], "text": small}]} if n == 1 else {
+            advice = {"protected": [1], "removable": [2], "memories": [
+                {"source_ids": [2], "text": large},
+                {"source_ids": [2], "text": small}]} if n == 1 else {
                 "protected": [], "removable": data["eligible_memory_ids"], "memories": []}
             return 200, advice_response(advice)
 

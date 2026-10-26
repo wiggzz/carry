@@ -158,7 +158,7 @@ fn adapted_wire_cache_prefix_protects_cached_native_members_not_canonical_positi
     session
         .apply_advice(
             &session.groups(),
-            &json!({"protected":[],"removable":["g3","g5"],"memories":[]}),
+            &json!({"protected":[],"removable":[3,5],"memories":[]}),
         )
         .unwrap();
     let body = json!({"model":"gpt-6-luna","prompt_cache_key":"stable","input":h});

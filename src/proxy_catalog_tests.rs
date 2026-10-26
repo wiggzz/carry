@@ -193,7 +193,7 @@ fn fixture(rates: Rates) -> (ProxyCli, Session, Value) {
     session
         .apply_advice(
             &groups,
-            &json!({"protected":["g1"],"removable":["g2"],"memories":[]}),
+            &json!({"protected":[1],"removable":[2],"memories":[]}),
         )
         .unwrap();
     let route = Route::new(&config.upstream_url, false);

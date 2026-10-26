@@ -22,10 +22,10 @@ def body_for(observations, revision, previous):
     records: list[dict] = [dict(role='user', content='Return JSON.'),
                dict(role='user', content=json.dumps({'current_request': {'model': 'fixture'}}))]
     for index in range(observations):
-        records.append(dict(role='user', content=json.dumps({'group_id': f'g{index + 1}',
+        records.append(dict(role='user', content=json.dumps({'group_id': index + 1,
             'member_ids': [index + 1], 'items': [{'role': 'user', 'content': f'synthetic source {index}'}]})))
-    records.append(dict(role='user', content=json.dumps({'eligible_group_ids': ['g1'],
-        'current_groups': [{'group_id': f'g{index + 1}', 'opinion': 'keep' if revision % 2 else None}
+    records.append(dict(role='user', content=json.dumps({'eligible_group_ids': [1],
+        'current_groups': [{'group_id': index + 1, 'opinion': 'keep' if revision % 2 else None}
                            for index in range(observations)]})))
     for record in records:
         record['content'] = [{'type': 'input_text', 'text': record['content']}]
@@ -108,7 +108,7 @@ class SimulatorTests(unittest.TestCase):
             self.assertEqual(send(provider, body)['usage']['input_tokens_details']['cached_tokens'], 0)
             extended = copy.deepcopy(body)
             extended['input'] += [{'role': 'assistant', 'content': 'synthetic answer'},
-                                  {'role': 'user', 'content': json.dumps({'eligible_group_ids': ['g1']})}]
+                                  {'role': 'user', 'content': json.dumps({'eligible_group_ids': [1]})}]
             self.assertEqual(send(provider, extended)['usage']['input_tokens_details']['cached_tokens'], 2048)
             self.assertIn(len(body['input']), provider.receipts[-1]['matched_boundaries'])
             for mutation in ('text', 'role', 'wrapper', 'settings'):
@@ -130,22 +130,22 @@ class SimulatorTests(unittest.TestCase):
             body = body_for(1, 0, [])
             responses = [send(provider, body) for _ in range(10)]
             advice = [json.loads(r['output'][-1]['content'][0]['text']) for r in responses]
-            self.assertEqual(advice[-2], {'protected': ['g1'], 'removable': [], 'memories': []})
-            self.assertEqual(advice[-1], {'protected': [], 'removable': ['g1'], 'memories': []})
-            self.assertTrue(all(a['protected'] + a['removable'] == ['g1'] for a in advice))
+            self.assertEqual(advice[-2], {'protected': [1], 'removable': [], 'memories': []})
+            self.assertEqual(advice[-1], {'protected': [], 'removable': [1], 'memories': []})
+            self.assertTrue(all(a['protected'] + a['removable'] == [1] for a in advice))
         # The coupled fixture must still protect direction while removing the
         # whole native cohort, rather than alternately dropping direction.
         with Provider('coupled') as provider:
             body = body_for(2, 0, [])
             ledger = json.loads(body['input'][-1]['content'][0]['text'])
-            ledger['eligible_group_ids'].append('g2')
+            ledger['eligible_group_ids'].append(2)
             body['input'][-1]['content'][0]['text'] = json.dumps(ledger)
             # Insert cohort evidence as valid observation JSON.
-            body['input'][3]['content'][0]['text'] = json.dumps({'group_id': 'g2', 'items': ['DISCARD_NATIVE_BYTES']})
+            body['input'][3]['content'][0]['text'] = json.dumps({'group_id': 2, 'items': ['DISCARD_NATIVE_BYTES']})
             for _ in range(2):
                 response = send(provider, body)
                 self.assertEqual(json.loads(response['output'][-1]['content'][0]['text']),
-                    {'protected': ['g1'], 'removable': ['g2'], 'memories': []})
+                    {'protected': [1], 'removable': [2], 'memories': []})
 
     def test_default_dispatcher_labels_nine_distinct_conditions(self):
         import contextlib

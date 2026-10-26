@@ -193,7 +193,7 @@ def review_records(body):
             fact = {'source_ids': observed['source_ids'], 'text': observed['text']}
         else:
             # Provenance identifies evidence, not a fact: same-source siblings
-            # require distinct explicit bindings for their current m handles.
+            # require distinct explicit bindings for their current review indices.
             raise AssertionError('missing current memory observation or materialized fact')
         if fact not in sources:
             sources.append(fact)

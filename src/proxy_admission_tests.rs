@@ -83,7 +83,7 @@ fn ordinary_backoff_classifies_new_protection_repeats_and_useful_removal() {
     session
         .apply_advice(
             &groups,
-            &json!({"protected":["g2"],"removable":[],"memories":[]}),
+            &json!({"protected":[2],"removable":[],"memories":[]}),
         )
         .unwrap();
     assert_eq!(
@@ -95,7 +95,7 @@ fn ordinary_backoff_classifies_new_protection_repeats_and_useful_removal() {
     session
         .apply_advice(
             &groups,
-            &json!({"protected":[],"removable":["g2"],"memories":[]}),
+            &json!({"protected":[],"removable":[2],"memories":[]}),
         )
         .unwrap();
     assert_eq!(
@@ -107,7 +107,7 @@ fn ordinary_backoff_classifies_new_protection_repeats_and_useful_removal() {
     session
         .apply_advice(
             &groups,
-            &json!({"protected":[],"removable":["g2"],"memories":[]}),
+            &json!({"protected":[],"removable":[2],"memories":[]}),
         )
         .unwrap();
     assert_eq!(
