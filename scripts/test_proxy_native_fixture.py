@@ -106,6 +106,30 @@ def contract_send(url, body, directory):
     return result
 
 
+def contract_workers_finished(directory):
+    """Receipt-pending clears before the real completed-H publication finishes."""
+    events = []
+    for path in (Path(directory) / 'diagnostics').glob('*'):
+        if not path.is_file():
+            continue
+        for line in path.read_text().splitlines():
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    request_ids = [event['request_id'] for event in events if event.get('request_id')]
+    if not request_ids:
+        return True  # Existing fail-open diagnostic-I/O controls have no lane.
+    current = max(request_ids, key=lambda value: int(value.split('-')[1]))
+    pid = current.split('-')[0]
+    dispatched = {event['request_id'] for event in events
+                  if event.get('event') == 'background_review_dispatched'
+                  and event['request_id'].split('-')[0] == pid}
+    merged = {event['request_id'] for event in events
+              if event.get('event') == 'background_review_merged'}
+    return dispatched <= merged
+
+
 def contract_settle(directory, terminal_requests=0):
     import time
     deadline = time.monotonic() + 30
@@ -113,7 +137,8 @@ def contract_settle(directory, terminal_requests=0):
         try:
             state = contract_state(directory)
             terminal = state['completed_requests'] + state['failed_primaries']
-            if terminal >= terminal_requests and not state['background_review_pending']:
+            if (terminal >= terminal_requests and not state['background_review_pending']
+                    and contract_workers_finished(directory)):
                 return state
         except (StopIteration, FileNotFoundError):
             pass
