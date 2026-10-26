@@ -55,7 +55,7 @@ pub(super) fn base(body: &Value) -> Value {
 fn input_identity(input: &[Value]) -> String {
     let mut input = input.to_vec();
     for item in &mut input {
-        if let Some(blocks) = item["content"].as_array_mut() {
+        if let Some(blocks) = item.get_mut("content").and_then(Value::as_array_mut) {
             for block in blocks {
                 if block["prompt_cache_breakpoint"]["mode"] == "explicit" {
                     block

@@ -3520,6 +3520,48 @@ mod tests {
     }
 
     #[test]
+    fn actual_native_cache_identity_preserves_absent_content_fields() {
+        let input = json!([
+            {"type":"reasoning","summary":[],"encrypted_content":"synthetic-opaque"},
+            {"type":"function_call","name":"one","call_id":"a","arguments":"{}"},
+            {"type":"custom_tool_call","name":"two","call_id":"b","input":"synthetic"},
+            {"type":"function_call_output","call_id":"a","output":"one"},
+            {"type":"custom_tool_call_output","call_id":"b","output":"two"},
+            {"role":"user","content":[{"type":"input_text","text":"stable boundary"}]}
+        ]);
+        let mut wire =
+            json!({"model":"gpt-6-luna","input":input,"prompt_cache_options":{"mode":"explicit"}});
+        wire["input"][5]["content"][0]["prompt_cache_breakpoint"] = json!({"mode":"explicit"});
+        let model = resolve_model(
+            "gpt-6-luna",
+            Route::new("https://api.openai.com/v1/responses", false),
+            None,
+            None,
+            16384,
+            0,
+        )
+        .unwrap()
+        .with_scenario_cache_policy();
+        let mut cache = Vec::new();
+        assert!(crate::proxy_cache::observe(
+            &mut cache,
+            &wire,
+            &json!({"input_tokens":4000,"input_tokens_details":{"cached_tokens":3000}}),
+            Some(&model),
+            "auth",
+            now()
+        ));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache[0].input_sha256,
+            crate::proxy_cache::serialized_identity(&input).1,
+            "cache key must bind actual native wire, stripping only the transport marker, not inserting null content into native items"
+        );
+        assert_eq!(cache[0].input_len, input.as_array().unwrap().len());
+        assert!(cache[0].matches(&wire, Some(&model), "auth", now()));
+    }
+
+    #[test]
     fn dashboard_client_provenance_is_bounded_and_optional() {
         let body = json!({"client_metadata": {"x-codex-turn-metadata":
             json!({"agent_name":"/root/worker", "thread_source":"subagent", "subagent_kind":"thread_spawn"}).to_string()}});
