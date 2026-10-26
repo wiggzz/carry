@@ -92,7 +92,8 @@ def contract_proxy(test, provider, state_dir, mode='audit', binary=None, classif
 
 def contract_send(url, body, directory):
     try:
-        expected = contract_state(directory)['completed_requests'] + 1
+        before = contract_state(directory)
+        expected = before['completed_requests'] + before['failed_primaries'] + 1
     except StopIteration:
         expected = 1
     request = urllib.request.Request(url + '/v1/responses', data=json.dumps(body).encode(),
@@ -101,22 +102,23 @@ def contract_send(url, body, directory):
     # sequence completed reviews; production forwarding must never do this.
     with urllib.request.urlopen(request, timeout=30) as response:
         result = json.load(response)
-    contract_settle(directory, completed_requests=expected)
+    contract_settle(directory, terminal_requests=expected)
     return result
 
 
-def contract_settle(directory, completed_requests=0):
+def contract_settle(directory, terminal_requests=0):
     import time
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         try:
             state = contract_state(directory)
-            if state['completed_requests'] >= completed_requests and not state['background_review_pending']:
+            terminal = state['completed_requests'] + state['failed_primaries']
+            if terminal >= terminal_requests and not state['background_review_pending']:
                 return state
         except (StopIteration, FileNotFoundError):
             pass
         time.sleep(.01)
-    raise AssertionError('completed primary reviewer receipt did not settle')
+    raise AssertionError('primary disposition/reviewer receipt did not settle')
 
 
 def wire_data(body):
@@ -409,7 +411,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                         with urllib.request.urlopen(req, timeout=30) as response:
                             events=[json.loads(line[6:]) for line in response.read().decode().splitlines()
                                     if line.startswith('data: ')]
-                        contract_settle(trial/'state', completed_requests=turn + 1)
+                        contract_settle(trial/'state', terminal_requests=turn + 1)
                         output=events[-1]['response']['output']
                         body['input'].extend(output)
                         for item in output:
