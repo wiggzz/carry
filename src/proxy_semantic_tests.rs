@@ -164,6 +164,152 @@ fn merged_projected_group_authorizes_original_member_union_not_separator() {
     );
 }
 
+fn memory_provenance_on_wire(body: &Value, id: &str) -> (Value, Value) {
+    let records: Vec<Value> = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| {
+            item["content"]
+                .as_str()
+                .or_else(|| item["content"][0]["text"].as_str())
+                .and_then(|text| serde_json::from_str(text).ok())
+        })
+        .collect();
+    let fact = records
+        .iter()
+        .find(|r| r["memory_id"] == id && r["text"].is_string())
+        .unwrap();
+    let ledger = records
+        .iter()
+        .find(|r| r["current_memories"].is_array())
+        .unwrap();
+    let entry = ledger["current_memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["memory_id"] == id)
+        .unwrap();
+    (fact["source_ids"].clone(), entry["source_ids"].clone())
+}
+
+fn provenance_tool_subject() -> Session {
+    let mut s = Session::default();
+    s.ingest(&[
+        json!({"role":"user","content":"goal"}),
+        json!({"type":"reasoning","encrypted_content":"opaque","summary":[]}),
+        json!({"type":"function_call","call_id":"f","name":"inspect","arguments":"{}"}),
+        json!({"type":"custom_tool_call","call_id":"c","name":"inspect","input":"raw"}),
+        json!({"type":"function_call_output","call_id":"f","output":"function evidence"}),
+        json!({"type":"custom_tool_call_output","call_id":"c","output":"custom evidence"}),
+        json!({"role":"user","content":"current"}),
+    ])
+    .unwrap();
+    for i in &mut s.history {
+        i.exposed = true;
+    }
+    s.apply_advice(&s.groups(), &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g2"],"text":"complete native fact"}]})).unwrap();
+    assert_eq!(s.memories[0].source_ids, vec![2, 3, 4, 5, 6]);
+    s
+}
+
+#[test]
+fn reviewer_memory_provenance_names_complete_native_group_and_preserves_strict_eligibility() {
+    let config = reviewer_config();
+    let mut s = provenance_tool_subject();
+    let original = s.render_primary();
+    let (sources, ledger) = memory_provenance_on_wire(&review_body(&config, &s), "m1");
+    assert_eq!(
+        sources,
+        json!(["g2"]),
+        "members are not independently actionable groups"
+    );
+    assert_eq!(ledger, sources);
+    s.apply_advice(&s.groups(), &json!({"protected":[],"removable":[],"memories":[{"source_ids":sources,"text":"derived native fact"}]})).unwrap();
+    assert_eq!(s.review_feedback["rejected_count"], 0);
+    assert_eq!(s.memories[1].source_ids, vec![2, 3, 4, 5, 6]);
+    let omitted = HashSet::from([2, 3, 4, 5, 6]);
+    let projection = planning::Projection {
+        input: s.render_projection(&omitted),
+        omitted,
+    };
+    let body = review_body_projected(&config, &s, &projection);
+    assert_eq!(
+        memory_provenance_on_wire(&body, "m1"),
+        (json!(["g2"]), json!(["g2"]))
+    );
+    for ids in [json!(["g2"]), json!([2]), json!(["m1"]), json!(["g999"])] {
+        s.apply_advice(&s.groups_for(&projection.omitted), &json!({"protected":[],"removable":[],"memories":[{"source_ids":ids,"text":"not newly eligible"}]})).unwrap();
+        assert_eq!(s.review_feedback["rejected_count"], 1);
+        assert_eq!(s.memories.len(), 2);
+    }
+    assert_eq!(s.render_primary(), original);
+}
+
+#[test]
+fn reviewer_memory_provenance_resolves_merged_split_and_omitted_original_groups() {
+    let config = reviewer_config();
+    let mut s = Session::default();
+    s.ingest(&[
+        json!({"role":"user","content":"goal"}),
+        json!({"role":"assistant","content":"first evidence"}),
+        json!({"role":"user","content":"separator"}),
+        json!({"role":"assistant","content":"second evidence"}),
+        json!({"role":"user","content":"current"}),
+    ])
+    .unwrap();
+    for i in &mut s.history {
+        i.exposed = true;
+    }
+    let original = s.render_primary();
+    s.apply_advice(&s.groups_for(&HashSet::from([3])), &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g2"],"text":"joined fact"}]})).unwrap();
+    assert_eq!(s.memories[0].source_ids, vec![2, 4]);
+    let record = semantic::Record::capture(&s);
+    let mut restored: Session = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+    record.apply(&mut restored);
+    for (omitted, expected) in [
+        (HashSet::new(), json!(["g2", "g4"])),
+        (HashSet::from([3]), json!(["g2"])),
+        (HashSet::from([2]), json!(["g2", "g4"])),
+        (HashSet::from([2, 4]), json!(["g2", "g4"])),
+    ] {
+        let projection = planning::Projection {
+            input: restored.render_projection(&omitted),
+            omitted,
+        };
+        let body = review_body_projected(&config, &restored, &projection);
+        assert_eq!(
+            memory_provenance_on_wire(&body, "m1"),
+            (expected.clone(), expected.clone())
+        );
+        let mut candidate = restored.clone();
+        candidate.apply_advice(&candidate.groups_for(&projection.omitted), &json!({"protected":[],"removable":[],"memories":[{"source_ids":expected,"text":"derived joined fact"}]})).unwrap();
+        if projection.omitted.contains(&2) {
+            assert_eq!(candidate.review_feedback["rejected_count"], 1);
+            assert_eq!(candidate.memories.len(), 1);
+        } else {
+            assert_eq!(candidate.review_feedback["rejected_count"], 0);
+            assert_eq!(candidate.memories[1].source_ids, vec![2, 4]);
+        }
+    }
+    assert_eq!(restored.render_primary(), original);
+    assert_eq!(restored.memory_anchors[&restored.memories[0].id], 4);
+}
+
+#[test]
+fn repeated_native_fact_is_deduplicated_in_original_member_coordinates() {
+    let mut s = provenance_tool_subject();
+    let next = s.next_memory_id;
+    s.apply_advice(&s.groups(), &json!({"protected":[],"removable":[],"memories":[{"source_ids":["g2"],"text":"complete native fact"}]})).unwrap();
+    assert_eq!(s.review_feedback["rejected_count"], 0);
+    assert_eq!(
+        s.memories.len(),
+        1,
+        "group identity must normalize before comparison to stored member provenance"
+    );
+    assert_eq!(s.next_memory_id, next);
+}
+
 #[test]
 fn native_suffix_dependency_extension_rejects_drop_and_fact_but_unrelated_growth_does_not() {
     for ty in ["function_call", "custom_tool_call"] {
