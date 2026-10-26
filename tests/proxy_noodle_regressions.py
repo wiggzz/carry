@@ -73,6 +73,58 @@ class NoodleRegressions(unittest.TestCase):
         self.assertGreater(after["cost_trajectory"]["result"]["observed_primary_cost"],
                            before["cost_trajectory"]["result"]["observed_primary_cost"])
 
+    def test_off_tracking_fallback_has_zero_projection_after_repeat_and_restart(self):
+        root = self.state
+        for label, count in (("tracked", 100), ("tracker_limit", 16385)):
+            with self.subTest(case=label):
+                self.state = root / label
+                self.state.mkdir()
+                def primary(_body, n):
+                    response = completed(response_id=f"off_{label}_{n}")
+                    response["usage"]["input_tokens"] = 200000
+                    return 200, response
+                fixture = self.fixture(primary)
+                h = [{"role":"user", "content":"x"} for _ in range(count)]
+                def start():
+                    proxy = Proxy(self.state, fixture, mode="off")
+                    self.stack.callback(proxy.close)
+                    return proxy
+                proxy = start()
+                snapshots = []
+                for _ in range(2):
+                    self.assertEqual(proxy.send(h, max_output_tokens=1)[0], 200)
+                    self.assertEqual(fixture.primaries[-1]["input"], h)
+                    snapshots.append(proxy.saved())
+                proxy.close()
+                proxy = start()
+                self.assertEqual(proxy.send(h, max_output_tokens=1)[0], 200)
+                self.assertEqual(fixture.primaries[-1]["input"], h)
+                snapshots.append(proxy.saved())
+                proxy.close()
+                self.evidence[label] = {"snapshots":snapshots, "primaries":fixture.primaries,
+                                        "reviews":fixture.reviews}
+                self.assertFalse(fixture.reviews)
+                for n, saved in enumerate(snapshots, 1):
+                    trajectory = saved["cost_trajectory"]
+                    self.assertEqual(len(saved["history"]), count if label == "tracked" else 0)
+                    self.assertEqual(saved["primary"]["calls"], n)
+                    self.assertEqual(saved["primary"]["input_tokens"], 200000*n)
+                    self.assertEqual(saved["primary"]["output_tokens"], n)
+                    self.assertEqual(saved["shadow"]["calls"], 0)
+                    self.assertEqual(trajectory["priced_primary_responses"], n)
+                    self.assertEqual(trajectory["result"]["coverage"]["unmodeled_calls"], 0)
+                    self.assertEqual(trajectory["result"]["excluded_unpriced_calls"], 0)
+                    self.assertAlmostEqual(trajectory["result"]["observed_primary_cost"],
+                                           saved["primary"]["cost_usd"], places=12)
+                # Grade after collecting every request so RED retains repeat,
+                # restart, complete forwarded input and paid receipt evidence.
+                for label_request, saved in zip(("first", "repeat", "restart"), snapshots):
+                    with self.subTest(case=label, request=label_request):
+                        self.assertEqual(saved["cost_trajectory"]["restored"], 0,
+                                         "pass-through does not edit input when tracking fails")
+                        self.assertEqual(saved["cost_trajectory"]["last_traditional_input"], 200000)
+        self.state = root
+
     def test_compact_to_passthrough_measures_current_projection_on_repeat_and_restart(self):
         root = self.state
         for mode in ("off", "audit"):

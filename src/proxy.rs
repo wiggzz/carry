@@ -1736,11 +1736,17 @@ async fn forward_request(
         // pass-through. Receipt compatibility may preserve only this quantity.
         let canonical = json!(session.render_primary());
         if let Some(t) = &mut session.cost_trajectory {
-            t.projected(
-                estimate(&canonical) as u64,
-                estimate(&outbound["input"]) as u64,
-                canonical != outbound["input"],
-            );
+            if service.config.mode == Mode::Off {
+                // Off never edits input. Its optional tracker can fail or be
+                // empty, so it cannot define a canonical-minus-sent delta.
+                t.projected(0, 0, false);
+            } else {
+                t.projected(
+                    estimate(&canonical) as u64,
+                    estimate(&outbound["input"]) as u64,
+                    canonical != outbound["input"],
+                );
+            }
         }
         let reviewed = session.clone();
         session.last_submitted_ids = session
