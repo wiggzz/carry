@@ -285,7 +285,11 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
     credit_snapshots = []
     with Provider(case) as provider:
         # Two actual OS processes share durable state; provider cache survives restart.
-        for epoch, turns in enumerate((range(5), range(5, 11))):
+        # After the missing receipt and real cold write, repeat the COMPLETE
+        # unchanged payload once to actually earn the early cached-read probe.
+        # Keep every original append/turn; no reduced payload or clock change.
+        first_epoch = [0, 1, 2, None, 3, 4] if case == 'missing-usage' else range(5)
+        for epoch, turns in enumerate((first_epoch, range(5, 11))):
             with socket.socket() as sock:
                 sock.bind(('127.0.0.1', 0))
                 port = sock.getsockname()[1]
@@ -338,7 +342,7 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
                                 inputs = [{'role': 'user', 'content': 'NEW_RESET_DIRECTION ' + 'new ' * 600}]
                             elif turn == 9:
                                 inputs.append({'role': 'user', 'content': 'Continue on the new branch.'})
-                        elif turn < 9:
+                        elif turn is not None and turn < 9:
                             inputs.append({'role': 'user', 'content': f'FIXTURE_OBSERVATION_{turn} ' + 'stable data ' * 400})
                         body = {'model': 'gpt-6-luna', 'input': copy.deepcopy(inputs), 'store': False, 'stream': False,
                                 'prompt_cache_key': 'primary-fixture-affinity'}
@@ -400,6 +404,8 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
             grade(provider.reviews, provider.receipts, enabled, case == 'missing-usage',
                   outputs=provider.review_outputs)
         if case == 'missing-usage':
+            assert sent[2] == sent[3] and sent_hashes[2] == sent_hashes[3], 'read probe must repeat the full unchanged native payload'
+            assert provider.receipts[2]['synthetic_cached_tokens'] > 0, 'read-credit assertion requires an actual transmitted matching prefix and cached-read receipt'
             assert credit_snapshots[1]['read_credit'] == credit_snapshots[2]['read_credit'] == 0
             assert credit_snapshots[3]['read_credit'] > 0, 'only an explicit cached-read receipt may grant credit'
             assert state['shadow']['unavailable_cost_calls'] >= 1, 'missing usage must remain unknown in metering'
