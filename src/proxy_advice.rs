@@ -71,10 +71,10 @@ impl Record {
             session.review_feedback = self.feedback.clone();
             session.review_feedback_generation = self.generation;
         }
-        session.bootstrap_review_pending &= session
-            .history
-            .iter()
-            .any(|item| item.exposed && item.id as usize > self.len);
+        // A completed original prefix is already reviewed authority. Newly
+        // exposed suffix work follows ordinary admission, not a paid replay
+        // bootstrap merely because a cold owner also contains later output.
+        session.bootstrap_review_pending = false;
         let groups = session.groups();
         // Original member unions may span several canonical groups after a
         // projected separator omission. Require the entire native closure now;
