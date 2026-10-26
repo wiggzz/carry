@@ -722,7 +722,9 @@ class NativeProviderFixtureTests(unittest.TestCase):
                     return {'protected': [], 'removable': [], 'memories': [
                         {'source_ids': shown['source_ids'], 'text': 'retired source is not newly eligible'}]}
                 provider.advice = retired
+                invalid_before = state['invalid_reviews']
                 partial_before = state['partial_reviews']
+                shadow_before = state['shadow']['calls']
                 body['input'].append({'role': 'user', 'content': 'next task'})
                 contract_send(url, body, directory)
                 later = provider.shadow[-1]
@@ -732,9 +734,16 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 retained = {g['group_id']: g['member_ids'] for g in ledger['retained_source_groups']}
                 self.assertEqual([member for ref in sources for member in retained[ref]], [1])
                 self.assertTrue(set(sources).isdisjoint(ledger['eligible_group_ids']))
-                self.assertEqual(contract_state(directory)['invalid_reviews'], 0,
-                                 'valid envelope with invalid references uses partial validation')
-                self.assertEqual(contract_state(directory)['partial_reviews'], partial_before + 1)
+                settled = contract_state(directory)
+                self.assertEqual(settled['invalid_reviews'], invalid_before + 1,
+                                 'an entirely rejected review must not advance semantic coverage')
+                self.assertEqual(settled['partial_reviews'], partial_before,
+                                 'only accepted siblings classify a review as partial')
+                self.assertEqual(settled['shadow']['calls'], shadow_before + 1,
+                                 'rejected advice still settles its actual paid receipt once')
+                self.assertEqual(settled['review_feedback']['rejected_count'], 1)
+                self.assertEqual(settled['review_feedback']['accepted_opinions'], 0)
+                self.assertEqual(settled['review_feedback']['accepted_memories'], 0)
                 self.assertEqual(len(contract_advice(directory)['memories']), 2)
 
     def test_proxy_parallel_cohort_extension_observes_only_new_members_and_current_opinion(self):
