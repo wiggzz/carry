@@ -14,6 +14,7 @@ result_url_file=/dev/shm/carry-result-url
 capability_refresh_pid=""
 preparation_telemetry_pid=""
 worker_log_pid=""
+timeout_command=""
 exec 3>&1 4>&2
 worker_event() {
   printf 'BENCHMARK_WORKER {"stage":"%s","exit_code":%s,"elapsed_seconds":%s}\n' "$1" "${2:-0}" "$SECONDS"
@@ -22,6 +23,9 @@ finish() {
   status=$?
   worker_status=$status
   delivery_status=0
+  # Dependency rejection still sanitizes/shuts down, but cannot deliver stale
+  # results through an absent or unverified process-group timeout.
+  [[ -n "$timeout_command" ]] || delivery_status=2
   trap - EXIT
   trap '' PIPE
   set +e
@@ -31,7 +35,7 @@ finish() {
   for pid in "$capability_refresh_pid" "$preparation_telemetry_pid"; do
     [[ -n "$pid" ]] || continue
     kill "$pid" 2>/dev/null
-    if timeout --signal=KILL 2s tail --pid="$pid" -f /dev/null >/dev/null 2>&1; then
+    if "$timeout_command" --signal=KILL 2s tail --pid="$pid" -f /dev/null >/dev/null 2>&1; then
       wait "$pid" 2>/dev/null
     else
       kill -KILL "$pid" 2>/dev/null
@@ -52,7 +56,7 @@ finish() {
   # Bound the logger drain before tar snapshots worker.log.
   if [[ -n "$worker_log_pid" ]]; then
     log_status=0
-    if timeout --signal=KILL 5s tail --pid="$worker_log_pid" -f /dev/null >/dev/null 2>&1; then
+    if "$timeout_command" --signal=KILL 5s tail --pid="$worker_log_pid" -f /dev/null >/dev/null 2>&1; then
       wait "$worker_log_pid" || log_status=$?
     else
       log_status=$?
@@ -68,10 +72,10 @@ finish() {
     worker_event worker_exit "$worker_status" >> "$CARRY_ROOT/results/worker.log"
     printf '%s\n' "$worker_status" > "$CARRY_ROOT/results/worker-exit-status"
     worker_event archive
-    if timeout --signal=TERM --kill-after=5s 120s \
+    if "$timeout_command" --signal=TERM --kill-after=5s 120s \
       tar -C "$CARRY_ROOT/results" -czf "$CARRY_ROOT/results.tar.gz" . >/dev/null 2>&1; then
       worker_event upload
-      if timeout --signal=TERM --kill-after=5s 125s \
+      if "$timeout_command" --signal=TERM --kill-after=5s 125s \
         curl --proto '=https' --tlsv1.2 --fail --silent \
         --connect-timeout 10 --max-time 60 --retry 2 --retry-all-errors --retry-max-time 120 \
         -X PUT -T "$CARRY_ROOT/results.tar.gz" "$result_url" >/dev/null 2>&1; then
@@ -93,6 +97,18 @@ finish() {
 }
 trap finish EXIT
 trap 'exit 141' PIPE
+
+# Descendant termination and kill statuses require GNU semantics. Ubuntu ships
+# GNU-prefixed tools beside its default uutils; older workers use plain timeout.
+timeout_candidate=$(command -v gnutimeout || command -v timeout || true)
+if [[ -z "$timeout_candidate" ]] ||
+   ! timeout_version=$(LC_ALL=C "$timeout_candidate" --version 2>/dev/null) ||
+   [[ "${timeout_version%%$'\n'*}" != *"(GNU coreutils)"* ]]; then
+  printf 'GNU coreutils timeout is required (gnutimeout or timeout)\n' >&2
+  exit 2
+fi
+timeout_command=$timeout_candidate
+printf 'Worker timeout: %s — %s\n' "$timeout_command" "${timeout_version%%$'\n'*}"
 
 mkdir -p "$CARRY_ROOT/results" "$CARRY_ROOT/source" "$CARRY_ROOT/work"
 exec > >(exec tee -a "$CARRY_ROOT/results/worker.log") 2>&1
@@ -328,6 +344,6 @@ if [[ "$BENCHMARK_MODE" == prepare-50 || "$BENCHMARK_MODE" == prepare-long-50 ]]
 else
   worker_event benchmark
 fi
-timeout --signal=TERM --kill-after=30s "$OVERALL_TIMEOUT_SECONDS" python3 "$CARRY_ROOT/source/scripts/swebench_smoke.py" \
+"$timeout_command" --signal=TERM --kill-after=30s "$OVERALL_TIMEOUT_SECONDS" python3 "$CARRY_ROOT/source/scripts/swebench_smoke.py" \
   "$runner_mode" --source "$CARRY_ROOT/source" --work "$CARRY_ROOT/work" \
   --output "$CARRY_ROOT/results" --harness "$BENCHMARK_HARNESS"
