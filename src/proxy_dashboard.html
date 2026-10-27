@@ -2,34 +2,116 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Carry Proxy</title>
+<title>Carry · Usage</title>
 <style>
-:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#10151d;color:#e4eaf3}body{max-width:1200px;margin:auto;padding:24px}h1{margin-bottom:4px}p{color:#9eabc0}button,input{padding:10px;border:1px solid #39465a;border-radius:6px;background:#182231;color:inherit}button{cursor:pointer}input{width:min(65vw,480px)}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:24px 0}.card{background:#1a2432;border:1px solid #2c3b50;border-radius:8px;padding:16px}.value{font-size:26px;font-weight:600;margin-top:6px}.label{color:#aebbd0;font-size:13px}.scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;white-space:nowrap;font-size:14px}th,td{text-align:left;padding:12px;border-bottom:1px solid #2b3748}th{color:#acbdd4}#status{padding:10px 0;color:#b1c4dc}.warning{color:#edc887}summary{cursor:pointer}a{color:#a1caff}small{color:#9eabc0}
-
-.session-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:16px;margin:20px 0}.session{background:#17212e;border:1px solid #2c3b50;border-radius:12px;padding:20px}.session h3{margin:0 0 8px;font-size:16px}.session p{margin:8px 0;line-height:1.5}.context-bar{display:flex;height:12px;border-radius:6px;overflow:hidden;background:#39465a;margin:14px 0}.removable{background:#65c9a3}.protected{background:#79a9f5}.unreviewed{background:#6d788a}.legend{font-size:13px}.legend b{font-weight:500}.planner{border-top:1px solid #334154;margin-top:16px;padding-top:12px}.planner progress{width:100%;height:9px;accent-color:#65c9a3}.diagnostics{margin-top:14px;color:#edc887;font-size:13px}.scope{font-size:13px}
-
-.session{position:relative}.session h3{line-height:1.4;overflow-wrap:anywhere}.session>.activity{font-size:12px;color:#9eabc0}.session>.request-counts{font-size:12px}.session>.session-savings{font-size:18px;color:#dce8f7;margin:12px 0}.session-meta{font-size:12px;color:#94a7c2;font-family:ui-monospace,monospace}.capacity-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:14px 0}.capacity{background:#111b28;padding:12px;border-radius:8px}.capacity .capacity-value{display:block;font-size:24px;font-weight:600;margin:4px 0}.capacity p{font-size:12px;margin:5px 0}.capacity progress{margin:5px 0}.planner>p:first-child{font-size:13px}.history-group{grid-column:1 / -1;border:1px solid #35475e;border-radius:12px;padding:16px}.history-group>summary{font-size:16px;font-weight:600;line-height:1.5;overflow-wrap:anywhere}.history-group>p,#background-traffic>p{font-size:13px}.history-group>.session-grid{margin-bottom:0}.plan-details{font-size:12px;color:#9eabc0;margin-top:12px}#background-traffic{margin:24px 0;padding:16px;border:1px solid #2c3b50;border-radius:12px}#background-traffic>summary{color:#aebbd0}.empty{padding:20px;color:#9eabc0}.context-bar{height:6px;margin:14px 0 8px}.legend{font-size:12px}.planner{margin-top:12px}.scope{font-size:12px}@media(max-width:500px){body{padding:16px}.capacity-grid{grid-template-columns:1fr}.session{padding:16px}}
+:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+  background: #10151d;
+  color: #e4eaf3;
+  --muted: #b0bdd0;
+  --border: #334154;
+  font-size: 15px;
+  line-height: 1.55;
+}
+* { box-sizing: border-box; }
+body { max-width: 1160px; margin: auto; padding: 32px 24px; }
+header { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+h1 { font-size: 24px; letter-spacing: -.5px; margin: 0; }
+h2 { font-size: 19px; margin: 28px 0 4px; }
+p { color: var(--muted); margin: 8px 0; }
+.subtitle { margin: 0; }
+#activity-summary, #status, .section-note { font-size: 14px; }
+#status { padding: 12px 0; margin-bottom: 12px; }
+#status.error, .warning, .diagnostics, .loss .value { color: #edc887; }
+.estimate-notice { color: #d0dbea; }
+.cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }
+.card { background: #1a2432; border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; min-width: 0; }
+.label { color: var(--muted); font-size: 14px; }
+.value { font-size: 25px; font-weight: 600; letter-spacing: -.5px; font-variant-numeric: tabular-nums; margin-top: 4px; overflow-wrap: anywhere; }
+.card-note { margin: 4px 0 0; font-size: 13px; }
+.coverage { font-size: 14px; margin: 12px 0; }
+details { min-width: 0; }
+summary { cursor: pointer; padding: 10px 0; min-height: 44px; color: #d0dbea; }
+summary:hover { color: #fff; }
+:focus-visible { outline: 2px solid #8bbcff; outline-offset: 4px; border-radius: 3px; }
+#estimate-details { border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+#estimate-details p { max-width: 90ch; }
+#config, .scope, .legend, .plan-details { font-size: 14px; }
+.session-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 16px; margin: 16px 0; }
+.session { background: #17212e; border: 1px solid var(--border); border-radius: 8px; padding: 20px; min-width: 0; }
+.session h3 { margin: 0 0 6px; font-size: 16px; line-height: 1.45; overflow-wrap: anywhere; }
+.session p { margin: 6px 0; }
+.activity, .request-counts, .session-meta, .plan-summary { font-size: 14px; }
+.session-meta { color: var(--muted); overflow-wrap: anywhere; }
+.session .session-savings { font-size: 18px; color: #e4eaf3; margin: 14px 0 4px; font-variant-numeric: tabular-nums; }
+.session-costs { font-size: 14px; font-variant-numeric: tabular-nums; }
+.session-details { border-top: 1px solid var(--border); margin-top: 12px; }
+.context-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: #39465a; margin: 14px 0 8px; }
+.removable { background: #65c9a3; }
+.protected { background: #79a9f5; }
+.unreviewed { background: #6d788a; }
+.planner { margin-top: 12px; }
+.planner progress { width: 100%; height: 9px; accent-color: #65c9a3; }
+.capacity-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 14px 0; }
+.capacity { background: #101923; padding: 12px; border-radius: 6px; }
+.capacity .capacity-value { display: block; font-size: 22px; font-weight: 600; margin: 4px 0; }
+.capacity p { font-size: 14px; }
+.diagnostics { font-size: 14px; overflow-wrap: anywhere; }
+.history-group { grid-column: 1 / -1; border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; }
+.history-group > summary { font-size: 16px; font-weight: 600; overflow-wrap: anywhere; }
+.history-group > p, #background-traffic > p { font-size: 14px; }
+#background-traffic { margin: 24px 0; padding: 8px 16px; border: 1px solid var(--border); border-radius: 8px; }
+.empty { padding: 20px 0; color: var(--muted); }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; white-space: nowrap; font-size: 14px; }
+th, td { text-align: left; padding: 12px; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); }
+pre { max-height: 480px; overflow: auto; font-size: 13px; }
+button, input { padding: 10px; min-height: 44px; border: 1px solid var(--border); border-radius: 6px; background: #182231; color: inherit; font: inherit; }
+button { cursor: pointer; }
+input { width: min(65vw, 480px); }
+@media (max-width: 600px) {
+  body { padding: 20px 16px; }
+  header { display: block; }
+  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .card { padding: 12px; }
+  .card:last-child { grid-column: 1 / -1; }
+  .value { font-size: clamp(18px, 5.5vw, 23px); }
+  .capacity-grid { grid-template-columns: 1fr; }
+  .session { padding: 16px; }
+  .session-grid { gap: 12px; }
+}
 </style>
 </head>
 <body>
-<h1>Carry Proxy</h1><p id="config">Live usage &amp; retained-context stats</p>
+<header><div><h1>Carry</h1><p class="subtitle">Usage overview</p></div><p id="activity-summary"></p></header>
 <form id="login" hidden><input id="token" type="password" placeholder="Scoped proxy token (not your provider credential)" autocomplete="off" aria-label="Proxy token"> <button>Connect</button></form>
 <div id="status" role="status">Connecting…</div>
-<div class="cards" id="cards"></div><p id="estimate-coverage"></p>
-<h2>Conversations</h2><p>Separate histories with the same opening message are grouped, not merged. Recent activity means the last five minutes.</p>
+<main>
+<section aria-label="Cost comparison">
+<p class="estimate-notice">Estimates at API rates — not subscription bills or measured savings.</p>
+<div class="cards" id="cards"></div>
+<p id="estimate-coverage" class="coverage"></p>
+<details id="estimate-details"><summary>How this is estimated</summary>
+<p>With Carry includes completed primary and reviewer costs. Traditional models the same recorded activity with conventional summaries. The difference is hypothetical; cache and summary assumptions can affect it even without a Carry rewrite. Costs cover the available accounting window, not necessarily the whole conversation.</p>
+<p id="accounting-detail"></p>
+<p id="config"></p>
+<p id="assumptions"></p>
+<p>Unavailable comparisons are excluded, not treated as zero. Failed or unpriced calls are excluded where noted; observed usage has separate cost coverage.</p>
+<div class="cards" id="cost-cards"></div>
+<div class="scroll" tabindex="0" role="region" aria-label="Recorded usage by lane"><table><thead><tr><th>Lane</th><th>Calls</th><th>Input tokens</th><th>Cached reads</th><th>Read share</th><th>Cache writes</th><th>Output tokens</th><th>API-equivalent cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
+<p class="scope">This proxy’s saved histories only. Activity counts may span more history than the cost comparison. Retained bytes are serialized input, not tokens. Titles are shortened opening messages; roles are client-reported, never inferred from titles. Full messages, memories and credentials are not shown.</p>
+<details><summary>Inspect stats JSON</summary><pre id="raw"></pre></details>
+</details></section>
+<section aria-labelledby="conversations-heading">
+<h2 id="conversations-heading">Conversations</h2><p class="section-note">Matching opening messages are grouped, not merged. Recent means active in the last five minutes.</p>
 <div id="sessions" class="session-grid"></div>
 <details id="background-traffic"><summary id="background-summary">Client background requests</summary>
 <p>Client-generated calls such as title generation and safety assessment. These are separate from Carry’s reviewer; their usage remains included in all totals.</p>
 <div id="background-sessions" class="session-grid"></div></details>
 
-<details><summary>Costs, coverage &amp; diagnostics</summary>
-<div class="cards" id="cost-cards"></div>
-<p id="assumptions"></p>
-<p><small>Savings compare the same recorded trajectory with a simulated conventional compaction policy, including completed reviewer costs. Where marked “successful requests only”, failed calls are excluded from both scenarios, including calls before later successes. The backend supplies session estimates and totals; unavailable comparisons have null amounts in the stats JSON and are excluded from totals. They are estimates, not measured savings or subscription charges; the observed priced subtotal includes all available receipts.</small></p>
-<div class="scroll"><table><thead><tr><th>Lane</th><th>Calls</th><th>Input tokens</th><th>Cached reads</th><th>Read share</th><th>Cache writes</th><th>Output tokens</th><th>API-equivalent cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
-</details>
-<p><small>Scope: this proxy's state directory only. Retained bytes are serialized input bytes, not token counts or measured savings. Session names show up to 80 characters from the first user message. Full messages, memory contents and credentials stay private. Roles are optional client-reported metadata; titles never determine roles. Histories without role metadata remain unclassified.</small></p>
-<details><summary>Inspect stats JSON</summary><pre id="raw"></pre></details>
+</section></main>
 <script>
 'use strict';
 let token = new URLSearchParams(location.hash.slice(1)).get('token') || '';
@@ -39,6 +121,7 @@ const expandedDiagnostics=new Set();
 const expandedGroups=new Map();
 const $=id=>document.getElementById(id);
 const fmt=n=>Number(n).toLocaleString();
+const count=(n,one,many=one+'s')=>fmt(n)+' '+(Number(n)===1?one:many);
 const sum=(xs,key)=>xs.reduce((a,x)=>a+(Number(x?.[key])||0),0);
 const money=n=>n==null?'Unavailable':'$'+Number(n).toFixed(6);
 const savingsText=e=>e?.savings==null?'Unavailable':money(e.savings)+(e.savings_percent!=null?' ('+Number(e.savings_percent).toFixed(1)+'%)':'');
@@ -46,6 +129,7 @@ const unpricedText=e=>fmt(e?.excluded_unpriced_calls||0)+(e?.excluded_unpriced_r
 const unpricedNote=e=>e?.excluded_unpriced_calls?' Priced calls only: '+fmt(e.excluded_unpriced_calls)+' unpriced calls excluded'+(e.excluded_unpriced_reviewer_calls?' ('+fmt(e.excluded_unpriced_reviewer_calls)+' reviewer-only)':'')+'; amounts and percentages are approximate.':'';
 const receiptNote=e=>e?.matched_primary_responses==null?'':' Receipt window: '+fmt(e.matched_primary_responses)+' matched primary responses. Observed v2 subtotal: '+money(e.observed_primary_cost==null&&e.observed_reviewer_cost==null?null:(e.observed_primary_cost||0)+(e.observed_reviewer_cost||0))+'. Unknown actual costs: '+fmt(e.unavailable_primary_cost_calls||0)+' primary, '+fmt(e.unavailable_reviewer_cost_calls||0)+' reviewer.';
 const cachePolicyNote=e=>e?.counterfactual_cache_policy==='legacy_route_cache_v0'?' Legacy route-cache assumptions; historical estimates not repaired.':e?.counterfactual_cache_policy==='mixed_legacy_route_v0_and_model_v1'?' Mixed cache policies: legacy estimates retained unchanged; corrected model policy applies prospectively.':e?.counterfactual_cache_policy==='conditional_model_cache_v1'?' Conditional model cache v1 (not route entitlement).':'';
+const actualCostNote=e=>e?.unavailable_primary_cost_calls||e?.unavailable_reviewer_cost_calls?' Unknown actual costs: '+fmt(e.unavailable_primary_cost_calls||0)+' primary, '+fmt(e.unavailable_reviewer_cost_calls||0)+' reviewer.':'';
 const compact=n=>Number(n)>=1000?(Number(n)/1000).toLocaleString(undefined,{maximumFractionDigits:1})+'k':fmt(Math.ceil(Number(n)));
 const backgroundTypes=new Set(['background']);
 const sourceNames={conversation:'Conversation',agent:'Agent',background:'Client background request'};
@@ -53,6 +137,11 @@ function sourceLabel(s){return sourceNames[s.client?.kind]||'Unclassified'}
 function sessionMeta(s){const agent=s.client?.agent_name?.split('/').filter(Boolean).pop();return sourceLabel(s)+(agent&&agent!=='root'?' · '+agent:'')+' · '+s.id.slice(0,8)}
 function row(values){const tr=document.createElement('tr');for(const value of values){const td=document.createElement('td');td.textContent=value;tr.append(td)}return tr}
 function card(label,value){const el=document.createElement('div');el.className='card';const l=document.createElement('div');l.className='label';l.textContent=label;const v=document.createElement('div');v.className='value';v.textContent=value;el.append(l,v);return el}
+function disclosure(key,label,className){
+ const detail=document.createElement('details');detail.id='disclosure:'+key;detail.className=className;detail.open=expandedDiagnostics.has(key);
+ detail.addEventListener('toggle',()=>{if(detail.isConnected){if(detail.open)expandedDiagnostics.add(key);else expandedDiagnostics.delete(key)}});
+ const summary=document.createElement('summary');summary.textContent=label;detail.append(summary);return detail;
+}
 async function refresh(){
  if(busy)return;busy=true;
  try{
@@ -60,8 +149,10 @@ async function refresh(){
   const res=await fetch('/carry/dashboard/stats',{headers,cache:'no-store'});
   if(!res.ok)throw Error(res.status===401?'Enter the scoped proxy token for remote dashboard access.':'Stats request failed (HTTP '+res.status+').');
   const data=await res.json();const sessions=data.sessions;
+  const focusedDisclosure=document.activeElement?.tagName==='SUMMARY'?document.activeElement.parentElement.id:null;
   $('config').textContent='Mode: '+data.mode+' · Auth: '+data.auth+' · Reviewer: '+data.classifier_model+' / '+data.classifier_effort+' · Reviewer cache: '+data.reviewer_cache_mode;
   $('status').textContent='Updated '+new Date().toLocaleTimeString()+' · auto-refresh every 2 seconds'+(data.unavailable_sessions?' · WARNING: '+data.unavailable_sessions+' unreadable checkpoints; totals incomplete':'');
+  $('status').className=data.unavailable_sessions?'warning':'';
   $('login').hidden=true;
   const primary=sessions.map(s=>s.primary),shadow=sessions.map(s=>s.shadow);
   const unavailable=sum(primary,'unavailable_cost_calls')+sum(shadow,'unavailable_cost_calls')+data.unavailable_sessions;
@@ -69,21 +160,24 @@ async function refresh(){
   const estimate=data.cost_estimate||{};
   const included=estimate.included_sessions||0,excluded=estimate.excluded_sessions||0;
   const excludedFailed=estimate.excluded_failed_calls||0;
-  $('estimate-coverage').textContent='Includes '+fmt(included)+' of '+fmt(included+excluded)+' sessions; '+fmt(excluded)+' excluded because comparable estimates are unavailable.'+(estimate.legacy_sessions?' '+fmt(estimate.legacy_sessions)+' legacy JSON sessions excluded from receipt-anchored totals.':'')+(estimate.legacy_cache_policy_sessions||estimate.mixed_cache_policy_sessions?' Included cache policies: '+fmt(estimate.legacy_cache_policy_sessions||0)+' legacy, '+fmt(estimate.mixed_cache_policy_sessions||0)+' mixed; historical estimates not repaired.':'')+(estimate.in_flight_sessions?' In-flight costs are not included; completed costs remain visible.':'')+(excludedFailed?' Successful requests only: '+fmt(excludedFailed)+' failed calls excluded.':'')+unpricedNote(estimate)+receiptNote(estimate)+' Totals include conversation histories and client background requests.';
+  $('estimate-coverage').textContent='Includes '+fmt(included)+' of '+fmt(included+excluded)+' sessions; '+fmt(excluded)+' excluded because comparable estimates are unavailable.'+(estimate.legacy_sessions?' '+fmt(estimate.legacy_sessions)+' legacy JSON sessions excluded from receipt-anchored totals.':'')+(estimate.legacy_cache_policy_sessions||estimate.mixed_cache_policy_sessions?' Included cache policies: '+fmt(estimate.legacy_cache_policy_sessions||0)+' legacy, '+fmt(estimate.mixed_cache_policy_sessions||0)+' mixed; historical estimates not repaired.':'')+(estimate.in_flight_sessions?' In-flight costs are not included; completed costs remain visible.':'')+(excludedFailed?' Successful requests only: '+fmt(excludedFailed)+' failed calls excluded.':'')+unpricedNote(estimate)+actualCostNote(estimate)+' Includes client background requests.';
+  $('accounting-detail').textContent=receiptNote(estimate).trim();
   const scenario=data.cost_scenario;
   $('assumptions').textContent=scenario?'Receipt-anchored v2: actual primary and reviewer costs use provider-observed input/cache/write/output and dispatch-frozen API-equivalent tariffs, not invoices or measured causal savings. Traditional input shares the receipt basis plus estimated restoration, summaries and retained output. Traditional scenario: '+fmt(scenario.context_window)+'-token assumed window, '+fmt(scenario.reserve)+' reserve; after each completed response crossing the threshold, keep '+fmt(scenario.keep_recent)+' recent tokens plus a '+fmt(scenario.summary)+'-token summary. Counterfactual cache reuse uses the dispatch-frozen API-equivalent model policy (not route entitlement), conditional on compatible append, route/key and 30-minute expiry; unknown model policy assumes uncached. Carry-only rewrites do not clear the traditional cache; traditional summaries make its next request cold. Discontinuities start a new comparison epoch. Old and mixed cache-policy sums are labeled, never retroactively repaired. Legacy JSON sums are separate.':'';
   const recent=sessions.filter(s=>s.updated_at && Date.now()/1000-s.updated_at<300).length;
+  $('activity-summary').textContent=fmt(recent)+' recently active · '+fmt(sum(sessions,'completed_requests'))+' completed requests';
   $('cards').replaceChildren(...[
-   ['Estimated savings · all time',savingsText(estimate)],
-   ['Recently active histories',fmt(recent)],
-   ['Completed requests',fmt(sum(sessions,'completed_requests'))]
+   ['With Carry',money(estimate.carry_cost)],
+   ['Traditional',money(estimate.traditional_cost)],
+   ['Estimated difference',savingsText(estimate)]
   ].map(([label,value])=>card(label,value)));
+  const difference=$('cards').children[2],direction=document.createElement('p');direction.className='card-note';
+  direction.textContent=estimate.savings==null?'No comparable estimate':estimate.savings<0?'Higher cost with Carry':estimate.savings>0?'Lower cost with Carry':'No estimated difference';
+  if(estimate.savings<0)difference.className='card loss';difference.append(direction);
   $('cost-cards').replaceChildren(...[
    ['API-equivalent total',unavailable?'Incomplete':money(subtotal)],
    ['Observed priced subtotal',money(subtotal)],
-   ['Unpriced calls excluded',unpricedText(estimate)],
-   ['Carry scenario',money(estimate.carry_cost)],
-   ['Traditional scenario',money(estimate.traditional_cost)]
+   ['Unpriced calls excluded',unpricedText(estimate)]
   ].map(([label,value])=>card(label,value)));
   $('usage').replaceChildren(...[['Primary',primary],['Reviewer',shadow]].map(([name,ledgers])=>{
    const input=sum(ledgers,'input_tokens'),cached=sum(ledgers,'cached_tokens'),missing=sum(ledgers,'unavailable_cost_calls');
@@ -92,9 +186,12 @@ async function refresh(){
   const sorted=[...sessions].sort((a,b)=>(b.updated_at||0)-(a.updated_at||0));
   const renderSession=(s,grouped=false)=>{
    const e=s.cost_estimate;
-   const savings=(e?.accounting_basis==='legacy_json_v1'?'Legacy JSON v1 · ':e?.accounting_basis==='receipt_anchored_v2'?'Receipt-anchored v2 · ':'')+savingsText(e)+(e?.savings!=null&&e.excluded_failed_calls?' · successful requests only ('+fmt(e.excluded_failed_calls)+' failed calls excluded)':'')+(e?.savings!=null?unpricedNote(e):'')+(e?.accounting_basis==='receipt_anchored_v2'?receiptNote(e):'')+cachePolicyNote(e)+(e?.legacy_estimate?' · separate legacy JSON sums retained':'');
    const issues=[];
-   if(e?.savings==null&&e?.excluded_unpriced_calls)issues.push(unpricedNote(e).trim());
+   if(e?.excluded_unpriced_calls)issues.push(unpricedNote(e).trim());
+   if(e?.savings!=null&&e.excluded_failed_calls)issues.push('Successful requests only: '+fmt(e.excluded_failed_calls)+' failed calls excluded.');
+   if(e?.accounting_basis==='legacy_json_v1'||e?.legacy_estimate)issues.push('Legacy JSON estimate; separate from receipt-anchored totals.');
+   if(e?.counterfactual_cache_policy!=='conditional_model_cache_v1'&&cachePolicyNote(e))issues.push(cachePolicyNote(e).trim());
+   if(actualCostNote(e))issues.push(actualCostNote(e).trim());
    const unknown=[...new Set([...(s.primary.unpriced_models||[]),...(s.shadow.unpriced_models||[])])];
    if(unknown.length)issues.push('No rate: '+unknown.join(', '));
    if(e?.savings==null){
@@ -115,22 +212,27 @@ async function refresh(){
    const el=document.createElement('article');el.className='session';
    const heading=document.createElement('h3');heading.textContent=grouped?sourceLabel(s):backgroundTypes.has(s.client?.kind)?sourceLabel(s):s.title||'Session '+s.id.slice(0,12);heading.title=s.id;
    const status=document.createElement('p');status.className='activity';status.textContent=activity;
-   const requests=document.createElement('p');requests.className='request-counts';requests.textContent=fmt(s.completed_requests||0)+' completed requests · '+fmt(s.compactions||0)+' rewrites · '+fmt(s.reviewer_compactions||0)+' reviewer cleanups';
-   const saved=document.createElement('p');saved.className='session-savings';saved.textContent='Estimated savings: '+savings;
+   const requests=document.createElement('p');requests.className='request-counts';requests.textContent=count(s.completed_requests||0,'completed request')+' · '+count(s.compactions||0,'rewrite');
+   const saved=document.createElement('p');saved.className='session-savings';saved.textContent='Estimated difference: '+savingsText(e)+(e?.savings<0?' · higher cost with Carry':'');
    el.append(heading,status,requests,saved);
+   const costs=document.createElement('p');costs.className='session-costs';costs.textContent='With Carry '+money(e?.carry_cost)+' · Traditional '+money(e?.traditional_cost);el.append(costs);
    const meta=document.createElement('p');meta.className='session-meta';meta.textContent=sessionMeta(s);meta.title='Role reported by the client, not inferred from the title. Unknown roles stay unclassified.';el.append(meta);
-   const c=s.context||{},counts=[c.removable_items||0,c.protected_items||0,c.unreviewed_items||0];
+   if(issues.length){const warning=document.createElement('p');warning.className='diagnostics';warning.textContent=issues.join(' ');el.append(warning)}
+   const details=disclosure('session:'+s.id,'Details','session-details');
+   const accounting=document.createElement('p');accounting.textContent=(e?.accounting_basis==='receipt_anchored_v2'?'Receipt-anchored v2. ':e?.accounting_basis==='legacy_json_v1'?'Legacy JSON v1. ':'')+receiptNote(e)+cachePolicyNote(e);details.append(accounting);
+   if(s.reviewer_compactions!=null){const cleanup=document.createElement('p');cleanup.textContent=fmt(s.reviewer_compactions)+' reviewer cleanups (legacy replay counter).';details.append(cleanup)}
+   const c=s.context||{},counts=[c.removable_items,c.protected_items,c.unreviewed_items];
    const total=counts.reduce((a,b)=>a+b,0),bar=document.createElement('div');bar.className='context-bar';
-   ['removable','protected','unreviewed'].forEach((name,i)=>{const part=document.createElement('span');part.className=name;part.style.width=(total?100*counts[i]/total:0)+'%';part.title=fmt(counts[i])+' '+name+' items';bar.append(part)});
-   const legend=document.createElement('p');legend.className='legend';legend.textContent=fmt(counts[0])+' removable · '+fmt(counts[1])+' protected · '+fmt(counts[2])+' unreviewed · '+fmt(c.memories||0)+' memories';
+   ['removable','protected','unreviewed'].forEach((name,i)=>{const part=document.createElement('span');part.className=name;part.style.width=(total?100*counts[i]/total:0)+'%';part.title=count(counts[i],['removable','protected','other'][i]+' item');bar.append(part)});
+   const legend=document.createElement('p');legend.className='legend';legend.textContent=[...counts.map((n,i)=>n==null?null:fmt(n)+' '+['removable','protected','other'][i]),c.memories==null?null:fmt(c.memories)+' memories'].filter(n=>n!=null).join(' · ');
    bar.title='Context composition by item count, not tokens';
-   if(total)el.append(bar);
-   el.append(legend);
+   if(counts.every(n=>n!=null)&&total)details.append(bar);
+   if(legend.textContent){details.append(legend);const basis=document.createElement('p');basis.className='legend';basis.textContent='Item counts, not tokens. Other means not classified removable or protected, not necessarily unseen by the reviewer.';details.append(basis)}
    const p=s.planner||{},section=document.createElement('div');section.className='planner';
    const decision=document.createElement('p');
-   decision.textContent=p.forced&&p.selected?(p.mode==='audit'?'Would require compaction (audit)':'Compacted to fit the next requests'):p.selected?(p.mode==='audit'?'Last plan: would compact (audit)':'Last plan: compaction selected'):p.reason?({context_capacity_exceeded:'Protected context exceeds the available budget',unsupported_model_or_tier:'Compaction unavailable for this model or service tier'}[p.reason]||p.reason.replaceAll('_',' ')):p.candidate?'Waiting for compaction payoff':'Waiting for removable context';
-   section.append(decision);
-   if(p.selected&&p.selected_action==='reviewer_only')decision.textContent=p.mode==='audit'?'Last plan: would select reviewer-only cleanup (audit)':'Last plan: reviewer-only cleanup selected';
+   const action={projection:'context projection',reviewer_only:'reviewer-only cleanup',primary:'primary compaction'}[p.selected_action]||p.selected_action||'action not recorded';
+   decision.textContent=p.selected?'Last plan: '+(p.mode==='audit'?'would select '+action+' (audit)':action+' selected')+(!p.mode||p.mode==='unknown'?' · mode not recorded':''):p.reason?({context_capacity_exceeded:'Protected context exceeds the available budget',unsupported_model_or_tier:'Compaction unavailable for this model or service tier'}[p.reason]||p.reason.replaceAll('_',' ')):p.selected_action==='keep'?'Last plan: keep current context':p.candidate?'Last plan: no context change selected':'No saved context decision';
+   decision.className='plan-summary';section.append(decision);
    if(p.primary_output_allowance_tokens!=null){
     const output=document.createElement('p');output.className='legend';
     output.textContent=p.primary_output_allowance_basis==='legacy_zero_no_explicit_request_cap_not_headroom'?'Primary output: legacy zero · no explicit request cap; capacity headroom is not expected output.':'Primary output: '+fmt(p.primary_output_allowance_tokens)+' tokens/request cap sensitivity · not expected generation; priced at each branch’s input-selected tariff.';
@@ -138,31 +240,31 @@ async function refresh(){
    }
    const capacities=document.createElement('div');capacities.className='capacity-grid';
    for(const [name,estimated,required,limit,ordinary] of [['Primary',p.primary_estimated_tokens,p.primary_required_tokens,p.primary_context_tokens,p.primary_ordinary_context_tokens],['Reviewer',p.reviewer_estimated_tokens,p.reviewer_required_tokens,p.reviewer_context_tokens,p.reviewer_ordinary_context_tokens]]){
-    if(required==null||!limit)continue;
+    if(estimated==null&&required==null&&limit==null&&ordinary==null)continue;
     const block=document.createElement('div');block.className='capacity';
-    const label=document.createElement('p');label.textContent=name+(estimated!=null?' planned input · est.':' reservation · est.');
-    const value=document.createElement('strong');value.className='capacity-value';value.textContent=compact(estimated??required);value.title=fmt(Math.ceil(estimated??required))+' tokens';
-    const budget=document.createElement('p');budget.textContent=compact(required)+' reserved of '+compact(limit)+' budget';if(required>limit)budget.className='warning';budget.title=fmt(Math.ceil(required))+' / '+fmt(limit)+' tokens, including margin and output reserve';
-    const capacity=document.createElement('progress');capacity.max=limit;capacity.value=Math.min(required,limit);capacity.setAttribute('aria-label',name+' context budget');
-    block.append(label,value,capacity,budget);
+    const label=document.createElement('p');label.textContent=name+(estimated!=null?' planned input · est.':required!=null?' reservation · est.':' input not recorded');
+    const value=document.createElement('strong');value.className='capacity-value';value.textContent=estimated==null&&required==null?'Unknown':compact(estimated??required);value.title=estimated==null&&required==null?'Input not recorded':fmt(Math.ceil(estimated??required))+' tokens';
+    const budget=document.createElement('p');budget.textContent=required==null?'Reservation not recorded'+(limit!=null?' · '+compact(limit)+' capacity':''):compact(required)+' reserved'+(limit!=null?' of '+compact(limit)+' budget':' · capacity not recorded');if(limit!=null&&required>limit)budget.className='warning';budget.title=required==null?'No recorded reservation':fmt(Math.ceil(required))+' tokens reserved, including margin and output reserve';
+    block.append(label,value);
+    if(required!=null&&limit>0){const capacity=document.createElement('progress');capacity.max=limit;capacity.value=Math.min(required,limit);capacity.setAttribute('aria-label',name+' context budget');block.append(capacity)}
+    block.append(budget);
     if(ordinary!=null){const target=document.createElement('p');target.className='legend';target.textContent=compact(ordinary)+' ordinary economic target · not a hard limit';block.append(target)}
     capacities.append(block);
    }
    section.append(capacities);
    if(capacities.children.length){
-    const note=document.createElement('p');note.className='legend';note.textContent='Last plan, not live usage. Reserved = input + margin + output allowance.';section.append(note);
+    const note=document.createElement('p');note.className='legend';note.textContent='Last plan, not live usage. A reservation includes input, margin and output allowance.';section.append(note);
    }
 
    if(p.candidate){
-    const j=p.candidate,percent=j.keep>0?100*j.savings/j.keep:0,threshold=p.min_payback_percent,targetKnown=threshold!=null;
-    const economics=document.createElement('p');economics.className='legend';economics.textContent='Projected payoff '+percent.toFixed(1)+'%'+(targetKnown?' / >'+threshold+'% required':' · threshold not recorded in older plan')+(p.payoff_requests?' over '+p.payoff_requests+' requests':'')+' · Keep '+money(j.keep)+' → Compact '+money(j.compact);
-    const payoff=document.createElement('p');payoff.className='legend';payoff.textContent='Compaction payoff: '+percent.toFixed(1)+'%'+(targetKnown?' · needs >'+threshold+'%':' · threshold unknown');
+    const j=p.candidate,percent=j.keep>0&&j.savings!=null?100*j.savings/j.keep:null,threshold=p.min_payback_percent,targetKnown=threshold!=null;
+    const percentText=percent==null?'Unavailable':percent.toFixed(1)+'%';
+    const economics=document.createElement('p');economics.className='legend';economics.textContent='Projected payoff '+percentText+(targetKnown?' / >'+threshold+'% required':' · threshold not recorded in older plan')+(p.payoff_requests?' over '+p.payoff_requests+' requests':'')+' · Keep '+money(j.keep)+' → Compact '+money(j.compact);
+    const payoff=document.createElement('p');payoff.className='legend';payoff.textContent='Compaction payoff: '+percentText+(targetKnown?' · needs >'+threshold+'%':' · threshold unknown');
     section.append(payoff);
-    const detail=document.createElement('details');detail.className='plan-details';detail.open=expandedDiagnostics.has('plan:'+s.id);detail.addEventListener('toggle',()=>{if(detail.isConnected){if(detail.open)expandedDiagnostics.add('plan:'+s.id);else expandedDiagnostics.delete('plan:'+s.id)}});const summary=document.createElement('summary');summary.textContent='Plan details';
-    detail.append(summary,economics);section.append(detail);
+    const detail=disclosure('plan:'+s.id,'Plan details','plan-details');detail.append(economics);section.append(detail);
    }
-   el.append(section);
-   if(issues.length){const detail=document.createElement('details');detail.className='diagnostics';detail.open=expandedDiagnostics.has(s.id);detail.addEventListener('toggle',()=>{if(detail.isConnected){if(detail.open)expandedDiagnostics.add(s.id);else expandedDiagnostics.delete(s.id)}});const summary=document.createElement('summary');summary.textContent=fmt(issues.length)+' diagnostics';const text=document.createElement('p');text.textContent=issues.join('; ');detail.append(summary,text);el.append(detail)}
+   details.append(section);el.append(details);
    return el;
   };
   const conversations=sorted.filter(s=>!backgroundTypes.has(s.client?.kind));
@@ -175,6 +277,7 @@ async function refresh(){
   const rendered=groups.map(group=>{
    if(group.length===1)return renderSession(group[0]);
    const key=group[0].title,detail=document.createElement('details');detail.className='history-group';
+   detail.id='history-group:'+key;
    detail.open=expandedGroups.has(key)?expandedGroups.get(key):group.some(s=>s.processing||s.background_review_pending);
    detail.addEventListener('toggle',()=>{if(detail.isConnected)expandedGroups.set(key,detail.open)});
    const summary=document.createElement('summary');summary.textContent=key+' · '+fmt(group.length)+' histories';
@@ -183,11 +286,13 @@ async function refresh(){
    detail.append(summary,note,grid);return detail;
   });
   $('sessions').replaceChildren(...rendered);
+  if(!conversations.length){const empty=document.createElement('p');empty.className='empty';empty.textContent='No conversations recorded here yet.';$('sessions').append(empty)}
   $('background-sessions').replaceChildren(...background.map(s=>renderSession(s)));
-  $('background-summary').textContent='Client background requests · '+fmt(background.length)+' histories';
+  $('background-summary').textContent='Client background requests · '+count(background.length,'history','histories');
   $('background-traffic').hidden=background.length===0;
+  if(focusedDisclosure)$(focusedDisclosure)?.firstElementChild.focus({preventScroll:true});
   $('raw').textContent=JSON.stringify(data,null,2);
- }catch(err){$('status').textContent=err.message+' Previous stats may be stale.';$('login').hidden=false}
+ }catch(err){$('status').textContent=err.message+' Previous stats may be stale.';$('status').className='error';$('login').hidden=false}
  finally{busy=false}
 }
 $('login').addEventListener('submit',event=>{event.preventDefault();token=$('token').value.trim();$('token').value='';refresh()});
