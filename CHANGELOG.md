@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.14.2](https://github.com/wiggzz/carry/compare/v0.14.1...v0.14.2) (2026-10-27)
+
+
+### Bug Fixes
+
+* **savings:** model traditional cache independently of transport ([#178](https://github.com/wiggzz/carry/issues/178)) ([fdbee29](https://github.com/wiggzz/carry/commit/fdbee292388eaa4106066422e58eff2c5afc0778))
+
+
+### Performance Improvements
+
+* **ci:** parallelize independent contracts and preserve build caches ([#185](https://github.com/wiggzz/carry/issues/185)) ([5668ce7](https://github.com/wiggzz/carry/commit/5668ce742c00a186019cf07a491ffbab7ecd2927))
+
 ## [0.14.1](https://github.com/wiggzz/carry/compare/v0.14.0...v0.14.1) (2026-10-23)
 
 
