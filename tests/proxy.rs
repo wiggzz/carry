@@ -32,6 +32,28 @@ fn transparent_server_owned_history() {
     );
 }
 
+#[test]
+fn noodle_review_regressions() {
+    let output = Command::new("python3")
+        .args([
+            "-B",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/proxy_noodle_regressions.py"
+            ),
+            "-v",
+        ])
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("review regression loopback fixture");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 struct Proxy(Child);
 
 impl Drop for Proxy {
@@ -759,7 +781,7 @@ async fn codex_login_authenticates_primary_and_streamed_reviewer_with_shared_cre
             assert!(body.get("max_output_tokens").is_none());
             assert!(body.get("prompt_cache_options").is_none());
             assert!(!body.to_string().contains("prompt_cache_breakpoint"));
-            let reviewer = body["prompt_cache_key"] != "fixture-main";
+            let reviewer = body["text"]["format"]["name"] == "carry_review";
             let text = if reviewer {
                 assert_eq!(body["text"]["format"]["type"], "json_schema");
                 assert_eq!(body["text"]["format"]["strict"], true);
@@ -1183,17 +1205,7 @@ async fn start_proxy_options_env(
                     format!("http://{upstream}/review"),
                 ]
             })
-            // These fixtures exercise synchronous review with a five-request horizon.
-            .args(
-                if extra
-                    .iter()
-                    .any(|arg| arg.starts_with("--background-reviews"))
-                {
-                    vec![]
-                } else {
-                    vec!["--background-reviews=false"]
-                },
-            )
+            // Receipt assertions settle the background review after the primary.
             .args(if extra.contains(&"--payoff-requests") {
                 vec![]
             } else {
@@ -1330,7 +1342,10 @@ async fn classifier_cache_affinity_is_bounded_stable_and_identity_isolated() {
                 "classifier cache key exceeds provider's 64-character bound: {}",
                 key.len()
             );
-            assert_ne!(key, id, "review/main cache domains must remain separate");
+            assert_eq!(
+                key, id,
+                "purpose does not partition actual upstream cache affinity"
+            );
             assert!(
                 !review["input"].to_string().contains(session),
                 "raw session owner is not model prompt data"
@@ -1475,10 +1490,10 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
                 async move {
                     reviewed.lock().await.push(body);
                     let advice = json!({
-                        "protected": ["g1"], "removable": ["g2"],
+                        "protected": [1], "removable": [2],
                         "memories": [
-                            {"source_ids": ["g2"], "text": "both tools succeeded"},
-                            {"source_ids": ["g2"], "text": "Migration unfinished on feat/migration; artifacts/migration.diff; next run fixture B; schema decision unresolved."}
+                            {"source_ids": [2], "text": "both tools succeeded"},
+                            {"source_ids": [2], "text": "Migration unfinished on feat/migration; artifacts/migration.diff; next run fixture B; schema decision unresolved."}
                         ]
                     });
                     axum::Json(json!({
@@ -1578,6 +1593,30 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     assert!(!sent.to_string().contains("DISCARD_SOURCE_PAYLOAD_"));
     assert!(!sent.to_string().contains("opaque-reasoning"));
     assert!(sent.to_string().contains("both tools succeeded"));
+    // The primary response is deliberately independent of its reviewer. Wait
+    // for this owner's paid settlement before comparing completed coverage to
+    // the provider's inbound call count; do not make forwarding synchronous.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let states = std::fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .map(|entry| {
+                    serde_json::from_slice::<serde_json::Value>(
+                        &std::fs::read(entry.path()).unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            if states.len() == 1 && states[0]["background_review_pending"] != true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(
         sent["input"][1],
         json!({"role":"user","content":"[Earlier conversation omitted by Carry; retained messages remain in original order.]"})
@@ -1601,24 +1640,14 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         })
         .collect::<Vec<_>>();
     assert_eq!(states.len(), 1);
-    let active = states[0]["active_shadow"].to_string();
-    assert!(!active.contains("DISCARD_SOURCE_PAYLOAD_"));
-    assert!(!active.contains("opaque-reasoning"));
+    // Completed facts live in the semantic map, not a hidden active replay.
+    let record = advice_for_checkpoint(temp.path(), &states[0]);
     assert!(
-        states[0]["active_shadow"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|record| {
-                let data: serde_json::Value =
-                    serde_json::from_str(record["value"]["content"].as_str().unwrap()).unwrap();
-                data["group_id"] != "g2"
-            }),
-        "removed observation/opinion must not survive as actionable group data"
+        record["memories"]
+            .to_string()
+            .contains("schema decision unresolved")
     );
-    assert!(active.contains("preserve requirement"));
-    assert!(active.contains("both tools succeeded"));
-    assert!(active.contains("schema decision unresolved"));
+    assert!(states[0].get("active_shadow").is_none());
     let cost_stats: serde_json::Value = reqwest::get(format!("{url}/carry/dashboard/stats"))
         .await
         .unwrap()
@@ -1629,7 +1658,10 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     assert!(estimate.get("priced").is_none());
     assert!(estimate["carry_cost"].is_number());
     assert_eq!(estimate["coverage"]["primary_responses"], 3);
-    assert_eq!(estimate["coverage"]["reviewer_responses"], 1);
+    assert_eq!(
+        estimate["coverage"]["reviewer_responses"],
+        shadow.lock().await.len()
+    );
     assert!(estimate["reviewer_cost"].as_f64().unwrap() > 0.0);
     assert_eq!(estimate["traditional_compactions"], 0);
     let carry = estimate["carry_cost"].as_f64().unwrap();
@@ -1659,14 +1691,14 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     );
     assert_eq!(
         primary.lock().await[3]["input"],
-        sent["input"],
-        "repeated projection must preserve notice/fact positions"
+        second["input"],
+        "native compaction is a separate canonical-history operation"
     );
     assert!(
-        !primary.lock().await[3]
+        primary.lock().await[3]
             .to_string()
             .contains("DISCARD_SOURCE_PAYLOAD_"),
-        "native compaction must operate on the same retained main view, not resurrect removed echo source"
+        "canonical source stays available to native compaction, with complete cohorts"
     );
     let stale = client
         .post(format!("{url}/v1/responses"))
@@ -1815,8 +1847,42 @@ fn checkpoint_states(path: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-// Legacy advice/receipt assertions run only after the primary body is read.
-// This is fixture synchronization, not primary admission or a rescue review.
+// A receipt clears paid-pending before H publication. Synchronize on the real
+// worker completion event, then assert authority only from the canonical store.
+fn worker_publications_finished(path: &std::path::Path) -> bool {
+    let Ok(files) = std::fs::read_dir(path.join("diagnostics")) else {
+        return true; // fail-open diagnostic-I/O fixtures have no event lane
+    };
+    let events: Vec<serde_json::Value> = files
+        .filter_map(Result::ok)
+        .filter_map(|file| std::fs::read_to_string(file.path()).ok())
+        .flat_map(|text| {
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let current = events
+        .iter()
+        .filter_map(|event| event["request_id"].as_str())
+        .max_by_key(|id| id.split('-').nth(1).and_then(|v| v.parse::<u128>().ok()));
+    let Some(pid) = current.and_then(|id| id.split('-').next()) else {
+        return true;
+    };
+    let merged: std::collections::HashSet<_> = events
+        .iter()
+        .filter(|event| event["event"] == "background_review_merged")
+        .filter_map(|event| event["request_id"].as_str())
+        .collect();
+    events
+        .iter()
+        .filter(|event| event["event"] == "background_review_dispatched")
+        .filter_map(|event| event["request_id"].as_str())
+        .filter(|id| id.split('-').next() == Some(pid))
+        .all(|id| merged.contains(id))
+}
+
+// Advice/receipt assertions run only after the primary body is consumed.
 async fn settled(path: &std::path::Path) -> Vec<serde_json::Value> {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -1824,6 +1890,7 @@ async fn settled(path: &std::path::Path) -> Vec<serde_json::Value> {
             if states
                 .iter()
                 .all(|s| s["background_review_pending"] != true)
+                && worker_publications_finished(path)
             {
                 break states;
             }
@@ -1854,14 +1921,13 @@ async fn send(
 #[tokio::test]
 async fn explicit_replay_reviews_after_first_primary_without_exposing_fresh_tool_results() {
     for mode in ["compact", "audit", "off"] {
-        let fixture =
-            fixture(json!({"protected": ["g1"], "removable": ["g2"], "memories": []})).await;
+        let fixture = fixture(json!({"protected": [1], "removable": [2], "memories": []})).await;
         let state = tempfile::tempdir().unwrap();
         let (proxy, url) = start_proxy_options(
             state.path(),
             fixture.address,
             mode,
-            &["--review-every-requests", "5", "--background-reviews"],
+            &["--review-every-requests", "5"],
             "",
         )
         .await;
@@ -1973,7 +2039,7 @@ async fn replay_opt_in_does_not_review_a_fresh_system_and_user_request() {
 
 #[tokio::test]
 async fn replay_import_does_not_reclassify_fresh_suffix_on_failed_primary_retry() {
-    let fixture = fixture(json!({"protected": ["g1"], "removable": ["g2"], "memories": []})).await;
+    let fixture = fixture(json!({"protected": [1], "removable": [2], "memories": []})).await;
     let state = tempfile::tempdir().unwrap();
     let (_proxy, url) = start_proxy(state.path(), fixture.address, "compact").await;
     let request = json!({"model": "gpt-6-luna", "input": [
@@ -2055,8 +2121,10 @@ async fn failed_rebase_primary_reuses_successful_bootstrap_before_review_cadence
             "successful bootstrap chunks survive failed primaries and restarts without replay"
         );
         assert_eq!(saved["history"][2]["exposed"], false);
-        assert_eq!(saved["bootstrap_review_pending"], false);
-        assert_eq!(saved["bootstrap_review_complete"], true);
+        // Settlement preserves intent; only applying the durably indexed
+        // completion on the next ingress closes it. No second paid review.
+        assert_eq!(saved["bootstrap_review_pending"], attempt == 1);
+        assert_eq!(advice_for_checkpoint(state.path(), &saved)["len"], 3);
         if attempt == 1 {
             drop(proxy);
             let restarted = start_proxy(state.path(), fixture.address, "compact").await;
@@ -2301,7 +2369,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
                 if scenario == "reviewer_failure" {
                     return (axum::http::StatusCode::SERVICE_UNAVAILABLE,"review unavailable").into_response();
                 }
-                let advice = json!({"protected":[],"removable":["g2"],"memories":[{"source_ids":["g2"],"text":"background fact"}]});
+                let advice = json!({"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"background fact"}]});
                 axum::Json(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":advice.to_string()}]}],"usage":{
                     "input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}})).into_response()
             }
@@ -2314,11 +2382,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
             state.path(),
             address,
             "audit",
-            &[
-                "--background-reviews",
-                "--bootstrap-min-input-bytes",
-                "8388608",
-            ],
+            &["--bootstrap-min-input-bytes", "8388608"],
             "",
         )
         .await;
@@ -2410,7 +2474,6 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
                 address,
                 "audit",
                 &[
-                    "--background-reviews",
                     "--bootstrap-min-input-bytes",
                     "8388608",
                     "--review-every-requests",
@@ -2429,7 +2492,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
             assert_eq!(saved["shadow"]["calls"], 1);
             assert_eq!(saved["shadow"]["unavailable_cost_calls"], 1);
             assert_eq!(saved["background_review_pending"], false);
-            assert_eq!(saved["memories"], json!([]));
+            assert!(advice_for_checkpoint(state.path(), &saved).is_null());
             server.abort();
             continue;
         } else {
@@ -2472,23 +2535,16 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
             "merge must preserve the newer continuation"
         );
         if scenario == "rebase" {
-            assert_eq!(saved["opinions"], json!({}));
-            assert_eq!(saved["memories"], json!([]));
-            assert!(
-                saved["review_feedback"]["rejected"][0]["reason"]
-                    .as_str()
-                    .unwrap()
-                    .contains("discarded")
-            );
+            assert!(advice_for_checkpoint(state.path(), &saved).is_null());
         } else if scenario == "reviewer_failure" {
-            assert_eq!(saved["opinions"], json!({}));
-            assert_eq!(saved["memories"], json!([]));
+            assert!(advice_for_checkpoint(state.path(), &saved).is_null());
             assert_eq!(saved["shadow"]["unavailable_cost_calls"], 1);
             assert_eq!(saved["invalid_reviews"], 1);
             assert_eq!(saved["background_review_pending"], false);
         } else {
-            assert_eq!(saved["opinions"]["2"], "drop");
-            assert_eq!(saved["memories"][0]["text"], "background fact");
+            let advice = advice_for_checkpoint(state.path(), &saved);
+            assert_eq!(advice["opinions"]["2"], "drop");
+            assert_eq!(advice["memories"][0]["text"], "background fact");
         }
         assert_eq!(
             saved["cost_trajectory"]["result"]["coverage"]["reviewer_responses"],
@@ -2500,7 +2556,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
 
 #[tokio::test]
 async fn mixed_advice_applies_valid_items_and_failed_primary_keeps_feedback() {
-    let fixture = fixture(json!({"protected": ["g2"], "removable": ["g2"], "memories": [{"source_ids": ["g2"], "text": "valid sourced fact"}]})).await;
+    let fixture = fixture(json!({"protected": [2], "removable": [2], "memories": [{"source_ids": [2], "text": "valid sourced fact"}]})).await;
     let state = tempfile::tempdir().unwrap();
     // Preserve the live-primary exposure boundary rather than importing replay.
     let (_proxy, url) = start_proxy_options(
@@ -2535,15 +2591,13 @@ async fn mixed_advice_applies_valid_items_and_failed_primary_keeps_feedback() {
     assert_eq!(saved["invalid_reviews"], 0);
     assert_eq!(saved["partial_reviews"], 1);
     assert_eq!(saved["shadow"]["calls"], 1);
-    assert_eq!(saved["memories"][0]["text"], "valid sourced fact");
-    assert_eq!(saved["opinions"]["2"], "keep");
-    assert_eq!(saved["review_feedback"]["rejected_count"], 1);
-    assert_eq!(
-        saved["review_feedback"]["rejected"][0]["field"],
-        "removable"
-    );
+    let advice = advice_for_checkpoint(state.path(), &saved);
+    assert_eq!(advice["memories"][0]["text"], "valid sourced fact");
+    assert_eq!(advice["opinions"]["2"], "keep");
+    assert_eq!(advice["feedback"]["rejected_count"], 1);
+    assert_eq!(advice["feedback"]["rejected"][0]["field"], "removable");
     assert!(
-        saved["review_feedback"]["rejected"][0]["reason"]
+        advice["feedback"]["rejected"][0]["reason"]
             .as_str()
             .unwrap()
             .contains("conflicting")
@@ -2698,7 +2752,7 @@ async fn gateway_token_is_separate_and_not_an_upstream_credential() {
 
 #[tokio::test]
 async fn valid_completed_shadow_and_shared_memory_survive_a_failed_primary() {
-    let fixture = fixture(json!({"protected": ["g1"], "removable": ["g2"], "memories": [{"source_ids": ["g2"], "text": "remember tested outcome"}]})).await;
+    let fixture = fixture(json!({"protected": [1], "removable": [2], "memories": [{"source_ids": [2], "text": "remember tested outcome"}]})).await;
     let state = tempfile::tempdir().unwrap();
     // Preserve the live-primary exposure boundary rather than importing replay.
     let (_proxy, url) = start_proxy_options(
@@ -2730,8 +2784,9 @@ async fn valid_completed_shadow_and_shared_memory_survive_a_failed_primary() {
     let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["invalid_reviews"], 0);
     assert_eq!(saved["shadow"]["calls"], 1);
-    assert_eq!(saved["memories"][0]["text"], "remember tested outcome");
-    assert_eq!(saved["opinions"]["2"], "drop");
+    let advice = advice_for_checkpoint(state.path(), &saved);
+    assert_eq!(advice["memories"][0]["text"], "remember tested outcome");
+    assert_eq!(advice["opinions"]["2"], "drop");
     assert_eq!(
         saved["compactions"], 0,
         "failed primary does not commit a speculative removal"
@@ -2744,7 +2799,7 @@ async fn valid_completed_shadow_and_shared_memory_survive_a_failed_primary() {
         saved["cost_trajectory"]["restored"], 0,
         "failed rewrites must not restore hypothetical context"
     );
-    assert_eq!(saved["history"][1]["removed"], false);
+    assert_eq!(saved["history"][1]["value"], next["input"][1]);
     assert_eq!(saved["history"][4]["exposed"], false);
 }
 
@@ -2987,7 +3042,7 @@ async fn client_continuation_is_expanded_but_never_forwarded_upstream() {
 
 #[tokio::test]
 async fn implicit_history_reuses_removals_and_keeps_divergent_history_separate() {
-    let fixture = fixture(json!({"protected": ["g1"], "removable": ["g2"], "memories": []})).await;
+    let fixture = fixture(json!({"protected": [1], "removable": [2], "memories": []})).await;
     let state = tempfile::tempdir().unwrap();
     let (proxy, url) = start_proxy(state.path(), fixture.address, "compact").await;
     let original = json!({"model": "gpt-6-luna", "input": [
@@ -3044,14 +3099,13 @@ async fn implicit_history_reuses_removals_and_keeps_divergent_history_separate()
         .find(|s| s["history"].as_array().unwrap().len() == 1)
         .unwrap();
     assert_eq!(fresh["history_rebases"], 0);
-    assert!(fresh["memories"].as_array().unwrap().is_empty());
-    assert!(fresh["opinions"].as_object().unwrap().is_empty());
+    assert!(advice_for_checkpoint(state.path(), fresh).is_null());
 }
 
 #[tokio::test]
 async fn unseen_explicit_history_bootstraps_but_small_histories_skip_replay() {
     for (size, calls) in [(10, 0), (30_000, 1)] {
-        let fixture = fixture(json!({"protected": [], "removable": ["g2"], "memories": []})).await;
+        let fixture = fixture(json!({"protected": [], "removable": [2], "memories": []})).await;
         let state = tempfile::tempdir().unwrap();
         let (_proxy, url) = start_proxy(state.path(), fixture.address, "compact").await;
         let request = json!({"model": "gpt-6-luna", "input": [
@@ -3123,7 +3177,7 @@ async fn oversized_replay_groups_are_kept_whole_without_reviewer_dispatch() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|item| item["removed"] == false)
+            .all(|item| item.get("removed").is_none())
     );
     assert_eq!(saved["bootstrap_review_pending"], true);
 }
@@ -3141,18 +3195,19 @@ async fn unseen_history_with_only_pinned_sources_skips_bootstrap_calls() {
     let response = send(&url, &request, "a", "main").await;
     assert!(response.status().is_success());
     response.bytes().await.unwrap();
+    let saved = settled(state.path()).await.remove(0);
     assert!(
         fixture.reviews.lock().await.is_empty(),
         "nothing is safely removable"
     );
     assert_eq!(fixture.requests.lock().await[0], request);
-    let saved = settled(state.path()).await.remove(0);
     assert_eq!(saved["bootstrap_review_pending"], false);
+    assert_eq!(saved["shadow"]["calls"], 0, "no paid nonactionable review");
 }
 
 #[tokio::test]
 async fn implicit_prefix_state_is_isolated_by_tenant_branch_and_settings() {
-    let fixture = fixture(json!({"protected": [], "removable": ["g2"], "memories": []})).await;
+    let fixture = fixture(json!({"protected": [], "removable": [2], "memories": []})).await;
     let state = tempfile::tempdir().unwrap();
     let (_proxy, url) = start_proxy(state.path(), fixture.address, "compact").await;
     let original = json!({"model": "gpt-6-luna", "input": [
@@ -3302,37 +3357,109 @@ async fn client_turn_metadata_preserves_proxy_session_and_reviewer_affinity() {
 
 #[tokio::test]
 async fn reviewer_transport_preserves_encrypted_reasoning_and_native_tool_pairs() {
-    let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
-    let state = tempfile::tempdir().unwrap();
-    let (_proxy, url) = start_proxy_options(
-        state.path(),
-        fixture.address,
-        "audit",
-        &["--classifier-cache-policy", "openai-explicit"],
-        "",
-    )
-    .await;
     let reasoning = json!({"type":"reasoning","id":"rs_fixture","encrypted_content":"ENCRYPTED_NATIVE_FIXTURE","summary":[]});
     let call = json!({"type":"function_call","id":"fc_fixture","call_id":"native_pair","name":"inspect","arguments":"{}"});
     let result = json!({"type":"function_call_output","call_id":"native_pair","output":"native evidence ".repeat(3000)});
-    let request = json!({"model":"gpt-6.1-sol","input":[{"role":"user","content":"goal"},reasoning.clone(),call.clone(),result.clone(),{"role":"user","content":"current"}]});
-    let response = reqwest::Client::new()
-        .post(format!("{url}/v1/responses"))
-        .json(&request)
-        .send()
-        .await
-        .unwrap();
-    assert!(response.status().is_success());
-    response.bytes().await.unwrap();
-    settled(state.path()).await;
-    let reviews = fixture.reviews.lock().await;
-    assert_eq!(reviews[0]["model"], "gpt-6-luna");
-    let input = reviews[0]["input"].as_array().unwrap();
-    assert!(input.contains(&reasoning));
-    assert!(input.contains(&call));
-    assert!(input.contains(&result));
-    let forwarded = fixture.requests.lock().await;
-    assert_eq!(forwarded[0]["input"], request["input"]);
+    let custom = json!({"type":"custom_tool_call","id":"custom_fixture","call_id":"custom_pair","name":"inspect_custom","input":"unaltered source\n雪"});
+    let custom_result = json!({"type":"custom_tool_call_output","call_id":"custom_pair","output":"custom evidence \"quoted\""});
+    let opaque = json!({"type":"future_native_payload","id":"opaque_fixture","payload":{"nested":["retain",3]}});
+    for (native, visible, withheld) in [
+        (
+            vec![reasoning.clone(), call.clone(), result.clone()],
+            vec![reasoning.clone(), call.clone(), result.clone()],
+            vec![],
+        ),
+        (
+            vec![
+                reasoning.clone(),
+                call.clone(),
+                custom.clone(),
+                result.clone(),
+                custom_result.clone(),
+            ],
+            vec![
+                reasoning.clone(),
+                call.clone(),
+                custom.clone(),
+                result.clone(),
+                custom_result.clone(),
+            ],
+            vec![],
+        ),
+        (
+            vec![
+                reasoning.clone(),
+                call.clone(),
+                custom.clone(),
+                result.clone(),
+            ],
+            vec![],
+            vec![
+                reasoning.clone(),
+                call.clone(),
+                custom.clone(),
+                result.clone(),
+            ],
+        ),
+        (
+            vec![opaque.clone()],
+            vec![json!({"role":"user","content":json!({"quoted_opaque_item":opaque}).to_string()})],
+            vec![opaque.clone()],
+        ),
+    ] {
+        let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
+        let state = tempfile::tempdir().unwrap();
+        let (_proxy, url) = start_proxy_options(
+            state.path(),
+            fixture.address,
+            "audit",
+            &[
+                "--classifier-cache-policy",
+                "openai-explicit",
+                "--review-replayed-history",
+            ],
+            "",
+        )
+        .await;
+        let mut input = vec![
+            json!({"role":"user","content":"goal"}),
+            json!({"role":"assistant","content":"independent complete eligible source"}),
+            json!({"role":"user","content":"native tool step starts"}),
+        ];
+        input.extend(native);
+        input.push(json!({"role":"user","content":"current"}));
+        let request = json!({"model":"gpt-6.1-sol","input":input});
+        let response = reqwest::Client::new()
+            .post(format!("{url}/v1/responses"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        response.bytes().await.unwrap();
+        settled(state.path()).await;
+        let reviews = fixture.reviews.lock().await;
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0]["model"], "gpt-6-luna");
+        let wire_input = reviews[0]["input"].as_array().unwrap();
+        let mut offset = 0;
+        for item in visible {
+            let position = wire_input[offset..]
+                .iter()
+                .position(|v| *v == item)
+                .expect("native/quoted item must reach actual reviewer unchanged and in order")
+                + offset;
+            offset = position + 1;
+        }
+        for item in withheld {
+            assert!(
+                !wire_input.contains(&item),
+                "incomplete cohort/opaque native item cannot be replayed"
+            );
+        }
+        let forwarded = fixture.requests.lock().await;
+        assert_eq!(forwarded[0]["input"], request["input"]);
+    }
 }
 
 #[tokio::test]
@@ -3584,4 +3711,22 @@ async fn api_key_model_discovery_remains_an_authenticated_upstream_relay() {
         json!({"object":"list", "data":[{"id":"fixture-api", "custom":true}]})
     );
     server.abort();
+}
+
+fn advice_for_checkpoint(path: &std::path::Path, state: &serde_json::Value) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("history.index")).unwrap()).unwrap();
+    let mut key = state["history_namespace"].as_str().unwrap().to_owned();
+    let mut found = serde_json::Value::Null;
+    for item in state["history"].as_array().unwrap() {
+        key = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&json!([key, item["value"]])).unwrap())
+        );
+        if let Some(record) = index["reviews"].get(key.as_str()) {
+            found = record.clone();
+        }
+    }
+    found
 }

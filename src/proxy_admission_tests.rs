@@ -1,38 +1,17 @@
-// Model-free, real HTTP scheduler regressions; no production substitutes.
-use super::*;
-
-async fn admission_fixture(
-    advice: Value,
-) -> (tempfile::TempDir, Service, tokio::task::JoinHandle<()>) {
-    let directory = tempfile::tempdir().unwrap();
-    let router = Router::new().route("/responses", post(move || {
-        let advice = advice.clone();
-        async move { axum::Json(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":advice.to_string()}]}],"usage":{"input_tokens":100,"output_tokens":10}})) }
-    }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/responses", listener.local_addr().unwrap());
-    let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let mut service = checkpoint_service(directory.path());
-    service.config =
-        ProxyCli::try_parse_from(["carry proxy", "--background-reviews=false"]).unwrap();
-    service.config.state_dir = directory.path().to_path_buf();
-    service.config.classifier_url = Some(url);
-    (directory, service, provider)
-}
-
-fn admission_session(tokens: usize, completed: u64) -> Session {
+// Ordinary policy controls independent of deleted import/replay/lease seams.
+fn admission_subject() -> Session {
     let mut session = Session::default();
     session
         .ingest(&[
             json!({"role":"user","content":"original goal"}),
-            json!({"role":"assistant","content":" payload".repeat(tokens)}),
+            json!({"role":"assistant","content":"native evidence ".repeat(100)}),
             json!({"role":"user","content":"current goal"}),
         ])
         .unwrap();
     for item in &mut session.history {
         item.exposed = true;
     }
-    session.completed_requests = completed;
+    session.completed_requests = 4;
     session
 }
 
@@ -40,118 +19,165 @@ fn admission_main(session: &Session) -> Value {
     json!({"model":"gpt-6-luna","input":session.render_primary()})
 }
 
-#[tokio::test]
-async fn adaptive_default_floor_skips_small_retained_primary_without_paid_review() {
-    let (_directory, service, provider) =
-        admission_fixture(json!({"protected":[],"removable":[],"memories":[]})).await;
-    let mut session = admission_session(100, 4);
+#[test]
+fn ordinary_admission_floor_age_and_unique_native_growth_are_conjunctive() {
+    let mut config = ProxyCli::try_parse_from(["carry proxy"]).unwrap();
+    let mut session = admission_subject();
     let main = admission_main(&session);
-    assert!(
-        !review(
-            &service,
-            "floor",
-            &mut session,
-            &main,
-            false,
-            &mut ReviewRun::default()
-        )
-        .await,
-        "ordinary review below the retained primary floor must be skipped"
+    let primary = admission::primary_tokens(&config, &session, &main) as u32;
+    let growth =
+        admission::decision(&config, &session, &main, false)["new_native_source_estimated_tokens"]
+            .as_f64()
+            .unwrap() as u32;
+    assert!(growth > 0);
+    config.review_min_primary_tokens = primary + 1;
+    config.review_min_new_tokens = growth;
+    assert_eq!(
+        admission::decision(&config, &session, &main, false)["reason"],
+        "primary_floor"
     );
-    assert_eq!(session.shadow.calls, 0);
-    provider.abort();
-}
-
-#[tokio::test]
-async fn adaptive_default_requires_four_completed_requests_even_with_large_source() {
-    let (_directory, service, provider) =
-        admission_fixture(json!({"protected":[],"removable":[],"memories":[]})).await;
-    let mut session = admission_session(151000, 3);
-    let main = admission_main(&session);
-    assert!(
-        !review(
-            &service,
-            "cadence",
-            &mut session,
-            &main,
-            false,
-            &mut ReviewRun::default()
-        )
-        .await,
-        "large native growth does not replace the completed-request batch"
+    config.review_min_primary_tokens = primary;
+    session.completed_requests = 3;
+    assert_eq!(
+        admission::decision(&config, &session, &main, false)["reason"],
+        "cadence"
     );
-    assert_eq!(session.shadow.calls, 0);
-    session.completed_requests = 4;
-    assert!(
-        review(
-            &service,
-            "cadence",
-            &mut session,
-            &main,
-            false,
-            &mut ReviewRun::default()
-        )
-        .await
+    session.completed_requests = 400;
+    config.review_min_new_tokens = growth + 1;
+    assert_eq!(
+        admission::decision(&config, &session, &main, false)["reason"],
+        "native_source_growth"
     );
-    assert_eq!(session.shadow.calls, 1);
-    provider.abort();
-}
-
-#[tokio::test]
-async fn adaptive_no_yield_backoff_survives_checkpoint_and_requires_both_batches() {
-    let (_directory, service, provider) =
-        admission_fixture(json!({"protected":[],"removable":[],"memories":[]})).await;
-    let mut session = admission_session(151000, 4);
-    let main = admission_main(&session);
-    assert!(
-        review(
-            &service,
-            "backoff",
-            &mut session,
-            &main,
-            false,
-            &mut ReviewRun::default()
-        )
-        .await
+    config.review_min_new_tokens = growth;
+    assert_eq!(
+        admission::decision(&config, &session, &main, false)["reason"],
+        "admitted"
     );
-    let mut input = session
-        .history
-        .iter()
-        .map(|i| i.value.clone())
-        .collect::<Vec<_>>();
-    input.push(json!({"role":"assistant","content":" addition".repeat(26000)}));
-    input.push(json!({"role":"user","content":"next task"}));
-    session.ingest(&input).unwrap();
-    for item in &mut session.history {
-        item.exposed = true;
+    let groups = session.groups();
+    admission::cover(&mut session, &groups);
+    for resumed in [
+        session.clone(),
+        serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap(),
+    ] {
+        let decision = admission::decision(&config, &resumed, &main, false);
+        assert_eq!(decision["new_native_source_estimated_tokens"], 0.0);
+        assert_eq!(decision["reason"], "native_source_growth");
     }
-    session.completed_requests = 8;
-    save(&service, "backoff", &session).unwrap();
-    let mut resumed = load(&service, "backoff").unwrap();
-    let main = admission_main(&resumed);
-    assert!(
-        !review(
-            &service,
-            "backoff",
-            &mut resumed,
-            &main,
-            false,
-            &mut ReviewRun::default()
-        )
-        .await,
-        "one valid no-yield doubles BOTH request and native-token batches across restart"
-    );
-    assert_eq!(resumed.shadow.calls, 1);
-    provider.abort();
 }
 
 #[test]
-fn adaptive_planner_does_not_invent_native_growth_in_frozen_source_forecast() {
+fn ordinary_backoff_classifies_new_protection_repeats_and_useful_removal() {
     let config = ProxyCli::try_parse_from(["carry proxy"]).unwrap();
-    let session = admission_session(100, 4);
-    let (_, report) = plan(&config, &session, &admission_main(&session));
+    let mut session = admission_subject();
+    for expected in [2, 4, 8, 8] {
+        let before = session.clone();
+        let groups = session.groups();
+        assert_eq!(
+            admission::complete(&before, &mut session, true, &groups),
+            "no_yield"
+        );
+        assert_eq!(admission::multiplier(&config, &session), expected);
+    }
+    let before = session.clone();
+    let groups = session.groups();
+    session
+        .apply_advice(
+            &groups,
+            &json!({"protected":[2],"removable":[],"memories":[]}),
+        )
+        .unwrap();
     assert_eq!(
-        report["future_reviewer_calls"], 0,
-        "frozen small retained source never crosses the primary admission floor"
+        admission::complete(&before, &mut session, true, &groups),
+        "protection_progress"
     );
+    assert_eq!(admission::multiplier(&config, &session), 8);
+    let before = session.clone();
+    session
+        .apply_advice(
+            &groups,
+            &json!({"protected":[],"removable":[2],"memories":[]}),
+        )
+        .unwrap();
+    assert_eq!(
+        admission::complete(&before, &mut session, true, &groups),
+        "productive"
+    );
+    assert_eq!(admission::multiplier(&config, &session), 1);
+    let before = session.clone();
+    session
+        .apply_advice(
+            &groups,
+            &json!({"protected":[],"removable":[2],"memories":[]}),
+        )
+        .unwrap();
+    assert_eq!(
+        admission::complete(&before, &mut session, true, &groups),
+        "no_yield"
+    );
+    assert_eq!(admission::multiplier(&config, &session), 2);
+    let restored: Session =
+        serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+    assert_eq!(admission::multiplier(&config, &restored), 2);
+}
+
+#[test]
+fn invalid_review_does_not_cover_source_or_increase_backoff_and_unexposed_source_cannot_admit() {
+    let mut config = ProxyCli::try_parse_from(["carry proxy"]).unwrap();
+    config.review_min_primary_tokens = 0;
+    config.review_min_new_tokens = 1;
+    let before = admission_subject();
+    let mut after = before.clone();
+    let groups = after.groups();
+    assert_eq!(
+        admission::complete(&before, &mut after, false, &groups),
+        "failed_or_invalid"
+    );
+    let coverage = after.review_admission.as_ref().unwrap();
+    assert_eq!(coverage.no_yield_streak, 0);
+    assert!(coverage.source_ids.is_empty());
+    assert_eq!(
+        admission::decision(&config, &after, &admission_main(&after), false)["reason"],
+        "admitted"
+    );
+    for item in &mut after.history {
+        item.exposed = false;
+    }
+    let decision = admission::decision(&config, &after, &admission_main(&after), false);
+    assert_eq!(decision["new_native_source_estimated_tokens"], 0.0);
+    assert_eq!(decision["reason"], "no_eligible_sources");
+}
+
+#[test]
+fn ordinary_policy_defaults_and_explicit_bounds_are_not_legacy_aliases() {
+    let config = ProxyCli::try_parse_from(["carry proxy"]).unwrap();
+    assert_eq!(config.review_min_primary_tokens, 150_000);
+    assert_eq!(config.review_min_new_tokens, 25_000);
+    assert_eq!(config.review_every_requests, 4);
+    assert_eq!(config.review_backoff_factor, 2);
+    assert_eq!(config.review_backoff_max, 8);
+    for (flag, value) in [
+        ("--review-every-requests", "0"),
+        ("--review-min-primary-tokens", "2000001"),
+        ("--review-min-new-tokens", "2000001"),
+        ("--review-backoff-factor", "17"),
+        ("--review-backoff-max", "65"),
+    ] {
+        assert!(ProxyCli::try_parse_from(["carry proxy", flag, value]).is_err());
+    }
+    let config = ProxyCli::try_parse_from([
+        "carry proxy",
+        "--review-min-primary-tokens",
+        "0",
+        "--review-min-new-tokens",
+        "0",
+        "--review-every-requests",
+        "1",
+        "--review-backoff-factor",
+        "1",
+    ])
+    .unwrap();
+    assert_eq!(config.review_min_primary_tokens, 0);
+    assert_eq!(config.review_min_new_tokens, 0);
+    assert_eq!(config.review_every_requests, 1);
+    assert_eq!(admission::multiplier(&config, &admission_subject()), 1);
 }

@@ -88,6 +88,27 @@ class ParentCheckpointProof:
         assert row['parsed_equal'], 'parent B parsed state changed: '+stage
 
 
+def completed_advice(index, snapshot):
+    """Read actual greatest completed-prefix authority, not an owner mirror."""
+    values = [item['value'] for item in snapshot['history']]
+    if snapshot.get('history_frontier'):
+        values, frontier = [], snapshot['history_frontier']
+        while frontier in index['nodes']:
+            node = index['nodes'][frontier]
+            values.append(node['value'])
+            frontier = node['parent']
+        values.reverse()
+        if frontier != snapshot['history_namespace']:
+            return None
+    key, record = snapshot['history_namespace'], None
+    for value in values:
+        key = hashlib.sha256(json.dumps([key, value], ensure_ascii=False,
+                                       separators=(',', ':')).encode()).hexdigest()
+        if key in index['reviews']:
+            record = index['reviews'][key]
+    return record
+
+
 def run_case(*, carry, pi, output, fixture_class, observer_class):
     root = Path(output); root.mkdir()
     workspace = root/'workspace'; workspace.mkdir()
@@ -161,9 +182,12 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
                             assert len(canonical) == len(value['history']), 'complete canonical ancestry'
                             for item, original in zip(value['history'], canonical):
                                 item['value'] = original
+                        record = completed_advice(index, value)
                         if ([i['value'] for i in value['history']] == target
                                 and value['completed_requests'] >= completed
-                                and not value['background_review_pending']):
+                                and not value['background_review_pending']
+                                and (not value['review_epoch'] or
+                                     (record and record['generation'] >= value['review_epoch']))):
                             return path, value
                 time.sleep(.01)
             raise AssertionError('exact transparent native lineage did not settle')
@@ -178,8 +202,9 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         native = rpc.call('get_state')
         rpc.prompt('PROTECTED_A: run the scripted tools and finish A.')
         a = wait_transparent(3)[1]
-        assert a.get('fork_points'), 'real first accepted unchanged raw cut must commit'
-        assert any(m['text']=='ACCEPTED_A_FACT' for m in a['memories']), 'actual A advice required'
+        a_advice = completed_advice(json.loads((state_dir/'history.index').read_text()), a)
+        assert a_advice and a_advice['len'] <= len(a['history']), 'real completed original-prefix advice must commit'
+        assert any(m['text']=='ACCEPTED_A_FACT' for m in a_advice['memories']), 'actual A advice required'
         a_tree = rpc.call('get_entries')
         (root/'a-checkpoint.json').write_text(json.dumps(a)+'\n')
         rpc.prompt('B_ONLY: advance the parent and clean up A.')
@@ -191,10 +216,13 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         parent_snapshot = json.loads(parent_path.read_text())
         assert json.loads((state_dir/'history.index').read_text())['snapshots'][parent_path.stem] == parent_snapshot
         parent_proof = ParentCheckpointProof(root, parent_path, parent_snapshot)
-        assert b['reviewer_compactions']>0, 'actual parent disposable cleanup'
-        assert any(m['text']=='B_ONLY_FACT' for m in b['memories']), 'B-only advice must really exist on parent'
+        assert b['compactions']>0, 'actual parent disposable primary cleanup'
+        b_advice = completed_advice(json.loads((state_dir/'history.index').read_text()), b)
+        assert any(m['text']=='B_ONLY_FACT' for m in b_advice['memories']), 'B-only advice must really exist on parent'
         (root/'b-checkpoint.json').write_text(json.dumps(b)+'\n')
         assert 'DROP_COHORT_PAYLOAD_A' not in json.dumps(fixture.reviews[-1]), 'later real review must prune A'
+        assert not any(i.get('call_id') in ('call_fixture_1_a','call_fixture_1_b')
+                       for i in fixture.calls[-1]['input']), 'parent primary omits every old parallel member'
         parent_tree = rpc.call('get_entries')
         anchors = rpc.call('get_fork_messages')['messages']
         selected = next(x['entryId'] for x in anchors if x['text'].startswith('B_ONLY: advance'))
@@ -235,7 +263,12 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         assert child['primary']['calls']==1 and child['shadow']['calls']==0
         assert child['primary']['cached_tokens']==0 and child['primary']['input_tokens']==1000
         assert child['primary']['cost_usd']>0, 'actual cold child spend, not copied or free'
-        assert child['reviewer_cache']==[] and not child['background_review_pending']
+        assert not child['background_review_pending']
+        # Cache evidence is now one exact-wire upstream index, not copied owner
+        # reviewer caches. Actual child receipt/call assertions above prove cold
+        # ownership; this synthetic provider never issued a positive read receipt.
+        assert all(e['native_cached_fraction']==0 for e in
+                   json.loads((state_dir/'history.index').read_text())['upstream_cache'])
         (root/'child-checkpoint.json').write_text(json.dumps(child)+'\n')
         assert json.loads(parent_path.read_text())==parent_snapshot, 'parent B unchanged'
         assert json.loads((state_dir/'history.index').read_text())['snapshots'][parent_path.stem] == parent_snapshot

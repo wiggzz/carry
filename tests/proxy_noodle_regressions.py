@@ -1,0 +1,357 @@
+"""PR184 review regressions against the actual CLI; synthetic loopback only."""
+import json
+import time
+import unittest
+from proxy_state_regressions import Proxy, advice_response, completed, wire
+import proxy_transparent_history as history_fixture
+from proxy_transparent_history import TransparentProxy
+
+
+class NoodleRegressions(unittest.TestCase):
+    setUp = history_fixture.TransparentHistory.setUp
+    record_evidence = history_fixture.TransparentHistory.record_evidence
+    fixture = history_fixture.TransparentHistory.fixture
+    proxy = history_fixture.TransparentHistory.proxy
+
+    def history(self):
+        return [{"role": "user", "content": "NOODLE_GOAL"},
+                {"role": "assistant", "content": "NOODLE_SOURCE " + "payload " * 3000},
+                {"role": "user", "content": "NOODLE_TASK"}]
+
+    def events(self):
+        return [json.loads(line) for p in (self.state / "diagnostics").glob("*.jsonl")
+                for line in p.read_text().splitlines()]
+
+    def attest_cache(self):
+        # Only synthetic route capability; never manufacture a native receipt.
+        path = self.state / "history.index"
+        index = json.loads(path.read_text())
+        for snapshot in index["snapshots"].values():
+            snapshot["model_resolution"]["primary"]["cache"] = {
+                "minimum_prefix_tokens": 1024, "max_read_breakpoints": 50,
+                "max_write_breakpoints": 4, "implicit_breakpoint_uses_write_slot": True}
+        path.write_bytes(wire(index))
+
+    def test_changed_cap_preserves_current_projection_and_summary_threshold_after_restart(self):
+        fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"cap_{n}")),
+            lambda _b,_n: (200, advice_response({"protected":[], "removable":[2], "memories":[]})))
+        h = self.history()
+        options = ["--payoff-requests","1","--classifier-cache-policy","disabled"]
+        proxy = self.proxy(fixture, [*options,"--review-replayed-history"])
+        self.assertEqual(proxy.send(h, max_output_tokens=1)[0], 200)
+        proxy.close()
+        options += ["--review-every-requests","100"]
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(h, max_output_tokens=1)[0], 200)
+        _, before = proxy.checkpoint(h)
+        restored = before["cost_trajectory"]["restored"]
+        self.assertGreater(restored, 0)
+        self.assertNotIn(h[1], fixture.primaries[-1]["input"])
+        proxy.close()
+        # Place the alternative's summary boundary between native and restored
+        # input. A receipt-config change must invalidate old summary assumptions,
+        # not the already measured current canonical-minus-sent quantity.
+        path = self.state / "history.index"
+        index = json.loads(path.read_text())
+        for state in index["snapshots"].values():
+            state["cost_trajectory"]["scenario"] = {
+                "context_window": 200 + restored // 2, "reserve":100,
+                "keep_recent":100, "summary":50}
+        path.write_bytes(wire(index))
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(h, max_output_tokens=2)[0], 200)
+        _, after = proxy.checkpoint(h)
+        self.evidence.update(before=before, after=after, primary=fixture.primaries, reviews=fixture.reviews)
+        self.assertNotIn(h[1], fixture.primaries[-1]["input"])
+        self.assertEqual(after["primary"]["calls"], 3)
+        self.assertEqual(after["primary"]["input_tokens"], 300)
+        self.assertEqual(after["shadow"]["calls"], 1)
+        self.assertEqual(after["cost_trajectory"]["restored"], restored,
+                         "receipt epoch reset must preserve this request's projection")
+        self.assertEqual(after["cost_trajectory"]["result"]["traditional_compactions"], 1)
+        self.assertGreater(after["cost_trajectory"]["result"]["summary_cost"], 0)
+        self.assertGreater(after["cost_trajectory"]["result"]["observed_primary_cost"],
+                           before["cost_trajectory"]["result"]["observed_primary_cost"])
+
+    def test_off_tracking_fallback_has_zero_projection_after_repeat_and_restart(self):
+        root = self.state
+        for label, count in (("tracked", 100), ("tracker_limit", 16385)):
+            with self.subTest(case=label):
+                self.state = root / label
+                self.state.mkdir()
+                def primary(_body, n):
+                    response = completed(response_id=f"off_{label}_{n}")
+                    response["usage"]["input_tokens"] = 200000
+                    return 200, response
+                fixture = self.fixture(primary)
+                h = [{"role":"user", "content":"x"} for _ in range(count)]
+                def start():
+                    proxy = Proxy(self.state, fixture, mode="off")
+                    self.stack.callback(proxy.close)
+                    return proxy
+                proxy = start()
+                snapshots = []
+                for _ in range(2):
+                    self.assertEqual(proxy.send(h, max_output_tokens=1)[0], 200)
+                    self.assertEqual(fixture.primaries[-1]["input"], h)
+                    snapshots.append(proxy.saved())
+                proxy.close()
+                proxy = start()
+                self.assertEqual(proxy.send(h, max_output_tokens=1)[0], 200)
+                self.assertEqual(fixture.primaries[-1]["input"], h)
+                snapshots.append(proxy.saved())
+                proxy.close()
+                self.evidence[label] = {"snapshots":snapshots, "primaries":fixture.primaries,
+                                        "reviews":fixture.reviews}
+                self.assertFalse(fixture.reviews)
+                for n, saved in enumerate(snapshots, 1):
+                    trajectory = saved["cost_trajectory"]
+                    self.assertEqual(len(saved["history"]), count if label == "tracked" else 0)
+                    self.assertEqual(saved["primary"]["calls"], n)
+                    self.assertEqual(saved["primary"]["input_tokens"], 200000*n)
+                    self.assertEqual(saved["primary"]["output_tokens"], n)
+                    self.assertEqual(saved["shadow"]["calls"], 0)
+                    self.assertEqual(trajectory["priced_primary_responses"], n)
+                    self.assertEqual(trajectory["result"]["coverage"]["unmodeled_calls"], 0)
+                    self.assertEqual(trajectory["result"]["excluded_unpriced_calls"], 0)
+                    self.assertAlmostEqual(trajectory["result"]["observed_primary_cost"],
+                                           saved["primary"]["cost_usd"], places=12)
+                # Grade after collecting every request so RED retains repeat,
+                # restart, complete forwarded input and paid receipt evidence.
+                for label_request, saved in zip(("first", "repeat", "restart"), snapshots):
+                    with self.subTest(case=label, request=label_request):
+                        self.assertEqual(saved["cost_trajectory"]["restored"], 0,
+                                         "pass-through does not edit input when tracking fails")
+                        self.assertEqual(saved["cost_trajectory"]["last_traditional_input"], 200000)
+        self.state = root
+
+    def test_compact_to_passthrough_measures_current_projection_on_repeat_and_restart(self):
+        root = self.state
+        for mode in ("off", "audit"):
+            with self.subTest(mode=mode):
+                self.state = root / mode
+                self.state.mkdir()
+                fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"mode_{mode}_{n}")),
+                    lambda _b,_n: (200, advice_response({"protected":[],"removable":[2],"memories":[]})))
+                h = self.history()
+                options = ["--payoff-requests","1","--classifier-cache-policy","disabled"]
+                def start(mode, extra=()):
+                    proxy = Proxy(self.state, fixture, [*options,*extra], mode=mode)
+                    self.stack.callback(proxy.close)
+                    return proxy
+                proxy = start("compact", ["--review-replayed-history"])
+                self.assertEqual(proxy.send(h, max_output_tokens=1)[0],200)
+                proxy.close()
+                options += ["--review-every-requests","100"]
+                proxy = start("compact")
+                self.assertEqual(proxy.send(h, max_output_tokens=1)[0],200)
+                compact = proxy.saved()
+                self.assertGreater(compact["cost_trajectory"]["restored"],0)
+                self.assertNotIn(h[1],fixture.primaries[-1]["input"])
+                proxy.close()
+                # Execute every repeat/restart before grading restoration, so
+                # a stale first receipt cannot hide the later lifetime seam.
+                proxy = start(mode)
+                snapshots = []
+                for _ in range(2):
+                    self.assertEqual(proxy.send(h, max_output_tokens=1)[0],200)
+                    snapshots.append(proxy.saved())
+                    self.assertEqual(fixture.primaries[-1]["input"],h)
+                proxy.close()
+                proxy = start(mode)
+                self.assertEqual(proxy.send(h, max_output_tokens=1)[0],200)
+                snapshots.append(proxy.saved())
+                self.assertEqual(fixture.primaries[-1]["input"],h)
+                proxy.close()
+                # Returning to compact must measure a real current omission;
+                # globally clearing restoration would fail this positive arm.
+                proxy = start("compact")
+                self.assertEqual(proxy.send(h, max_output_tokens=2)[0],200)
+                resumed = proxy.saved()
+                self.assertNotIn(h[1],fixture.primaries[-1]["input"])
+                self.evidence[mode] = {"compact":compact,"passthrough":snapshots,"resumed":resumed,
+                                       "primaries":fixture.primaries,"reviews":fixture.reviews}
+                self.assertEqual(len(fixture.reviews),1)
+                for n, saved in enumerate(snapshots,3):
+                    self.assertEqual(saved["primary"]["calls"],n)
+                    self.assertEqual(saved["primary"]["input_tokens"],100*n)
+                    self.assertEqual(saved["primary"]["output_tokens"],n)
+                    self.assertEqual(saved["shadow"],compact["shadow"])
+                    result = saved["cost_trajectory"]["result"]
+                    self.assertAlmostEqual(result["observed_primary_cost"],
+                        compact["cost_trajectory"]["result"]["observed_primary_cost"]*n/2,places=12)
+                    self.assertEqual(result["traditional_compactions"],0)
+                # Grade each current quantity independently, retaining all wire
+                # and paid evidence even on the intentionally failing baseline.
+                for label, saved in zip(("first","repeat","restart"),snapshots):
+                    with self.subTest(mode=mode,request=label):
+                        self.assertEqual(saved["cost_trajectory"]["restored"],0,
+                                         "full current wire must replace prior compact restoration")
+                        self.assertEqual(saved["cost_trajectory"]["last_traditional_input"],100)
+                self.assertEqual(resumed["cost_trajectory"]["restored"],compact["cost_trajectory"]["restored"])
+                self.assertEqual(resumed["primary"]["calls"],6)
+                self.assertEqual(resumed["primary"]["input_tokens"],600)
+                self.assertEqual(resumed["shadow"],compact["shadow"])
+                proxy.close()
+        self.state = root
+
+    def test_cold_extension_revokes_old_warm_prefix_through_repeat_restart_and_rewarm(self):
+        def primary(_body, n):
+            response = completed(response_id=f"extension_{n}")
+            response["usage"]["input_tokens"] = 4000
+            response["usage"]["input_tokens_details"]["cached_tokens"] = 3900 if n in (2,6) else 0
+            return 200, response
+        fixture = self.fixture(primary)
+        h = [{"role":"user","content":"WARM_ORIGINAL " + "prefix " * 3000}]
+        extended = h + [{"role":"user","content":"COLD_SUFFIX"}]
+        options = ["--review-every-requests","100","--classifier-cache-policy","disabled"]
+        proxy = TransparentProxy(self.state,fixture,options,mode="audit")
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(h)[0],200)
+        proxy.close(); self.attest_cache()
+        proxy = TransparentProxy(self.state,fixture,options,mode="audit")
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(h)[0],200)  # actual warm H terminal
+        self.assertEqual(proxy.send(extended)[0],200)  # actual cold H+suffix terminal
+        _, cold = proxy.checkpoint(extended)
+        self.assertGreater(cold["last_plan"]["primary_cached_estimated_tokens"],0,
+                           "first extension legitimately forecasts the prior warm H")
+        self.assertEqual(proxy.send(extended)[0],200)
+        _, repeated = proxy.checkpoint(extended)
+        proxy.close()
+        proxy = TransparentProxy(self.state,fixture,options,mode="audit")
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(extended)[0],200)
+        _, restarted = proxy.checkpoint(extended)
+        self.assertEqual(proxy.send(extended)[0],200)  # genuine later rewarm of the current wire
+        _, positive = proxy.checkpoint(extended)
+        self.assertEqual(positive["primary"]["cached_tokens"],7800,
+                         "prove the provider's later positive receipt was observed")
+        self.assertEqual(proxy.send(extended)[0],200)
+        _, rewarmed = proxy.checkpoint(extended)
+        self.evidence.update(cold=cold,repeated=repeated,restarted=restarted,positive=positive,rewarmed=rewarmed,
+                             actual_wires=fixture.primaries,events=self.events())
+        self.assertEqual(repeated["last_plan"]["primary_cached_estimated_tokens"],0,
+                         "newer cold extension supersedes old covered warmth")
+        self.assertEqual(restarted["last_plan"]["primary_cached_estimated_tokens"],0)
+        self.assertGreater(rewarmed["last_plan"]["primary_cached_estimated_tokens"],0)
+        self.assertEqual(rewarmed["primary"]["calls"],7)
+        self.assertEqual(rewarmed["primary"]["input_tokens"],28000)
+        self.assertEqual(rewarmed["primary"]["cached_tokens"],7800)
+        self.assertFalse(fixture.reviews)
+
+    def test_cold_extension_changes_actual_disposable_selection_after_restart(self):
+        def primary(_body,n):
+            value = completed(response_id=f"selection_{n}")
+            value["usage"]["input_tokens"] = 40000
+            value["usage"]["input_tokens_details"]["cached_tokens"] = 39600 if n == 2 else 0
+            return 200,value
+        fixture = self.fixture(primary,lambda _b,_n:(200,advice_response({"protected":[],"removable":[2],"memories":[]})))
+        h = self.history()
+        h[0]["content"] += " protected direction " * 10000
+        extended = h + [{"role":"user","content":"APPENDED_CURRENT_TASK"}]
+        options = ["--payoff-requests","1","--classifier-cache-policy","disabled"]
+        proxy = self.proxy(fixture,[*options,"--review-replayed-history"])
+        self.assertEqual(proxy.send(h)[0],200)
+        proxy.close(); self.attest_cache()
+        options += ["--review-every-requests","100"]
+        proxy = TransparentProxy(self.state,fixture,options,mode="audit")
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(h)[0],200)
+        proxy.close()
+        proxy = self.proxy(fixture,options)
+        self.assertEqual(proxy.send(extended)[0],200)
+        self.assertIn(h[1],fixture.primaries[-1]["input"],"confirmed warm H makes retaining original cheaper on first append")
+        _, warm = proxy.checkpoint(extended)
+        proxy.close()
+        proxy = self.proxy(fixture,options)
+        self.assertEqual(proxy.send(extended)[0],200)
+        _, cold = proxy.checkpoint(extended)
+        self.evidence.update(warm=warm,cold=cold,primaries=fixture.primaries,reviews=fixture.reviews)
+        self.assertNotIn(h[1],fixture.primaries[-1]["input"],"new cold extension must change real selection, not only a diagnostic")
+        self.assertFalse(warm["last_plan"]["selected"])
+        self.assertTrue(cold["last_plan"]["selected"])
+        self.assertEqual(len(fixture.reviews),1)
+        self.assertEqual(cold["primary"]["calls"],4)
+        self.assertEqual(cold["primary"]["cached_tokens"],39600)
+
+    def test_planning_and_dispatch_share_metadata_stripped_floor(self):
+        fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"floor_{n}")),
+            lambda _b,_n:(200,advice_response({"protected":[],"removable":[2],"memories":[]})))
+        h = self.history()
+        options = ["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled",
+                   "--review-min-primary-tokens","5000"]
+        proxy = self.proxy(fixture,options)
+        fields = {"metadata":{"diagnostic":"metadata " * 6000}}
+        self.assertEqual(proxy.send(h,**fields)[0],200)
+        self.assertEqual(proxy.send(h,**fields)[0],200)
+        _, saved = proxy.checkpoint(h)
+        decisions = [e["data"] for e in self.events() if e["event"] == "review_admission"]
+        self.evidence.update(saved=saved,decisions=decisions,primaries=fixture.primaries,reviews=fixture.reviews)
+        self.assertEqual(len(fixture.reviews),1)
+        self.assertEqual(decisions[-1]["reason"],"primary_floor")
+        self.assertLess(decisions[-1]["primary_estimated_tokens"],5000)
+        self.assertGreater(saved["last_plan"]["primary_estimated_tokens"],5000)
+        candidates = saved["last_plan"]["candidates"]
+        self.assertTrue(candidates)
+        for candidate in candidates:
+            joint = candidate["selection_joint"]
+            self.assertEqual(joint["future_shadow_keep"],0,
+                             "an undispatchable ordinary review cannot subsidize omission")
+            self.assertEqual(joint["future_shadow_compact"],0)
+
+    def bootstrap_retry(self, rejected):
+        def review(_body,n):
+            if n == 1:
+                return (200,advice_response({"protected":[999],"removable":[],"memories":[]})) if rejected else None
+            return 200,advice_response({"protected":[],"removable":[],"memories":[]})
+        fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"retry_{n}")),review)
+        h = self.history()
+        options = ["--review-replayed-history","--classifier-cache-policy","disabled",
+                   "--review-min-primary-tokens","100000","--review-every-requests","3"]
+        proxy = self.proxy(fixture,options)
+        self.assertEqual(proxy.send(h)[0],200)
+        _, failed = proxy.checkpoint(h)
+        index = json.loads((self.state / "history.index").read_text())
+        self.assertFalse(index["reviews"])
+        self.assertEqual(failed["shadow"]["calls"],1)
+        self.assertEqual(failed["shadow"]["unavailable_cost_calls"],int(not rejected))
+        self.assertEqual(failed["shadow"]["input_tokens"],100 if rejected else 0)
+        self.assertTrue(failed["bootstrap_review_pending"])
+        self.assertTrue(failed["bootstrap_review_attempted"])
+        # Failed bootstrap must honor normal request cadence on its retries,
+        # even though the initial replay acquisition bypassed ordinary floors.
+        self.assertEqual(proxy.send(h)[0],200)
+        self.assertEqual(len(fixture.reviews),1)
+        proxy.close()
+        proxy = self.proxy(fixture,options)
+        self.assertEqual(proxy.send(h)[0],200)
+        self.assertEqual(len(fixture.reviews),1)
+        self.assertEqual(proxy.send(h)[0],200)
+        _, accepted = proxy.checkpoint(h)
+        self.evidence.update(failed=failed,accepted=accepted,events=self.events(),reviews=fixture.reviews)
+        self.assertEqual(len(fixture.reviews),2,"below-floor intent must retry after failure/rejection and restart")
+        # Settlement does not decide semantic completion. The next ingress
+        # applies the indexed accepted-empty record and closes replay intent.
+        self.assertTrue(accepted["bootstrap_review_pending"])
+        self.assertEqual(accepted["shadow"]["calls"],2)
+        self.assertEqual(accepted["shadow"]["input_tokens"],200 if rejected else 100)
+        self.assertEqual(accepted["shadow"]["unavailable_cost_calls"],int(not rejected))
+        self.assertTrue(json.loads((self.state / "history.index").read_text())["reviews"],
+                        "accepted empty advice is a durable semantic completion")
+        proxy.close()
+        proxy = self.proxy(fixture,options)
+        for _ in range(4): self.assertEqual(proxy.send(h)[0],200)
+        self.assertEqual(len(fixture.reviews),2,"accepted empty completion closes below-floor retries")
+        self.assertEqual(proxy.checkpoint(h)[1]["shadow"],accepted["shadow"])
+        self.assertFalse(proxy.checkpoint(h)[1]["bootstrap_review_pending"])
+
+    def test_failed_bootstrap_retries_below_floor_with_cadence_and_once_only_censorship(self):
+        self.bootstrap_retry(False)
+
+    def test_all_rejected_bootstrap_retries_below_floor_with_cadence_and_once_only_payment(self):
+        self.bootstrap_retry(True)
+
+
+if __name__ == "__main__":
+    unittest.main()

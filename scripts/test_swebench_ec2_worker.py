@@ -501,6 +501,14 @@ case " $* " in
 esac
 exec {shutil.which('tar')} "$@"
 ''')
+        gnu_timeout = shutil.which("gnutimeout") or shutil.which("timeout")
+        self.assertIsNotNone(gnu_timeout, "GNU coreutils timeout is required")
+        version = subprocess.run(
+            [gnu_timeout, "--version"], text=True, capture_output=True,
+            env=dict(os.environ, LC_ALL="C"), timeout=5,
+        )
+        self.assertEqual(version.returncode, 0, version.stderr)
+        self.assertIn("(GNU coreutils)", version.stdout.splitlines()[0])
         self.write_command("timeout", f'''
 import json, os, pathlib, sys
 args = sys.argv[1:]
@@ -511,8 +519,10 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT']) / 'timeout.jsonl').open('a') as o
 if os.environ.get('FAST_DELIVERY_TIMEOUTS') == '1' and any(x in args for x in ('tar', 'curl', 'tail')):
     args = ['1s' if x in ('120s', '125s') else '2s' if x == '5s' else
             '--kill-after=0.2s' if x == '--kill-after=5s' else x for x in args]
-os.execv({shutil.which('timeout')!r}, ['timeout', *args])
+os.execv({gnu_timeout!r}, ['timeout', *args])
 ''', python=True)
+        # The GNU alias must use the same accelerated, recording wrapper.
+        (self.bin / "gnutimeout").symlink_to("timeout")
 
     def write_command(self, name, body, python=False):
         path = self.bin / name
@@ -568,6 +578,101 @@ while True:
             ["bash", str(SCRIPT)], env=env, text=True, capture_output=True, timeout=15,
         )
         return self.completed
+
+    def isolate_command_path(self):
+        # Do not let an installed gnutimeout leak into the absent-name controls.
+        for name in ("bash", "rm", "mkdir", "tee", "base64", "chmod", "date",
+                     "sha256sum", "gzip", "tail", "sleep", "touch"):
+            path = self.bin / name
+            if not path.exists():
+                path.symlink_to(shutil.which(name))
+        self.env["PATH"] = str(self.bin)
+
+    def test_prefers_gnu_timeout_and_still_kills_archive_descendants(self):
+        (self.bin / "gnutimeout").unlink()
+        (self.bin / "timeout").rename(self.bin / "gnutimeout")
+        self.write_command("timeout", 'exit 99\n')
+        pids = self.install_hanging_command("tar", "-czf")
+        run = self.run_worker(FAST_DELIVERY_TIMEOUTS="1")
+        self.assertEqual(run.returncode, 137, run.stdout + run.stderr)
+        self.assertIn({"stage": "archive_failed", "exit_code": 137}, self.events())
+        self.assertFalse(any('-T' in call for call in self.calls("curl")))
+        self.assertTrue((self.root / "shutdown").exists())
+        self.assert_processes_stopped(pids)
+
+    def test_plain_gnu_timeout_remains_supported(self):
+        self.isolate_command_path()
+        (self.bin / "gnutimeout").unlink()
+        run = self.run_worker()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertTrue((self.root / "uploaded.tar.gz").exists())
+        self.assertTrue((self.root / "shutdown").exists())
+
+    def assert_timeout_dependency_rejected(self):
+        self.write_command("dnf", 'touch "$FIXTURE_ROOT/packages-started"\n')
+        for name in ("SECRET_FILE", "DOCKER_AUTH_FILE", "REGISTRY_AUTH_FILE"):
+            pathlib.Path(self.env[name]).write_text(self.sentinel)
+        run = self.run_worker()
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertFalse((self.root / "packages-started").exists())
+        self.assertFalse(self.worker.exists())
+        self.assertFalse(self.calls("curl"))
+        self.assertTrue((self.root / "shutdown").exists())
+        for name in ("SECRET_FILE", "DOCKER_AUTH_FILE", "REGISTRY_AUTH_FILE"):
+            self.assertFalse(pathlib.Path(self.env[name]).exists())
+
+    def test_non_gnu_timeout_is_rejected_before_work_and_still_sanitizes(self):
+        self.isolate_command_path()
+        (self.bin / "gnutimeout").unlink()
+        self.write_command("timeout", '''
+if [ "${1:-}" = --version ]; then
+    printf 'timeout (uutils coreutils) fixture\\n'
+    exit 0
+fi
+exit 99
+''')
+        self.assert_timeout_dependency_rejected()
+
+    def test_missing_timeout_is_rejected_before_work_and_still_sanitizes(self):
+        self.isolate_command_path()
+        (self.bin / "gnutimeout").unlink()
+        (self.bin / "timeout").unlink()
+        self.assert_timeout_dependency_rejected()
+
+    def test_unverified_timeout_does_not_deliver_preexisting_results(self):
+        self.isolate_command_path()
+        (self.bin / "gnutimeout").unlink()
+        self.write_command("timeout", f'''
+if [ "${{1:-}}" = --version ]; then
+    printf 'timeout (uutils coreutils) fixture\\n'
+    exit 0
+fi
+exec {shutil.which('timeout')} "$@"
+''')
+        results = self.worker / "results"
+        results.mkdir(parents=True)
+        (results / "stale.txt").write_text("retained evidence")
+        result_url = self.root / "result-url"
+        result_url.write_text(self.capability)
+        # Redirect only the fixed shared-memory path in an owned script copy;
+        # never write a fixture capability into a real worker's /dev/shm file.
+        source = SCRIPT.read_text()
+        assignment = "result_url_file=/dev/shm/carry-result-url"
+        self.assertEqual(source.count(assignment), 1)
+        isolated = self.root / "worker.sh"
+        isolated.write_text(source.replace(assignment, f"result_url_file={shlex.quote(str(result_url))}"))
+        self.completed = subprocess.run(
+            ["bash", str(isolated)], env=self.env, text=True,
+            capture_output=True, timeout=15,
+        )
+        self.assertEqual(self.completed.returncode, 2,
+                         self.completed.stdout + self.completed.stderr)
+        self.assertFalse(self.calls("curl"))
+        self.assertFalse((self.root / "uploaded.tar.gz").exists())
+        self.assertFalse((results / "worker-exit-status").exists())
+        self.assertEqual((results / "stale.txt").read_text(), "retained evidence")
+        self.assertFalse(result_url.exists())
+        self.assertTrue((self.root / "shutdown").exists())
 
     def events(self):
         events = [json.loads(line.split("BENCHMARK_WORKER ", 1)[1])

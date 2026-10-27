@@ -72,58 +72,55 @@ class ProxyTrialTests(unittest.TestCase):
         import io
         from unittest.mock import patch
         from scripts import proxy_trial
-        for synchronous in (False, True):
-            with self.subTest(synchronous=synchronous), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                ordinary = root / 'ordinary'; ordinary.mkdir()
-                carry_home = ordinary / '.carry'; carry_home.mkdir()
-                saved = carry_home / 'auth.json'
-                saved.write_text('{"fixture_only":"saved subscription must not select auth"}')
-                workspace = root / 'workspace'; workspace.mkdir()
-                trial = root / 'trial'
-                launches = []
-                class Process:
-                    def poll(self): return None
-                    def wait(self, timeout=None): return 0
-                def launch(argv, **kwargs):
-                    launches.append((argv, kwargs['env'].copy()))
-                    return Process()
-                class Response(io.BytesIO):
-                    status = 200
-                def get(request, **kwargs):
-                    return Response(b'{"mode":"off"}')
-                env = {'HOME': str(ordinary), 'CARRY_HOME': str(carry_home),
-                       'XDG_CONFIG_HOME': str(ordinary / '.config')}
-                argv = ['trial', '--client', 'codex', '--workspace', str(workspace),
-                        '--trial-dir', str(trial), '--prompt', 'synthetic task',
-                        '--fixture-client-base-url', 'http://127.0.0.1:12345/v1']
-                if synchronous:
-                    argv.append('--synchronous-reviews')
-                with patch.dict(os.environ, env, clear=True), patch('sys.argv', argv), \
-                     patch.object(proxy_trial.subprocess, 'Popen', side_effect=launch), \
-                     patch.object(proxy_trial.urllib.request, 'urlopen', side_effect=get), \
-                     patch.object(proxy_trial, 'stop_process_group'):
-                    self.assertEqual(proxy_trial.main(), 0)
-                self.assertEqual(len(launches), 2)
-                import tomllib
-                config = tomllib.loads((trial/'codex/config.toml').read_text())
-                self.assertEqual(config['model_providers']['carry-trial']['base_url'],
-                                 'http://127.0.0.1:12345/v1')
-                proxy_argv, proxy_env = launches[0]
-                self.assertIn('--verbose', proxy_argv)
-                self.assertIn('--login', proxy_argv)
-                self.assertEqual(proxy_argv[proxy_argv.index('--login') + 1], 'api-key')
-                self.assertEqual(proxy_argv[proxy_argv.index('--mode') + 1], 'off')
-                self.assertEqual('--background-reviews=false' in proxy_argv, synchronous)
-                self.assertEqual(proxy_env['HOME'], str(ordinary))
-                self.assertNotIn('OPENAI_API_KEY', proxy_env)
-                self.assertNotIn('CARRY_PROXY_UPSTREAM_KEY', proxy_env)
-                self.assertEqual(saved.read_text(), '{"fixture_only":"saved subscription must not select auth"}')
-                _, client_env = launches[1]
-                self.assertEqual(client_env['HOME'], str(trial / 'home'))
-                self.assertNotIn('CARRY_PROXY_AUTH_TOKEN', client_env)
-                self.assertEqual(client_env['CARRY_TRIAL_GATEWAY_TOKEN'], proxy_env['CARRY_PROXY_AUTH_TOKEN'])
-                self.assertNotIn(proxy_env['CARRY_PROXY_AUTH_TOKEN'], proxy_argv)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ordinary = root / 'ordinary'; ordinary.mkdir()
+            carry_home = ordinary / '.carry'; carry_home.mkdir()
+            saved = carry_home / 'auth.json'
+            saved.write_text('{"fixture_only":"saved subscription must not select auth"}')
+            workspace = root / 'workspace'; workspace.mkdir()
+            trial = root / 'trial'
+            launches = []
+            class Process:
+                def poll(self): return None
+                def wait(self, timeout=None): return 0
+            def launch(argv, **kwargs):
+                launches.append((argv, kwargs['env'].copy()))
+                return Process()
+            class Response(io.BytesIO):
+                status = 200
+            def get(request, **kwargs):
+                return Response(b'{"mode":"off"}')
+            env = {'HOME': str(ordinary), 'CARRY_HOME': str(carry_home),
+                   'XDG_CONFIG_HOME': str(ordinary / '.config')}
+            argv = ['trial', '--client', 'codex', '--workspace', str(workspace),
+                    '--trial-dir', str(trial), '--prompt', 'synthetic task',
+                    '--fixture-client-base-url', 'http://127.0.0.1:12345/v1']
+            with patch.dict(os.environ, env, clear=True), patch('sys.argv', argv), \
+                 patch.object(proxy_trial.subprocess, 'Popen', side_effect=launch), \
+                 patch.object(proxy_trial.urllib.request, 'urlopen', side_effect=get), \
+                 patch.object(proxy_trial, 'stop_process_group'):
+                self.assertEqual(proxy_trial.main(), 0)
+            self.assertEqual(len(launches), 2)
+            import tomllib
+            config = tomllib.loads((trial/'codex/config.toml').read_text())
+            self.assertEqual(config['model_providers']['carry-trial']['base_url'],
+                             'http://127.0.0.1:12345/v1')
+            proxy_argv, proxy_env = launches[0]
+            self.assertIn('--verbose', proxy_argv)
+            self.assertIn('--login', proxy_argv)
+            self.assertEqual(proxy_argv[proxy_argv.index('--login') + 1], 'api-key')
+            self.assertEqual(proxy_argv[proxy_argv.index('--mode') + 1], 'off')
+            self.assertNotIn('--background-reviews=false', proxy_argv)
+            self.assertEqual(proxy_env['HOME'], str(ordinary))
+            self.assertNotIn('OPENAI_API_KEY', proxy_env)
+            self.assertNotIn('CARRY_PROXY_UPSTREAM_KEY', proxy_env)
+            self.assertEqual(saved.read_text(), '{"fixture_only":"saved subscription must not select auth"}')
+            _, client_env = launches[1]
+            self.assertEqual(client_env['HOME'], str(trial / 'home'))
+            self.assertNotIn('CARRY_PROXY_AUTH_TOKEN', client_env)
+            self.assertEqual(client_env['CARRY_TRIAL_GATEWAY_TOKEN'], proxy_env['CARRY_PROXY_AUTH_TOKEN'])
+            self.assertNotIn(proxy_env['CARRY_PROXY_AUTH_TOKEN'], proxy_argv)
 
     def test_both_clients_use_fresh_homes_scoped_auth_and_stable_session(self):
         for client, cache_policy in (('codex', 'auto'), ('pi', 'disabled'), ('codex', 'openai-explicit')):

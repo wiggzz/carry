@@ -45,7 +45,7 @@ class TransparentProxy(Proxy):
         self.response_id = response[1].get("id")
         if wait and self.wait_reviews:
             deadline = time.monotonic() + 15
-            while self.saved().get("background_review_pending"):
+            while not self.reviewers_settled():
                 assert time.monotonic() < deadline, "post-response reviewer did not settle"
                 time.sleep(0.01)
         return response
@@ -66,10 +66,687 @@ class TransparentHistory(unittest.TestCase):
     record_evidence = regressions.StateRegressions.record_evidence
     fixture = regressions.StateRegressions.fixture
 
-    def proxy(self, fixture, options):
-        proxy = TransparentProxy(self.state, fixture, options)
+    def proxy(self, fixture, options, *, wait_reviews=True):
+        proxy = TransparentProxy(self.state, fixture, options, wait_reviews=wait_reviews)
         self.stack.callback(proxy.close)
         return proxy
+
+    def test_all_rejected_background_feedback_reaches_real_retry_after_restart(self):
+        root = self.state
+        for prior in (False, True):
+            with self.subTest(prior_feedback=prior):
+                self.state = root / ("prior" if prior else "fresh")
+                self.state.mkdir()
+                def review(_body, n):
+                    value = {"protected": [2] if prior and n == 1 else [999],
+                             "removable": [], "memories": []}
+                    return 200, advice_response(value)
+                fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"rejected_{prior}_{n}")), review)
+                options = ["--review-replayed-history", "--payoff-requests", "1",
+                           "--classifier-cache-policy", "disabled"]
+                h = [{"role":"user","content":"FEEDBACK_GOAL"},
+                     {"role":"assistant","content":"FEEDBACK_SOURCE " + "payload " * 2000},
+                     {"role":"user","content":"FEEDBACK_TASK"}]
+                proxy = self.proxy(fixture, options)
+                if prior:
+                    self.assertEqual(proxy.send(h)[0], 200)
+                    self.assertEqual(len(fixture.reviews), 1)
+                    self.assertEqual(proxy.advice()["feedback"]["rejected_count"], 0)
+                self.assertEqual(proxy.send(h)[0], 200)
+                count = 2 if prior else 1
+                self.assertEqual(len(fixture.reviews), count)
+                _, settled = proxy.checkpoint(h)
+                self.assertFalse(settled["background_review_pending"])
+                self.assertEqual(settled["shadow"]["calls"], count)
+                self.assertEqual(settled["shadow"]["input_tokens"], 100 * count)
+                self.assertEqual(settled["shadow"]["output_tokens"], count)
+                self.assertEqual(settled["shadow"]["unavailable_cost_calls"], 0)
+                index = json.loads((self.state / "history.index").read_text())
+                self.assertEqual(len(index["reviews"]), int(prior), "rejection is not a semantic completion")
+                self.assertTrue(all("999" not in record["opinions"] for record in index["reviews"].values()),
+                                "unknown protection must gain no authority")
+                proxy.close()
+                proxy = self.proxy(fixture, options)
+                self.assertEqual(proxy.send(h)[0], 200)
+                self.assertEqual(len(fixture.reviews), count + 1, "invalid advice must leave retry scheduling live")
+                retry = ledger(fixture.reviews[-1])
+                feedback = retry["previous_review_feedback"]
+                self.evidence[str(prior)] = {"settled": settled, "retry_ledger": retry}
+                self.assertIsNotNone(feedback, "all-rejected paid background diagnostics must survive restart")
+                self.assertEqual(feedback["rejected_count"], 1, "old accepted-record feedback must not overwrite the rejection")
+                self.assertEqual(feedback["accepted_opinions"], 0)
+                self.assertEqual(feedback["accepted_memories"], 0)
+                self.assertEqual(len(feedback["rejected"]), 1)
+                self.assertEqual(feedback["rejected"][0]["field"], "protected")
+                self.assertEqual(feedback["rejected"][0]["index"], 0)
+                self.assertLess(len(wire(feedback)), 2048)
+                self.assertIn(h[1], fixture.primaries[-1]["input"], "rejection must not omit canonical source")
+                print("ALL_REJECTED_FEEDBACK=" + json.dumps({"prior":prior,"calls_before_restart":count,
+                      "retry_feedback":feedback,"semantic_records_before_retry":len(index["reviews"])}), flush=True)
+                proxy.close()
+        self.state = root
+
+    def test_rejected_feedback_does_not_cross_direction_or_namespace_on_same_paid_owner(self):
+        root = self.state
+        for boundary, fields in (("direction", {"instructions":"NEW_DIRECTION"}),
+                                 ("namespace", {"client_metadata":{"tenant_id":"other-tenant"}})):
+            with self.subTest(boundary=boundary):
+                self.state = root / boundary
+                self.state.mkdir()
+                fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"isolation_{boundary}_{n}")),
+                    lambda _b,_n:(200,advice_response({"protected":[999],"removable":[],"memories":[]})))
+                options = ["--review-replayed-history", "--payoff-requests", "1",
+                           "--classifier-cache-policy", "disabled"]
+                h = [{"role":"user","content":"ISOLATION_GOAL"},
+                     {"role":"assistant","content":"ISOLATION_SOURCE " + "payload " * 2000},
+                     {"role":"user","content":"ISOLATION_TASK"}]
+                # Explicit identity deliberately reuses the paid owner across a
+                # settings boundary; diagnostic compatibility is not owner ID.
+                proxy = Proxy(self.state, fixture, options)
+                self.stack.callback(proxy.close)
+                self.assertEqual(proxy.send(h)[0], 200)
+                self.assertEqual(proxy.send(h)[0], 200)
+                self.assertEqual(len(fixture.reviews), 2)
+                self.assertEqual(ledger(fixture.reviews[-1])["previous_review_feedback"]["rejected_count"], 1)
+                old_namespace = proxy.saved()["history_namespace"]
+                proxy.close()
+                proxy = Proxy(self.state, fixture, options)
+                self.stack.callback(proxy.close)
+                self.assertEqual(proxy.send(h, **fields)[0], 200)
+                self.assertEqual(len(fixture.reviews), 3)
+                retry = ledger(fixture.reviews[-1])
+                self.assertIsNone(retry["previous_review_feedback"], "another observation's diagnostic is private")
+                self.assertNotEqual(proxy.saved()["history_namespace"], old_namespace)
+                self.assertEqual(proxy.saved()["shadow"]["calls"], 3)
+                self.assertEqual(proxy.saved()["shadow"]["unavailable_cost_calls"], 0)
+                self.assertIn(h[1], fixture.primaries[-1]["input"])
+                self.evidence[boundary] = {"retry_ledger":retry,"settled":proxy.saved()}
+                print("REJECTED_FEEDBACK_ISOLATION=" + json.dumps({"boundary":boundary,
+                      "feedback":retry["previous_review_feedback"],"paid_calls":3}), flush=True)
+                proxy.close()
+        self.state = root
+
+    def test_successive_memory_acceptances_then_retire_only_one_same_source_fact_on_raw_wires(self):
+        facts = ["RETIRED_SAME_SOURCE_FACT", "SURVIVING_SAME_SOURCE_FACT", "LATER_CUMULATIVE_FACT"]
+        def review(body,n):
+            if n == 1:
+                value = {"protected":[],"removable":[2],"memories":[
+                    {"source_ids":[2],"text":facts[0]}, {"source_ids":[2],"text":facts[1]}]}
+            elif n == 2:
+                value = {"protected":[],"removable":[4],"memories":[{"source_ids":[4],"text":facts[2]}]}
+            elif n == 3:
+                value = {"protected":[],"removable":[ledger(body)["eligible_memory_ids"][0]],"memories":[]}
+            else:
+                value = {"protected":[],"removable":[],"memories":[]}
+            return 200,advice_response(value)
+        fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"selective_{n}")),review)
+        options = ["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled"]
+        proxy = self.proxy(fixture,options)
+        # Both sources are consumed replay, not fresh unconsumed additions.
+        h = [{"role":"user","content":"goal"},{"role":"assistant","content":"original source " * 3000},
+             {"role":"user","content":"historical separator"},{"role":"assistant","content":"second original source " * 3000},
+             {"role":"user","content":"task 1"}]
+        for n in range(1,4):
+            self.assertEqual(proxy.send(h)[0],200)
+            self.assertEqual(len(fixture.reviews),n)
+            if n == 2:
+                raw = json.dumps(fixture.primaries[-1])
+                self.assertIn(facts[0],raw); self.assertIn(facts[1],raw)
+            if n < 3:
+                h += [{"role":"assistant","content":f"source {n+1} " * 3000},{"role":"user","content":f"task {n+1}"}]
+        proxy.close()
+        proxy = self.proxy(fixture,options)
+        h += [{"role":"assistant","content":"last source " * 3000},{"role":"user","content":"task 4"}]
+        self.assertEqual(proxy.send(h)[0],200)
+        self.assertEqual(len(fixture.reviews),4)
+        for body in (fixture.primaries[-1],fixture.reviews[-1]):
+            raw = json.dumps(body)
+            self.assertNotIn(facts[0],raw)
+            self.assertIn(facts[1],raw)
+            self.assertIn(facts[2],raw)
+        self.evidence.update(primary=fixture.primaries[-1],review=fixture.reviews[-1],canonical=proxy.saved())
+
+    def test_paid_primary_output_outgrows_index_preserves_exact_receipt_without_publishing_id(self):
+        def primary(_body, n):
+            response = completed(response_id=f"paid_growth_{n}")
+            if n == 1:
+                response["output"] = [{"type":"message","role":"assistant","content":[
+                    {"type":"output_text","text":"UNPUBLISHED_LARGE_RESULT_" + "x" * 200000}]}]
+            return 200, response
+        fixture = self.fixture(primary, lambda _b,_n: (200,advice_response({"protected":[],"removable":[],"memories":[]})))
+        options = ["--history-max-bytes","100000","--review-every-requests","100"]
+        h = [{"role":"user","content":"fit before paid dispatch"}]
+        proxy = self.proxy(fixture,options)
+        # A known-paid result that cannot be published terminates the already
+        # started HTTP stream. Observe that failure rather than demand a false
+        # successful terminal/ID from the ordinary JSON helper.
+        import http.client
+        connection = http.client.HTTPConnection(*proxy.address, timeout=30)
+        connection.request("POST", "/v1/responses", json.dumps({"model":"gpt-6-luna","input":h}),
+                           headers={"Content-Type":"application/json"})
+        response = connection.getresponse()
+        self.assertEqual(response.status,200)
+        with self.assertRaises(http.client.IncompleteRead):
+            response.read()
+        connection.close()
+        deadline = time.monotonic() + 5
+        while True:
+            index = json.loads((self.state / "history.index").read_text())
+            snapshots = list(index["snapshots"].values())
+            if snapshots and not snapshots[0]["primary_pending"]: break
+            self.assertLess(time.monotonic(),deadline)
+            time.sleep(.01)
+        self.assertEqual(snapshots[0]["primary"]["calls"],1)
+        self.assertEqual(snapshots[0]["primary"]["input_tokens"],100)
+        self.assertNotIn("UNPUBLISHED_LARGE_RESULT_",json.dumps(index))
+        self.assertNotIn("paid_growth_1",[v["external_id"] for v in index["transcripts"].values()])
+        self.assertEqual(proxy.request("POST","/v1/responses",{"model":"gpt-6-luna","previous_response_id":"paid_growth_1","input":[]})[0],409)
+        proxy.close()
+        proxy = self.proxy(fixture,options)
+        self.assertEqual(proxy.send(h)[0],200)
+        self.assertEqual(proxy.saved()["primary"]["calls"],2)
+        self.assertEqual(proxy.saved()["primary"]["input_tokens"],200)
+        self.assertEqual(len(fixture.primaries),2)
+        self.evidence.update(before_restart=snapshots[0],after_restart=proxy.saved())
+
+    def test_terminal_reviewer_receipt_write_failure_restarts_unknown_without_advice_or_double_charge(self):
+        def review(_body, n):
+            fixture.held.set()
+            self.assertTrue(fixture.release.wait(10))
+            value = {"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"MUST_NOT_PUBLISH_UNSETTLED_FACT"}]} if n == 1 else {"protected":[],"removable":[],"memories":[]}
+            return 200, advice_response(value)
+        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"receipt_fault_{n}")),review)
+        options = ["--review-replayed-history","--classifier-cache-policy","disabled","--payoff-requests","1"]
+        h = [{"role":"user","content":"goal"},{"role":"assistant","content":"source " * 1000},{"role":"user","content":"task"}]
+        proxy = self.proxy(fixture,options,wait_reviews=False)
+        self.assertEqual(proxy.send(h,wait=False)[0],200)
+        self.assertTrue(fixture.held.wait(5))
+        # Primary is complete and canonical before breaking only the completed
+        # review's receipt publication. The provider then sends its real terminal.
+        deadline = time.monotonic()+5
+        while proxy.saved().get("primary_pending"):
+            self.assertLess(time.monotonic(),deadline); time.sleep(.01)
+        fault = self.state / ".history-index.tmp"
+        fault.mkdir()
+        fixture.release.set()
+        deadline = time.monotonic()+5
+        while not any('"background_review_merged"' in p.read_text() and '"receipt_durable":false' in p.read_text()
+                      for p in (self.state / "diagnostics").glob("*.jsonl")):
+            self.assertLess(time.monotonic(),deadline); time.sleep(.01)
+        index = json.loads((self.state / "history.index").read_text())
+        self.assertFalse(index["reviews"])
+        paid = list(index["snapshots"].values())[0]
+        self.assertTrue(paid["background_review_pending"])
+        self.assertEqual(paid["shadow"]["calls"],0, "uncommitted receipt is explicitly unknown, never silently known-zero")
+        proxy.close()
+        fault.rmdir()
+        # Preserve the exact settings namespace. A bootstrap retry is a new
+        # paid call, separate from the single explicitly censored orphan.
+        proxy = self.proxy(fixture,options)
+        self.assertEqual(proxy.send(h)[0],200)
+        stats = proxy.request("GET","/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
+        self.assertGreaterEqual(stats["coverage"]["prior_untracked_calls"],1)
+        self.assertIsNone(stats["carry_cost"])
+        self.assertEqual(len(fixture.reviews),2)
+        self.assertNotIn("MUST_NOT_PUBLISH_UNSETTLED_FACT",json.dumps(fixture.primaries[-1]))
+        self.assertEqual(proxy.saved()["shadow"]["calls"],2)
+        self.assertEqual(proxy.saved()["shadow"]["input_tokens"],100)
+        self.assertEqual(proxy.saved()["shadow"]["unavailable_cost_calls"],1)
+        self.assertEqual(proxy.saved()["primary"]["calls"],2)
+        self.evidence.update(canonical_unknown=paid,restarted=proxy.saved(),stats=stats)
+
+    def test_reviewer_cache_identity_tracks_actual_fallback_credential_after_restart(self):
+        def review(_body, _n):
+            response = advice_response({"protected": [], "removable": [], "memories": []})
+            response["usage"] = {"input_tokens": 10000, "output_tokens": 1,
+                                 "input_tokens_details": {"cached_tokens": 9000}}
+            return 200, response
+        fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"auth_{n}")), review)
+        history = [{"role": "user", "content": "goal"},
+                   {"role": "assistant", "content": "synthetic credential control " * 3000},
+                   {"role": "user", "content": "current"}]
+        identities = []
+        for default, override in (("default-B", ""), ("default-C", ""),
+                                  ("default-C", "  "), ("default-C", "explicit-D")):
+            proxy = TransparentProxy(self.state, fixture,
+                ["--review-replayed-history", "--classifier-cache-policy", "openai-explicit"],
+                extra_env={"CARRY_PROXY_UPSTREAM_KEY": "upstream-A",
+                           "CARRY_PROXY_CLASSIFIER_KEY": override, "OPENAI_API_KEY": default})
+            self.stack.callback(proxy.close)
+            before = len(fixture.reviews)
+            self.assertEqual(proxy.send(history)[0], 200)
+            self.assertEqual(len(fixture.reviews), before + 1, "each credential control must dispatch an actual reviewer")
+            index = json.loads((self.state / "history.index").read_text())
+            latest = [entry for entry in index["upstream_cache"]
+                      if entry["credential_sha256"] == fixture.review_auth_hashes[-1]]
+            self.evidence.update(cache=index["upstream_cache"], actual_auth_hashes=fixture.review_auth_hashes)
+            self.assertTrue(latest, "cache identity must hash the credential actually sent, not primary fallback")
+            identities.append(fixture.review_auth_hashes[-1])
+            proxy.close()
+        self.assertNotEqual(identities[0], identities[1])
+        self.assertEqual(identities[1], identities[2], "blank override uses the actual default")
+        self.assertNotEqual(identities[2], identities[3])
+
+    def test_request_projection_can_restore_genuinely_rewarmed_original_source(self):
+        """A past cold omission is an audit event, never semantic removal authority."""
+        def primary(body, n):
+            value = completed(response_id=f"reversible_{n}")
+            value["usage"]["input_tokens"] = max(100, len(wire(body["input"])) // 4)
+            value["usage"]["input_tokens_details"]["cached_tokens"] = (
+                value["usage"]["input_tokens"] * 99 // 100)
+            return 200, value
+
+        def review(_body, _n):
+            return 200, advice_response({"protected": [], "removable": [2], "memories": []})
+
+        fixture = self.fixture(primary, review)
+        options = ["--payoff-requests", "1", "--classifier-cache-policy", "disabled"]
+        proxy = self.proxy(fixture, [*options, "--review-replayed-history"])
+        history = [{"role": "user", "content": "PROTECTED_ORIGINAL_GOAL " + "direction " * 10000},
+                   {"role": "assistant", "content": "REVERSIBLE_ORIGINAL_SOURCE " + "payload " * 6000},
+                   {"role": "user", "content": "CURRENT_H_DIRECTION"}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        proxy.close()
+        # The loopback destination cannot advertise official provider semantics.
+        # Attest only this synthetic fixture's cache capability on the frozen
+        # pair; native cache activity still comes solely from actual HTTP usage.
+        path = self.state / "history.index"
+        index = json.loads(path.read_text())
+        for snapshot in index["snapshots"].values():
+            snapshot["model_resolution"]["primary"]["cache"] = {
+                "minimum_prefix_tokens": 1024, "max_read_breakpoints": 50,
+                "max_write_breakpoints": 4, "implicit_breakpoint_uses_write_slot": True}
+        path.write_bytes(wire(index))
+        options += ["--review-every-requests", "100"]
+        # Advertised fixture capability precedes a real canonical dispatch.
+        # No saved cache receipt is manufactured by the attestation above.
+        warm = TransparentProxy(self.state, fixture, options, mode="audit")
+        self.stack.callback(warm.close)
+        self.assertEqual(warm.send(history)[0], 200)
+        warm.close()
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertIn(history[1], fixture.primaries[-1]["input"], "warm prefix favors original source")
+        proxy.close()
+        # Stage elapsed provider TTL only, not semantic advice, a receipt or a
+        # planner result. Every outgoing body is still rendered by the real CLI.
+        path = self.state / "history.index"
+        index = json.loads(path.read_text())
+        for entry in index.get("upstream_cache", []):
+            entry["at"] = 1
+        for snapshot in index["snapshots"].values():
+            for field in ("primary_cache", "reviewer_cache", "upstream_cache"):
+                for entry in snapshot.get(field, []):
+                    entry["at"] = 1
+                    if "read_confirmed_at" in entry:
+                        entry["read_confirmed_at"] = 1
+        path.write_bytes(wire(index))
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertNotIn(history[1], fixture.primaries[-1]["input"], "expired prefix permits cold omission")
+        cold = fixture.primaries[-1]
+        proxy.close()
+        # If both shapes are warm the smaller compact view can remain cheaper.
+        # Expire its new receipt before genuinely re-warming canonical H alone.
+        index = json.loads(path.read_text())
+        for entry in index["upstream_cache"]:
+            entry["at"] = 1
+        path.write_bytes(wire(index))
+        # Audit mode genuinely dispatches canonical H. Only its terminal provider
+        # receipt may re-warm that exact shape; no invented saved cache entries.
+        proxy = TransparentProxy(self.state, fixture, options, mode="audit")
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(history)[0], 200)
+        rewarmed = fixture.primaries[-1]
+        self.evidence.update(cold=cold, actual_rewarm=rewarmed, upstream=fixture.primaries)
+        self.assertIn(history[1], rewarmed["input"], "audit must dispatch canonical original H after prior omission")
+        proxy.close()
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.evidence["restored"] = fixture.primaries[-1]
+        self.assertIn(history[1], fixture.primaries[-1]["input"],
+                      "genuine compatible cache evidence must make the same original H retainable again")
+        self.assertIn(history[0], fixture.primaries[-1]["input"])
+        self.assertEqual(proxy.checkpoint(history)[1]["cost_trajectory"]["restored"], 0,
+                         "retaining canonical source replaces the old omission quantity with zero")
+        self.assertEqual(len(fixture.reviews), 1, "reversibility needs no paid semantic recovery")
+
+
+    def test_actual_cache_receipts_replace_cold_warm_cold_without_stale_owner_replay(self):
+        def primary(_body, n):
+            value = completed(response_id=f"cache_latest_{n}")
+            value["usage"]["input_tokens"] = 4000
+            value["usage"]["input_tokens_details"]["cached_tokens"] = 3000 if n == 3 else 0
+            return 200, value
+        fixture = self.fixture(primary)
+        history = [{"role":"user","content":"CACHE_WIRE " + "prefix " * 2000}]
+        options = ["--review-every-requests","100","--classifier-cache-policy","disabled"]
+        proxy = TransparentProxy(self.state, fixture, options, mode="audit")
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(history)[0], 200)
+        proxy.close()
+        path = self.state / "history.index"
+        index = json.loads(path.read_text())
+        for snapshot in index["snapshots"].values():
+            snapshot["model_resolution"]["primary"]["cache"] = {
+                "minimum_prefix_tokens":1024,"max_read_breakpoints":50,
+                "max_write_breakpoints":4,"implicit_breakpoint_uses_write_slot":True}
+        path.write_bytes(wire(index))
+        proxy = TransparentProxy(self.state, fixture, options, mode="audit")
+        self.stack.callback(proxy.close)
+        snapshots = []
+        self.evidence["observations"] = snapshots
+        # No sleep, clock change, receipt injection, or increasing request body.
+        for fraction in (0, .75, 0):
+            self.assertEqual(proxy.send(history)[0], 200)
+            index = json.loads(path.read_text())
+            records = index["upstream_cache"]
+            snapshots.append({"expected":fraction,"records":records,
+                              "paid":proxy.checkpoint(history)[1]["primary"]})
+        self.evidence["primary_wires"] = fixture.primaries
+        self.assertTrue(all(body == fixture.primaries[0] for body in fixture.primaries))
+        self.assertEqual(len(fixture.reviews), 0)
+        self.assertEqual(snapshots[-1]["paid"]["calls"], 4)
+        self.assertEqual(snapshots[-1]["paid"]["input_tokens"], 16000)
+        self.assertEqual(snapshots[-1]["paid"]["cached_tokens"], 3000)
+        for snapshot in snapshots:
+            self.assertEqual(len(snapshot["records"]), 1, "one latest actual receipt per exact wire identity")
+            self.assertEqual(snapshot["records"][0]["native_cached_fraction"], snapshot["expected"],
+                             "actual warm receipt must replace cold; later cold must revoke warm evidence")
+        proxy.close()
+        proxy = TransparentProxy(self.state, fixture, options, mode="audit")
+        self.stack.callback(proxy.close)
+        self.assertEqual(json.loads(path.read_text())["upstream_cache"], snapshots[-1]["records"])
+
+    def test_repeated_projection_prices_current_omission_once_after_restart(self):
+        """Real advice/planner/receipts: identical H and N must not invent growth."""
+        fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"projection_{n}")),
+            lambda _b,_n: (200, advice_response({"protected":[], "removable":[2], "memories":[]})))
+        history = [{"role":"user","content":"PROJECTION_GOAL"},
+                   {"role":"assistant","content":"REMOVABLE_SOURCE " + "payload " * 3000},
+                   {"role":"user","content":"PROJECTION_TASK"}]
+        options = ["--payoff-requests","1","--classifier-cache-policy","disabled"]
+        proxy = self.proxy(fixture, [*options, "--review-replayed-history"])
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(len(fixture.reviews), 1)
+        proxy.close()
+        options += ["--review-every-requests","100"]
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertNotIn(history[1], fixture.primaries[-1]["input"])
+        first_wire = fixture.primaries[-1]
+        _, first = proxy.checkpoint(history)
+        before = first["cost_trajectory"]
+        self.assertGreater(before["restored"], 0)
+        self.assertEqual(before["last_traditional_input"], 100 + before["restored"])
+        proxy.close()
+        # Owned synthetic scenario only: one legitimate restoration fits, two
+        # copies cross. No receipt, source, tariff, or semantic advice is staged.
+        path = self.state / "history.index"
+        index = json.loads(path.read_text())
+        owner = next(k for k,v in index["snapshots"].items() if v["primary"]["calls"] == 2)
+        threshold = 100 + before["restored"] + before["restored"] // 2
+        index["snapshots"][owner]["cost_trajectory"]["scenario"] = {
+            "context_window":threshold + 100,"reserve":100,"keep_recent":100,"summary":50}
+        path.write_bytes(wire(index))
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        _, second = proxy.checkpoint(history)
+        after = second["cost_trajectory"]
+        self.evidence.update(first=first, second=second, threshold=threshold,
+                             primary_wires=fixture.primaries, review_wires=fixture.reviews)
+        self.assertEqual(fixture.primaries[-1], first_wire, "same canonical H chooses the same omission")
+        self.assertEqual(second["primary"]["calls"], 3)
+        self.assertEqual(second["primary"]["input_tokens"], 300)
+        self.assertEqual(second["shadow"]["calls"], 1)
+        self.assertEqual(after["last_traditional_input"], before["last_traditional_input"],
+                         "repeated disposable omission must not accumulate restoration")
+        self.assertEqual(after["result"]["traditional_compactions"], 0,
+                         "duplicate restoration must not cross the modeled summary boundary")
+        self.assertEqual(after["result"]["summary_cost"], 0)
+        self.assertEqual(after["restored"], before["restored"])
+        rates = first["model_resolution"]["primary"]["rates"]
+        expected = (before["last_traditional_input"] * rates["cached"] + rates["output"]) / 1_000_000
+        self.assertAlmostEqual(after["result"]["traditional_cost"] - before["result"]["traditional_cost"],
+                               expected, delta=1e-12, msg="the repeated request uses one current restoration at frozen rates")
+        self.assertEqual(second["model_resolution"], first["model_resolution"])
+
+    def test_repeated_projections_do_not_starve_async_review(self):
+        def review(body, n):
+            eligible = ledger(body)["eligible_group_ids"]
+            return 200, advice_response({"protected": [], "removable": eligible, "memories": []})
+        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"starve_{n}")), review)
+        proxy = self.proxy(fixture,["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled"])
+        h = [{"role":"user","content":"goal"},
+             {"role":"assistant","content":"old output " * 6000},
+             {"role":"user","content":"next"}]
+        self.assertEqual(proxy.send(h)[0],200)
+        self.assertEqual(len(fixture.reviews),1)
+        for n in range(3):
+            h += [{"role":"assistant","content":f"later {n} " * 3000},
+                  {"role":"user","content":f"continue {n}"}]
+            self.assertEqual(proxy.send(h)[0],200)
+        self.evidence.update(primaries=fixture.primaries,reviews=fixture.reviews)
+        self.assertGreater(len(fixture.reviews),1,"selected projections must not suppress ordinary async review")
+
+    def test_completed_advice_survives_two_days_and_more_than_eight_cuts(self):
+        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"retained_{n}")),
+            lambda body,n: (200,advice_response({"protected":[],"removable":[2],"memories":[]})))
+        proxy = self.proxy(fixture,["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled"])
+        h = [{"role":"user","content":"goal"},{"role":"assistant","content":"reviewed source " * 6000},
+             {"role":"user","content":"cut 0"}]
+        self.assertEqual(proxy.send(h)[0],200)
+        original = list(h)
+        for n in range(10):
+            h += [{"role":"user","content":f"cut {n+1}"}]
+            self.assertEqual(proxy.send(h)[0],200)
+        proxy.close()
+        path = self.state / "history.index"
+        index = json.loads(path.read_text())
+        # Clock seam only: no manufactured advice, wire/cache receipt or plan.
+        for records in index["reviews"].values():
+            for record in (records if isinstance(records,list) else [records]):
+                record["at"] = int(time.time()) - 2*86400
+        path.write_bytes(wire(index))
+        proxy = self.proxy(fixture,["--review-every-requests","100","--payoff-requests","1","--classifier-cache-policy","disabled"])
+        self.assertEqual(proxy.send(original+[{"role":"user","content":"sibling"}])[0],200)
+        self.evidence.update(index=index,primaries=fixture.primaries)
+        self.assertNotIn(original[1],fixture.primaries[-1]["input"],"seven-day review retention must not expire after one day")
+
+    def test_no_fit_acquires_one_bounded_review_before_primary(self):
+        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"fit_{n}")),
+            lambda _b,n: (200,advice_response({"protected":[],"removable":[2],"memories":[]})))
+        h = [{"role":"user","content":"goal"},{"role":"assistant","content":"bulky output " * 12000},
+             {"role":"user","content":"current task"}]
+        proxy = self.proxy(fixture,["--review-every-requests","100","--classifier-cache-policy","disabled"])
+        self.assertEqual(proxy.send(h)[0],200)
+        self.assertEqual(len(fixture.reviews),0)
+        proxy.close()
+        proxy = self.proxy(fixture,["--review-every-requests","100","--classifier-cache-policy","disabled",
+            "--primary-context-tokens","5000","--primary-output-reserve-tokens","1","--context-margin-percent","0"])
+        self.assertEqual(proxy.send(h)[0],200,"genuine no-fit may acquire one useful review before primary")
+        self.assertEqual(len(fixture.reviews),1)
+        self.assertNotIn(h[1],fixture.primaries[-1]["input"])
+        self.assertEqual(proxy.saved()["shadow"]["calls"],1)
+        self.evidence.update(primaries=fixture.primaries,reviews=fixture.reviews,state=proxy.saved())
+
+    def test_no_fit_exception_failure_no_help_and_timeout_never_send_primary(self):
+        original_state = self.state
+        for outcome in ("failure", "no_help", "timeout"):
+            with self.subTest(outcome=outcome):
+                self.state = original_state / outcome
+                def review(_body, _n):
+                    if outcome == "timeout":
+                        time.sleep(3)
+                    if outcome == "failure":
+                        return 503, {"error": "synthetic failure"}
+                    return 200, advice_response({"protected": [], "removable": [], "memories": []})
+                fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"nohelp_{n}")), review)
+                history = [{"role":"user","content":"goal"},
+                           {"role":"assistant","content":"UNREVIEWED_SOURCE " * 3000},
+                           {"role":"user","content":"current"}]
+                options = ["--review-every-requests","100","--classifier-cache-policy","disabled"]
+                proxy = self.proxy(fixture, options)
+                self.assertEqual(proxy.send(history)[0], 200)
+                proxy.close()
+                proxy = self.proxy(fixture, options + ["--primary-context-tokens","5000",
+                    "--primary-output-reserve-tokens","1","--context-margin-percent","0",
+                    "--classifier-timeout-secs","1"])
+                started = time.monotonic()
+                self.assertEqual(proxy.send(history)[0], 413)
+                self.assertLess(time.monotonic() - started, 4, "one bounded exceptional attempt including planning/persistence")
+                self.assertEqual(len(fixture.reviews), 1)
+                self.assertEqual(len(fixture.primaries), 1, "no unqualified source removal or overflowing primary")
+                saved = json.loads(proxy.checkpoint(history)[0].read_text())
+                self.assertEqual(saved["shadow"]["calls"], 1)
+                self.assertEqual(saved["shadow"]["unavailable_cost_calls"], int(outcome != "no_help"))
+                # checkpoint(history) above hydrates the canonical node chain
+                # and requires exact original values, not omitted wire values.
+                self.assertEqual(len(saved["history"]), len(history))
+                self.evidence[outcome] = {"saved": saved, "reviews": fixture.reviews}
+                proxy.close()
+        self.state = original_state
+
+    def test_projected_merged_members_publish_under_original_cut_after_advancement(self):
+        import threading
+        held, release = threading.Event(), threading.Event()
+        self.stack.callback(release.set)
+        def review(body,n):
+            if n == 1:
+                return 200,advice_response({"protected":[],"removable":[3],"memories":[]})
+            if n == 2:
+                group = next(g for g in ledger(body)["current_groups"] if g["group_id"] == 2)
+                self.assertEqual(group["member_ids"],[2,4])
+                held.set()
+                self.assertTrue(release.wait(10))
+                return 200,advice_response({"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"MERGED_ORIGINAL_FACT"}]})
+            self.fail("no extra review while captured projection is held")
+        fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"merged_{n}")),review)
+        h = [{"role":"user","content":"original goal"},
+             {"role":"assistant","content":"LEFT_SOURCE " * 3000},
+             {"role":"user","content":"OLD_SEPARATOR " * 10000},
+             {"role":"assistant","content":"RIGHT_SOURCE " * 3000},
+             {"role":"user","content":"original H boundary"}]
+        options = ["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled"]
+        proxy = self.proxy(fixture,options)
+        self.assertEqual(proxy.send(h)[0],200)
+        proxy.wait_reviews = False
+        self.assertEqual(proxy.send(h)[0],200)
+        self.assertTrue(held.wait(3),"selected source projection must still dispatch the next async review")
+        advanced = h + [{"role":"user","content":"A_ONLY"}]
+        self.assertEqual(proxy.send(advanced)[0],200)
+        release.set()
+        deadline = time.monotonic()+5
+        while not proxy.reviewers_settled():
+            self.assertLess(time.monotonic(),deadline)
+            time.sleep(.01)
+        proxy.close()
+        proxy = self.proxy(fixture,["--review-every-requests","100","--payoff-requests","1","--classifier-cache-policy","disabled"])
+        for suffix in ("B_ONLY","C_ONLY"):
+            child = h + [{"role":"user","content":suffix}]
+            self.assertEqual(proxy.send(child)[0],200)
+            sent = fixture.primaries[-1]["input"]
+            for source in h[1:4]: self.assertNotIn(source,sent)
+            self.assertIn("MERGED_ORIGINAL_FACT",json.dumps(sent))
+            self.assertNotIn("A_ONLY",json.dumps(sent))
+            self.assertIn(h[0],sent)
+            fact_at = next(i for i,x in enumerate(sent) if "MERGED_ORIGINAL_FACT" in json.dumps(x))
+            self.assertLess(fact_at,sent.index(h[4]),"fact belongs after original member 4, before original H direction")
+        self.evidence.update(primaries=fixture.primaries,reviews=fixture.reviews)
+        self.assertEqual(len(fixture.reviews),2)
+
+    def test_exact_original_review_survives_advanced_owner_and_restart(self):
+        """Completed H advice belongs to H, not its worker's now-advanced owner."""
+        import threading
+        held, release = threading.Event(), threading.Event()
+        self.stack.callback(release.set)
+
+        def review(body, n):
+            self.assertEqual(n, 1, "one captured-H worker, no synchronous rescue")
+            held.set()
+            self.assertTrue(release.wait(10), "release the actual held HTTP review")
+            self.assertIn(2, ledger(body)["eligible_group_ids"])
+            return 200, advice_response({"protected": [], "removable": [2],
+                "memories": [{"source_ids": [2], "text": "EXACT_H_FACT"}]})
+
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"exact_h_{n}")), review)
+        options = ["--review-replayed-history", "--payoff-requests", "1",
+                   "--classifier-cache-policy", "disabled"]
+        proxy = self.proxy(fixture, options, wait_reviews=False)
+        history = [{"role": "user", "content": "KEEP_ORIGINAL_GOAL"},
+                   {"role": "assistant", "content": "EXACT_H_SOURCE " + "payload " * 6000},
+                   {"role": "user", "content": "H_BOUNDARY"}]
+        self.assertEqual(proxy.send(history)[0], 200, "ordinary primary cannot wait for review")
+        self.assertTrue(held.wait(3), "real reviewer must be held before advancement")
+        advanced = history + [{"role": "user", "content": "A_ONLY"}]
+        self.assertEqual(proxy.send(advanced)[0], 200)
+        self.assertEqual(len(fixture.primaries), 2, "H+A completed before H review release")
+        release.set()
+        deadline = time.monotonic() + 5
+        while not proxy.reviewers_settled():
+            self.assertLess(time.monotonic(), deadline, "captured H completion must settle")
+            time.sleep(.01)
+        settled = proxy.checkpoint(advanced)[1]
+        self.assertEqual(settled["shadow"]["calls"], 1, "paid review settles once")
+        proxy.close()
+        options = ["--review-every-requests", "100", "--payoff-requests", "1",
+                   "--classifier-cache-policy", "disabled"]
+        proxy = self.proxy(fixture, options)
+        wires = []
+        for suffix in ("B_ONLY", "C_ONLY"):
+            child = history + [{"role": "user", "content": suffix}]
+            self.assertEqual(proxy.send(child)[0], 200)
+            sent = fixture.primaries[-1]["input"]
+            wires.append(sent)
+            self.evidence.update(settled=settled, primary_inputs=wires,
+                                 reviewer_requests=fixture.reviews)
+            self.assertNotIn(history[1], sent,
+                "exact original H advice must be reusable after H+A advancement/restart")
+            self.assertIn("EXACT_H_FACT", json.dumps(sent))
+            self.assertNotIn("A_ONLY", json.dumps(sent))
+            self.assertIn(history[0], sent)
+            _, state = proxy.checkpoint(child)
+            self.assertEqual(state["primary"]["calls"], 1)
+            self.assertEqual(state["shadow"]["calls"], 0, "no sibling billed receipt inheritance")
+        self.assertEqual(len(fixture.reviews), 1)
+
+
+    def test_empty_selection_retires_historical_memory_authority(self):
+        def review(body, n):
+            return 200, advice_response({"protected": [], "removable": [ledger(body)["eligible_memory_ids"][0]] if n == 2 else [],
+                "memories": [{"source_ids": [2], "text": "RETIRED_FACT"}] if n == 1 else []})
+
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"retire_{n}")), review)
+        options = ["--review-replayed-history", "--payoff-requests", "1",
+                   "--classifier-cache-policy", "disabled"]
+        proxy = self.proxy(fixture, options)
+        history = [{"role": "user", "content": "GOAL"},
+                   {"role": "assistant", "content": "SOURCE"},
+                   {"role": "user", "content": "BOUNDARY"}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(proxy.advice()["memories"][0]["text"], "RETIRED_FACT")
+        self.assertEqual(proxy.send(history)[0], 200)
+        owner, retired = proxy.checkpoint(history)
+        retired_advice = proxy.advice()
+        self.assertEqual(retired_advice["memories"], [])
+        self.assertFalse(any(v == "drop" for v in retired_advice["opinions"].values()))
+        self.assertTrue(all("removed" not in i for i in retired["history"]))
+        auxiliary = history + [{"role": "user", "content": "AUX"}]
+        self.assertEqual(proxy.send(auxiliary)[0], 200)
+        sibling_bytes = owner.read_bytes()
+        proxy.close()
+        proxy = self.proxy(fixture, options)
+        foreground = history + [{"role": "user", "content": "FOREGROUND"}]
+        self.assertEqual(proxy.send(foreground)[0], 200)
+        child_owner, child = proxy.checkpoint(foreground)
+        self.evidence.update(retired=retired, child=child, primary=fixture.primaries[-1])
+        self.assertEqual(proxy.advice()["memories"], [], "empty committed selection must supersede retired facts")
+        self.assertNotIn("RETIRED_FACT", json.dumps(fixture.primaries[-1]["input"]))
+        self.assertNotEqual(child_owner, owner)
+        self.assertEqual(child["primary"]["calls"], 1)
+        self.assertEqual(child["shadow"]["calls"], 0)
+        self.assertEqual(owner.read_bytes(), sibling_bytes)
+
 
     def test_no_header_fork_reuses_committed_ancestor_after_cleanup_and_restart(self):
         history = [{"role": "user", "content": "ANCESTOR_GOAL"},
@@ -77,8 +754,8 @@ class TransparentHistory(unittest.TestCase):
                    {"role": "user", "content": "A_BOUNDARY"}]
         def review(body, n):
             ids = ledger(body)["eligible_group_ids"]
-            return 200, advice_response({"protected": [i for i in ids if i == "g1"], "removable": [i for i in ids if i != "g1"],
-                "memories": [{"source_ids": ["g2"], "text": "A_FACT"}] if n == 1 else []})
+            return 200, advice_response({"protected": [i for i in ids if i == 1], "removable": [i for i in ids if i != 1],
+                "memories": [{"source_ids": [2], "text": "A_FACT"}] if n == 1 else []})
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")), review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
                    "--classifier-cache-policy", "disabled"]
@@ -164,9 +841,9 @@ class TransparentHistory(unittest.TestCase):
                    {"role": "user", "content": "A_BOUNDARY"}]
         def default_review(body, n):
             ids = ledger(body)["eligible_group_ids"]
-            return 200, advice_response({"protected": [i for i in ids if i == "g1"],
-                "removable": [i for i in ids if i != "g1"],
-                "memories": [{"source_ids": ["g2"], "text": "A_FACT"}] if n == 1 else []})
+            return 200, advice_response({"protected": [i for i in ids if i == 1],
+                "removable": [i for i in ids if i != 1],
+                "memories": [{"source_ids": [2], "text": "A_FACT"}] if n == 1 else []})
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")), review or default_review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
                    "--classifier-cache-policy", "disabled", *extra]
@@ -175,84 +852,6 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(history)[0], 200)
         return proxy, fixture, history, options
 
-    def test_lowered_fork_byte_budget_retires_indexed_review_after_restart(self):
-        proxy, fixture, history, options = self.seed()
-        self.assertEqual(proxy.send(history + [{"role": "user", "content": "BYTE_PARENT_B"}])[0], 200)
-        self.assertTrue(json.loads((self.state / "history.index").read_text())["reviews"])
-        proxy.close()
-        # Positive restart control: the retained A version really is portable.
-        proxy = self.proxy(fixture, options)
-        control = history + [{"role": "user", "content": "BYTE_CONTROL_C"}]
-        self.assertEqual(proxy.send(control)[0], 200)
-        self.assertIn("A_FACT", json.dumps(fixture.primaries[-1]))
-        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]))
-        proxy.close()
-        # A distinct divergent child cannot use the now-over-budget A version.
-        # Disable new reviews so no fresh paid advice can hide stale hydration.
-        bounded = ["--payoff-requests", "1", "--classifier-cache-policy", "disabled",
-                   "--review-every-requests", "100", "--fork-max-bytes", "2"]
-        proxy = self.proxy(fixture, bounded)
-        reviews = len(fixture.reviews)
-        child = history + [{"role": "user", "content": "BYTE_COLD_D"}]
-        status, result = proxy.send(child)
-        self.assertEqual(status, 200, result)
-        self.assertEqual(fixture.primaries[-1]["input"], child,
-                         "the index must not bypass the portable-review byte bound")
-        self.assertEqual(len(fixture.reviews), reviews)
-        _, saved = proxy.checkpoint(child)
-        self.assertEqual(saved["primary"]["calls"], 1)
-        self.assertEqual(saved["shadow"]["calls"], 0)
-        self.assertEqual(saved["memories"], [])
-        index = json.loads((self.state / "history.index").read_text())
-        self.assertEqual(index["reviews"], {})
-        self.assertEqual(len(wire([p for ps in index["reviews"].values() for p in ps])), 2)
-        # Evidence eviction is not permission to clear an existing selected
-        # lineage's accepted memory, removals or once-only paid receipts.
-        self.assertEqual(proxy.send(control)[0], 200)
-        _, retained = proxy.checkpoint(control)
-        self.assertEqual(retained["primary"]["calls"], 2)
-        self.assertEqual(retained["shadow"]["calls"], 0)
-        self.assertIn("A_FACT", json.dumps(fixture.primaries[-1]["input"]))
-        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
-
-    def test_shared_review_budget_counts_exact_flattened_vector_not_individual_points(self):
-        proxy, fixture, history, _ = self.seed()
-        parent = history + [{"role": "user", "content": "AGGREGATE_PARENT"}]
-        self.assertEqual(proxy.send(parent)[0], 200)
-        other = [{"role": "user", "content": "OTHER_GOAL"},
-                 {"role": "assistant", "content": "OTHER_RAW " + "payload " * 6000},
-                 {"role": "user", "content": "OTHER_BOUNDARY"}]
-        self.assertEqual(proxy.send(other)[0], 200)
-        index = json.loads((self.state / "history.index").read_text())
-        points = [p for ps in index["reviews"].values() for p in ps]
-        self.assertGreaterEqual(len(points), 2, "actual independent committed reviews required")
-        limit = len(wire(points)) - 1
-        self.assertTrue(all(len(wire([p])) <= limit for p in points))
-        self.assertLessEqual(sum(len(wire(p)) for p in points), limit,
-                             "point-only summation must miss this exact-vector boundary")
-        _, selected = proxy.checkpoint(parent)
-        proxy.close()
-        proxy = self.proxy(fixture, ["--fork-max-bytes", str(limit),
-                                   "--review-every-requests", "100"])
-        reviews = len(fixture.reviews)
-        self.assertEqual(proxy.send(parent)[0], 200)
-        index = json.loads((self.state / "history.index").read_text())
-        retained = [p for ps in index["reviews"].values() for p in ps]
-        self.assertLessEqual(len(wire(retained)), limit)
-        self.assertLess(len(retained), len(points))
-        self.assertTrue(retained, "a fitting version still remains portable")
-        self.assertEqual(len(fixture.reviews), reviews)
-        _, resumed = proxy.checkpoint(parent)
-        self.assertEqual(resumed["primary"]["calls"], selected["primary"]["calls"] + 1)
-        self.assertEqual(resumed["shadow"], selected["shadow"])
-        self.assertEqual(resumed["memories"], selected["memories"])
-        self.assertEqual([i["removed"] for i in resumed["history"]],
-                         [i["removed"] for i in selected["history"]])
-        self.assertIn("A_FACT", json.dumps(fixture.primaries[-1]["input"]))
-        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
-        self.evidence.update(flattened_before_bytes=len(wire(points)),
-                             individual_point_bytes=sum(len(wire(p)) for p in points),
-                             configured_bytes=limit, retained_bytes=len(wire(retained)))
 
     def test_expired_original_input_starts_cold_with_and_without_restart(self):
         root = self.state
@@ -260,15 +859,18 @@ class TransparentHistory(unittest.TestCase):
             with self.subTest(restart=restart):
                 self.state = root / ("restart" if restart else "same_process")
                 self.state.mkdir()
-                proxy, fixture, history, _ = self.seed(extra=["--fork-max-age-secs", "1",
+                # Whole-second retention timestamps need setup slack: a one-second
+                # TTL can expire a real review during its first primary publication.
+                ttl = 5
+                proxy, fixture, history, _ = self.seed(extra=["--history-max-age-secs", str(ttl),
                                                              "--review-every-requests", "100"])
                 old_path, old = proxy.checkpoint(history)
                 self.assertEqual(old["primary"]["calls"], 1)
-                self.assertTrue(old["memories"], "real accepted review supplies old authority")
-                time.sleep(2.05)
+                self.assertTrue(json.loads((self.state / "history.index").read_text())["reviews"], "real completed advice supplies old authority")
+                time.sleep(ttl + 1.05)
                 if restart:
                     proxy.close()
-                    proxy = self.proxy(fixture, ["--fork-max-age-secs", "1",
+                    proxy = self.proxy(fixture, ["--history-max-age-secs", str(ttl),
                         "--review-every-requests", "100", "--classifier-cache-policy", "disabled"])
                 status, result = proxy.send(history)
                 self.assertEqual(status, 200, result)
@@ -281,7 +883,6 @@ class TransparentHistory(unittest.TestCase):
                 if restart:
                     self.assertEqual(saved["shadow"]["calls"], 0)
                     self.assertEqual(fixture.primaries[-1]["input"], history)
-                    self.assertEqual(saved["memories"], [])
                 proxy.close()
         self.state = root
 
@@ -296,7 +897,7 @@ class TransparentHistory(unittest.TestCase):
                 assert release.wait(15), "fresh primary release"
             return 200, completed(response_id=f"same_input_{n}")
         fixture = self.fixture(primary)
-        options = ["--fork-max-age-secs", "1", "--review-every-requests", "100",
+        options = ["--history-max-age-secs", "1", "--review-every-requests", "100",
                    "--request-timeout-secs", "30"]
         proxy = self.proxy(fixture, options)
         history = [{"role": "user", "content": "CONCURRENT_FRESH_INPUT"}]
@@ -353,15 +954,14 @@ class TransparentHistory(unittest.TestCase):
         _, state = proxy.checkpoint(child)
         self.assertEqual(state["primary"]["calls"], 1)
         self.assertEqual(state["shadow"]["calls"], 0)
-        self.assertEqual(state["reviewer_cache"], [])
         self.assertEqual(len(fixture.reviews), before)
         self.assertEqual(path.read_bytes(), original)
 
     def test_later_review_closure_never_exports_b_dependent_fact_to_a_c(self):
         def review(body, n):
             ids = ledger(body)["eligible_group_ids"]
-            return 200, advice_response({"protected": [i for i in ids if i == "g2"],
-                "removable": [], "memories": [{"source_ids": ["g2"],
+            return 200, advice_response({"protected": [i for i in ids if i == 2],
+                "removable": [], "memories": [{"source_ids": [2],
                 "text": "A_FACT" if n == 1 else "B_DEPENDENT_FACT_CLAIMS_A"}]})
         proxy, fixture, history, _ = self.seed(review=review, extra=["--min-payback-percent", "100"])
         b = history + [{"role": "assistant", "content": "B_OBSERVED " + "payload " * 100},
@@ -369,26 +969,32 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(b)[0], 200)
         self.assertGreaterEqual(len(fixture.reviews), 2)
         _, parent = proxy.checkpoint(b)
-        self.assertTrue(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in parent["memories"]))
+        self.assertTrue(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in proxy.advice()["memories"]))
         index = json.loads((self.state / "history.index").read_text())
         self.assertTrue(any(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in p["memories"])
-                            for versions in index["reviews"].values() for p in versions),
+                            for p in index["reviews"].values()),
                         "later compatible reviews must be committed too, not first-raw-only: "
                         + json.dumps({"feedback": parent.get("review_feedback"),
                                       "versions": parent.get("fork_points"),
                                       "stderr": (self.state / f"fixture-{proxy.process.pid}-stderr.log").read_text()[-3000:]}))
+        # Inspect inheritance without manufacturing a new C-dependent fact
+        # from this fixture's intentionally repeated later-review response.
+        proxy.close()
+        proxy = self.proxy(fixture, ["--min-payback-percent", "100", "--review-every-requests", "100"])
         c = history + [{"role": "user", "content": "C_NOT_B"}]
         self.assertEqual(proxy.send(c)[0], 200)
         _, child = proxy.checkpoint(c)
-        self.assertTrue(any(m["text"] == "A_FACT" for m in child["memories"]))
-        self.assertFalse(any("B_DEPENDENT" in m["text"] for m in child["memories"]))
+        self.assertTrue(any(m["text"] == "A_FACT" for m in proxy.advice()["memories"]))
+        self.assertFalse(any("B_DEPENDENT" in m["text"] for m in proxy.advice()["memories"]))
+        self.assertNotIn("B_DEPENDENT", json.dumps(fixture.primaries[-1]))
         # The same later frontier IS reusable when the complete B dependency
         # remains. Advance its mutable tip first so this must hydrate B's review.
         self.assertEqual(proxy.send(b + [{"role": "user", "content": "B_NEXT"}])[0], 200)
         d = b + [{"role": "user", "content": "B_FORK_D"}]
         self.assertEqual(proxy.send(d)[0], 200)
         _, compatible = proxy.checkpoint(d)
-        self.assertTrue(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in compatible["memories"]))
+        self.assertTrue(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in proxy.advice()["memories"]))
+        self.assertEqual(len(fixture.reviews), 2, "inheritance checks cannot be satisfied by fresh reviews")
         self.assertNotIn("B_NEXT", json.dumps(fixture.primaries[-1]["input"]))
 
     def test_native_checkpoint_archives_observed_input_and_actual_output(self):
@@ -418,9 +1024,9 @@ class TransparentHistory(unittest.TestCase):
 
     def test_history_empty_envelope_limits_two_requests_and_restart(self):
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"minimum_{n}")))
-        minimum = len(wire({"nodes": {}, "tips": {}, "reviews": {},
+        minimum = len(wire({"format": "carry-prefix-history-v3", "nodes": {},
+                            "upstream_cache": [], "tips": {}, "reviews": {},
                             "transcripts": {}, "snapshots": {}}))
-        self.assertEqual(minimum, 67)
         for limit in (2, minimum - 1):
             with self.subTest(rejected_limit=limit):
                 with self.assertRaises(AssertionError, msg="impossible history byte limits must reject startup"):
@@ -587,12 +1193,19 @@ class TransparentHistory(unittest.TestCase):
         child = history + [{"role": "user", "content": "C_ONLY"}]
         self.assertEqual(proxy.send(child)[0], 200)
         self.assertIn("RAW_A", json.dumps(fixture.primaries[-1]))
-        self.assertEqual(json.loads((self.state / "history.index").read_text())["reviews"], {})
+        points = [p for ps in json.loads((self.state / "history.index").read_text())["reviews"].values()
+                  for p in ps]
+        self.assertEqual(points, [], "failed review cannot publish semantic authority")
+        for point in points:
+            self.assertEqual(point["memories"], [])
+            self.assertEqual(point["drop_members"], {})
+            self.assertNotIn("drop", point["opinions"].values())
+            self.assertFalse(any(source["removed"] for source in point["sources"]))
 
     def test_index_byte_node_age_limits_and_evicted_ids_fail_closed(self):
         env = {"CARRY_PROXY_HISTORY_MAX_BYTES": "4096", "CARRY_PROXY_HISTORY_MAX_NODES": "4",
                "CARRY_PROXY_HISTORY_MAX_REFERENCES": "4",
-               "CARRY_PROXY_FORK_MAX_AGE_SECS": "1"}
+               "CARRY_PROXY_HISTORY_MAX_AGE_SECS": "1"}
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")))
         proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"], env)
         self.stack.callback(proxy.close)
@@ -631,13 +1244,13 @@ class TransparentHistory(unittest.TestCase):
             if n == 2:
                 held.set()
                 assert release.wait(10), "held review release"
-            return 200, advice_response({"protected": [i for i in ids if i == "g1"],
-                "removable": [i for i in ids if i != "g1"],
-                "memories": [{"source_ids": ["g2"] if n == 1 else [i for i in ids if i != "g1"][:1],
+            return 200, advice_response({"protected": [i for i in ids if i == 1],
+                "removable": [i for i in ids if i != 1],
+                "memories": [{"source_ids": [2] if n == 1 else [i for i in ids if i != 1][:1],
                               "text": "A_FACT" if n == 1 else "UNCOMMITTED_B_FACT"}]})
         proxy, fixture, history, options = self.seed(review=review)
         proxy.close()
-        proxy = TransparentProxy(self.state, fixture, [*options, "--background-reviews=true"])
+        proxy = TransparentProxy(self.state, fixture, options, wait_reviews=False)
         self.stack.callback(proxy.close)
         b = [*history, {"role": "assistant", "content": "B_ONLY " + "payload " * 6000},
              {"role": "user", "content": "B_BOUNDARY"}]
@@ -674,18 +1287,18 @@ class TransparentHistory(unittest.TestCase):
                     held.set()
                     assert release.wait(45), "held reviewer release"
                     ids = ledger(body)["eligible_group_ids"]
-                    return 200, advice_response({"protected": ["g1"],
-                        "removable": [i for i in ids if i != "g1"],
-                        "memories": [{"source_ids": ["g2"], "text": "PINNED_FACT"}]})
+                    return 200, advice_response({"protected": [1],
+                        "removable": [i for i in ids if i != 1],
+                        "memories": [{"source_ids": [2], "text": "PINNED_FACT"}]})
                 fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"pin_{pressure}_{n}")), review)
                 env = {"CARRY_PROXY_HISTORY_MAX_NODES": "8"} if pressure == "nodes" else (
                     {"CARRY_PROXY_HISTORY_MAX_REFERENCES": "6"} if pressure == "references" else (
                     {"CARRY_PROXY_HISTORY_MAX_BYTES": "300000"} if pressure == "bytes" else
-                    {"CARRY_PROXY_FORK_MAX_AGE_SECS": "1"}))
+                    {"CARRY_PROXY_HISTORY_MAX_AGE_SECS": "1"}))
                 options = ["--review-replayed-history", "--payoff-requests", "1",
-                           "--classifier-cache-policy", "disabled", "--background-reviews=true",
+                           "--classifier-cache-policy", "disabled",
                            "--classifier-timeout-secs", "60"]
-                proxy = TransparentProxy(self.state, fixture, options, env)
+                proxy = TransparentProxy(self.state, fixture, options, env, wait_reviews=False)
                 self.stack.callback(proxy.close)
                 history = [{"role": "user", "content": "PINNED_GOAL"},
                            {"role": "assistant", "content": "PINNED_RAW " + "payload " * 2000},
@@ -714,25 +1327,45 @@ class TransparentHistory(unittest.TestCase):
                 while True:
                     index = json.loads((self.state / "history.index").read_text())
                     settled = index["snapshots"].get(owner, {})
-                    if not settled.get("background_review_pending", True):
+                    if not settled.get("background_review_pending", True) and proxy.reviewers_settled():
                         break
                     self.assertLess(time.monotonic(), deadline, "held review must durably settle")
                     time.sleep(.01)
                 self.assertEqual(settled["primary"]["calls"], 1)
                 self.assertEqual(settled["shadow"]["calls"], 1, "paid receipt settles exactly once")
-                self.assertTrue(any(m["text"] == "PINNED_FACT" for m in settled["memories"]))
+                # Capacity may evict advice, never an in-flight paid owner.
+                records = list(index["reviews"].values())
+                self.evidence[pressure] = {"settled": settled, "reviews": records}
                 proxy.close()
                 # The age policy may legitimately expire a settled branch. The
                 # durable receipt is checked above; non-age restart must retain it.
                 if pressure != "age":
+                    reviews_before = len(fixture.reviews)
                     proxy = TransparentProxy(self.state, fixture, options, env)
                     self.stack.callback(proxy.close)
+                    restarted = json.loads((self.state / "history.index").read_text())
+                    self.assertEqual(restarted["snapshots"][owner]["shadow"]["calls"], 1,
+                                     "restart must retain the exact settled paid receipt")
                     followup = history + [{"role": "user", "content": "PINNED_CONTINUE"}]
                     self.assertEqual(proxy.send(followup)[0], 200)
                     _, resumed = proxy.checkpoint(followup)
                     self.assertEqual(resumed["primary"]["calls"], 2)
-                    self.assertEqual(resumed["shadow"]["calls"], 1)
-                    self.assertNotIn("PINNED_RAW", json.dumps(fixture.primaries[-1]["input"]))
+                    self.assertEqual(resumed["shadow"]["calls"],
+                                     1 + len(fixture.reviews) - reviews_before,
+                                     "only actual fresh native reviews can add another paid call")
+                    sent = fixture.primaries[-1]["input"]
+                    self.assertIn(history[0], sent, "direction survives advice eviction")
+                    # The follow-up can acquire fresh bounded advice after
+                    # quota eviction. Compare source retention with the fact
+                    # on THAT actual wire, not the stale pre-restart index.
+                    materialized = any("PINNED_FACT" in json.dumps(item) for item in sent)
+                    self.evidence[pressure]["followup"] = {
+                        "primary": fixture.primaries[-1],
+                        "fresh_review_count": len(fixture.reviews) - reviews_before,
+                        "materialized_fact": materialized,
+                    }
+                    self.assertEqual(history[1] in sent, not materialized,
+                                     "retain original source unless its replacement is on this actual wire")
                 proxy.close()
         self.state = original_state
 
@@ -742,12 +1375,26 @@ class TransparentHistory(unittest.TestCase):
         held, release = threading.Event(), threading.Event()
         self.stack.callback(release.set)
         proxy, fixture, history, options = self.seed()
-        def primary(_b, n):
-            if n == 2:
-                held.set()
-                assert release.wait(20), "held primary release"
+        owner_primaries, owner_receipts = [], []
+        review_seen = threading.Event()
+        original_review = fixture.review
+        def primary(body, n):
+            if {"role":"user","content":"HELD_PRIMARY"} in body["input"]:
+                owner_primaries.append(body)
+                if len(owner_primaries) == 1:
+                    held.set()
+                    assert release.wait(20), "held primary release"
             return 200, completed(response_id=f"primary_pin_{n}")
+        def review(body, n):
+            result = original_review(body, n)
+            if any("HELD_PRIMARY" in json.dumps(item) for item in body["input"]):
+                owner_receipts.append(result[1]["usage"])
+                review_seen.set()
+            return result
         fixture.primary = primary
+        fixture.review = review
+        seeded_reviews = len(fixture.reviews)
+        self.assertEqual(seeded_reviews, 1)
         proxy.close()
         env = {"CARRY_PROXY_HISTORY_MAX_REFERENCES": "6"}
         proxy = TransparentProxy(self.state, fixture, [*options, "--request-timeout-secs", "30"], env)
@@ -756,10 +1403,15 @@ class TransparentHistory(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor() as pool:
             pending = pool.submit(proxy.send, parent)
             self.assertTrue(held.wait(2))
+            self.assertTrue(review_seen.wait(5), "join this owner's actual second reviewer dispatch")
             path, before = proxy.checkpoint(parent)
             owner = path.stem
+            self.assertEqual(before["shadow"]["calls"], 1, "new receipt cannot settle while primary holds owner lock")
+            self.assertEqual(len(owner_receipts), 1)
             for n in range(12):
-                self.assertIn(proxy.send([{"role": "user", "content": f"PRIMARY_PRESSURE_{n}"}])[0], (200, 500, 507))
+                # Do not wait on the fixture-wide barrier while another owner's
+                # primary intentionally holds that owner's reviewer settlement.
+                self.assertIn(proxy.send([{"role": "user", "content": f"PRIMARY_PRESSURE_{n}"}], wait=False)[0], (200, 500, 507))
             try:
                 index = json.loads((self.state / "history.index").read_text())
                 self.assertIn(owner, index["snapshots"], "primary transport owns its selected snapshot")
@@ -768,15 +1420,50 @@ class TransparentHistory(unittest.TestCase):
             self.assertEqual(pending.result()[0], 200)
         _, after = proxy.checkpoint(parent)
         self.assertEqual(after["primary"]["calls"], 2)
-        self.assertEqual(after["shadow"]["calls"], before["shadow"]["calls"])
-        self.assertTrue(any(i["removed"] for i in after["history"]))
+        self.assertEqual(after["primary"]["input_tokens"], 200)
+        self.assertEqual(after["primary"]["output_tokens"], 2)
+        self.assertEqual(after["primary"]["unavailable_cost_calls"], 0)
+        self.assertFalse(after["background_review_pending"])
+        self.assertEqual(after["shadow"]["calls"], 2)
+        self.assertEqual(after["shadow"]["calls"], before["shadow"]["calls"] + len(owner_receipts))
+        self.assertEqual(after["shadow"]["input_tokens"], before["shadow"]["input_tokens"] + sum(u["input_tokens"] for u in owner_receipts))
+        self.assertEqual(after["shadow"]["output_tokens"], before["shadow"]["output_tokens"] + sum(u["output_tokens"] for u in owner_receipts))
+        self.assertEqual(after["shadow"]["unavailable_cost_calls"], 0)
+        self.assertEqual(len(owner_primaries), 1)
+        self.assertNotIn("RAW_A", json.dumps(owner_primaries[0]["input"]))
+        self.assertIn(history[0], owner_primaries[0]["input"])
         proxy.close()
         proxy = TransparentProxy(self.state, fixture, options, env)
         self.stack.callback(proxy.close)
+        restarted = json.loads((self.state / "history.index").read_text())["snapshots"][owner]
+        self.assertEqual(restarted["primary"], after["primary"], "restart must not duplicate a settled primary")
+        self.assertEqual(restarted["shadow"], after["shadow"], "restart must not duplicate a settled review")
+        receipts_before = len(owner_receipts)
         self.assertEqual(proxy.send(parent)[0], 200)
         _, resumed = proxy.checkpoint(parent)
         self.assertEqual(resumed["primary"]["calls"], 3)
-        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
+        self.assertEqual(resumed["primary"]["input_tokens"], 300)
+        self.assertEqual(resumed["primary"]["output_tokens"], 3)
+        self.assertEqual(resumed["primary"]["unavailable_cost_calls"], 0)
+        owner_wires = [body for body in fixture.reviews if any("HELD_PRIMARY" in json.dumps(item) for item in body["input"])]
+        self.assertEqual(len(owner_wires), len(owner_receipts), "only this owner's actual paid requests enter its total")
+        self.assertEqual(resumed["shadow"]["calls"], seeded_reviews + len(owner_wires))
+        self.assertEqual(resumed["shadow"]["input_tokens"], 100 + sum(u["input_tokens"] for u in owner_receipts))
+        self.assertEqual(resumed["shadow"]["output_tokens"], 1 + sum(u["output_tokens"] for u in owner_receipts))
+        self.assertEqual(resumed["shadow"]["unavailable_cost_calls"], 0)
+        self.assertFalse(resumed["background_review_pending"])
+        self.assertEqual(len(owner_primaries), 2)
+        sent = owner_primaries[-1]["input"]
+        self.assertIn(history[0], sent)
+        if history[1] not in sent:
+            self.assertTrue(any(r["drops"] for r in json.loads(
+                (self.state / "history.index").read_text())["reviews"].values()),
+                "omission requires retained advice; advice does not require omission")
+        self.evidence.update(before=before, after=after, restarted=restarted, resumed=resumed,
+                             owner_primaries=owner_primaries, owner_review_wires=owner_wires, owner_receipts=owner_receipts)
+        print("HELD_PRIMARY_RECEIPTS=" + json.dumps({"settled_calls":after["shadow"]["calls"],
+              "resumed_calls":resumed["shadow"]["calls"],"new_restart_calls":len(owner_receipts)-receipts_before,
+              "owner_paid_usage":owner_receipts,"primary_calls":resumed["primary"]["calls"]}), flush=True)
 
     def test_bounded_many_sibling_storage_observation_is_not_latency_evidence(self):
         proxy, fixture, history, _ = self.seed(extra=("--history-max-references", "32"))
@@ -842,7 +1529,6 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(saved.get("model_resolution_history", []), [])
         self.assertEqual(saved["primary"]["calls"], 1)
         self.assertEqual(saved["shadow"]["calls"], 0)
-        self.assertEqual(saved["reviewer_cache"], [])
         self.assertTrue(saved["last_plan"]["primary_fits"])
         self.assertFalse(saved["last_plan"]["reviewer_fits"])
         self.assertFalse(saved["last_plan"]["forced"])
@@ -896,86 +1582,16 @@ class TransparentHistory(unittest.TestCase):
             try:
                 self.assertTrue(held.wait(2))
                 _, saved = proxy.checkpoint(child)
-                self.assertEqual(saved["primary_cache"], [])
-                self.assertEqual(saved["reviewer_cache"], [])
                 self.assertEqual(saved["primary"]["calls"], 0)
                 self.assertEqual(saved["shadow"]["calls"], 0)
                 self.assertEqual(saved["completed_requests"], 0)
                 self.assertFalse(saved["background_review_pending"])
-                self.assertEqual(saved["review_cache_key"], "")
+                self.assertNotIn("prompt_cache_key", saved["review_context"],
+                                 "cold child cannot inherit a parent's reviewer namespace")
             finally:
                 release.set()
             self.assertEqual(pending.result()[0], 200)
 
-    def test_child_memory_retirement_survives_retry_restart_and_gc(self):
-        proxy, fixture, history, options = self.seed(extra=("--review-every-requests", "1"))
-        self.assertEqual(proxy.send(history + [{"role": "user", "content": "RETIRE_PARENT"}])[0], 200)
-        child = history + [{"role": "user", "content": "RETIRE_CHILD"}]
-        self.assertEqual(proxy.send(child)[0], 200)
-        _, saved = proxy.checkpoint(child)
-        memory = "m" + str(saved["memories"][0]["id"])
-        fixture.review = lambda _b, _n: (200, advice_response({"protected": [], "removable": [memory], "memories": []}))
-        advanced = child + [{"role": "assistant", "content": "RETIRE_LOCAL_ANSWER"},
-                            {"role": "user", "content": "RETIRE_NEXT"}]
-        self.assertEqual(proxy.send(advanced)[0], 200)
-        _, saved = proxy.checkpoint(advanced)
-        self.assertEqual(saved["memories"], [])
-        shadow = saved["shadow"]["calls"]
-        self.assertGreater(shadow, 0, "actual branch-local retirement receipt")
-        self.assertEqual(proxy.send(advanced)[0], 200)
-        self.assertNotIn("A_FACT", json.dumps(fixture.primaries[-1]["input"]))
-        self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
-        _, retried = proxy.checkpoint(advanced)
-        self.assertEqual(retried["shadow"]["calls"], shadow + 1,
-                         "configured cadence-one retry settles exactly one paid review")
-        shadow = retried["shadow"]["calls"]
-        proxy.close()
-        # Freeze further reviewer work to isolate receipt persistence across
-        # restart/GC; cadence is not a review-authority namespace dimension.
-        options = list(options)
-        options[options.index("--review-every-requests") + 1] = "100"
-        proxy = TransparentProxy(self.state, fixture, options)
-        self.stack.callback(proxy.close)
-        self.assertEqual(proxy.send(advanced)[0], 200)
-        _, restored = proxy.checkpoint(advanced)
-        self.assertEqual(restored["memories"], [])
-        self.assertEqual(restored["shadow"]["calls"], shadow)
-        self.assertNotIn("A_FACT", json.dumps(fixture.primaries[-1]["input"]))
-        # Reopen under a small reference budget, then keep this retired branch
-        # selected during real primary transport while unrelated histories GC.
-        proxy.close()
-        proxy = TransparentProxy(self.state, fixture, options,
-                                 {"CARRY_PROXY_HISTORY_MAX_REFERENCES": "12"})
-        self.stack.callback(proxy.close)
-        import concurrent.futures
-        import threading
-        held, release = threading.Event(), threading.Event()
-        self.stack.callback(release.set)
-        def primary(body, n):
-            if "RETIRE_NEXT" in json.dumps(body["input"]):
-                held.set()
-                assert release.wait(15), "retired owner primary release"
-            return 200, completed(response_id=f"retired_gc_{n}")
-        fixture.primary = primary
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            pending = pool.submit(proxy.send, advanced)
-            try:
-                self.assertTrue(held.wait(2))
-                owner = proxy.checkpoint(advanced)[0].stem
-                for n in range(16):
-                    self.assertEqual(proxy.send([{"role": "user", "content": f"RETIRE_GC_{n}"}])[0], 200)
-                index = json.loads((self.state / "history.index").read_text())
-                retained = index["snapshots"][owner]
-                self.assertEqual(retained["memories"], [])
-                self.assertEqual(retained["shadow"]["calls"], shadow)
-                self.assertLessEqual(len(index["tips"]) + len(index["reviews"]) + len(index["transcripts"]), 12)
-            finally:
-                release.set()
-            self.assertEqual(pending.result()[0], 200)
-        _, settled = proxy.checkpoint(advanced)
-        self.assertEqual(settled["memories"], [])
-        self.assertEqual(settled["primary"]["calls"], restored["primary"]["calls"] + 1)
-        self.assertEqual(settled["shadow"]["calls"], shadow)
 
     def test_extended_tool_cohort_cannot_inherit_partial_review_authority(self):
         history = [{"role": "user", "content": "PROTECTED_GOAL"},

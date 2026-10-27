@@ -148,12 +148,8 @@ def review_records(body):
         content = item.get('content', '')
         text = content if isinstance(content, str) else ''.join(
             block.get('text', '') for block in content if isinstance(block, dict)) if isinstance(content, list) else ''
-        if '\n\n[carry context] ' in text:
-            source, annotation = text.rsplit('\n\n[carry context] ', 1)
-            if source:
-                native = dict(item)
-                native['content'] = source
-                pending.append(native)
+        if text.startswith('[carry context] '):
+            annotation = text[len('[carry context] '):]
             data = json.loads(annotation)
             count = len(data['member_ids'])
             data['items'] = pending[-count:]
@@ -175,6 +171,9 @@ def review_records(body):
             pending.append(item)
             continue
         if isinstance(data, dict):
+            if {'memory_id', 'source_ids', 'text'} <= data.keys():
+                memory_observations[data['memory_id']] = data
+                continue
             records.append(data)
     # Reviewer nudges/answers now remain in the append-only transcript. Grade
     # source observations against the current ledger rather than treating old
@@ -194,11 +193,19 @@ def review_records(body):
             fact = {'source_ids': observed['source_ids'], 'text': observed['text']}
         else:
             # Provenance identifies evidence, not a fact: same-source siblings
-            # require distinct explicit bindings for their current m handles.
+            # require distinct explicit bindings for their current review indices.
             raise AssertionError('missing current memory observation or materialized fact')
         if fact not in sources:
             sources.append(fact)
     return sources + [current]
+
+
+def checkpoint_continuation_clean(state, body):
+    """A completed reset forwards the fresh native summary, not old tool replay."""
+    return state['background_review_pending'] is False and not any(
+        item.get('type') in ('function_call', 'function_call_output',
+                            'custom_tool_call', 'custom_tool_call_output')
+        for item in body['input'])
 
 
 class Fixture:
@@ -441,10 +448,16 @@ def compact_evidence(trial, fixture, *, received):
     assert cohort_group not in tail_eligible[0] and cohort_group in tail_eligible[1], 'tail must reflect newly completed cohort exposure'
     bulk_mentions=[json.dumps(r).count('DROP_COHORT_PAYLOAD') for r in fixture.reviews]
     assert bulk_mentions[0]==bulk_mentions[1] and bulk_mentions[-1]==0, 'eligibility transition must not double source payload'
-    removed=[i for i in state['history'] if i['removed'] and i['value'].get('call_id') in cohort]
-    assert len(removed)==4 and len({i['cohort'] for i in removed if i['value']['type']=='function_call'})==1
-    removed_ids={i['id'] for i in removed}
-    assert not any(r['source_id'] in removed_ids for r in state['active_shadow'])
+    # Removal belongs to this request's wire projection, not a destructive
+    # canonical-history flag. Require all original members to survive on disk
+    # unchanged, while both real primaries and the later reviewer omit them.
+    originals=members(received[2])
+    omitted=[i for i in state['history'] if i['value'].get('call_id') in cohort]
+    assert len(omitted)==4 and [i['value'] for i in omitted]==originals
+    assert len({i['cohort'] for i in omitted if i['value']['type']=='function_call'})==1
+    omitted_ids={i['id'] for i in omitted}
+    later_ids={member for r in review_records(fixture.reviews[-1]) for member in r.get('member_ids',[])}
+    assert not omitted_ids.intersection(later_ids)
     assert state['invalid_reviews']==0 and state['compactions']>=1
     assert (trial.parent/(trial.name.removesuffix('-trial')+'-workspace')/'proxy-fixture-b.txt').read_text()=='FIXTURE_TOOL_OK_B'
     # Forwarded surviving tool outputs must be the caller's unmodified bytes.
@@ -452,7 +465,7 @@ def compact_evidence(trial, fixture, *, received):
         originals={i['call_id']:i for i in before['input'] if i.get('type')=='function_call_output'}
         for item in after['input']:
             if item.get('type')=='function_call_output': assert item==originals[item['call_id']]
-    return {'compact_verified':True,'removed_atomic_members':len(removed),
+    return {'compact_verified':True,'removed_atomic_members':len(omitted),
             'classifier_cache_key_characters':len(cache_keys[0]),
             'classifier_cache_namespace_sha256':hashlib.sha256(cache_keys[0].encode()).hexdigest(),
             'classifier_cache_affinity_verified':True,
@@ -503,7 +516,6 @@ def main():
                 '--codex-sandbox','danger-full-access',
                 '--codex-native-compaction',case if case in ('v1','v2') else 'disabled',
                 '--payoff-requests','5','--min-payback-percent','0',
-                '--synchronous-reviews',
                 '--listen',f'127.0.0.1:{port}','--upstream-url',fixture.url+'/v1/responses',
                 '--classifier-url',fixture.url+'/classifier','--timeout','60',
                 '--prompt','Run the supplied tool once and finish. This is a scripted offline fixture.']
@@ -542,7 +554,8 @@ def main():
                     result['pi_checkpoint_verified']=bool(len(received)==len(submitted) and received and len(fixture.calls)-len(fixture.summary_calls)==3 and fixture.calls[-1].get('prompt_cache_key') and fixture.summary_calls and compact and compact[0].get('success') is True and
                         'FIXTURE_PI_CHECKPOINT' in json.dumps(fixture.calls[-1]['input']) and
                         received[-1]==submitted[-1] and state['history_rebases']>=1 and
-                        not state['active_shadow'] and sum(e.get('type')=='agent_settled' for e in rpc)>=2)
+                        checkpoint_continuation_clean(state, received[-1]) and
+                        sum(e.get('type')=='agent_settled' for e in rpc)>=2)
                     result['pi_summary_calls']=len(fixture.summary_calls)
                     result['history_rebases']=state['history_rebases']
                     if not result['pi_checkpoint_verified']: result['acceptance_failure']='Pi checkpoint reset/continuation failed'

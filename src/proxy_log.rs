@@ -239,7 +239,6 @@ fn append(
             (
                 config.mode,
                 config.classifier_cache_policy,
-                config.background_reviews,
                 &config.classifier_reasoning_effort,
                 config.review_replayed_history,
                 config.bootstrap_min_input_bytes
@@ -252,8 +251,6 @@ fn append(
                 config.classifier_max_input_tokens,
                 config.classifier_max_input_bytes,
                 config.review_every_requests,
-                config.review_max_calls,
-                config.bootstrap_max_cost_usd,
                 config.payoff_requests,
                 config.min_payback_percent,
                 config.context_margin_percent,
@@ -485,7 +482,6 @@ pub(super) fn changes(
         &json!({
         "main_changed":after.compactions > before.compactions || after.native_compactions > before.native_compactions,
         "main_compactions":after.compactions.saturating_sub(before.compactions),
-        "reviewer_compactions":after.reviewer_compactions.saturating_sub(before.reviewer_compactions),
         "native_compactions":after.native_compactions.saturating_sub(before.native_compactions)}),
     );
 }

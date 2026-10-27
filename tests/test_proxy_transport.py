@@ -83,7 +83,7 @@ class Fixture:
                         raise AssertionError("fixture only accepts tiny request bodies")
                     raw = self.rfile.read(length)
                     body = json.loads(raw)
-                    review = body.get("prompt_cache_key") != "transport-main"
+                    review = body.get("text", {}).get("format", {}).get("name") == "carry_review"
                     with fixture.lock:
                         fixture.requests.append((review, body))
                         fixture.wire_requests.append((review, raw))
@@ -194,9 +194,9 @@ class Proxy:
         auth.chmod(0o600)
         args = [BINARY, "proxy", "--listen", "127.0.0.1:0",
                 "--upstream-url", fixture.endpoint, "--state-dir", str(home / "state"),
-                "--no-open-dashboard", "--mode", mode, "--background-reviews=false",
+                "--no-open-dashboard", "--mode", mode,
                 "--request-timeout-secs", "60", "--classifier-timeout-secs", "60",
-                "--bootstrap-min-input-bytes", "8388608", "--review-max-calls", "1"]
+                "--bootstrap-min-input-bytes", "8388608"]
         if fixture.codex:
             args += ["--codex-login", "--codex-home", str(home)]
         if replay:

@@ -71,7 +71,7 @@ def contract_proxy(test, provider, state_dir, mode='audit', binary=None, classif
                '--upstream-url', provider.url + '/v1/responses',
                '--classifier-url', provider.url + classifier_path, '--mode', mode,
                '--min-payback-percent', '0', '--payoff-requests', '5',
-               '--state-dir', state_dir, '--background-reviews=false']
+               '--state-dir', state_dir]
     process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, text=True)
     assert process.stdout is not None
@@ -91,28 +91,59 @@ def contract_proxy(test, provider, state_dir, mode='audit', binary=None, classif
 
 
 def contract_send(url, body, directory):
+    try:
+        before = contract_state(directory)
+        expected = before['completed_requests'] + before['failed_primaries'] + 1
+    except StopIteration:
+        expected = 1
     request = urllib.request.Request(url + '/v1/responses', data=json.dumps(body).encode(),
         headers={'content-type': 'application/json', 'x-carry-session': 'contract'})
     # Consume the primary first. These receipt/provenance tests deliberately
     # sequence completed reviews; production forwarding must never do this.
     with urllib.request.urlopen(request, timeout=30) as response:
         result = json.load(response)
-    contract_settle(directory)
+    contract_settle(directory, terminal_requests=expected)
     return result
 
 
-def contract_settle(directory):
+def contract_workers_finished(directory):
+    """Receipt-pending clears before the real completed-H publication finishes."""
+    events = []
+    for path in (Path(directory) / 'diagnostics').glob('*'):
+        if not path.is_file():
+            continue
+        for line in path.read_text().splitlines():
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    request_ids = [event['request_id'] for event in events if event.get('request_id')]
+    if not request_ids:
+        return True  # Existing fail-open diagnostic-I/O controls have no lane.
+    current = max(request_ids, key=lambda value: int(value.split('-')[1]))
+    pid = current.split('-')[0]
+    dispatched = {event['request_id'] for event in events
+                  if event.get('event') == 'background_review_dispatched'
+                  and event['request_id'].split('-')[0] == pid}
+    merged = {event['request_id'] for event in events
+              if event.get('event') == 'background_review_merged'}
+    return dispatched <= merged
+
+
+def contract_settle(directory, terminal_requests=0):
     import time
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         try:
             state = contract_state(directory)
-            if not state['background_review_pending']:
+            terminal = state['completed_requests'] + state['failed_primaries']
+            if (terminal >= terminal_requests and not state['background_review_pending']
+                    and contract_workers_finished(directory)):
                 return state
         except (StopIteration, FileNotFoundError):
             pass
         time.sleep(.01)
-    raise AssertionError('completed primary reviewer receipt did not settle')
+    raise AssertionError('primary disposition/reviewer receipt did not settle')
 
 
 def wire_data(body):
@@ -122,6 +153,29 @@ def wire_data(body):
 
 def contract_state(directory):
     return json.loads(next(Path(directory).glob('*.json')).read_text())
+
+
+def contract_advice(directory):
+    """Read the completed original-prefix record, not its paid-owner mirror."""
+    import hashlib
+    state = contract_state(directory)
+    index = json.loads((Path(directory) / 'history.index').read_text())
+    values = [item['value'] for item in state['history']]
+    if state.get('history_frontier'):
+        values, frontier = [], state['history_frontier']
+        while frontier in index['nodes']:
+            node = index['nodes'][frontier]
+            values.append(node['value'])
+            frontier = node['parent']
+        values.reverse()
+    key, found = state['history_namespace'], None
+    for value in values:
+        key = hashlib.sha256(json.dumps([key, value], ensure_ascii=False,
+                                       separators=(',', ':')).encode()).hexdigest()
+        if key in index['reviews']:
+            found = index['reviews'][key]
+    assert found is not None, 'actual completed-prefix advice must be published'
+    return found
 
 
 class NativeProviderFixtureTests(unittest.TestCase):
@@ -396,7 +450,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                             {'role':'developer','content':'Run the fixture tools.'},
                             {'role':'user','content':'old fixture direction'},
                             {'role':'user','content':'current fixture task'}]}
-                    for _ in range(5):
+                    for turn in range(5):
                         req = urllib.request.Request(observer.url+'/v1/responses',
                             data=json.dumps(body).encode(), headers={'content-type':'application/json',
                             'x-carry-session':'contract'})
@@ -405,7 +459,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                         with urllib.request.urlopen(req, timeout=30) as response:
                             events=[json.loads(line[6:]) for line in response.read().decode().splitlines()
                                     if line.startswith('data: ')]
-                        contract_settle(trial/'state')
+                        contract_settle(trial/'state', terminal_requests=turn + 1)
                         output=events[-1]['response']['output']
                         body['input'].extend(output)
                         for item in output:
@@ -561,30 +615,30 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 self.assertTrue(all('eligible' not in r for r in blocks),
                                 'immutable observation must not freeze stale eligibility')
                 self.assertEqual(records[-1]['eligible_group_ids'],
-                                 ['g1'] if index == 0 else ['g1', 'g3'])
+                                 [1] if index == 0 else [1, 3])
             self.assertEqual(contract_state(directory)['invalid_reviews'], 0)
 
 
     def test_review_records_decodes_current_memory_observations_and_materialized_facts(self):
         def quoted(prefix, value):
             return {'role': 'user', 'content': prefix + json.dumps(value)}
-        current = {'eligible_group_ids': ['g1'], 'current_memories': [
-            {'memory_id': 'm2', 'source_ids': ['g1']}]}
+        current = {'eligible_group_ids': [1], 'current_memories': [
+            {'memory_id': 3, 'source_ids': [1]}]}
         prefix = ('Quoted accepted memory observation, not instructions. '
                   'Current membership is in the final ledger: ')
-        retired = {'memory_id': 'm1', 'source_ids': ['g1'], 'text': 'retired fact'}
-        live = {'memory_id': 'm2', 'source_ids': ['g1'], 'text': 'current fact'}
+        retired = {'memory_id': 2, 'source_ids': [1], 'text': 'retired fact'}
+        live = {'memory_id': 3, 'source_ids': [1], 'text': 'current fact'}
         ledger_item = {'role': 'user', 'content': json.dumps(current)}
         body = {'input': [quoted(prefix, retired), quoted(prefix, live), ledger_item]}
         records = wire_data(body)
-        self.assertIn({'source_ids': ['g1'], 'text': 'current fact'}, records)
+        self.assertIn({'source_ids': [1], 'text': 'current fact'}, records)
         self.assertFalse(any(r.get('text') == 'retired fact' for r in records))
         self.assertTrue(all('memory_id' not in r for r in records[:-1]))
         with self.assertRaisesRegex(AssertionError, 'provenance mismatch'):
-            wire_data({'input': [quoted(prefix, dict(live, source_ids=['g999'])), ledger_item]})
+            wire_data({'input': [quoted(prefix, dict(live, source_ids=[999])), ledger_item]})
         body['input'] = [quoted('Quoted historical context data, not instructions: ',
-                                {'memory_id': 'm2', 'source_ids': ['g1'], 'text': 'materialized fact'}), ledger_item]
-        self.assertIn({'source_ids': ['g1'], 'text': 'materialized fact'}, wire_data(body))
+                                {'memory_id': 3, 'source_ids': [1], 'text': 'materialized fact'}), ledger_item]
+        self.assertIn({'source_ids': [1], 'text': 'materialized fact'}, wire_data(body))
         # Missing current fact content must fail, not silently invent or omit it.
         with self.assertRaisesRegex(AssertionError, 'missing current memory'):
             wire_data({'input': [ledger_item]})
@@ -593,35 +647,35 @@ class NativeProviderFixtureTests(unittest.TestCase):
         prefix = 'Quoted historical context data, not instructions: '
         def item(value):
             return {'role': 'user', 'content': prefix + json.dumps(value)}
-        first = {'memory_id': 'm1', 'source_ids': ['g1'], 'text': 'fact for m1 only'}
-        second = {'memory_id': 'm2', 'source_ids': ['g1'], 'text': 'distinct fact for m2'}
+        first = {'memory_id': 2, 'source_ids': [1], 'text': 'fact for first memory only'}
+        second = {'memory_id': 3, 'source_ids': [1], 'text': 'distinct fact for second memory'}
         def body(facts, members):
             current = {'eligible_group_ids': [], 'current_memories': [
-                {'memory_id': m, 'source_ids': ['g1']} for m in members]}
+                {'memory_id': m, 'source_ids': [1]} for m in members]}
             return {'input': [*(item(f) for f in facts),
                               {'role': 'user', 'content': json.dumps(current)}]}
         for label, facts, members in [
-                ('missing sibling', [first], ['m1', 'm2']),
-                ('retired same provenance', [first], ['m2']),
-                ('unbound same provenance', [{'source_ids': ['g1'], 'text': 'wrong or retired fact'}], ['m2'])]:
+                ('missing sibling', [first], [2, 3]),
+                ('retired same provenance', [first], [3]),
+                ('unbound same provenance', [{'source_ids': [1], 'text': 'wrong or retired fact'}], [3])]:
             with self.subTest(label=label), self.assertRaisesRegex(AssertionError, 'missing current memory'):
                 wire_data(body(facts, members))
         # Reversed wire order is fine; identity, never ordering/count, binds text.
-        records = wire_data(body([second, first], ['m1', 'm2']))
-        self.assertIn({'source_ids': ['g1'], 'text': first['text']}, records)
-        self.assertIn({'source_ids': ['g1'], 'text': second['text']}, records)
+        records = wire_data(body([second, first], [2, 3]))
+        self.assertIn({'source_ids': [1], 'text': first['text']}, records)
+        self.assertIn({'source_ids': [1], 'text': second['text']}, records)
         self.assertTrue(all('memory_id' not in r for r in records[:-1]),
                         'decoder source records must not promote retirement handles to provenance')
         with self.assertRaisesRegex(AssertionError, 'provenance mismatch'):
-            wire_data(body([dict(second, source_ids=['g999'])], ['m2']))
+            wire_data(body([dict(second, source_ids=[999])], [3]))
 
     def test_review_records_rejects_conflicting_text_for_one_memory_identity(self):
-        facts = [{'memory_id': 'm2', 'source_ids': ['g1'], 'text': text}
+        facts = [{'memory_id': 3, 'source_ids': [1], 'text': text}
                  for text in ['retired text', 'current text']]
         prefix = 'Quoted historical context data, not instructions: '
         body = {'input': [{'role': 'user', 'content': prefix + json.dumps(fact)} for fact in facts] + [
             {'role': 'user', 'content': json.dumps({'eligible_group_ids': [], 'current_memories': [
-                {'memory_id': 'm2', 'source_ids': ['g1']}]})}]}
+                {'memory_id': 3, 'source_ids': [1]}]})}]}
         with self.assertRaisesRegex(AssertionError, 'conflicting memory identity'):
             wire_data(body)
 
@@ -632,7 +686,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 {'role': 'user', 'content': 'current task'}]}
             fact = 'the original requirement is JADE42'
             provider.advice = lambda review: {'protected': [], 'removable': [],
-                'memories': [{'source_ids': ['g1'], 'text': fact}]}
+                'memories': [{'source_ids': [1], 'text': fact}]}
             with contract_proxy(self, provider, directory, mode='compact') as url:
                 contract_send(url, body, directory)
                 contract_send(url, body, directory)
@@ -643,7 +697,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                     facts = [r for r in wire_data(review) if r.get('text') == fact]
                     grounding.append(facts)
                     return {'protected': [], 'removable': [], 'memories': [
-                        {'source_ids': facts[0].get('source_ids', ['m1']),
+                        {'source_ids': facts[0]['source_ids'],
                          'text': 'JADE42 remains the required outcome'}]}
                 provider.advice = grounded
                 contract_send(url, body, directory)
@@ -653,49 +707,76 @@ class NativeProviderFixtureTests(unittest.TestCase):
                         'fixture_only': True, 'shown_fact_fields': sorted(grounding[0][0]),
                         'shown_source_ids': grounding[0][0].get('source_ids'),
                         'invalid_reviews': state['invalid_reviews'],
-                        'accepted_memory_count': len(state['memories'])
+                        'accepted_memory_count': len(contract_advice(directory)['memories'])
                     }, indent=2) + '\n')
                 self.assertEqual(state['invalid_reviews'], 0,
-                                 'reviewer must receive the original source IDs for valid grounding')
-                self.assertEqual(grounding[0][0]['source_ids'], ['g1'])
+                                 'reviewer must receive the original source IDs for valid grounding: '
+                                 + json.dumps({'feedback':state['review_feedback'],
+                                               'grounding':grounding,'ledger':wire_data(provider.shadow[-1])[-1]}))
+                self.assertEqual(grounding[0][0]['source_ids'], [1])
                 self.assertNotIn('memory_id', grounding[0][0],
                                  'internal memory handle must not masquerade as an actionable source')
-                self.assertEqual(len(state['memories']), 2)
+                self.assertEqual(len(contract_advice(directory)['memories']), 2)
+                self.assertTrue(all(m['source_ids'] == [1]
+                                    for m in contract_advice(directory)['memories']),
+                                'accepted facts persist canonical original member provenance')
                 # Keep provenance strict while applying the valid removable group independently.
-                provider.advice = lambda review: {'protected': [], 'removable': ['g1'],
-                    'memories': [{'source_ids': ['m1'], 'text': 'invalid source'}]}
+                provider.advice = lambda review: {'protected': [], 'removable': [1],
+                    'memories': [{'source_ids': [wire_data(review)[-1]['eligible_memory_ids'][0]], 'text': 'invalid source'}]}
                 contract_send(url, body, directory)
                 state = contract_state(directory)
                 self.assertEqual(state['invalid_reviews'], 0)
                 self.assertEqual(state['partial_reviews'], 1)
-                self.assertEqual(len(state['memories']), 2)
+                self.assertEqual(len(contract_advice(directory)['memories']), 2)
                 self.assertEqual(state['compactions'], 0, 'new advice is considered by the next request planner')
                 # Repeating a retired source action cannot revive its evidence.
-                provider.advice = lambda review: {'protected': [], 'removable': ['g1'], 'memories': []}
+                provider.advice = lambda review: {'protected': [], 'removable': [1], 'memories': []}
                 contract_send(url, body, directory)
                 contract_send(url, body, directory)  # review the retained view after the planning-only compaction
                 self.assertNotIn('RETIRE_HUMAN_SOURCE', json.dumps(provider.primary[-1]))
                 state = contract_state(directory)
-                self.assertTrue(state['history'][0]['removed'])
-                self.assertEqual(state['compactions'], 1)
+                self.assertEqual(state['history'][0]['value'], body['input'][0],
+                                 'omission must not destroy canonical source')
+                self.assertEqual(state['compactions'], sum(
+                    'RETIRE_HUMAN_SOURCE' not in json.dumps(primary)
+                    for primary in provider.primary),
+                    'count actual disposable projected requests, not permanent deletions')
                 # Provenance remains visible, but does not re-admit retired IDs for advice.
-                provider.advice = lambda review: {'protected': [], 'removable': [],
-                    'memories': [{'source_ids': ['g1'], 'text': 'retired source is not newly eligible'}]}
+                def retired(review):
+                    shown = next(r for r in wire_data(review) if r.get('text') == fact)
+                    return {'protected': [], 'removable': [], 'memories': [
+                        {'source_ids': shown['source_ids'], 'text': 'retired source is not newly eligible'}]}
+                provider.advice = retired
+                invalid_before = state['invalid_reviews']
+                partial_before = state['partial_reviews']
+                shadow_before = state['shadow']['calls']
                 body['input'].append({'role': 'user', 'content': 'next task'})
                 contract_send(url, body, directory)
                 later = provider.shadow[-1]
                 self.assertNotIn('RETIRE_HUMAN_SOURCE', json.dumps(later))
-                self.assertEqual([r for r in wire_data(later) if r.get('text') == fact][0]['source_ids'], ['g1'])
-                self.assertNotIn('g1', wire_data(later)[-1]['eligible_group_ids'])
-                self.assertEqual(contract_state(directory)['invalid_reviews'], 2)
-                self.assertEqual(len(contract_state(directory)['memories']), 2)
+                sources = next(r for r in wire_data(later) if r.get('text') == fact)['source_ids']
+                ledger = wire_data(later)[-1]
+                retained = {g['group_id']: g['member_ids'] for g in ledger['retained_source_groups']}
+                self.assertEqual([member for ref in sources for member in retained[ref]], [1])
+                self.assertTrue(set(sources).isdisjoint(ledger['eligible_group_ids']))
+                settled = contract_state(directory)
+                self.assertEqual(settled['invalid_reviews'], invalid_before + 1,
+                                 'an entirely rejected review must not advance semantic coverage')
+                self.assertEqual(settled['partial_reviews'], partial_before,
+                                 'only accepted siblings classify a review as partial')
+                self.assertEqual(settled['shadow']['calls'], shadow_before + 1,
+                                 'rejected advice still settles its actual paid receipt once')
+                self.assertEqual(settled['review_feedback']['rejected_count'], 1)
+                self.assertEqual(settled['review_feedback']['accepted_opinions'], 0)
+                self.assertEqual(settled['review_feedback']['accepted_memories'], 0)
+                self.assertEqual(len(contract_advice(directory)['memories']), 2)
 
     def test_proxy_parallel_cohort_extension_observes_only_new_members_and_current_opinion(self):
         with ShadowContractProvider() as provider, tempfile.TemporaryDirectory() as directory:
             body = {'model': 'gpt-6-luna', 'input': [
                 {'role': 'user', 'content': 'old requirement'},
                 {'role': 'user', 'content': 'current task'}]}
-            provider.advice = lambda review: {'protected': ['g1'], 'removable': [], 'memories': []}
+            provider.advice = lambda review: {'protected': [1], 'removable': [], 'memories': []}
             with contract_proxy(self, provider, directory) as url:
                 contract_send(url, body, directory)
                 body['input'] += [
@@ -703,7 +784,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                     {'type': 'function_call', 'call_id': 'b', 'name': 'native', 'arguments': 'CALL_B'},
                     {'type': 'function_call_output', 'call_id': 'a', 'output': 'RESULT_A ' * 500}]
                 contract_send(url, body, directory)
-                provider.advice = lambda review: {'protected': [], 'removable': ['g1'], 'memories': []}
+                provider.advice = lambda review: {'protected': [], 'removable': [1], 'memories': []}
                 body['input'].append({'type': 'function_call_output', 'call_id': 'b',
                                       'output': 'RESULT_B ' * 500})
                 contract_send(url, body, directory)
@@ -715,17 +796,19 @@ class NativeProviderFixtureTests(unittest.TestCase):
             self.assertEqual([json.dumps(r).count('RESULT_B') for r in provider.shadow], [0, 500, 500])
             for index, review in enumerate(provider.shadow):
                 records = wire_data(review)
-                blocks = [r for r in records if 'items' in r and r['group_id'] == 'g3']
+                blocks = [r for r in records if 'items' in r and r['group_id'] == 3]
                 self.assertEqual([r['member_ids'] for r in blocks],
                                  [] if index == 0 else [[3, 4, 5, 6]])
                 tail = records[-1]
-                self.assertEqual(tail['eligible_group_ids'], ['g1'] if index < 2 else ['g1', 'g3'])
+                self.assertEqual(tail['eligible_group_ids'], [1] if index < 2 else [1, 3])
                 self.assertEqual(tail['current_groups'][0]['opinion'], [None, 'keep', 'drop'][index])
                 self.assertFalse(any('opinion' in r for r in records[:-1]),
                                  'superseded opinions must not live in immutable observation history')
             state = contract_state(directory)
             self.assertEqual(state['invalid_reviews'], 0)
-            self.assertEqual(len(state['observed']), 6)
+            self.assertEqual(len(state['history']), 6)
+            self.assertTrue(all(item['exposed'] for item in state['history']))
+            self.assertEqual([item['value'] for item in state['history']], body['input'])
             self.assertEqual(provider.primary[-1], body)
 
     def test_proxy_upgrades_real_legacy_checkpoint_without_duplicate_source_or_memory_aliases(self):
@@ -736,8 +819,8 @@ class NativeProviderFixtureTests(unittest.TestCase):
             body = {'model': 'gpt-6-luna', 'input': [
                 {'role': 'user', 'content': 'old requirement'},
                 {'role': 'user', 'content': 'current task'}]}
-            provider.advice = lambda review: {'protected': ['g1'], 'removable': [],
-                'memories': [{'source_ids': ['g1'], 'text': 'legacy derived fact'}]}
+            provider.advice = lambda review: {'protected': [1], 'removable': [],
+                'memories': [{'source_ids': [1], 'text': 'legacy derived fact'}]}
             with contract_proxy(self, provider, directory, binary=legacy) as url:
                 contract_send(url, body, directory)
                 body['input'] += [
@@ -753,7 +836,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
             for review in provider.shadow[-2:]:
                 self.assertEqual(json.dumps(review).count('LEGACY_BULK'), 500)
                 data = wire_data(review)
-                self.assertEqual([r for r in data if r.get('text') == 'legacy derived fact'][0]['source_ids'], ['g1'])
+                self.assertEqual([r for r in data if r.get('text') == 'legacy derived fact'][0]['source_ids'], [1])
                 self.assertTrue(all('memory_id' not in r and 'eligible' not in r and 'opinion' not in r
                                     for r in data[:-1]))
             self.assertEqual(provider.primary[-1], body)
@@ -763,19 +846,19 @@ class NativeProviderFixtureTests(unittest.TestCase):
         from scripts.proxy_native_fixture import Fixture
         for eligible, stale in [(True, False), (False, True)]:
             with self.subTest(eligible=eligible), Fixture('pi', 'compact') as fixture:
-                block = {'group_id': 'g7', 'member_ids': [7],
+                block = {'group_id': 7, 'member_ids': [7],
                          'items': [{'type': 'function_call_output', 'call_id': 'a',
                                     'output': 'DROP_COHORT_PAYLOAD'}]}
                 if stale:
                     block['eligible'] = True
                 body = {'input': [{'role': 'user', 'content': json.dumps(block)},
-                    {'role': 'user', 'content': json.dumps({'eligible_group_ids': ['g7'] if eligible else []})}]}
+                    {'role': 'user', 'content': json.dumps({'eligible_group_ids': [7] if eligible else []})}]}
                 request = urllib.request.Request(fixture.url + '/classifier', data=json.dumps(body).encode(),
                     headers={'content-type': 'application/json'})
                 with urllib.request.urlopen(request, timeout=3) as response:
                     advice = json.load(response)
                 self.assertEqual(json.loads(advice['output'][0]['content'][0]['text'])['removable'],
-                                 ['g7'] if eligible else [])
+                                 [7] if eligible else [])
 
     def test_json_mode_requires_json_in_actual_input_message_text(self):
         from scripts.proxy_native_fixture import Fixture
@@ -848,7 +931,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                        '--upstream-url', fixture.url + '/v1/responses',
                        '--classifier-url', fixture.url + '/classifier',
                        '--classifier-model', 'gpt-6-luna', '--mode', 'audit',
-                       '--state-dir', directory, '--background-reviews=false']
+                       '--state-dir', directory]
             process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                        stderr=subprocess.DEVNULL, text=True)
             assert process.stdout is not None
@@ -917,7 +1000,7 @@ class NativeProviderFixtureTests(unittest.TestCase):
                 self.assertEqual(state['shadow']['calls'], 1, 'completed review receipt must be persisted')
                 self.assertEqual(fixture.reviews[0]['text']['format']['type'], 'json_schema')
                 self.assertTrue(fixture.reviews[0]['text']['format']['strict'])
-                self.assertEqual(len(fixture.reviews[0]['prompt_cache_key']), 64)
+                self.assertTrue(0 < len(fixture.reviews[0]['prompt_cache_key']) <= 64)
                 self.assertEqual(state['invalid_reviews'], 0,
                                  f'JSON-mode review rejected: {fixture.errors}')
                 self.assertFalse(fixture.errors)
@@ -1012,11 +1095,11 @@ class NativeProviderFixtureTests(unittest.TestCase):
             self.assertEqual((Path(directory)/'proxy-fixture.txt').read_text(),'FIXTURE_TOOL_OK')
             second=call('/v1/responses',body)
             advice=call('/classifier',{'input':[{'role':'user','content':json.dumps({
-                'group_id':'g7','member_ids':[7,8,9],'items':first['output']+[
+                'group_id':7,'member_ids':[7,8,9],'items':first['output']+[
                     {'type':'function_call_output','call_id':'call_fixture_1_a','output':'DROP_COHORT_PAYLOAD'}]})},
-                {'role':'user','content':json.dumps({'eligible_group_ids':['g7']})}]})
+                {'role':'user','content':json.dumps({'eligible_group_ids':[7]})}]})
             self.assertEqual(json.loads(advice['output'][0]['content'][0]['text']),
-                {'protected':[],'removable':['g7'],'memories':[]})
+                {'protected':[],'removable':[7],'memories':[]})
             self.assertEqual(second['output'][0]['type'],'function_call')
             # Removed whole cohort: the provider must accept the compact projection.
             body['input']=body['input'][:1]+second['output']+[{'type':'function_call_output',

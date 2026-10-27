@@ -190,6 +190,19 @@ jobs:
           restore-keys: |
             ci-pip-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.python-version.outputs.version }}-
 
+      - name: Identify timeout implementations
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tool in timeout gnutimeout; do
+            if resolved=$(command -v "$tool"); then
+              printf '%s resolves to %s\n' "$tool" "$resolved"
+              "$resolved" --version
+            else
+              printf '%s is not installed\n' "$tool"
+            fi
+          done
+
       - name: Benchmark planner, runner, worker, and lifecycle tests
         run: >-
           python3 -m unittest -v

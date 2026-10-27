@@ -1,4 +1,4 @@
-//! Synthetic frozen contracts, not vendor tariff or route evidence.
+// Synthetic frozen contracts, not vendor tariff or route evidence.
 // Rates in snapshots are USD per MILLION; planner results are dollars.
 use super::*;
 
@@ -66,13 +66,8 @@ fn stale_background_receipts_keep_the_dispatched_frozen_tariff_not_current_slug_
         }],
         ..ReviewRun::default()
     };
-    assert!(!merge_review(
-        &config,
-        &mut current,
-        &before,
-        &reviewed,
-        &run
-    ));
+    settle_review(&mut current, &before, &reviewed, &run);
+    assert_eq!(current.review_epoch, before.review_epoch + 1);
     assert_eq!(current.shadow.calls, 1);
     assert!((current.shadow.cost_usd - (90.0 * 11.0 + 10.0 * 0.1 + 31.0) / 1e6).abs() < 1e-12);
     // Advice is stale, but the paid receipt uses its native partition and
@@ -118,34 +113,33 @@ fn receipt_prediction_uses_measured_prefix_without_relaxing_capacity_reservation
 
 #[test]
 fn frozen_unknown_prices_do_not_fall_back_to_the_known_slug() {
-    let (config, mut session, main) = fixture(Rates {
+    let (mut config, mut session, main) = fixture(Rates {
         input: 7.0,
         cached: 0.7,
         write: 9.0,
         output: 21.0,
     });
     session.model_resolution.as_mut().unwrap().primary.rates = None;
+    config.model_resolution = session.model_resolution.clone();
     let (_, report) = plan(&config, &session, &main);
     assert_eq!(report["reason"], "unsupported_model_or_tier");
     assert!(
-        report["candidates"][0]["joint"].is_null(),
+        report["candidates"][0]["selection_joint"].is_null(),
         "unknown price is not zero or legacy slug price"
     );
 }
 
 #[test]
 fn each_candidate_prices_its_own_frozen_input_tier_after_restart() {
-    let (config, mut session, main) = fixture(Rates {
+    let (mut config, mut session, main) = fixture(Rates {
         input: 7.0,
         cached: 0.7,
         write: 9.0,
         output: 21.0,
     });
-    let mut compact = session.clone();
-    let groups = compact.groups();
-    compact.remove(&[groups[1].id], &groups);
+    let groups = session.groups();
     let mut compact_body = main.clone();
-    compact_body["input"] = json!(compact.render_primary());
+    compact_body["input"] = json!(session.render_projection(&[groups[1].id].into_iter().collect()));
     let keep_tokens = estimate(&primary_wire_body(&config, &main));
     let compact_tokens = estimate(&primary_wire_body(&config, &compact_body));
     assert!(compact_tokens < keep_tokens);
@@ -154,10 +148,13 @@ fn each_candidate_prices_its_own_frozen_input_tier_after_restart() {
     primary.cheap_input_boundary = Some(threshold);
     primary.long_input_multiplier = Some(3.0);
     primary.long_output_multiplier = Some(2.0);
-    let restored: Session =
+    config.model_resolution = session.model_resolution.clone();
+    let record = semantic::Record::capture(&session);
+    let mut restored: Session =
         serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+    record.apply(&mut restored);
     let (_, report) = plan(&config, &restored, &main);
-    let joint = &report["candidates"][0]["joint"];
+    let joint = &report["candidates"][0]["selection_joint"];
     let keep = joint["primary_keep"].as_f64().unwrap();
     let compact = joint["primary_compact"].as_f64().unwrap();
     assert!((keep - keep_tokens * 7.0 * 3.0 / 1e6 * 3.0).abs() < 1e-10);
@@ -165,7 +162,7 @@ fn each_candidate_prices_its_own_frozen_input_tier_after_restart() {
 }
 
 fn fixture(rates: Rates) -> (ProxyCli, Session, Value) {
-    let config = ProxyCli::try_parse_from([
+    let mut config = ProxyCli::try_parse_from([
         "carry proxy",
         "--upstream-url",
         "https://synthetic-gateway.invalid/v1/responses",
@@ -177,7 +174,6 @@ fn fixture(rates: Rates) -> (ProxyCli, Session, Value) {
         "3",
         "--review-every-requests",
         "100",
-        "--background-reviews=false",
         "--mode",
         "compact",
     ])
@@ -194,11 +190,10 @@ fn fixture(rates: Rates) -> (ProxyCli, Session, Value) {
         item.exposed = true;
     }
     let groups = session.groups();
-    session.observe_groups(&groups);
     session
         .apply_advice(
             &groups,
-            &json!({"protected":["g1"],"removable":["g2"],"memories":[]}),
+            &json!({"protected":[1],"removable":[2],"memories":[]}),
         )
         .unwrap();
     let route = Route::new(&config.upstream_url, false);
@@ -214,6 +209,7 @@ fn fixture(rates: Rates) -> (ProxyCli, Session, Value) {
     session.completed_requests = 1;
     let main = json!({"model":"gpt-6-sol","input":session.render_primary(),"store":false});
     session.review_context = cache_base(&main);
+    config.model_resolution = session.model_resolution.clone();
     (config, session, main)
 }
 
@@ -230,7 +226,7 @@ fn planner_consumes_frozen_primary_rates_and_does_not_invent_gateway_cache_suppo
     let primary_tokens = estimate(&primary_wire_body(&config, &main));
     assert!(primary_tokens > 1024.0);
     let expected = primary_tokens * modeled.input / 1e6 * 3.0;
-    let actual = report["candidates"][0]["joint"]["primary_keep"]
+    let actual = report["candidates"][0]["selection_joint"]["primary_keep"]
         .as_f64()
         .unwrap();
     assert!(
@@ -273,19 +269,88 @@ fn planner_consumes_independent_frozen_reviewer_rates_without_gateway_cache_inhe
         .unwrap()
         .reviewer
         .price_basis = "synthetic_fixture_only".into();
+    config.model_resolution = session.model_resolution.clone();
     let (_, report) = plan(&config, &session, &main);
-    let calls = report["future_review_events"].as_u64().unwrap();
-    assert!(calls > 0);
+    assert_eq!(
+        admission::decision(&config, &session, &main, false)["admitted"],
+        true
+    );
     let body = review_body(&config, &session);
-    let expected = calls as f64
-        * (estimate(&body) * reviewer.input
-            + config.classifier_max_output_tokens as f64 * reviewer.output)
+    let expected = (estimate(&body) * reviewer.input
+        + config.classifier_max_output_tokens as f64 * reviewer.output)
         / 1e6;
-    let actual = report["candidates"][0]["joint"]["future_shadow_keep"]
+    let actual = report["candidates"][0]["selection_joint"]["future_shadow_keep"]
         .as_f64()
         .unwrap();
     assert!(
         (actual - expected).abs() < 1e-10,
         "reviewer has its own frozen rates, no speculative route cache: actual={actual} expected={expected}"
     );
+}
+
+#[test]
+fn primary_output_cap_reverses_warm_keep_vs_cold_tier_rewrite_with_zero_missing_unknown_controls() {
+    let (mut config, mut session, mut body) = fixture(Rates {
+        input: 7.0,
+        cached: 0.001,
+        write: 9.0,
+        output: 21.0,
+    });
+    config.payoff_requests = 1;
+    let groups = session.groups();
+    let mut compact = body.clone();
+    compact["input"] = json!(session.render_projection(&HashSet::from([groups[1].id])));
+    let keep_tokens = estimate(&primary_wire_body(&config, &body));
+    let drop_tokens = estimate(&primary_wire_body(&config, &compact));
+    let primary = &mut session.model_resolution.as_mut().unwrap().primary;
+    primary.cache = carry::models::model_spec("gpt-6-sol").unwrap().cache;
+    primary.cheap_input_boundary = Some(((keep_tokens + drop_tokens) / 2.0) as u32);
+    primary.long_input_multiplier = Some(1.0);
+    primary.long_output_multiplier = Some(2.0);
+    config.model_resolution = session.model_resolution.clone();
+    for cap in [None, Some(0), Some(10000)] {
+        body.as_object_mut().unwrap().remove("max_output_tokens");
+        if let Some(cap) = cap {
+            body["max_output_tokens"] = json!(cap);
+        }
+        session.upstream_cache.clear();
+        crate::proxy_cache::observe(
+            &mut session.upstream_cache,
+            &primary_wire_body(&config, &body),
+            &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":10000}}),
+            config.model_resolution.as_ref().map(|p| &p.primary),
+            &config.primary_cache_auth,
+            now(),
+        );
+        assert_eq!(session.upstream_cache.len(), 1);
+        let (selected, report) = plan(&config, &session, &body);
+        assert_eq!(selected.is_some(), cap == Some(10000), "{report}");
+        let joint = &report["candidates"][0]["selection_joint"];
+        if cap == Some(10000) {
+            assert!(
+                joint["primary_compact"].as_f64().unwrap()
+                    < joint["primary_keep"].as_f64().unwrap()
+            );
+        } else {
+            assert!(
+                joint["primary_keep"].as_f64().unwrap()
+                    < joint["primary_compact"].as_f64().unwrap()
+            );
+        }
+    }
+    config
+        .model_resolution
+        .as_mut()
+        .unwrap()
+        .primary
+        .long_output_multiplier = Some(1.0);
+    assert!(
+        plan(&config, &session, &body).0.is_none(),
+        "same output rate cannot reverse input ranking"
+    );
+    config.model_resolution.as_mut().unwrap().primary.rates = None;
+    let (selected, report) = plan(&config, &session, &body);
+    assert!(selected.is_none());
+    assert_eq!(report["reason"], "unsupported_model_or_tier");
+    assert!(report["candidates"][0]["selection_joint"].is_null());
 }

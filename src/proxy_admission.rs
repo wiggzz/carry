@@ -4,15 +4,7 @@ use crate::proxy_state::ReviewAdmission;
 use std::collections::BTreeSet;
 
 fn coverage(session: &Session) -> ReviewAdmission {
-    session
-        .review_admission
-        .clone()
-        .unwrap_or_else(|| ReviewAdmission {
-            // Legacy observations already ingested native source. Never call replay
-            // reconstruction "new growth" merely because this field was absent.
-            source_ids: session.observed.keys().copied().collect(),
-            no_yield_streak: 0,
-        })
+    session.review_admission.clone().unwrap_or_default()
 }
 
 pub(super) fn initialize(session: &mut Session) {
@@ -43,6 +35,28 @@ pub(super) fn multiplier(config: &ProxyCli, session: &Session) -> u64 {
     value
 }
 
+/// One request-boundary scheduling decision for both candidate pricing and
+/// dispatch. Caller metadata/output caps are not reviewer admission context;
+/// primary_tokens renders canonical source, independent of selected omission.
+pub(super) fn scheduled(config: &ProxyCli, session: &Session) -> Value {
+    let mut result = decision(config, session, &session.review_context, false);
+    if session.background_review_pending {
+        result["admitted"] = json!(false);
+        result["reason"] = json!("review_pending");
+    } else if session.bootstrap_review_pending && result["reason"] != "no_eligible_sources" {
+        let initial = !session.bootstrap_review_attempted;
+        let due = result["completed_requests_since_review"].as_u64().unwrap()
+            >= result["required_requests"].as_u64().unwrap();
+        result["admitted"] = json!(initial || due);
+        result["reason"] = json!(if initial || due {
+            "replay_bootstrap"
+        } else {
+            "cadence"
+        });
+    }
+    result
+}
+
 pub(super) fn decision(
     config: &ProxyCli,
     session: &Session,
@@ -57,14 +71,12 @@ pub(super) fn decision_for_plan(
     session: &Session,
     main: &Value,
     pressure: bool,
-    allow_extra: bool,
+    _allow_extra: bool,
 ) -> Value {
-    decision_with_primary(config, session, main, pressure, allow_extra, None)
+    decision_with_primary(config, session, main, pressure, false, None)
 }
 
 pub(super) fn primary_tokens(config: &ProxyCli, session: &Session, main: &Value) -> f64 {
-    #[cfg(test)]
-    planner_work::record("admission_primary_projections");
     let mut retained = main.clone();
     retained["input"] = json!(session.render_primary());
     estimate(&primary_wire_body(config, &retained))
@@ -75,7 +87,7 @@ pub(super) fn decision_with_primary(
     session: &Session,
     main: &Value,
     pressure: bool,
-    allow_extra: bool,
+    _allow_extra: bool,
     primary: Option<f64>,
 ) -> Value {
     let coverage = coverage(session);
@@ -95,7 +107,7 @@ pub(super) fn decision_with_primary(
     let multiplier = multiplier(config, session);
     let requests = config.review_every_requests.saturating_mul(multiplier);
     let tokens = (config.review_min_new_tokens as u64).saturating_mul(multiplier);
-    let mut reason = if eligible.is_empty() && session.memories.is_empty() {
+    let reason = if eligible.is_empty() && session.memories.is_empty() {
         "no_eligible_sources"
     } else if pressure {
         "pressure_override"
@@ -108,58 +120,13 @@ pub(super) fn decision_with_primary(
     } else {
         "admitted"
     };
-    if allow_extra
-        && reason == "native_source_growth"
-        && economic_keep_demand(config, session, main)
-    {
-        reason = "keep_lease_economic";
-    }
-    json!({"admitted": matches!(reason, "admitted" | "pressure_override" | "keep_lease_economic"),
+    json!({"admitted": matches!(reason, "admitted" | "pressure_override"),
         "reason":reason,"primary_estimated_tokens":primary,
         "new_native_source_estimated_tokens":growth,"completed_requests_since_review":age,
         "required_requests":requests,"required_new_tokens":tokens,
         "min_primary_tokens":config.review_min_primary_tokens,"multiplier":multiplier,
         "no_yield_streak":coverage.no_yield_streak,"covered_source_count":coverage.source_ids.len(),
         "eligible_source_count":eligible.len(),"lineage_rebases":session.history_rebases})
-}
-
-/// One bounded hypothetical release, using the very same removal, rendered
-/// feasibility, cache/tier pricing and payback decision as the live planner.
-/// No paid work is justified by elapsed rounds alone or speculative review wins.
-fn economic_keep_demand(config: &ProxyCli, session: &Session, main: &Value) -> bool {
-    if !session.extra_keep_attempt_available()
-        || session.background_review_pending
-        || session.bootstrap_review_pending
-        || !standard(main)
-    {
-        return false;
-    }
-    // Do not buy advice when already-authorized material supplies a safe useful
-    // candidate, including a cache-preserving subset. Probe the actual planner
-    // with extra-lease admission disabled to break the admission/forecast cycle.
-    if planning::economic_candidate(config, session, main, 0.0) {
-        return false;
-    }
-    let mut reviewed = session.clone();
-    let pending = crate::proxy_state::PendingKeepReview {
-        request_id: "forecast".into(),
-        targets: session.due_keep_targets(),
-    };
-    reviewed.keep_leases.as_mut().unwrap().pending = Some(pending.clone());
-    let request = review_body(config, &reviewed);
-    if !review_fits(config, &request) {
-        return false;
-    }
-    let Some(rates) = super::reviewer_rates(config, estimate(&request)) else {
-        return false;
-    };
-    let Some(inputs) = reviewer_view_costs(config, &session.reviewer_cache, &request, &request, 1)
-    else {
-        return false;
-    };
-    let paid = inputs.keep + config.classifier_max_output_tokens as f64 * rates.output;
-    reviewed.resolve_keep_targets(&pending);
-    planning::economic_candidate(config, &reviewed, main, paid)
 }
 
 /// Classify actual committed deltas, not accepted-opinion counters (which include
@@ -223,5 +190,5 @@ pub(super) fn cover(session: &mut Session, groups: &[Group]) {
     // Keep only active history identity; removed IDs cannot re-enter this lineage.
     admission
         .source_ids
-        .retain(|id| session.history.iter().any(|i| i.id == *id && !i.removed));
+        .retain(|id| session.history.iter().any(|i| i.id == *id));
 }

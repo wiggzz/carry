@@ -19,11 +19,11 @@ import urllib.error
 import urllib.request
 
 try:
-    from proxy_native_fixture import Fixture, ClientObserver
+    from proxy_native_fixture import Fixture, ClientObserver, checkpoint_continuation_clean
     from proxy_trial import client_configuration, stop_process_group
     from proxy_gateway_fixture_support import Gateway
 except ModuleNotFoundError:
-    from scripts.proxy_native_fixture import Fixture, ClientObserver
+    from scripts.proxy_native_fixture import Fixture, ClientObserver, checkpoint_continuation_clean
     from scripts.proxy_trial import client_configuration, stop_process_group
     from scripts.proxy_gateway_fixture_support import Gateway
 
@@ -39,7 +39,7 @@ def grade_case(case, *, exit_code, rpc, fixture, state, received):
     assert len(fixture.summary_calls)>=2 and len(fixture.calls)-len(fixture.summary_calls)==4
     assert len(compact)==2 and all(e.get('success') is True for e in compact)
     assert sum(e.get('type')=='agent_settled' for e in rpc)>=3
-    assert state['history_rebases']>=2 and not state['active_shadow']
+    assert state['history_rebases']>=2 and checkpoint_continuation_clean(state, fixture.calls[-1])
     submitted=fixture.calls
     assert len(received)==len(submitted) and received and received[-1]==submitted[-1]
     assert 'FIXTURE_PI_CHECKPOINT' in json.dumps(submitted[-1]['input'])
@@ -112,8 +112,7 @@ def run_case(args,case):
         try:
             command=[args.carry,'proxy','--verbose','--listen',f'127.0.0.1:{port}',
                 '--upstream-url',fixture.url+'/v1/responses','--classifier-url',gateway.url+'/v1/responses',
-                '--state-dir',str(state_dir),'--mode',mode,'--payoff-requests','5','--min-payback-percent','0',
-                '--background-reviews=false']
+                '--state-dir',str(state_dir),'--mode',mode,'--payoff-requests','5','--min-payback-percent','0']
             proxy=subprocess.Popen(command,env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
             deadline=time.monotonic()+20
             while True:

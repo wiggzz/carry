@@ -412,14 +412,30 @@ impl Trajectory {
         self.traditional_edited = false;
     }
 
-    pub fn compacted(&mut self, before: u64, after: u64) {
-        if let Some(receipts) = &mut self.receipts {
-            // Carry changed its own wire input, not the traditional history.
-            receipts.invalidate_actual();
+    /// Receipt compatibility invalidates historical anchors and summary state,
+    /// not the already measured current request's signed disposable projection.
+    pub(super) fn reset_receipt_epoch(&mut self) {
+        let restored = self.restored;
+        let edited = self.carry_edited;
+        self.reset_epoch();
+        self.restored = restored;
+        self.carry_edited = edited;
+    }
+
+    /// Complete current canonical-minus-sent projection, not an additive edit.
+    /// Historical charges and the alternative's own summary remain untouched.
+    pub fn projected(&mut self, before: u64, after: u64, edited: bool) {
+        let restored = before as i128 - after as i128;
+        if edited || self.restored != restored {
+            if let Some(receipts) = &mut self.receipts {
+                // Carry changed its wire, not the traditional history. The
+                // explicit edit bit preserves equal-token prefix invalidation.
+                receipts.invalidate_actual();
+            }
+            self.carry_edited = true;
         }
-        // Restore the net input difference, including newly rendered memories.
-        self.restored = self.restored.saturating_add(before as i128 - after as i128);
-        self.carry_edited = true;
+        // Signed: a replacement memory can be larger than its original source.
+        self.restored = restored;
     }
 
     #[cfg(test)]
@@ -1405,7 +1421,7 @@ mod tests {
             100,
             true,
         );
-        trajectory.compacted(2000, 100);
+        trajectory.projected(2000, 100, true);
         let before = serde_json::to_value(&trajectory).unwrap();
         trajectory.failed_call();
         let after = serde_json::to_value(&trajectory).unwrap();
@@ -1541,7 +1557,7 @@ mod tests {
                 100,
                 true,
             );
-            trajectory.compacted(1000, 0);
+            trajectory.projected(1000, 0, true);
             trajectory.primary(
                 &request("retained fact"),
                 &response(metered),
@@ -1563,7 +1579,7 @@ mod tests {
     fn added_memory_can_make_the_traditional_input_smaller_than_carry() {
         let body = request("a retained derived memory with additional quoting overhead");
         let mut trajectory = legacy_trajectory();
-        trajectory.compacted(20, 30);
+        trajectory.projected(20, 30, true);
         trajectory.primary(&body, &response(100), "route", 100, true);
         let expected = projection(&body, "route", 100).unwrap().input - 10;
         assert_eq!(
@@ -1674,9 +1690,9 @@ mod tests {
                 };
                 // Establish the alternative size through the real compaction path.
                 if traditional_input >= carry_input {
-                    trajectory.compacted(traditional_input - carry_input, 0);
+                    trajectory.projected(traditional_input - carry_input, 0, true);
                 } else {
-                    trajectory.compacted(0, carry_input - traditional_input);
+                    trajectory.projected(0, carry_input - traditional_input, true);
                 }
                 let mut completion = response(17);
                 completion["usage"]["output_tokens"] = json!(output);

@@ -18,24 +18,17 @@ active worktree or merge prerequisite.
 - [x] Consolidate the proxy estimator with the shared savings/report estimator.
   Both use the same local token basis; do not add tokenized removals directly
   to provider input usage.
-- [x] Shared bounded windows for bootstrap and oversized ongoing reviews.
-  The live `0d16e73c823a…` session had ~1.07 MiB / 436,617 estimated tokens in its
-  reviewer projection alone, beyond both the old byte cap and the new token cap.
-  Both paths now retire old projections and carry sourced memories; atomic
-  oversized groups stay protected. Ongoing sweep progress survives failed
-  primaries/restarts, with newer context deferred to later sweeps.
-  `--review-max-calls` bounds both paths; the old bootstrap flag remains an alias.
-- [x] Apply valid reviewer items independently and return bounded rejection
-  feedback in the next mutable ledger, persisted across failed primaries/restarts.
-- [x] Opt-in background ordinary reviews (`--background-reviews`) to remove reviewer
-  round-trip latency from primary requests; bootstrap remains synchronous and is
-  deferred while old-lineage review work is still in flight.
-  - Dispatch from an immutable snapshot without holding the primary session lock.
-  - Reacquire the lock only to merge usage and validated advice; never overwrite a
-    newer checkpoint or mutate a request already submitted to the provider.
-  - Check lineage/epoch and current group eligibility; discard stale advice after
-    a rebase, removal or changed tool cohort. Keep source provenance validation.
-  - Bound one in-flight review per session, handle shutdown/restart and failures,
-    and test latency, simultaneous continuation, rebases and failed primaries.
+- [x] Replace import windows, persistent selection, reviewer replay and keep leases
+  with immutable original-prefix semantic advice and disposable projections.
+  See [the current contract](proxy-fork-continuity.md); old checkpoint migration
+  and operator compatibility are intentionally not provided.
+- [x] Apply valid reviewer items independently, preserving sources for rejected
+  replacement facts and returning bounded feedback in the next current ledger.
+- [x] Asynchronous ordinary/replay review captures immutable H without holding a
+  fitting primary. Completion may publish at H after the paid owner advances;
+  sibling branches cannot inherit advice whose observation included a divergent
+  suffix. Cohort/protection/dependency checks and paid settlement remain required.
+- [x] One bounded no-fit review acquisition, never unbounded capacity rescue or
+  partial-observation authority. Failure/no-help/timeout preserves local rejection.
 
 No running proxy is restarted or upgraded by these source changes.

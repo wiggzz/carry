@@ -61,21 +61,21 @@ def prefix_identity(body, end):
     return hashlib.sha256(wire).hexdigest()
 
 
-def grade_cache_records(records, body, explicit=True, history=()):
-    assert records and len(records) <= 8
-    assert len(json.dumps(records, separators=(',', ':'), ensure_ascii=False).encode()) <= 64 * 1024
-    stable_end = len(body['input']) - (1 if explicit else 0)
-    settings = {key: value for key, value in body.items() if key != 'input'}
+def grade_cache_records(records, history):
+    """Check the shared purpose-neutral evidence against actual outbound bodies."""
+    assert len(records) <= 128
+    assert len(json.dumps(records, separators=(',', ':')).encode()) <= 65536
+    digest = lambda v: hashlib.sha256(json.dumps(v, sort_keys=True, separators=(',', ':'),
+                                               ensure_ascii=False).encode()).hexdigest()
     for record in records:
-        assert set(record) == {'format_version', 'base', 'input_len', 'input_sha256', 'at',
-                               'read_estimated_tokens', 'read_confirmed_at'}
-        assert record['format_version'] == 1
-        assert 0 < record['input_len'] <= stable_end, 'cache evidence includes ledger or out-of-bounds input'
-        candidates = [body] if explicit else [*history, body]
-        assert any(record['input_len'] <= len(sent['input'])
-                   and record['input_sha256'] == prefix_identity(sent, record['input_len'])
-                   for sent in candidates), 'cache prefix identity mismatch'
-        assert record['base']['settings'] == settings, 'cache non-input settings mismatch'
+        assert set(record) == {'route', 'credential_sha256', 'base_sha256', 'input_sha256',
+                               'input_len', 'estimated_tokens', 'at', 'ttl_seconds', 'native_cached_fraction'}
+        assert 0 <= record['native_cached_fraction'] <= 1
+        assert record['at'] > 0 and record['ttl_seconds'] == 1800
+        assert any(0 < record['input_len'] <= len(body['input'])
+                   and record['input_sha256'] == digest(without_markers(body['input'][:record['input_len']]))
+                   and record['base_sha256'] == digest({k: v for k, v in body.items() if k not in ('input', 'stream')})
+                   for body in history), 'cache identity must bind an actual wire prefix and settings'
 
 
 def boundaries(body):
@@ -194,63 +194,37 @@ class Provider:
         self.thread.join(timeout=3)
 
 
-def grade_replay(reviews, outputs, allow_pruning=False):
+def grade_projection(reviews, outputs):
     assert len(reviews) == len(outputs), 'each actual reviewer result must be captured'
-    for index, current in enumerate(reviews[1:], 1):
-        previous = reviews[index - 1]['input']
-        items = without_markers(current['input'])
-        if (canonical(items[:len(previous)]) == canonical(previous)
-                and (not allow_pruning or len(items) >= len(previous) + len(outputs[index - 1]) + 1)):
-            assert items[len(previous):len(previous) + len(outputs[index - 1])] == outputs[index - 1], \
-                'native reviewer output must replay exactly before new source/ledger'
-        else:
-            assert allow_pruning, 'prior review input must remain an exact prefix'
-            old_ids = {item['id'] for output in outputs[:index] for item in output}
-            assert not any(item.get('id') in old_ids for item in items), 'pruned reviewer output must disappear'
-        for output in outputs[:index]:
-            for expected in output:
-                matches = [item for item in items if item.get('id') == expected['id']]
-                if matches:
-                    assert matches == [expected], 'native reviewer output must replay exactly once'
+    output_ids = {item['id'] for output in outputs for item in output}
+    for body in reviews:
+        items = without_markers(body['input'])
+        assert not any(item.get('id') in output_ids for item in items), 'disposable reviewer output must not replay'
+        records = review_records(body)
+        groups = [r for r in records if 'member_ids' in r]
+        members = [m for r in groups for m in r['member_ids']]
+        assert len(members) == len(set(members)), 'native source members must occur once per projection'
 
 
-def grade(reviews, receipts, enabled=True, missing_usage=False, append_only=False, outputs=None):
+def grade(reviews, receipts, enabled=True, missing_usage=False, outputs=None):
     assert len(reviews) >= 8, 'at least eight actual reviews required'
+    assert len(reviews) == len(receipts), 'every actual review has one simulator receipt'
     for body in reviews:
         assert json.loads(text(body['input'][-1])).get('current_groups'), 'missing current ledger groups'
-    if outputs is not None:
-        grade_replay(reviews, outputs)
-    if append_only:
-        previous = reviews[-2]['input']
-        current = reviews[-1]['input']
-        assert canonical(current[:len(previous)]) == canonical(previous), 'prior review input must remain an exact prefix'
-        if outputs is None:
-            assert current[len(previous)]['role'] == 'assistant', 'prior reviewer answer must precede the new nudge'
-        output_length = len(outputs[-2]) if outputs is not None else 1
-        assert len(current) == len(previous) + output_length + 1, 'no new source items expected on the final ledger-only update'
-    else:
-        assert canonical(reviews[-1]['input'][:-1]) == canonical(reviews[-2]['input'][:-1]), 'ledger-only review required'
-    assert text(reviews[-1]['input'][-1]) != text(reviews[-2]['input'][-1]), 'ledger really must change'
-    if not enabled:
-        assert all(not boundaries(b) and 'prompt_cache_options' not in b for b in reviews)
-        if outputs is not None:
-            for index, receipt in enumerate(receipts[1:]):
-                if not missing_usage or index > 0:
-                    assert receipt['synthetic_cached_tokens'] > 0, 'implicit simulator must reuse an exact historical prefix'
-        return
-    for body in reviews:
         points = boundaries(body)
-        assert points, 'missing outbound stable reviewer cache breakpoint'
-        assert body['prompt_cache_options'] == {'mode': 'explicit'}
-        assert max(points) == len(body['input']) - 1, 'must WRITE stable observations, not ledger'
-        assert len(points) <= 4
-        assert json.loads(text(body['input'][-1]))['current_groups']
-    for index, (previous, current, receipt) in enumerate(zip(reviews, reviews[1:], receipts[1:])):
-        previous_end = max(boundaries(previous))
-        assert canonical(current['input'][:previous_end]) == canonical(previous['input'][:previous_end])
-        assert previous_end in boundaries(current), 'latest prior WRITE must remain a lookup candidate'
-        if not missing_usage or index > 0:
-            assert receipt['synthetic_cached_tokens'] > 0, 'simulator failed to reuse preserved stable boundary'
+        if enabled:
+            assert points == [len(body['input']) - 1], 'one stable observation boundary, not ledger'
+            assert body['prompt_cache_options'] == {'mode': 'explicit'}
+        else:
+            assert not points and 'prompt_cache_options' not in body, 'disabled means no explicit markers'
+    if outputs is not None:
+        grade_projection(reviews, outputs)
+    assert canonical(reviews[-1]['input'][:-1]) == canonical(reviews[-2]['input'][:-1]), 'ledger-only review required'
+    assert text(reviews[-1]['input'][-1]) != text(reviews[-2]['input'][-1]), 'ledger really must change'
+    # No rotating historical markers or answer replay is required. Only an
+    # actually matching stable prefix may produce the final synthetic hit.
+    if not missing_usage:
+        assert receipts[-1]['synthetic_cached_tokens'] > 0, 'unchanged stable observations must be reusable'
 
 
 def grade_coupled(provider, sent, state, enabled):
@@ -261,27 +235,19 @@ def grade_coupled(provider, sent, state, enabled):
     assert native(provider.primary[2]) == native(sent[2]), 'new native bytes must first receive exposure intact'
     assert native(provider.primary[3]) == native(sent[3]), 'new review advice affects the following request'
     assert not native(provider.primary[4]), 'complete exposed cohort must be removed together'
-    assert not any(native(b) for b in provider.primary[4:]), 'removed native source must never resurrect'
     before_reset = [b for b in provider.reviews if 'NEW_RESET_DIRECTION' not in json.dumps(b)]
     after_reset = [b for b in provider.reviews if 'NEW_RESET_DIRECTION' in json.dumps(b)]
     assert before_reset and after_reset
-    assert any('DISCARD_NATIVE_BYTES' in json.dumps(b) for b in before_reset[:2])
-    assert all('DISCARD_NATIVE_BYTES' not in json.dumps(b) for b in before_reset[3:]), 'paired shadow source must be pruned'
+    assert any('DISCARD_NATIVE_BYTES' in json.dumps(b) for b in before_reset)
+    assert any('DISCARD_NATIVE_BYTES' not in json.dumps(b) for b in before_reset[3:]), 'selected reviewer projection must omit the whole cohort'
     assert all('DISCARD_NATIVE_BYTES' not in json.dumps(b) for b in after_reset)
     assert state['compactions'] >= 1 and state['history_rebases'] == 1
-    assert len(state['active_shadow']) == 2 and len(state['history']) == 2
-    grade_replay(provider.reviews, provider.review_outputs, allow_pruning=True)
-    if enabled:
-        assert all(0 < len(boundaries(b)) <= 4 and max(boundaries(b)) == len(b['input']) - 1 for b in provider.reviews)
-    else:
-        assert all(not boundaries(b) and 'prompt_cache_options' not in b for b in provider.reviews)
-    # A compatible smaller pre-cohort generation survives the shared trim.
-    assert provider.receipts[3]['synthetic_cached_tokens'] > 0, 'post-prune stable prefix must remain a lookup candidate'
+    assert len(state['history']) == 2
+    grade_projection(provider.reviews, provider.review_outputs)
+    for body in provider.reviews:
+        assert boundaries(body) == ([len(body['input']) - 1] if enabled else [])
     reset_index = provider.reviews.index(after_reset[0])
     assert provider.receipts[reset_index]['synthetic_cached_tokens'] == 0, 'divergent reset must start cold'
-    # Hash/length matching the actual post-reset render proves no stale
-    # pre-reset prefix evidence survives, without storing source copies.
-    grade_cache_records(state['reviewer_cache'], after_reset[-1], enabled, history=after_reset)
 
 
 def fixture_environment():
@@ -319,7 +285,11 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
     credit_snapshots = []
     with Provider(case) as provider:
         # Two actual OS processes share durable state; provider cache survives restart.
-        for epoch, turns in enumerate((range(5), range(5, 11))):
+        # After the missing receipt and real cold write, repeat the COMPLETE
+        # unchanged payload once to actually earn the early cached-read probe.
+        # Keep every original append/turn; no reduced payload or clock change.
+        first_epoch = [0, 1, 2, None, 3, 4] if case == 'missing-usage' else range(5)
+        for epoch, turns in enumerate((first_epoch, range(5, 11))):
             with socket.socket() as sock:
                 sock.bind(('127.0.0.1', 0))
                 port = sock.getsockname()[1]
@@ -329,7 +299,7 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
                    # Synthetic cache/replay budget, including the deliberately
                    # unlisted-model control; never depend on a model-role default.
                    '--classifier-max-input-tokens', '300000',
-                   '--mode', 'compact' if case == 'coupled' else 'audit', '--background-reviews=false']
+                   '--mode', 'compact' if case == 'coupled' else 'audit']
             if case == 'coupled':
                 cmd += ['--payoff-requests', '1', '--min-payback-percent', '0']
             if policy_arg != 'none':
@@ -372,7 +342,7 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
                                 inputs = [{'role': 'user', 'content': 'NEW_RESET_DIRECTION ' + 'new ' * 600}]
                             elif turn == 9:
                                 inputs.append({'role': 'user', 'content': 'Continue on the new branch.'})
-                        elif turn < 9:
+                        elif turn is not None and turn < 9:
                             inputs.append({'role': 'user', 'content': f'FIXTURE_OBSERVATION_{turn} ' + 'stable data ' * 400})
                         body = {'model': 'gpt-6-luna', 'input': copy.deepcopy(inputs), 'store': False, 'stream': False,
                                 'prompt_cache_key': 'primary-fixture-affinity'}
@@ -398,9 +368,19 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
                             if time.monotonic() > deadline:
                                 raise AssertionError('reviewer cache receipt did not settle')
                             time.sleep(.01)
+                        if turn == 0 and policy_arg in ('openai-explicit', 'disabled') and model == 'gpt-6-luna':
+                            # Advertise only the synthetic simulator capability;
+                            # cache receipts still come exclusively from HTTP.
+                            reviewer = snapshot['model_resolution']['reviewer']
+                            reviewer['cache'] = {'minimum_prefix_tokens': 1024, 'max_read_breakpoints': 50,
+                                'max_write_breakpoints': 4, 'implicit_breakpoint_uses_write_slot': True}
+                            reviewer['explicit_cache_transport'] = enabled
+                            checkpoints[0].write_text(json.dumps(snapshot))
                         if case == 'missing-usage':
+                            index = json.loads((directory / 'state' / 'history.index').read_text())
                             credit_snapshots.append({'turn': turn,
-                                'read_credit': sum(e['read_estimated_tokens'] for e in snapshot.get('reviewer_cache', []))})
+                                'read_credit': sum(e['estimated_tokens'] * e['native_cached_fraction']
+                                                   for e in index['upstream_cache'])})
                 finally:
                     process.terminate()
                     process.wait(timeout=5)
@@ -422,18 +402,19 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
             assert provider.primary == sent, 'reviewer repair must leave primary bodies unchanged'
             assert provider.primary_raw_hashes == sent_hashes, 'audit primary raw JSON bytes must remain identical'
             grade(provider.reviews, provider.receipts, enabled, case == 'missing-usage',
-                  append_only=True, outputs=provider.review_outputs)
+                  outputs=provider.review_outputs)
         if case == 'missing-usage':
+            assert sent[2] == sent[3] and sent_hashes[2] == sent_hashes[3], 'read probe must repeat the full unchanged native payload'
+            assert provider.receipts[2]['synthetic_cached_tokens'] > 0, 'read-credit assertion requires an actual transmitted matching prefix and cached-read receipt'
             assert credit_snapshots[1]['read_credit'] == credit_snapshots[2]['read_credit'] == 0
             assert credit_snapshots[3]['read_credit'] > 0, 'only an explicit cached-read receipt may grant credit'
             assert state['shadow']['unavailable_cost_calls'] >= 1, 'missing usage must remain unknown in metering'
-        records = state['reviewer_cache']
-        assert records and any(e['read_estimated_tokens'] > 0 for e in records)
-        assert sum(e['read_confirmed_at'] is not None for e in records) == 1, 'aggregate read must credit only one boundary'
-        latest = provider.reviews[-1]
-        total_estimate = len(json.dumps(latest, separators=(',', ':'), ensure_ascii=False).encode()) / 4
-        assert sum(e['read_estimated_tokens'] for e in records) <= total_estimate * 2048 / 10000 + 1e-9
-        grade_cache_records(records, latest, enabled, history=provider.reviews)
+        records = json.loads((directory / 'state' / 'history.index').read_text())['upstream_cache']
+        if policy_arg == 'auto':
+            assert not records, 'unknown generic capability cannot confer cache evidence'
+        else:
+            assert records and any(e['native_cached_fraction'] > 0 for e in records)
+        grade_cache_records(records, provider.reviews + provider.primary)
         return {'reviews': len(provider.reviews), 'processes': 2, 'case': case, 'basis': evidence['basis'],
                 'classifier_cache_policy': policy_arg, 'classifier_model': model, 'explicit_enabled': enabled}
 

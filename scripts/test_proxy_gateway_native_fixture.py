@@ -11,7 +11,7 @@ class NativeGatewayGradeTests(unittest.TestCase):
         fixture=SimpleNamespace(calls=[{'input':[], 'prompt_cache_key':'native'} for _ in range(4)] + [
             {'input':[{'content':'FIXTURE_PI_CHECKPOINT'}]} for _ in range(2)],
             summary_calls=[{},{}],errors=[])
-        state={'history_rebases':2,'active_shadow':[],'compactions':0}
+        state={'history_rebases':2,'background_review_pending':False,'compactions':0}
         wire={'input':[{'content':'FIXTURE_PI_CHECKPOINT'}]}
         fixture.calls[-1]=wire
         return dict(exit_code=0,rpc=rpc,fixture=fixture,state=state,received=[wire]*6)
@@ -21,11 +21,13 @@ class NativeGatewayGradeTests(unittest.TestCase):
         result=grade_case('compact-reset',**evidence)
         self.assertTrue(result.get('two_summary_continuation_verified'))
         self.assertTrue(result.get('checkpoint_wire_preserved'))
-        for missing in ('summary','rebase','shadow','wire','missing-in','extra-in','missing-out','extra-out'):
+        for missing in ('summary','rebase','shadow','old-cohort','wire','missing-in','extra-in','missing-out','extra-out'):
             evidence=self.evidence()
             if missing=='summary': evidence['fixture'].summary_calls.pop()
             if missing=='rebase': evidence['state']['history_rebases']=1
-            if missing=='shadow': evidence['state']['active_shadow']=[{'source_id':'stale'}]
+            if missing=='shadow': evidence['state']['background_review_pending']=True
+            if missing=='old-cohort': evidence['fixture'].calls[-1]['input'].append(
+                {'type':'function_call_output','call_id':'old','output':'stale'})
             if missing=='wire': evidence['received'][-1]={'input':[]}
             if missing=='missing-in': evidence['received'].pop()
             if missing=='extra-in': evidence['received'].append(evidence['received'][-1])

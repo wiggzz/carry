@@ -110,228 +110,32 @@ No Pi plugin, Pi runtime dependency, or client process management is required
 by the proxy. Pi summary replacement needs an explicit new branch or the
 `x-carry-history-policy: reset-on-divergence` opt-in described below.
 
-### First replay compaction
+### Prefix advice and review admission
 
-On a new or rebased history, Carry automatically imports complete turns before
-the latest user message when serialized input is at least 16 KiB. This applies
-to both implicit prefixes and explicit sessions. Small histories skip this
-bootstrap, and a fresh system/user request never qualifies as replay. Increase
-`--bootstrap-min-input-bytes` to avoid automatic import for histories below a
-chosen size. The threshold is a simple size heuristic, not a claim of savings.
+See [prefix advice and request-time history](proxy-fork-continuity.md) for the
+current authority, dependency, cache-evidence, capacity and scheduling contract.
+Canonical source is immutable; request-time omission is reversible. Reviewer
+outputs are disposable, and complete advice is bound to the original observed
+prefix even if the paid owner advances. This clean replacement requires a new
+empty state directory; there is no checkpoint migration, import-window/replay
+trajectory, lease, fork-point API, or synchronous-review mode.
 
-`--review-replayed-history` or the per-request header
-`x-carry-replay-history: before-latest-user` explicitly declares prior turns
-consumed and overrides that threshold. Imported turns become reviewable before
-the first primary request, independently of normal review cadence. The latest
-user turn and its fresh tool results are not made removable by import.
-Cross-boundary tool cohorts, opaque items and other pinned groups stay protected.
-Histories with no eligible sources incur no bootstrap reviewer calls.
+Ordinary reviews require both completed-primary cadence and newly reviewable
+native-source growth, plus the retained-primary size floor. Defaults are four
+requests, 25,000 new tokens and a 150,000-token primary estimate. Set
+`--review-every-requests`, `--review-min-new-tokens`, and
+`--review-min-primary-tokens` (or their `CARRY_PROXY_REVIEW_*` environment values)
+explicitly for matched experiments. Bounded no-yield backoff does not manufacture
+new source. Review answers, memories and repeated old native content are not new
+source growth. Replay exposure declarations do not make review synchronous.
 
-Each reviewer requests provider-enforced structured output with
-`text.format.type=json_schema` and `strict:true`, on both API-key and Codex
-routes. The schema enforces the three advice fields and memory shapes. Carry
-still validates eligible IDs, decisions, provenance and size limits per item.
-Valid items are applied even when siblings are invalid; protection takes precedence
-over a conflicting drop. Invalid memories never activate. The next reviewer ledger
-includes bounded `previous_review_feedback` with rejected field/index/reason and
-accepted counts, so the model can correct rejected instructions without repeating
-accepted facts. Feedback is checkpointed and never retains rejected source text.
-Refusals, incomplete output, malformed top-level JSON or a provider rejecting the
-schema reject the review; there is no silent unconstrained-output fallback.
-Only the final assistant message is parsed as JSON advice; progress commentary
-is not concatenated into that answer, and a final refusal does not fall back to
-an earlier message.
-The primary request can continue unchanged.
-The newest live user group is pinned independently of reviewer advice.
-
-The reviewer maintains one conversation aligned with the primary's retained
-sources and shared memories. New source items append after the prior reviewer's
-request and replayable response, including reasoning and phase fields. Each
-ordinary review is one brief state update, not a sweep of independent source
-windows. Accepted retention decisions and memories are durable state. Nudge
-prompts and previous reviewer answers are disposable: compaction rebuilds both
-views and removes that bookkeeping. Facts become part of both rendered histories
-when their sources are removed; unmaterialized facts remain in the current ledger.
-Primary tool descriptions are not duplicated into the reviewer instructions.
-
-Before dispatch, the planner checks the actual rendered next primary and reviewer
-requests, including incoming material. Both capacity bounds resolve through the
-[shared model catalog](model-catalog.md), constrained by fresh exact-route metadata
-when available. Explicit `--primary-context-tokens` and
-`--classifier-max-input-tokens` (also named `--reviewer-context-tokens`) overrides
-remain supported within known capacity. There are no separate primary/reviewer
-role defaults. The ordinary economic target is not a hard capacity ceiling. An
-unknown reviewer capacity disables review rather than blocking a fitting primary.
-The default 10% `--context-margin-percent`
-margin is added to estimated inputs, with an output reserve: the client's
-`max_output_tokens` or `--primary-output-reserve-tokens` (16,384) for primary,
-and `--classifier-max-output-tokens` (2,048) for reviewer. Serialized reviewer
-requests are also capped by `--classifier-max-input-bytes` (8 MiB).
-
-Capacity takes precedence over economics in compact mode. If either next request
-cannot fit, the planner removes only authorized atomic source groups and rebuilds
-the reviewer without disposable control turns. It can also clean only reviewer
-bookkeeping while preserving the primary's cached prefix. If protected material,
-an indivisible tool group, or incoming material still cannot fit, Carry returns
-HTTP 413 without sending an oversized primary request. Audit mode reports the
-capacity problem without making removals.
-
-When both requests fit, the planner compares both retained histories over the
-configured payoff horizon (five requests by default), including upcoming reviewer
-calls and their configured output allowance. Each candidate advances its own
-review age, cadence, eligibility and completed-primary exposure; a source rewrite
-skips an immediate ordinary review, while a reviewer-only cleanup does not. This
-is a **frozen-source, timely-completion sensitivity**: hypothetical future reviews
-are assumed to complete and merge before their next due dispatch, not guaranteed
-to do so. Already-pending background work and unfinished imports remain unknown,
-not free; completed bootstrap receipts are sunk. The legacy `joint` diagnostic
-keeps its input-only primary arithmetic. `selection_joint` separately includes
-an explicit primary **output-cap sensitivity**: when the request supplies
-`max_output_tokens`, that many output tokens per payoff request are priced at
-**each rendered branch's own input-selected, frozen output tariff**. This is
-neither expected generation nor measured usage. An explicit zero is zero; without
-a request cap, the legacy zero-output assumption is reported explicitly.
-`--primary-output-reserve-tokens` is capacity headroom only, never an implicit
-expected-output estimate. The report separates primary input and output costs,
-allowance, horizon and assumption basis; native paid receipts remain unchanged.
-
-Reports identify actual actions as `keep`, `reviewer_only` or `joint`; primary-only
-removal is not an applicable action because removing source necessarily rebuilds
-reviewer replay. The additive `keep_candidate` stays outside the legacy
-`candidates` vector. Stable candidate IDs name removal/memory-retirement actions
-within one frozen source plan, not globally unique sessions or rank positions.
-`selected_candidate_id` and `selected_action` are carried with the selected state;
-the dashboard uses that exact row's `selection_joint`, not the largest recurring
-savings row. Older selected reports without identity remain unidentified rather
-than guessing which rendering won. Audit mode still records a proposal, not proof
-of forwarding or mutation.
-
-Fresh compatible receipts can credit
-cache reads; evidence expires after 30 minutes. Implicit fills use ordinary input
-rates, while explicit cache writes use the modeled write rate. No cache markers
-are required for implicit-prefix evidence. Capacity and planner input counts are
-local `o200k_base` estimates over rendered JSON; configured budgets, estimation
-margin and output reserves are operator planning assumptions, not native provider
-counts or enforced provider limits.
-The usage ledger separately records native input/output/cache counts from actual
-receipts (or reports them unavailable). Local estimates do not guarantee a cache
-hit. There is no dependency on a historical reviewer-window partition.
-
-Reviewer requests replay native messages, reasoning (including encrypted content),
-and tool call/result items. Source IDs are appended to the last message text block;
-protocol/ciphertext items stay exact and receive an adjacent small metadata note.
-Primary system/developer source roles become reviewer user evidence, with original
-roles recorded in source metadata. Unknown native types use an opaque fallback.
-The final mutable ledger carries the latest native user task even when reviewing
-an older window, without rewriting the source prefix. It also exposes
-`eligible_memory_ids` and `current_memories`. Existing
-`m…` memory IDs can be protected or made removable independently of `g…` source
-groups. Protection wins conflicting opinions. Retirement removes the fact from
-both primary/reviewer views and its source anchor; IDs remain monotonic across
-retirement and restart. New memories still cite eligible `g…` sources, never
-memory handles. Invalid items are rejected individually.
-Primary forwarding remains unchanged. Strict structured output is requested on
-both API-key and subscription reviewer paths. Live cross-model encrypted reasoning
-compatibility still requires provider verification; local fixtures verify transport.
-
-Oversized imports are admitted chronologically into the retained reviewer history.
-Carry fills the next request up to its budget, obtains advice, and retains the
-protected sources and shared facts. When the next chunk cannot fit, disposable
-reviewer turns and authorized sources are removed before admitting more material.
-The primary is dispatched only once its requests fit; an incomplete oversized
-import returns a capacity error while preserving successful import progress.
-`--review-max-calls` (default 16) bounds each import attempt, and
-`--bootstrap-max-cost-usd` (default $1 of modeled API-equivalent spend) is reserved
-before each call and persists across restart. Raising limits or retrying can
-resume incomplete imports; restarting does not replenish the cumulative allowance.
-These modeled amounts are not provider billing limits. Subscription transport does
-not enforce the API output cap, so configure conservative budgets for that route.
-
-## Ordinary review admission and batching
-
-Ordinary review is admitted only when **all three** conditions hold: the currently
-retained primary wire-prompt estimate reaches its floor, enough primary requests
-have completed since the last attempt, and enough previously uncovered native
-source has become reviewable. Equality admits. A large tool result can satisfy
-the token batch, but cannot replace the completed-request batch. Unexposed,
-pinned or incomplete tool cohorts are not reviewable growth. Reviewer ledgers,
-answers, memories, cache-window rebuilding and repeated old source do not count.
-The primary estimate includes retained instructions/tools and is reevaluated after
-selection/rebase; it is not cumulative billing usage or reviewer-prompt size.
-
-| CLI option | Environment variable | Default | Range |
-| --- | --- | ---: | --- |
-| `--review-min-primary-tokens` | `CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS` | 150000 | 0–2000000 |
-| `--review-every-requests` | `CARRY_PROXY_REVIEW_EVERY_REQUESTS` | 4 | 1–100 |
-| `--review-min-new-tokens` | `CARRY_PROXY_REVIEW_MIN_NEW_TOKENS` | 25000 | 0–2000000 |
-| `--review-backoff-factor` | `CARRY_PROXY_REVIEW_BACKOFF_FACTOR` | 2 | 1–16 |
-| `--review-backoff-max` | `CARRY_PROXY_REVIEW_BACKOFF_MAX` | 8 | 1–64 |
-
-CLI overrides environment; environment overrides defaults. Empty/malformed or
-out-of-range values fail at startup before state creation. Zero disables either
-token gate; factor 1 (or maximum 1) disables adaptive backoff. To restore the old
-per-request policy explicitly, use:
-
-```sh
-carry proxy --review-min-primary-tokens 0 --review-min-new-tokens 0 \
-  --review-every-requests 1 --review-backoff-factor 1
-```
-
-A valid review with no actual decision/material delta multiplies **both** request
-and native-token batches by the factor, up to the configured maximum multiplier
-(default sequence 1, 2, 4, 8, 8). The primary floor is not multiplied. Newly
-authorized atomic removals, unique accepted memories, or retired existing memories
-reset backoff. A new protection is progress, not removal yield: it holds the
-current multiplier without resetting it. Repeated protections, removability
-opinions and duplicate memories are no-yield. A transport/protocol failure or
-wholly invalid advice consumes request cadence but neither increases no-yield
-backoff nor consumes the native-source batch; retry still requires ordinary
-cadence and eligibility. Partial valid advice is classified by committed deltas.
-This does not equate accepted-opinion counts, or a lack of physical rewrites,
-with useful removal. Existing safety constraints retain authority over any advice.
-
-Coverage and no-yield state persist across process restarts separately from
-reviewer replay/cache windows. Legacy checkpoints seed coverage from existing
-native observations rather than counting old source as growth. Native ancestry
-rebases retire coverage/backoff and restart cadence at the current completed
-request count. Compatible background merges classify only the applied deltas;
-stale lineage work cannot reset backoff or cover a new lineage's source.
-Bootstrap/import and blocking real-capacity recovery bypass ordinary admission,
-not exposure, pinning, tool atomicity, request-size limits or import spend bounds.
-
-The planner uses this same admission predicate per retained candidate and consumes
-a frozen native-source batch once. It does not invent future source growth or
-successful removal yield; current backoff is held constant in this sensitivity.
-Pending/incomplete work remains unknown. Operational journals expose bounded
-numeric admission inputs, reason, multiplier and outcome; policy fingerprints,
-`/carry/metrics.review_policy`, plan reports and trial provenance record effective
-settings. No prompt contents or native source IDs are added to admission logs.
-
-These defaults are **hypotheses, not a measured optimum**. They aim to avoid early
-paid reviews and batch low-yield histories, but may delay useful advice. Fewer
-reviews do not establish lower whole-session cost or maintained task quality.
-Batching does not guarantee an 80–95% cache-hit ratio or any savings: removing cold
-calls can change the denominator, and longer backoff can expire provider caches.
-Fewer reviews send fewer repeated mutable-ledger copies; this scheduling change
-does not alter primary instruction placement, reviewer prefixes or cache-key handling.
-Evaluate native cached/input counts, total reviewer expense, whole-session cost
-and task quality together before promoting a treatment. Small protocol fixtures
-explicitly select the legacy policy so they continue exercising review behavior;
-they are not admission-economics measurements.
-
-Ordinary updates run in the background by default, with one review in flight per
-session. Only compatible advice is merged into the latest checkpoint. Capacity
-pressure waits for an in-flight update without holding its merge lock, then
-replans, and can require a synchronous update. Failed/stale work still counts as
-spent usage. Restart does not resume an in-flight model call; its durable pending
-marker censors unknown usage. Successful transcript and import progress survive
-restart. Dashboard savings remain incomplete while a background review is pending.
-
-`off` is unchanged; `audit` reviews without rewriting; `compact` removes sources only after valid advice, either to satisfy capacity or
-after the economic admission check. Import does not
-fabricate completed requests or native usage. Failed primaries do not grant
-exposure to fresh input or commit speculative removals. Previously committed
-removals remain applied to matching echoed histories after restart.
+Planning prices the configured primary input payoff horizon plus each reviewer
+view actually due now, including its output cap. It does not forecast reviewer
+answer replay or claim unknown in-flight work is free. Ordinary review does not
+hold a fitting primary; at most one bounded review may help an otherwise no-fit
+primary. Hard request limits, native usage and API-equivalent economic estimates
+remain separate. These forecasts do not establish model quality, live cache
+behavior or whole-session savings.
 
 ## Everyday Pi launcher
 
