@@ -146,25 +146,30 @@ function disclosure(key,label,className){
 }
 // Retain keyed rows and native disclosures instead of remounting the live tree.
 // Unchanged siblings never move, preserving focus, selection and nested scroll.
-function patchChildren(parent, freshChildren){
+const descendants=node=>[node,...[...node.children].flatMap(descendants)];
+function patchChildren(parent, freshChildren, histories){
  const key=node=>node.tagName+':'+(node.id||node.className||'');
  const old=[...parent.children],used=new Set();
  freshChildren.forEach((fresh,index)=>{
-  const current=old.find(node=>!used.has(node)&&key(node)===key(fresh));
+  // History identity is independent of its current grouping container.
+  const current=histories.get(fresh.id)?.node||old.find(node=>!used.has(node)&&key(node)===key(fresh));
   const node=current||fresh;
   if(current){
    used.add(current);
-   for(const name of current.getAttributeNames())if(name!=='open'&&fresh.getAttribute(name)==null)current.removeAttribute(name);
-   for(const name of fresh.getAttributeNames())if(name!=='open')current.setAttribute(name,fresh.getAttribute(name));
-   for(const name of ['id','className','title'])current[name]=fresh[name]||'';
-   if(fresh.tagName.toLowerCase()==='progress'){current.max=fresh.max;current.value=fresh.value}
-   if(fresh.children.length)patchChildren(current,[...fresh.children]);
-   else {if(current.children.length)current.replaceChildren();if(current.textContent!==fresh.textContent)current.textContent=fresh.textContent}
+   if(current!==fresh){
+    for(const name of current.getAttributeNames())if(name!=='open'&&fresh.getAttribute(name)==null)current.removeAttribute(name);
+    for(const name of fresh.getAttributeNames())if(name!=='open')current.setAttribute(name,fresh.getAttribute(name));
+    for(const name of ['id','className','title'])current[name]=fresh[name]||'';
+    if(fresh.tagName.toLowerCase()==='progress'){current.max=fresh.max;current.value=fresh.value}
+    if(!fresh.children.length){if(current.children.length)current.replaceChildren();if(current.textContent!==fresh.textContent)current.textContent=fresh.textContent}
+   }
   }
+  // Even a new wrapper may contain histories from an existing parent.
+  if(fresh.children.length)patchChildren(node,[...fresh.children],histories);
   const at=parent.children[index]||null;
   if(at!==node)parent.insertBefore(node,at);
  });
- for(const node of old)if(!used.has(node))parent.removeChild(node);
+ for(const node of old)if(!used.has(node)&&node.parentElement===parent)parent.removeChild(node);
 }
 async function refresh(){
  if(busy)return;busy=true;
@@ -173,7 +178,13 @@ async function refresh(){
   const res=await fetch('/carry/dashboard/stats',{headers,cache:'no-store'});
   if(!res.ok)throw Error(res.status===401?'Enter the scoped proxy token for remote dashboard access.':'Stats request failed (HTTP '+res.status+').');
   const data=await res.json();const sessions=data.sessions;
-  const focusedDisclosure=document.activeElement?.tagName==='SUMMARY'?document.activeElement.parentElement.id:null;
+  const focusedElement=document.activeElement;
+  const roots=[$('sessions'),$('background-sessions')];
+  const histories=new Map(roots.flatMap(descendants).filter(node=>node.className==='session').map(node=>{
+   let visible=true;
+   for(let ancestor=node.parentElement;ancestor;ancestor=ancestor.parentElement)if(ancestor.tagName.toLowerCase()==='details'&&!ancestor.open)visible=false;
+   return [node.id,{node,parent:node.parentElement,reveal:visible&&(node.contains(focusedElement)||descendants(node).some(child=>child.tagName.toLowerCase()==='details'&&child.open))}];
+  }));
   $('config').textContent='Mode: '+data.mode+' · Auth: '+data.auth+' · Reviewer: '+data.classifier_model+' / '+data.classifier_effort+' · Reviewer cache: '+data.reviewer_cache_mode;
   $('status').textContent='Updated '+new Date().toLocaleTimeString()+' · auto-refresh every 2 seconds'+(data.unavailable_sessions?' · WARNING: '+data.unavailable_sessions+' unreadable checkpoints; totals incomplete':'');
   $('status').className=data.unavailable_sessions?'warning':'';
@@ -334,12 +345,15 @@ async function refresh(){
    const grid=document.createElement('div');grid.className='session-grid';grid.append(...group.map(s=>renderSession(s,true)));
    detail.append(summary,note,grid);return detail;
   });
-  patchChildren($('sessions'),rendered);
+  patchChildren($('sessions'),rendered,histories);
   if(!conversations.length){const empty=document.createElement('p');empty.className='empty';empty.textContent='No conversations recorded here yet.';$('sessions').append(empty)}
-  patchChildren($('background-sessions'),background.map(s=>renderSession(s)));
+  patchChildren($('background-sessions'),background.map(s=>renderSession(s)),histories);
+  for(const {node,parent,reveal} of histories.values())if(reveal&&node.parentElement!==parent){
+   for(let ancestor=node.parentElement;ancestor;ancestor=ancestor.parentElement)if(ancestor.tagName.toLowerCase()==='details')ancestor.open=true;
+  }
   $('background-summary').textContent='Client background requests · '+count(background.length,'history','histories');
   $('background-traffic').hidden=background.length===0;
-  if(focusedDisclosure)$(focusedDisclosure)?.firstElementChild.focus({preventScroll:true});
+  if(focusedElement&&document.activeElement!==focusedElement&&roots.some(root=>root.contains(focusedElement)))focusedElement.focus({preventScroll:true});
   $('raw').textContent=JSON.stringify(data,null,2);
  }catch(err){$('status').textContent=err.message+' Previous stats may be stale.';$('status').className='error';$('login').hidden=false}
  finally{busy=false}

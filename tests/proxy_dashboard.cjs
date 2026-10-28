@@ -12,16 +12,28 @@ const element = (tagName = '') => ({
   append(...items) { for (const item of items) this.insertBefore(item, null); },
   insertBefore(item, next) {
     if (item === next) return;
-    if (item.parentElement) item.parentElement.removeChild(item);
+    if (item.parentElement) {
+      if (item.contains(document.activeElement)) document.activeElement = null;
+      item.parentElement.removeChild(item);
+    }
     const index=next ? this.children.indexOf(next) : this.children.length;
     this.children.splice(index,0,item); item.parentElement=this;
   },
   removeChild(item) { this.children.splice(this.children.indexOf(item),1); item.parentElement=null; },
   addEventListener() {},
+  get firstElementChild() { return this.children[0] || null; },
+  contains(node) { return this === node || this.children.some(child => child.contains(node)); },
+  focus() { document.activeElement = this; },
 });
 const elements = new Map();
 const document = {
+  activeElement: null,
   getElementById(id) {
+    const find = node => node.id === id ? node : node.children.map(find).find(Boolean);
+    for (const root of elements.values()) {
+      const found = find(root);
+      if (found) return found;
+    }
     if (!elements.has(id)) elements.set(id, element());
     return elements.get(id);
   },
@@ -358,6 +370,43 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.equal(stableDetails.open,true); assert.equal(stableGroup.open,true);
   assert.equal(stableDetails.scrollTop,73,'nested scroll position is retained');
   assert.match(byClass(firstSession(),'session-costs').textContent,/With Carry \$1.500000/,'retained rows still update amounts');
+  // Arrival/removal of a same-title sibling must not remount or hide an open row.
+  const original = {...session(1,2),id:'regroup-a',title:'Regroup task'};
+  const sibling = {...session(2,4),id:'regroup-b',title:'Regroup task'};
+  data.sessions=[original];
+  await vm.runInContext('refresh()',sandbox);
+  const regroupRow=firstSession(), regroupContext=byClass(regroupRow,'context-summary');
+  const regroupSummary=regroupContext.children[0];
+  regroupContext.open=true; regroupContext.scrollTop=41; regroupSummary.focus();
+  const assertRegrouped = phase => {
+    const liveRows=walk(elements.get('sessions')).filter(n=>n.className==='session');
+    assert.equal(liveRows.find(n=>n.id==='history:regroup-a'),regroupRow,phase+': retain article identity');
+    assert.equal(byClass(regroupRow,'context-summary'),regroupContext,phase+': retain disclosure identity');
+    assert.equal(regroupContext.children[0],regroupSummary,phase+': retain summary identity');
+    assert.equal(regroupContext.open,true,phase+': keep open disclosure');
+    assert.equal(regroupContext.scrollTop,41,phase+': keep nested scroll');
+    assert.equal(document.activeElement,regroupSummary,phase+': retain summary focus');
+    for(let ancestor=regroupRow.parentElement;ancestor;ancestor=ancestor.parentElement){
+      if(ancestor.tagName==='details')assert.equal(ancestor.open,true,phase+': do not hide row inside a closed group');
+    }
+    assert.equal(liveRows.length,data.sessions.length,phase+': render each history once');
+  };
+  data.sessions=[sibling,original];
+  await vm.runInContext('refresh()',sandbox);
+  assertRegrouped('one to two');
+  const regroupGroup=elements.get('sessions').children[0];
+  await vm.runInContext('refresh()',sandbox);
+  assertRegrouped('unchanged group');
+  assert.equal(elements.get('sessions').children[0],regroupGroup,'do not replace the group on ordinary polling');
+  regroupGroup.open=false; document.activeElement=null;
+  await vm.runInContext('refresh()',sandbox);
+  assert.equal(regroupGroup.open,false,'ordinary polling respects an explicitly closed group even with open nested details');
+  regroupGroup.open=true; regroupSummary.focus();
+  data.sessions=[original];
+  await vm.runInContext('refresh()',sandbox);
+  assertRegrouped('two to one');
+  assert.equal(elements.get('sessions').children[0],regroupRow,'last sibling removal returns the same row to top level');
+  document.activeElement=null;
   if(process.env.CARRY_DASHBOARD_STATS_FIXTURE){
     data=JSON.parse(fs.readFileSync(process.env.CARRY_DASHBOARD_STATS_FIXTURE,'utf8'));
     await vm.runInContext('refresh()', sandbox);

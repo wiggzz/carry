@@ -3943,8 +3943,9 @@ mod tests {
         let mut config = ProxyCli::try_parse_from(["carry proxy"]).unwrap();
         config.context_margin_percent = 10;
         config.primary_output_reserve_tokens = 777;
-        let session = Session::default();
+        let mut session = Session::default();
         let mut body = json!({"model":"gpt-6-sol","input":[{"role":"user","content":"synthetic"}]});
+        session.ingest(body["input"].as_array().unwrap()).unwrap();
         let (_, report) = plan(&config, &session, &body);
         assert_eq!(report["primary_output_reserve_tokens"], 777);
         assert_eq!(
@@ -3983,15 +3984,27 @@ mod tests {
             ]
         });
         let plan = dashboard_plan(&session);
-        assert_eq!(plan["primary_retained_estimated_tokens"], 200);
-        assert_eq!(plan["primary_retained_required_tokens"], 320);
+        assert_eq!(
+            plan["primary_retained_estimated_tokens"].as_f64(),
+            Some(200.0)
+        );
+        assert_eq!(
+            plan["primary_retained_required_tokens"].as_f64(),
+            Some(320.0)
+        );
         assert_eq!(plan["primary_output_reserve_tokens"].as_f64(), Some(100.0));
         session.last_plan["selected_candidate_id"] = json!("missing");
         assert!(dashboard_plan(&session)["primary_retained_estimated_tokens"].is_null());
         session.last_plan = json!({"selected":false,"selected_action":"keep","primary_estimated_tokens":900,"primary_required_tokens":1090});
         let kept = dashboard_plan(&session);
-        assert_eq!(kept["primary_retained_estimated_tokens"], 900);
-        assert_eq!(kept["primary_retained_required_tokens"], 1090);
+        assert_eq!(
+            kept["primary_retained_estimated_tokens"].as_f64(),
+            Some(900.0)
+        );
+        assert_eq!(
+            kept["primary_retained_required_tokens"].as_f64(),
+            Some(1090.0)
+        );
         assert!(kept["primary_output_reserve_tokens"].is_null());
         assert!(kept["context_margin_percent"].is_null());
         session.last_plan =
