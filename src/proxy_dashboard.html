@@ -38,21 +38,23 @@ summary:hover { color: #fff; }
 #estimate-details { border-bottom: 1px solid var(--border); padding-bottom: 8px; }
 #estimate-details p { max-width: 90ch; }
 #config, .scope, .legend, .plan-details { font-size: 14px; }
-.session-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 16px; margin: 16px 0; }
-.session { background: #17212e; border: 1px solid var(--border); border-radius: 8px; padding: 20px; min-width: 0; }
+.session-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; margin: 16px 0; border-top: 1px solid var(--border); }
+.session { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) minmax(0, 1fr); gap: 4px 20px; background: #17212e; border-bottom: 1px solid var(--border); padding: 16px; min-width: 0; align-items: start; }
+.session > * { min-width: 0; }
+.session > .diagnostics, .session > details { grid-column: 1 / -1; }
 .session h3 { margin: 0 0 6px; font-size: 16px; line-height: 1.45; overflow-wrap: anywhere; }
 .session p { margin: 6px 0; }
 .activity, .request-counts, .session-meta, .plan-summary { font-size: 14px; }
 .session-meta { color: var(--muted); overflow-wrap: anywhere; }
-.session .session-savings { font-size: 18px; color: #e4eaf3; margin: 14px 0 4px; font-variant-numeric: tabular-nums; }
-.session-costs { font-size: 14px; font-variant-numeric: tabular-nums; }
+.session .session-savings { font-size: 15px; color: #e4eaf3; margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.session-costs { font-size: 14px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .session-details { border-top: 1px solid var(--border); margin-top: 12px; }
-.context-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: #39465a; margin: 14px 0 8px; }
-.removable { background: #65c9a3; }
-.protected { background: #79a9f5; }
-.unreviewed { background: #6d788a; }
+.context-summary { border-top: 1px solid var(--border); margin-top: 8px; font-size: 14px; }
+.context-summary > summary { font-variant-numeric: tabular-nums; }
+.input-bars { max-width: 640px; margin: 12px 0; }
+.input-change { color: #e4eaf3; font-weight: 600; font-size: 16px; }
 .planner { margin-top: 12px; }
-.planner progress { width: 100%; height: 9px; accent-color: #65c9a3; }
+.planner progress, .context-summary progress { width: 100%; height: 9px; accent-color: #65c9a3; }
 .capacity-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 14px 0; }
 .capacity { background: #101923; padding: 12px; border-radius: 6px; }
 .capacity .capacity-value { display: block; font-size: 22px; font-weight: 600; margin: 4px 0; }
@@ -79,8 +81,8 @@ input { width: min(65vw, 480px); }
   .card:last-child { grid-column: 1 / -1; }
   .value { font-size: clamp(18px, 5.5vw, 23px); }
   .capacity-grid { grid-template-columns: 1fr; }
-  .session { padding: 16px; }
-  .session-grid { gap: 12px; }
+  .session { padding: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 12px; }
+  .session-identity { grid-column: 1 / -1; }
 }
 </style>
 </head>
@@ -105,7 +107,7 @@ input { width: min(65vw, 480px); }
 <details><summary>Inspect stats JSON</summary><pre id="raw"></pre></details>
 </details></section>
 <section aria-labelledby="conversations-heading">
-<h2 id="conversations-heading">Conversations</h2><p class="section-note">Matching opening messages are grouped, not merged. Recent means active in the last five minutes.</p>
+<h2 id="conversations-heading">Conversations</h2><p class="section-note">Stable history-ID order; polling activity does not reorder rows. Matching opening messages are grouped, not merged. Recent means active in the last five minutes.</p>
 <div id="sessions" class="session-grid"></div>
 <details id="background-traffic"><summary id="background-summary">Client background requests</summary>
 <p>Client-generated calls such as title generation and safety assessment. These are separate from Carry’s reviewer; their usage remains included in all totals.</p>
@@ -141,6 +143,28 @@ function disclosure(key,label,className){
  const detail=document.createElement('details');detail.id='disclosure:'+key;detail.className=className;detail.open=expandedDiagnostics.has(key);
  detail.addEventListener('toggle',()=>{if(detail.isConnected){if(detail.open)expandedDiagnostics.add(key);else expandedDiagnostics.delete(key)}});
  const summary=document.createElement('summary');summary.textContent=label;detail.append(summary);return detail;
+}
+// Retain keyed rows and native disclosures instead of remounting the live tree.
+// Unchanged siblings never move, preserving focus, selection and nested scroll.
+function patchChildren(parent, freshChildren){
+ const key=node=>node.tagName+':'+(node.id||node.className||'');
+ const old=[...parent.children],used=new Set();
+ freshChildren.forEach((fresh,index)=>{
+  const current=old.find(node=>!used.has(node)&&key(node)===key(fresh));
+  const node=current||fresh;
+  if(current){
+   used.add(current);
+   for(const name of current.getAttributeNames())if(name!=='open'&&fresh.getAttribute(name)==null)current.removeAttribute(name);
+   for(const name of fresh.getAttributeNames())if(name!=='open')current.setAttribute(name,fresh.getAttribute(name));
+   for(const name of ['id','className','title'])current[name]=fresh[name]||'';
+   if(fresh.tagName.toLowerCase()==='progress'){current.max=fresh.max;current.value=fresh.value}
+   if(fresh.children.length)patchChildren(current,[...fresh.children]);
+   else {if(current.children.length)current.replaceChildren();if(current.textContent!==fresh.textContent)current.textContent=fresh.textContent}
+  }
+  const at=parent.children[index]||null;
+  if(at!==node)parent.insertBefore(node,at);
+ });
+ for(const node of old)if(!used.has(node))parent.removeChild(node);
 }
 async function refresh(){
  if(busy)return;busy=true;
@@ -183,7 +207,7 @@ async function refresh(){
    const input=sum(ledgers,'input_tokens'),cached=sum(ledgers,'cached_tokens'),missing=sum(ledgers,'unavailable_cost_calls');
    return row([name,fmt(sum(ledgers,'calls')),fmt(input),fmt(cached),input?(100*cached/input).toFixed(1)+'%':'—',fmt(sum(ledgers,'cache_write_tokens')),fmt(sum(ledgers,'output_tokens')),missing?'Unavailable (subtotal '+money(sum(ledgers,'cost_usd'))+')':money(sum(ledgers,'cost_usd')),fmt(missing)]);
   }));
-  const sorted=[...sessions].sort((a,b)=>(b.updated_at||0)-(a.updated_at||0));
+  const sorted=[...sessions].sort((a,b)=>a.id.localeCompare(b.id));
   const renderSession=(s,grouped=false)=>{
    const e=s.cost_estimate;
    const issues=[];
@@ -209,26 +233,51 @@ async function refresh(){
    if(s.invalid_reviews)issues.push(fmt(s.invalid_reviews)+' invalid reviews');
    if(s.partial_reviews)issues.push(fmt(s.partial_reviews)+' partial reviews');
    const activity=s.processing?'Processing request':s.background_review_pending?'Reviewing':s.updated_at?(Date.now()/1000-s.updated_at<300?'Recent · ':'Idle · ')+new Date(s.updated_at*1000).toLocaleTimeString():'No recent activity';
-   const el=document.createElement('article');el.className='session';
+   const el=document.createElement('article');el.className='session';el.id='history:'+s.id;
    const heading=document.createElement('h3');heading.textContent=grouped?sourceLabel(s):backgroundTypes.has(s.client?.kind)?sourceLabel(s):s.title||'Session '+s.id.slice(0,12);heading.title=s.id;
    const status=document.createElement('p');status.className='activity';status.textContent=activity;
-   const requests=document.createElement('p');requests.className='request-counts';requests.textContent=count(s.completed_requests||0,'completed request')+' · '+count(s.compactions||0,'rewrite');
+   const requests=document.createElement('p');requests.className='request-counts';requests.textContent=count(s.completed_requests||0,'completed request')+' · '+count(s.compactions||0,'filtered request');
+   requests.title='Lifetime counters, not necessarily the cost window. Filtered requests count nonempty outgoing omissions before completion, not new cleanup jobs; they can include failed requests.';
    const saved=document.createElement('p');saved.className='session-savings';saved.textContent='Estimated difference: '+savingsText(e)+(e?.savings<0?' · higher cost with Carry':'');
-   el.append(heading,status,requests,saved);
+   const identity=document.createElement('div');identity.className='session-identity';identity.append(heading,status,requests);el.append(identity,saved);
    const costs=document.createElement('p');costs.className='session-costs';costs.textContent='With Carry '+money(e?.carry_cost)+' · Traditional '+money(e?.traditional_cost);el.append(costs);
-   const meta=document.createElement('p');meta.className='session-meta';meta.textContent=sessionMeta(s);meta.title='Role reported by the client, not inferred from the title. Unknown roles stay unclassified.';el.append(meta);
+   const meta=document.createElement('p');meta.className='session-meta';meta.textContent=sessionMeta(s);meta.title='Role reported by the client, not inferred from the title. Unknown roles stay unclassified.';identity.append(meta);
    if(issues.length){const warning=document.createElement('p');warning.className='diagnostics';warning.textContent=issues.join(' ');el.append(warning)}
    const details=disclosure('session:'+s.id,'Details','session-details');
    const accounting=document.createElement('p');accounting.textContent=(e?.accounting_basis==='receipt_anchored_v2'?'Receipt-anchored v2. ':e?.accounting_basis==='legacy_json_v1'?'Legacy JSON v1. ':'')+receiptNote(e)+cachePolicyNote(e);details.append(accounting);
    if(s.reviewer_compactions!=null){const cleanup=document.createElement('p');cleanup.textContent=fmt(s.reviewer_compactions)+' reviewer cleanups (legacy replay counter).';details.append(cleanup)}
-   const c=s.context||{},counts=[c.removable_items,c.protected_items,c.unreviewed_items];
-   const total=counts.reduce((a,b)=>a+b,0),bar=document.createElement('div');bar.className='context-bar';
-   ['removable','protected','unreviewed'].forEach((name,i)=>{const part=document.createElement('span');part.className=name;part.style.width=(total?100*counts[i]/total:0)+'%';part.title=count(counts[i],['removable','protected','other'][i]+' item');bar.append(part)});
-   const legend=document.createElement('p');legend.className='legend';legend.textContent=[...counts.map((n,i)=>n==null?null:fmt(n)+' '+['removable','protected','other'][i]),c.memories==null?null:fmt(c.memories)+' memories'].filter(n=>n!=null).join(' · ');
-   bar.title='Context composition by item count, not tokens';
-   if(counts.every(n=>n!=null)&&total)details.append(bar);
-   if(legend.textContent){details.append(legend);const basis=document.createElement('p');basis.className='legend';basis.textContent='Item counts, not tokens. Other means not classified removable or protected, not necessarily unseen by the reviewer.';details.append(basis)}
-   const p=s.planner||{},section=document.createElement('div');section.className='planner';
+   const c=s.context||{};
+   const p=s.planner||{},contextSummary=disclosure('context:'+s.id,'Context plan','context-summary');
+   const submitted=document.createElement('p');submitted.className='submitted-items';submitted.textContent=[c.removed_items==null?null:fmt(c.removed_items)+' omitted',c.retained_items==null?null:fmt(c.retained_items)+' kept'].filter(n=>n!=null).join(' · ');
+   if(submitted.textContent){submitted.textContent+=' · last submitted request (source items)';contextSummary.append(submitted)}
+   const source=document.createElement('p');source.className='source-items';source.textContent=[c.history_items==null?null:fmt(c.history_items)+' source items',c.removable_items==null?null:fmt(c.removable_items)+' eligible to omit',c.protected_items==null?null:fmt(c.protected_items)+' protected',c.memories==null?null:fmt(c.memories)+' memories'].filter(n=>n!=null).join(' · ');
+   if(source.textContent){source.textContent='Retained history: '+source.textContent;contextSummary.append(source)}
+   if(source.textContent||submitted.textContent||s.compactions){const basis=document.createElement('p');basis.className='legend';basis.textContent='The same source items can be omitted repeatedly, not deleted. Eligibility and protection cover the whole retained history, not just the kept request; memories are separate. Filtered requests are not new reviewer jobs.';contextSummary.append(basis)}
+   if(p.primary_estimated_tokens!=null){
+    const input=document.createElement('p');input.className='input-change';
+    input.textContent='Primary input: '+compact(p.primary_estimated_tokens)+' → '+(p.primary_retained_estimated_tokens==null?'Unknown':compact(p.primary_retained_estimated_tokens))+' · local estimate, before → after selected filtering'+(p.mode==='audit'?' (audit only)':'');
+    input.title='Same saved plan and local tokenizer basis, not provider usage or completed dispatch. Missing selected estimates remain unknown.';contextSummary.children[0].textContent=input.textContent;contextSummary.children[0].title=input.title;
+   }
+   for(const [name,input,required] of [['Before filtering',p.primary_estimated_tokens,p.primary_required_tokens],['After selected filtering',p.primary_retained_estimated_tokens,p.primary_retained_required_tokens]]){
+    if(input==null&&required==null)continue;
+    const allowance=document.createElement('p');allowance.className='allowance';
+    allowance.textContent=name+': '+(input==null?'Unknown input':compact(input)+' input')+' + '+(input!=null&&p.context_margin_percent!=null?compact(input*p.context_margin_percent/100)+' margin ('+p.context_margin_percent+'%)':'margin not recorded')+' + '+(p.primary_output_reserve_tokens==null?'output reserve not recorded':compact(p.primary_output_reserve_tokens)+' output reserve')+' = '+(required==null?'Unknown allowance':compact(required)+' allowance');contextSummary.append(allowance);
+   }
+   if(p.primary_context_tokens!=null){const capacity=document.createElement('p');capacity.textContent=compact(p.primary_context_tokens)+' hard context capacity · not usage';contextSummary.append(capacity)}
+   if(p.primary_retained_required_tokens!=null&&p.primary_context_tokens>0){const capacity=document.createElement('progress');capacity.max=p.primary_context_tokens;capacity.value=Math.min(p.primary_retained_required_tokens,p.primary_context_tokens);capacity.setAttribute('aria-label','Primary selected plan allowance, not usage');contextSummary.append(capacity)}
+   if(p.primary_ordinary_context_tokens!=null){const target=document.createElement('p');target.className='legend';target.textContent=compact(p.primary_ordinary_context_tokens)+' economic total · includes margin and output reserve; not an input target or hard cap'+(p.primary_ordinary_input_target_tokens!=null?' · '+fmt(p.primary_ordinary_input_target_tokens)+' policy input target':'');contextSummary.append(target)}
+   if(p.primary_estimated_tokens!=null||p.primary_required_tokens!=null){const note=document.createElement('p');note.className='legend';note.textContent='Last plan, not live usage or proof of dispatch. '+(p.primary_output_reserve_basis==='request_max_output_tokens'?'Output reserve uses the recorded client cap. ':p.primary_output_reserve_basis==='configured_capacity_reserve'?'Output reserve is configured capacity headroom, not a recorded client cap. ':p.primary_output_reserve_basis==='derived_from_saved_allowance_not_client_cap'?'Output reserve and after allowance derived from the saved allowance equation; not a recovered client output cap. ':'Output reserve source not recorded. ')+'Allowance is not expected output, usage or prepaid tokens.';contextSummary.append(note)}
+   if(p.primary_estimated_tokens!=null&&p.primary_retained_estimated_tokens!=null){
+    const bars=document.createElement('div');bars.className='input-bars';
+    const scale=Math.max(p.primary_estimated_tokens,p.primary_retained_estimated_tokens,1);
+    for(const [name,value] of [['Before filtering',p.primary_estimated_tokens],['After selected filtering',p.primary_retained_estimated_tokens]]){
+     const label=document.createElement('p');label.textContent=name+' · '+compact(value)+' local estimated input';
+     const bar=document.createElement('progress');bar.max=scale;bar.value=value;bar.setAttribute('aria-label',label.textContent);bars.append(label,bar);
+    }
+    contextSummary.append(bars);
+   }
+   el.append(contextSummary);
+   const section=document.createElement('div');section.className='planner';
    const decision=document.createElement('p');
    const action={projection:'context projection',reviewer_only:'reviewer-only cleanup',primary:'primary compaction'}[p.selected_action]||p.selected_action||'action not recorded';
    decision.textContent=p.selected?'Last plan: '+(p.mode==='audit'?'would select '+action+' (audit)':action+' selected')+(!p.mode||p.mode==='unknown'?' · mode not recorded':''):p.reason?({context_capacity_exceeded:'Protected context exceeds the available budget',unsupported_model_or_tier:'Compaction unavailable for this model or service tier'}[p.reason]||p.reason.replaceAll('_',' ')):p.selected_action==='keep'?'Last plan: keep current context':p.candidate?'Last plan: no context change selected':'No saved context decision';
@@ -239,7 +288,7 @@ async function refresh(){
     section.append(output);
    }
    const capacities=document.createElement('div');capacities.className='capacity-grid';
-   for(const [name,estimated,required,limit,ordinary] of [['Primary',p.primary_estimated_tokens,p.primary_required_tokens,p.primary_context_tokens,p.primary_ordinary_context_tokens],['Reviewer',p.reviewer_estimated_tokens,p.reviewer_required_tokens,p.reviewer_context_tokens,p.reviewer_ordinary_context_tokens]]){
+   for(const [name,estimated,required,limit,ordinary] of [['Reviewer',p.reviewer_estimated_tokens,p.reviewer_required_tokens,p.reviewer_context_tokens,p.reviewer_ordinary_context_tokens]]){
     if(estimated==null&&required==null&&limit==null&&ordinary==null)continue;
     const block=document.createElement('div');block.className='capacity';
     const label=document.createElement('p');label.textContent=name+(estimated!=null?' planned input · est.':required!=null?' reservation · est.':' input not recorded');
@@ -248,7 +297,7 @@ async function refresh(){
     block.append(label,value);
     if(required!=null&&limit>0){const capacity=document.createElement('progress');capacity.max=limit;capacity.value=Math.min(required,limit);capacity.setAttribute('aria-label',name+' context budget');block.append(capacity)}
     block.append(budget);
-    if(ordinary!=null){const target=document.createElement('p');target.className='legend';target.textContent=compact(ordinary)+' ordinary economic target · not a hard limit';block.append(target)}
+    if(ordinary!=null){const target=document.createElement('p');target.className='legend';target.textContent=compact(ordinary)+' ordinary economic target · total includes margin and output reserve, not an input target or hard limit';block.append(target)}
     capacities.append(block);
    }
    section.append(capacities);
@@ -285,9 +334,9 @@ async function refresh(){
    const grid=document.createElement('div');grid.className='session-grid';grid.append(...group.map(s=>renderSession(s,true)));
    detail.append(summary,note,grid);return detail;
   });
-  $('sessions').replaceChildren(...rendered);
+  patchChildren($('sessions'),rendered);
   if(!conversations.length){const empty=document.createElement('p');empty.className='empty';empty.textContent='No conversations recorded here yet.';$('sessions').append(empty)}
-  $('background-sessions').replaceChildren(...background.map(s=>renderSession(s)));
+  patchChildren($('background-sessions'),background.map(s=>renderSession(s)));
   $('background-summary').textContent='Client background requests · '+count(background.length,'history','histories');
   $('background-traffic').hidden=background.length===0;
   if(focusedDisclosure)$(focusedDisclosure)?.firstElementChild.focus({preventScroll:true});

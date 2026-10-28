@@ -2,10 +2,21 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const element = (tagName = '') => ({
-  tagName,
-  children: [], textContent: '', style: {}, setAttribute() {},
-  replaceChildren(...items) { this.children = items; },
-  append(...items) { this.children.push(...items); },
+  tagName, parentElement: null,
+  children: [], textContent: '', style: {}, attributes: new Map(),
+  setAttribute(name, value) { this.attributes.set(name, String(value)); },
+  getAttribute(name) { return this.attributes.get(name) ?? null; },
+  getAttributeNames() { return [...this.attributes.keys()]; },
+  removeAttribute(name) { this.attributes.delete(name); },
+  replaceChildren(...items) { for (const child of this.children) child.parentElement=null; this.children=[]; this.append(...items); },
+  append(...items) { for (const item of items) this.insertBefore(item, null); },
+  insertBefore(item, next) {
+    if (item === next) return;
+    if (item.parentElement) item.parentElement.removeChild(item);
+    const index=next ? this.children.indexOf(next) : this.children.length;
+    this.children.splice(index,0,item); item.parentElement=this;
+  },
+  removeChild(item) { this.children.splice(this.children.indexOf(item),1); item.parentElement=null; },
   addEventListener() {},
 });
 const elements = new Map();
@@ -16,8 +27,9 @@ const document = {
   },
   createElement: element,
 };
+let nextSession = 0;
 const session = (carry, traditional, available = true) => ({
-  id: 'a'.repeat(64), primary: {}, shadow: {}, context: {},
+  id: (++nextSession).toString(16).padStart(64,'0'), primary: {}, shadow: {}, context: {},
   cost_estimate: { carry_cost: available ? carry : null, traditional_cost: available ? traditional : null,
     savings: available ? traditional - carry : null,
     savings_percent: available && traditional > 0 ? 100 * (traditional - carry) / traditional : null,
@@ -53,7 +65,7 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   data.sessions[0].title='Older task'; data.sessions[0].updated_at=1;
   data.sessions[1].title='Newest task'; data.sessions[1].updated_at=2;
   await vm.runInContext('refresh()', sandbox);
-  assert.equal(walk(firstSession()).find(n=>n.tagName==='h3').textContent, 'Newest task', 'show titles and most recent sessions first');
+  assert.equal(walk(firstSession()).find(n=>n.tagName==='h3').textContent, 'Older task', 'stable history-ID order does not follow polling activity');
   assert.equal(elements.get('cards').children.length, 3, 'overview compares Carry, traditional and difference');
   assert.equal(cards().get('With Carry'), '$4.000000');
   assert.equal(cards().get('Traditional'), '$6.000000');
@@ -260,10 +272,10 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.match(current, /reservation not recorded/i);
   data.sessions[0].context={removable_items:0,protected_items:0,unreviewed_items:1};
   await vm.runInContext('refresh()', sandbox);
-  assert.equal(byClass(firstSession(), 'unreviewed').title, '1 other item', 'residual category does not claim the reviewer has not seen an item');
+  assert.ok(!byClass(firstSession(), 'unreviewed'), 'mixed-population residual is not a valid unseen-item classification');
   data.sessions[0].completed_requests=1;data.sessions[0].compactions=1;
   await vm.runInContext('refresh()', sandbox);
-  assert.equal(byClass(firstSession(), 'request-counts').textContent, '1 completed request · 1 rewrite');
+  assert.equal(byClass(firstSession(), 'request-counts').textContent, '1 completed request · 1 filtered request');
   for(const [selected_action,mode,expected] of [
     ['reviewer_only','audit',/would select reviewer-only cleanup \(audit\)/],
     ['primary','audit',/would select primary compaction \(audit\)/],
@@ -282,6 +294,70 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     await vm.runInContext('refresh()', sandbox);
     assert.ok(walk(firstSession()).some(n=>n.textContent.startsWith('Projected payoff '+expected)), 'plan economics preserve zero and losses without dividing by zero');
   }
+  // Synthetic plan: before/after are the same local tokenizer basis, never receipts.
+  data.sessions = [{...session(1, 2), completed_requests:28, compactions:28,
+    context:{history_items:753, retained_items:92, removed_items:661, removable_items:661,
+      protected_items:69, unreviewed_items:0, memories:10},
+    planner:{selected:true, selected_action:'projection', mode:'compact',
+      primary_estimated_tokens:864961, primary_retained_estimated_tokens:129381,
+      primary_required_tokens:967841.1, primary_retained_required_tokens:158703.1,
+      context_margin_percent:10, primary_output_reserve_tokens:16384,
+      primary_output_reserve_basis:'configured_capacity_reserve',
+      primary_context_tokens:1050000, primary_ordinary_context_tokens:272000}}];
+  await vm.runInContext('refresh()', sandbox);
+  const projectionSummary = byClass(firstSession(), 'context-summary');
+  assert.ok(projectionSummary, 'filtering and capacity explanation has a separate drilldown');
+  assert.equal(projectionSummary.tagName,'details','large context explanation starts in a compact drilldown');
+  assert.equal(projectionSummary.open,false);
+  assert.match(projectionSummary.children[0].textContent,/865k → 129.4k.*local estimate/i,'before/after remains visible when closed');
+  assert.ok(byClass(firstSession(),'session-identity'),'compact row groups title and activity');
+  const inputBars=byClass(projectionSummary,'input-bars');
+  assert.ok(inputBars,'comparable local-token estimates have paired bars');
+  assert.deepEqual(walk(inputBars).filter(n=>n.tagName==='progress').map(n=>[n.value,n.max]),[[864961,864961],[129381,864961]]);
+  assert.ok(!walk(byClass(firstSession(), 'session-details')).includes(projectionSummary));
+  assert.match(noteTexts(projectionSummary).join('\n'), /865k → 129.4k.*local estimate/i);
+  assert.equal(byClass(firstSession(), 'request-counts').textContent, '28 completed requests · 28 filtered requests');
+  assert.match(noteTexts(projectionSummary).join('\n'), /661 omitted.*92 kept.*last submitted/i);
+  assert.match(noteTexts(projectionSummary).join('\n'), /753 source items.*661 eligible to omit.*69 protected.*10 memories/i);
+  assert.match(noteTexts(projectionSummary).join('\n'), /same.*items.*repeated.*not.*delet/i);
+  assert.ok(!walk(firstSession()).some(n=>n.className==='context-bar'), 'mixed populations must not be stacked as a partition');
+  const allowance=noteTexts(projectionSummary).join('\n');
+  assert.match(allowance, /Before filtering: 865k input \+ 86.5k margin \(10%\) \+ 16.4k output reserve = 967.8k allowance/);
+  assert.match(allowance, /After selected filtering: 129.4k input \+ 12.9k margin \(10%\) \+ 16.4k output reserve = 158.7k allowance/);
+  assert.match(allowance, /272k economic total.*includes margin.*reserve.*not.*input target.*hard cap/i);
+  assert.match(allowance, /configured.*capacity.*not.*expected output.*usage.*prepaid/i);
+  const primaryProgress=walk(projectionSummary).find(n=>n.tagName==='progress');
+  assert.equal(primaryProgress?.value,158703.1,'capacity bar describes selected allowance, not the unfiltered history');
+  assert.equal(primaryProgress?.max,1050000);
+  data.sessions[0].planner.primary_output_reserve_basis='derived_from_saved_allowance_not_client_cap';
+  await vm.runInContext('refresh()', sandbox);
+  assert.match(noteTexts(byClass(firstSession(),'context-summary')).join('\n'), /derived from.*saved.*not.*client.*cap/i);
+  delete data.sessions[0].planner.primary_retained_estimated_tokens;
+  delete data.sessions[0].planner.primary_retained_required_tokens;
+  delete data.sessions[0].planner.primary_output_reserve_tokens;
+  await vm.runInContext('refresh()', sandbox);
+  const oldPlan=byClass(firstSession(),'context-summary');
+  assert.match(noteTexts(oldPlan).join('\n'), /865k → Unknown/);
+  assert.match(noteTexts(oldPlan).join('\n'), /output reserve not recorded/i);
+  assert.ok(!walk(oldPlan).some(n=>n.tagName==='progress'),'unknown outgoing allowance cannot use prefilter allowance for utilization');
+  // Polling patches keyed rows and disclosures in place, including changed values.
+  data.sessions=[{...session(1,2),id:'stable-a',title:'Stable task'},
+    {...session(2,4),id:'stable-b',title:'Stable task'}];
+  await vm.runInContext('refresh()',sandbox);
+  const stableGroup=elements.get('sessions').children[0];
+  const stableRow=firstSession(), stableDetails=byClass(stableRow,'session-details');
+  const stableSummary=stableDetails.children[0];
+  stableGroup.open=true; stableDetails.open=true; stableDetails.scrollTop=73;
+  data.sessions.reverse(); data.sessions[1].updated_at=Date.now()/1000;
+  data.sessions[1].cost_estimate.carry_cost=1.5;
+  await vm.runInContext('refresh()',sandbox);
+  assert.equal(elements.get('sessions').children[0],stableGroup,'group identity survives polling');
+  assert.equal(firstSession(),stableRow,'session row identity survives changed values and response order');
+  assert.equal(byClass(firstSession(),'session-details'),stableDetails,'open drilldown is not remounted');
+  assert.equal(stableDetails.children[0],stableSummary,'focused summary keeps its DOM identity');
+  assert.equal(stableDetails.open,true); assert.equal(stableGroup.open,true);
+  assert.equal(stableDetails.scrollTop,73,'nested scroll position is retained');
+  assert.match(byClass(firstSession(),'session-costs').textContent,/With Carry \$1.500000/,'retained rows still update amounts');
   if(process.env.CARRY_DASHBOARD_STATS_FIXTURE){
     data=JSON.parse(fs.readFileSync(process.env.CARRY_DASHBOARD_STATS_FIXTURE,'utf8'));
     await vm.runInContext('refresh()', sandbox);

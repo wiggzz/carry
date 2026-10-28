@@ -80,7 +80,8 @@ pub(super) fn plan(
         let projection = Projection { omitted, input };
         let mut compact = body.clone();
         compact["input"] = json!(projection.input);
-        let feasible = primary_fits(config, &compact);
+        let required = primary_required_tokens(config, &compact);
+        let feasible = required <= config.primary_context_tokens as f64;
         let compact = primary_wire_body(config, &compact);
         let primary = resolved_view_costs(
             &wire,
@@ -140,7 +141,7 @@ pub(super) fn plan(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&members).unwrap())
         );
-        reports.push(json!({"candidate_id":id,"action":"projection","removed_groups":eligible.iter().filter(|g| g.members.iter().all(|m| projection.omitted.contains(m))).map(|g|g.id).collect::<Vec<_>>(),"omitted_members":members,"feasible":feasible,"selection_joint":joint,"primary_retained_estimated_tokens":estimate(&compact)}));
+        reports.push(json!({"candidate_id":id,"action":"projection","removed_groups":eligible.iter().filter(|g| g.members.iter().all(|m| projection.omitted.contains(m))).map(|g|g.id).collect::<Vec<_>>(),"omitted_members":members,"feasible":feasible,"selection_joint":joint,"primary_retained_estimated_tokens":estimate(&compact),"primary_retained_required_tokens":required}));
         if feasible && (forced || joint.is_some_and(|j| j.accepted)) {
             let score = if forced {
                 estimate(&compact)
@@ -156,6 +157,9 @@ pub(super) fn plan(
         "primary_cached_estimated_tokens":crate::proxy_cache::reusable(&session.upstream_cache,&wire,config.model_resolution.as_ref().map(|p|&p.primary),&config.primary_cache_auth,now()),
         "reviewer_fits":review_fits(config,&review),"primary_estimated_tokens":estimate(&wire),
         "primary_required_tokens":primary_required_tokens(config,&retained),"primary_receipt_prediction_tokens":prediction,
+        "context_margin_percent":config.context_margin_percent,
+        "primary_output_reserve_tokens":primary_output_reserve(config,&retained),
+        "primary_output_reserve_basis":if retained["max_output_tokens"].as_u64().is_some() {"request_max_output_tokens"} else {"configured_capacity_reserve"},
         "reviewer_estimated_tokens":estimate(&review),"primary_context_tokens":config.primary_context_tokens,
         "selected_candidate_id":best.as_ref().map(|(_,_,id)|id.as_str()).or(if forced {None} else {Some("keep")}),
         "selected_action":if best.is_some() {"projection"} else {"keep"},
