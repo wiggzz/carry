@@ -491,7 +491,7 @@ impl ResolvedModel {
                     source: "https://developers.openai.com/api/docs/guides/prompt-caching".into(),
                     status: status.into(),
                     revision: "traditional-cache-v2-request-mode-2026-10-28".into(),
-                    fetched_at: Some("2026-10-28".into()),
+                    fetched_at: None,
                     fallback_reason: None,
                     operator_override: None,
                 },
