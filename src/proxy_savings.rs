@@ -54,12 +54,37 @@ pub struct CachePolicySegment {
     pub coverage: Coverage,
 }
 
+impl From<&Estimate> for CachePolicySegment {
+    fn from(estimate: &Estimate) -> Self {
+        Self {
+            matched_primary_responses: estimate.matched_primary_responses,
+            carry_cost: estimate.carry_cost,
+            traditional_cost: estimate.traditional_cost,
+            reviewer_cost: estimate.reviewer_cost,
+            summary_cost: estimate.summary_cost,
+            traditional_compactions: estimate.traditional_compactions,
+            coverage: estimate.coverage.clone(),
+        }
+    }
+}
+
+/// Cumulative comparison totals immediately before a prospective policy change.
+/// These overlapping snapshots are provenance, NEVER additive cost segments.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CachePolicyBoundary {
+    pub previous_version: Option<u32>,
+    pub next_version: Option<u32>,
+    pub cumulative: CachePolicySegment,
+}
+
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Estimate {
     #[serde(default)]
     pub counterfactual_cache_policy: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_cache_policy_segment: Option<CachePolicySegment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_policy_boundaries: Vec<CachePolicyBoundary>,
     #[serde(default)]
     pub accounting_basis: String,
     #[serde(default)]
@@ -97,6 +122,7 @@ pub struct Estimate {
 pub struct DashboardEstimate {
     counterfactual_cache_policy: String,
     legacy_cache_policy_segment: Option<CachePolicySegment>,
+    cache_policy_boundaries: Vec<CachePolicyBoundary>,
     in_flight_costs_excluded: bool,
     accounting_basis: String,
     matched_primary_responses: u64,
@@ -125,6 +151,7 @@ impl Estimate {
         DashboardEstimate {
             counterfactual_cache_policy: self.counterfactual_cache_policy,
             legacy_cache_policy_segment: self.legacy_cache_policy_segment,
+            cache_policy_boundaries: self.cache_policy_boundaries,
             in_flight_costs_excluded: pending,
             observed_primary_cost: (self.accounting_basis == RECEIPT_BASIS
                 && self.coverage.primary_responses > self.unavailable_primary_cost_calls)
@@ -207,7 +234,9 @@ impl DashboardTotals {
         self.included_sessions += 1;
         match estimate.counterfactual_cache_policy.as_str() {
             "legacy_route_cache_v0" => self.legacy_cache_policy_sessions += 1,
-            "mixed_legacy_route_v0_and_model_v1" => self.mixed_cache_policy_sessions += 1,
+            "mixed_legacy_route_v0_and_model_v1" | "mixed_versioned_cache_policies" => {
+                self.mixed_cache_policy_sessions += 1
+            }
             _ => (),
         }
         self.matched_primary_responses += estimate.matched_primary_responses;
@@ -282,18 +311,33 @@ impl Default for Trajectory {
 impl Trajectory {
     pub fn snapshot(&self) -> Estimate {
         let mut estimate = self.result.clone();
-        estimate.counterfactual_cache_policy = match self
+        let version = self
             .receipts
             .as_ref()
-            .and_then(|r| r.scenario_cache_policy_version)
+            .and_then(|r| r.scenario_cache_policy_version);
+        // Preserve the original missing -> v1 label for old checkpoint readers,
+        // but never label an arbitrary present version as v1. New boundaries
+        // retain each transition without replacing the first legacy segment.
+        let original_upgrade = version == Some(1)
+            && estimate.legacy_cache_policy_segment.is_some()
+            && (estimate.cache_policy_boundaries.is_empty()
+                || (estimate.cache_policy_boundaries.len() == 1
+                    && estimate.cache_policy_boundaries[0]
+                        .previous_version
+                        .is_none()
+                    && estimate.cache_policy_boundaries[0].next_version == Some(1)));
+        estimate.counterfactual_cache_policy = if original_upgrade {
+            "mixed_legacy_route_v0_and_model_v1".into()
+        } else if !estimate.cache_policy_boundaries.is_empty()
+            || estimate.legacy_cache_policy_segment.is_some()
         {
-            None => "legacy_route_cache_v0",
-            Some(_) if estimate.legacy_cache_policy_segment.is_some() => {
-                "mixed_legacy_route_v0_and_model_v1"
-            }
-            Some(_) => "conditional_model_cache_v1",
-        }
-        .into();
+            "mixed_versioned_cache_policies".into()
+        } else {
+            version.map_or_else(
+                || "legacy_route_cache_v0".into(),
+                |v| format!("conditional_model_cache_v{v}"),
+            )
+        };
         estimate.accounting_basis = if self.receipts.is_some() {
             RECEIPT_BASIS
         } else {

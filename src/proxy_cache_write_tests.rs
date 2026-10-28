@@ -23,6 +23,97 @@ fn cache_write188_reviewer_overhead_remains_a_loss_on_identical_no_write_input()
     );
 }
 
+// Additional acceptance coverage for labeling and later legacy transitions.
+// These bodies are not claimed as separately observed failing-first tests.
+#[test]
+fn cache_policy188_version_labels_and_first_legacy_segment_survive_later_transitions() {
+    use carry::models::{Route, resolve_model};
+    let resolved = resolve_model(
+        "gpt-6.1-sol",
+        Route::new("https://api.openai.com/v1/responses", false),
+        None,
+        None,
+        0,
+        0,
+    )
+    .unwrap();
+    let mut trajectory = Trajectory::default();
+    trajectory
+        .receipts
+        .as_mut()
+        .unwrap()
+        .scenario_cache_policy_version = Some(7);
+    assert_eq!(
+        trajectory.snapshot().counterfactual_cache_policy,
+        "conditional_model_cache_v7"
+    );
+    trajectory
+        .receipts
+        .as_mut()
+        .unwrap()
+        .scenario_cache_policy_version = None;
+    let mut request = body();
+    let mut original_legacy = Value::Null;
+    let mut prior_boundaries = json!([]);
+    for (index, version) in [None, Some(1), Some(2), None, Some(3), Some(1)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut policy = resolved.clone();
+        if let Some(version) = version {
+            policy.scenario_cache_policy.as_mut().unwrap().version = version;
+        } else {
+            policy.scenario_cache_policy = None;
+        }
+        request["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user", "content":format!("transition {index}")}));
+        let before = trajectory.snapshot();
+        trajectory.primary_resolved(
+            &request,
+            &terminal(2000 + index as u64 * 100, 0, 0, 0),
+            "policy-fixture",
+            100 + index as u64,
+            true,
+            Some(&policy),
+        );
+        let after = serde_json::to_value(trajectory.snapshot()).unwrap();
+        if index == 0 {
+            assert_eq!(
+                after["counterfactual_cache_policy"],
+                "legacy_route_cache_v0"
+            );
+            assert!(after.get("legacy_cache_policy_segment").is_none());
+        } else {
+            let boundaries = after["cache_policy_boundaries"].as_array().unwrap();
+            assert_eq!(boundaries.len(), index);
+            assert_eq!(
+                &boundaries[..index - 1],
+                prior_boundaries.as_array().unwrap()
+            );
+            let cumulative = serde_json::to_value(CachePolicySegment::from(&before)).unwrap();
+            assert_eq!(boundaries[index - 1]["cumulative"], cumulative);
+            if index == 1 {
+                original_legacy = after["legacy_cache_policy_segment"].clone();
+                assert_eq!(original_legacy, cumulative);
+                assert_eq!(
+                    after["counterfactual_cache_policy"],
+                    "mixed_legacy_route_v0_and_model_v1"
+                );
+            } else {
+                assert_eq!(after["legacy_cache_policy_segment"], original_legacy);
+                assert_eq!(
+                    after["counterfactual_cache_policy"],
+                    "mixed_versioned_cache_policies"
+                );
+            }
+            prior_boundaries = json!(boundaries);
+        }
+        trajectory = serde_json::from_slice(&serde_json::to_vec(&trajectory).unwrap()).unwrap();
+    }
+}
+
 // Placeholder future version numbers exercise the migration owner, not an
 // assertion that either future write-billing policy has been implemented.
 #[test]

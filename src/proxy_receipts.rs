@@ -263,28 +263,34 @@ impl Trajectory {
         let policy_version = resolved.map_or(Some(1), |r| {
             r.scenario_cache_policy.as_ref().map(|p| p.version)
         });
-        let receipts = self.receipts.as_ref().unwrap();
-        if receipts.scenario_cache_policy_version.is_none() && policy_version.is_some() {
-            // One immutable pre-upgrade segment, not a replay or accounting reset.
-            // The next comparison starts cold under its newly frozen policy.
+        let previous_version = self
+            .receipts
+            .as_ref()
+            .unwrap()
+            .scenario_cache_policy_version;
+        if previous_version != policy_version {
+            // Freeze cumulative provenance before ANY version transition, not
+            // just missing -> present. Never replay, reset money or overwrite
+            // earlier boundaries. The next comparison starts cold.
             let prior = self.snapshot();
             if prior.coverage.primary_responses > 0 || prior.coverage.reviewer_responses > 0 {
-                self.result.legacy_cache_policy_segment = Some(CachePolicySegment {
-                    matched_primary_responses: prior.matched_primary_responses,
-                    carry_cost: prior.carry_cost,
-                    traditional_cost: prior.traditional_cost,
-                    reviewer_cost: prior.reviewer_cost,
-                    summary_cost: prior.summary_cost,
-                    traditional_compactions: prior.traditional_compactions,
-                    coverage: prior.coverage,
-                });
+                let cumulative = CachePolicySegment::from(&prior);
+                if previous_version.is_none()
+                    && policy_version.is_some()
+                    && self.result.legacy_cache_policy_segment.is_none()
+                    && self.result.cache_policy_boundaries.is_empty()
+                {
+                    self.result.legacy_cache_policy_segment = Some(cumulative.clone());
+                }
+                self.result
+                    .cache_policy_boundaries
+                    .push(CachePolicyBoundary {
+                        previous_version,
+                        next_version: policy_version,
+                        cumulative,
+                    });
             }
             self.reset_receipt_epoch();
-            self.receipts
-                .as_mut()
-                .unwrap()
-                .scenario_cache_policy_version = policy_version;
-        } else if self.result.coverage.primary_responses == 0 {
             self.receipts
                 .as_mut()
                 .unwrap()
