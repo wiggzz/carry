@@ -325,6 +325,28 @@ fn pr144_review_behavior_regressions() {
     );
 }
 
+// Issue188 tests-first accounting reproduction. Keep RED visible until the
+// route-specific write contract and immutable policy migration are implemented.
+#[test]
+fn cache_write188_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_cache_write_regressions.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute source-bound cache-write accounting controls");
+    assert!(
+        output.status.success(),
+        "CACHE_WRITE_188 HTTP controls failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn proxy_cli_serves_health_and_forwards_opaque_json() {
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

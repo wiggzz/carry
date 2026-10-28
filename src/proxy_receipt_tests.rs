@@ -1,5 +1,6 @@
 //! Synthetic receipts: the wire body deliberately does not predict provider units.
 use super::*;
+include!("proxy_cache_write_tests.rs");
 
 fn body() -> Value {
     json!({"model":"gpt-6.1-sol","input":[{"role":"user","content":"fixed source"}]})
