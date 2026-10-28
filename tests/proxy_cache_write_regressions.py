@@ -1,8 +1,8 @@
 """Issue188 economics controls: real CLI, synthetic receipts, no paid traffic.
 
-The fixture models Responses-style automatic cache population with no separately
-billed writes. Zero native writes certify these scripted calls only; they do not
-establish every route's tariff or force hits on divergent hypothetical history.
+No-write requests explicitly disable implicit caching and supply no breakpoints.
+Default/implicit GPT-5.6+ caching can charge writes: separate positive controls
+must preserve those charges. All receipts are synthetic, not live tariff proof.
 """
 import unittest
 
@@ -20,15 +20,20 @@ class CacheWriteRegressions(unittest.TestCase):
     def cleanup_harness(self):
         self.assertTrue(self.harness.doCleanups(), "nested fixture cleanup failed")
 
-    def run_control(self, inputs, *, restart=False, omit_write=False):
+    def run_control(self, inputs, *, restart=False, omit_write=False, paid_write=False):
+        options = {"mode": "implicit" if paid_write else "explicit", "ttl": "30m"}
+
         def primary(_body, n):
             incoming, cached = inputs[n - 1]
+            self.assertEqual(_body["prompt_cache_options"], options)
+            self.assertEqual(_body["prompt_cache_key"], "cache-write-188")
+            written = incoming - cached if paid_write and incoming >= 1024 else 0
             response = support.completed(response_id=f"cache-control-{n}")
             response["usage"] = {
                 "input_tokens": incoming, "output_tokens": 100,
                 "input_tokens_details": {"cached_tokens": cached}}
             if not omit_write:
-                response["usage"]["input_tokens_details"]["cache_write_tokens"] = 0
+                response["usage"]["input_tokens_details"]["cache_write_tokens"] = written
             return 200, response
 
         def review(_body, _n):
@@ -47,7 +52,9 @@ class CacheWriteRegressions(unittest.TestCase):
                 self.harness.stack.callback(proxy.close)
             if index:
                 history.append({"role": "user", "content": f"continue {index}"})
-            self.assertEqual(proxy.send(history, model="gpt-6.1-sol")[0], 200)
+            self.assertEqual(proxy.send(history, model="gpt-6.1-sol",
+                                        prompt_cache_options=options,
+                                        prompt_cache_key="cache-write-188")[0], 200)
             status, stats = proxy.request("GET", "/carry/dashboard/stats")
             self.assertEqual(status, 200)
             self.assertEqual(len(stats["sessions"]), 1)
@@ -56,11 +63,15 @@ class CacheWriteRegressions(unittest.TestCase):
             # Independent frozen catalog expectations in dollars/token. The
             # local wire is deliberately tiny: shared receipt units must own
             # both branches, rather than inferring native input from JSON size.
-            paid += (incoming - cached) * 2.0 / 1e6 + cached * 0.10 / 1e6 + 100 * 10.0 / 1e6
+            written = incoming - cached if paid_write and incoming >= 1024 else 0
+            paid += ((incoming - cached - written) * 2.0 + cached * 0.10
+                     + written * 2.50 + 100 * 10.0) / 1e6
             self.evidence.update(primaries=fixture.primaries, reviews=fixture.reviews,
                                  snapshots=snapshots, saved=saved,
-                                 fixture_write_semantics="automatic_population_no_separate_charge")
+                                 fixture_write_semantics=("paid_implicit_30m" if paid_write else
+                                                          "explicit_only_no_breakpoints"))
             self.assertEqual(fixture.primaries[-1]["input"], history)
+            self.assertEqual(fixture.primaries[-1]["prompt_cache_options"], options)
             self.assertEqual(saved["compactions"], 0)
             self.assertEqual(estimate["traditional_compactions"], 0)
             self.assertEqual(estimate["reviewer_cost"], 0)
@@ -80,7 +91,7 @@ class CacheWriteRegressions(unittest.TestCase):
             with self.subTest(request=index + 1):
                 self.assertAlmostEqual(
                     estimate["traditional_cost"], snapshot["expected_paid"], places=12,
-                    msg="CACHE_WRITE_188: identical branches cannot invent a billed write premium")
+                    msg="CACHE_WRITE_188: identical declared-cache branches must have equal cost")
                 self.assertAlmostEqual(estimate["savings"], 0.0, places=12)
 
     def test_identical_uncached_zero_write_has_no_savings(self):
@@ -89,14 +100,21 @@ class CacheWriteRegressions(unittest.TestCase):
     def test_identical_uncached_missing_optional_write_has_no_savings(self):
         self.assert_no_write_premium(self.run_control([(43298, 0)], omit_write=True))
 
-    def test_matched_append_cache_has_no_write_premium_across_restart(self):
-        # These scripted native hits match the declared alternative's append
-        # assumption. This does NOT copy native hits into a divergent branch.
+    def test_explicit_without_breakpoints_stays_uncached_across_restart(self):
         self.assert_no_write_premium(self.run_control(
-            [(43298, 0), (44298, 43298), (45298, 44298)], restart=True))
+            [(43298, 0), (44298, 0), (45298, 0)], restart=True))
+
+    def test_paid_implicit_cold_write_remains_charged(self):
+        self.assert_no_write_premium(self.run_control([(43298, 0)], paid_write=True))
+
+    def test_paid_implicit_append_reads_and_writes_survive_restart(self):
+        # Matching scripted hits isolate prices, not divergent-history reuse.
+        self.assert_no_write_premium(self.run_control(
+            [(43298, 0), (44298, 43298), (45298, 44298)],
+            restart=True, paid_write=True))
 
     def test_cache_ineligible_input_ordinary_price_control(self):
-        self.assert_no_write_premium(self.run_control([(512, 0)]))
+        self.assert_no_write_premium(self.run_control([(512, 0)], paid_write=True))
 
 
 if __name__ == "__main__":

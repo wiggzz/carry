@@ -1,8 +1,10 @@
-// Issue188: paid reviewer expense must not be masked by a synthetic write.
+// Issue188: explicit-only with no breakpoints must not mask reviewer expense
+// with a synthetic write. Default/implicit paid-write controls stay separate.
 #[test]
 fn cache_write188_reviewer_overhead_remains_a_loss_on_identical_no_write_input() {
     let mut t = Trajectory::default();
-    let request = body();
+    let mut request = body();
+    request["prompt_cache_options"] = json!({"mode":"explicit", "ttl":"30m"});
     let response = terminal(43_298, 0, 0, 100);
     t.primary(&request, &response, "no-write-fixture", 100, true);
     t.reviewer(&request, &terminal(1000, 0, 0, 100), true);
@@ -21,6 +23,45 @@ fn cache_write188_reviewer_overhead_remains_a_loss_on_identical_no_write_input()
         (estimate.savings + reviewer).abs() < 1e-12,
         "CACHE_WRITE_188_REVIEW: paid reviewer expense must remain a loss without a context benefit"
     );
+}
+
+// Acceptance coverage for existing paid-write accounting, not a new defect.
+#[test]
+fn cache_write188_paid_implicit_receipts_and_append_reads_survive_restart() {
+    let mut t = Trajectory::default();
+    let mut request = body();
+    request["prompt_cache_key"] = json!("cache-write-188");
+    request["prompt_cache_options"] = json!({"mode":"implicit", "ttl":"30m"});
+    let mut expected = 0.0;
+    for (index, (input, cached, written)) in
+        [(2000, 0, 2000), (2100, 2000, 100)].into_iter().enumerate()
+    {
+        if index > 0 {
+            request["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user", "content":"append"}));
+        }
+        t.primary(
+            &request,
+            &terminal(input, cached, written, 0),
+            "paid-implicit-fixture",
+            100 + index as u64,
+            true,
+        );
+        expected += (cached as f64 * 0.10 + written as f64 * 2.50) / 1e6;
+        let snapshot = t.snapshot();
+        assert!(snapshot.priced);
+        assert_eq!(snapshot.matched_primary_responses, index as u64 + 1);
+        assert_eq!(snapshot.traditional_compactions, 0);
+        assert_eq!(snapshot.summary_cost, 0.0);
+        assert_eq!(snapshot.reviewer_cost, 0.0);
+        assert!((snapshot.observed_primary_cost - expected).abs() < 1e-12);
+        assert!((snapshot.carry_cost - expected).abs() < 1e-12);
+        assert!((snapshot.traditional_cost - expected).abs() < 1e-12);
+        assert!(snapshot.savings.abs() < 1e-12);
+        t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+    }
 }
 
 // Additional acceptance coverage for labeling and later legacy transitions.
