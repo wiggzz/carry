@@ -162,6 +162,65 @@ def load_agent_usage(harness: str, output: pathlib.Path) -> dict[str, int]:
     return usage
 
 
+def carry_usage_evidence(output: pathlib.Path, usage: Mapping[str, int], model: str) -> tuple[bool, int]:
+    """Client-only fallback; trusted proxy attempt receipts remain authoritative.
+
+    A retry is not necessarily billed, but cannot prove an earlier accepted
+    attempt was free. Normalized zero counters are not native billing evidence.
+    """
+    pending: list[int] = []
+    observed = empty_usage()
+    responses = retries = 0
+    complete = True
+    try:
+        with (output / "trace.jsonl").open(encoding="utf-8") as events:
+            for line in events:
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    return False, retries
+                if event.get("event") not in {"model_request", "model_response"}:
+                    continue
+                data = event.get("data")
+                if not isinstance(data, dict):
+                    return False, retries
+                step = data.get("step")
+                if type(step) is not int or step < 1:
+                    return False, retries
+                if event["event"] == "model_request":
+                    pending.append(step)
+                    continue
+                response_retries = data.get("response_retries")
+                if type(response_retries) is not int or response_retries < 0:
+                    return False, retries
+                retries += response_retries
+                if not pending or pending.pop(0) != step:
+                    return False, retries
+                normalized = data.get("usage")
+                raw = data.get("raw")
+                native = raw.get("usage") if isinstance(raw, dict) else None
+                if (not isinstance(normalized, dict) or any(
+                        type(normalized.get(key)) is not int or normalized[key] < 0
+                        for key in USAGE_KEYS)):
+                    return False, retries
+                # The aggregate estimate uses configured rates. A receipt for a
+                # different/missing model or unpriced tier cannot certify it.
+                if (not isinstance(raw, dict) or raw.get("model") != model
+                        or proxy_benchmark.native_cost(
+                            model, native, service_tier=raw.get("service_tier", "default")) is None):
+                    complete = False
+                elif (native["input_tokens"] != normalized["input_tokens"]
+                      or native["output_tokens"] != normalized["output_tokens"]
+                      or native["input_tokens_details"]["cached_tokens"] != normalized["cached_input_tokens"]
+                      or native["input_tokens_details"].get("cache_write_tokens", 0) != normalized["cache_write_input_tokens"]):
+                    complete = False
+                for key in USAGE_KEYS:
+                    observed[key] += normalized[key]
+                responses += 1
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False, retries
+    return complete and responses > 0 and not pending and retries == 0 and observed == dict(usage), retries
+
+
 def pricing_for_model(model: str) -> dict[str, float] | None:
     try:
         from model_catalog import model_spec
@@ -1746,19 +1805,9 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
         patch = patch_file.read_text(encoding="utf-8") if patch_file.is_file() else ""
         if not patch_file.is_file():
             raise RuntimeError("agent did not produce final.patch")
-        response_retries = 0
-        if harness == "carry":
-            result_file = output / "result.json"
-            if not result_file.is_file():
-                raise RuntimeError("Carry did not produce result.json metrics")
-            result = json.loads(result_file.read_text(encoding="utf-8"))
-            response_retries = result.get("response_retries")
-            if (isinstance(response_retries, bool) or not isinstance(response_retries, int)
-                    or response_retries < 0):
-                raise RuntimeError("Carry result.json has invalid response_retries")
         record = {"instance_id": instance_id, "harness": harness, "status": "agent-completed",
                   "patch": patch, "error": None, "attempts": 1, "retries": 0,
-                  "response_retries": response_retries}
+                  "response_retries": 0}
     except (OSError, RuntimeError, json.JSONDecodeError,
             subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         timed_out = agent_timed_out(error)
@@ -1770,6 +1819,26 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
                   "patch": patch, "error": str(error), "attempts": 1, "retries": 0,
                   "response_retries": 0,
                   "timed_out": timed_out}
+    # Settle available metrics on every process outcome, including deadlines.
+    # Missing metrics on a failed slot may still be covered by a complete trace;
+    # present but invalid metrics cannot certify that no retry was lost.
+    result_metrics_valid = True
+    if harness == "carry":
+        result_file = output / "result.json"
+        try:
+            if result_file.is_file():
+                result = json.loads(result_file.read_text(encoding="utf-8"))
+                response_retries = result.get("response_retries") if isinstance(result, dict) else None
+                if (isinstance(response_retries, bool) or not isinstance(response_retries, int)
+                        or response_retries < 0):
+                    raise RuntimeError("Carry result.json has invalid response_retries")
+                record["response_retries"] = response_retries
+            elif record["status"] == "agent-completed":
+                raise RuntimeError("Carry did not produce result.json metrics")
+        except (OSError, RuntimeError, json.JSONDecodeError) as error:
+            result_metrics_valid = False
+            record["status"] = "agent-failed"
+            record["error"] = record["error"] or str(error)
     record["elapsed_seconds"] = round(time.monotonic() - started, 3)
     record["round_input_tokens"] = load_proxy_round_input_tokens(proxy_container)
     record["max_round_input_tokens"] = max_observed_input_tokens(record["round_input_tokens"])
@@ -1778,6 +1847,14 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
         record["usage"], pricing, max_round_input_tokens=record["max_round_input_tokens"],
         observed_round_input_tokens=sum(record["round_input_tokens"]),
     )
+    if harness == "carry":
+        complete, retries = carry_usage_evidence(output, record["usage"], model)
+        record["response_retries"] = max(record["response_retries"], retries)
+        # A clean trace cannot erase retry evidence retained by result.json.
+        complete = complete and result_metrics_valid and record["response_retries"] == 0
+        record["client_usage_complete"] = complete
+        if not complete:
+            record["estimated_cost_usd"] = None
     print("BENCHMARK_PROGRESS " + json.dumps({
         "elapsed_seconds": record["elapsed_seconds"], "instance_id": instance_id,
         "harness": harness, "state": "completed", "status": record["status"],
@@ -2318,7 +2395,9 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
                 later < earlier for item in harness_records
                 for earlier, later in zip(item["round_input_tokens"], item["round_input_tokens"][1:])
             ),
-            "estimated_cost_usd": round(sum(costs), 6) if costs else None,
+            "estimated_cost_usd": round(sum(costs), 6) if len(costs) == len(harness_records) else None,
+            "costed_slot_subtotal_usd": round(sum(costs), 6) if costs else None,
+            "cost_complete": len(costs) == len(harness_records),
             "costed_slots": len(costs),
             "statuses": dict(sorted(Counter(item["status"] for item in harness_records).items())),
         }
@@ -2367,7 +2446,9 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
             task_harness_reports[f"{task['instance_id']}/{harness}"] = {
                 "attempts": attempt_count,
                 "completed": sum(item["status"] == "evaluated" for item in task_records),
-                "estimated_cost_usd": round(sum(costs), 6) if costs else None,
+                "estimated_cost_usd": round(sum(costs), 6) if len(costs) == len(task_records) else None,
+                "costed_slot_subtotal_usd": round(sum(costs), 6) if costs else None,
+                "cost_complete": len(costs) == len(task_records),
                 "resolved": resolved_count,
                 "resolve_rate": resolved_count / attempt_count,
                 "solved_at_least_once": bool(resolved_count),
@@ -2393,8 +2474,11 @@ def finalize(*, tasks: list[dict[str, Any]], records: list[dict[str, Any]], outp
 
     def harness_cost_text(values: dict[str, Any]) -> str:
         rendered = cost_text(values["estimated_cost_usd"])
-        if values["estimated_cost_usd"] is not None and values["costed_slots"] < values["denominator"]:
-            rendered += f" ({values['costed_slots']}/{values['denominator']} slots)"
+        if not values["cost_complete"]:
+            rendered += f" ({values['costed_slots']}/{values['denominator']} priced slots"
+            if values["costed_slot_subtotal_usd"] is not None:
+                rendered += f"; priced subtotal {cost_text(values['costed_slot_subtotal_usd'])}"
+            rendered += ")"
         return rendered
 
     harness_lines = "\n".join(
