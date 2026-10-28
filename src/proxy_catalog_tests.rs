@@ -1,6 +1,7 @@
 // Synthetic frozen contracts, not vendor tariff or route evidence.
 // Rates in snapshots are USD per MILLION; planner results are dollars.
 use super::*;
+include!("proxy_projection_economics_tests.rs");
 
 #[test]
 fn reviewer_catalog_capacity_and_tier_drive_real_fit_checks_without_role_defaults() {
