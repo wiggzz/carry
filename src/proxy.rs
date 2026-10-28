@@ -2049,9 +2049,11 @@ fn review_body_for_view(
             let memory = session.memories.iter().find(|m| m.id == *id).unwrap();
             let mut fact =
                 json!({"memory_id":index,"source_ids":view.provenance(memory),"text":memory.text});
-            input.push(
-                json!({"role":"user","content":[{"type":"input_text","text":fact.to_string()}]}),
-            );
+            // Mutable proxy state must not become the implicit WRITE endpoint.
+            // GPT-5.6+ writes the latest eligible user/tool-message boundary;
+            // the stable source annotations above provide that boundary. Keep
+            // changing facts/ledger as assistant-side quoted state after it.
+            input.push(json!({"role":"assistant","content":fact.to_string()}));
             fact.as_object_mut().unwrap().remove("text");
             current_memories.push(fact);
         }
@@ -2063,7 +2065,7 @@ fn review_body_for_view(
         "eligible_memory_ids":current_memories.iter().map(|m|m["memory_id"].clone()).collect::<Vec<_>>(),
         "current_memories":current_memories,
         "previous_review_feedback":session.review_feedback});
-    input.push(json!({"role":"user","content":ledger.to_string()}));
+    input.push(json!({"role":"assistant","content":ledger.to_string()}));
     review_body_with_input(config, session, input)
 }
 
@@ -2101,8 +2103,12 @@ fn review_body_with_input(config: &ProxyCli, session: &Session, input: Vec<Value
         body["prompt_cache_options"] = json!({"mode":"explicit"});
         // One actual current boundary, never a second reviewer cache registry.
         let input = body["input"].as_array_mut().unwrap();
-        // The final ledger is mutable advice state, not a stable observation.
-        let boundary = input.len().saturating_sub(2);
+        // Mutable memory/ledger state follows the last stable annotation.
+        // Never mark that state merely because it is next-to-last in input.
+        let boundary = input
+            .iter()
+            .rposition(|item| item["role"] == "user")
+            .unwrap_or(0);
         if let Some(last) = input.get_mut(boundary)
             && let Some(block) = last["content"]
                 .as_array_mut()

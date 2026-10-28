@@ -82,6 +82,7 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.equal(cards().get('With Carry'), '$4.000000');
   assert.equal(cards().get('Traditional'), '$6.000000');
   assert.equal(cards().get('Estimated difference'), '$2.000000 (33.3%)');
+  assert.match(elements.get('assumptions').textContent, /^Usage-based cost estimate at API rates/, 'explanation leads with plain meaning, not accounting version jargon');
   assert.ok(elements.get('assumptions').textContent.includes('272,000'));
   // Deliberately distinct from the session sum: the backend owns aggregation,
   // amounts, percentage and coverage. The browser only formats its response.
@@ -125,11 +126,30 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     excluded_unpriced_reviewer_calls: 1};
   await vm.runInContext('refresh()', sandbox);
   assert.equal(cards().get('Estimated difference'), '$1.000000 (50.0%)', 'show the backend priced subset despite omitted calls');
-  assert.equal(cards().get('Unpriced calls excluded'), '5 (1 reviewer-only)');
-  assert.match(elements.get('estimate-coverage').textContent, /5 unpriced calls excluded.*1 reviewer-only/i);
+  assert.equal(cards().get('Calls excluded from comparison'), '5 (1 reviewer-only)');
+  assert.match(elements.get('estimate-coverage').textContent, /5 calls excluded from comparison.*1 reviewer-only/i);
   assert.match(elements.get('estimate-coverage').textContent, /approximate/i);
-  assert.match(byClass(firstSession(), 'diagnostics').textContent, /priced calls only.*3 unpriced calls excluded.*1 reviewer-only/i);
+  assert.match(byClass(firstSession(), 'diagnostics').textContent, /priced calls only.*3 calls excluded from comparison.*1 reviewer-only/i);
   assert.equal(cards().get('API-equivalent total'), 'Incomplete', 'estimated comparison coverage must not hide unavailable observed usage');
+  // Native ledgers and comparison accounting deliberately describe different
+  // populations. Keep the known observed subtotal visible outside disclosures.
+  Object.assign(unpriced.primary, {cost_usd: 7, unavailable_cost_calls: 3});
+  Object.assign(unpriced.shadow, {cost_usd: 0.25, unavailable_cost_calls: 2});
+  await vm.runInContext('refresh()', sandbox);
+  assert.equal(elements.get('observed-cost-summary')?.textContent || '',
+    'Observed API-equivalent cost: known subtotal $7.250000 · 5 unpriced calls (3 primary, 2 reviewer). Total unavailable.');
+  assert.equal(cards().get('Observed priced subtotal'), '$7.250000');
+  assert.equal(cards().get('With Carry'), '$1.000000', 'native subtotal does not replace comparison-window money');
+  unpriced.primary.cost_usd = null; unpriced.shadow.cost_usd = null;
+  await vm.runInContext('refresh()', sandbox);
+  assert.match(elements.get('observed-cost-summary').textContent, /known subtotal Unavailable.*5 unpriced calls.*Total unavailable/);
+  assert.equal(cards().get('Observed priced subtotal'), 'Unavailable', 'wholly unknown observed expense never becomes zero');
+  assert.equal(elements.get('usage').children[0].children[7].textContent,
+    'Known subtotal Unavailable · total unavailable', 'lane detail cannot invent a zero subtotal for null expense');
+  unpriced.primary.cost_usd = 0; unpriced.shadow.cost_usd = 0;
+  unpriced.primary.unavailable_cost_calls = 0; unpriced.shadow.unavailable_cost_calls = 0;
+  await vm.runInContext('refresh()', sandbox);
+  assert.equal(elements.get('observed-cost-summary').textContent, 'Observed API-equivalent total: $0.000000.');
   data.sessions = [session(3, 2)];
   data.cost_estimate = total(3, 2, -1, -50, 1);
   await vm.runInContext('refresh()', sandbox);
@@ -155,9 +175,9 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   data.cost_estimate = {...total(null, null, null, null, 0, 1), excluded_unpriced_calls: 2};
   await vm.runInContext('refresh()', sandbox);
   assert.equal(cards().get('Estimated difference'), 'Unavailable', 'no priced primary observations must not become zero savings');
-  assert.equal(cards().get('Unpriced calls excluded'), '2', 'track exclusions even if the entire estimate is unavailable');
+  assert.equal(cards().get('Calls excluded from comparison'), '2', 'track exclusions even if the entire estimate is unavailable');
   const noteTexts = el => [el.textContent, ...(el.children || []).flatMap(noteTexts)];
-  assert.match(noteTexts(elements.get('sessions')).join('\n'), /2 unpriced calls excluded/i, 'unavailable session diagnostics retain omission counts');
+  assert.match(noteTexts(elements.get('sessions')).join('\n'), /2 calls excluded from comparison/i, 'unavailable session diagnostics retain omission counts');
   data.sessions = [session(0, 0)];
   data.cost_estimate = total(0, 0, 0, null, 1);
   await vm.runInContext('refresh()', sandbox);
@@ -228,10 +248,57 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   await vm.runInContext('refresh()', sandbox);
   assert.match(walk(elements.get('sessions')).map(n=>n.textContent).join('\n'), /7 matched primary.*observed.*subtotal.*\$0.125000.*2 primary.*1 reviewer/i);
   assert.match(elements.get('accounting-detail').textContent, /42 matched primary.*3 primary.*4 reviewer/i, 'backend owns aggregate observed-cost completeness and matched coverage too');
-  assert.match(elements.get('estimate-coverage').textContent, /3 primary.*4 reviewer/i, 'unknown actual costs remain visible outside technical details');
+  assert.match(elements.get('estimate-coverage').textContent, /3 primary.*4 reviewer/i, 'comparison-accounting gaps stay visible without claiming native usage is unpriced');
+  assert.doesNotMatch(elements.get('estimate-coverage').textContent, /unknown actual costs/i);
+  assert.match(elements.get('accounting-detail').textContent, /comparison.*subtotal/i, 'receipt-window subtotal is not the all-usage subtotal');
   assert.match(elements.get('assumptions').textContent, /provider.*input/i);
   assert.match(elements.get('assumptions').textContent, /estimated.*restor/i);
   assert.ok(!/non-tool|reviewer inputs priced uncached/.test(elements.get('assumptions').textContent));
+  // Comparison support does not establish observed-cost completeness. No
+  // modality reason exists in this contract: never infer images from counts.
+  const unsupported = session(0, 0, false);
+  unsupported.primary = {cost_usd: 9, unavailable_cost_calls: 0};
+  unsupported.shadow = {cost_usd: 0.5, unavailable_cost_calls: 0};
+  unsupported.cost_estimate.excluded_unpriced_calls = 2;
+  unsupported.cost_estimate.coverage = {unmodeled_calls: 2, failed_calls: 1,
+    unknown_cache_requests: 3, missing_usage: 4, prior_untracked_calls: 5};
+  data.sessions = [unsupported];
+  data.cost_estimate = total(null, null, null, null, 0, 1);
+  await vm.runInContext('refresh()', sandbox);
+  const unsupportedNotes = byClass(firstSession(), 'diagnostics').textContent;
+  assert.match(unsupportedNotes, /2 calls excluded from comparison/i);
+  assert.doesNotMatch(unsupportedNotes, /2 unpriced calls/i, 'unmodeled comparisons are not proof of unknown observed expense');
+  assert.match(unsupportedNotes, /comparison.*2 unmodeled calls.*reason not reported/i, 'unsupported comparisons must not be hidden by a failure');
+  for (const reason of [/failed call/i, /unknown model or cache/i, /missing usage/i, /earlier calls.*not tracked/i]) {
+    assert.match(unsupportedNotes, reason, 'independent coverage reasons coexist');
+  }
+  assert.doesNotMatch(unsupportedNotes, /image/i, 'missing modality provenance cannot be invented in UI');
+  assert.equal(cards().get('API-equivalent total'), '$9.500000', 'unsupported comparison can still have complete observed cost');
+  assert.equal(cards().get('Estimated difference'), 'Unavailable');
+  assert.equal(elements.get('observed-cost-summary').textContent, 'Observed API-equivalent total: $9.500000.');
+  // Zero filtering is lifetime activity, not permission to erase backend money
+  // or claim that a positive modeled difference was caused by filtering.
+  const noFilter = {...session(0.7109506, 0.7601263), compactions: 0, completed_requests: 40};
+  data.sessions = [noFilter];
+  data.cost_estimate = total(8, 10, 2, 20, 1);
+  await vm.runInContext('refresh()', sandbox);
+  assert.match(byClass(firstSession(), 'diagnostics')?.textContent || '',
+    /no filtering recorded.*lifetime.*not demonstrated filtering savings/i);
+  assert.match(byClass(firstSession(), 'session-savings').textContent, /Estimated difference: \$0\.049176/, 'preserve the valid positive backend difference');
+  assert.equal(cards().get('Estimated difference'), '$2.000000 (20.0%)', 'no-filter row must not rewrite backend-owned aggregate');
+  delete noFilter.compactions;
+  await vm.runInContext('refresh()', sandbox);
+  assert.doesNotMatch(byClass(firstSession(), 'diagnostics')?.textContent || '', /no filtering recorded/i, 'unknown filtering activity cannot be asserted to be zero');
+  Object.assign(noFilter.shadow, {input_tokens: 10000, cached_tokens: 0});
+  data.reviewer_cache_mode = 'codex-implicit';
+  await vm.runInContext('refresh()', sandbox);
+  const reviewerUsage = elements.get('usage').children[1];
+  assert.equal(reviewerUsage.children[3].textContent, '0 (provider-reported)');
+  assert.match(reviewerUsage.children[3].title || '', /zero.*not.*implicit cach.*disabled/i);
+  assert.match(elements.get('config').textContent, /Reviewer cache mode \(configuration\): codex-implicit/);
+  noFilter.shadow.cached_tokens = null;
+  await vm.runInContext('refresh()', sandbox);
+  assert.equal(elements.get('usage').children[1].children[3].textContent, 'Unavailable', 'missing cache usage must not masquerade as provider-reported zero');
   // Activity is independent of completed accounting. Exercise actual rendering
   // for both pending producers, losses, valid zero and genuinely unavailable.
   for (const pending of ['processing', 'background_review_pending']) {
@@ -414,6 +481,21 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     const amount=n=>n==null?'Unavailable':'$'+Number(n).toFixed(6);
     assert.equal(cards().get('With Carry'),amount(data.cost_estimate.carry_cost));
     assert.equal(cards().get('Traditional'),amount(data.cost_estimate.traditional_cost));
+    const nativeLedgers = data.sessions.flatMap(s=>[s.primary,s.shadow]);
+    const nativeSubtotal = nativeLedgers.some(l=>l.cost_usd!=null)
+      ? nativeLedgers.reduce((n,l)=>n+(l.cost_usd||0),0) : null;
+    const nativeUnpriced = nativeLedgers.reduce((n,l)=>n+(l.unavailable_cost_calls||0),0);
+    assert.equal(cards().get('Observed priced subtotal'),amount(nativeSubtotal));
+    if(nativeUnpriced || data.unavailable_sessions){
+      assert.match(elements.get('observed-cost-summary').textContent, /known subtotal.*Total unavailable/);
+      assert.ok(elements.get('observed-cost-summary').textContent.includes(amount(nativeSubtotal)));
+      assert.ok(elements.get('observed-cost-summary').textContent.includes(nativeUnpriced.toLocaleString()+' unpriced call'));
+    }
+    for(const history of data.sessions.filter(s=>s.compactions===0&&s.cost_estimate?.savings>0)){
+      const row = [...walk(elements.get('sessions')),...walk(elements.get('background-sessions'))]
+        .find(n=>n.id==='history:'+history.id);
+      assert.match(byClass(row,'diagnostics').textContent,/not demonstrated filtering savings/);
+    }
     assert.equal(walk(elements.get('sessions')).filter(n=>n.className==='session').length+
       walk(elements.get('background-sessions')).filter(n=>n.className==='session').length,data.sessions.length);
     assert.ok(!/reviewer cleanups/.test(walk(elements.get('sessions')).map(n=>n.textContent).join('\n')));

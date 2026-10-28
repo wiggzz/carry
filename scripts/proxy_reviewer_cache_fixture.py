@@ -84,6 +84,21 @@ def boundaries(body):
             and any('prompt_cache_breakpoint' in block for block in item['content'])]
 
 
+def implicit_eligible_endings(items):
+    """Documented GPT-5.6+ message boundaries; not a live cache oracle."""
+    def tool(item):
+        return item.get('role') == 'tool' or item.get('type') in (
+            'function_call_output', 'custom_tool_call_output')
+
+    initial_developers = 0
+    while initial_developers < len(items) and items[initial_developers].get('role') == 'developer':
+        initial_developers += 1
+    return [n + 1 for n, item in enumerate(items)
+            if item.get('role') == 'user'
+            or (initial_developers and n + 1 == initial_developers)
+            or (tool(item) and (n + 1 == len(items) or not tool(items[n + 1])))]
+
+
 class Provider:
     def __init__(self, case='rotation'):
         self.case = case
@@ -117,16 +132,18 @@ class Provider:
                         assert 'eligible_group_ids' in ledger
                         base = {k: v for k, v in body.items() if k != 'input'}
                         key = lambda n: json.dumps([base, n, prefix_identity(body, n)], sort_keys=True)
-                        # Explicit mode writes marked slots; the synthetic implicit
-                        # provider remembers only actually transmitted full/stable
-                        # prefixes. Wrappers and every non-input setting are exact.
+                        # GPT-5.6+ implicit mode WRITES the latest eligible
+                        # ending, not every earlier stable prefix. LOOKUP may
+                        # inspect it and up to 20 earlier eligible endings.
+                        # This simulator is protocol evidence, not provider proof.
                         explicit = bool(points)
-                        candidates = points if explicit else range(1, len(data) + 1)
+                        eligible = implicit_eligible_endings(data)
+                        candidates = points if explicit else eligible[-21:]
                         matched = [n for n in candidates if key(n) in owner.cache]
                         cached = 2048 if matched else 0
                         if owner.case == 'missing-usage' and len(owner.reviews) <= 2:
                             cached = 0
-                        for point in points if explicit else (len(data) - 1, len(data)):
+                        for point in points if explicit else eligible[-1:]:
                             owner.cache.add(key(point))
                         owner.receipts.append({'synthetic_cached_tokens': cached,
                                                'matched_boundaries': matched,

@@ -170,10 +170,33 @@ fn summary(
     let mut spent = 0;
     let mut items = Vec::new();
     let mut prior_end = (prior.and_then(|p| p["item_count"].as_u64()) == Some(0)).then_some(cursor);
-    for (index, item) in input.into_iter().flatten().take(ITEMS).enumerate() {
+    // Compare the actual latest eligible USER boundary, not mutable trailing
+    // assistant-side proxy state. This is the implicit write candidate, not
+    // evidence that the provider wrote or retained it. Item detail limits do
+    // not restrict identity; byte/hash limits still fail closed to unknown.
+    let stable_count = input
+        .and_then(|items| items.iter().rposition(|item| item["role"] == "user"))
+        .map_or(0, |index| index + 1);
+    let mut stable_end = None;
+    let mut prior_stable_end = None;
+    data["prior_stable_prefix_equal"] = Value::Null;
+    for (index, item) in input.into_iter().flatten().enumerate() {
         let Some(stop) = value_end(bytes, cursor) else {
             break;
         };
+        if index + 1 == stable_count {
+            stable_end = Some(stop);
+        }
+        if prior.and_then(|p| p["stable_prefix_items"].as_u64()) == Some((index + 1) as u64) {
+            prior_stable_end = Some(stop);
+        }
+        if prior.and_then(|p| p["item_count"].as_u64()) == Some((index + 1) as u64) {
+            prior_end = Some(stop);
+        }
+        if index >= ITEMS {
+            cursor = stop + 1;
+            continue;
+        }
         let raw = &bytes[cursor..stop];
         let digest = if raw.len() <= ITEM_BYTES && spent + raw.len() <= HASH_BYTES {
             spent += raw.len();
@@ -183,10 +206,27 @@ fn summary(
         };
         items.push(json!({"type":safe_enum(&item["type"], &["message","reasoning","function_call","function_call_output","custom_tool_call","custom_tool_call_output","item_reference"]),
             "role":safe_enum(&item["role"], &["system","developer","user","assistant","tool"]),"bytes":raw.len(),"fingerprint":digest}));
-        if prior.and_then(|p| p["item_count"].as_u64()) == Some((index + 1) as u64) {
-            prior_end = Some(stop);
-        }
         cursor = stop + 1;
+    }
+    if let Some(stop) = stable_end.filter(|stop| stop.saturating_sub(start + 1) <= HASH_BYTES) {
+        data["stable_prefix_items"] = json!(stable_count);
+        data["stable_prefix_bytes"] = json!(stop - start - 1);
+        data["stable_prefix_fingerprint"] = json!(fingerprint(
+            key,
+            b"stable-input-prefix",
+            &[&bytes[start + 1..stop]]
+        ));
+    }
+    if let Some(p) = prior.filter(|p| p["stable_prefix_fingerprint"].is_string())
+        && let Some(stop) =
+            prior_stable_end.filter(|stop| stop.saturating_sub(start + 1) <= HASH_BYTES)
+    {
+        data["prior_stable_prefix_items"] = p["stable_prefix_items"].clone();
+        data["prior_stable_prefix_bytes"] = p["stable_prefix_bytes"].clone();
+        data["prior_stable_prefix_equal"] = json!(
+            p["stable_prefix_fingerprint"]
+                == fingerprint(key, b"stable-input-prefix", &[&bytes[start + 1..stop]])
+        );
     }
     let complete = items.len() == count
         && items.iter().all(|i| i["fingerprint"].is_string())
@@ -367,6 +407,39 @@ mod tests {
         let transformed = crate::proxy::codex_body(&body);
         let raw = capture(&transformed, None, &[7; 32]);
         assert_ne!(raw["settings_fingerprint"], first["settings_fingerprint"]);
+    }
+
+    #[test]
+    fn stable_observation_prefix_ignores_detail_cap_but_detects_real_mutations() {
+        let mut items = (0..100)
+            .map(|i| json!({"role":"user","content":format!("source {i}")}))
+            .collect::<Vec<_>>();
+        items.push(json!({"role":"assistant","content":"old ledger"}));
+        let first_body = json!({"input":items});
+        let first = capture(&first_body, None, &[7; 32]);
+        assert_eq!(first["coverage_complete"], false);
+        assert_eq!(first["stable_prefix_items"], 100);
+        assert!(first["stable_prefix_fingerprint"].is_string());
+        let mut next_body = first_body.clone();
+        let items = next_body["input"].as_array_mut().unwrap();
+        items.pop();
+        items.push(json!({"role":"user","content":"new source"}));
+        items.push(json!({"role":"assistant","content":"changed ledger"}));
+        let next = capture(&next_body, Some(&first), &[7; 32]);
+        assert_eq!(next["prior_stable_prefix_equal"], true);
+        assert_eq!(next["prior_stable_prefix_items"], 100);
+        assert!(next["prior_prefix_equal"].is_null());
+        next_body["input"].as_array_mut().unwrap().swap(50, 51);
+        let changed = capture(&next_body, Some(&first), &[7; 32]);
+        assert_eq!(changed["prior_stable_prefix_equal"], false);
+        let restart = capture(&next_body, Some(&first), &[8; 32]);
+        assert!(restart["prior_stable_prefix_equal"].is_null());
+        let oversized = json!({"input":[{"role":"user","content":"x".repeat(HASH_BYTES + 1)}, {"role":"assistant","content":"ledger"}]});
+        let unknown = capture(&oversized, None, &[7; 32]);
+        assert!(unknown["stable_prefix_fingerprint"].is_null());
+        assert!(
+            capture(&oversized, Some(&unknown), &[7; 32])["prior_stable_prefix_equal"].is_null()
+        );
     }
 
     #[test]
