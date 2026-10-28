@@ -11,7 +11,8 @@ from scripts import swebench_smoke as worker
 
 class DeadlineAccountingTests(unittest.TestCase):
     def run_slot(self, native_usage, retries=0, pending=False, timed_out=True, result_retries=None,
-                 response_model='gpt-5.6-luna', service_tier='default'):
+                 response_model='gpt-5.6-luna', service_tier='default', exit_code=0,
+                 launch_timeout=False):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             for name in ('repo', 'input', 'output'):
@@ -34,8 +35,11 @@ class DeadlineAccountingTests(unittest.TestCase):
                 'response_retries': retries if result_retries is None else result_retries}))
             (output / 'final.patch').write_text('')
             def launch(command, **kwargs):
-                if command[:2] == ['docker', 'run'] and timed_out:
-                    raise subprocess.CalledProcessError(124, command)
+                if command[:2] == ['docker', 'run']:
+                    if launch_timeout:
+                        raise subprocess.TimeoutExpired(command, 1200)
+                    if timed_out or exit_code:
+                        raise subprocess.CalledProcessError(124 if timed_out else exit_code, command)
                 return subprocess.CompletedProcess(command, 0, stdout='')
             with mock.patch.object(worker.subprocess, 'run', side_effect=launch):
                 return worker.run_agent(instance_id='task-1', harness='carry', image='carry:test',
@@ -52,12 +56,34 @@ class DeadlineAccountingTests(unittest.TestCase):
                 self.assertEqual(record['response_retries'], 1)
 
     def test_result_retry_evidence_cannot_be_cleared_by_a_clean_trace(self):
-        record = self.run_slot({'input_tokens': 100, 'output_tokens': 20},
-                               timed_out=False, result_retries=1)
-        self.assertEqual(record['response_retries'], 1)
-        self.assertFalse(record['client_usage_complete'])
-        self.assertIsNone(record['estimated_cost_usd'])
-        self.assertEqual(record['usage']['input_tokens'], 100)
+        for launch in ({'timed_out': False}, {'timed_out': True},
+                       {'timed_out': False, 'exit_code': 1},
+                       {'timed_out': False, 'launch_timeout': True}):
+            with self.subTest(launch=launch):
+                record = self.run_slot({'input_tokens': 100, 'output_tokens': 20},
+                                       result_retries=1, **launch)
+                self.assertEqual(record['response_retries'], 1)
+                self.assertFalse(record['client_usage_complete'])
+                self.assertIsNone(record['estimated_cost_usd'])
+                self.assertEqual(record['usage']['input_tokens'], 100)
+                self.assertEqual(record['usage']['output_tokens'], 20)
+                self.assertEqual(record['status'], 'agent-failed' if (
+                    launch.get('timed_out') or launch.get('exit_code') or launch.get('launch_timeout')
+                ) else 'agent-completed')
+
+    def test_invalid_result_retry_metrics_cannot_certify_complete_cost(self):
+        for retries in (True, -1, '1'):
+            for launch in ({'timed_out': False}, {'timed_out': True},
+                           {'timed_out': False, 'exit_code': 1}):
+                with self.subTest(retries=retries, launch=launch):
+                    record = self.run_slot({'input_tokens': 100, 'output_tokens': 20},
+                                           result_retries=retries, **launch)
+                    self.assertEqual(record['status'], 'agent-failed')
+                    self.assertFalse(record['client_usage_complete'])
+                    self.assertIsNone(record['estimated_cost_usd'])
+                    self.assertEqual(record['usage']['input_tokens'], 100)
+                    self.assertEqual(record['usage']['output_tokens'], 20)
+                    self.assertTrue(record['error'])
 
     def test_normalized_zero_is_not_native_usage_provenance(self):
         for native in (None, {}, 'invalid', {'input_tokens': True, 'output_tokens': 20},
@@ -80,7 +106,13 @@ class DeadlineAccountingTests(unittest.TestCase):
                 self.assertEqual(record['usage']['input_tokens'], 100)
 
     def test_valid_native_receipt_is_priced(self):
-        self.assertIsNotNone(self.run_slot({'input_tokens': 100, 'output_tokens': 20})['estimated_cost_usd'])
+        for launch in ({'timed_out': False}, {'timed_out': True},
+                       {'timed_out': False, 'exit_code': 1}):
+            with self.subTest(launch=launch):
+                record = self.run_slot({'input_tokens': 100, 'output_tokens': 20}, **launch)
+                self.assertTrue(record['client_usage_complete'])
+                self.assertIsNotNone(record['estimated_cost_usd'])
+                self.assertEqual(record['response_retries'], 0)
 
     def test_aggregate_unknown_keeps_priced_subtotal(self):
         tasks = [{'instance_id': f'task-{n}'} for n in range(5)]

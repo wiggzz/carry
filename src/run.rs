@@ -184,7 +184,7 @@ fn persist_context_checkpoint(config: &RunConfig, state: &ContextState) -> Resul
 }
 
 pub enum Backend {
-    OpenAi(OpenAiClient),
+    OpenAi(Box<OpenAiClient>),
     Scripted {
         steps: VecDeque<Step>,
         emitted: usize,
@@ -493,7 +493,7 @@ fn cache_alive(activity: Option<Instant>, now: Instant) -> bool {
 
 impl Backend {
     pub fn openai(client: OpenAiClient) -> Self {
-        Self::OpenAi(client)
+        Self::OpenAi(Box::new(client))
     }
 
     fn configure_shell_timeout(&mut self, seconds: u64) {

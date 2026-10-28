@@ -1805,19 +1805,9 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
         patch = patch_file.read_text(encoding="utf-8") if patch_file.is_file() else ""
         if not patch_file.is_file():
             raise RuntimeError("agent did not produce final.patch")
-        response_retries = 0
-        if harness == "carry":
-            result_file = output / "result.json"
-            if not result_file.is_file():
-                raise RuntimeError("Carry did not produce result.json metrics")
-            result = json.loads(result_file.read_text(encoding="utf-8"))
-            response_retries = result.get("response_retries")
-            if (isinstance(response_retries, bool) or not isinstance(response_retries, int)
-                    or response_retries < 0):
-                raise RuntimeError("Carry result.json has invalid response_retries")
         record = {"instance_id": instance_id, "harness": harness, "status": "agent-completed",
                   "patch": patch, "error": None, "attempts": 1, "retries": 0,
-                  "response_retries": response_retries}
+                  "response_retries": 0}
     except (OSError, RuntimeError, json.JSONDecodeError,
             subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         timed_out = agent_timed_out(error)
@@ -1829,6 +1819,26 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
                   "patch": patch, "error": str(error), "attempts": 1, "retries": 0,
                   "response_retries": 0,
                   "timed_out": timed_out}
+    # Settle available metrics on every process outcome, including deadlines.
+    # Missing metrics on a failed slot may still be covered by a complete trace;
+    # present but invalid metrics cannot certify that no retry was lost.
+    result_metrics_valid = True
+    if harness == "carry":
+        result_file = output / "result.json"
+        try:
+            if result_file.is_file():
+                result = json.loads(result_file.read_text(encoding="utf-8"))
+                response_retries = result.get("response_retries") if isinstance(result, dict) else None
+                if (isinstance(response_retries, bool) or not isinstance(response_retries, int)
+                        or response_retries < 0):
+                    raise RuntimeError("Carry result.json has invalid response_retries")
+                record["response_retries"] = response_retries
+            elif record["status"] == "agent-completed":
+                raise RuntimeError("Carry did not produce result.json metrics")
+        except (OSError, RuntimeError, json.JSONDecodeError) as error:
+            result_metrics_valid = False
+            record["status"] = "agent-failed"
+            record["error"] = record["error"] or str(error)
     record["elapsed_seconds"] = round(time.monotonic() - started, 3)
     record["round_input_tokens"] = load_proxy_round_input_tokens(proxy_container)
     record["max_round_input_tokens"] = max_observed_input_tokens(record["round_input_tokens"])
@@ -1841,7 +1851,7 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
         complete, retries = carry_usage_evidence(output, record["usage"], model)
         record["response_retries"] = max(record["response_retries"], retries)
         # A clean trace cannot erase retry evidence retained by result.json.
-        complete = complete and record["response_retries"] == 0
+        complete = complete and result_metrics_valid and record["response_retries"] == 0
         record["client_usage_complete"] = complete
         if not complete:
             record["estimated_cost_usd"] = None
