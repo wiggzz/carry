@@ -1,8 +1,8 @@
 """Immutable comparison-policy boundaries through the real CLI and restart.
 
-The future version numbers below are owned checkpoint fixtures, not claims that
-write-pricing v2/v3 is implemented. Rates and receipts stay fixed; the test
-isolates migration from the still-failing #188 write-pricing controls.
+The later version numbers below are owned checkpoint fixtures, not new billing
+contracts. Rates and receipts stay fixed; the test isolates version migration
+from the separate #188 request-mode pricing controls.
 """
 import copy
 import json
@@ -39,7 +39,7 @@ class CachePolicyRegressions(unittest.TestCase):
         fixture = self.harness.fixture(primary, review)
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "user", "content": "immutable policy boundary"}]
-        versions = [1, 2, 2, 3]
+        versions = [2, 3, 3, 4]
         snapshots = []
         checkpoints = []
         paid = 0.0
@@ -81,9 +81,9 @@ class CachePolicyRegressions(unittest.TestCase):
         self.assertEqual(before.get("cache_policy_boundaries", []), [])
         boundaries = changed.get("cache_policy_boundaries", [])
         self.assertEqual(len(boundaries), 1,
-                         "CACHE_POLICY_188: present v1 -> present v2 must freeze the old ledger")
-        self.assertEqual(boundaries[0]["previous_version"], 1)
-        self.assertEqual(boundaries[0]["next_version"], 2)
+                         "CACHE_POLICY_188: present version change must freeze the old ledger")
+        self.assertEqual(boundaries[0]["previous_version"], 2)
+        self.assertEqual(boundaries[0]["next_version"], 3)
         cumulative = boundaries[0]["cumulative"]
         for field in ("carry_cost", "traditional_cost", "reviewer_cost", "summary_cost",
                       "traditional_compactions", "coverage", "matched_primary_responses"):
@@ -94,7 +94,7 @@ class CachePolicyRegressions(unittest.TestCase):
         later = changed_again["cache_policy_boundaries"]
         self.assertEqual(len(later), 2)
         self.assertEqual(later[0], boundaries[0], "never overwrite an earlier boundary")
-        self.assertEqual((later[1]["previous_version"], later[1]["next_version"]), (2, 3))
+        self.assertEqual((later[1]["previous_version"], later[1]["next_version"]), (3, 4))
         for field in cumulative:
             self.assertEqual(later[1]["cumulative"][field], same[field], field)
         # Monetary snapshots are cumulative, never additive disjoint segments.

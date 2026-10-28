@@ -241,3 +241,120 @@ fn cache_policy188_present_version_boundaries_preserve_primary_and_reviewer_mone
         "mixed_versioned_cache_policies"
     );
 }
+
+// Prospective v1 -> request-aware v2 upgrade: historical money is immutable.
+#[test]
+fn cache_write188_resolution_upgrade_keeps_old_money_and_disables_future_reads_and_writes() {
+    use carry::models::{Route, resolve_model};
+    let mut old = resolve_model(
+        "gpt-6.1-sol",
+        Route::new("https://api.openai.com/v1/responses", false),
+        None,
+        None,
+        0,
+        0,
+    )
+    .unwrap();
+    old.scenario_cache_policy.as_mut().unwrap().version = 1;
+    old.scenario_cache_policy
+        .as_mut()
+        .unwrap()
+        .minimum_prefix_tokens = Some(1500);
+    old.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 7;
+    let mut request = body();
+    request["prompt_cache_options"] = json!({"mode":"explicit", "ttl":"30m"});
+    let mut t = Trajectory::default();
+    t.primary_resolved(
+        &request,
+        &terminal(2000, 0, 0, 0),
+        "fixture",
+        100,
+        true,
+        Some(&old),
+    );
+    let before = t.snapshot();
+    assert!((before.observed_primary_cost - 0.004).abs() < 1e-12);
+    assert!((before.traditional_cost - 0.005).abs() < 1e-12);
+    let upgraded = old.clone().with_scenario_cache_policy();
+    assert_eq!(upgraded.scenario_cache_policy.as_ref().unwrap().version, 2);
+    assert_eq!(
+        upgraded
+            .scenario_cache_policy
+            .as_ref()
+            .unwrap()
+            .minimum_prefix_tokens,
+        Some(1500)
+    );
+    assert_eq!(
+        upgraded.scenario_cache_policy.as_ref().unwrap().ttl_seconds,
+        7
+    );
+    assert_eq!(
+        serde_json::to_value(upgraded.rates).unwrap(),
+        serde_json::to_value(old.rates).unwrap()
+    );
+    for (index, input) in [2100, 2200].into_iter().enumerate() {
+        t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+        request["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user", "content":format!("append {index}")}));
+        t.primary_resolved(
+            &request,
+            &terminal(input, 0, 0, 0),
+            "fixture",
+            101 + index as u64,
+            true,
+            Some(&upgraded),
+        );
+        let after = t.snapshot();
+        let prospective = if index == 0 { 0.0042 } else { 0.0086 };
+        assert!((after.traditional_cost - before.traditional_cost - prospective).abs() < 1e-12);
+        assert!(
+            (after.observed_primary_cost - before.observed_primary_cost - prospective).abs()
+                < 1e-12
+        );
+        assert_eq!(after.cache_policy_boundaries.len(), 1);
+        assert_eq!(after.cache_policy_boundaries[0].previous_version, Some(1));
+        assert_eq!(after.cache_policy_boundaries[0].next_version, Some(2));
+        assert_eq!(
+            serde_json::to_value(&after.cache_policy_boundaries[0].cumulative).unwrap(),
+            serde_json::to_value(CachePolicySegment::from(&before)).unwrap()
+        );
+        assert_eq!(
+            after.counterfactual_cache_policy,
+            "mixed_versioned_cache_policies"
+        );
+    }
+}
+
+// Unknown request contracts exclude comparison, never actual paid receipts.
+#[test]
+fn cache_write188_unknown_mode_ttl_or_explicit_extent_keeps_actual_money() {
+    for options in [
+        json!({"mode":"unknown"}),
+        json!({"mode":"implicit","ttl":"12h"}),
+        json!({"mode":null}),
+        json!(null),
+        json!({"mode":"explicit"}),
+    ] {
+        let mut request = body();
+        request["prompt_cache_options"] = options.clone();
+        if options == json!({"mode":"explicit"}) {
+            request["input"] = json!([{"role":"user","content":[{"type":"input_text","text":"prefix","prompt_cache_breakpoint":{"mode":"explicit"}}]}]);
+        }
+        let mut t = Trajectory::default();
+        t.primary(&request, &terminal(2000, 0, 0, 0), "fixture", 100, true);
+        let snapshot = t.snapshot();
+        assert!((snapshot.observed_primary_cost - 0.004).abs() < 1e-12);
+        assert_eq!(snapshot.unavailable_primary_cost_calls, 0);
+        assert_eq!(snapshot.coverage.unknown_cache_requests, 1);
+        assert_eq!(snapshot.excluded_unpriced_calls, 1);
+        assert_eq!(snapshot.matched_primary_responses, 0);
+        assert!(!snapshot.priced);
+        let dashboard = serde_json::to_value(snapshot.dashboard(false)).unwrap();
+        assert!(dashboard["traditional_cost"].is_null());
+        assert!(dashboard["savings"].is_null());
+        assert!((dashboard["observed_primary_cost"].as_f64().unwrap() - 0.004).abs() < 1e-12);
+    }
+}

@@ -589,7 +589,7 @@ fn receipt_policy_upgrade_freezes_legacy_segment_and_starts_cold() {
     let mixed = t.snapshot();
     assert_eq!(
         mixed.counterfactual_cache_policy,
-        "mixed_legacy_route_v0_and_model_v1"
+        "mixed_versioned_cache_policies"
     );
     let segment = mixed.legacy_cache_policy_segment.as_ref().unwrap();
     assert_eq!(segment.traditional_cost, before.traditional_cost);

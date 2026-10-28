@@ -13,7 +13,7 @@ pub fn accounting_policy() -> Value {
     json!({"default_basis": RECEIPT_BASIS, "retained_legacy_basis": LEGACY_BASIS,
         "observed_cost_basis": "provider_native_partitions_with_dispatch_frozen_tariffs",
         "counterfactual_basis": RECEIPT_COUNTERFACTUAL_BASIS,
-        "counterfactual_cache_policy": "conditional_model_cache_v1",
+        "counterfactual_cache_policy": format!("conditional_model_cache_v{}", carry::models::ScenarioCachePolicy::VERSION),
         "retained_counterfactual_cache_policy": "legacy_route_cache_v0",
         "cache_policy_upgrade": "prospective_cold_boundary_with_immutable_legacy_segment_no_repricing",
         "opaque_output_retention": "unknown_not_ciphertext_length",
@@ -752,6 +752,40 @@ fn scenario_input_cost_resolved(
     crate::savings::scenario_input_cost(model, input, cached, minimum, |model, usage| {
         modeled_cost(model, usage, resolved)
     })
+}
+
+fn request_cache_mode(
+    body: &Value,
+    model: &str,
+    resolved: Option<&ResolvedModel>,
+) -> carry::models::ScenarioCacheMode {
+    match resolved {
+        Some(r) => r
+            .scenario_cache_policy
+            .as_ref()
+            .map_or(carry::models::ScenarioCacheMode::Implicit, |p| {
+                p.request_mode(body)
+            }),
+        None => carry::models::ScenarioCachePolicy::for_model(model).request_mode(body),
+    }
+}
+
+fn scenario_request_input_cost_resolved(
+    body: &Value,
+    model: &str,
+    input: u64,
+    cached: u64,
+    minimum: Option<u64>,
+    resolved: Option<&ResolvedModel>,
+) -> Option<f64> {
+    crate::savings::scenario_input_cost_with_mode(
+        model,
+        input,
+        cached,
+        minimum,
+        request_cache_mode(body, model, resolved),
+        |model, usage| modeled_cost(model, usage, resolved),
+    )
 }
 
 fn scenario_output_cost_resolved(

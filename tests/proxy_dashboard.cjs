@@ -259,6 +259,8 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     ['legacy_route_cache_v0', /legacy route.cache.*not repaired/i],
     ['mixed_legacy_route_v0_and_model_v1', /mixed cache policies.*retained unchanged.*prospectively/i],
     ['conditional_model_cache_v1', /conditional model cache.*not route entitlement/i],
+    ['conditional_model_cache_v2', /conditional model cache v2.*not route entitlement/i],
+    ['mixed_versioned_cache_policies', /mixed cache policies.*retained unchanged.*prospectively/i],
   ]) {
     data.sessions = [session(1, 2)];
     data.sessions[0].cost_estimate.counterfactual_cache_policy = policy;

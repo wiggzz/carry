@@ -70,3 +70,50 @@ fn cache_write188_native_report_preserves_paid_implicit_writes() {
     assert!((estimate.pi_cost - paid).abs() < 1e-12);
     assert_eq!(estimate.savings, 0.0);
 }
+
+// Acceptance controls for mode changes and unsupported request metadata.
+#[test]
+fn cache_write188_native_report_mode_switch_never_reuses_disabled_cache() {
+    let mut body = json!({"model":"gpt-6.1-sol", "prompt_cache_key":"mode-switch",
+        "input":[{"role":"user", "content":"cache boundary ".repeat(1000)}]});
+    let input = prompt_projection(&body).unwrap().2;
+    let mut t = Trajectory::with_model("gpt-6.1-sol".into());
+    let mut expected = 0.0;
+    for (index, mode) in ["implicit", "explicit", "explicit"].into_iter().enumerate() {
+        body["prompt_cache_options"] = json!({"mode":mode, "ttl":"30m"});
+        let writes = if index == 0 { input } else { 0 };
+        t.record(&json!({"event":"model_request", "timestamp_ms":100+index,
+            "data":{"step":index,"transport":{"api_base":"https://api.openai.com/v1"},"request":body}}));
+        let e = t
+            .record(&json!({"event":"model_response", "timestamp_ms":101+index,
+            "data":{"step":index,"usage":{"input_tokens":input,"output_tokens":0,
+            "cached_input_tokens":0,"cache_write_input_tokens":writes},"raw":{"output":[]}}}))
+            .unwrap();
+        expected += input as f64 * if index == 0 { 2.5 } else { 2.0 } / 1e6;
+        assert!(e.priced && e.observed_priced);
+        assert!((e.observed_cost - expected).abs() < 1e-12);
+        assert!((e.carry_cost - expected).abs() < 1e-12);
+        assert!((e.pi_cost - expected).abs() < 1e-12);
+        assert_eq!(e.savings, 0.0);
+        assert_eq!(e.counterfactual_cache_policy, "conditional_model_cache_v2");
+    }
+}
+
+#[test]
+fn cache_write188_native_report_unknown_mode_preserves_observed_ledger() {
+    let body = json!({"model":"gpt-6.1-sol",
+        "prompt_cache_options":{"mode":"unknown"},
+        "input":[{"role":"user", "content":"unknown contract ".repeat(1000)}]});
+    let input = prompt_projection(&body).unwrap().2;
+    let mut t = Trajectory::with_model("gpt-6.1-sol".into());
+    t.record(&json!({"event":"model_request","data":{"step":1,"request":body}}));
+    let e = t
+        .record(&json!({"event":"model_response","data":{"step":1,
+        "usage":{"input_tokens":input,"output_tokens":0,
+        "cached_input_tokens":0,"cache_write_input_tokens":0},"raw":{"output":[]}}}))
+        .unwrap();
+    assert!(e.observed_priced);
+    assert!((e.observed_cost - input as f64 * 2.0 / 1e6).abs() < 1e-12);
+    assert!(!e.priced);
+    assert_eq!(e.coverage.unknown_cache_requests, 1);
+}

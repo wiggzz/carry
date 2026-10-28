@@ -21,7 +21,7 @@ impl Default for Receipts {
             anchor: None,
             traditional_anchor: None,
             configuration: None,
-            scenario_cache_policy_version: Some(1),
+            scenario_cache_policy_version: Some(carry::models::ScenarioCachePolicy::VERSION),
             last_appended_input: None,
             legacy_estimate: None,
             epochs: 0,
@@ -260,9 +260,10 @@ impl Trajectory {
             self.failed_call();
             return;
         }
-        let policy_version = resolved.map_or(Some(1), |r| {
-            r.scenario_cache_policy.as_ref().map(|p| p.version)
-        });
+        let policy_version = resolved
+            .map_or(Some(carry::models::ScenarioCachePolicy::VERSION), |r| {
+                r.scenario_cache_policy.as_ref().map(|p| p.version)
+            });
         let previous_version = self
             .receipts
             .as_ref()
@@ -395,7 +396,10 @@ impl Trajectory {
                 )
             },
         );
-        if minimum.is_none() {
+        if minimum.is_none()
+            || request_cache_mode(body, model, resolved)
+                == carry::models::ScenarioCacheMode::Unknown
+        {
             self.result.coverage.unknown_cache_requests += 1;
         }
         let ttl = resolved
@@ -409,7 +413,8 @@ impl Trajectory {
         // cache behavior is a conditional append-prefix scenario even before
         // the first hypothetical edit. The first request of an epoch is cold.
         let traditional_cost = {
-            scenario_input_cost_resolved(
+            scenario_request_input_cost_resolved(
+                body,
                 model,
                 traditional,
                 if warm {
