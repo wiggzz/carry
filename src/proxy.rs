@@ -3972,17 +3972,19 @@ mod tests {
 
     #[test]
     fn dashboard_plan_binds_filtering_to_selected_saved_candidate() {
-        let mut session = Session::default();
-        session.last_plan = json!({
-            "selected": true, "selected_candidate_id": "chosen", "selected_action": "projection",
-            "primary_estimated_tokens": 900, "primary_required_tokens": 1090,
-            "context_margin_percent": 10, "primary_output_reserve_tokens": 100,
-            "primary_output_reserve_basis": "configured_capacity_reserve",
-            "candidates": [
-                {"candidate_id":"other", "primary_retained_estimated_tokens":50, "primary_retained_required_tokens":155},
-                {"candidate_id":"chosen", "primary_retained_estimated_tokens":200, "primary_retained_required_tokens":320}
-            ]
-        });
+        let mut session = Session {
+            last_plan: json!({
+                "selected": true, "selected_candidate_id": "chosen", "selected_action": "projection",
+                "primary_estimated_tokens": 900, "primary_required_tokens": 1090,
+                "context_margin_percent": 10, "primary_output_reserve_tokens": 100,
+                "primary_output_reserve_basis": "configured_capacity_reserve",
+                "candidates": [
+                    {"candidate_id":"other", "primary_retained_estimated_tokens":50, "primary_retained_required_tokens":155},
+                    {"candidate_id":"chosen", "primary_retained_estimated_tokens":200, "primary_retained_required_tokens":320}
+                ]
+            }),
+            ..Session::default()
+        };
         let plan = dashboard_plan(&session);
         assert_eq!(
             plan["primary_retained_estimated_tokens"].as_f64(),
