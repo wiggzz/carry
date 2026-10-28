@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.15.0](https://github.com/wiggzz/carry/compare/v0.14.2...v0.15.0) (2026-10-28)
+
+
+### Features
+
+* **dashboard:** clarify context estimates and stabilize session rows ([#189](https://github.com/wiggzz/carry/issues/189)) ([f11f6ac](https://github.com/wiggzz/carry/commit/f11f6ac13008d7cb4b6cd50feeca5978360d70d5))
+
+
+### Bug Fixes
+
+* **bench:** drain model usage at task deadline ([#137](https://github.com/wiggzz/carry/issues/137)) ([7934187](https://github.com/wiggzz/carry/commit/793418703016657943f7c396ce5e2f8a6633d8f6))
+* **review:** clarify reconsiderable protection for immutable history ([#181](https://github.com/wiggzz/carry/issues/181)) ([0cfe451](https://github.com/wiggzz/carry/commit/0cfe4518370ec8aa6991dae49bbac70251ba5d00))
+
 ## [0.14.2](https://github.com/wiggzz/carry/compare/v0.14.1...v0.14.2) (2026-10-27)
 
 
