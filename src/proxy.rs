@@ -4017,13 +4017,10 @@ mod tests {
             "model_resolution":{"primary":{"ordinary":{"estimation_margin_percent":10,"output_reserve":999}}},
             "candidates":[{"candidate_id":"chosen","primary_retained_estimated_tokens":200}]});
         let legacy = dashboard_plan(&session);
-        assert_eq!(
-            legacy["primary_output_reserve_tokens"].as_f64(),
-            Some(100.0)
-        );
-        assert_eq!(
-            legacy["primary_retained_required_tokens"].as_f64(),
-            Some(320.0)
+        // Reconstructing the saved allowance introduces floating-point roundoff.
+        assert!((legacy["primary_output_reserve_tokens"].as_f64().unwrap() - 100.0).abs() < 1e-9);
+        assert!(
+            (legacy["primary_retained_required_tokens"].as_f64().unwrap() - 320.0).abs() < 1e-9
         );
         assert_eq!(
             legacy["primary_output_reserve_basis"],
