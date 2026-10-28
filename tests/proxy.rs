@@ -1074,7 +1074,7 @@ async fn dashboard_is_public_locally_and_reports_stats_without_conversation_cont
         200,
         "dashboard shell must be available in a browser"
     );
-    assert!(shell.text().await.unwrap().contains("Carry Proxy"));
+    assert!(shell.text().await.unwrap().contains("<h1>Carry</h1>"));
     let stats_url = format!("{url}/carry/dashboard/stats");
     assert_eq!(client.get(&stats_url).send().await.unwrap().status(), 200);
     for endpoint in ["/v1/models", "/carry/metrics"] {

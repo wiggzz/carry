@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, watch},
     time::Duration,
 };
 
@@ -184,7 +184,7 @@ fn persist_context_checkpoint(config: &RunConfig, state: &ContextState) -> Resul
 }
 
 pub enum Backend {
-    OpenAi(OpenAiClient),
+    OpenAi(Box<OpenAiClient>),
     Scripted {
         steps: VecDeque<Step>,
         emitted: usize,
@@ -493,7 +493,7 @@ fn cache_alive(activity: Option<Instant>, now: Instant) -> bool {
 
 impl Backend {
     pub fn openai(client: OpenAiClient) -> Self {
-        Self::OpenAi(client)
+        Self::OpenAi(Box::new(client))
     }
 
     fn configure_shell_timeout(&mut self, seconds: u64) {
@@ -596,8 +596,20 @@ impl Backend {
     }
 }
 
-pub async fn run(config: RunConfig, mut backend: Backend) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, None, None, None).await
+#[cfg(any(test, not(unix)))]
+pub async fn run(config: RunConfig, backend: Backend) -> Result<RunOutcome> {
+    run_with_shutdown(config, backend, watch::channel(false).1).await
+}
+
+pub async fn run_with_shutdown(
+    config: RunConfig,
+    mut backend: Backend,
+    shutdown: watch::Receiver<bool>,
+) -> Result<RunOutcome> {
+    if let Backend::OpenAi(client) = &mut backend {
+        client.set_shutdown(shutdown.clone());
+    }
+    run_loop(config, &mut backend, None, None, None, Some(shutdown)).await
 }
 
 pub async fn run_interactive(
@@ -605,7 +617,7 @@ pub async fn run_interactive(
     mut backend: Backend,
     input: mpsc::UnboundedReceiver<UserInput>,
 ) -> Result<RunOutcome> {
-    run_loop(config, &mut backend, Some(input), None, None).await
+    run_loop(config, &mut backend, Some(input), None, None, None).await
 }
 
 pub async fn run_interactive_with_events(
@@ -621,6 +633,7 @@ pub async fn run_interactive_with_events(
         Some(input),
         Some(events),
         initial_submission_id,
+        None,
     )
     .await
 }
@@ -631,6 +644,7 @@ async fn run_loop(
     mut input: Option<mpsc::UnboundedReceiver<UserInput>>,
     events: Option<broadcast::Sender<serde_json::Value>>,
     initial_submission_id: Option<String>,
+    shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<RunOutcome> {
     let run_started = Instant::now();
     backend.configure_shell_timeout(config.default_shell_timeout_secs);
@@ -734,6 +748,17 @@ async fn run_loop(
     let mut turn_step = 0;
     let mut protected_until_request = Vec::new();
     loop {
+        if shutdown.as_ref().is_some_and(|signal| *signal.borrow()) {
+            return finish_shutdown(
+                &config,
+                patch_baseline.as_deref(),
+                &context_state,
+                &metrics,
+                &mut logger,
+                run_started,
+            )
+            .await;
+        }
         if let Some(max_steps) = config.max_steps
             && turn_step >= max_steps
         {
@@ -848,6 +873,16 @@ async fn run_loop(
                 if !displayed_preview.is_empty() {
                     stream_output.finish();
                 }
+                if let Some(response) = error.downcast_ref::<crate::openai::InvalidModelResponse>()
+                {
+                    let usage = crate::openai::extract_usage(&response.raw);
+                    metrics.record(&usage, response.latency_ms, response.response_retries);
+                    logger.raw_event_silent("model_response", json!({
+                        "step": step_index, "raw": response.raw, "usage": usage,
+                        "latency_ms": response.latency_ms, "response_retries": response.response_retries,
+                        "action_valid": false
+                    }))?;
+                }
                 logger.raw_event(
                     "model_error",
                     json!({
@@ -861,6 +896,16 @@ async fn run_loop(
                         request_started.elapsed().as_millis()
                     ),
                 )?;
+                write_final_artifacts(
+                    &config,
+                    patch_baseline.as_deref(),
+                    false,
+                    None,
+                    &metrics,
+                    run_started.elapsed().as_millis() as u64,
+                )
+                .await?;
+                persist_context_checkpoint(&config, &context_state)?;
                 return Err(error);
             }
         };
@@ -890,6 +935,17 @@ async fn run_loop(
             ),
         )?;
 
+        if shutdown.as_ref().is_some_and(|signal| *signal.borrow()) {
+            return finish_shutdown(
+                &config,
+                patch_baseline.as_deref(),
+                &context_state,
+                &metrics,
+                &mut logger,
+                run_started,
+            )
+            .await;
+        }
         log_assistant_output_text(&mut logger, &reply.raw["output"], step_index)?;
 
         match reply.step.action.kind {
@@ -908,7 +964,7 @@ async fn run_loop(
                     json!({"step": step_index, "call_id": call_id, "command": command}),
                     &format!("  $ {command}"),
                 )?;
-                let result = execute_shell(
+                let result = execute_shell_with_shutdown(
                     &config.cwd,
                     &config.session_dir,
                     call_id,
@@ -918,6 +974,7 @@ async fn run_loop(
                         .action
                         .timeout_secs
                         .unwrap_or(config.default_shell_timeout_secs),
+                    shutdown.clone(),
                 )
                 .await?;
                 let output = function_call_output(&reply.function_call, &result)?;
@@ -1074,6 +1131,37 @@ async fn run_loop(
             }
         }
     }
+}
+
+async fn finish_shutdown(
+    config: &RunConfig,
+    patch_baseline: Option<&str>,
+    state: &ContextState,
+    metrics: &RunMetrics,
+    logger: &mut RunLogger,
+    started: Instant,
+) -> Result<RunOutcome> {
+    logger.raw_event(
+        "run_failed",
+        json!({"reason": "deadline_shutdown", "usage_recorded": metrics.usage}),
+        "  deadline reached; stopped without starting more work",
+    )?;
+    write_final_artifacts(
+        config,
+        patch_baseline,
+        false,
+        None,
+        metrics,
+        started.elapsed().as_millis() as u64,
+    )
+    .await?;
+    persist_context_checkpoint(config, state)?;
+    Ok(RunOutcome {
+        completed: false,
+        answer_streamed: false,
+        answer: None,
+        session_dir: config.session_dir.clone(),
+    })
 }
 
 fn drain_user_input(
@@ -1374,12 +1462,24 @@ fn current_executable() -> Result<PathBuf> {
         .context("failed to canonicalize the running carry executable")
 }
 
+#[cfg(test)]
 async fn execute_shell(
     cwd: &Path,
     run_dir: &Path,
     call_id: String,
     command: &str,
     timeout_secs: u64,
+) -> Result<ShellResult> {
+    execute_shell_with_shutdown(cwd, run_dir, call_id, command, timeout_secs, None).await
+}
+
+async fn execute_shell_with_shutdown(
+    cwd: &Path,
+    run_dir: &Path,
+    call_id: String,
+    command: &str,
+    timeout_secs: u64,
+    mut shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<ShellResult> {
     let started = Instant::now();
     let mut command_builder = Command::new("/bin/sh");
@@ -1408,15 +1508,29 @@ async fn execute_shell(
     let stdout_reader = tokio::spawn(read_shell_stream(stdout));
     let stderr_reader = tokio::spawn(read_shell_stream(stderr));
 
-    let status = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+    let status = tokio::select! {
+        biased;
+        _ = async {
+            if let Some(signal) = shutdown.as_mut() {
+                while !*signal.borrow() {
+                    if signal.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => None,
+        status = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()) => Some(status),
+    };
     let (exit_code, timed_out) = match status {
-        Ok(status) => (
+        Some(Ok(status)) => (
             status
                 .context("failed while waiting for shell command")?
                 .code(),
             false,
         ),
-        Err(_) => {
+        Some(Err(_)) | None => {
             terminate_shell_process_group(&mut child)?;
             (
                 child
