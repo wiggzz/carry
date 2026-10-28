@@ -50,6 +50,7 @@ pub struct OpenAiClient {
     connect_timeout: Duration,
     #[cfg(test)]
     auth_token_url: Option<String>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -111,7 +112,27 @@ pub struct ModelReply {
     pub raw: Value,
 }
 
+/// A received response remains metering evidence even when its action is invalid.
+#[derive(Debug)]
+pub struct InvalidModelResponse {
+    pub raw: Value,
+    pub latency_ms: u64,
+    pub response_retries: usize,
+    error: anyhow::Error,
+}
+
+impl std::fmt::Display for InvalidModelResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid model action: {:#}", self.error)
+    }
+}
+
+impl std::error::Error for InvalidModelResponse {}
+
 impl OpenAiClient {
+    pub fn set_shutdown(&mut self, shutdown: tokio::sync::watch::Receiver<bool>) {
+        self.shutdown = Some(shutdown);
+    }
     #[cfg(test)]
     fn new_with_auth(
         api_base: String,
@@ -191,6 +212,7 @@ impl OpenAiClient {
             default_shell_timeout_secs: 60,
             request_timeout,
             connect_timeout,
+            shutdown: None,
             #[cfg(test)]
             auth_token_url: None,
         })
@@ -311,6 +333,15 @@ impl OpenAiClient {
         let mut retry_wait = Duration::ZERO;
         let mut retry_stopped_reason = None;
         let raw = loop {
+            // Covers initial auth waits, retry backoff and subscription refresh.
+            // Never cancel an already sent response: its usage may still arrive.
+            if self
+                .shutdown
+                .as_ref()
+                .is_some_and(|signal| *signal.borrow())
+            {
+                bail!("deadline shutdown: no new Responses API attempt");
+            }
             let request = self
                 .http
                 .post(format!("{}/responses", self.api_base))
@@ -480,29 +511,38 @@ impl OpenAiClient {
             bail!("Responses API returned {status}: {raw}");
         };
 
-        let calls = function_calls(&raw);
-        if calls.len() != 1 {
-            let output_types = raw["output"]
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item["type"].as_str())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            bail!(
-                "Responses API returned {} function calls; expected exactly one; output types: {output_types:?}",
-                calls.len()
-            );
-        }
+        let parsed = (|| -> Result<_> {
+            let calls = function_calls(&raw);
+            if calls.len() != 1 {
+                let output_types = raw["output"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item["type"].as_str())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                bail!(
+                    "Responses API returned {} function calls; expected exactly one; output types: {output_types:?}",
+                    calls.len()
+                );
+            }
 
-        let function_call = calls[0].clone();
-        let step = Step::from_function_call(&function_call)?;
-        let output_items = raw["output"]
-            .as_array()
-            .context("Responses API response has no output array")?
-            .clone();
+            let function_call = calls[0].clone();
+            let step = Step::from_function_call(&function_call)?;
+            let output_items = raw["output"]
+                .as_array()
+                .context("Responses API response has no output array")?
+                .clone();
+            Ok((step, function_call, output_items))
+        })();
+        let (step, function_call, output_items) = parsed.map_err(|error| InvalidModelResponse {
+            raw: raw.clone(),
+            latency_ms: started.elapsed().as_millis() as u64,
+            response_retries: retries,
+            error,
+        })?;
 
         Ok(ModelReply {
             response_id: raw["id"].as_str().unwrap_or("unknown").to_owned(),
@@ -574,7 +614,7 @@ fn function_calls(raw: &Value) -> Vec<&Value> {
         .collect()
 }
 
-fn extract_usage(raw: &Value) -> Usage {
+pub(crate) fn extract_usage(raw: &Value) -> Usage {
     let usage = &raw["usage"];
     Usage {
         input_tokens: usage["input_tokens"].as_u64().unwrap_or_default(),
