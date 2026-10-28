@@ -2865,7 +2865,12 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                 return mock.Mock(returncode=0, stdout="")
 
             (root / "output" / "trace.jsonl").write_text(json.dumps({
-                "event": "model_response", "data": {"usage": {
+                "event": "model_request", "data": {"step": 1},
+            }) + "\n" + json.dumps({
+                "event": "model_response", "data": {"step": 1, "response_retries": 0,
+                    "raw": {"model": "gpt-5.6-luna", "usage": {"input_tokens": 100, "output_tokens": 20,
+                        "input_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 10}}},
+                    "usage": {
                     "input_tokens": 100, "cached_input_tokens": 40,
                     "cache_write_input_tokens": 10, "output_tokens": 20,
                     "reasoning_tokens": 5, "total_tokens": 120,
@@ -2918,7 +2923,8 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             self.assertEqual(record["response_retries"], 4)
             self.assertEqual(record["elapsed_seconds"], 2.5)
             self.assertEqual(record["usage"]["total_tokens"], 120)
-            self.assertEqual(record["estimated_cost_usd"], 0.000037)
+            self.assertIsNone(record["estimated_cost_usd"])
+            self.assertFalse(record["client_usage_complete"])
             progress = [json.loads(line.removeprefix("BENCHMARK_PROGRESS "))
                         for line in stdout.getvalue().splitlines()]
             self.assertEqual([event["state"] for event in progress], ["started", "completed"])

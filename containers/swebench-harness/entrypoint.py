@@ -5,8 +5,70 @@ import json
 import os
 import pathlib
 import shlex
+import signal
 import subprocess
 import sys
+import time
+
+
+def owned_descendants():
+    """Linux container process ownership, independent of shell process groups."""
+    parents = {}
+    for entry in pathlib.Path('/proc').iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
+            parents[int(entry.name)] = int(fields[1])
+        except FileNotFoundError:
+            continue
+    owned = {os.getpid()}
+    while True:
+        added = {pid for pid, parent in parents.items() if parent in owned} - owned
+        if not added:
+            return owned - {os.getpid()}
+        owned.update(added)
+
+
+def signal_if_alive(pid, sig):
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def quiesce_owned(exclude=None):
+    # Stop parents before terminating descendants so a writer cannot fork around
+    # cleanup. Carry itself is stopped by the caller during the response drain.
+    stopped = set()
+    while True:
+        owned = owned_descendants() - {exclude}
+        fresh = owned - stopped
+        if not fresh:
+            break
+        for pid in fresh:
+            signal_if_alive(pid, signal.SIGSTOP)
+        stopped.update(fresh)
+    for pid in stopped:
+        signal_if_alive(pid, signal.SIGKILL)
+
+
+def reap_owned():
+    deadline = time.monotonic() + 5
+    while True:
+        quiesce_owned()
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if not pid:
+                break
+        if not owned_descendants():
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError('owned agent descendants did not quiesce; refusing patch capture')
+        time.sleep(.01)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("command", choices=["run"])
@@ -209,16 +271,41 @@ with trace_path.open("w", encoding="utf-8") as trace:
             returncode = 124
     if returncode == 0:
         try:
-            result = subprocess.run(
-                command,
-                cwd=workspace,
-                env=agent_env,
-                stdout=trace,
-                stderr=subprocess.STDOUT,
-                check=False,
-                timeout=int(os.environ.get("AGENT_TIMEOUT_SECONDS", "1200")),
-            )
-            returncode = result.returncode
+            agent_timeout = int(os.environ.get("AGENT_TIMEOUT_SECONDS", "1200"))
+            if args.harness == 'carry':
+                import ctypes
+                # Adopt detached/double-forked tools after Carry exits, not PID 1.
+                libc = ctypes.CDLL(None, use_errno=True)
+                if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+                    raise OSError(ctypes.get_errno(), 'cannot establish agent process ownership')
+                grace = int(os.environ.get('AGENT_SHUTDOWN_GRACE_SECONDS', '25'))
+                if not 1 <= grace <= 30:
+                    raise ValueError('Carry shutdown grace must be between 1 and 30 seconds')
+                with subprocess.Popen(command, cwd=workspace, env=agent_env,
+                        stdout=trace, stderr=subprocess.STDOUT, start_new_session=True) as process:
+                    try:
+                        returncode = process.wait(timeout=agent_timeout)
+                    except subprocess.TimeoutExpired:
+                        signal_if_alive(process.pid, signal.SIGSTOP)
+                        quiesce_owned(exclude=process.pid)
+                        signal_if_alive(process.pid, signal.SIGUSR1)
+                        signal_if_alive(process.pid, signal.SIGCONT)
+                        try:
+                            process.wait(timeout=grace)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
+                        trace.write('\nagent timed out after response-only shutdown window\n')
+                        returncode = 124
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait(timeout=5)
+                        reap_owned()
+            else:
+                result = subprocess.run(command, cwd=workspace, env=agent_env,
+                    stdout=trace, stderr=subprocess.STDOUT, check=False, timeout=agent_timeout)
+                returncode = result.returncode
         except subprocess.TimeoutExpired:
             trace.write("\nagent timed out\n")
             returncode = 124
