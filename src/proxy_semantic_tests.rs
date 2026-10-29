@@ -682,6 +682,75 @@ fn explicit_review_cache_boundary_excludes_current_ledger_and_preserves_native_s
     );
 }
 #[test]
+fn mutable_review_facts_preserve_the_actual_implicit_or_explicit_write_prefix() {
+    for policy in [
+        ClassifierCachePolicy::Disabled,
+        ClassifierCachePolicy::OpenaiExplicit,
+    ] {
+        let mut config = reviewer_config();
+        config.classifier_cache_policy = policy;
+        let mut session = semantic_subject();
+        session
+            .apply_advice(
+                &session.groups(),
+                &json!({
+                    "protected":[],"removable":[],
+                    "memories":[{"source_ids":[2],"text":"Accepted quoted fact"}]
+                }),
+            )
+            .unwrap();
+        assert_eq!(session.memories.len(), 1);
+        let first = review_body(&config, &session);
+        let input = first["input"].as_array().unwrap();
+        let end = input
+            .iter()
+            .rposition(|item| item["role"] == "user")
+            .unwrap()
+            + 1;
+        assert_eq!(
+            input.len() - end,
+            2,
+            "both fact and ledger follow the stable endpoint"
+        );
+        assert!(input[end..].iter().all(|item| item["role"] == "assistant"));
+        for source in session.render_primary() {
+            assert!(
+                input.contains(&source),
+                "native source is never rewrapped for cache reuse"
+            );
+        }
+        let points = input
+            .iter()
+            .enumerate()
+            .filter_map(|(n, item)| {
+                item["content"]
+                    .as_array()
+                    .is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|block| block.get("prompt_cache_breakpoint").is_some())
+                    })
+                    .then_some(n + 1)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            points,
+            if matches!(policy, ClassifierCachePolicy::OpenaiExplicit) {
+                vec![end]
+            } else {
+                vec![]
+            }
+        );
+        session.memories[0].text = "Changed quoted fact".into();
+        session.review_feedback = json!({"changed":true});
+        let next = review_body(&config, &session);
+        let next_input = next["input"].as_array().unwrap();
+        assert_eq!(&input[..end], &next_input[..end]);
+        assert_ne!(&input[end..], &next_input[end..]);
+    }
+}
+
+#[test]
 fn removed_synchronous_compatibility_flag_is_rejected() {
     assert!(
         ProxyCli::try_parse_from(["carry proxy", "--background-reviews=false"]).is_err(),

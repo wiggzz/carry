@@ -119,6 +119,11 @@ fn reviewer_control_observations_once_and_restart() {
 }
 
 #[test]
+fn cache_observation_coverage_survives_http_restart_and_rendering() {
+    state_regression("cache_observation_coverage_survives_http_restart_and_rendering");
+}
+
+#[test]
 fn direction_changes_reject_held_advice_and_preserve_paid_receipt() {
     state_regression("direction_changes_reject_held_advice_and_preserve_paid_receipt");
 }

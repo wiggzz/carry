@@ -70,6 +70,109 @@ class ReviewRegressions(unittest.TestCase):
         self.assertEqual(proxy.advice()["opinions"].get("2"), "keep")
         self.assertIn("UNIQUE_LIVE_SOURCE", json.dumps(fixture.primaries[-1]["input"]))
 
+    def reviewer_prefix_capture(self, review=None):
+        fixture = self.fixture(review)
+        proxy = self.harness.proxy(fixture, ["--min-payback-percent", "100"])
+        history = [{"role": "user", "content": "Preserve the source prefix exactly."}]
+        for n in range(32):
+            history.extend([{"role": "assistant", "content": f"Source {n}: " + "evidence " * 32},
+                            {"role": "user", "content": f"Continue {n}."}])
+        for n in range(3):
+            self.assertEqual(proxy.send(history, instructions="Fixed task direction.")[0], 200)
+            history.extend([{"role": "assistant", "content": f"Appended outcome {n}."},
+                            {"role": "user", "content": f"Next operation {n}."}])
+        self.assertGreaterEqual(len(fixture.reviews), 2)
+        before, after = fixture.reviews[-2:]
+        self.assertGreater(len(before["input"]), 48)
+        # Only the final opinion ledger is mutable; every previously transmitted
+        # observation must survive byte-for-byte, including native wrappers.
+        stable = before["input"][:-1]
+        self.assertEqual(wire(after["input"][:len(stable)]), wire(stable))
+        self.assertEqual({k: v for k, v in before.items() if k != "input"},
+                         {k: v for k, v in after.items() if k != "input"})
+        events = [json.loads(line) for path in (proxy.state / "diagnostics").glob("*.jsonl")
+                  for line in path.read_text().splitlines()]
+        records = [e["data"] for e in events if e["event"] == "review_wire"]
+        self.evidence.update(reviews=fixture.reviews, wire_diagnostics=records)
+        return records
+
+    def test_reviewer_implicit_write_boundary_is_reusable_after_ledger_changes(self):
+        # Documented GPT-5.6+ implicit behavior: WRITE only the latest
+        # eligible message ending; LOOKUP up to 20 earlier eligible endings.
+        # This is a credential-free protocol simulator, not provider evidence.
+        cached_prefixes, hits = set(), []
+        def review(body, _n):
+            import hashlib
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+            from proxy_reviewer_cache_fixture import implicit_eligible_endings
+            base = {k: v for k, v in body.items() if k not in ("input", "stream")}
+            eligible = implicit_eligible_endings(body["input"])
+            def identity(end):
+                return hashlib.sha256(wire([base, body["input"][:end]])).hexdigest()
+            hit = any(identity(end) in cached_prefixes for end in eligible[-21:])
+            hits.append(hit)
+            cached_prefixes.add(identity(eligible[-1]))
+            response = advice_response({"protected": ledger(body)["eligible_group_ids"],
+                                        "removable": [], "memories": []})
+            response["usage"]["input_tokens"] = 6000
+            response["usage"]["input_tokens_details"]["cached_tokens"] = 4000 if hit else 0
+            return 200, response
+        self.reviewer_prefix_capture(review)
+        self.evidence["synthetic_implicit_hits"] = hits
+        self.assertFalse(hits[0], "first request must really start cold")
+        self.assertTrue(hits[-1],
+                        "unchanged observations must retain the actual implicit WRITE endpoint, not merely some earlier bytes")
+
+    def test_long_reviewer_prefix_is_exact_on_the_wire(self):
+        self.reviewer_prefix_capture()
+
+    def test_long_reviewer_stable_prefix_has_complete_diagnostic_identity(self):
+        records = self.reviewer_prefix_capture()
+        self.assertTrue(records[-1].get("prior_stable_prefix_equal"),
+                        "complete stable-prefix identity must not depend on the 48-item detail cap")
+        self.assertGreater(records[-1]["prior_stable_prefix_items"], 48)
+        self.assertGreater(records[-1]["prior_stable_prefix_bytes"], 1024)
+
+    def test_image_receipt_preserves_known_observed_cost(self):
+        fixture = self.fixture()
+        proxy = self.harness.proxy(fixture, ["--review-every-requests", "100"])
+        history = [{"role": "user", "content": [
+            {"type": "input_text", "text": "Read this synthetic image."},
+            {"type": "input_image", "image_url": "data:image/png;base64,TEST_ONLY_NOT_DECODED"}]}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        _, stats = proxy.request("GET", "/carry/dashboard/stats")
+        row = stats["sessions"][0]
+        self.evidence.update(stats=stats, saved=proxy.saved(), primaries=fixture.primaries)
+        estimate = row["cost_estimate"]
+        self.assertGreater(row["primary"]["cost_usd"], 0,
+                           "raw native ledger is independently priceable")
+        self.assertEqual(estimate["unavailable_primary_cost_calls"], 0,
+                         "unsupported comparison must not erase a valid observed image receipt")
+        self.assertAlmostEqual(estimate["observed_primary_cost"],
+                               row["primary"]["cost_usd"])
+
+    def test_unchanged_image_comparison_uses_receipt_input_and_survives_restart(self):
+        fixture = self.fixture()
+        options = ["--review-every-requests", "100"]
+        proxy = self.harness.proxy(fixture, options)
+        history = [{"role": "user", "content": [
+            {"type": "input_text", "text": "Read this synthetic image."},
+            {"type": "input_image", "image_url": "data:image/png;base64,TEST_ONLY_NOT_DECODED"}]}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        proxy.close()
+        proxy = self.harness.proxy(fixture, options)
+        self.assertEqual(proxy.send(history)[0], 200)
+        _, stats = proxy.request("GET", "/carry/dashboard/stats")
+        estimate = stats["sessions"][0]["cost_estimate"]
+        self.evidence.update(stats=stats, saved=proxy.saved(), primaries=fixture.primaries)
+        self.assertEqual(estimate["matched_primary_responses"], 2,
+                         "unchanged native image input has exact request-total receipt units")
+        self.assertEqual(estimate["unavailable_primary_cost_calls"], 0)
+        self.assertEqual(estimate["coverage"]["unmodeled_calls"], 0)
+        self.assertGreater(estimate["carry_cost"], 0)
+
     def test_state01_top_level_instructions_observed_as_data(self):
         self.instructions(True)
 
