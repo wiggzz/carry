@@ -523,6 +523,65 @@ fn cache_write191_unsupported_lifetime_preserves_known_money_in_both_receipt_lan
 }
 
 #[test]
+fn cache_write191_breakpoint_lifetimes_preserve_known_money_and_zero_write_cost() {
+    for reviewer in [false, true] {
+        let mut t = Trajectory::default();
+        let mut expected = 0.0;
+        for (index, (lifetimes, written)) in [
+            (vec!["30m"], 2000),
+            (vec!["12h"], 2000),
+            (vec!["30m", "12h"], 2000),
+            (vec!["12h"], 0),
+            (vec!["30m"], 2000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = json!({"model":"gpt-6.1-sol",
+                "prompt_cache_options":{"mode":"explicit","ttl":"30m"},
+                "input":[{"role":"user","content":lifetimes.iter().map(|ttl|
+                    json!({"type":"input_text","text":"prefix",
+                        "prompt_cache_breakpoint":{"mode":"explicit","ttl":ttl}})
+                ).collect::<Vec<_>>()}]});
+            let usage = terminal(2000, 0, written, 10);
+            if reviewer {
+                t.reviewer(&request, &usage, true);
+            } else {
+                t.primary(&request, &usage, "fixture", 100 + index as u64, true);
+            }
+            if !lifetimes.contains(&"12h") || written == 0 {
+                expected += (2000.0 * if written == 0 { 2.0 } else { 2.5 } + 100.0) / 1e6;
+            }
+            let snapshot = t.snapshot();
+            let (known, unavailable) = if reviewer {
+                (
+                    snapshot.observed_reviewer_cost,
+                    snapshot.unavailable_reviewer_cost_calls,
+                )
+            } else {
+                (
+                    snapshot.observed_primary_cost,
+                    snapshot.unavailable_primary_cost_calls,
+                )
+            };
+            assert!(
+                (known - expected).abs() < 1e-12,
+                "CACHE_WRITE_191_BREAKPOINT: unsupported overrides/mixed lifetimes are not 30m writes"
+            );
+            assert_eq!(unavailable, (index as u64).min(2));
+            t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+        }
+    }
+    let schema_data = json!({"input":[{"type":"function_call_output","output":{
+        "prompt_cache_breakpoint":{"ttl":"12h"}}}],
+        "tools":[{"parameters":{"properties":{"prompt_cache_breakpoint":{"ttl":"12h"}}}}]});
+    assert!(
+        carry::models::cache_write_tariff_known(&schema_data),
+        "ordinary schema/tool payload fields are not breakpoint metadata"
+    );
+}
+
+#[test]
 fn cache_write188_unknown_mode_ttl_or_explicit_extent_keeps_actual_money() {
     for options in [
         json!({"mode":"unknown"}),

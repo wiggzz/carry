@@ -155,6 +155,54 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertIsNone(estimate["savings"])
             proxy.close()
 
+    def test_breakpoint_override_and_mixed_lifetimes_keep_money_unknown_across_restart(self):
+        cases = [(["30m"], 2000), (["12h"], 2000),
+                 (["30m", "12h"], 2000), (["12h"], 0), (["30m"], 2000)]
+        def primary(body, n):
+            lifetimes, written = cases[n-1]
+            self.assertEqual(body["prompt_cache_options"], {"mode": "explicit", "ttl": "30m"})
+            self.assertEqual([b["prompt_cache_breakpoint"]["ttl"]
+                              for b in body["input"][-1]["content"]], lifetimes)
+            long_written = written // len(lifetimes) if "12h" in lifetimes else 0
+            response = support.completed(response_id=f"breakpoint-ttl-{n}")
+            response["usage"] = {"input_tokens": 2000, "output_tokens": 10,
+                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": written,
+                    "cache_write_tokens_details": {"ttl_30m_tokens": written-long_written,
+                                                    "ttl_12h_tokens": long_written}}}
+            return 200, response
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("off mode reviewed"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+        history, snapshots, expected = [], [], 0.0
+        for index, (lifetimes, written) in enumerate(cases):
+            proxy = support.Proxy(self.harness.state, fixture, mode="off")
+            self.harness.stack.callback(proxy.close)
+            history.append({"role": "user", "content": [
+                {"type": "input_text", "text": f"breakpoint {index}",
+                 "prompt_cache_breakpoint": {"mode": "explicit", "ttl": ttl}}
+                for ttl in lifetimes]})
+            self.assertEqual(proxy.send(history, model="gpt-6.1-sol",
+                prompt_cache_options={"mode": "explicit", "ttl": "30m"})[0], 200)
+            saved = proxy.saved()
+            estimate = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
+            # Earlier unsupported breakpoints remain applicable in growing history.
+            if index == 0 or not written:
+                expected += (2000 * (2.5 if written else 2) + 100) / 1e6
+            unknown = sum(bool(w) and n > 0 for n, (_, w) in enumerate(cases[:index+1]))
+            snapshots.append({"saved": saved, "estimate": estimate, "known": expected})
+            self.evidence.update(snapshots=snapshots, primaries=fixture.primaries)
+            self.assertEqual(fixture.primaries[-1]["input"], history)
+            self.assertEqual(saved["primary"]["calls"], index+1)
+            self.assertEqual(saved["primary"]["input_tokens"], (index+1)*2000)
+            self.assertEqual(saved["primary"]["cached_tokens"], 0)
+            self.assertEqual(saved["primary"]["cache_write_tokens"], sum(w for _, w in cases[:index+1]))
+            self.assertEqual(saved["primary"]["unavailable_cost_calls"], unknown)
+            self.assertAlmostEqual(saved["primary"]["cost_usd"], expected, places=12)
+            self.assertEqual(estimate["unavailable_primary_cost_calls"], unknown)
+            self.assertAlmostEqual(estimate["observed_primary_cost"], expected, places=12)
+            self.assertIsNone(estimate["traditional_cost"])
+            self.assertIsNone(estimate["savings"])
+            proxy.close()
+
     def test_branch_specific_summary_tiers_and_cache_survive_restart(self):
         # The actual full input stays large; only the hypothetical branch summarizes.
         # Staging changes this owned fixture's threshold, never production state.

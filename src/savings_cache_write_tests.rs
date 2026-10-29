@@ -146,6 +146,45 @@ fn cache_write191_native_unsupported_lifetime_is_not_observed_30m_cost() {
     }
 }
 
+#[test]
+fn cache_write191_native_breakpoint_override_and_mixed_lifetimes_stay_unknown() {
+    let mut t = Trajectory::with_model("gpt-6.1-sol".into());
+    let mut expected = 0.0;
+    for (index, (lifetimes, writes)) in [
+        (vec!["30m"], true),
+        (vec!["12h"], true),
+        (vec!["30m", "12h"], true),
+        (vec!["12h"], false),
+        (vec!["30m"], true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body = json!({"model":"gpt-6.1-sol",
+            "prompt_cache_options":{"mode":"explicit","ttl":"30m"},
+            "input":[{"role":"user","content":lifetimes.iter().map(|ttl|
+                json!({"type":"input_text","text":"prefix ".repeat(2000),
+                    "prompt_cache_breakpoint":{"mode":"explicit","ttl":ttl}})
+            ).collect::<Vec<_>>()}]});
+        let input = prompt_projection(&body).unwrap().2;
+        let written = if writes { input } else { 0 };
+        t.record(&json!({"event":"model_request","data":{"step":index,"request":body}}));
+        let e = t
+            .record(&json!({"event":"model_response","data":{"step":index,
+            "usage":{"input_tokens":input,"cached_input_tokens":0,
+                "cache_write_input_tokens":written,"output_tokens":0},"raw":{"output":[]}}}))
+            .unwrap();
+        if !lifetimes.contains(&"12h") || !writes {
+            expected += input as f64 * if writes { 2.5 } else { 2.0 } / 1e6;
+        }
+        assert!(
+            (e.observed_cost - expected).abs() < 1e-12,
+            "CACHE_WRITE_191_NATIVE_BREAKPOINT: unsupported override writes remain unknown"
+        );
+        assert_eq!(e.coverage.unpriced_responses, index.min(2));
+    }
+}
+
 // Acceptance controls for mode changes and unsupported request metadata.
 #[test]
 fn cache_write188_native_report_mode_switch_never_reuses_disabled_cache() {
