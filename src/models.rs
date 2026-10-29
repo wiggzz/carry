@@ -404,17 +404,28 @@ pub fn cache_write_tariff_known(body: &Value) -> bool {
         && body
             .get("prompt_cache_options")
             .is_none_or(supported_lifetime)
-        // Breakpoints can override the request default on input items or their
-        // content blocks. Do not descend into tool results or schema payloads:
-        // lookalike data there is not request cache metadata. Native usage does
-        // not partition writes by lifetime, so any unsupported lifetime makes a
-        // nonzero write cost unknown (including mixed-lifetime requests).
+        // Breakpoints override the request default on input items, content blocks,
+        // and typed tool-output blocks. Do not recursively interpret arbitrary
+        // tool-result JSON or schemas as metadata. Native usage does not partition
+        // writes by lifetime, so any unsupported lifetime makes a nonzero write
+        // cost unknown (including mixed-lifetime requests).
         && body["input"].as_array().is_none_or(|items| {
             items.iter().all(|item| {
                 supported_breakpoint(item)
                     && item["content"]
                         .as_array()
                         .is_none_or(|blocks| blocks.iter().all(supported_breakpoint))
+                    && (!matches!(
+                        item["type"].as_str(),
+                        Some("function_call_output" | "custom_tool_call_output")
+                    ) || item["output"].as_array().is_none_or(|blocks| {
+                        blocks.iter().all(|block| {
+                            !matches!(
+                                block["type"].as_str(),
+                                Some("input_text" | "input_image" | "input_file")
+                            ) || supported_breakpoint(block)
+                        })
+                    }))
             })
         })
 }

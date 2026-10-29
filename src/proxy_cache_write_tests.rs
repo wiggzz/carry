@@ -661,6 +661,29 @@ fn cache_write191_typed_tool_output_lifetimes_preserve_both_roles_and_restart() 
             t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
         }
     }
+    // Both Responses tool-output item kinds accept the same typed content union.
+    for output_type in ["function_call_output", "custom_tool_call_output"] {
+        for block_type in ["input_text", "input_image", "input_file"] {
+            for (breakpoint, known) in [
+                (json!({"mode":"explicit"}), true),
+                (json!({"mode":"explicit","ttl":"30m"}), true),
+                (json!({"mode":"explicit","ttl":"12h"}), false),
+                (json!({"mode":"explicit","ttl":null}), false),
+                (json!(null), false),
+            ] {
+                let request = json!({"input":[{"type":output_type,"output":[{
+                    "type":block_type,"prompt_cache_breakpoint":breakpoint}]}]});
+                assert_eq!(
+                    carry::models::cache_write_tariff_known(&request),
+                    known,
+                    "{output_type}/{block_type} breakpoint {breakpoint}"
+                );
+            }
+        }
+    }
+    let unrelated_output = json!({"input":[{"type":"application_json","output":[{
+        "type":"input_text","prompt_cache_breakpoint":{"ttl":"12h"}}]}]});
+    assert!(carry::models::cache_write_tariff_known(&unrelated_output));
     for payload in [
         json!({"prompt_cache_breakpoint":{"ttl":"12h"}}),
         json!([{"type":"application_json","prompt_cache_breakpoint":{"ttl":"12h"}}]),
