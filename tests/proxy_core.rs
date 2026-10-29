@@ -127,6 +127,104 @@ fn missing_or_invalid_cache_partition_never_makes_a_cost_claim() {
     assert_eq!(input_cost(100.0, 50.0, 2.0, 0.1), 105.0);
 }
 
+#[test]
+fn cache_observation_is_independent_of_price_and_missing_is_not_zero() {
+    let mut ledger = UsageLedger::default();
+    ledger.observe_with_rates(
+        "unknown",
+        &json!({"input_tokens":2000,"output_tokens":0,
+        "input_tokens_details":{}}),
+        true,
+        None,
+    );
+    assert_eq!(
+        serde_json::to_value(&ledger).unwrap()["cache_observation"],
+        json!({"calls":0,"input_tokens":0,"cached_tokens":0})
+    );
+    ledger.observe_with_rates(
+        "unknown",
+        &json!({"input_tokens":2000,"output_tokens":0,
+        "input_tokens_details":{"cached_tokens":0}}),
+        true,
+        None,
+    );
+    ledger.observe_with_rates(
+        "unknown",
+        &json!({"input_tokens":2000,"output_tokens":0,
+        "input_tokens_details":{"cached_tokens":500}}),
+        true,
+        None,
+    );
+    for usage in [
+        json!({"input_tokens":10,"input_tokens_details":{"cached_tokens":11}}),
+        json!({"input_tokens_details":{"cached_tokens":0}}),
+        json!({"input_tokens":10,"input_tokens_details":{"cached_tokens":null}}),
+    ] {
+        ledger.observe_with_rates("unknown", &usage, true, None);
+    }
+    assert_eq!(
+        serde_json::to_value(&ledger).unwrap()["cache_observation"],
+        json!({"calls":2,"input_tokens":4000,"cached_tokens":500})
+    );
+    assert_eq!(ledger.calls, 6);
+    assert_eq!(ledger.unavailable_cost_calls, 6);
+    assert_eq!(ledger.cost_usd, 0.0);
+}
+
+#[test]
+fn legacy_usage_retains_money_without_inventing_cache_observations() {
+    let mut ledger = UsageLedger::default();
+    ledger.observe(
+        "gpt-6-luna",
+        &json!({"input_tokens":2000,"output_tokens":0,
+        "input_tokens_details":{"cached_tokens":500}}),
+        true,
+    );
+    let mut legacy = serde_json::to_value(&ledger).unwrap();
+    legacy.as_object_mut().unwrap().remove("cache_observation");
+    let mut restored: UsageLedger = serde_json::from_value(legacy).unwrap();
+    assert_eq!(restored.cost_usd, ledger.cost_usd);
+    assert_eq!(restored.cached_tokens, ledger.cached_tokens);
+    assert_eq!(
+        serde_json::to_value(&restored).unwrap()["cache_observation"],
+        json!({"calls":0,"input_tokens":0,"cached_tokens":0})
+    );
+    restored.observe(
+        "gpt-6-luna",
+        &json!({"input_tokens":2000,"output_tokens":0,
+        "input_tokens_details":{"cached_tokens":0}}),
+        true,
+    );
+    let round_trip: UsageLedger =
+        serde_json::from_value(serde_json::to_value(&restored).unwrap()).unwrap();
+    assert_eq!(round_trip.calls, 2);
+    assert_eq!(round_trip.cached_tokens, 500);
+    assert_eq!(
+        serde_json::to_value(&round_trip).unwrap()["cache_observation"],
+        json!({"calls":1,"input_tokens":2000,"cached_tokens":0})
+    );
+    assert_eq!(round_trip.cost_usd, restored.cost_usd);
+}
+
+#[test]
+fn cache_observation_overflow_preserves_its_known_subtotal() {
+    let mut ledger = UsageLedger::default();
+    let usage = json!({"input_tokens":u64::MAX,"output_tokens":0,
+        "input_tokens_details":{"cached_tokens":u64::MAX}});
+    ledger.observe_with_rates("unknown", &usage, true, None);
+    let before = serde_json::to_value(&ledger).unwrap()["cache_observation"].clone();
+    ledger.observe_with_rates("unknown", &usage, true, None);
+    assert_eq!(
+        serde_json::to_value(&ledger).unwrap()["cache_observation"],
+        before
+    );
+    assert_eq!(
+        before,
+        json!({"calls":1,"input_tokens":u64::MAX,"cached_tokens":u64::MAX})
+    );
+    assert_eq!(ledger.calls, 2);
+}
+
 // These extreme receipts are structurally valid, not a realistic token volume.
 // Exercise observe itself: arithmetic-only witnesses cannot catch partial writes.
 fn assert_usage_aggregate_overflow_is_censored(first: [u64; 4], next: [u64; 4], known_cost: f64) {

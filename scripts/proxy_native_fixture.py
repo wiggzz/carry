@@ -5,6 +5,7 @@ This is credential-free protocol evidence, never live model/quality/usage eviden
 Only CI installs the clients; this script never installs anything.
 """
 import argparse
+import errno
 import hashlib
 import http.server
 import json
@@ -51,7 +52,14 @@ class ClientObserver:
                                     if source is self.request and pending:
                                         raise ValueError('incomplete observed HTTP request')
                                     peers.remove(source)
-                                    destination.shutdown(socket.SHUT_WR)
+                                    try:
+                                        destination.shutdown(socket.SHUT_WR)
+                                    except OSError as error:
+                                        # A fully closed peer has no write half left.
+                                        # Keep draining the other direction; malformed
+                                        # requests and all other transport errors fail.
+                                        if error.errno != errno.ENOTCONN:
+                                            raise
                                     continue
                                 if source is self.request:
                                     pending += data

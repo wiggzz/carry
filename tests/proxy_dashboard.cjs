@@ -289,7 +289,8 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   delete noFilter.compactions;
   await vm.runInContext('refresh()', sandbox);
   assert.doesNotMatch(byClass(firstSession(), 'diagnostics')?.textContent || '', /no filtering recorded/i, 'unknown filtering activity cannot be asserted to be zero');
-  Object.assign(noFilter.shadow, {input_tokens: 10000, cached_tokens: 0});
+  Object.assign(noFilter.shadow, {calls:1, input_tokens: 10000, cached_tokens: 0,
+    cache_observation:{calls:1,input_tokens:10000,cached_tokens:0}});
   data.reviewer_cache_mode = 'codex-implicit';
   await vm.runInContext('refresh()', sandbox);
   const reviewerUsage = elements.get('usage').children[1];
@@ -297,8 +298,28 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.match(reviewerUsage.children[3].title || '', /zero.*not.*implicit cach.*disabled/i);
   assert.match(elements.get('config').textContent, /Reviewer cache mode \(configuration\): codex-implicit/);
   noFilter.shadow.cached_tokens = null;
+  noFilter.shadow.cache_observation = {calls:0,input_tokens:0,cached_tokens:0};
   await vm.runInContext('refresh()', sandbox);
   assert.equal(elements.get('usage').children[1].children[3].textContent, 'Unavailable', 'missing cache usage must not masquerade as provider-reported zero');
+  // Legacy numeric zeros have no observation coverage. A priced cost, or an
+  // unavailable cost for another reason, cannot establish cache completeness.
+  Object.assign(noFilter.shadow,{calls:2,input_tokens:20000,cached_tokens:700,cost_usd:1,
+    unavailable_cost_calls:0,cache_observation:{calls:1,input_tokens:10000,cached_tokens:500}});
+  await vm.runInContext('refresh()', sandbox);
+  assert.equal(elements.get('usage').children[1].children[3].textContent,
+    '500 (known subtotal; 1 of 2 calls)');
+  assert.equal(elements.get('usage').children[1].children[4].textContent,'—',
+    'partial known cached usage cannot produce an overall percentage');
+  delete noFilter.shadow.cache_observation;
+  await vm.runInContext('refresh()', sandbox);
+  assert.equal(elements.get('usage').children[1].children[3].textContent,'Unavailable',
+    'legacy totals cannot retroactively establish provider observations');
+  noFilter.shadow.cache_observation={calls:2,input_tokens:20000,cached_tokens:500};
+  noFilter.shadow.unavailable_cost_calls=2;
+  await vm.runInContext('refresh()', sandbox);
+  assert.equal(elements.get('usage').children[1].children[3].textContent,'500 (provider-reported)');
+  assert.equal(elements.get('usage').children[1].children[4].textContent,'2.5%',
+    'unknown monetary tariffs do not erase independently measured cache usage');
   // Activity is independent of completed accounting. Exercise actual rendering
   // for both pending producers, losses, valid zero and genuinely unavailable.
   for (const pending of ['processing', 'background_review_pending']) {

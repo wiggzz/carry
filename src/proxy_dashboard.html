@@ -219,9 +219,13 @@ async function refresh(){
    ['Calls excluded from comparison',unpricedText(estimate)]
   ].map(([label,value])=>card(label,value)));
   $('usage').replaceChildren(...[['Primary',primary],['Reviewer',shadow]].map(([name,ledgers])=>{
-   const input=sum(ledgers,'input_tokens'),cached=ledgers.some(l=>l.cached_tokens!=null)?sum(ledgers,'cached_tokens'):null,missing=sum(ledgers,'unavailable_cost_calls');
-   const usage=row([name,fmt(sum(ledgers,'calls')),fmt(input),cached==null?'Unavailable':fmt(cached)+' (provider-reported)',input&&cached!=null?(100*cached/input).toFixed(1)+'%':'—',fmt(sum(ledgers,'cache_write_tokens')),fmt(sum(ledgers,'output_tokens')),missing?'Known subtotal '+money(pricedSubtotal(ledgers))+' · total unavailable':money(pricedSubtotal(ledgers)),fmt(missing)]);
-   usage.children[3].title='Provider-reported cache usage. Zero reads do not mean implicit caching is disabled; the cause of a cache miss is not reported.';
+   const calls=sum(ledgers,'calls'),input=sum(ledgers,'input_tokens'),missing=sum(ledgers,'unavailable_cost_calls');
+   const observations=ledgers.map(l=>l.cache_observation||{}),observed=sum(observations,'calls');
+   const cached=observed?sum(observations,'cached_tokens'):null,observedInput=sum(observations,'input_tokens');
+   const complete=observed>0&&observed===calls&&!data.unavailable_sessions;
+   const cacheText=cached==null?'Unavailable':fmt(cached)+(complete?' (provider-reported)':' (known subtotal; '+fmt(observed)+' of '+fmt(calls)+' calls)');
+   const usage=row([name,fmt(calls),fmt(input),cacheText,complete&&observedInput?(100*cached/observedInput).toFixed(1)+'%':'—',fmt(sum(ledgers,'cache_write_tokens')),fmt(sum(ledgers,'output_tokens')),missing?'Known subtotal '+money(pricedSubtotal(ledgers))+' · total unavailable':money(pricedSubtotal(ledgers)),fmt(missing)]);
+   usage.children[3].title='Provider-reported cache usage from calls with valid input/cache observations. Missing or legacy coverage leaves only a known subtotal and no overall percentage. Zero reads do not mean implicit caching is disabled; the cause of a cache miss is not reported.';
    return usage;
   }));
   const sorted=[...sessions].sort((a,b)=>a.id.localeCompare(b.id));
