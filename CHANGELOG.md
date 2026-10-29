@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.15.1](https://github.com/wiggzz/carry/compare/v0.15.0...v0.15.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* **accounting:** compose cache lifetime and receipt coverage repairs ([ddcb61d](https://github.com/wiggzz/carry/commit/ddcb61dc647f54cb645594707ca4d4ebe43b11f9))
+* **cache:** honor typed tool-output breakpoint lifetimes ([e60010b](https://github.com/wiggzz/carry/commit/e60010b6e04fb5aaf827d618f6430f4743eabe55))
+* **cache:** preserve unknown write tariffs and semantic reuse ([eac7338](https://github.com/wiggzz/carry/commit/eac7338b0f7c9685570864c95a7892aa089a575b))
+* **cache:** respect input breakpoint write lifetimes ([ba74a8c](https://github.com/wiggzz/carry/commit/ba74a8cf410dfe1e3431b5baf6b58b798b9b6b73))
+* **proxy:** compose cache lifetime, reviewer boundary and receipt coverage repairs ([#192](https://github.com/wiggzz/carry/issues/192)) ([f0a0cac](https://github.com/wiggzz/carry/commit/f0a0caca009655cb0dcdb6c344f5250cc72a9802))
+* **proxy:** preserve native cache observation coverage ([970e386](https://github.com/wiggzz/carry/commit/970e3867c605fc5949c985cd425e956ae269c40d))
+* **proxy:** preserve reviewer cache boundary and image receipt costs ([d73d72f](https://github.com/wiggzz/carry/commit/d73d72fd390f71b858779545f588aedb84f2f3d3))
+* **savings:** model declared cache population prospectively ([#191](https://github.com/wiggzz/carry/issues/191)) ([fd29354](https://github.com/wiggzz/carry/commit/fd293547416818edd90a9667c31bd05498889569))
+
 ## [0.15.0](https://github.com/wiggzz/carry/compare/v0.14.2...v0.15.0) (2026-10-28)
 
 
