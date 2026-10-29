@@ -345,6 +345,54 @@ class StateRegressions(unittest.TestCase):
         if not available:
             self.assertIsNone(estimate["savings_percent"], message)
 
+    def test_cache_observation_coverage_survives_http_restart_and_rendering(self):
+        cases = [('missing', None), ('zero', 0), ('hit', 500)]
+        for name, cached in cases:
+            with self.subTest(case=name):
+                state = self.state / name
+                state.mkdir()
+                usage = {'input_tokens': 2000, 'output_tokens': 0,
+                         'input_tokens_details': {}}
+                if cached is not None:
+                    usage['input_tokens_details']['cached_tokens'] = cached
+                def primary(_body, _n):
+                    response = completed()
+                    response['usage'] = usage
+                    return 200, response
+                fixture = self.fixture(primary)
+                history = [{'role': 'user', 'content': 'cache coverage fixture'}]
+                expected = {'calls': int(cached is not None),
+                            'input_tokens': 2000 if cached is not None else 0,
+                            'cached_tokens': cached or 0}
+                proxy = Proxy(state, fixture, mode='off')
+                self.stack.callback(proxy.close)
+                self.assertEqual(proxy.send(history)[0], 200)
+                before = proxy.saved()
+                for restarted in (False, True):
+                    if restarted:
+                        proxy.close()
+                        proxy = Proxy(state, fixture, mode='off')
+                        self.stack.callback(proxy.close)
+                    status, stats = proxy.request('GET', '/carry/dashboard/stats')
+                    self.assertEqual(status, 200)
+                    lane = stats['sessions'][0]['primary']
+                    self.assertEqual(lane.get('cache_observation'), expected,
+                                     'missing cached usage must retain explicit observation coverage')
+                    self.assertEqual(lane['calls'], 1)
+                    self.assertEqual(lane['unavailable_cost_calls'], int(cached is None))
+                    self.assertEqual(lane['cost_usd'], before['primary']['cost_usd'])
+                    path = self.state / f'{name}-dashboard-fixture.json'
+                    path.write_text(json.dumps(stats))
+                    label = 'Unavailable' if cached is None else f'{cached:,} (provider-reported)'
+                    percent = '\u2014' if cached is None else f'{100 * cached / 2000:.1f}%'
+                    env = dict(os.environ, CARRY_DASHBOARD_STATS_FIXTURE=str(path),
+                               CARRY_DASHBOARD_CACHE_EXPECT=json.dumps([label, percent]))
+                    result = subprocess.run(['node', 'tests/proxy_dashboard.cjs'], env=env,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.evidence[name] = {'primary': lane, 'restarted': True}
+                proxy.close()
+
     def test_accounting_basis_matches_current_and_retained_legacy_policy(self):
         fixture = self.fixture(lambda _body, _n: (200, completed()))
         proxy = self.proxy(fixture)

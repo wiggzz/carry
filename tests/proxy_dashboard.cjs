@@ -478,6 +478,11 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     data=JSON.parse(fs.readFileSync(process.env.CARRY_DASHBOARD_STATS_FIXTURE,'utf8'));
     await vm.runInContext('refresh()', sandbox);
     assert.ok(!elements.get('status').textContent.includes('stale'), 'exact frozen producer shape renders without error');
+    if(process.env.CARRY_DASHBOARD_CACHE_EXPECT){
+      const [cached,percent]=JSON.parse(process.env.CARRY_DASHBOARD_CACHE_EXPECT);
+      assert.equal(elements.get('usage').children[0].children[3].textContent,cached);
+      assert.equal(elements.get('usage').children[0].children[4].textContent,percent);
+    }
     const amount=n=>n==null?'Unavailable':'$'+Number(n).toFixed(6);
     assert.equal(cards().get('With Carry'),amount(data.cost_estimate.carry_cost));
     assert.equal(cards().get('Traditional'),amount(data.cost_estimate.traditional_cost));
