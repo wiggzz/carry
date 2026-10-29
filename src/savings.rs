@@ -1,6 +1,7 @@
 //! Conditional frozen-trajectory scenario using local o200k_base token estimates.
 //! Provider usage remains a separate modeled ledger.
 use crate::openai::{Usage, estimated_cost_usd, prompt_cache_capabilities};
+use carry::models::{ScenarioCacheMode, ScenarioCachePolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -47,6 +48,7 @@ pub struct Coverage {
 
 #[derive(Clone, Default, Debug, Serialize)]
 pub struct Estimate {
+    pub counterfactual_cache_policy: String,
     pub savings: f64,
     pub observed_cost: f64,
     pub carry_cost: f64,
@@ -67,6 +69,8 @@ struct Prompt {
     route: String,
     input: u64,
     cached_at_ms: Option<u64>,
+    cache_mode: ScenarioCacheMode,
+    write_tariff_known: bool,
 }
 
 pub struct Trajectory {
@@ -131,6 +135,8 @@ impl Trajectory {
     }
     pub fn snapshot(&self) -> Estimate {
         let mut e = self.result.clone();
+        e.counterfactual_cache_policy =
+            format!("conditional_model_cache_v{}", ScenarioCachePolicy::VERSION);
         e.coverage.unmatched_requests += usize::from(self.pending_request);
         e.observed_priced = e.coverage.responses > 0
             && e.coverage.unpriced_responses == 0
@@ -242,7 +248,12 @@ impl Trajectory {
                     self.result.coverage.missing_projection += 1;
                 }
                 let model = self.pending.as_ref().map_or(&self.model, |p| &p.model);
-                if let Some(cost) = usage.as_ref().and_then(|u| estimated_cost_usd(model, u)) {
+                if let Some(cost) = usage.as_ref().and_then(|u| {
+                    (u.cache_write_input_tokens == 0
+                        || self.pending.as_ref().is_some_and(|p| p.write_tariff_known))
+                    .then(|| estimated_cost_usd(model, u))
+                    .flatten()
+                }) {
                     self.result.observed_cost += cost;
                 } else {
                     self.result.coverage.unpriced_responses += 1;
@@ -263,6 +274,7 @@ impl Trajectory {
                         p.model == prompt.model
                             && p.overhead == prompt.overhead
                             && p.route == prompt.route
+                            && p.cache_mode == prompt.cache_mode
                             && self
                                 .cache_ttl_ms
                                 .zip(p.cached_at_ms)
@@ -286,11 +298,25 @@ impl Trajectory {
                             0
                         };
                     let minimum = self.cache_minimum_for(&prompt.model);
-                    if minimum.is_none() {
+                    if minimum.is_none() || prompt.cache_mode == ScenarioCacheMode::Unknown {
                         self.result.coverage.unknown_cache_requests += 1;
                     }
-                    let carry = input_cost(&prompt.model, prompt.input, carry_cached, minimum);
-                    let pi = input_cost(&prompt.model, pi_input, pi_cached, minimum);
+                    let carry = scenario_input_cost_with_mode(
+                        &prompt.model,
+                        prompt.input,
+                        carry_cached,
+                        minimum,
+                        prompt.cache_mode,
+                        estimated_cost_usd,
+                    );
+                    let pi = scenario_input_cost_with_mode(
+                        &prompt.model,
+                        pi_input,
+                        pi_cached,
+                        minimum,
+                        prompt.cache_mode,
+                        estimated_cost_usd,
+                    );
                     if let (Some(carry), Some(pi), Some(carry_output), Some(pi_output)) =
                         (carry, pi, carry_output, pi_output)
                     {
@@ -354,6 +380,7 @@ impl Trajectory {
         Some(self.snapshot())
     }
 }
+#[cfg(test)]
 fn input_cost(model: &str, input: u64, cached: u64, minimum: Option<u64>) -> Option<f64> {
     scenario_input_cost(model, input, cached, minimum, estimated_cost_usd)
 }
@@ -363,7 +390,7 @@ pub(crate) fn scenario_output_cost(model: &str, input: u64, output: u64) -> Opti
     carry::models::Rates::for_model(model, input as f64).map(|rates| output as f64 * rates.output)
 }
 
-/// Shared cache eligibility math; each frontend retains its pricing policy.
+/// Legacy/default implicit policy; request-aware consumers use the mode owner.
 pub(crate) fn scenario_input_cost(
     model: &str,
     input: u64,
@@ -371,6 +398,33 @@ pub(crate) fn scenario_input_cost(
     minimum: Option<u64>,
     price: impl FnOnce(&str, &Usage) -> Option<f64>,
 ) -> Option<f64> {
+    scenario_input_cost_with_mode(
+        model,
+        input,
+        cached,
+        minimum,
+        ScenarioCacheMode::Implicit,
+        price,
+    )
+}
+
+/// Shared request-population and eligibility math, never native receipt pricing.
+pub(crate) fn scenario_input_cost_with_mode(
+    model: &str,
+    input: u64,
+    cached: u64,
+    minimum: Option<u64>,
+    mode: ScenarioCacheMode,
+    price: impl FnOnce(&str, &Usage) -> Option<f64>,
+) -> Option<f64> {
+    if mode == ScenarioCacheMode::Unknown {
+        return None;
+    }
+    let minimum = if mode == ScenarioCacheMode::Disabled {
+        None
+    } else {
+        minimum
+    };
     let eligible = minimum.is_some_and(|min| input >= min);
     let cached = if minimum.is_some_and(|min| cached >= min) {
         cached.min(input)
@@ -412,6 +466,8 @@ pub(crate) fn prompt_projection(body: &Value) -> Option<(String, String, u64)> {
 fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
     let request = &data["request"];
     let (prefix, overhead, input) = prompt_projection(request)?;
+    // Semantic policy is compared separately; equivalent default spellings do
+    // not change the real route/key or force an artificial cold request.
     let route=serde_json::to_string(&json!({"api_base":data["transport"].get("api_base"),"route":data.get("route"),"cache_key":request.get("prompt_cache_key")})).ok()?;
     Some(Prompt {
         model: request["model"].as_str().unwrap_or(fallback).to_owned(),
@@ -420,6 +476,9 @@ fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
         overhead,
         route,
         cached_at_ms: None,
+        write_tariff_known: carry::models::cache_write_tariff_known(request),
+        cache_mode: ScenarioCachePolicy::for_model(request["model"].as_str().unwrap_or(fallback))
+            .request_mode(request),
     })
 }
 
@@ -432,6 +491,7 @@ pub fn savings_percent(savings: f64, carry_cost: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("savings_cache_write_tests.rs");
     fn request(t: &mut Trajectory, units: u64) {
         t.record(&json!({"event":"model_request","data":{"step":1,"request":{"input":["a ".repeat(units as usize)],"tools":[]}}}));
     }

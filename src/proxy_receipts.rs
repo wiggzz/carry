@@ -21,7 +21,7 @@ impl Default for Receipts {
             anchor: None,
             traditional_anchor: None,
             configuration: None,
-            scenario_cache_policy_version: Some(1),
+            scenario_cache_policy_version: Some(carry::models::ScenarioCachePolicy::VERSION),
             last_appended_input: None,
             legacy_estimate: None,
             epochs: 0,
@@ -213,6 +213,7 @@ impl Trajectory {
         usage: &Value,
         standard: bool,
         resolved: Option<&ResolvedModel>,
+        write_tariff_known: bool,
     ) {
         self.result.coverage.reviewer_responses += 1;
         let native = receipt(usage);
@@ -227,7 +228,7 @@ impl Trajectory {
         let cost = native
             .as_ref()
             .filter(|_| text)
-            .and_then(|u| modeled_cost(model, u, resolved));
+            .and_then(|u| observed_cost(model, u, resolved, write_tariff_known));
         if let Some(cost) = cost {
             self.result.observed_reviewer_cost += cost;
             self.result.reviewer_cost += cost;
@@ -260,31 +261,38 @@ impl Trajectory {
             self.failed_call();
             return;
         }
-        let policy_version = resolved.map_or(Some(1), |r| {
-            r.scenario_cache_policy.as_ref().map(|p| p.version)
-        });
-        let receipts = self.receipts.as_ref().unwrap();
-        if receipts.scenario_cache_policy_version.is_none() && policy_version.is_some() {
-            // One immutable pre-upgrade segment, not a replay or accounting reset.
-            // The next comparison starts cold under its newly frozen policy.
+        let policy_version = resolved
+            .map_or(Some(carry::models::ScenarioCachePolicy::VERSION), |r| {
+                r.scenario_cache_policy.as_ref().map(|p| p.version)
+            });
+        let previous_version = self
+            .receipts
+            .as_ref()
+            .unwrap()
+            .scenario_cache_policy_version;
+        if previous_version != policy_version {
+            // Freeze cumulative provenance before ANY version transition, not
+            // just missing -> present. Never replay, reset money or overwrite
+            // earlier boundaries. The next comparison starts cold.
             let prior = self.snapshot();
             if prior.coverage.primary_responses > 0 || prior.coverage.reviewer_responses > 0 {
-                self.result.legacy_cache_policy_segment = Some(CachePolicySegment {
-                    matched_primary_responses: prior.matched_primary_responses,
-                    carry_cost: prior.carry_cost,
-                    traditional_cost: prior.traditional_cost,
-                    reviewer_cost: prior.reviewer_cost,
-                    summary_cost: prior.summary_cost,
-                    traditional_compactions: prior.traditional_compactions,
-                    coverage: prior.coverage,
-                });
+                let cumulative = CachePolicySegment::from(&prior);
+                if previous_version.is_none()
+                    && policy_version.is_some()
+                    && self.result.legacy_cache_policy_segment.is_none()
+                    && self.result.cache_policy_boundaries.is_empty()
+                {
+                    self.result.legacy_cache_policy_segment = Some(cumulative.clone());
+                }
+                self.result
+                    .cache_policy_boundaries
+                    .push(CachePolicyBoundary {
+                        previous_version,
+                        next_version: policy_version,
+                        cumulative,
+                    });
             }
             self.reset_receipt_epoch();
-            self.receipts
-                .as_mut()
-                .unwrap()
-                .scenario_cache_policy_version = policy_version;
-        } else if self.result.coverage.primary_responses == 0 {
             self.receipts
                 .as_mut()
                 .unwrap()
@@ -304,10 +312,14 @@ impl Trajectory {
                         .as_u64()
                         .is_some_and(|n| n > 0)
                 });
-        let observed = native
-            .as_ref()
-            .filter(|_| text)
-            .and_then(|u| modeled_cost(model, u, resolved));
+        let observed = native.as_ref().filter(|_| text).and_then(|u| {
+            observed_cost(
+                model,
+                u,
+                resolved,
+                carry::models::cache_write_tariff_known(body),
+            )
+        });
         if let Some(cost) = observed {
             self.result.observed_primary_cost += cost;
         } else {
@@ -389,7 +401,10 @@ impl Trajectory {
                 )
             },
         );
-        if minimum.is_none() {
+        if minimum.is_none()
+            || request_cache_mode(body, model, resolved)
+                == carry::models::ScenarioCacheMode::Unknown
+        {
             self.result.coverage.unknown_cache_requests += 1;
         }
         let ttl = resolved
@@ -403,7 +418,8 @@ impl Trajectory {
         // cache behavior is a conditional append-prefix scenario even before
         // the first hypothetical edit. The first request of an epoch is cold.
         let traditional_cost = {
-            scenario_input_cost_resolved(
+            scenario_request_input_cost_resolved(
+                body,
                 model,
                 traditional,
                 if warm {

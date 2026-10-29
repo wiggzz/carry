@@ -379,10 +379,103 @@ pub struct ScenarioCachePolicy {
     pub minimum_prefix_tokens: Option<u64>,
     pub ttl_seconds: u64,
 }
+/// Request-level population contract, separate from eligibility and tariffs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScenarioCacheMode {
+    Implicit,
+    Disabled,
+    Unknown,
+}
+
+/// Whether this request's write lifetime has a supported tariff. This is not
+/// cache eligibility or transport entitlement: zero-write receipts remain priced
+/// even when the request's population/expiry contract is unknown.
+pub fn cache_write_tariff_known(body: &Value) -> bool {
+    fn supported_lifetime(options: &Value) -> bool {
+        options
+            .as_object()
+            .is_some_and(|options| options.get("ttl").is_none_or(|ttl| ttl == "30m"))
+    }
+    fn supported_breakpoint(item: &Value) -> bool {
+        item.get("prompt_cache_breakpoint")
+            .is_none_or(supported_lifetime)
+    }
+    body.get("prompt_cache_retention").is_none()
+        && body
+            .get("prompt_cache_options")
+            .is_none_or(supported_lifetime)
+        // Breakpoints override the request default on input items, content blocks,
+        // and typed tool-output blocks. Do not recursively interpret arbitrary
+        // tool-result JSON or schemas as metadata. Native usage does not partition
+        // writes by lifetime, so any unsupported lifetime makes a nonzero write
+        // cost unknown (including mixed-lifetime requests).
+        && body["input"].as_array().is_none_or(|items| {
+            items.iter().all(|item| {
+                supported_breakpoint(item)
+                    && item["content"]
+                        .as_array()
+                        .is_none_or(|blocks| blocks.iter().all(supported_breakpoint))
+                    && (!matches!(
+                        item["type"].as_str(),
+                        Some("function_call_output" | "custom_tool_call_output")
+                    ) || item["output"].as_array().is_none_or(|blocks| {
+                        blocks.iter().all(|block| {
+                            !matches!(
+                                block["type"].as_str(),
+                                Some("input_text" | "input_image" | "input_file")
+                            ) || supported_breakpoint(block)
+                        })
+                    }))
+            })
+        })
+}
+
 impl ScenarioCachePolicy {
+    pub const VERSION: u32 = 2;
+
+    /// The comparison is API-equivalent even on a subscription route; this
+    /// declares modeled billing, never transport support or observed activity.
+    pub fn request_mode(&self, body: &Value) -> ScenarioCacheMode {
+        if self.version < Self::VERSION {
+            return ScenarioCacheMode::Implicit;
+        }
+        fn has_breakpoint(value: &Value) -> bool {
+            match value {
+                Value::Object(fields) => {
+                    fields.contains_key("prompt_cache_breakpoint")
+                        || fields.values().any(has_breakpoint)
+                }
+                Value::Array(items) => items.iter().any(has_breakpoint),
+                _ => false,
+            }
+        }
+        if body.get("prompt_cache_retention").is_some() || has_breakpoint(&body["input"]) {
+            // Explicit extents and legacy retention settings are not priced by
+            // the whole-prompt, 30-minute conditional scenario.
+            return ScenarioCacheMode::Unknown;
+        }
+        let Some(options) = body.get("prompt_cache_options") else {
+            return ScenarioCacheMode::Implicit;
+        };
+        let Some(options) = options.as_object() else {
+            return ScenarioCacheMode::Unknown;
+        };
+        if options.get("ttl").is_some_and(|ttl| ttl != "30m") {
+            // Longer-lived writes and explicit-prefix extents need their own
+            // frozen tariff/partition model; never price them as free writes.
+            return ScenarioCacheMode::Unknown;
+        }
+        match options.get("mode").and_then(Value::as_str) {
+            None if !options.contains_key("mode") => ScenarioCacheMode::Implicit,
+            Some("implicit") => ScenarioCacheMode::Implicit,
+            Some("explicit") => ScenarioCacheMode::Disabled,
+            _ => ScenarioCacheMode::Unknown,
+        }
+    }
+
     pub fn for_model(model: &str) -> Self {
         Self {
-            version: 1,
+            version: Self::VERSION,
             minimum_prefix_tokens: model_spec(model)
                 .and_then(|s| s.cache)
                 .map(|c| c.minimum_prefix_tokens as u64),
@@ -416,8 +509,16 @@ impl ResolvedModel {
     /// Upgrade only prospective assumptions at the resolution boundary. Existing
     /// tariffs, route capability and historical monetary sums remain frozen.
     pub fn with_scenario_cache_policy(mut self) -> Self {
-        if self.scenario_cache_policy.is_none() {
-            let policy = ScenarioCachePolicy::for_model(&self.model);
+        if self
+            .scenario_cache_policy
+            .as_ref()
+            .is_none_or(|p| p.version == 1)
+        {
+            let mut policy = self
+                .scenario_cache_policy
+                .take()
+                .unwrap_or_else(|| ScenarioCachePolicy::for_model(&self.model));
+            policy.version = ScenarioCachePolicy::VERSION;
             let known_model = model_spec(&self.model).is_some();
             let status = if policy.minimum_prefix_tokens.is_some() {
                 "conditional_api_equivalent_model_policy_not_route_entitlement"
@@ -430,9 +531,9 @@ impl ResolvedModel {
             self.provenance.insert(
                 "scenario_cache".into(),
                 Provenance {
-                    source: "carry/src/model_catalog.json".into(),
+                    source: "https://developers.openai.com/api/docs/guides/prompt-caching".into(),
                     status: status.into(),
-                    revision: "traditional-cache-v1".into(),
+                    revision: "traditional-cache-v2-request-mode-2026-10-28".into(),
                     fetched_at: None,
                     fallback_reason: None,
                     operator_override: None,
