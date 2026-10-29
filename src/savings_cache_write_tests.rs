@@ -185,6 +185,39 @@ fn cache_write191_native_breakpoint_override_and_mixed_lifetimes_stay_unknown() 
     }
 }
 
+#[test]
+fn cache_write191_native_typed_tool_output_keeps_unsupported_writes_unknown() {
+    let mut t = Trajectory::with_model("gpt-6.1-sol".into());
+    let mut expected = 0.0;
+    for (index, (ttl, writes)) in [("30m", true), ("12h", true), ("12h", false), ("30m", true)]
+        .into_iter()
+        .enumerate()
+    {
+        let body = json!({"model":"gpt-6.1-sol",
+            "prompt_cache_options":{"mode":"explicit","ttl":"30m"},
+            "input":[{"type":"function_call","call_id":"call_191","name":"lookup","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_191","output":[
+                    {"type":"input_text","text":"tool result ".repeat(2000),
+                        "prompt_cache_breakpoint":{"mode":"explicit","ttl":ttl}}]}]});
+        let input = prompt_projection(&body).unwrap().2;
+        t.record(&json!({"event":"model_request","data":{"step":index,"request":body}}));
+        let e = t
+            .record(&json!({"event":"model_response","data":{"step":index,
+            "usage":{"input_tokens":input,"cached_input_tokens":0,
+                "cache_write_input_tokens":if writes {input} else {0},"output_tokens":0},
+            "raw":{"output":[]}}}))
+            .unwrap();
+        if ttl == "30m" || !writes {
+            expected += input as f64 * if writes { 2.5 } else { 2.0 } / 1e6;
+        }
+        assert!(
+            (e.observed_cost - expected).abs() < 1e-12,
+            "CACHE_WRITE_191_NATIVE_TOOL_OUTPUT: unsupported typed result writes remain unknown"
+        );
+        assert_eq!(e.coverage.unpriced_responses, usize::from(index > 0));
+    }
+}
+
 // Acceptance controls for mode changes and unsupported request metadata.
 #[test]
 fn cache_write188_native_report_mode_switch_never_reuses_disabled_cache() {

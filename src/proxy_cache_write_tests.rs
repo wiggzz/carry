@@ -604,6 +604,78 @@ fn cache_write191_breakpoint_lifetimes_preserve_known_money_and_zero_write_cost(
 }
 
 #[test]
+fn cache_write191_typed_tool_output_lifetimes_preserve_both_roles_and_restart() {
+    for reviewer in [false, true] {
+        let mut t = Trajectory::default();
+        let mut expected = 0.0;
+        for (index, (lifetimes, written)) in [
+            (vec!["30m"], 2000),
+            (vec!["12h"], 2000),
+            (vec!["30m", "12h"], 2000),
+            (vec!["12h"], 0),
+            (vec!["30m"], 2000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = json!({"model":"gpt-6.1-sol",
+                "prompt_cache_options":{"mode":"explicit","ttl":"30m"},
+                "input":[{"type":"function_call","call_id":"call_191","name":"lookup","arguments":"{}"},
+                    {"type":"function_call_output","call_id":"call_191",
+                        "output":lifetimes.iter().map(|ttl|
+                            json!({"type":"input_text","text":"tool result",
+                                "prompt_cache_breakpoint":{"mode":"explicit","ttl":ttl}})
+                        ).collect::<Vec<_>>()}]});
+            let usage = terminal(2000, 0, written, 10);
+            if reviewer {
+                t.reviewer(&request, &usage, true);
+            } else {
+                t.primary(
+                    &request,
+                    &usage,
+                    "tool-output-fixture",
+                    100 + index as u64,
+                    true,
+                );
+            }
+            if !lifetimes.contains(&"12h") || written == 0 {
+                expected += (2000.0 * if written == 0 { 2.0 } else { 2.5 } + 100.0) / 1e6;
+            }
+            let snapshot = t.snapshot();
+            let (known, unavailable) = if reviewer {
+                (
+                    snapshot.observed_reviewer_cost,
+                    snapshot.unavailable_reviewer_cost_calls,
+                )
+            } else {
+                (
+                    snapshot.observed_primary_cost,
+                    snapshot.unavailable_primary_cost_calls,
+                )
+            };
+            assert!(
+                (known - expected).abs() < 1e-12,
+                "CACHE_WRITE_191_TOOL_OUTPUT: typed result metadata must not borrow the 30m rate"
+            );
+            assert_eq!(unavailable, (index as u64).min(2));
+            t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+        }
+    }
+    for payload in [
+        json!({"prompt_cache_breakpoint":{"ttl":"12h"}}),
+        json!([{"type":"application_json","prompt_cache_breakpoint":{"ttl":"12h"}}]),
+        json!([{"type":"input_text","text":"{\"prompt_cache_breakpoint\":{\"ttl\":\"12h\"}}"}]),
+    ] {
+        let request = json!({"input":[{"type":"function_call_output","output":payload}],
+            "tools":[{"parameters":{"properties":{"prompt_cache_breakpoint":{"ttl":"12h"}}}}]});
+        assert!(
+            carry::models::cache_write_tariff_known(&request),
+            "untyped JSON, text and schema lookalikes are not typed block metadata"
+        );
+    }
+}
+
+#[test]
 fn cache_write188_unknown_mode_ttl_or_explicit_extent_keeps_actual_money() {
     for options in [
         json!({"mode":"unknown"}),
