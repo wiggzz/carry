@@ -391,12 +391,32 @@ pub enum ScenarioCacheMode {
 /// cache eligibility or transport entitlement: zero-write receipts remain priced
 /// even when the request's population/expiry contract is unknown.
 pub fn cache_write_tariff_known(body: &Value) -> bool {
+    fn supported_lifetime(options: &Value) -> bool {
+        options
+            .as_object()
+            .is_some_and(|options| options.get("ttl").is_none_or(|ttl| ttl == "30m"))
+    }
+    fn supported_breakpoint(item: &Value) -> bool {
+        item.get("prompt_cache_breakpoint")
+            .is_none_or(supported_lifetime)
+    }
     body.get("prompt_cache_retention").is_none()
-        && match body.get("prompt_cache_options") {
-            None => true,
-            Some(Value::Object(options)) => options.get("ttl").is_none_or(|ttl| ttl == "30m"),
-            Some(_) => false,
-        }
+        && body
+            .get("prompt_cache_options")
+            .is_none_or(supported_lifetime)
+        // Breakpoints can override the request default on input items or their
+        // content blocks. Do not descend into tool results or schema payloads:
+        // lookalike data there is not request cache metadata. Native usage does
+        // not partition writes by lifetime, so any unsupported lifetime makes a
+        // nonzero write cost unknown (including mixed-lifetime requests).
+        && body["input"].as_array().is_none_or(|items| {
+            items.iter().all(|item| {
+                supported_breakpoint(item)
+                    && item["content"]
+                        .as_array()
+                        .is_none_or(|blocks| blocks.iter().all(supported_breakpoint))
+            })
+        })
 }
 
 impl ScenarioCachePolicy {

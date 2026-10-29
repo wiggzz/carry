@@ -572,6 +572,28 @@ fn cache_write191_breakpoint_lifetimes_preserve_known_money_and_zero_write_cost(
             t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
         }
     }
+    for (breakpoint, known) in [
+        (json!({}), true),
+        (json!({"ttl":"30m"}), true),
+        (json!({"ttl":"12h"}), false),
+        (json!({"ttl":null}), false),
+        (json!(null), false),
+    ] {
+        for content_block in [false, true] {
+            let mut item = json!({"role":"user","content":"prefix"});
+            if content_block {
+                item["content"] = json!([{"type":"input_text","text":"prefix",
+                    "prompt_cache_breakpoint":breakpoint}]);
+            } else {
+                item["prompt_cache_breakpoint"] = breakpoint.clone();
+            }
+            assert_eq!(
+                carry::models::cache_write_tariff_known(&json!({"input":[item]})),
+                known,
+                "item/content breakpoint lifetime {breakpoint}"
+            );
+        }
+    }
     let schema_data = json!({"input":[{"type":"function_call_output","output":{
         "prompt_cache_breakpoint":{"ttl":"12h"}}}],
         "tools":[{"parameters":{"properties":{"prompt_cache_breakpoint":{"ttl":"12h"}}}}]});
