@@ -66,6 +66,62 @@ fn cache_write191_dispatch_frozen_lifetime_censors_only_new_written_receipts() {
         assert!(receipt_rates(&config.classifier_model, &usage, None, true).is_some());
     }
 }
+// Joined acceptance: monetary lifetime censorship cannot erase #192's
+// independent cache observations during real reviewer settlement and restart.
+#[test]
+fn joined191192_unpriced_write_settlement_keeps_independent_cache_observations() {
+    let (config, mut before, _) = fixture(Rates {
+        input: 2.0,
+        cached: 0.1,
+        write: 2.5,
+        output: 10.0,
+    });
+    before.cost_trajectory = Some(crate::proxy_savings::Trajectory::default());
+    let mut current = before.clone();
+    let reviewed = before.clone();
+    for (index, written) in [1900, 0].into_iter().enumerate() {
+        let usage = json!({"input_tokens":2000,"output_tokens":10,
+            "input_tokens_details":{"cached_tokens":100,"cache_write_tokens":written}});
+        let model = config.classifier_model.clone();
+        let rates = receipt_rates(
+            &model,
+            &usage,
+            before.model_resolution.as_ref().map(|p| &p.reviewer),
+            false,
+        );
+        assert_eq!(rates.is_none(), written > 0);
+        let run = ReviewRun {
+            receipts: vec![ReviewReceipt {
+                model,
+                input: 2000,
+                usage: Some(usage),
+                write_tariff_known: false,
+                standard: true,
+                completed: true,
+            }],
+            ..ReviewRun::default()
+        };
+        settle_review(&mut current, &before, &reviewed, &run);
+        let calls = index as u64 + 1;
+        assert_eq!(current.shadow.calls, calls);
+        assert_eq!(current.shadow.unavailable_cost_calls, 1);
+        assert_eq!(current.shadow.input_tokens, calls * 2000);
+        assert_eq!(current.shadow.cached_tokens, calls * 100);
+        assert_eq!(current.shadow.cache_write_tokens, 1900);
+        assert_eq!(current.shadow.cache_observation.calls, calls);
+        assert_eq!(current.shadow.cache_observation.input_tokens, calls * 2000);
+        assert_eq!(current.shadow.cache_observation.cached_tokens, calls * 100);
+        assert_eq!(current.shadow.cost_usd > 0.0, written == 0);
+        let estimate = current.cost_trajectory.as_ref().unwrap().snapshot();
+        assert_eq!(estimate.unavailable_reviewer_cost_calls, 1);
+        assert!((estimate.observed_reviewer_cost - current.shadow.cost_usd).abs() < 1e-12);
+        current = serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+        assert_eq!(current.shadow.cache_observation.calls, calls);
+        assert_eq!(current.shadow.cache_observation.input_tokens, calls * 2000);
+        assert_eq!(current.shadow.cache_observation.cached_tokens, calls * 100);
+    }
+}
+
 include!("proxy_projection_economics_tests.rs");
 
 #[test]

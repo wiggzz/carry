@@ -5,6 +5,34 @@ import proxy_state_regressions as support
 from proxy_state_regressions import advice_response, completed, ledger
 
 
+def assert_source_projection(test, body, history):
+    items = body["input"]
+    test.assertEqual(sum("eligible_group_ids" in json.dumps(i) for i in items), 1)
+    # The final quoted control ledger is not a native source or a reviewer answer.
+    control = items[-1]
+    test.assertEqual(control.get("role"), "assistant")
+    test.assertEqual(json.loads(control["content"]), ledger(body))
+    for item in items[:-1]:
+        if item.get("role") == "assistant":
+            test.assertIn(item, history, "reviewer answers are not retained source")
+    for source in history:
+        test.assertLessEqual(items.count(source), 1)
+
+
+class ProjectionAssertionControls(unittest.TestCase):
+    def test_control_ledger_is_not_mistaken_for_a_reviewer_answer(self):
+        history = [{"role": "user", "content": "task"},
+                   {"role": "assistant", "content": "native evidence"}]
+        control = {"role": "assistant", "content": json.dumps({
+            "eligible_group_ids": [1], "current_groups": []})}
+        assert_source_projection(self, {"input": history + [control]}, history)
+        with self.assertRaises(AssertionError):
+            assert_source_projection(self, {"input": history + [
+                {"role": "assistant", "content": "reviewer answer"}, control]}, history)
+        with self.assertRaises(AssertionError):
+            assert_source_projection(self, {"input": history + [history[-1], control]}, history)
+
+
 class IncrementalReviewer(unittest.TestCase):
     def setUp(self):
         self.harness = support.StateRegressions()
@@ -30,13 +58,13 @@ class IncrementalReviewer(unittest.TestCase):
                         {"role": "user", "content": f"next direction {n}"}]
         self.assertGreaterEqual(len(fixture.reviews), 2)
         for body in fixture.reviews:
-            items = body["input"]
-            self.assertEqual(sum("eligible_group_ids" in json.dumps(i) for i in items), 1)
-            for item in items:
-                if item.get("role") == "assistant":
-                    self.assertIn(item, history, "reviewer answers are not retained source")
-            for source in history:
-                self.assertLessEqual(items.count(source), 1)
+            assert_source_projection(self, body, history)
+        eligible = ledger(fixture.reviews[-1])["eligible_group_ids"]
+        self.assertTrue(eligible, "exercise actionable source IDs, not just ledger presence")
+        advice = proxy.advice()
+        self.assertIsNotNone(advice)
+        for group_id in eligible:
+            self.assertEqual(advice["opinions"].get(str(group_id)), "keep")
 
     def test_primary_keeps_native_input_when_reviewer_does_not_fit(self):
         fixture = self.fixture()

@@ -171,6 +171,26 @@ fn retained_output_tokens(output: &Value) -> Option<u64> {
     })
 }
 
+/// Responses image inputs are billed in the request's native input tokens.
+/// Audio/video and generated image output can have independent tariffs, so they
+/// remain unsupported by this token-only tariff contract.
+fn has_unpriced_modalities(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| {
+                    kind != "input_image"
+                        && ["image", "audio", "video"].iter().any(|m| kind.contains(m))
+                })
+                || object.values().any(has_unpriced_modalities)
+        }
+        Value::Array(items) => items.iter().any(has_unpriced_modalities),
+        _ => false,
+    }
+}
+
 impl Trajectory {
     /// Freeze old sums on the first post-upgrade request, never reprice them.
     /// The new window starts from the retained input, not an invented empty chat.
@@ -195,6 +215,15 @@ impl Trajectory {
     ) -> Option<u64> {
         let anchor = self.receipts.as_ref()?.anchor.as_ref()?;
         if !append_compatible(anchor, body, &configuration(body, route, resolved)) {
+            return None;
+        }
+        let items = body["input"].as_array()?;
+        if items.len() == anchor.items {
+            return Some(anchor.input);
+        }
+        if has_native_modalities(&json!(&items[anchor.items..])) {
+            // A receipt measured the old prefix, not a newly appended image.
+            // Never tokenize its URL/base64 and present that as image units.
             return None;
         }
         let (_, _, local) = crate::savings::prompt_projection(body)?;
@@ -302,8 +331,8 @@ impl Trajectory {
         let native = receipt(&response["usage"]);
         let model = body["model"].as_str().unwrap_or("");
         let projection = crate::savings::prompt_projection(body);
-        let text = standard
-            && !has_native_modalities(body)
+        let billable = standard
+            && !has_unpriced_modalities(body)
             && !has_native_modalities(&response["output"])
             && !["input_tokens_details", "output_tokens_details"]
                 .iter()
@@ -312,7 +341,7 @@ impl Trajectory {
                         .as_u64()
                         .is_some_and(|n| n > 0)
                 });
-        let observed = native.as_ref().filter(|_| text).and_then(|u| {
+        let observed = native.as_ref().filter(|_| billable).and_then(|u| {
             observed_cost(
                 model,
                 u,
@@ -326,16 +355,33 @@ impl Trajectory {
             self.result.unavailable_primary_cost_calls += 1;
             if native.is_none() {
                 self.result.coverage.missing_usage += 1;
-            } else if text {
+            } else if billable {
                 self.result.coverage.unknown_rate_calls += 1;
             }
         }
-        if !text {
-            self.result.coverage.unmodeled_calls += 1;
-        }
         let retained_output = retained_output_tokens(&response["output"]);
-        if text && retained_output.is_none() {
+        // An unchanged image-bearing request can share its exact receipt total
+        // between both branches. A projected/restored/summary slice cannot use
+        // base64 length or an invented per-image allocation as native tokens.
+        let image_input = has_native_modalities(body);
+        let image_comparable = !image_input
+            || (!self.carry_edited
+                && self.restored == 0
+                && self.retired == 0
+                && self.summary == 0
+                && native
+                    .as_ref()
+                    .zip(retained_output)
+                    .is_some_and(|(u, retained)| {
+                        !self.scenario.valid()
+                            || u.input_tokens.saturating_add(retained)
+                                <= self.scenario.context_window - self.scenario.reserve
+                    }));
+        if !billable || !image_comparable || retained_output.is_none() {
             self.result.coverage.unmodeled_calls += 1;
+            self.result.excluded_unpriced_calls += 1;
+            self.reset_epoch();
+            return;
         }
         let (Some(native), Some(carry), Some((_, _, local)), Some(items), Some(retained_output)) = (
             native,

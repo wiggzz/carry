@@ -320,6 +320,74 @@ class NativeProviderFixtureTests(unittest.TestCase):
             finally:
                 thread.join(3)
 
+    def test_observer_handles_completed_response_then_delayed_client_eof(self):
+        self.check_observer_delayed_client_eof()
+
+    def test_observer_tolerates_only_enotconn_during_eof_propagation(self):
+        import errno
+        from unittest.mock import patch
+        import socket
+        shutdown = socket.socket.shutdown
+        injected = []
+        for error in (errno.ENOTCONN, errno.EIO):
+            def shutdown_fault(sock, how):
+                shutdown(sock, how)
+                if how == socket.SHUT_WR and threading.current_thread() is not threading.main_thread():
+                    injected.append(error)
+                    raise OSError(error, os.strerror(error))
+            with self.subTest(errno=error), patch.object(socket.socket, 'shutdown', shutdown_fault):
+                self.check_observer_delayed_client_eof(error if error != errno.ENOTCONN else None)
+        self.assertTrue(injected, 'exercise a real EOF cleanup with an injected OS error')
+
+    def check_observer_delayed_client_eof(self, expected_error=None):
+        from scripts.proxy_native_fixture import ClientObserver
+        import base64
+        import socket
+        import time
+        request = b'POST /v1/responses HTTP/1.1\r\nHost: fixture\r\nContent-Length: 2\r\n\r\n{}'
+        response = b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'
+        seen, failures = [], []
+        with tempfile.TemporaryDirectory() as directory, socket.socket() as server:
+            server.bind(('127.0.0.1', 0)); server.listen(); server.settimeout(3)
+            def target():
+                try:
+                    for _ in range(8):
+                        conn, _ = server.accept()
+                        with conn:
+                            conn.settimeout(3)
+                            raw = b''
+                            while len(raw) < len(request):
+                                raw += conn.recv(4096)
+                            seen.append(raw)
+                            conn.sendall(response)
+                            conn.shutdown(socket.SHUT_RDWR)
+                except OSError as error:
+                    failures.append(str(error))
+            thread = threading.Thread(target=target, daemon=True); thread.start()
+            with ClientObserver(server.getsockname()[1], Path(directory)/'wire.jsonl') as observer:
+                for _ in range(8):
+                    with socket.create_connection(('127.0.0.1', observer.port), timeout=3) as client:
+                        client.sendall(request)
+                        raw = b''
+                        while part := client.recv(4096): raw += part
+                        self.assertEqual(raw, response)
+                        # Upstream has fully closed; the caller finishes later.
+                        time.sleep(.03)
+                        client.shutdown(socket.SHUT_WR)
+                thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(seen, [request] * 8)
+            if expected_error is not None:
+                self.assertTrue(observer.errors)
+                self.assertTrue(all(f'[Errno {expected_error}]' in error for error in observer.errors))
+                with self.assertRaises(AssertionError): observer.bodies()
+            else:
+                self.assertEqual(observer.errors, [])
+                self.assertEqual(observer.bodies(), [{}] * 8)
+            self.assertEqual([base64.b64decode(r['wire_base64']) for r in observer.records],
+                             [request] * 8)
+
     def test_observer_shutdown_interrupts_stalled_response_reader(self):
         from scripts.proxy_native_fixture import ClientObserver
         import socket

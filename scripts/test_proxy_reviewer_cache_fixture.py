@@ -43,6 +43,21 @@ def send(provider, body):
 
 
 class SimulatorTests(unittest.TestCase):
+    def test_documented_implicit_message_endings(self):
+        tool = {'type': 'function_call_output', 'output': 'synthetic'}
+        developer = {'role': 'developer', 'content': 'synthetic'}
+        user = {'role': 'user', 'content': 'synthetic'}
+        assistant = {'role': 'assistant', 'content': 'synthetic'}
+        for items, expected in [
+            ([], []), ([assistant], []),
+            ([user, tool, tool, assistant], [1, 3]),
+            ([developer, developer, user, developer, assistant], [2, 3]),
+            ([user, {'role': 'tool', 'content': 'a'}, {'role': 'tool', 'content': 'b'}], [1, 3]),
+            ([user, tool, {'type': 'custom_tool_call_output', 'output': 'x'}, user], [1, 3, 4]),
+        ]:
+            with self.subTest(expected=expected):
+                self.assertEqual(fixture.implicit_eligible_endings(items), expected)
+
     def sequence(self):
         with Provider() as provider:
             bodies = [body_for(min(turn + 1, 7), turn, []) for turn in range(8)]
@@ -99,6 +114,27 @@ class SimulatorTests(unittest.TestCase):
             else: entry['native_cached_fraction'] = 2
             with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
                 fixture.grade_cache_records([entry], [changed])
+
+    def test_implicit_lookup_horizon_and_no_eligible_ending(self):
+        for growth, expected in ((20, 2048), (21, 0)):
+            with self.subTest(growth=growth), Provider() as provider:
+                body = body_for(1, 0, [])
+                body.pop('prompt_cache_options')
+                body['input'] = canonical(body['input'])
+                send(provider, body)
+                extended = copy.deepcopy(body)
+                extended['input'] += [{'role': 'user', 'content': f'new {n}'} for n in range(growth)]
+                extended['input'] += [{'role': 'assistant', 'content': json.dumps({'eligible_group_ids': [1]})}]
+                self.assertEqual(send(provider, extended)['usage']['input_tokens_details']['cached_tokens'], expected)
+        with Provider() as provider:
+            body = body_for(1, 0, [])
+            body.pop('prompt_cache_options')
+            body['input'] = canonical(body['input'])
+            for item in body['input']:
+                item['role'] = 'assistant'
+            self.assertEqual(send(provider, body)['usage']['input_tokens_details']['cached_tokens'], 0)
+            self.assertEqual(provider.cache, set())
+            self.assertEqual(provider.errors, [])
 
     def test_implicit_receipts_require_exact_historical_prefix_and_settings(self):
         body = body_for(1, 0, [])

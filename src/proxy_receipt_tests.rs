@@ -13,6 +13,139 @@ fn state(t: &Trajectory) -> Value {
     serde_json::to_value(t).unwrap()
 }
 
+// Joined #191/#192 acceptance, not a separately reproduced defect. Native
+// execution is pending the rebuilt joined-source hosted lane.
+#[test]
+fn joined191192_image_receipts_obey_write_lifetime_without_erasing_known_money() {
+    for breakpoint in [false, true] {
+        let mut t = Trajectory::default();
+        let mut expected = 0.0;
+        for (index, (ttl, written, priced)) in [
+            ("30m", 2000, true),
+            ("12h", 2000, false),
+            ("12h", 0, true),
+            ("30m", 2000, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut request = body();
+            request["prompt_cache_options"] = json!({"mode":"implicit","ttl":"30m"});
+            request["input"][0]["content"] = json!([
+                {"type":"input_text","text":"image source"},
+                {"type":"input_image","image_url":"data:image/png;base64,fixture"}
+            ]);
+            if breakpoint {
+                request["input"][0]["content"][1]["prompt_cache_breakpoint"] =
+                    json!({"mode":"explicit","ttl":ttl});
+            } else {
+                request["prompt_cache_options"]["ttl"] = json!(ttl);
+            }
+            t.primary(
+                &request,
+                &terminal(4000, 1000, written, 5),
+                "joined-image-fixture",
+                100 + index as u64,
+                true,
+            );
+            if priced {
+                expected += ((3000 - written) as f64 * 2.0
+                    + 1000.0 * 0.1
+                    + written as f64 * 2.5
+                    + 5.0 * 10.0)
+                    / 1e6;
+            }
+            let snapshot = t.snapshot();
+            assert!((snapshot.observed_primary_cost - expected).abs() < 1e-12);
+            assert_eq!(
+                snapshot.unavailable_primary_cost_calls,
+                u64::from(index > 0)
+            );
+            assert_eq!(snapshot.coverage.unmodeled_calls, 0);
+            assert_eq!(
+                snapshot.matched_primary_responses,
+                if breakpoint {
+                    0
+                } else if index < 3 {
+                    1
+                } else {
+                    2
+                }
+            );
+            t = serde_json::from_value(state(&t)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn receipt_image_input_uses_native_totals_not_encoded_payload_length() {
+    let mut costs = Vec::new();
+    for payload in ["short".to_owned(), "encoded ".repeat(4000)] {
+        let mut request = body();
+        request["input"][0]["content"] = json!([
+            {"type":"input_text","text":"image source"},
+            {"type":"input_image","image_url":format!("data:image/png;base64,{payload}")}
+        ]);
+        let mut t = Trajectory::default();
+        t.primary(&request, &terminal(4000, 1000, 0, 5), "route", 100, true);
+        let first = t.snapshot();
+        assert_eq!(first.unavailable_primary_cost_calls, 0);
+        assert_eq!(first.matched_primary_responses, 1);
+        assert_eq!(first.coverage.unmodeled_calls, 0);
+        assert_eq!(t.last_traditional_input, 4000);
+        assert_eq!(t.receipt_prediction(&request, "route", None), Some(4000));
+        costs.push(first.observed_primary_cost);
+        t = serde_json::from_value(state(&t)).unwrap();
+        t.primary(&request, &terminal(4000, 3000, 0, 5), "route", 101, true);
+        assert_eq!(t.snapshot().matched_primary_responses, 2);
+        assert_eq!(state(&t)["receipts"]["last_appended_input"], 0);
+        let mut appended = request.clone();
+        appended["input"].as_array_mut().unwrap().push(json!({
+            "role":"user","content":[{"type":"input_image","image_url":"new unmeasured image"}]
+        }));
+        assert_eq!(t.receipt_prediction(&appended, "route", None), None);
+        // A changed multimodal projection has no measured allocation for its
+        // restored image/material. Keep known expense, omit that comparison.
+        t.projected(2000, 1000, true);
+        let before = t.snapshot().observed_primary_cost;
+        t.primary(&request, &terminal(3000, 0, 0, 5), "route", 102, true);
+        let after = t.snapshot();
+        assert!(after.observed_primary_cost > before);
+        assert_eq!(after.unavailable_primary_cost_calls, 0);
+        assert_eq!(after.matched_primary_responses, 2);
+        assert_eq!(after.coverage.unmodeled_calls, 1);
+        assert_eq!(after.excluded_unpriced_calls, 1);
+    }
+    assert_eq!(costs[0], costs[1]);
+}
+
+#[test]
+fn receipt_images_do_not_invent_summary_or_audio_token_tariffs() {
+    for kind in ["input_image", "input_audio", "input_video"] {
+        let mut request = body();
+        request["input"][0]["content"] = json!([{ "type":kind,"data":"opaque" }]);
+        let mut t = Trajectory {
+            scenario: Scenario {
+                context_window: 3000,
+                reserve: 100,
+                keep_recent: 100,
+                summary: 50,
+            },
+            ..Trajectory::default()
+        };
+        t.primary(&request, &terminal(4000, 0, 0, 0), "route", 100, true);
+        let result = t.snapshot();
+        assert_eq!(result.matched_primary_responses, 0);
+        assert_eq!(result.traditional_compactions, 0);
+        assert_eq!(result.coverage.unmodeled_calls, 1);
+        assert_eq!(
+            result.unavailable_primary_cost_calls,
+            u64::from(kind != "input_image")
+        );
+        assert_eq!(result.observed_primary_cost > 0.0, kind == "input_image");
+    }
+}
+
 #[test]
 fn changed_receipt_configuration_preserves_signed_current_projection_not_old_summary() {
     for difference in [1000_i128, -200, 0] {

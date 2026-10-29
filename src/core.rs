@@ -75,6 +75,15 @@ pub fn joint_decision(primary: ViewCosts, shadow: ViewCosts, min_percent: u8) ->
     }
 }
 
+/// Independently observed input/cache pairs, not inferred from monetary pricing.
+/// Legacy ledgers have no coverage; their historical numeric totals stay intact.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CacheObservation {
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+}
+
 /// Numeric native usage is kept separate from byte-estimated scenario sizes.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct UsageLedger {
@@ -83,6 +92,8 @@ pub struct UsageLedger {
     pub output_tokens: u64,
     pub cached_tokens: u64,
     pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub cache_observation: CacheObservation,
     #[serde(default)]
     pub unpriced_models: std::collections::BTreeSet<String>,
     pub unavailable_cost_calls: u64,
@@ -114,6 +125,22 @@ impl UsageLedger {
         let input = usage["input_tokens"].as_u64();
         let output = usage["output_tokens"].as_u64();
         let cached = usage["input_tokens_details"]["cached_tokens"].as_u64();
+        if let (Some(input), Some(cached)) = (input, cached)
+            && cached <= input
+        {
+            let observed = &mut self.cache_observation;
+            if let (Some(calls), Some(input), Some(cached)) = (
+                observed.calls.checked_add(1),
+                observed.input_tokens.checked_add(input),
+                observed.cached_tokens.checked_add(cached),
+            ) {
+                *observed = CacheObservation {
+                    calls,
+                    input_tokens: input,
+                    cached_tokens: cached,
+                };
+            }
+        }
         let written = usage["input_tokens_details"]["cache_write_tokens"]
             .as_u64()
             .or_else(|| usage["input_tokens_details"]["cache_creation_tokens"].as_u64())
