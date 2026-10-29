@@ -71,6 +71,81 @@ fn cache_write188_native_report_preserves_paid_implicit_writes() {
     assert_eq!(estimate.savings, 0.0);
 }
 
+#[test]
+fn cache_write191_native_equivalent_defaults_reuse_each_divergent_branch() {
+    for restored in [0_u64, 700] {
+        let mut t = Trajectory::with_model("gpt-6.1-sol".into());
+        t.record(&json!({"event":"run_started","data":{"model":"gpt-6.1-sol", "cache_ttl_seconds":1800, "implicit_cache_minimum_prefix_tokens":1024}}));
+        let mut body = json!({"model":"gpt-6.1-sol","prompt_cache_key":"stable", "input":[{"role":"user","content":"prefix ".repeat(2000)}]});
+        t.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":restored}}));
+        let mut carry_expected = 0.0;
+        let mut pi_expected = 0.0;
+        let mut previous = 0;
+        for (index, options) in [
+            None,
+            Some(json!({})),
+            Some(json!({"mode":"implicit","ttl":"30m"})),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index == 2 {
+                body["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"role":"user","content":"append ".repeat(100)}));
+            }
+            body.as_object_mut().unwrap().remove("prompt_cache_options");
+            if let Some(options) = options {
+                body["prompt_cache_options"] = options;
+            }
+            let input = prompt_projection(&body).unwrap().2;
+            let cached = previous.min(input);
+            let pi_cached = if index == 0 { 0 } else { previous + restored };
+            carry_expected += (cached as f64 * 0.1 + (input - cached) as f64 * 2.5) / 1e6;
+            pi_expected +=
+                (pi_cached as f64 * 0.1 + (input + restored - pi_cached) as f64 * 2.5) / 1e6;
+            t.record(&json!({"event":"model_request","timestamp_ms":100+index,"data":{"step":index,"route":"official","request":body}}));
+            let e = t.record(&json!({"event":"model_response","timestamp_ms":100+index,"data":{"step":index,"usage":{"input_tokens":input,"cached_input_tokens":cached,"cache_write_input_tokens":input-cached,"output_tokens":0},"raw":{"output":[]}}})).unwrap();
+            assert!(e.priced && e.observed_priced);
+            assert_eq!(e.pi_compactions, 0);
+            assert!(
+                (e.carry_cost - carry_expected).abs() < 1e-12,
+                "CACHE_WRITE_191_DEFAULT: equivalent options must preserve absolute warm price"
+            );
+            assert!((e.pi_cost - pi_expected).abs() < 1e-12);
+            assert!((e.savings - (pi_expected - carry_expected)).abs() < 1e-12);
+            previous = input;
+        }
+    }
+}
+
+#[test]
+fn cache_write191_native_unsupported_lifetime_is_not_observed_30m_cost() {
+    let mut body =
+        json!({"model":"gpt-6.1-sol","input":[{"role":"user","content":"prefix ".repeat(2000)}]});
+    let input = prompt_projection(&body).unwrap().2;
+    let mut t = Trajectory::with_model("gpt-6.1-sol".into());
+    let mut expected = 0.0;
+    for (index, (ttl, written)) in [("30m", input), ("12h", input), ("12h", 0), ("30m", input)]
+        .into_iter()
+        .enumerate()
+    {
+        body["prompt_cache_options"] = json!({"mode":"implicit","ttl":ttl});
+        t.record(&json!({"event":"model_request","data":{"step":index,"request":body}}));
+        let e = t.record(&json!({"event":"model_response","data":{"step":index,"usage":{"input_tokens":input,"cached_input_tokens":0,"cache_write_input_tokens":written,"output_tokens":0},"raw":{"output":[]}}})).unwrap();
+        if ttl == "30m" || written == 0 {
+            expected += input as f64 * if written == 0 { 2.0 } else { 2.5 } / 1e6;
+        }
+        assert!(
+            (e.observed_cost - expected).abs() < 1e-12,
+            "CACHE_WRITE_191_NATIVE_TTL: unsupported writes remain unknown"
+        );
+        assert_eq!(e.coverage.unpriced_responses, usize::from(index > 0));
+    }
+}
+
 // Acceptance controls for mode changes and unsupported request metadata.
 #[test]
 fn cache_write188_native_report_mode_switch_never_reuses_disabled_cache() {

@@ -170,6 +170,13 @@ fn cache_policy188_present_version_boundaries_preserve_primary_and_reviewer_mone
     )
     .unwrap();
     let mut trajectory = Trajectory::default();
+    // Seed both the synthetic owner and dispatch contract before paid coverage.
+    resolved.scenario_cache_policy.as_mut().unwrap().version = 1;
+    trajectory
+        .receipts
+        .as_mut()
+        .unwrap()
+        .scenario_cache_policy_version = Some(1);
     let mut request = body();
     trajectory.reviewer_resolved(&request, &terminal(1000, 0, 0, 100), true, Some(&resolved));
     let mut snapshots = Vec::new();
@@ -329,6 +336,54 @@ fn cache_write188_resolution_upgrade_keeps_old_money_and_disables_future_reads_a
 }
 
 // Unknown request contracts exclude comparison, never actual paid receipts.
+#[test]
+fn cache_write191_unsupported_lifetime_preserves_known_money_in_both_receipt_lanes() {
+    for reviewer in [false, true] {
+        let mut t = Trajectory::default();
+        let mut request = body();
+        request["prompt_cache_options"] = json!({"mode":"implicit","ttl":"30m"});
+        let mut expected = 0.0;
+        for (index, (ttl, written)) in [("30m", 2000), ("12h", 2000), ("12h", 0), ("30m", 2000)]
+            .into_iter()
+            .enumerate()
+        {
+            request["prompt_cache_options"]["ttl"] = json!(ttl);
+            if reviewer {
+                t.reviewer(&request, &terminal(2000, 0, written, 10), true);
+            } else {
+                t.primary(
+                    &request,
+                    &terminal(2000, 0, written, 10),
+                    "fixture",
+                    100 + index as u64,
+                    true,
+                );
+            }
+            if ttl == "30m" || written == 0 {
+                expected += (2000.0 * if written == 0 { 2.0 } else { 2.5 } + 100.0) / 1e6;
+            }
+            let snapshot = t.snapshot();
+            let (known, unavailable) = if reviewer {
+                (
+                    snapshot.observed_reviewer_cost,
+                    snapshot.unavailable_reviewer_cost_calls,
+                )
+            } else {
+                (
+                    snapshot.observed_primary_cost,
+                    snapshot.unavailable_primary_cost_calls,
+                )
+            };
+            assert!(
+                (known - expected).abs() < 1e-12,
+                "CACHE_WRITE_191_TTL: unsupported writes must not acquire the 30m price"
+            );
+            assert_eq!(unavailable, u64::from(index > 0));
+            t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+        }
+    }
+}
+
 #[test]
 fn cache_write188_unknown_mode_ttl_or_explicit_extent_keeps_actual_money() {
     for options in [

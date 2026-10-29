@@ -113,6 +113,48 @@ class CacheWriteRegressions(unittest.TestCase):
             [(43298, 0), (44298, 43298), (45298, 44298)],
             restart=True, paid_write=True))
 
+    def test_unsupported_lifetime_writes_keep_raw_receipts_and_known_subtotal_across_restart(self):
+        receipts = [(2000, 0, 0), (2000, 0, 2000), (2100, 2000, 0)]
+        def primary(body, n):
+            self.assertEqual(body["prompt_cache_options"], {"mode": "implicit", "ttl": "12h"})
+            incoming, cached, written = receipts[n-1]
+            response = support.completed(response_id=f"unknown-ttl-{n}")
+            response["usage"] = {"input_tokens": incoming, "output_tokens": 10,
+                "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": written,
+                    "cache_write_tokens_details": {"12h": written}}}
+            return 200, response
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("off mode reviewed"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+        history = [{"role": "user", "content": "unsupported lifetime receipt"}]
+        snapshots = []
+        expected = 0.0
+        for index, (incoming, cached, written) in enumerate(receipts):
+            proxy = support.Proxy(self.harness.state, fixture, mode="off")
+            self.harness.stack.callback(proxy.close)
+            if index:
+                history.append({"role": "user", "content": f"append {index}"})
+            self.assertEqual(proxy.send(history, model="gpt-6.1-sol",
+                prompt_cache_options={"mode": "implicit", "ttl": "12h"})[0], 200)
+            saved = proxy.saved()
+            status, stats = proxy.request("GET", "/carry/dashboard/stats")
+            self.assertEqual(status, 200)
+            estimate = stats["sessions"][0]["cost_estimate"]
+            if not written:
+                expected += ((incoming-cached)*2 + cached*0.1 + 100)/1e6
+            snapshots.append({"saved": saved, "estimate": estimate, "known": expected})
+            self.evidence.update(snapshots=snapshots, primaries=fixture.primaries)
+            self.assertEqual(saved["primary"]["calls"], index+1)
+            self.assertEqual(saved["primary"]["cache_write_tokens"], 2000 if index else 0)
+            self.assertEqual(saved["primary"]["input_tokens"], sum(x[0] for x in receipts[:index+1]))
+            self.assertEqual(saved["primary"]["cached_tokens"], sum(x[1] for x in receipts[:index+1]))
+            self.assertEqual(saved["primary"]["unavailable_cost_calls"], int(index > 0))
+            self.assertAlmostEqual(saved["primary"]["cost_usd"], expected, places=12)
+            self.assertEqual(estimate["unavailable_primary_cost_calls"], int(index > 0))
+            self.assertAlmostEqual(estimate["observed_primary_cost"], expected, places=12)
+            self.assertIsNone(estimate["traditional_cost"])
+            self.assertIsNone(estimate["savings"])
+            proxy.close()
+
     def test_cache_ineligible_input_ordinary_price_control(self):
         self.assert_no_write_premium(self.run_control([(512, 0)], paid_write=True))
 
