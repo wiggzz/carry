@@ -70,6 +70,7 @@ struct Prompt {
     input: u64,
     cached_at_ms: Option<u64>,
     cache_mode: ScenarioCacheMode,
+    write_tariff_known: bool,
 }
 
 pub struct Trajectory {
@@ -247,7 +248,12 @@ impl Trajectory {
                     self.result.coverage.missing_projection += 1;
                 }
                 let model = self.pending.as_ref().map_or(&self.model, |p| &p.model);
-                if let Some(cost) = usage.as_ref().and_then(|u| estimated_cost_usd(model, u)) {
+                if let Some(cost) = usage.as_ref().and_then(|u| {
+                    (u.cache_write_input_tokens == 0
+                        || self.pending.as_ref().is_some_and(|p| p.write_tariff_known))
+                    .then(|| estimated_cost_usd(model, u))
+                    .flatten()
+                }) {
                     self.result.observed_cost += cost;
                 } else {
                     self.result.coverage.unpriced_responses += 1;
@@ -460,7 +466,9 @@ pub(crate) fn prompt_projection(body: &Value) -> Option<(String, String, u64)> {
 fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
     let request = &data["request"];
     let (prefix, overhead, input) = prompt_projection(request)?;
-    let route=serde_json::to_string(&json!({"api_base":data["transport"].get("api_base"),"route":data.get("route"),"cache_key":request.get("prompt_cache_key"),"cache_options":request.get("prompt_cache_options")})).ok()?;
+    // Semantic policy is compared separately; equivalent default spellings do
+    // not change the real route/key or force an artificial cold request.
+    let route=serde_json::to_string(&json!({"api_base":data["transport"].get("api_base"),"route":data.get("route"),"cache_key":request.get("prompt_cache_key")})).ok()?;
     Some(Prompt {
         model: request["model"].as_str().unwrap_or(fallback).to_owned(),
         input,
@@ -468,6 +476,7 @@ fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
         overhead,
         route,
         cached_at_ms: None,
+        write_tariff_known: carry::models::cache_write_tariff_known(request),
         cache_mode: ScenarioCachePolicy::for_model(request["model"].as_str().unwrap_or(fallback))
             .request_mode(request),
     })

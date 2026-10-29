@@ -155,6 +155,72 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertIsNone(estimate["savings"])
             proxy.close()
 
+    def test_branch_specific_summary_tiers_and_cache_survive_restart(self):
+        # The actual full input stays large; only the hypothetical branch summarizes.
+        # Staging changes this owned fixture's threshold, never production state.
+        import json
+        import tempfile
+        from pathlib import Path
+        snapshots = []
+        for mode in ("implicit", "explicit"):
+            with self.subTest(mode=mode):
+                self.harness.state = Path(self.harness.stack.enter_context(tempfile.TemporaryDirectory()))
+                inputs = [1000, 300000, 300100, 300200]
+                def primary(body, n):
+                    incoming = inputs[n-1]
+                    cached = 300000 if mode == "implicit" and n > 2 else 0
+                    written = incoming-cached if mode == "implicit" and incoming >= 1024 else 0
+                    response = support.completed(response_id=f"summary-{n}")
+                    response["usage"] = {"input_tokens": incoming, "output_tokens": 100,
+                        "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": written}}
+                    self.assertEqual(body["prompt_cache_options"], {"mode": mode, "ttl": "30m"})
+                    return 200, response
+                fixture = self.harness.fixture(primary, lambda *_: self.fail("off mode reviewed"))
+                self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+                history = [{"role": "user", "content": "owned summary scenario"}]
+                actual, traditional, summary = 0.0, 0.0, 0.0
+                for index, incoming in enumerate(inputs):
+                    proxy = support.Proxy(self.harness.state, fixture, mode="off")
+                    self.harness.stack.callback(proxy.close)
+                    if index:
+                        history.append({"role": "user", "content": f"continue {index}"})
+                    self.assertEqual(proxy.send(history, model="gpt-6.1-sol",
+                        prompt_cache_options={"mode": mode, "ttl": "30m"},
+                        prompt_cache_key="summary-tiers")[0], 200)
+                    cached = 300000 if mode == "implicit" and index > 1 else 0
+                    written = incoming-cached if mode == "implicit" and incoming >= 1024 else 0
+                    ordinary, read, write, output = (4, .2, 5, 15) if incoming > 272000 else (2, .1, 2.5, 10)
+                    actual += ((incoming-cached-written)*ordinary+cached*read+written*write+100*output)/1e6
+                    alt = [1000, 300000, 1700, 1800][index]
+                    alt_cached = 1700 if mode == "implicit" and index == 3 else 0
+                    alt_written = alt-alt_cached if mode == "implicit" and alt >= 1024 else 0
+                    ordinary, read, write, output = (4, .2, 5, 15) if alt > 272000 else (2, .1, 2.5, 10)
+                    traditional += ((alt-alt_cached-alt_written)*ordinary+alt_cached*read+alt_written*write+100*output)/1e6
+                    if index == 1:
+                        summary = (298500*4+100*15)/1e6
+                        traditional += summary
+                    saved = proxy.saved()
+                    estimate = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
+                    snapshots.append({"mode": mode, "estimate": estimate, "saved": saved})
+                    self.evidence.update(snapshots=snapshots)
+                    self.assertEqual(fixture.primaries[-1]["input"], history)
+                    self.assertEqual(estimate["matched_primary_responses"], index+1)
+                    self.assertEqual(estimate["traditional_compactions"], int(index > 0))
+                    self.assertEqual(saved["compactions"], 0)
+                    self.assertAlmostEqual(estimate["observed_primary_cost"], actual, places=12)
+                    self.assertAlmostEqual(saved["primary"]["cost_usd"], actual, places=12)
+                    self.assertAlmostEqual(estimate["carry_cost"], actual, places=12)
+                    self.assertAlmostEqual(estimate["traditional_cost"], traditional, places=12)
+                    self.assertAlmostEqual(estimate["summary_cost"], summary, places=12)
+                    self.assertAlmostEqual(estimate["savings"], traditional-actual, places=12)
+                    proxy.close()
+                    if index == 0:
+                        path = next(self.harness.state.glob("*.json"))
+                        saved["cost_trajectory"]["scenario"] = {"context_window":4000,
+                            "reserve":100,"keep_recent":1500,"summary":100}
+                        path.write_text(json.dumps(saved))
+                self.assertEqual(fixture.reviews, [])
+
     def test_cache_ineligible_input_ordinary_price_control(self):
         self.assert_no_write_premium(self.run_control([(512, 0)], paid_write=True))
 

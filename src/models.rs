@@ -387,6 +387,18 @@ pub enum ScenarioCacheMode {
     Unknown,
 }
 
+/// Whether this request's write lifetime has a supported tariff. This is not
+/// cache eligibility or transport entitlement: zero-write receipts remain priced
+/// even when the request's population/expiry contract is unknown.
+pub fn cache_write_tariff_known(body: &Value) -> bool {
+    body.get("prompt_cache_retention").is_none()
+        && match body.get("prompt_cache_options") {
+            None => true,
+            Some(Value::Object(options)) => options.get("ttl").is_none_or(|ttl| ttl == "30m"),
+            Some(_) => false,
+        }
+}
+
 impl ScenarioCachePolicy {
     pub const VERSION: u32 = 2;
 

@@ -1,6 +1,71 @@
 // Synthetic frozen contracts, not vendor tariff or route evidence.
 // Rates in snapshots are USD per MILLION; planner results are dollars.
 use super::*;
+
+#[test]
+fn cache_write191_dispatch_frozen_lifetime_censors_only_new_written_receipts() {
+    let (config, mut before, _) = fixture(Rates {
+        input: 2.0,
+        cached: 0.1,
+        write: 2.5,
+        output: 10.0,
+    });
+    before.cost_trajectory = Some(crate::proxy_savings::Trajectory::default());
+    let mut current = before.clone();
+    let reviewed = before.clone();
+    let mut expected = 0.0;
+    for (index, (known, written)) in [(true, 2000), (false, 2000), (false, 0), (true, 2000)]
+        .into_iter()
+        .enumerate()
+    {
+        let usage = json!({"input_tokens":2000,"output_tokens":10,
+            "input_tokens_details":{"cached_tokens":100,"cache_write_tokens":written.min(1900)}});
+        let model = config.classifier_model.clone();
+        if known || written == 0 {
+            let rates = receipt_rates(
+                &model,
+                &usage,
+                before.model_resolution.as_ref().map(|p| &p.reviewer),
+                known,
+            )
+            .unwrap();
+            let write = written.min(1900) as f64;
+            expected += (1900.0 - write) * rates.input
+                + 100.0 * rates.cached
+                + write * rates.write
+                + 10.0 * rates.output;
+        }
+        let run = ReviewRun {
+            receipts: vec![ReviewReceipt {
+                model,
+                input: 2000,
+                usage: Some(usage),
+                write_tariff_known: known,
+                standard: true,
+                completed: true,
+            }],
+            ..ReviewRun::default()
+        };
+        // A newer paid owner cannot reprice the dispatch contract or lifetime.
+        current.model_resolution.as_mut().unwrap().reviewer.rates = None;
+        settle_review(&mut current, &before, &reviewed, &run);
+        assert_eq!(current.shadow.calls, index as u64 + 1);
+        assert_eq!(current.shadow.unavailable_cost_calls, u64::from(index > 0));
+        assert!((current.shadow.cost_usd - expected).abs() < 1e-12);
+        let estimate = current.cost_trajectory.as_ref().unwrap().snapshot();
+        assert!((estimate.observed_reviewer_cost - expected).abs() < 1e-12);
+        assert_eq!(
+            estimate.unavailable_reviewer_cost_calls,
+            u64::from(index > 0)
+        );
+        current = serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+    }
+    for field in ["cache_write_input_tokens", "cache_creation_input_tokens"] {
+        let usage = json!({"input_tokens":2000,"output_tokens":0,field:2000});
+        assert!(receipt_rates(&config.classifier_model, &usage, None, false).is_none());
+        assert!(receipt_rates(&config.classifier_model, &usage, None, true).is_some());
+    }
+}
 include!("proxy_projection_economics_tests.rs");
 
 #[test]
@@ -59,6 +124,7 @@ fn stale_background_receipts_keep_the_dispatched_frozen_tariff_not_current_slug_
         receipts: vec![ReviewReceipt {
             model: config.classifier_model.clone(),
             input: 200,
+            write_tariff_known: true,
             usage: Some(
                 json!({"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":10}}),
             ),

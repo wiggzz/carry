@@ -335,6 +335,144 @@ fn cache_write188_resolution_upgrade_keeps_old_money_and_disables_future_reads_a
     }
 }
 
+// Acceptance: compare absolute prices across branch histories, cache modes,
+// native receipt tier boundaries and checkpoint restarts (not cancellation).
+#[test]
+fn cache_write191_divergent_history_uses_frozen_branch_tiers_and_independent_cache() {
+    use carry::models::{Route, resolve_model};
+    for mode in ["implicit", "explicit"] {
+        let resolved = resolve_model(
+            "gpt-6.1-sol",
+            Route::new("https://api.openai.com/v1/responses", false),
+            None,
+            None,
+            0,
+            0,
+        )
+        .unwrap();
+        let mut t = Trajectory {
+            scenario: Scenario {
+                context_window: 1_000_000,
+                ..Scenario::default()
+            },
+            ..Trajectory::default()
+        };
+        let mut request = body();
+        request["prompt_cache_options"] = json!({"mode":mode,"ttl":"30m"});
+        request["prompt_cache_key"] = json!("divergent");
+        let mut traditional = 0.0;
+        let mut actual = 0.0;
+        for index in 0..3 {
+            let input = 200_000 + index * 100;
+            if index > 0 {
+                request["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"role":"user","content":"append"}));
+                if index == 1 {
+                    t.projected(100_100, 100, true);
+                }
+            }
+            // Actual cache stays cold: its receipt must not set the alternative's hit.
+            t.primary_resolved(
+                &request,
+                &terminal(input, 0, 0, 10_000),
+                "fixture",
+                100 + index,
+                true,
+                Some(&resolved),
+            );
+            actual += (input as f64 * 2.0 + 100_000.0) / 1e6;
+            let alternative = input + if index > 0 { 100_000 } else { 0 };
+            let cached = if mode == "implicit" && index > 0 {
+                if index == 1 { 200_000 } else { 300_100 }
+            } else {
+                0
+            };
+            let (ordinary, read, write, output) = if alternative > 272_000 {
+                (4.0, 0.2, 5.0, 15.0)
+            } else {
+                (2.0, 0.1, 2.5, 10.0)
+            };
+            traditional += (if mode == "implicit" {
+                cached as f64 * read + (alternative - cached) as f64 * write
+            } else {
+                alternative as f64 * ordinary
+            } + 10_000.0 * output)
+                / 1e6;
+            let estimate = t.snapshot();
+            assert!(estimate.priced);
+            assert_eq!(estimate.matched_primary_responses, index as usize + 1);
+            assert_eq!(estimate.traditional_compactions, 0);
+            assert!((estimate.observed_primary_cost - actual).abs() < 1e-12);
+            assert!((estimate.carry_cost - actual).abs() < 1e-12);
+            assert!(
+                (estimate.traditional_cost - traditional).abs() < 1e-12,
+                "{mode} branch-specific cache/tier"
+            );
+            assert!((estimate.savings - (traditional - actual)).abs() < 1e-12);
+            t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+        }
+    }
+}
+
+#[test]
+fn cache_write191_post_summary_cold_then_warm_obeys_mode_after_restart() {
+    for mode in ["implicit", "explicit"] {
+        let mut t = Trajectory {
+            scenario: Scenario {
+                context_window: 3000,
+                reserve: 100,
+                keep_recent: 1200,
+                summary: 20,
+            },
+            ..Trajectory::default()
+        };
+        let mut request = body();
+        request["prompt_cache_options"] = json!({"mode":mode,"ttl":"30m"});
+        t.primary(&request, &terminal(3000, 3000, 0, 0), "fixture", 100, true);
+        let first = t.snapshot();
+        assert!(first.priced);
+        assert_eq!(first.traditional_compactions, 1);
+        // Summary request is ordinary uncached at its own input tier.
+        assert!((first.summary_cost - (1800.0 * 2.0 + 20.0 * 10.0) / 1e6).abs() < 1e-12);
+        let mut expected = first.traditional_cost;
+        for (index, input) in [3100, 3200].into_iter().enumerate() {
+            t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+            request["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":"continue"}));
+            t.primary(
+                &request,
+                &terminal(input, 3000, 0, 0),
+                "fixture",
+                101 + index as u64,
+                true,
+            );
+            let alternative = input - 1780;
+            let cached = if mode == "implicit" && index > 0 {
+                1320
+            } else {
+                0
+            };
+            expected += if mode == "implicit" {
+                (cached as f64 * 0.1 + (alternative - cached) as f64 * 2.5) / 1e6
+            } else {
+                alternative as f64 * 2.0 / 1e6
+            };
+            let after = t.snapshot();
+            assert!(after.priced);
+            assert_eq!(after.traditional_compactions, 1);
+            assert_eq!(after.summary_cost, first.summary_cost);
+            assert!(
+                (after.traditional_cost - expected).abs() < 1e-12,
+                "{mode} post-summary price"
+            );
+        }
+    }
+}
+
 // Unknown request contracts exclude comparison, never actual paid receipts.
 #[test]
 fn cache_write191_unsupported_lifetime_preserves_known_money_in_both_receipt_lanes() {

@@ -218,7 +218,7 @@ fn pr154_usage_diagnostics_are_numeric_and_preserve_censoring() {
             "request",
             "primary",
             Some(&response),
-            "gpt-6-luna",
+            &json!({"model":"gpt-6-luna"}),
             true,
         );
     }

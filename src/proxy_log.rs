@@ -379,7 +379,7 @@ pub(super) fn usage(
     request_id: &str,
     actor: &str,
     response: Option<&Value>,
-    model: &str,
+    body: &Value,
     standard: bool,
 ) {
     journal(
@@ -390,7 +390,7 @@ pub(super) fn usage(
         &usage_data(
             actor,
             response,
-            model,
+            body["model"].as_str().unwrap_or(""),
             standard,
             service.config.model_resolution.as_ref().map(|p| {
                 if actor == "shadow" {
@@ -399,6 +399,7 @@ pub(super) fn usage(
                     &p.primary
                 }
             }),
+            carry::models::cache_write_tariff_known(body),
         ),
     );
 }
@@ -409,6 +410,7 @@ pub(super) fn usage_data(
     model: &str,
     standard: bool,
     resolved: Option<&ResolvedModel>,
+    write_tariff_known: bool,
 ) -> Value {
     let absent = Value::Null;
     let value = response.unwrap_or(&absent);
@@ -420,7 +422,7 @@ pub(super) fn usage_data(
         standard
             && value["status"] == "completed"
             && value.get("service_tier").is_none_or(|v| v == "default"),
-        receipt_rates(model, &usage, resolved),
+        receipt_rates(model, &usage, resolved, write_tariff_known),
     );
     json!({"actor":actor,"native_usage":usage,
         "usage_available":usage["input_tokens"].as_u64().is_some() && usage["output_tokens"].as_u64().is_some(),

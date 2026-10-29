@@ -504,12 +504,13 @@ impl Trajectory {
             &response["usage"],
             standard,
             resolved,
+            carry::models::cache_write_tariff_known(body),
         );
     }
 
     #[cfg(test)]
     pub fn reviewer_usage(&mut self, model: &str, input: u64, usage: &Value, standard: bool) {
-        self.reviewer_usage_resolved(model, input, usage, standard, None);
+        self.reviewer_usage_resolved(model, input, usage, standard, None, true);
     }
 
     pub fn reviewer_usage_resolved(
@@ -519,9 +520,10 @@ impl Trajectory {
         usage: &Value,
         standard: bool,
         resolved: Option<&ResolvedModel>,
+        write_tariff_known: bool,
     ) {
         if self.receipts.is_some() {
-            self.observed_reviewer(model, usage, standard, resolved);
+            self.observed_reviewer(model, usage, standard, resolved, write_tariff_known);
             return;
         }
         self.start_priced_subset();
@@ -801,6 +803,18 @@ fn scenario_output_cost_resolved(
         Some(_) => None,
         None => crate::savings::scenario_output_cost(model, input, output),
     }
+}
+
+fn observed_cost(
+    model: &str,
+    usage: &Usage,
+    resolved: Option<&ResolvedModel>,
+    write_tariff_known: bool,
+) -> Option<f64> {
+    if usage.cache_write_input_tokens > 0 && !write_tariff_known {
+        return None;
+    }
+    modeled_cost(model, usage, resolved)
 }
 
 fn modeled_cost(model: &str, usage: &Usage, resolved: Option<&ResolvedModel>) -> Option<f64> {

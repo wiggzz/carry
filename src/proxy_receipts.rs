@@ -213,6 +213,7 @@ impl Trajectory {
         usage: &Value,
         standard: bool,
         resolved: Option<&ResolvedModel>,
+        write_tariff_known: bool,
     ) {
         self.result.coverage.reviewer_responses += 1;
         let native = receipt(usage);
@@ -227,7 +228,7 @@ impl Trajectory {
         let cost = native
             .as_ref()
             .filter(|_| text)
-            .and_then(|u| modeled_cost(model, u, resolved));
+            .and_then(|u| observed_cost(model, u, resolved, write_tariff_known));
         if let Some(cost) = cost {
             self.result.observed_reviewer_cost += cost;
             self.result.reviewer_cost += cost;
@@ -311,10 +312,14 @@ impl Trajectory {
                         .as_u64()
                         .is_some_and(|n| n > 0)
                 });
-        let observed = native
-            .as_ref()
-            .filter(|_| text)
-            .and_then(|u| modeled_cost(model, u, resolved));
+        let observed = native.as_ref().filter(|_| text).and_then(|u| {
+            observed_cost(
+                model,
+                u,
+                resolved,
+                carry::models::cache_write_tariff_known(body),
+            )
+        });
         if let Some(cost) = observed {
             self.result.observed_primary_cost += cost;
         } else {

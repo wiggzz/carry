@@ -1311,6 +1311,7 @@ struct ReviewReceipt {
     model: String,
     input: u64,
     usage: Option<Value>,
+    write_tariff_known: bool,
     standard: bool,
     // Usage can be present on failed/incomplete terminals, or absent on a
     // completed one. Keep this independent from both usage and advice validity.
@@ -1874,6 +1875,7 @@ async fn forward_request(
         native,
         standard(&outbound),
         service.config.model_resolution.as_ref().map(|p| &p.primary),
+        carry::models::cache_write_tariff_known(&outbound),
     );
     let response = if service.config.codex_login {
         send_codex(&service, &endpoint, &outbound, false, None).await
@@ -1932,7 +1934,7 @@ async fn forward_request(
                     &commit.request_id,
                     "primary",
                     None,
-                    commit.outbound["model"].as_str().unwrap_or(""),
+                    &commit.outbound,
                     standard(&commit.outbound),
                 );
                 journal(
@@ -2298,7 +2300,7 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
                 &receipt.model,
                 usage,
                 receipt.standard,
-                receipt_rates(&receipt.model, usage, resolved),
+                receipt_rates(&receipt.model, usage, resolved, receipt.write_tariff_known),
             );
         } else {
             current.shadow.calls += 1;
@@ -2312,6 +2314,7 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
                     receipt.usage.as_ref().unwrap_or(&Value::Null),
                     receipt.standard,
                     resolved,
+                    receipt.write_tariff_known,
                 );
             } else {
                 t.failed_reviewer_call();
@@ -2431,6 +2434,7 @@ async fn review_chunk(
         false,
         true,
         resolved,
+        carry::models::cache_write_tariff_known(body),
     );
     let codex_reviewer = service.config.codex_login && service.config.classifier_url.is_none();
     let wire_log = logging::ReviewWire {
@@ -2520,6 +2524,7 @@ async fn review_chunk(
                 model: service.config.classifier_model.clone(),
                 input: crate::proxy_savings::token_units(body),
                 usage: Some(numeric_review_usage(&value["usage"])),
+                write_tariff_known: carry::models::cache_write_tariff_known(body),
                 standard: value.get("service_tier").is_none_or(|v| v == "default"),
                 completed: value["status"] == "completed",
             });
@@ -2528,7 +2533,12 @@ async fn review_chunk(
             &service.config.classifier_model,
             &value["usage"],
             value.get("service_tier").is_none_or(|v| v == "default"),
-            receipt_rates(&service.config.classifier_model, &value["usage"], resolved),
+            receipt_rates(
+                &service.config.classifier_model,
+                &value["usage"],
+                resolved,
+                carry::models::cache_write_tariff_known(body),
+            ),
         );
         if let Some(trajectory) = &mut session.cost_trajectory {
             trajectory.reviewer_resolved(
@@ -2563,6 +2573,7 @@ async fn review_chunk(
                 &service.config.classifier_model,
                 true,
                 resolved,
+                carry::models::cache_write_tariff_known(body),
             ),
         );
         if value["status"] != "completed" {
@@ -2632,6 +2643,7 @@ async fn review_chunk(
                 &service.config.classifier_model,
                 true,
                 resolved,
+                carry::models::cache_write_tariff_known(body),
             ),
         );
         if run.background {
@@ -2639,6 +2651,7 @@ async fn review_chunk(
                 model: String::new(),
                 input: 0,
                 usage: None,
+                write_tariff_known: false,
                 standard: false,
                 completed: false,
             });
@@ -3043,7 +3056,25 @@ fn resolved_view_costs(
 
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
-fn receipt_rates(model: &str, usage: &Value, resolved: Option<&ResolvedModel>) -> Option<Rates> {
+fn receipt_rates(
+    model: &str,
+    usage: &Value,
+    resolved: Option<&ResolvedModel>,
+    write_tariff_known: bool,
+) -> Option<Rates> {
+    if !write_tariff_known
+        && [
+            usage["cache_write_input_tokens"].as_u64(),
+            usage["cache_creation_input_tokens"].as_u64(),
+            usage["input_tokens_details"]["cache_write_tokens"].as_u64(),
+            usage["input_tokens_details"]["cache_creation_tokens"].as_u64(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|n| n > 0)
+    {
+        return None;
+    }
     let input = usage["input_tokens"].as_u64()? as f64;
     match resolved {
         Some(r) if r.model == model => r.rates_for_input(input),
@@ -3060,6 +3091,7 @@ struct Attempt {
     started: Instant,
     standard: bool,
     resolved: Option<ResolvedModel>,
+    write_tariff_known: bool,
 }
 
 impl Attempt {
@@ -3069,6 +3101,7 @@ impl Attempt {
         native: bool,
         standard: bool,
         resolved: Option<&ResolvedModel>,
+        write_tariff_known: bool,
     ) -> Self {
         let attempt = Self {
             id: format!(
@@ -3083,6 +3116,7 @@ impl Attempt {
             started: Instant::now(),
             standard,
             resolved: resolved.cloned(),
+            write_tariff_known,
         };
         attempt.emit("started", json!({}));
         attempt
@@ -3149,7 +3183,12 @@ impl Attempt {
             &self.model,
             usage,
             self.standard && response.get("service_tier").is_none_or(|v| v == "default"),
-            receipt_rates(&self.model, usage, self.resolved.as_ref()),
+            receipt_rates(
+                &self.model,
+                usage,
+                self.resolved.as_ref(),
+                self.write_tariff_known,
+            ),
         );
         let tools = response["output"]
             .as_array()
@@ -3245,7 +3284,7 @@ async fn relay(
                 &commit.request_id,
                 "primary",
                 observed.as_ref(),
-                commit.outbound["model"].as_str().unwrap_or(""),
+                &commit.outbound,
                 status.is_success() && complete_transport && standard(&commit.outbound),
             );
             let completed = observed.as_ref().is_some_and(|v| {
@@ -3279,7 +3318,12 @@ async fn relay(
                     &value["usage"],
                     standard(&commit.outbound)
                         && value.get("service_tier").is_none_or(|v| v == "default"),
-                    receipt_rates(model, &value["usage"], resolved),
+                    receipt_rates(
+                        model,
+                        &value["usage"],
+                        resolved,
+                        carry::models::cache_write_tariff_known(&commit.outbound),
+                    ),
                 );
                 if let Some(trajectory) = &mut commit.candidate.cost_trajectory {
                     if commit.native {
@@ -3399,6 +3443,7 @@ async fn relay(
                                 .model_resolution
                                 .as_ref()
                                 .map(|p| &p.primary),
+                            carry::models::cache_write_tariff_known(&commit.outbound),
                         ),
                     );
                 } else {
