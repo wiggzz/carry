@@ -402,7 +402,7 @@ fn cache_write191_divergent_history_uses_frozen_branch_tiers_and_independent_cac
                 / 1e6;
             let estimate = t.snapshot();
             assert!(estimate.priced);
-            assert_eq!(estimate.matched_primary_responses, index as u64 + 1);
+            assert_eq!(estimate.matched_primary_responses, index + 1);
             assert_eq!(estimate.traditional_compactions, 0);
             assert!((estimate.observed_primary_cost - actual).abs() < 1e-12);
             assert!((estimate.carry_cost - actual).abs() < 1e-12);
