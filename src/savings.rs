@@ -78,6 +78,7 @@ struct Prompt {
     overhead: String,
     route: String,
     input: u64,
+    fixed_input: u64,
     protected_input: u64,
     requested_output: Option<u64>,
     cached_at_ms: Option<u64>,
@@ -387,7 +388,13 @@ impl Trajectory {
                             .context_window
                             .saturating_sub(self.scenario.reserve)
                 {
-                    let discarded = total.saturating_sub(self.scenario.keep_recent);
+                    let kept = self
+                        .previous
+                        .as_ref()
+                        .map_or(self.scenario.keep_recent, |p| {
+                            self.scenario.keep_recent.max(p.fixed_input)
+                        });
+                    let discarded = total.saturating_sub(kept);
                     let summary_usage = Usage {
                         input_tokens: discarded,
                         output_tokens: self.scenario.summary,
@@ -402,7 +409,7 @@ impl Trajectory {
                             .removed
                             .saturating_add(discarded.saturating_sub(self.summary));
                         self.summary = self.scenario.summary;
-                        self.last_pi_input = self.scenario.keep_recent.saturating_add(self.summary);
+                        self.last_pi_input = kept.saturating_add(self.summary);
                         self.last_output_proxy = 0;
                     } else {
                         self.scenario_available = false;
@@ -519,6 +526,8 @@ fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
     Some(Prompt {
         model: request["model"].as_str().unwrap_or(fallback).to_owned(),
         input,
+        fixed_input: token_units(&json!({"instructions":request.get("instructions"),
+            "tools":request.get("tools"),"text":request.get("text")})),
         protected_input,
         requested_output: request["max_output_tokens"].as_u64(),
         prefix,
