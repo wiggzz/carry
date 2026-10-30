@@ -239,6 +239,10 @@ fn receipt_policy_migration_preserves_summary_with_exact_legacy_contract() {
             // Preserve the original exact-old-contract migration control even
             // though new successful windows now persist a structured cursor.
             legacy.as_object_mut().unwrap().remove("history_continuity");
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("receipt_history_load");
             legacy["receipts"]["history_anchor"] = legacy["receipts"]["anchor"].clone();
             t = serde_json::from_value(legacy).unwrap();
             b["input"]
@@ -248,7 +252,7 @@ fn receipt_policy_migration_preserves_summary_with_exact_legacy_contract() {
             if projected {
                 t.projected(5100, 3000, true);
             }
-            t.rekey_receipt_policy(&b, "route", &prior, &current);
+            t.load_receipt_history(&b, "route", Some(&current), std::iter::once(&prior));
             t.primary_resolved(
                 &b,
                 &terminal(if projected { 3000 } else { 5100 }, 0, 0, 0),
@@ -385,6 +389,10 @@ fn receipt_policy_migration_does_not_bypass_trajectory_guards() {
                 // This old-decoder control must actually select legacy state;
                 // a typed cursor no longer depends on the opaque cache digest.
                 saved.as_object_mut().unwrap().remove("history_continuity");
+                saved
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("receipt_history_load");
                 saved["receipts"]["history_anchor"] = saved["receipts"]["anchor"].clone();
                 saved["receipts"]["configuration"] = json!("mismatched");
                 t = serde_json::from_value(saved).unwrap();
@@ -392,7 +400,8 @@ fn receipt_policy_migration_does_not_bypass_trajectory_guards() {
             "reset" => t.reset_epoch(),
             _ => unreachable!(),
         }
-        t.rekey_receipt_policy(&b, route, &prior, &current);
+        let before_continuation = t.snapshot();
+        t.load_receipt_history(&b, route, Some(&current), std::iter::once(&prior));
         t.primary_resolved(
             &b,
             &terminal(input, 0, 0, 0),
@@ -403,13 +412,34 @@ fn receipt_policy_migration_does_not_bypass_trajectory_guards() {
         );
         assert_eq!(
             t.snapshot().initial_compactions,
-            if matches!(change, "rates" | "tier") {
+            if matches!(change, "rates" | "tier" | "missing_proof") {
                 1
             } else {
                 2
             },
             "{change}: pricing is not a history contract; legacy/ancestry guards remain"
         );
+        if change == "missing_proof" {
+            // Supersedes the old repeated-initialization oracle: absence of
+            // legacy proof freezes its comparison, never creates a new window.
+            assert_eq!(t.history.retired, 3500);
+            assert_eq!(t.history.summary, 500);
+            assert_eq!(t.history.last_traditional_input, 2000);
+            assert_eq!(
+                t.snapshot().traditional_cost,
+                before_continuation.traditional_cost
+            );
+            assert_eq!(t.snapshot().summary_cost, before_continuation.summary_cost);
+            assert_eq!(
+                t.snapshot().matched_primary_responses,
+                before_continuation.matched_primary_responses
+            );
+            assert_eq!(
+                t.snapshot().excluded_unpriced_calls,
+                before_continuation.excluded_unpriced_calls + 1
+            );
+            assert!(t.snapshot().observed_primary_cost > before_continuation.observed_primary_cost);
+        }
         if matches!(change, "rates" | "tier") {
             assert_eq!(t.history.retired, 3500);
             assert_eq!(t.history.summary, 500);

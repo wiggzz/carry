@@ -1,6 +1,6 @@
 // Tests-first load/continuation boundary for review5712117725. These are old
 // opaque receipt histories, not genuinely new windows and not typed cursors.
-// No decoder/settlement production changes accompany this tracer.
+// Older fixtures omit both the typed cursor and its load-schema disposition.
 fn legacy_history_continuation(proof: &str, initialized: bool) {
     use carry::models::{Route, resolve_model};
     let current = resolve_model(
@@ -60,6 +60,10 @@ fn legacy_history_continuation(proof: &str, initialized: bool) {
     let boundaries = serde_json::to_value(&before.cache_policy_boundaries).unwrap();
     let mut legacy = state(&t);
     legacy.as_object_mut().unwrap().remove("history_continuity");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("receipt_history_load");
     legacy
         .as_object_mut()
         .unwrap()

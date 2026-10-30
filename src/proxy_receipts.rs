@@ -210,52 +210,57 @@ fn has_unpriced_modalities(value: &Value) -> bool {
 }
 
 impl Trajectory {
-    /// Advance only cache-policy identity after proving the old full contract.
-    /// Legacy checkpoints retain opaque configuration hashes, so excluding policy
-    /// fields from new hashes alone would discard their existing summary history.
-    pub(crate) fn rekey_receipt_policy(
+    /// Input-bound legacy load normalization. Only the owner that has the real
+    /// adapted wire and frozen saved resolutions can prove an old opaque digest.
+    /// Called before the existing atomic paid-request reservation, never from
+    /// terminal settlement. New/typed histories do no reconstruction or scan.
+    pub(crate) fn load_receipt_history<'a>(
         &mut self,
         body: &Value,
         route: &str,
-        prior: &ResolvedModel,
-        current: &ResolvedModel,
+        current: Option<&'a ResolvedModel>,
+        prior: impl IntoIterator<Item = &'a ResolvedModel>,
     ) {
-        let Some(receipts) = self.receipts.as_mut() else {
+        use super::traditional::ReceiptHistoryLoad;
+        if self.history.receipt_history_load.is_some() {
+            return;
+        }
+        if self.history.history_continuity.is_some() {
+            self.history.receipt_history_load = Some(ReceiptHistoryLoad::StructuredV1);
+            return;
+        }
+        self.history.receipt_history_load = Some(ReceiptHistoryLoad::ReadOnlyLegacyV1);
+        let Some(receipts) = &self.receipts else {
             return;
         };
-        let prior_version = prior.scenario_cache_policy.as_ref().map(|p| p.version);
-        let current_version = current.scenario_cache_policy.as_ref().map(|p| p.version);
-        if receipts.scenario_cache_policy_version != prior_version
-            || prior_version == current_version
+        let Some(anchor) = &receipts.history_anchor else {
+            return;
+        };
+        if receipts.configuration.as_ref() != Some(&anchor.configuration)
+            || receipts.initialization_policy_version != Some(1)
+            || !append_compatible(anchor, body, &anchor.configuration)
         {
             return;
         }
-        let without_policy = |resolution: &ResolvedModel| {
-            let mut resolution = resolution.clone();
-            resolution.scenario_cache_policy = None;
-            resolution.provenance.remove("scenario_cache");
-            resolution
+        let Some(current) = current else {
+            return;
         };
-        if digest(&without_policy(prior)) != digest(&without_policy(current)) {
-            return;
-        }
-        let previous = configuration(body, route, Some(prior));
-        if receipts.configuration.as_ref() != Some(&previous) {
-            return;
-        }
-        let next = configuration(body, route, Some(current));
-        receipts.configuration = Some(next.clone());
-        for anchor in [
-            &mut receipts.anchor,
-            &mut receipts.traditional_anchor,
-            &mut receipts.history_anchor,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if anchor.configuration == previous {
-                anchor.configuration = next.clone();
-            }
+        let contract = HistoryContract::extract(body, route, Some(current), self.scenario);
+        // A bounded one-time adapter, not a growing normal-request audit scan.
+        // Exact old-contract evidence beyond this bound is unavailable, not a
+        // guessed match. Frozen monetary totals/cache events are never rewritten.
+        let proven = std::iter::once(current).chain(prior).take(64).any(|old| {
+            configuration(body, route, Some(old)) == anchor.configuration
+                && HistoryContract::extract(body, route, Some(old), self.scenario) == contract
+        });
+        if proven {
+            self.history.load_legacy_cursor(
+                contract,
+                anchor.prefix.clone(),
+                anchor.items,
+                anchor.input,
+                anchor.at,
+            );
         }
     }
 
@@ -354,6 +359,15 @@ impl Trajectory {
             self.failed_call();
             return;
         }
+        if self.history.read_only_legacy() {
+            let (_, _, billable) =
+                self.record_primary_observation(body, response, standard, settled);
+            if !billable {
+                self.result.coverage.unmodeled_calls += 1;
+            }
+            self.result.excluded_unpriced_calls += 1;
+            return;
+        }
         if self
             .receipts
             .as_ref()
@@ -384,21 +398,6 @@ impl Trajectory {
             .scenario_cache_policy_version;
         let cache_policy_changed = previous_version != policy_version;
         if cache_policy_changed {
-            // A version-only frozen contract can be reconstructed, but is accepted
-            // only when its complete old digest matches. Actual upgrades with
-            // changed provenance use the original saved resolution at dispatch.
-            if let Some(current) = resolved {
-                let mut prior = current.clone();
-                if let Some(version) = previous_version {
-                    if let Some(policy) = &mut prior.scenario_cache_policy {
-                        policy.version = version;
-                    }
-                } else {
-                    prior.scenario_cache_policy = None;
-                    prior.provenance.remove("scenario_cache");
-                }
-                self.rekey_receipt_policy(body, route, &prior, current);
-            }
             // Freeze cumulative provenance before ANY version transition. Cache
             // becomes cold, but ancestry checks still own summary invalidation.
             let prior = self.snapshot();
@@ -424,31 +423,10 @@ impl Trajectory {
                 .unwrap()
                 .scenario_cache_policy_version = policy_version;
         }
-        self.result.coverage.primary_responses += 1;
-        let native = receipt(&response["usage"]);
         let model = body["model"].as_str().unwrap_or("");
         let projection = crate::savings::prompt_projection(body);
-        let billable = standard
-            && !has_unpriced_modalities(body)
-            && !has_native_modalities(&response["output"])
-            && !["input_tokens_details", "output_tokens_details"]
-                .iter()
-                .any(|f| {
-                    response["usage"][*f]["audio_tokens"]
-                        .as_u64()
-                        .is_some_and(|n| n > 0)
-                });
-        let observed = native.as_ref().filter(|_| billable).and(settled);
-        if let Some(cost) = observed {
-            self.result.observed_primary_cost += cost;
-        } else {
-            self.result.unavailable_primary_cost_calls += 1;
-            if native.is_none() {
-                self.result.coverage.missing_usage += 1;
-            } else if billable {
-                self.result.coverage.unknown_rate_calls += 1;
-            }
-        }
+        let (native, observed, billable) =
+            self.record_primary_observation(body, response, standard, settled);
         let retained_output = retained_output_tokens(&response["output"]);
         let allowance = carry::models::output_allowance(
             body["max_output_tokens"].as_u64(),
@@ -506,17 +484,13 @@ impl Trajectory {
         };
         let config = configuration(body, route, resolved);
         let contract = HistoryContract::extract(body, route, resolved, self.scenario);
-        let legacy_configuration = self.receipts.as_ref().unwrap().configuration.clone();
         self.receipts.as_mut().unwrap().configuration = Some(config.clone());
         let previous = self.receipts.as_ref().unwrap().anchor.clone();
 
         let continuity =
             self.history
                 .compatible(&contract, body, native.input_tokens, at, self.carry_edited);
-        let history_previous = continuity
-            .is_none()
-            .then(|| self.receipts.as_ref().unwrap().history_anchor.clone())
-            .flatten();
+
         let compatible = previous.as_ref().is_some_and(|a| {
             append_compatible(a, body, &config)
                 && at >= a.at
@@ -524,21 +498,8 @@ impl Trajectory {
                 && (items.len() > a.items || native.input_tokens == a.input)
         });
 
-        // The legacy opaque anchor is only a decoder input. Once a structured
-        // cursor exists, neither full-model cache/pricing identity nor rekeying
-        // participates in history recognition.
-        let history_compatible = continuity.unwrap_or_else(|| {
-            legacy_configuration.as_ref() == Some(&config)
-                && history_previous.as_ref().is_some_and(|a| {
-                    a.configuration == config
-                        && at >= a.at
-                        && (self.carry_edited
-                            || (append_compatible(a, body, &config)
-                                && native.input_tokens >= a.input
-                                && (items.len() > a.items || native.input_tokens == a.input)))
-                })
-        });
-        if (continuity.is_some() || history_previous.is_some()) && !history_compatible {
+        let history_compatible = continuity.unwrap_or(false);
+        if continuity.is_some() && !history_compatible {
             // Rewind, edit, configuration switch or negative total-input delta:
             // invalidate historical assumptions, not the current projection.
             self.reset_receipt_epoch();
@@ -701,6 +662,39 @@ impl Trajectory {
         receipts.anchor = Some(anchor);
         receipts.traditional_anchor = None;
         receipts.history_anchor = None;
+    }
+
+    fn record_primary_observation(
+        &mut self,
+        body: &Value,
+        response: &Value,
+        standard: bool,
+        settled: Option<f64>,
+    ) -> (Option<Usage>, Option<f64>, bool) {
+        self.result.coverage.primary_responses += 1;
+        let native = receipt(&response["usage"]);
+        let billable = standard
+            && !has_unpriced_modalities(body)
+            && !has_native_modalities(&response["output"])
+            && !["input_tokens_details", "output_tokens_details"]
+                .iter()
+                .any(|f| {
+                    response["usage"][*f]["audio_tokens"]
+                        .as_u64()
+                        .is_some_and(|n| n > 0)
+                });
+        let observed = native.as_ref().filter(|_| billable).and(settled);
+        if let Some(cost) = observed {
+            self.result.observed_primary_cost += cost;
+        } else {
+            self.result.unavailable_primary_cost_calls += 1;
+            if native.is_none() {
+                self.result.coverage.missing_usage += 1;
+            } else if billable {
+                self.result.coverage.unknown_rate_calls += 1;
+            }
+        }
+        (native, observed, billable)
     }
 }
 

@@ -1781,6 +1781,20 @@ async fn forward_request(
         // pass-through. Receipt compatibility may preserve only this quantity.
         let canonical = json!(session.render_primary());
         if let Some(t) = &mut session.cost_trajectory {
+            t.load_receipt_history(
+                &outbound,
+                &service.config.upstream_url,
+                service
+                    .config
+                    .model_resolution
+                    .as_ref()
+                    .map(|pair| &pair.primary),
+                session
+                    .model_resolution_history
+                    .iter()
+                    .rev()
+                    .map(|pair| &pair.primary),
+            );
             if service.config.mode == Mode::Off {
                 // Off never edits input. Its optional tracker can fail or be
                 // empty, so it cannot define a canonical-minus-sent delta.
@@ -3343,16 +3357,6 @@ async fn relay(
                     if commit.native {
                         trajectory.unmodeled_call();
                     } else {
-                        if let Some(current) = resolved {
-                            for prior in commit.candidate.model_resolution_history.iter().rev() {
-                                trajectory.rekey_receipt_policy(
-                                    &commit.outbound,
-                                    &commit.service.config.upstream_url,
-                                    &prior.primary,
-                                    current,
-                                );
-                            }
-                        }
                         trajectory.primary_settled(crate::proxy_savings::PrimaryObservation {
                             body: &commit.outbound,
                             response: &value,

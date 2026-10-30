@@ -639,6 +639,8 @@ impl Trajectory {
         standard: bool,
         resolved: Option<&ResolvedModel>,
     ) {
+        // Test callers use the same input-bound load boundary as real dispatch.
+        self.load_receipt_history(body, route, resolved, std::iter::empty());
         let settled = receipts::receipt(&response["usage"])
             .filter(|_| standard)
             .and_then(|u| {
