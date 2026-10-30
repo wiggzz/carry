@@ -146,7 +146,7 @@ class InitializationRegressions(unittest.TestCase):
         estimate = self.first_primary(10000)
         self.assertEqual(estimate["traditional_compactions"], 0)
         self.assertEqual(estimate["summary_cost"], 0.0)
-        self.assertAlmostEqual(estimate["traditional_cost"], 10000 * 2.5 / 1e6, places=12)
+        self.assertAlmostEqual(estimate["traditional_cost"], 10000 * 2 / 1e6, places=12)
 
     def test_unknown_oversized_history_is_initialized_before_first_primary_pricing(self):
         estimate = self.first_primary(300000)
@@ -696,7 +696,7 @@ class InitializationRegressions(unittest.TestCase):
 
     def test_explicit_output_overrides_large_configured_capacity_reserve(self):
         estimate = self.omitted_output_comparison(reserve=40000, cap=1)
-        self.assertAlmostEqual(estimate["traditional_cost"], 0.1, places=12)
+        self.assertAlmostEqual(estimate["traditional_cost"], estimate["observed_primary_cost"], places=12)
         self.assertEqual(estimate["initial_compactions"], 0)
         self.assertEqual(estimate["matched_primary_responses"], 1)
 
@@ -752,7 +752,7 @@ class InitializationRegressions(unittest.TestCase):
     def test_unchanged_image_with_small_output_remains_priceable(self):
         estimate = self.image_output_comparison(1)
         self.assertEqual(estimate["summary_cost"], 0.0)
-        self.assertAlmostEqual(estimate["traditional_cost"], 0.5025, places=12)
+        self.assertAlmostEqual(estimate["traditional_cost"], estimate["observed_primary_cost"], places=12)
         self.assertEqual(estimate["coverage"]["unmodeled_calls"], 0)
         self.assertEqual(estimate["matched_primary_responses"], 1)
         self.assertEqual(estimate.get("initial_compactions", 0), 0)

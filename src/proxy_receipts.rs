@@ -93,7 +93,7 @@ fn append_compatible(anchor: &Anchor, body: &Value, configuration: &str) -> bool
 /// Explicit numeric partitions only. Absent optional write counts mean no
 /// reported write (Responses semantics); absent cache-read data is unknown.
 /// Reject contradictory aliases rather than clipping them into a priced call.
-fn receipt(usage: &Value) -> Option<Usage> {
+pub(super) fn receipt(usage: &Value) -> Option<Usage> {
     fn partition(values: &[Option<&Value>], required: bool) -> Option<u64> {
         let mut found = None;
         for value in values.iter().flatten() {
@@ -267,6 +267,7 @@ impl Trajectory {
             ..Self::default()
         };
         self.receipts.as_mut().unwrap().legacy_estimate = Some(Box::new(legacy));
+        self.history.diverge();
     }
 
     pub fn receipt_prediction(
@@ -300,11 +301,9 @@ impl Trajectory {
 
     pub(super) fn observed_reviewer(
         &mut self,
-        model: &str,
         usage: &Value,
         standard: bool,
-        resolved: Option<&ResolvedModel>,
-        write_tariff_known: bool,
+        settled: Option<f64>,
     ) {
         self.result.coverage.reviewer_responses += 1;
         let native = receipt(usage);
@@ -316,10 +315,7 @@ impl Trajectory {
                         .as_u64()
                         .is_some_and(|n| n > 0)
                 });
-        let cost = native
-            .as_ref()
-            .filter(|_| text)
-            .and_then(|u| observed_cost(model, u, resolved, write_tariff_known));
+        let cost = native.as_ref().filter(|_| text).and(settled);
         if let Some(cost) = cost {
             self.result.observed_reviewer_cost += cost;
             self.result.reviewer_cost += cost;
@@ -339,15 +335,16 @@ impl Trajectory {
         }
     }
 
-    pub(super) fn observed_primary(
-        &mut self,
-        body: &Value,
-        response: &Value,
-        route: &str,
-        at: u64,
-        standard: bool,
-        resolved: Option<&ResolvedModel>,
-    ) {
+    pub(super) fn observed_primary(&mut self, primary: PrimaryObservation<'_>) {
+        let PrimaryObservation {
+            body,
+            response,
+            route,
+            at,
+            standard,
+            resolved,
+            cost: settled,
+        } = primary;
         if response["status"] != "completed" {
             self.failed_call();
             return;
@@ -436,14 +433,7 @@ impl Trajectory {
                         .as_u64()
                         .is_some_and(|n| n > 0)
                 });
-        let observed = native.as_ref().filter(|_| billable).and_then(|u| {
-            observed_cost(
-                model,
-                u,
-                resolved,
-                carry::models::cache_write_tariff_known(body),
-            )
-        });
+        let observed = native.as_ref().filter(|_| billable).and(settled);
         if let Some(cost) = observed {
             self.result.observed_primary_cost += cost;
         } else {
@@ -601,10 +591,12 @@ impl Trajectory {
                 .as_ref()
                 .is_some_and(|a| traditional_compatible && at - a.at < ttl)
             && !self.traditional_edited;
-        // The alternative shares total-input units, never observed cache hits:
-        // cache behavior is a conditional append-prefix scenario even before
-        // the first hypothetical edit. The first request of an epoch is cold.
-        let traditional_cost = {
+        // Identical execution has one paid contribution. Only a genuinely
+        // different history asks the cache/tariff forecast a hypothetical price.
+        // Sharing the money does NOT seed divergent cache history with real hits.
+        let traditional_cost = if self.history.shares_primary() {
+            Some(carry)
+        } else {
             scenario_request_input_cost_resolved(
                 body,
                 model,

@@ -310,6 +310,7 @@ fn cache_write188_resolution_upgrade_keeps_old_money_and_disables_future_reads_a
     let mut request = body();
     request["prompt_cache_options"] = json!({"mode":"explicit", "ttl":"30m"});
     let mut t = Trajectory::default();
+    t.projected(100, 100, true);
     t.primary_resolved(
         &request,
         &terminal(2000, 0, 0, 0),
@@ -433,7 +434,9 @@ fn cache_write191_divergent_history_uses_frozen_branch_tiers_and_independent_cac
             } else {
                 (2.0, 0.1, 2.5, 10.0)
             };
-            traditional += (if mode == "implicit" {
+            traditional += (if index == 0 {
+                input as f64 * ordinary
+            } else if mode == "implicit" {
                 cached as f64 * read + (alternative - cached) as f64 * write
             } else {
                 alternative as f64 * ordinary

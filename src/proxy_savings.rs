@@ -300,6 +300,19 @@ pub struct Trajectory {
     #[serde(default)]
     priced_primary_responses: Option<u64>,
 }
+/// A terminal observation with money already settled under dispatch-frozen
+/// tariffs. Comparison may forecast another history, never reprice this one.
+#[derive(Clone, Copy)]
+pub struct PrimaryObservation<'a> {
+    pub body: &'a Value,
+    pub response: &'a Value,
+    pub route: &'a str,
+    pub at: u64,
+    pub standard: bool,
+    pub resolved: Option<&'a ResolvedModel>,
+    pub cost: Option<f64>,
+}
+
 impl Default for Trajectory {
     fn default() -> Self {
         Self {
@@ -311,7 +324,7 @@ impl Default for Trajectory {
             },
             previous: None,
             restored: 0,
-            history: TraditionalHistoryState::default(),
+            history: TraditionalHistoryState::identical(),
             carry_edited: false,
             traditional_edited: false,
             available: true,
@@ -495,6 +508,7 @@ impl Trajectory {
     pub fn projected(&mut self, before: u64, after: u64, edited: bool) {
         let restored = before as i128 - after as i128;
         if edited || self.restored != restored {
+            self.history.diverge();
             if let Some(receipts) = &mut self.receipts {
                 // Carry changed its wire, not the traditional history. The
                 // explicit edit bit preserves equal-token prefix invalidation.
@@ -511,6 +525,7 @@ impl Trajectory {
         self.reviewer_resolved(body, response, standard, None);
     }
 
+    #[cfg(test)]
     pub fn reviewer_resolved(
         &mut self,
         body: &Value,
@@ -537,6 +552,7 @@ impl Trajectory {
         self.reviewer_usage_resolved(model, input, usage, standard, None, true);
     }
 
+    #[cfg(test)]
     pub fn reviewer_usage_resolved(
         &mut self,
         model: &str,
@@ -546,8 +562,24 @@ impl Trajectory {
         resolved: Option<&ResolvedModel>,
         write_tariff_known: bool,
     ) {
+        let settled = receipts::receipt(usage)
+            .filter(|_| standard)
+            .and_then(|u| observed_cost(model, &u, resolved, write_tariff_known));
+        self.reviewer_usage_settled(model, input, usage, standard, resolved, settled);
+    }
+
+    /// Money is already frozen by the paid ledger, including delayed reviews.
+    pub fn reviewer_usage_settled(
+        &mut self,
+        model: &str,
+        input: u64,
+        usage: &Value,
+        standard: bool,
+        resolved: Option<&ResolvedModel>,
+        settled: Option<f64>,
+    ) {
         if self.receipts.is_some() {
-            self.observed_reviewer(model, usage, standard, resolved, write_tariff_known);
+            self.observed_reviewer(usage, standard, settled);
             return;
         }
         self.start_priced_subset();
@@ -597,6 +629,7 @@ impl Trajectory {
         self.primary_resolved(body, response, route, at, standard, None);
     }
 
+    #[cfg(test)]
     pub fn primary_resolved(
         &mut self,
         body: &Value,
@@ -606,10 +639,41 @@ impl Trajectory {
         standard: bool,
         resolved: Option<&ResolvedModel>,
     ) {
+        let settled = receipts::receipt(&response["usage"])
+            .filter(|_| standard)
+            .and_then(|u| {
+                observed_cost(
+                    body["model"].as_str().unwrap_or(""),
+                    &u,
+                    resolved,
+                    carry::models::cache_write_tariff_known(body),
+                )
+            });
+        self.primary_settled(PrimaryObservation {
+            body,
+            response,
+            route,
+            at,
+            standard,
+            resolved,
+            cost: settled,
+        });
+    }
+
+    pub fn primary_settled(&mut self, primary: PrimaryObservation<'_>) {
         if self.receipts.is_some() {
-            self.observed_primary(body, response, route, at, standard, resolved);
+            self.observed_primary(primary);
             return;
         }
+        let PrimaryObservation {
+            body,
+            response,
+            route,
+            at,
+            standard,
+            resolved,
+            ..
+        } = primary;
         self.start_priced_subset();
         if has_native_modalities(body)
             || has_native_modalities(&response["output"])
@@ -826,6 +890,7 @@ fn scenario_output_cost_resolved(
     }
 }
 
+#[cfg(test)]
 fn observed_cost(
     model: &str,
     usage: &Usage,

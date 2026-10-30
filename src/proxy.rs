@@ -2301,26 +2301,27 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
     current.background_review_pending = false;
     for receipt in &run.receipts {
         let resolved = before.model_resolution.as_ref().map(|p| &p.reviewer);
-        if let Some(usage) = &receipt.usage {
-            current.shadow.observe_with_rates(
+        let settled = if let Some(usage) = &receipt.usage {
+            current.shadow.settle_with_rates(
                 &receipt.model,
                 usage,
                 receipt.standard,
                 receipt_rates(&receipt.model, usage, resolved, receipt.write_tariff_known),
-            );
+            )
         } else {
             current.shadow.calls += 1;
             current.shadow.unavailable_cost_calls += 1;
-        }
+            None
+        };
         if let Some(t) = &mut current.cost_trajectory {
             if receipt.completed {
-                t.reviewer_usage_resolved(
+                t.reviewer_usage_settled(
                     &receipt.model,
                     receipt.input,
                     receipt.usage.as_ref().unwrap_or(&Value::Null),
                     receipt.standard,
                     resolved,
-                    receipt.write_tariff_known,
+                    settled,
                 );
             } else {
                 t.failed_reviewer_call();
@@ -2535,7 +2536,7 @@ async fn review_chunk(
                 completed: value["status"] == "completed",
             });
         }
-        session.shadow.observe_with_rates(
+        let settled = session.shadow.settle_with_rates(
             &service.config.classifier_model,
             &value["usage"],
             value.get("service_tier").is_none_or(|v| v == "default"),
@@ -2547,12 +2548,18 @@ async fn review_chunk(
             ),
         );
         if let Some(trajectory) = &mut session.cost_trajectory {
-            trajectory.reviewer_resolved(
-                body,
-                &value,
-                value.get("service_tier").is_none_or(|v| v == "default"),
-                resolved,
-            );
+            if value["status"] == "completed" {
+                trajectory.reviewer_usage_settled(
+                    &service.config.classifier_model,
+                    crate::proxy_savings::token_units(body),
+                    &value["usage"],
+                    value.get("service_tier").is_none_or(|v| v == "default"),
+                    resolved,
+                    settled,
+                );
+            } else {
+                trajectory.failed_reviewer_call();
+            }
         }
         if value["status"] == "completed"
             && let Ok(cache) = history::observe_cache(
@@ -3320,7 +3327,7 @@ async fn relay(
                     .model_resolution
                     .as_ref()
                     .map(|p| &p.primary);
-                commit.candidate.primary.observe_with_rates(
+                let settled = commit.candidate.primary.settle_with_rates(
                     model,
                     &value["usage"],
                     standard(&commit.outbound)
@@ -3346,15 +3353,16 @@ async fn relay(
                                 );
                             }
                         }
-                        trajectory.primary_resolved(
-                            &commit.outbound,
-                            &value,
-                            &commit.service.config.upstream_url,
-                            now(),
-                            standard(&commit.outbound)
+                        trajectory.primary_settled(crate::proxy_savings::PrimaryObservation {
+                            body: &commit.outbound,
+                            response: &value,
+                            route: &commit.service.config.upstream_url,
+                            at: now(),
+                            standard: standard(&commit.outbound)
                                 && value.get("service_tier").is_none_or(|v| v == "default"),
                             resolved,
-                        );
+                            cost: settled,
+                        });
                     }
                 }
                 if commit.native {

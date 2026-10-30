@@ -1,5 +1,58 @@
 // Issue186: native trace/report estimator, separate from proxy native receipts.
 // These tests intentionally precede production changes.
+// Review4424550949: retained instruction roles share the local projection owner.
+fn native_fixed_input_role_comparison(role: &str) {
+    let mut t = Trajectory::with_scenario(Scenario {
+        context_window: 4000,
+        reserve: 100,
+        keep_recent: 1500,
+        summary: 100,
+    });
+    let mut body = json!({"model":"gpt-6.1-sol", "max_output_tokens":1,
+        "input":[{"role":role,"content":" fixed".repeat(5000)},
+                 {"role":"user","content":"current request"}]});
+    for index in 0..2 {
+        if index > 0 {
+            body["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":"continue"}));
+        }
+        let input = prompt_projection(&body).unwrap().2;
+        let before = t.snapshot();
+        t.record(&json!({"event":"model_request","data":{"step":1,"request":body}}));
+        let result = response(&mut t, input, 0, 0);
+        assert!(result.observed_priced);
+        assert!(
+            (result.observed_cost - before.observed_cost - input as f64 * 2.0 / 1e6).abs() < 1e-12
+        );
+        assert_eq!(result.pi_compactions, 0);
+        assert_eq!(result.summary_cost, 0.0);
+        if role == "assistant" {
+            assert_eq!(result.initial_compactions, 1);
+            assert!(result.priced);
+        } else {
+            assert!(
+                !result.priced,
+                "FIXED_INPUT_ROLE_NATIVE: instruction messages cannot be hypothetically retired"
+            );
+            assert_eq!(result.initial_compactions, 0);
+        }
+    }
+}
+#[test]
+fn native_fixed_input_system_role_cannot_be_retired() {
+    native_fixed_input_role_comparison("system");
+}
+#[test]
+fn native_fixed_input_developer_role_cannot_be_retired() {
+    native_fixed_input_role_comparison("developer");
+}
+#[test]
+fn native_fixed_input_assistant_history_can_be_retired() {
+    native_fixed_input_role_comparison("assistant");
+}
+
 #[test]
 fn initialization186_native_paid_compaction_retains_fixed_floor() {
     let scenario = Scenario {

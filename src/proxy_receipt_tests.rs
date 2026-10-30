@@ -87,6 +87,74 @@ fn output_allowance_preserves_history(initialized: bool) {
     }
 }
 
+// Review4424550949: input instruction roles are fixed, not old chat history.
+fn fixed_input_role_comparison(role: &str) {
+    let mut t = Trajectory {
+        scenario: Scenario {
+            context_window: 4000,
+            reserve: 100,
+            keep_recent: 1500,
+            summary: 100,
+        },
+        ..Trajectory::default()
+    };
+    let mut request = json!({"model":"gpt-6.1-sol", "max_output_tokens":1,
+        "input":[{"role":role,"content":" fixed".repeat(5000)},
+                 {"role":"user","content":"current request"}]});
+    for index in 0..2 {
+        if index > 0 {
+            request["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":"continue"}));
+        }
+        let before = t.snapshot();
+        let input = 5100 + index * 100;
+        t.primary(
+            &request,
+            &terminal(input, 0, 0, 0),
+            "fixed-role",
+            100 + index,
+            true,
+        );
+        let result = t.snapshot();
+        assert!(
+            (result.observed_primary_cost
+                - before.observed_primary_cost
+                - input as f64 * 2.0 / 1e6)
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(result.traditional_compactions, 0);
+        assert_eq!(result.summary_cost, 0.0);
+        if role == "assistant" {
+            assert_eq!(result.initial_compactions, 1);
+            assert_eq!(result.matched_primary_responses, index + 1);
+            assert!(result.priced);
+        } else {
+            assert_eq!(
+                result.matched_primary_responses, 0,
+                "FIXED_INPUT_ROLE: instruction messages cannot be hypothetically retired"
+            );
+            assert_eq!(result.initial_compactions, 0);
+            assert!(!result.priced);
+        }
+        t = serde_json::from_value(state(&t)).unwrap();
+    }
+}
+#[test]
+fn fixed_input_system_role_cannot_be_retired_across_restart() {
+    fixed_input_role_comparison("system");
+}
+#[test]
+fn fixed_input_developer_role_cannot_be_retired_across_restart() {
+    fixed_input_role_comparison("developer");
+}
+#[test]
+fn fixed_input_assistant_history_can_be_retired_across_restart() {
+    fixed_input_role_comparison("assistant");
+}
+
 #[test]
 fn history_contract_output_allowance_preserves_free_initialized_growth() {
     output_allowance_preserves_history(true);
@@ -383,7 +451,7 @@ fn initialization186_output_trigger_cannot_compact_unallocated_image_input() {
         if cap == 1 {
             assert_eq!(result.coverage.unmodeled_calls, 0);
             assert_eq!(result.matched_primary_responses, 1);
-            assert!((result.traditional_cost - 0.5025).abs() < 1e-12);
+            assert!((result.traditional_cost - result.observed_primary_cost).abs() < 1e-12);
         } else {
             assert_eq!(result.coverage.unmodeled_calls, 1);
             assert_eq!(result.excluded_unpriced_calls, 1);
@@ -482,7 +550,7 @@ fn initialization186_omitted_output_uses_frozen_capacity_reserve() {
         if cap.is_some() {
             assert_eq!(result.initial_compactions, 0);
             assert_eq!(result.matched_primary_responses, 1);
-            assert!((result.traditional_cost - 0.1).abs() < 1e-12);
+            assert!((result.traditional_cost - result.observed_primary_cost).abs() < 1e-12);
         } else if reserve == 16384 {
             assert_eq!(
                 result.initial_compactions, 1,
@@ -674,6 +742,9 @@ fn receipt_current_projection_repeats_changes_and_retains_without_accumulation()
         ..Trajectory::default()
     };
     let mut retained = projected.clone();
+    // Both controls forecast a distinct history; the latest zero projection
+    // does not prove their previous executions were equal to the paid path.
+    retained.projected(100, 100, true);
     // Two copies of the original 1000-unit omission would cross 3500;
     // neither the real 3000-unit original nor any current projection does.
     for (i, difference) in [1000_i128, 1000, 500, 1500, -200, 0]
@@ -924,6 +995,8 @@ fn receipt_counterfactual_cache_is_conditional_not_copied_from_actual_hits() {
         (2000, 1800),
     ] {
         let mut t = Trajectory::default();
+        // A genuine equal-token rewrite keeps this a divergent-forecast control.
+        t.projected(100, 100, true);
         t.primary(&body(), &terminal(input, input, 0, 0), "route", 100, true);
         let before = t.snapshot();
         let mut appended = body();
@@ -960,6 +1033,8 @@ fn receipt_subscription_traditional_cache_uses_model_policy_not_transport_capabi
             resolve_model(model, Route::new(endpoint, subscription), None, None, 0, 0).unwrap();
         let route_cache = resolved.cache;
         let mut t = Trajectory::default();
+        // A genuine equal-token rewrite keeps this a divergent-forecast control.
+        t.projected(100, 100, true);
         // A real hit does not warm the hypothetical branch's first request.
         t.primary_resolved(
             &body(),
@@ -1059,6 +1134,8 @@ fn receipt_failed_reviewer_does_not_invalidate_primary_or_traditional_cache() {
     for status in ["failed", "incomplete"] {
         for restart in [false, true] {
             let mut t = Trajectory::default();
+            // A genuine equal-token rewrite keeps this a divergent-forecast control.
+            t.projected(100, 100, true);
             t.primary(&body(), &terminal(2000, 0, 0, 0), "route", 100, true);
             let before = t.snapshot();
             let mut failed = terminal(1000, 0, 0, 10);
@@ -1105,6 +1182,8 @@ fn receipt_frozen_scenario_policy_and_tariff_survive_restart_without_route_credi
     policy.minimum_prefix_tokens = Some(1500);
     policy.ttl_seconds = 7;
     let mut t = Trajectory::default();
+    // A genuine equal-token rewrite keeps this a divergent-forecast control.
+    t.projected(100, 100, true);
     t.primary_resolved(
         &body(),
         &terminal(2000, 1000, 0, 0),
@@ -1170,6 +1249,8 @@ fn receipt_policy_upgrade_freezes_legacy_segment_and_starts_cold() {
         .remove("scenario_cache");
     let old_resolution: ResolvedModel = serde_json::from_value(old_resolution).unwrap();
     let mut t = Trajectory::default();
+    // A genuine equal-token rewrite keeps this a divergent-forecast control.
+    t.projected(100, 100, true);
     t.primary_resolved(
         &body(),
         &terminal(2000, 1000, 0, 0),
@@ -1281,6 +1362,8 @@ fn receipt_traditional_cache_invalidations_are_independent_and_conservative() {
         )
         .unwrap();
         let mut t = Trajectory::default();
+        // A genuine equal-token rewrite keeps this a divergent-forecast control.
+        t.projected(100, 100, true);
         t.primary_resolved(
             &body(),
             &terminal(2000, 0, 0, 0),
@@ -1448,6 +1531,8 @@ fn receipt_unknown_scenario_cache_policy_stays_uncached_and_unknown_rates_stay_u
         .unwrap()
         .minimum_prefix_tokens = None;
     let mut t = Trajectory::default();
+    // A genuine equal-token rewrite keeps this a divergent-forecast control.
+    t.projected(100, 100, true);
     let mut b = body();
     for at in 100..102 {
         b["input"]
@@ -1578,12 +1663,8 @@ fn receipt_fixed_body_changes_both_branches_and_both_actual_lanes() {
             "actual primary must use native partitions"
         );
         assert!(
-            (primary.traditional_cost
-                - scenario_input_cost("gpt-6.1-sol", input, 0, Some(1024)).unwrap()
-                - scenario_output_cost_resolved("gpt-6.1-sol", input, 10, None).unwrap())
-            .abs()
-                < 1e-12,
-            "the counterfactual must share the native input basis, not unchanged JSON tokens"
+            (primary.traditional_cost - expected).abs() < 1e-12,
+            "identical execution shares native money, not imagined cache partitions"
         );
         t.reviewer(&body(), &r, true);
         assert!(

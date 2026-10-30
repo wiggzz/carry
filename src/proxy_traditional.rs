@@ -106,6 +106,10 @@ pub(super) struct HistoryContinuity {
 /// mutable access through this API. The legacy decoder is a separate boundary.
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub(super) struct TraditionalHistoryState {
+    // Proof for the entire comparison history, not a last-plan/no-op flag.
+    // Missing legacy proof never opts into sharing a provider observation.
+    #[serde(default)]
+    shared_primary_history: bool,
     pub(super) retired: u64,
     pub(super) summary: u64,
     pub(super) last_traditional_input: u64,
@@ -113,6 +117,21 @@ pub(super) struct TraditionalHistoryState {
     pub(super) history_continuity: Option<HistoryContinuity>,
 }
 impl TraditionalHistoryState {
+    pub(super) fn identical() -> Self {
+        Self {
+            shared_primary_history: true,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn shares_primary(&self) -> bool {
+        self.shared_primary_history
+    }
+
+    pub(super) fn diverge(&mut self) {
+        self.shared_primary_history = false;
+    }
+
     pub(super) fn compatible(
         &self,
         contract: &HistoryContract,
@@ -135,6 +154,7 @@ impl TraditionalHistoryState {
     }
 
     pub(super) fn summarize(&mut self, total: u64, kept: u64, summary: u64) {
+        self.diverge();
         self.retired = self
             .retired
             .saturating_add(total.saturating_sub(kept).saturating_sub(self.summary));

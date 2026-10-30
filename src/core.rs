@@ -117,6 +117,17 @@ impl UsageLedger {
         standard: bool,
         rates: Option<Rates>,
     ) {
+        let _ = self.settle_with_rates(model, usage, standard, rates);
+    }
+
+    /// Commit and return this receipt's frozen contribution, not a ledger delta.
+    pub fn settle_with_rates(
+        &mut self,
+        model: &str,
+        usage: &Value,
+        standard: bool,
+        rates: Option<Rates>,
+    ) -> Option<f64> {
         if rates.is_none() {
             self.unpriced_models.insert(model.to_owned());
         }
@@ -159,6 +170,7 @@ impl UsageLedger {
         } else {
             complete = false;
         }
+        let mut settled = None;
         if let (Some(input), Some(output), Some(cached), Some(rates)) =
             (input, output, cached, rates)
             && standard
@@ -179,6 +191,7 @@ impl UsageLedger {
             let total = self.cost_usd + cost;
             if cost.is_finite() && total.is_finite() {
                 self.cost_usd = total;
+                settled = Some(cost);
             } else {
                 complete = false;
             }
@@ -188,5 +201,8 @@ impl UsageLedger {
         if !complete {
             self.unavailable_cost_calls = self.unavailable_cost_calls.saturating_add(1);
         }
+        // The coordinator consumes this contribution; it must not independently
+        // reprice the same paid receipt or subtract cumulative rounded totals.
+        settled
     }
 }
