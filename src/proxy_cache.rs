@@ -393,6 +393,33 @@ mod tests {
         assert_eq!(serde_json::to_value(resumed).unwrap(), value);
     }
 
+    // Review5716439062: retention is not a cache miss. The original pressure
+    // test covers storage bounds; this checks the retained coverage itself.
+    #[test]
+    fn modeled_write_pressure_preserves_unexpired_root_coverage_after_restart() {
+        let mut cache = ModeledCache::default();
+        for input in 2000..=2128 {
+            let cached = cache.eligible_at("synthetic-pressure", 100, input);
+            assert_eq!(cached, if input == 2000 { 0 } else { input - 1 });
+            cache.written("synthetic-pressure".into(), 100, 1800, input, cached);
+        }
+        let encoded = serde_json::to_vec(&cache).unwrap();
+        let resumed: ModeledCache = serde_json::from_slice(&encoded).unwrap();
+        assert!(encoded.len() < 8192);
+        assert_eq!(
+            resumed.eligible_at("synthetic-pressure", 100, 2128),
+            2128,
+            "CACHE_RETENTION_COVERAGE: evicting numeric records is not a cold-write event"
+        );
+        for at in [100, 1899] {
+            assert_eq!(resumed.eligible_at("synthetic-pressure", at, 2128), 2128);
+        }
+        assert_eq!(resumed.eligible_at("synthetic-pressure", 1900, 2128), 0);
+        assert_eq!(resumed.eligible_at("other-scope", 100, 2128), 0);
+        assert_eq!(resumed.eligible_at("synthetic-pressure", 99, 2128), 0);
+        assert_eq!(serde_json::to_vec(&resumed).unwrap(), encoded);
+    }
+
     // A native read receipt proves this request's hit, not its write timestamp.
     // Keep it as an observation; a future guarantee needs timing/refresh proof.
     #[test]

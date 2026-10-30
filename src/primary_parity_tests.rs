@@ -181,6 +181,115 @@ fn modeled_cache_equivalent_options_keep_warmth_in_both_quantity_adapters() {
     }
 }
 
+// Review5716439062: exercise the real consumers past the 128-event retention
+// boundary, not just the container's serialized length. Both histories really
+// diverge before the first request; observed zero-write receipts stay independent.
+fn modeled_write_pressure_costs(native_adapter: bool) {
+    let mut live = Trajectory::default();
+    live.projected(100, 100, true);
+    let mut events = vec![
+        json!({"event":"run_started","data":{"model":"gpt-6.1-sol",
+            "cache_ttl_seconds":1800,"implicit_cache_minimum_prefix_tokens":1024}}),
+        json!({"event":"context_compacted","data":{"compaction_token_delta":0}}),
+    ];
+    let mut native = crate::savings::Trajectory::default();
+    for event in &events {
+        native.record(event);
+    }
+    let mut request = json!({"model":"gpt-6.1-sol","max_output_tokens":1,
+        "prompt_cache_key":"synthetic-pressure",
+        "input":[{"role":"user","content":"synthetic retained prefix ".repeat(400)}]});
+    let mut previous_input = 0;
+    let mut mismatches = Vec::new();
+    for step in 0..132 {
+        if step > 0 {
+            request["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":format!("append {step}")}));
+        }
+        let input = crate::savings::prompt_projection(&request).unwrap().2;
+        assert!(input > 1024 && input > previous_input);
+        live = serde_json::from_value(state(&live)).unwrap();
+        let before = live.snapshot();
+        let native_before = native.snapshot();
+        live.primary(
+            &request,
+            &terminal(input, 0, 0, 0),
+            "synthetic-pressure",
+            100,
+            true,
+        );
+        let req = json!({"event":"model_request","timestamp_ms":100000,
+            "data":{"step":step,"route":"synthetic-pressure","request":request}});
+        let res = json!({"event":"model_response","timestamp_ms":100000,
+            "data":{"step":step,"usage":{"input_tokens":input,"output_tokens":0,
+                "cached_input_tokens":0,"cache_write_input_tokens":0},"raw":{"output":[]}}});
+        native.record(&req);
+        native.record(&res);
+        events.extend([req, res]);
+        let after = live.snapshot();
+        let n = native.snapshot();
+        assert!(after.priced && n.priced && n.observed_priced);
+        assert_eq!(after.excluded_unpriced_calls, 0);
+        assert_eq!(after.matched_primary_responses, step + 1);
+        assert_eq!(n.coverage.responses, step as usize + 1);
+        assert_eq!(after.initial_compactions, 0);
+        assert_eq!(after.traditional_compactions, 0);
+        assert_eq!(n.initial_compactions, 0);
+        assert_eq!(n.pi_compactions, 0);
+        assert_eq!(after.summary_cost, 0.0);
+        assert_eq!(n.summary_cost, 0.0);
+        assert_eq!(live.history.last_traditional_input, input);
+        let actual = input as f64 * 2.0 / 1e6;
+        assert!(
+            (after.observed_primary_cost - before.observed_primary_cost - actual).abs() < 1e-12
+        );
+        assert!((after.carry_cost - before.carry_cost - actual).abs() < 1e-12);
+        assert!((n.observed_cost - native_before.observed_cost - actual).abs() < 1e-12);
+        assert!((n.carry_cost - native_before.carry_cost - actual).abs() < 1e-12);
+        // Every write is at100 with lifetime1800. No expiry, native hit, cache
+        // policy change or summary can justify making this prefix cold.
+        let expected = (previous_input as f64 * 0.1 + (input - previous_input) as f64 * 2.5) / 1e6;
+        let delta = if native_adapter {
+            n.pi_cost - native_before.pi_cost
+        } else {
+            after.traditional_cost - before.traditional_cost
+        };
+        if (delta - expected).abs() >= 1e-12 {
+            mismatches.push((step, input, expected, delta));
+        }
+        // Replaying the immutable native event prefix is its restart boundary.
+        // Do it after the cap-triggering append and before the next priced call.
+        if step == 128 {
+            let mut replay = crate::savings::Trajectory::default();
+            for event in &events {
+                replay.record(event);
+            }
+            assert_eq!(
+                serde_json::to_value(replay.snapshot()).unwrap(),
+                serde_json::to_value(n).unwrap()
+            );
+            native = replay;
+        }
+        previous_input = input;
+    }
+    assert!(
+        mismatches.is_empty(),
+        "CACHE_RETENTION_MONEY: numeric eviction cannot manufacture a cold charge; native={native_adapter}, mismatches={mismatches:?}"
+    );
+}
+
+#[test]
+fn modeled_write_pressure_keeps_live_money_across_restart() {
+    modeled_write_pressure_costs(false);
+}
+
+#[test]
+fn modeled_write_pressure_keeps_native_report_money_across_replay() {
+    modeled_write_pressure_costs(true);
+}
+
 fn cache_options_preserve_summarized_growth(initialized: bool) {
     let mut t = Trajectory::default();
     let mut request = body();
