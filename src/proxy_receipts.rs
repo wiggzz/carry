@@ -415,13 +415,22 @@ impl Trajectory {
             self.reset_epoch();
             return;
         }
-        let (Some(native), Some(carry), Some((_, _, local)), Some(items), Some(retained_output)) = (
+        let (
+            Some(native),
+            Some(carry),
+            Some((_, _, local)),
+            Some(items),
+            Some(retained_output),
+            Some(protected),
+        ) = (
             native,
             observed,
             projection,
             body["input"].as_array(),
             retained_output,
-        ) else {
+            crate::savings::protected_prompt_tokens(body),
+        )
+        else {
             self.result.excluded_unpriced_calls += 1;
             self.reset_epoch();
             return;
@@ -484,7 +493,8 @@ impl Trajectory {
             && self.receipts.as_ref().unwrap().history_anchor.is_none()
             && traditional > budget
         {
-            let initialized = kept.saturating_add(self.scenario.summary);
+            let initial_kept = kept.max(protected);
+            let initialized = initial_kept.saturating_add(self.scenario.summary);
             if initialized > budget || initialized >= traditional {
                 self.result.excluded_unpriced_calls += 1;
                 self.reset_epoch();
@@ -492,7 +502,7 @@ impl Trajectory {
             }
             self.retired = self.retired.saturating_add(
                 traditional
-                    .saturating_sub(kept)
+                    .saturating_sub(initial_kept)
                     .saturating_sub(self.summary),
             );
             self.summary = self.scenario.summary;
@@ -613,7 +623,6 @@ impl Trajectory {
 }
 
 fn projection_fixed_tokens(body: &Value) -> u64 {
-    // Same local prompt-bearing overhead projection as the native estimator.
     token_units(&json!({"instructions":body.get("instructions"),
         "tools":body.get("tools"),"text":body.get("text")}))
 }

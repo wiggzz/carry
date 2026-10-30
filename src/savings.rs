@@ -71,7 +71,7 @@ struct Prompt {
     overhead: String,
     route: String,
     input: u64,
-    fixed_input: u64,
+    protected_input: u64,
     cached_at_ms: Option<u64>,
     cache_mode: ScenarioCacheMode,
     write_tariff_known: bool,
@@ -277,7 +277,7 @@ impl Trajectory {
                     if !self.initialized && self.scenario.valid() {
                         let budget = self.scenario.context_window - self.scenario.reserve;
                         if pi_input > budget {
-                            let kept = self.scenario.keep_recent.max(prompt.fixed_input);
+                            let kept = self.scenario.keep_recent.max(prompt.protected_input);
                             let compacted = kept.saturating_add(self.scenario.summary);
                             if compacted > budget || compacted >= pi_input {
                                 self.scenario_available = false;
@@ -491,21 +491,27 @@ pub(crate) fn prompt_projection(body: &Value) -> Option<(String, String, u64)> {
     let prefix = format!("{overhead}{}", &serialized[..serialized.len() - 1]);
     Some((prefix, overhead, units))
 }
+/// Initialization may retire history, never fixed overhead or the current turn.
+/// Keep the same local prompt units as `prompt_projection` in both estimators.
+pub(crate) fn protected_prompt_tokens(body: &Value) -> Option<u64> {
+    let input = body["input"].as_array()?;
+    let current = input.iter().rposition(|item| item["role"] == "user");
+    let protected = current.map_or(&input[input.len()..], |start| &input[start..]);
+    let overhead = json!({"instructions":body.get("instructions"),"tools":body.get("tools"),"text":body.get("text")});
+    Some(token_units(&json!({"overhead":overhead,"input":protected})))
+}
+
 fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
     let request = &data["request"];
     let (prefix, overhead, input) = prompt_projection(request)?;
-    // Fixed request overhead cannot be discarded to invent a fitting history.
-    let fixed_input = token_units(&json!({
-        "overhead": serde_json::from_str::<Value>(&overhead).ok()?,
-        "input": [],
-    }));
+    let protected_input = protected_prompt_tokens(request)?;
     // Semantic policy is compared separately; equivalent default spellings do
     // not change the real route/key or force an artificial cold request.
     let route=serde_json::to_string(&json!({"api_base":data["transport"].get("api_base"),"route":data.get("route"),"cache_key":request.get("prompt_cache_key")})).ok()?;
     Some(Prompt {
         model: request["model"].as_str().unwrap_or(fallback).to_owned(),
         input,
-        fixed_input,
+        protected_input,
         prefix,
         overhead,
         route,
