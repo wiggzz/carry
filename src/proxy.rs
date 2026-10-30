@@ -2940,9 +2940,10 @@ fn memory_admission_fits(config: &ProxyCli, session: &Session, omitted: &HashSet
 }
 
 fn primary_output_reserve(config: &ProxyCli, body: &Value) -> u64 {
-    body["max_output_tokens"]
-        .as_u64()
-        .unwrap_or(config.primary_output_reserve_tokens as u64)
+    carry::models::output_allowance(
+        body["max_output_tokens"].as_u64(),
+        u64::from(config.primary_output_reserve_tokens),
+    )
 }
 
 fn primary_required_tokens(config: &ProxyCli, body: &Value) -> f64 {

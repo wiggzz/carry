@@ -392,8 +392,14 @@ impl Trajectory {
             }
         }
         let retained_output = retained_output_tokens(&response["output"]);
-        let budget = self.scenario.initial_input_budget(
+        let allowance = carry::models::output_allowance(
             body["max_output_tokens"].as_u64(),
+            resolved.map_or(self.scenario.reserve, |r| {
+                u64::from(r.ordinary.output_reserve)
+            }),
+        );
+        let budget = self.scenario.initial_input_budget(
+            allowance,
             resolved.and_then(|r| r.capacity_tokens.map(u64::from)),
         );
         // An unchanged image-bearing request can share its exact receipt total

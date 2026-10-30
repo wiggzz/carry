@@ -17,13 +17,14 @@ impl Scenario {
     /// hard capacity. This is feasibility, not expected or billable generation.
     pub(crate) fn initial_input_budget(
         &self,
-        requested_output: Option<u64>,
+        output_allowance: u64,
         hard_capacity: Option<u64>,
     ) -> u64 {
-        let output = requested_output.unwrap_or(0);
-        let economic = self.context_window.saturating_sub(self.reserve.max(output));
+        let economic = self
+            .context_window
+            .saturating_sub(self.reserve.max(output_allowance));
         hard_capacity.map_or(economic, |capacity| {
-            economic.min(capacity.saturating_sub(output))
+            economic.min(capacity.saturating_sub(output_allowance))
         })
     }
 
@@ -291,9 +292,11 @@ impl Trajectory {
                     // Initialize before pricing the first compared primary.
                     // Cache expiry does not erase known traditional history.
                     if !self.initialized && self.scenario.valid() {
-                        let budget = self
-                            .scenario
-                            .initial_input_budget(prompt.requested_output, None);
+                        let allowance = carry::models::output_allowance(
+                            prompt.requested_output,
+                            self.scenario.reserve,
+                        );
+                        let budget = self.scenario.initial_input_budget(allowance, None);
                         if pi_input > budget {
                             let kept = self.scenario.keep_recent.max(prompt.protected_input);
                             let compacted = kept.saturating_add(self.scenario.summary);
