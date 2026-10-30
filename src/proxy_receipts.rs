@@ -392,9 +392,10 @@ impl Trajectory {
             }
         }
         let retained_output = retained_output_tokens(&response["output"]);
-        let budget = self
-            .scenario
-            .initial_input_budget(body["max_output_tokens"].as_u64());
+        let budget = self.scenario.initial_input_budget(
+            body["max_output_tokens"].as_u64(),
+            resolved.and_then(|r| r.capacity_tokens.map(u64::from)),
+        );
         // An unchanged image-bearing request can share its exact receipt total
         // between both branches. A projected/restored/summary slice cannot use
         // base64 length or an invented per-image allocation as native tokens.
