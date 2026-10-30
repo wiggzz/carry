@@ -30,9 +30,9 @@ fn output_allowance_preserves_history(initialized: bool) {
             true,
         );
     }
-    assert_eq!(t.retired, 280000);
-    assert_eq!(t.summary, 1000);
-    assert_eq!(t.last_traditional_input, 21200);
+    assert_eq!(t.history.retired, 280000);
+    assert_eq!(t.history.summary, 1000);
+    assert_eq!(t.history.last_traditional_input, 21200);
     let before = t.snapshot();
     assert_eq!(before.initial_compactions, u64::from(initialized));
     assert_eq!(before.traditional_compactions, u64::from(!initialized));
@@ -73,10 +73,13 @@ fn output_allowance_preserves_history(initialized: bool) {
             after.initial_compactions, before.initial_compactions,
             "changing output allowance cannot grant another free initialization"
         );
-        assert_eq!(t.retired, 280000, "retain the original retired quantity");
-        assert_eq!(t.summary, 1000);
         assert_eq!(
-            t.last_traditional_input,
+            t.history.retired, 280000,
+            "retain the original retired quantity"
+        );
+        assert_eq!(t.history.summary, 1000);
+        assert_eq!(
+            t.history.last_traditional_input,
             21300 + offset as u64 * 100,
             "retain every appended native-input token"
         );
@@ -156,13 +159,18 @@ fn receipt_policy_migration_preserves_summary_with_exact_legacy_contract() {
                 true,
                 Some(&prior),
             );
-            assert_eq!(t.retired, 3500);
-            assert_eq!(t.summary, 500);
+            assert_eq!(t.history.retired, 3500);
+            assert_eq!(t.history.summary, 500);
             let before = t.snapshot();
             assert_eq!(before.initial_compactions, u64::from(initialized));
             assert_eq!(before.traditional_compactions, u64::from(!initialized));
             assert_eq!(before.summary_cost > 0.0, !initialized);
-            t = serde_json::from_value(state(&t)).unwrap();
+            let mut legacy = state(&t);
+            // Preserve the original exact-old-contract migration control even
+            // though new successful windows now persist a structured cursor.
+            legacy.as_object_mut().unwrap().remove("history_continuity");
+            legacy["receipts"]["history_anchor"] = legacy["receipts"]["anchor"].clone();
+            t = serde_json::from_value(legacy).unwrap();
             b["input"]
                 .as_array_mut()
                 .unwrap()
@@ -187,9 +195,9 @@ fn receipt_policy_migration_preserves_summary_with_exact_legacy_contract() {
             );
             assert_eq!(after.initial_compactions, u64::from(initialized));
             assert_eq!(after.summary_cost, before.summary_cost);
-            assert_eq!(t.retired, 3500);
-            assert_eq!(t.summary, 500);
-            assert_eq!(t.last_traditional_input, 2100);
+            assert_eq!(t.history.retired, 3500);
+            assert_eq!(t.history.summary, 500);
+            assert_eq!(t.history.last_traditional_input, 2100);
             let cold =
                 scenario_input_cost_resolved("gpt-6.1-sol", 2100, 0, Some(1024), Some(&current))
                     .unwrap();
@@ -304,6 +312,10 @@ fn receipt_policy_migration_does_not_bypass_trajectory_guards() {
             "input" => input = 4900,
             "missing_proof" => {
                 let mut saved = state(&t);
+                // This old-decoder control must actually select legacy state;
+                // a typed cursor no longer depends on the opaque cache digest.
+                saved.as_object_mut().unwrap().remove("history_continuity");
+                saved["receipts"]["history_anchor"] = saved["receipts"]["anchor"].clone();
                 saved["receipts"]["configuration"] = json!("mismatched");
                 t = serde_json::from_value(saved).unwrap();
             }
@@ -321,9 +333,18 @@ fn receipt_policy_migration_does_not_bypass_trajectory_guards() {
         );
         assert_eq!(
             t.snapshot().initial_compactions,
-            2,
-            "{change} must invalidate the prior summary"
+            if matches!(change, "rates" | "tier") {
+                1
+            } else {
+                2
+            },
+            "{change}: pricing is not a history contract; legacy/ancestry guards remain"
         );
+        if matches!(change, "rates" | "tier") {
+            assert_eq!(t.history.retired, 3500);
+            assert_eq!(t.history.summary, 500);
+            assert_eq!(t.history.last_traditional_input, 2100);
+        }
     }
 }
 
@@ -411,7 +432,7 @@ fn initialization186_resolved_hard_capacity_bounds_the_counterfactual() {
             );
             assert_eq!(result.matched_primary_responses, 1);
             assert!((result.traditional_cost - 0.0525).abs() < 1e-12);
-            assert!(t.last_traditional_input + cap <= 50000);
+            assert!(t.history.last_traditional_input + cap <= 50000);
         } else {
             assert_eq!(result.initial_compactions, 0);
             assert_eq!(
@@ -469,7 +490,7 @@ fn initialization186_omitted_output_uses_frozen_capacity_reserve() {
             );
             assert_eq!(result.matched_primary_responses, 1);
             assert!((result.traditional_cost - 0.0525).abs() < 1e-12);
-            assert!(t.last_traditional_input + u64::from(reserve) <= 50000);
+            assert!(t.history.last_traditional_input + u64::from(reserve) <= 50000);
         } else {
             assert_eq!(result.initial_compactions, 0);
             assert_eq!(
@@ -560,7 +581,7 @@ fn receipt_image_input_uses_native_totals_not_encoded_payload_length() {
         assert_eq!(first.unavailable_primary_cost_calls, 0);
         assert_eq!(first.matched_primary_responses, 1);
         assert_eq!(first.coverage.unmodeled_calls, 0);
-        assert_eq!(t.last_traditional_input, 4000);
+        assert_eq!(t.history.last_traditional_input, 4000);
         assert_eq!(t.receipt_prediction(&request, "route", None), Some(4000));
         costs.push(first.observed_primary_cost);
         t = serde_json::from_value(state(&t)).unwrap();
@@ -713,8 +734,8 @@ fn receipt_projection_preserves_legitimate_summary_retirement_and_failed_paid_sc
     t.primary(&request, &terminal(4000, 0, 0, 0), "route", 100, true);
     assert_eq!(t.snapshot().initial_compactions, 0);
     assert_eq!(t.snapshot().traditional_compactions, 1);
-    let retired = t.retired;
-    let summary = t.summary;
+    let retired = t.history.retired;
+    let summary = t.history.summary;
     for at in [101, 102, 103] {
         t.projected(5000, 4000, true);
         let before = t.snapshot();
@@ -727,9 +748,9 @@ fn receipt_projection_preserves_legitimate_summary_retirement_and_failed_paid_sc
             assert_eq!(t.snapshot().coverage.failed_calls, 1);
         }
         t.primary(&body(), &terminal(3500, 0, 0, 0), "route", at, true);
-        assert_eq!(t.retired, retired);
-        assert_eq!(t.summary, summary);
-        assert_eq!(t.last_traditional_input, 4500 - retired + summary);
+        assert_eq!(t.history.retired, retired);
+        assert_eq!(t.history.summary, summary);
+        assert_eq!(t.history.last_traditional_input, 4500 - retired + summary);
         assert_eq!(t.snapshot().traditional_compactions, 1);
         t = serde_json::from_value(state(&t)).unwrap();
     }
@@ -748,7 +769,7 @@ fn receipt_equal_size_projection_edit_invalidates_actual_not_traditional_anchor(
     let mut edited = body();
     edited["input"][0]["content"] = json!("different equal-size synthetic memory");
     t.primary(&edited, &terminal(2000, 0, 0, 0), "route", 101, true);
-    assert_eq!(t.last_traditional_input, 2000);
+    assert_eq!(t.history.last_traditional_input, 2000);
     assert!(state(&t)["receipts"]["last_appended_input"].is_null());
 }
 
@@ -1336,7 +1357,7 @@ fn receipt_traditional_summary_is_cold_then_rewarms_its_own_prefix() {
     let before = t.snapshot();
     // A real continuation includes the retained visible output in total input.
     // Keep that measured quantity, rather than an inconsistent nominal 3900.
-    let next_input = t.retired + 1700 - t.summary;
+    let next_input = t.history.retired + 1700 - t.history.summary;
     for (at, input, traditional_input, cached) in [
         (101, next_input, 1700, 0),
         (102, next_input + 100, 1800, 1700),

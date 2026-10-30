@@ -28,6 +28,9 @@ pub fn accounting_basis_label() -> String {
 
 #[path = "proxy_receipts.rs"]
 mod receipts;
+#[path = "proxy_traditional.rs"]
+mod traditional;
+use traditional::{HistoryContract, TraditionalHistoryState};
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Coverage {
@@ -283,9 +286,8 @@ pub struct Trajectory {
     result: Estimate,
     previous: Option<Prompt>,
     restored: i128,
-    retired: u64,
-    summary: u64,
-    last_traditional_input: u64,
+    #[serde(flatten)]
+    history: TraditionalHistoryState,
     carry_edited: bool,
     traditional_edited: bool,
     available: bool,
@@ -309,9 +311,7 @@ impl Default for Trajectory {
             },
             previous: None,
             restored: 0,
-            retired: 0,
-            summary: 0,
-            last_traditional_input: 0,
+            history: TraditionalHistoryState::default(),
             carry_edited: false,
             traditional_edited: false,
             available: true,
@@ -475,9 +475,7 @@ impl Trajectory {
         // assumptions do not cross an ancestry discontinuity.
         self.previous = None;
         self.restored = 0;
-        self.retired = 0;
-        self.summary = 0;
-        self.last_traditional_input = 0;
+        self.history = TraditionalHistoryState::default();
         self.carry_edited = false;
         self.traditional_edited = false;
     }
@@ -646,8 +644,8 @@ impl Trajectory {
         }
         let traditional_input = (prompt.input as i128)
             .saturating_add(self.restored)
-            .saturating_sub(self.retired as i128)
-            .saturating_add(self.summary as i128)
+            .saturating_sub(self.history.retired as i128)
+            .saturating_add(self.history.summary as i128)
             .clamp(0, u64::MAX as i128) as u64;
         let compatible = self.previous.as_ref().is_some_and(|previous| {
             previous.model == prompt.model
@@ -669,7 +667,7 @@ impl Trajectory {
         // scenario explicitly assumes frozen-size append reuse until its summary.
         let traditional_cached =
             if compatible && (append || self.carry_edited) && !self.traditional_edited {
-                self.last_traditional_input.min(traditional_input)
+                self.history.last_traditional_input.min(traditional_input)
             } else {
                 0
             };
@@ -748,16 +746,13 @@ impl Trajectory {
             self.result.excluded_unpriced_calls += 1;
             false
         };
-        self.last_traditional_input = traditional_input;
+        self.history.last_traditional_input = traditional_input;
         self.carry_edited = false;
         self.traditional_edited = false;
         if summarize {
             self.result.traditional_compactions += 1;
-            self.retired = self
-                .retired
-                .saturating_add(discarded.saturating_sub(self.summary));
-            self.summary = self.scenario.summary;
-            self.last_traditional_input = self.scenario.keep_recent.saturating_add(self.summary);
+            self.history
+                .summarize(total, self.scenario.keep_recent, self.scenario.summary);
             self.traditional_edited = true;
         }
         // An unknown intervening primary must never leave a stale cache hit.
@@ -955,7 +950,7 @@ mod tests {
                 if !crossing {
                     continue;
                 }
-                assert_eq!(trajectory.last_traditional_input, 1600);
+                assert_eq!(trajectory.history.last_traditional_input, 1600);
                 assert!(trajectory.traditional_edited);
                 let mut resumed: Trajectory =
                     serde_json::from_value(serde_json::to_value(&trajectory).unwrap()).unwrap();
@@ -968,8 +963,8 @@ mod tests {
                     json!({"type": "function_call_output", "call_id": "call_1", "output": "ok"}),
                 );
                 let next_input = (projection(&next, "route", 101).unwrap().input as i128
-                    - resumed.retired as i128
-                    + resumed.summary as i128) as u64;
+                    - resumed.history.retired as i128
+                    + resumed.history.summary as i128) as u64;
                 let expected = scenario_input_cost("gpt-6-luna", next_input, 0, Some(1024))
                     .unwrap()
                     + crate::savings::scenario_output_cost("gpt-6-luna", next_input, 3).unwrap();
@@ -1701,7 +1696,7 @@ mod tests {
         trajectory.primary(&body, &response(100), "route", 100, true);
         let expected = projection(&body, "route", 100).unwrap().input - 10;
         assert_eq!(
-            trajectory.last_traditional_input, expected,
+            trajectory.history.last_traditional_input, expected,
             "net context growth must not inflate the traditional baseline"
         );
     }

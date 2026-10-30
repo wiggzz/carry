@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Receipts {
     anchor: Option<Anchor>,
-    // Continuity evidence is not a cache receipt: failed calls may clear both
-    // cache anchors without forgetting the successful traditional history.
+    // Legacy decoder input only. New history has a typed quantity contract and
+    // cursor in TraditionalHistoryState, never this full-model cache digest.
     #[serde(default)]
     history_anchor: Option<Anchor>,
     #[serde(default)]
@@ -472,8 +472,8 @@ impl Trajectory {
         let image_comparable = !image_input
             || (!self.carry_edited
                 && self.restored == 0
-                && self.retired == 0
-                && self.summary == 0
+                && self.history.retired == 0
+                && self.history.summary == 0
                 && native
                     .as_ref()
                     .zip(retained_output)
@@ -510,22 +510,18 @@ impl Trajectory {
             return;
         };
         let config = configuration(body, route, resolved);
-        if self
-            .receipts
-            .as_ref()
-            .unwrap()
-            .configuration
-            .as_ref()
-            .is_some_and(|prior| prior != &config)
-            || (cache_policy_changed
-                && self.receipts.as_ref().unwrap().configuration.as_ref() != Some(&config))
-        {
-            self.reset_receipt_epoch();
-        }
+        let contract = HistoryContract::extract(body, route, resolved, self.scenario);
+        let legacy_configuration = self.receipts.as_ref().unwrap().configuration.clone();
         self.receipts.as_mut().unwrap().configuration = Some(config.clone());
         let previous = self.receipts.as_ref().unwrap().anchor.clone();
         let traditional_previous = self.receipts.as_ref().unwrap().traditional_anchor.clone();
-        let history_previous = self.receipts.as_ref().unwrap().history_anchor.clone();
+        let continuity =
+            self.history
+                .compatible(&contract, body, native.input_tokens, at, self.carry_edited);
+        let history_previous = continuity
+            .is_none()
+            .then(|| self.receipts.as_ref().unwrap().history_anchor.clone())
+            .flatten();
         let compatible = previous.as_ref().is_some_and(|a| {
             append_compatible(a, body, &config)
                 && at >= a.at
@@ -535,15 +531,21 @@ impl Trajectory {
         let traditional_compatible = traditional_previous.as_ref().is_some_and(|a| {
             a.configuration == config && at >= a.at && (self.carry_edited || compatible)
         });
-        let history_compatible = history_previous.as_ref().is_some_and(|a| {
-            a.configuration == config
-                && at >= a.at
-                && (self.carry_edited
-                    || (append_compatible(a, body, &config)
-                        && native.input_tokens >= a.input
-                        && (items.len() > a.items || native.input_tokens == a.input)))
+        // The legacy opaque anchor is only a decoder input. Once a structured
+        // cursor exists, neither full-model cache/pricing identity nor rekeying
+        // participates in history recognition.
+        let history_compatible = continuity.unwrap_or_else(|| {
+            legacy_configuration.as_ref() == Some(&config)
+                && history_previous.as_ref().is_some_and(|a| {
+                    a.configuration == config
+                        && at >= a.at
+                        && (self.carry_edited
+                            || (append_compatible(a, body, &config)
+                                && native.input_tokens >= a.input
+                                && (items.len() > a.items || native.input_tokens == a.input)))
+                })
         });
-        if history_previous.is_some() && !history_compatible {
+        if (continuity.is_some() || history_previous.is_some()) && !history_compatible {
             // Rewind, edit, configuration switch or negative total-input delta:
             // invalidate historical assumptions, not the current projection.
             self.reset_receipt_epoch();
@@ -552,19 +554,12 @@ impl Trajectory {
             .as_ref()
             .filter(|_| compatible)
             .map(|a| native.input_tokens - a.input);
-        let mut traditional = (native.input_tokens as i128)
-            .saturating_add(self.restored)
-            .saturating_sub(self.retired as i128)
-            .saturating_add(self.summary as i128)
-            .clamp(0, u64::MAX as i128) as u64;
+        let mut traditional = self.history.input(native.input_tokens, self.restored);
 
         let fixed = projection_fixed_tokens(body);
         let kept = self.scenario.keep_recent.max(fixed);
         let mut initialized_now = false;
-        if self.scenario.valid()
-            && self.receipts.as_ref().unwrap().history_anchor.is_none()
-            && traditional > budget
-        {
+        if self.scenario.valid() && !history_compatible && traditional > budget {
             let initial_kept = kept.max(protected);
             let initialized = initial_kept.saturating_add(self.scenario.summary);
             if initialized > budget || initialized >= traditional {
@@ -572,12 +567,8 @@ impl Trajectory {
                 self.reset_epoch();
                 return;
             }
-            self.retired = self.retired.saturating_add(
-                traditional
-                    .saturating_sub(initial_kept)
-                    .saturating_sub(self.summary),
-            );
-            self.summary = self.scenario.summary;
+            self.history
+                .summarize(traditional, initial_kept, self.scenario.summary);
             traditional = initialized;
             self.traditional_edited = true;
             initialized_now = true;
@@ -619,7 +610,7 @@ impl Trajectory {
                 model,
                 traditional,
                 if warm {
-                    self.last_traditional_input.min(traditional)
+                    self.history.last_traditional_input.min(traditional)
                 } else {
                     0
                 },
@@ -668,18 +659,16 @@ impl Trajectory {
             self.reset_epoch();
             return;
         }
-        self.last_traditional_input = traditional;
+        self.history.last_traditional_input = traditional;
         self.carry_edited = false;
         self.traditional_edited = false;
         if summarize {
             self.result.traditional_compactions += 1;
-            self.retired = self
-                .retired
-                .saturating_add(discarded.saturating_sub(self.summary));
-            self.summary = self.scenario.summary;
-            self.last_traditional_input = kept.saturating_add(self.summary);
+            self.history.summarize(total, kept, self.scenario.summary);
             self.traditional_edited = true;
         }
+        self.history
+            .observe(contract, items, native.input_tokens, at);
         let anchor = Anchor {
             configuration: config,
             prefix: digest(items),
@@ -690,8 +679,8 @@ impl Trajectory {
         };
         let receipts = self.receipts.as_mut().unwrap();
         receipts.anchor = Some(anchor.clone());
-        receipts.traditional_anchor = Some(anchor.clone());
-        receipts.history_anchor = Some(anchor);
+        receipts.traditional_anchor = Some(anchor);
+        receipts.history_anchor = None;
     }
 }
 

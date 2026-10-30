@@ -346,10 +346,10 @@ class InitializationRegressions(unittest.TestCase):
         self.assertEqual(failed["result"]["traditional_cost"], first["result"]["traditional_cost"])
         self.assertAlmostEqual(first["result"]["traditional_cost"], 0.0525, places=12)
         self.assertEqual(first["result"]["initial_compactions"], 1)
-        self.assertIsNotNone(first["receipts"]["history_anchor"])
+        self.assertIsNotNone(first["history_continuity"])
         self.assertIsNone(failed["receipts"]["anchor"])
         self.assertIsNone(failed["receipts"]["traditional_anchor"])
-        self.assertEqual(failed["receipts"]["history_anchor"], first["receipts"]["history_anchor"])
+        self.assertEqual(failed["history_continuity"], first["history_continuity"])
         self.assertEqual(restarted, failed, "restart preserves the failed-attempt boundary")
         self.assertEqual(retry["result"]["initial_compactions"], 1,
                          "cache-only invalidation cannot repeat free initialization")
@@ -406,7 +406,7 @@ class InitializationRegressions(unittest.TestCase):
         self.assertEqual(len(fixture.primaries), 5)
         self.assertEqual(fixture.reviews, [])
         first = snapshots[0]
-        self.assertIsNotNone(first["receipts"]["history_anchor"])
+        self.assertIsNotNone(first["history_continuity"])
         self.assertEqual(first["retired"], 280000)
         self.assertEqual(first["summary"], 1000)
         self.assertEqual(first["result"]["initial_compactions"], 1)
@@ -443,8 +443,9 @@ class InitializationRegressions(unittest.TestCase):
             self.assertEqual(boundaries[0]["next_version"], 3)
             for key in ["carry_cost", "traditional_cost", "summary_cost", "traditional_compactions"]:
                 self.assertEqual(boundaries[0]["cumulative"][key], snapshots[2]["result"][key])
-            self.assertNotEqual(snapshots[2]["receipts"]["history_anchor"]["configuration"],
-                                snapshots[3]["receipts"]["history_anchor"]["configuration"])
+            self.assertEqual(snapshots[2]["history_continuity"]["contract"],
+                             snapshots[3]["history_continuity"]["contract"],
+                             "cache policy must not rekey traditional history")
         self.assertEqual(snapshots[4]["result"].get("cache_policy_boundaries", []), boundaries)
 
     def test_initialized_history_unchanged_policy_stays_warm_across_restarts(self):
