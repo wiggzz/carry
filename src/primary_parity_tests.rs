@@ -290,6 +290,102 @@ fn modeled_write_pressure_keeps_native_report_money_across_replay() {
     modeled_write_pressure_costs(true);
 }
 
+// Unlike the coalescible pressure lifecycle above, these writes have different
+// clocks. The bounded owner may lose suffix precision, never invent cold money
+// or reset independent history. Each real adapter has its own registration.
+fn modeled_retention_unknown_costs(native_adapter: bool) {
+    let mut live = Trajectory::default();
+    live.projected(100, 100, true);
+    let mut native = crate::savings::Trajectory::with_model("gpt-6.1-sol".into());
+    native.record(&json!({"event":"run_started","data":{"model":"gpt-6.1-sol",
+        "cache_ttl_seconds":1800,"implicit_cache_minimum_prefix_tokens":1024}}));
+    native.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":0}}));
+    let mut request = json!({"model":"gpt-6.1-sol","max_output_tokens":1,
+        "input":[{"role":"user","content":"synthetic different-clock prefix ".repeat(400)}]});
+    let mut paid = 0.0;
+    let mut forecast = 0.0;
+    let mut previous = 0;
+    for step in 0..132_u64 {
+        if step > 0 {
+            request["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":format!("append {step}")}));
+        }
+        let input = crate::savings::prompt_projection(&request).unwrap().2;
+        assert!(input > 1024 && input > previous);
+        live = serde_json::from_value(state(&live)).unwrap();
+        live.primary(
+            &request,
+            &terminal(input, 0, 0, 0),
+            "retention-unknown",
+            100 + step,
+            true,
+        );
+        native.record(
+            &json!({"event":"model_request","timestamp_ms":(100+step)*1000,
+            "data":{"step":step,"route":"retention-unknown","request":request}}),
+        );
+        native.record(
+            &json!({"event":"model_response","timestamp_ms":(100+step)*1000,
+            "data":{"step":step,"usage":{"input_tokens":input,"output_tokens":0,
+                "cached_input_tokens":0,"cache_write_input_tokens":0},"raw":{"output":[]}}}),
+        );
+        paid += input as f64 * 2.0 / 1e6;
+        if step <= 128 {
+            forecast += (previous as f64 * 0.1 + (input - previous) as f64 * 2.5) / 1e6;
+        }
+        let l = live.snapshot();
+        let n = native.snapshot();
+        // Exact actual expense remains known even when the alternative does not.
+        assert!((l.observed_primary_cost - paid).abs() < 1e-12);
+        assert!((n.observed_cost - paid).abs() < 1e-12);
+        assert_eq!(l.coverage.primary_responses, step + 1);
+        assert_eq!(n.coverage.responses, step as usize + 1);
+        assert_eq!(l.initial_compactions, 0);
+        assert_eq!(l.traditional_compactions, 0);
+        assert_eq!(n.initial_compactions, 0);
+        assert_eq!(n.pi_compactions, 0);
+        assert_eq!(l.summary_cost, 0.0);
+        assert_eq!(n.summary_cost, 0.0);
+        assert_eq!(live.history.last_traditional_input, input);
+        assert_eq!(l.matched_primary_responses, (step + 1).min(129));
+        assert_eq!(l.excluded_unpriced_calls, (step + 1).saturating_sub(129));
+        if native_adapter {
+            assert!(
+                (n.pi_cost - forecast).abs() < 1e-12,
+                "RETENTION_UNKNOWN_NATIVE"
+            );
+            assert_eq!(n.priced, step <= 128);
+            assert_eq!(
+                n.coverage.unknown_cache_requests,
+                (step + 1).saturating_sub(129) as usize
+            );
+        } else {
+            assert!(
+                (l.traditional_cost - forecast).abs() < 1e-12,
+                "RETENTION_UNKNOWN_LIVE"
+            );
+            assert_eq!(
+                l.coverage.unknown_cache_requests,
+                (step + 1).saturating_sub(129)
+            );
+            assert!(state(&live)["history_continuity"].is_object());
+        }
+        previous = input;
+    }
+}
+
+#[test]
+fn modeled_retention_unknown_preserves_live_money_and_history_after_restart() {
+    modeled_retention_unknown_costs(false);
+}
+
+#[test]
+fn modeled_retention_unknown_preserves_native_money_and_quantity_history() {
+    modeled_retention_unknown_costs(true);
+}
+
 fn cache_options_preserve_summarized_growth(initialized: bool) {
     let mut t = Trajectory::default();
     let mut request = body();

@@ -599,14 +599,17 @@ impl Trajectory {
             cache.clear();
         }
         let cached = if mode == carry::models::ScenarioCacheMode::Implicit {
-            let prefix = cache.eligible_at(&cache_scope, at, traditional);
-            if minimum.is_some_and(|min| prefix >= min) {
-                prefix
-            } else {
-                0
-            }
+            cache
+                .eligible_at(&cache_scope, at, traditional)
+                .map(|prefix| {
+                    if minimum.is_some_and(|min| prefix >= min) {
+                        prefix
+                    } else {
+                        0
+                    }
+                })
         } else {
-            0
+            Some(0)
         };
         // Identical execution has one paid contribution. Only a genuinely
         // different history asks the cache/tariff forecast a hypothetical price.
@@ -616,7 +619,7 @@ impl Trajectory {
                 body,
                 model,
                 traditional,
-                cached,
+                cached?,
                 minimum,
                 resolved,
             )
@@ -659,15 +662,20 @@ impl Trajectory {
             *self.priced_primary_responses.as_mut().unwrap() += 1;
         } else {
             self.result.excluded_unpriced_calls += 1;
-            self.reset_epoch();
-            return;
+            if cached.is_some() {
+                self.reset_epoch();
+                return;
+            }
+            // Retention uncertainty excludes this monetary pair, not the
+            // independent quantities/cursor or earlier frozen contributions.
+            self.result.coverage.unknown_cache_requests += 1;
         }
         self.history.last_traditional_input = traditional;
         let cache = &mut self.receipts.as_mut().unwrap().modeled_cache;
         if mode == carry::models::ScenarioCacheMode::Implicit
             && minimum.is_some_and(|min| traditional >= min)
         {
-            cache.written(cache_scope, at, ttl, traditional, cached);
+            cache.written(cache_scope, at, ttl, traditional);
         } else {
             cache.clear();
         }

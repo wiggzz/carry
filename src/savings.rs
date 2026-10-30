@@ -365,27 +365,33 @@ impl Trajectory {
                         self.modeled_cache.clear();
                     }
                     let minimum = self.cache_minimum_for(&prompt.model);
-                    let pi_cached = prompt.request_at_ms.map_or(0, |at| {
-                        let prefix =
+                    let pi_cached = if prompt.cache_mode == ScenarioCacheMode::Implicit {
+                        prompt.request_at_ms.map_or(Some(0), |at| {
                             self.modeled_cache
-                                .eligible_at(&prompt.cache_scope, at, pi_input);
-                        if prompt.cache_mode == ScenarioCacheMode::Implicit
-                            && minimum.is_some_and(|min| prefix >= min)
-                        {
-                            prefix
-                        } else {
-                            0
-                        }
-                    });
+                                .eligible_at(&prompt.cache_scope, at, pi_input)
+                                .map(|prefix| {
+                                    if minimum.is_some_and(|min| prefix >= min) {
+                                        prefix
+                                    } else {
+                                        0
+                                    }
+                                })
+                        })
+                    } else {
+                        Some(0)
+                    };
                     let pair = self.primary_history.price(observed, || {
-                        if minimum.is_none() || prompt.cache_mode == ScenarioCacheMode::Unknown {
+                        if minimum.is_none()
+                            || prompt.cache_mode == ScenarioCacheMode::Unknown
+                            || pi_cached.is_none()
+                        {
                             self.result.coverage.unknown_cache_requests += 1;
                         }
                         Some(
                             scenario_input_cost_with_mode(
                                 &prompt.model,
                                 pi_input,
-                                pi_cached,
+                                pi_cached?,
                                 minimum,
                                 prompt.cache_mode,
                                 estimated_cost_usd,
@@ -410,7 +416,6 @@ impl Trajectory {
                             at,
                             lifetime,
                             pi_input,
-                            pi_cached,
                         );
                     } else {
                         self.modeled_cache.clear();

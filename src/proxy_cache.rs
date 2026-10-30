@@ -49,6 +49,16 @@ pub(crate) fn modeled_scope(body: &Value, model: &str, source: impl Serialize) -
 pub(crate) struct ModeledCache {
     scope: String,
     writes: Vec<ModeledWrite>,
+    // Bounded discarded suffix coverage is uncertainty, never a cache miss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unresolved: Option<UnresolvedCoverage>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct UnresolvedCoverage {
+    start: u64,
+    end: u64,
+    since: u64,
+    through: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ModeledWrite {
@@ -69,9 +79,9 @@ impl ModeledCache {
 
     /// Pure read-time contiguous-prefix query. Neither expiry nor a cache read
     /// records a write, refreshes a deadline, or consults today's policy TTL.
-    pub(crate) fn eligible_at(&self, scope: &str, at: u64, input: u64) -> u64 {
+    pub(crate) fn eligible_at(&self, scope: &str, at: u64, input: u64) -> Option<u64> {
         if self.scope != scope {
-            return 0;
+            return Some(0);
         }
         let mut prefix = 0;
         for write in &self.writes {
@@ -82,37 +92,92 @@ impl ModeledCache {
                 prefix = prefix.max(write.end);
             }
         }
-        prefix.min(input)
+        if self.unresolved.as_ref().is_some_and(|unknown| {
+            at >= unknown.since
+                && at <= unknown.through
+                && unknown.start <= prefix
+                && unknown.end > prefix
+                && input > prefix
+        }) {
+            return None;
+        }
+        Some(prefix.min(input))
     }
 
-    /// Record only the uncached extent written by the hypothetical request.
+    fn retain_uncertainty(&mut self, start: u64, end: u64, at: u64, lifetime: u64) {
+        let through = at.saturating_add(lifetime - 1);
+        if let Some(unknown) = &mut self.unresolved {
+            unknown.start = unknown.start.min(start);
+            unknown.end = unknown.end.max(end);
+            unknown.since = unknown.since.min(at);
+            unknown.through = unknown.through.max(through);
+        } else {
+            self.unresolved = Some(UnresolvedCoverage {
+                start,
+                end,
+                since: at,
+                through,
+            });
+        }
+    }
+
+    /// Record the hypothetical request's uncached extent. The owner derives it;
+    /// callers cannot turn a missing/retired forecast into a new cold write.
     /// There is no supported read-refresh contract in this whole-prefix model.
-    pub(crate) fn written(
-        &mut self,
-        scope: String,
-        at: u64,
-        lifetime: u64,
-        input: u64,
-        cached: u64,
-    ) {
+    pub(crate) fn written(&mut self, scope: String, at: u64, lifetime: u64, input: u64) {
+        if lifetime == 0 {
+            return;
+        }
+        let cached = self.eligible_at(&scope, at, input);
+        let Some(cached) = cached else {
+            // The unknown partition may have written any of this suffix. Keep
+            // that bound through its possible lifetime, not a fabricated write.
+            let start = self.unresolved.as_ref().unwrap().start;
+            self.retain_uncertainty(start, input, at, lifetime);
+            return;
+        };
         if self.scope != scope || cached == 0 {
             self.clear();
             self.scope = scope;
         }
-        if input <= cached || lifetime == 0 {
+        if input <= cached {
             return;
         }
-        // Pruning is a write-boundary operation, never a side effect of lookup.
+        // Pruning/coalescing is a write-boundary operation, never a read effect.
         self.writes.retain(|write| write.eligible_at(at));
+        if self
+            .unresolved
+            .as_ref()
+            .is_some_and(|unknown| at > unknown.through)
+        {
+            self.unresolved = None;
+        }
+        if let Some(last) = self.writes.last_mut()
+            && last.end == cached
+            && last.at == at
+            && last.lifetime == lifetime
+        {
+            // Exactly the same interval: no deadline, backward-time behavior or
+            // prefix eligibility is lost by representing contiguous extents once.
+            last.end = input;
+            return;
+        }
         self.writes.push(ModeledWrite {
             start: cached,
             end: input,
             at,
             lifetime,
         });
-        // Bounded state; losing an old extent can only reduce conditional credit.
         if self.writes.len() > 128 {
-            self.writes.remove(0);
+            // Preserve the known leading prefix. Non-coalescible suffix loss is
+            // explicit unknown, not zero credit consumed as a cold-write tariff.
+            let discarded = self.writes.pop().unwrap();
+            self.retain_uncertainty(
+                discarded.start,
+                discarded.end,
+                discarded.at,
+                discarded.lifetime,
+            );
         }
     }
 }
@@ -286,6 +351,13 @@ pub(super) fn trim(cache: &mut Vec<CacheEvidence>, at: u64) {
 mod tests {
     use super::*;
 
+    // Existing exact-credit controls must remain known, never accept None as0.
+    fn eligible(cache: &ModeledCache, scope: &str, at: u64, input: u64) -> u64 {
+        cache
+            .eligible_at(scope, at, input)
+            .expect("known modeled prefix")
+    }
+
     // Boundary acceptance for the shared semantic owner. The real-coordinator
     // differential separately reproduces the original equivalent-options bug.
     #[test]
@@ -294,7 +366,7 @@ mod tests {
             "instructions":"fixed", "tools":[], "input":[{"role":"user","content":"prefix"}]});
         let scope = modeled_scope(&body, "gpt-6.1-sol", "source");
         let mut cache = ModeledCache::default();
-        cache.written(scope.clone(), 100, 7, 2000, 0);
+        cache.written(scope.clone(), 100, 7, 2000);
         let original = serde_json::to_vec(&cache).unwrap();
         for controls in [
             json!({"prompt_cache_options":{}}),
@@ -308,9 +380,9 @@ mod tests {
                 .unwrap()
                 .extend(controls.as_object().unwrap().clone());
             let next_scope = modeled_scope(&next, "gpt-6.1-sol", "source");
-            assert_eq!(cache.eligible_at(&next_scope, 106, 2000), 2000);
+            assert_eq!(eligible(&cache, &next_scope, 106, 2000), 2000);
             // Even a newly requested TTL does not renew the original event.
-            assert_eq!(cache.eligible_at(&next_scope, 107, 2000), 0);
+            assert_eq!(eligible(&cache, &next_scope, 107, 2000), 0);
             assert_eq!(serde_json::to_vec(&cache).unwrap(), original);
         }
         for settings in [
@@ -324,16 +396,27 @@ mod tests {
                 .unwrap()
                 .extend(settings.as_object().unwrap().clone());
             assert_eq!(
-                cache.eligible_at(&modeled_scope(&next, "gpt-6.1-sol", "source"), 106, 2000),
+                eligible(
+                    &cache,
+                    &modeled_scope(&next, "gpt-6.1-sol", "source"),
+                    106,
+                    2000
+                ),
                 0
             );
         }
         assert_eq!(
-            cache.eligible_at(&modeled_scope(&body, "gpt-6-sol", "source"), 106, 2000),
+            eligible(
+                &cache,
+                &modeled_scope(&body, "gpt-6-sol", "source"),
+                106,
+                2000
+            ),
             0
         );
         assert_eq!(
-            cache.eligible_at(
+            eligible(
+                &cache,
                 &modeled_scope(&body, "gpt-6.1-sol", "other-source"),
                 106,
                 2000
@@ -346,26 +429,26 @@ mod tests {
     #[test]
     fn modeled_prefix_queries_are_pure_and_suffix_writes_keep_original_deadlines() {
         let mut cache = ModeledCache::default();
-        cache.written("scope".into(), 100, 7, 2000, 0);
+        cache.written("scope".into(), 100, 7, 2000);
         let original = serde_json::to_vec(&cache).unwrap();
         for at in [100, 106, 107, 10000] {
             assert_eq!(
-                cache.eligible_at("scope", at, 3000),
+                eligible(&cache, "scope", at, 3000),
                 if at < 107 { 2000 } else { 0 }
             );
             assert_eq!(serde_json::to_vec(&cache).unwrap(), original);
         }
-        assert_eq!(cache.eligible_at("other", 106, 3000), 0);
-        assert_eq!(cache.eligible_at("scope", 99, 3000), 0);
-        cache.written("scope".into(), 106, 100, 2100, 2000);
+        assert_eq!(eligible(&cache, "other", 106, 3000), 0);
+        assert_eq!(eligible(&cache, "scope", 99, 3000), 0);
+        cache.written("scope".into(), 106, 100, 2100);
         cache = serde_json::from_slice(&serde_json::to_vec(&cache).unwrap()).unwrap();
-        assert_eq!(cache.eligible_at("scope", 106, 2100), 2100);
-        assert_eq!(cache.eligible_at("scope", 107, 2100), 0);
+        assert_eq!(eligible(&cache, "scope", 106, 2100), 2100);
+        assert_eq!(eligible(&cache, "scope", 107, 2100), 0);
         // A later cold request really writes the prefix again, not a refresh
         // invented by an earlier read. Unknown/other namespaces cannot borrow it.
-        cache.written("scope".into(), 107, 7, 2100, 0);
-        assert_eq!(cache.eligible_at("scope", 113, 2100), 2100);
-        assert_eq!(cache.eligible_at("scope", 114, 2100), 0);
+        cache.written("scope".into(), 107, 7, 2100);
+        assert_eq!(eligible(&cache, "scope", 113, 2100), 2100);
+        assert_eq!(eligible(&cache, "scope", 114, 2100), 0);
     }
 
     #[test]
@@ -373,14 +456,17 @@ mod tests {
         let mut cache = ModeledCache::default();
         let mut maximum = 0;
         for input in 2000..2160 {
-            let cached = cache.eligible_at("synthetic", 100, input);
-            cache.written("synthetic".into(), 100, 1800, input, cached);
+            assert_eq!(
+                eligible(&cache, "synthetic", 100, input),
+                if input == 2000 { 0 } else { input - 1 }
+            );
+            cache.written("synthetic".into(), 100, 1800, input);
             let value = serde_json::to_value(&cache).unwrap();
             let count = value["writes"].as_array().unwrap().len();
             assert!(count <= 128);
             maximum = maximum.max(count);
         }
-        assert_eq!(maximum, 128);
+        assert_eq!(maximum, 1, "identical write intervals coalesce exactly");
         let value = serde_json::to_value(&cache).unwrap();
         let events = value["writes"].as_array().unwrap();
         assert!(serde_json::to_vec(events).unwrap().len() < 8192);
@@ -399,25 +485,59 @@ mod tests {
     fn modeled_write_pressure_preserves_unexpired_root_coverage_after_restart() {
         let mut cache = ModeledCache::default();
         for input in 2000..=2128 {
-            let cached = cache.eligible_at("synthetic-pressure", 100, input);
+            let cached = eligible(&cache, "synthetic-pressure", 100, input);
             assert_eq!(cached, if input == 2000 { 0 } else { input - 1 });
-            cache.written("synthetic-pressure".into(), 100, 1800, input, cached);
+            cache.written("synthetic-pressure".into(), 100, 1800, input);
         }
         let encoded = serde_json::to_vec(&cache).unwrap();
         let resumed: ModeledCache = serde_json::from_slice(&encoded).unwrap();
         assert!(encoded.len() < 8192);
         assert_eq!(
-            resumed.eligible_at("synthetic-pressure", 100, 2128),
+            eligible(&resumed, "synthetic-pressure", 100, 2128),
             2128,
             "CACHE_RETENTION_COVERAGE: evicting numeric records is not a cold-write event"
         );
         for at in [100, 1899] {
-            assert_eq!(resumed.eligible_at("synthetic-pressure", at, 2128), 2128);
+            assert_eq!(eligible(&resumed, "synthetic-pressure", at, 2128), 2128);
         }
-        assert_eq!(resumed.eligible_at("synthetic-pressure", 1900, 2128), 0);
-        assert_eq!(resumed.eligible_at("other-scope", 100, 2128), 0);
-        assert_eq!(resumed.eligible_at("synthetic-pressure", 99, 2128), 0);
+        assert_eq!(eligible(&resumed, "synthetic-pressure", 1900, 2128), 0);
+        assert_eq!(eligible(&resumed, "other-scope", 100, 2128), 0);
+        assert_eq!(eligible(&resumed, "synthetic-pressure", 99, 2128), 0);
         assert_eq!(serde_json::to_vec(&resumed).unwrap(), encoded);
+    }
+
+    #[test]
+    fn modeled_distinct_write_pressure_retains_prefix_and_marks_only_lost_suffix_unknown() {
+        let mut cache = ModeledCache::default();
+        for step in 0..129 {
+            let input = 2000 + step;
+            assert_eq!(
+                eligible(&cache, "pressure", 100 + step, input),
+                if step == 0 { 0 } else { input - 1 }
+            );
+            cache.written("pressure".into(), 100 + step, 1800, input);
+        }
+        let encoded = serde_json::to_vec(&cache).unwrap();
+        let mut resumed: ModeledCache = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(resumed.writes.len(), 128);
+        assert!(encoded.len() < 8192);
+        assert_eq!(resumed.eligible_at("pressure", 228, 2127), Some(2127));
+        assert_eq!(resumed.eligible_at("pressure", 228, 2128), None);
+        assert_eq!(resumed.eligible_at("other", 228, 2128), Some(0));
+        assert_eq!(resumed.eligible_at("pressure", 99, 2128), Some(0));
+        assert_eq!(serde_json::to_vec(&resumed).unwrap(), encoded);
+        // An unknown partition cannot become a known cold suffix on continuation.
+        resumed.written("pressure".into(), 229, 3600, 2129);
+        assert_eq!(resumed.eligible_at("pressure", 229, 2129), None);
+        assert_eq!(resumed.eligible_at("pressure", 229, 2127), Some(2127));
+        assert_eq!(resumed.writes.len(), 128);
+        // The known original root really expires at1900. A full cold rewrite is
+        // now justified; the unknown suffix never renews that root's deadline.
+        assert_eq!(resumed.eligible_at("pressure", 1900, 2129), Some(0));
+        resumed.written("pressure".into(), 1900, 7, 2129);
+        assert_eq!(resumed.eligible_at("pressure", 1906, 2129), Some(2129));
+        assert_eq!(resumed.eligible_at("pressure", 1907, 2129), Some(0));
+        assert!(resumed.unresolved.is_none());
     }
 
     // A native read receipt proves this request's hit, not its write timestamp.
