@@ -204,9 +204,14 @@ class NoodleRegressions(unittest.TestCase):
         def primary(_body, n):
             response = completed(response_id=f"extension_{n}")
             response["usage"]["input_tokens"] = 4000
-            response["usage"]["input_tokens_details"]["cached_tokens"] = 3900 if n in (2,6) else 0
+            response["usage"]["input_tokens_details"]["cached_tokens"] = 3900 if n in (2,7) else 0
+            if n in (3,8):
+                # A raw partial hit is not write-time/extent proof. Establish
+                # warmth with a real whole-input write after capability attestation.
+                response["usage"]["input_tokens_details"]["cache_write_tokens"] = 4000
             return 200, response
         fixture = self.fixture(primary)
+        self.evidence.update(actual_wires=fixture.primaries,reviews=fixture.reviews)
         h = [{"role":"user","content":"WARM_ORIGINAL " + "prefix " * 3000}]
         extended = h + [{"role":"user","content":"COLD_SUFFIX"}]
         options = ["--review-every-requests","100","--classifier-cache-policy","disabled"]
@@ -216,7 +221,13 @@ class NoodleRegressions(unittest.TestCase):
         proxy.close(); self.attest_cache()
         proxy = TransparentProxy(self.state,fixture,options,mode="audit")
         self.stack.callback(proxy.close)
-        self.assertEqual(proxy.send(h)[0],200)  # actual warm H terminal
+        self.assertEqual(proxy.send(h)[0],200)  # actual partial read, unknown original write
+        self.assertEqual(proxy.send(h)[0],200)  # actual timed whole H write
+        _, written = proxy.checkpoint(h)
+        self.evidence["written"] = written
+        self.assertEqual(written["last_plan"]["primary_cached_estimated_tokens"],0,
+                         "unlocated partial read alone cannot establish a future prefix")
+        self.assertEqual(written["primary"]["cache_write_tokens"],4000)
         self.assertEqual(proxy.send(extended)[0],200)  # actual cold H+suffix terminal
         _, cold = proxy.checkpoint(extended)
         self.assertGreater(cold["last_plan"]["primary_cached_estimated_tokens"],0,
@@ -228,10 +239,16 @@ class NoodleRegressions(unittest.TestCase):
         self.stack.callback(proxy.close)
         self.assertEqual(proxy.send(extended)[0],200)
         _, restarted = proxy.checkpoint(extended)
-        self.assertEqual(proxy.send(extended)[0],200)  # genuine later rewarm of the current wire
+        self.assertEqual(proxy.send(extended)[0],200)  # later partial read, not a new write
         _, positive = proxy.checkpoint(extended)
         self.assertEqual(positive["primary"]["cached_tokens"],7800,
                          "prove the provider's later positive receipt was observed")
+        self.assertEqual(proxy.send(extended)[0],200)  # genuine later whole-input write
+        _, rewritten = proxy.checkpoint(extended)
+        self.evidence["rewritten"] = rewritten
+        self.assertEqual(rewritten["last_plan"]["primary_cached_estimated_tokens"],0,
+                         "a later partial read cannot resurrect revoked write evidence")
+        self.assertEqual(rewritten["primary"]["cache_write_tokens"],8000)
         self.assertEqual(proxy.send(extended)[0],200)
         _, rewarmed = proxy.checkpoint(extended)
         self.evidence.update(cold=cold,repeated=repeated,restarted=restarted,positive=positive,rewarmed=rewarmed,
@@ -240,8 +257,8 @@ class NoodleRegressions(unittest.TestCase):
                          "newer cold extension supersedes old covered warmth")
         self.assertEqual(restarted["last_plan"]["primary_cached_estimated_tokens"],0)
         self.assertGreater(rewarmed["last_plan"]["primary_cached_estimated_tokens"],0)
-        self.assertEqual(rewarmed["primary"]["calls"],7)
-        self.assertEqual(rewarmed["primary"]["input_tokens"],28000)
+        self.assertEqual(rewarmed["primary"]["calls"],9)
+        self.assertEqual(rewarmed["primary"]["input_tokens"],36000)
         self.assertEqual(rewarmed["primary"]["cached_tokens"],7800)
         self.assertFalse(fixture.reviews)
 
@@ -250,8 +267,11 @@ class NoodleRegressions(unittest.TestCase):
             value = completed(response_id=f"selection_{n}")
             value["usage"]["input_tokens"] = 40000
             value["usage"]["input_tokens_details"]["cached_tokens"] = 39600 if n == 2 else 0
+            if n == 3:
+                value["usage"]["input_tokens_details"]["cache_write_tokens"] = 40000
             return 200,value
         fixture = self.fixture(primary,lambda _b,_n:(200,advice_response({"protected":[],"removable":[2],"memories":[]})))
+        self.evidence.update(primaries=fixture.primaries,reviews=fixture.reviews)
         h = self.history()
         h[0]["content"] += " protected direction " * 10000
         extended = h + [{"role":"user","content":"APPENDED_CURRENT_TASK"}]
@@ -263,6 +283,9 @@ class NoodleRegressions(unittest.TestCase):
         proxy = TransparentProxy(self.state,fixture,options,mode="audit")
         self.stack.callback(proxy.close)
         self.assertEqual(proxy.send(h)[0],200)
+        self.assertEqual(proxy.send(h)[0],200)  # real full write, not the preceding partial read
+        self.evidence["written"] = proxy.checkpoint(h)[1]
+        self.assertEqual(proxy.checkpoint(h)[1]["primary"]["cache_write_tokens"],40000)
         proxy.close()
         proxy = self.proxy(fixture,options)
         self.assertEqual(proxy.send(extended)[0],200)
@@ -277,7 +300,7 @@ class NoodleRegressions(unittest.TestCase):
         self.assertFalse(warm["last_plan"]["selected"])
         self.assertTrue(cold["last_plan"]["selected"])
         self.assertEqual(len(fixture.reviews),1)
-        self.assertEqual(cold["primary"]["calls"],4)
+        self.assertEqual(cold["primary"]["calls"],5)
         self.assertEqual(cold["primary"]["cached_tokens"],39600)
 
     def test_planning_and_dispatch_share_metadata_stripped_floor(self):
