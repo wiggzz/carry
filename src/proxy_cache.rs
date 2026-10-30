@@ -28,6 +28,81 @@ pub(super) fn serialized_identity<T: Serialize + ?Sized>(value: &T) -> (usize, S
     (writer.bytes, format!("{:x}", writer.digest.finalize()))
 }
 
+/// A conditional branch's writes, never provider observations or billed usage.
+/// Separate extents are necessary: appending a newly written suffix cannot move
+/// an older prefix's deadline. All times use the calling adapter's clock units.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct ModeledCache {
+    scope: String,
+    writes: Vec<ModeledWrite>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ModeledWrite {
+    start: u64,
+    end: u64,
+    at: u64,
+    lifetime: u64,
+}
+impl ModeledWrite {
+    fn eligible_at(&self, at: u64) -> bool {
+        at >= self.at && at - self.at < self.lifetime
+    }
+}
+impl ModeledCache {
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Pure read-time contiguous-prefix query. Neither expiry nor a cache read
+    /// records a write, refreshes a deadline, or consults today's policy TTL.
+    pub(crate) fn eligible_at(&self, scope: &str, at: u64, input: u64) -> u64 {
+        if self.scope != scope {
+            return 0;
+        }
+        let mut prefix = 0;
+        for write in &self.writes {
+            if write.start > prefix {
+                break;
+            }
+            if write.eligible_at(at) {
+                prefix = prefix.max(write.end);
+            }
+        }
+        prefix.min(input)
+    }
+
+    /// Record only the uncached extent written by the hypothetical request.
+    /// There is no supported read-refresh contract in this whole-prefix model.
+    pub(crate) fn written(
+        &mut self,
+        scope: String,
+        at: u64,
+        lifetime: u64,
+        input: u64,
+        cached: u64,
+    ) {
+        if self.scope != scope || cached == 0 {
+            self.clear();
+            self.scope = scope;
+        }
+        if input <= cached || lifetime == 0 {
+            return;
+        }
+        // Pruning is a write-boundary operation, never a side effect of lookup.
+        self.writes.retain(|write| write.eligible_at(at));
+        self.writes.push(ModeledWrite {
+            start: cached,
+            end: input,
+            at,
+            lifetime,
+        });
+        // Bounded state; losing an old extent can only reduce conditional credit.
+        if self.writes.len() > 128 {
+            self.writes.remove(0);
+        }
+    }
+}
+
 /// Actual dispatched wire identity. Purpose is deliberately absent.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct CacheEvidence {
@@ -196,6 +271,31 @@ pub(super) fn trim(cache: &mut Vec<CacheEvidence>, at: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modeled_prefix_queries_are_pure_and_suffix_writes_keep_original_deadlines() {
+        let mut cache = ModeledCache::default();
+        cache.written("scope".into(), 100, 7, 2000, 0);
+        let original = serde_json::to_vec(&cache).unwrap();
+        for at in [100, 106, 107, 10000] {
+            assert_eq!(
+                cache.eligible_at("scope", at, 3000),
+                if at < 107 { 2000 } else { 0 }
+            );
+            assert_eq!(serde_json::to_vec(&cache).unwrap(), original);
+        }
+        assert_eq!(cache.eligible_at("other", 106, 3000), 0);
+        assert_eq!(cache.eligible_at("scope", 99, 3000), 0);
+        cache.written("scope".into(), 106, 100, 2100, 2000);
+        cache = serde_json::from_slice(&serde_json::to_vec(&cache).unwrap()).unwrap();
+        assert_eq!(cache.eligible_at("scope", 106, 2100), 2100);
+        assert_eq!(cache.eligible_at("scope", 107, 2100), 0);
+        // A later cold request really writes the prefix again, not a refresh
+        // invented by an earlier read. Unknown/other namespaces cannot borrow it.
+        cache.written("scope".into(), 107, 7, 2100, 0);
+        assert_eq!(cache.eligible_at("scope", 113, 2100), 2100);
+        assert_eq!(cache.eligible_at("scope", 114, 2100), 0);
+    }
 
     // A native read receipt proves this request's hit, not its write timestamp.
     // Keep it as an observation; a future guarantee needs timing/refresh proof.

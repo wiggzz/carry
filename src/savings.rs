@@ -605,6 +605,7 @@ pub fn savings_percent(savings: f64, carry_cost: f64) -> Option<f64> {
 mod tests {
     use super::*;
     include!("savings_cache_write_tests.rs");
+    include!("savings_cache_lifetime_tests.rs");
     include!("savings_initialization_tests.rs");
     fn request(t: &mut Trajectory, units: u64) {
         t.record(&json!({"event":"model_request","data":{"step":1,"request":{"input":["a ".repeat(units as usize)],"tools":[]}}}));

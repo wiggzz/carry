@@ -11,8 +11,11 @@ pub(super) struct Receipts {
     history_anchor: Option<Anchor>,
     #[serde(default)]
     pub(super) initialization_policy_version: Option<u32>,
+    // Legacy observation cursor only; never reinterpret its terminal time as a write.
     #[serde(default)]
     traditional_anchor: Option<Anchor>,
+    #[serde(default)]
+    modeled_cache: crate::proxy_cache::ModeledCache,
     #[serde(default)]
     pub scenario_cache_policy_version: Option<u32>,
     #[serde(default)]
@@ -28,6 +31,7 @@ impl Default for Receipts {
             history_anchor: None,
             initialization_policy_version: Some(1),
             traditional_anchor: None,
+            modeled_cache: crate::proxy_cache::ModeledCache::default(),
             configuration: None,
             scenario_cache_policy_version: Some(carry::models::ScenarioCachePolicy::VERSION),
             last_appended_input: None,
@@ -53,6 +57,7 @@ impl Receipts {
     pub(super) fn invalidate(&mut self) {
         self.invalidate_actual();
         self.traditional_anchor = None;
+        self.modeled_cache.clear();
     }
 
     pub(super) fn forget_history(&mut self) {
@@ -504,7 +509,7 @@ impl Trajectory {
         let legacy_configuration = self.receipts.as_ref().unwrap().configuration.clone();
         self.receipts.as_mut().unwrap().configuration = Some(config.clone());
         let previous = self.receipts.as_ref().unwrap().anchor.clone();
-        let traditional_previous = self.receipts.as_ref().unwrap().traditional_anchor.clone();
+
         let continuity =
             self.history
                 .compatible(&contract, body, native.input_tokens, at, self.carry_edited);
@@ -518,9 +523,7 @@ impl Trajectory {
                 && native.input_tokens >= a.input
                 && (items.len() > a.items || native.input_tokens == a.input)
         });
-        let traditional_compatible = traditional_previous.as_ref().is_some_and(|a| {
-            a.configuration == config && at >= a.at && (self.carry_edited || compatible)
-        });
+
         // The legacy opaque anchor is only a decoder input. Once a structured
         // cursor exists, neither full-model cache/pricing identity nor rekeying
         // participates in history recognition.
@@ -586,11 +589,25 @@ impl Trajectory {
         let ttl = resolved
             .and_then(|r| r.scenario_cache_policy.as_ref())
             .map_or(1800, |p| p.ttl_seconds);
-        let warm = !cache_policy_changed
-            && traditional_previous
-                .as_ref()
-                .is_some_and(|a| traditional_compatible && at - a.at < ttl)
-            && !self.traditional_edited;
+        // The full resolution remains audit/measurement identity, not cache
+        // identity: price, provenance and capacity changes do not rename writes.
+        // Typed history continuity above owns append/projection compatibility.
+        let cache_scope = digest(&(configuration(body, route, None), resolved.map(|r| &r.route)));
+        let mode = request_cache_mode(body, model, resolved);
+        let cache = &mut self.receipts.as_mut().unwrap().modeled_cache;
+        if cache_policy_changed || self.traditional_edited {
+            cache.clear();
+        }
+        let cached = if mode == carry::models::ScenarioCacheMode::Implicit {
+            let prefix = cache.eligible_at(&cache_scope, at, traditional);
+            if minimum.is_some_and(|min| prefix >= min) {
+                prefix
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         // Identical execution has one paid contribution. Only a genuinely
         // different history asks the cache/tariff forecast a hypothetical price.
         // Sharing the money does NOT seed divergent cache history with real hits.
@@ -599,11 +616,7 @@ impl Trajectory {
                 body,
                 model,
                 traditional,
-                if warm {
-                    self.history.last_traditional_input.min(traditional)
-                } else {
-                    0
-                },
+                cached,
                 minimum,
                 resolved,
             )
@@ -650,12 +663,21 @@ impl Trajectory {
             return;
         }
         self.history.last_traditional_input = traditional;
+        let cache = &mut self.receipts.as_mut().unwrap().modeled_cache;
+        if mode == carry::models::ScenarioCacheMode::Implicit
+            && minimum.is_some_and(|min| traditional >= min)
+        {
+            cache.written(cache_scope, at, ttl, traditional, cached);
+        } else {
+            cache.clear();
+        }
         self.carry_edited = false;
         self.traditional_edited = false;
         if summarize {
             self.result.traditional_compactions += 1;
             self.history.summarize(total, kept, self.scenario.summary);
             self.traditional_edited = true;
+            self.receipts.as_mut().unwrap().modeled_cache.clear();
         }
         self.history
             .observe(contract, items, native.input_tokens, at);
@@ -668,8 +690,8 @@ impl Trajectory {
             at,
         };
         let receipts = self.receipts.as_mut().unwrap();
-        receipts.anchor = Some(anchor.clone());
-        receipts.traditional_anchor = Some(anchor);
+        receipts.anchor = Some(anchor);
+        receipts.traditional_anchor = None;
         receipts.history_anchor = None;
     }
 }

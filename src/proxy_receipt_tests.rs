@@ -831,7 +831,7 @@ fn receipt_equal_size_projection_edit_invalidates_actual_not_traditional_anchor(
     t.projected(100, 100, true);
     assert_eq!(t.restored, 0);
     assert!(state(&t)["receipts"]["anchor"].is_null());
-    assert!(state(&t)["receipts"]["traditional_anchor"].is_object());
+    assert!(state(&t)["receipts"]["modeled_cache"]["writes"][0].is_object());
     let mut edited = body();
     edited["input"][0]["content"] = json!("different equal-size synthetic memory");
     t.primary(&edited, &terminal(2000, 0, 0, 0), "route", 101, true);

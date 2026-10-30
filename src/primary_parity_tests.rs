@@ -54,6 +54,61 @@ fn modeled_cache_read_does_not_extend_original_write_lifetime_across_restart() {
     }
 }
 
+#[test]
+fn modeled_cache_append_and_new_policy_cannot_extend_old_prefix_deadline() {
+    use carry::models::{Route, resolve_model};
+    let mut resolved = resolve_model(
+        "gpt-6.1-sol",
+        Route::new("https://api.openai.com/v1/responses", false),
+        None,
+        None,
+        0,
+        0,
+    )
+    .unwrap();
+    resolved.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 7;
+    let mut t = Trajectory::default();
+    t.projected(100, 100, true);
+    let mut request = body();
+    for (index, (at, input, cached)) in [(100, 2000, 0), (106, 2100, 2000), (107, 2100, 0)]
+        .into_iter()
+        .enumerate()
+    {
+        if index == 1 {
+            // New lifetime applies only to newly written extents. The original
+            // prefix still expires at107, including across serialization.
+            resolved.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 100;
+            request["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":"append"}));
+        }
+        let before = t.snapshot();
+        t.primary_resolved(
+            &request,
+            &terminal(input, 0, 0, 0),
+            "lifetime-fixture",
+            at,
+            true,
+            Some(&resolved),
+        );
+        let after = t.snapshot();
+        assert_eq!(after.excluded_unpriced_calls, 0);
+        assert_eq!(after.initial_compactions, 0);
+        assert_eq!(after.traditional_compactions, 0);
+        let forecast =
+            scenario_input_cost_resolved("gpt-6.1-sol", input, cached, Some(1024), Some(&resolved))
+                .unwrap();
+        assert!((after.traditional_cost - before.traditional_cost - forecast).abs() < 1e-12);
+        assert!(
+            (after.observed_primary_cost - before.observed_primary_cost - input as f64 * 2.0 / 1e6)
+                .abs()
+                < 1e-12
+        );
+        t = serde_json::from_value(state(&t)).unwrap();
+    }
+}
+
 fn cache_options_preserve_summarized_growth(initialized: bool) {
     let mut t = Trajectory::default();
     let mut request = body();
