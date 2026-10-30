@@ -220,6 +220,70 @@ class InitializationRegressions(unittest.TestCase):
             self.assertEqual(later["traditional_compactions"], 1,
                              "charged in-window count excludes pre-window initialization")
 
+    def test_cache_only_failure_retains_recognition_but_changed_settings_reinitialize(self):
+        inputs = [260000, None, 260100, 260200]
+
+        def primary(_body, n):
+            incoming = inputs[n - 1]
+            if incoming is None:
+                return 429, {"error": "owned cache-only recognition fixture"}
+            response = support.completed(response_id=f"recognition186-{n}")
+            response["usage"] = {"input_tokens": incoming, "output_tokens": 0,
+                                 "input_tokens_details": {"cached_tokens": 0}}
+            return 200, response
+
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+
+        def start():
+            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+                                  extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
+            self.harness.stack.callback(proxy.close)
+            return proxy
+
+        proxy = start()
+        history = [{"role": "assistant", "content": "owned synthetic receipt tracer"},
+                   {"role": "user", "content": "current"}]
+        self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
+        first = copy.deepcopy(proxy.saved()["cost_trajectory"])
+        appended = history + [{"role": "user", "content": "append"}]
+        self.assertEqual(proxy.send(appended, model="gpt-6.1-sol", max_output_tokens=1)[0], 429)
+        failed = copy.deepcopy(proxy.saved()["cost_trajectory"])
+        proxy.close()
+        proxy = start()
+        restarted = copy.deepcopy(proxy.saved()["cost_trajectory"])
+        self.assertEqual(proxy.send(appended, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
+        retry = copy.deepcopy(proxy.saved()["cost_trajectory"])
+        self.assertEqual(proxy.send(appended, model="gpt-6.1-sol", max_output_tokens=1,
+                                    instructions="changed fixed settings")[0], 200)
+        changed = copy.deepcopy(proxy.saved()["cost_trajectory"])
+        self.evidence.update(first=first, failed=failed, restarted=restarted, retry=retry,
+                             changed=changed, primaries=fixture.primaries, reviews=fixture.reviews,
+                             basis="synthetic receipt accounting; explicit owner restart and settings fence")
+        self.assertEqual(fixture.reviews, [])
+        self.assertEqual(len(fixture.primaries), 4)
+        self.assertEqual(fixture.primaries[1]["input"], fixture.primaries[2]["input"])
+        self.assertEqual(fixture.primaries[3]["instructions"], "changed fixed settings")
+        self.assertAlmostEqual(changed["result"]["observed_primary_cost"], 1.5606, places=12)
+        self.assertEqual(failed["result"]["traditional_cost"], first["result"]["traditional_cost"])
+        self.assertAlmostEqual(first["result"]["traditional_cost"], 0.0525, places=12)
+        self.assertEqual(first["result"]["initial_compactions"], 1)
+        self.assertIsNotNone(first["receipts"]["history_anchor"])
+        self.assertIsNone(failed["receipts"]["anchor"])
+        self.assertIsNone(failed["receipts"]["traditional_anchor"])
+        self.assertEqual(failed["receipts"]["history_anchor"], first["receipts"]["history_anchor"])
+        self.assertEqual(restarted, failed, "restart preserves the failed-attempt boundary")
+        self.assertEqual(retry["result"]["initial_compactions"], 1,
+                         "cache-only invalidation cannot repeat free initialization")
+        self.assertAlmostEqual(retry["result"]["traditional_cost"] - first["result"]["traditional_cost"],
+                               21100 * 2.5 / 1e6, places=12)
+        self.assertEqual(changed["result"]["initial_compactions"], 2,
+                         "genuinely unrecognized changed settings require a new prospective assumption")
+        self.assertAlmostEqual(changed["result"]["traditional_cost"] - retry["result"]["traditional_cost"],
+                               0.0525, places=12)
+        self.assertEqual(changed["result"]["summary_cost"], 0.0)
+        self.assertEqual(changed["result"]["traditional_compactions"], 0)
+
     def test_native_offline_report_prices_initialized_first_primary(self):
         import json
         import os
@@ -392,11 +456,12 @@ class InitializationRegressions(unittest.TestCase):
         self.assertAlmostEqual(estimate["observed_primary_cost"], 0.402, places=12)
         self.assertEqual(proxy.saved()["primary"]["calls"], 1)
         self.assertEqual(estimate["traditional_compactions"], 0)
-        self.assertEqual(estimate["summary_cost"], 0.0)
+        self.assertEqual(self.evidence["trajectory"]["result"]["summary_cost"], 0.0)
         return estimate
 
     def test_unchanged_image_with_small_output_remains_priceable(self):
         estimate = self.image_output_comparison(1)
+        self.assertEqual(estimate["summary_cost"], 0.0)
         self.assertAlmostEqual(estimate["traditional_cost"], 0.5025, places=12)
         self.assertEqual(estimate["coverage"]["unmodeled_calls"], 0)
         self.assertEqual(estimate["matched_primary_responses"], 1)
@@ -407,8 +472,10 @@ class InitializationRegressions(unittest.TestCase):
         self.assertIsNone(estimate["traditional_cost"],
                           "initialization cannot allocate native image tokens to a projected slice")
         self.assertIsNone(estimate["savings"])
+        self.assertIsNone(estimate["summary_cost"])
         self.assertEqual(estimate["coverage"]["unmodeled_calls"], 1)
         self.assertEqual(estimate["excluded_unpriced_calls"], 1)
+        self.assertEqual(estimate["matched_primary_responses"], 0)
         self.assertEqual(estimate["initial_compactions"], 0)
 
     def test_requested_output_triggers_fitting_initialization_before_first_primary(self):
@@ -505,6 +572,39 @@ class InitializationRegressions(unittest.TestCase):
         self.assertEqual(proxy.saved()["primary"]["calls"], 1)
         self.assertIsNone(estimate["traditional_cost"],
                           "initialization cannot retire the current user request to invent feasibility")
+        self.assertIsNone(estimate["savings"])
+
+    def test_fixed_tools_that_cannot_fit_are_explicitly_unavailable(self):
+        def primary(_body, _n):
+            response = support.completed()
+            response["usage"] = {"input_tokens": 261000, "output_tokens": 0,
+                                 "input_tokens_details": {"cached_tokens": 0}}
+            return 200, response
+
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+        proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+                              extra=["--primary-context-tokens", "1048576"],
+                              extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
+        self.harness.stack.callback(proxy.close)
+        history = [{"role": "assistant", "content": " evidence" * 6000},
+                   {"role": "user", "content": "current protected request"}]
+        tools = [{"type": "function", "name": "owned", "description": " fixed" * 256000,
+                  "parameters": {"type": "object", "properties": {}}}]
+        self.assertEqual(proxy.send(history, model="gpt-6.1-sol", tools=tools,
+                                    max_output_tokens=1)[0], 200)
+        status, stats = proxy.request("GET", "/carry/dashboard/stats")
+        self.assertEqual(status, 200)
+        estimate = stats["sessions"][0]["cost_estimate"]
+        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["cost_trajectory"],
+                             primaries=fixture.primaries, reviews=fixture.reviews,
+                             basis="fixed tools exceed economic budget; synthetic receipt")
+        self.assertEqual(fixture.primaries[0]["tools"], tools)
+        self.assertEqual(fixture.primaries[0]["input"], history)
+        self.assertEqual(fixture.reviews, [])
+        self.assertAlmostEqual(estimate["observed_primary_cost"], 0.522, places=12)
+        self.assertEqual(proxy.saved()["primary"]["calls"], 1)
+        self.assertIsNone(estimate["traditional_cost"], "fixed tools cannot be hypothetically retired")
         self.assertIsNone(estimate["savings"])
 
     def test_fixed_instructions_that_cannot_fit_are_explicitly_unavailable(self):

@@ -196,6 +196,33 @@ fn initialization186_native_fixed_overhead_infeasible_preserves_observed_money()
 }
 
 #[test]
+fn initialization186_native_fixed_tools_infeasible_preserves_observed_money() {
+    let scenario = Scenario {
+        context_window: 3000,
+        reserve: 100,
+        keep_recent: 1200,
+        summary: 20,
+    };
+    let body = json!({"model":"gpt-6.1-sol", "tools":[{
+        "type":"function", "name":"owned", "description":" fixed".repeat(3000),
+        "parameters":{"type":"object", "properties":{}}
+    }], "input":[{"role":"user","content":"current protected goal"}]});
+    assert!(protected_prompt_tokens(&body).unwrap() > scenario.context_window - scenario.reserve);
+    let mut t = Trajectory::with_scenario(scenario);
+    t.record(&json!({"event":"model_request", "data":{"step":1,"request":body}}));
+    let estimate = response(&mut t, 3100, 0, 0);
+    assert!(estimate.observed_priced);
+    assert!(estimate.observed_cost > 0.0);
+    assert!(
+        !estimate.priced,
+        "fixed tools cannot be hypothetically retired"
+    );
+    assert_eq!(estimate.initial_compactions, 0);
+    assert_eq!(estimate.pi_compactions, 0);
+    assert_eq!(estimate.summary_cost, 0.0);
+}
+
+#[test]
 fn initialization186_native_current_user_infeasible_preserves_observed_money() {
     let mut t = Trajectory::with_scenario(Scenario {
         context_window: 3000,
