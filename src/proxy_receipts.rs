@@ -5,6 +5,12 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Receipts {
     anchor: Option<Anchor>,
+    // Continuity evidence is not a cache receipt: failed calls may clear both
+    // cache anchors without forgetting the successful traditional history.
+    #[serde(default)]
+    history_anchor: Option<Anchor>,
+    #[serde(default)]
+    pub(super) initialization_policy_version: Option<u32>,
     #[serde(default)]
     traditional_anchor: Option<Anchor>,
     #[serde(default)]
@@ -19,6 +25,8 @@ impl Default for Receipts {
     fn default() -> Self {
         Self {
             anchor: None,
+            history_anchor: None,
+            initialization_policy_version: Some(1),
             traditional_anchor: None,
             configuration: None,
             scenario_cache_policy_version: Some(carry::models::ScenarioCachePolicy::VERSION),
@@ -45,6 +53,11 @@ impl Receipts {
     pub(super) fn invalidate(&mut self) {
         self.invalidate_actual();
         self.traditional_anchor = None;
+    }
+
+    pub(super) fn forget_history(&mut self) {
+        self.invalidate();
+        self.history_anchor = None;
     }
 
     pub(super) fn invalidate_actual(&mut self) {
@@ -290,6 +303,25 @@ impl Trajectory {
             self.failed_call();
             return;
         }
+        if self
+            .receipts
+            .as_ref()
+            .unwrap()
+            .initialization_policy_version
+            != Some(1)
+        {
+            // The legacy window is an immutable cumulative boundary, not an
+            // additive ledger. Begin only future comparisons with the new rule.
+            let prior = self.snapshot();
+            if prior.coverage.primary_responses > 0 || prior.coverage.reviewer_responses > 0 {
+                self.result.legacy_initialization_segment = Some(CachePolicySegment::from(&prior));
+            }
+            self.reset_receipt_epoch();
+            self.receipts
+                .as_mut()
+                .unwrap()
+                .initialization_policy_version = Some(1);
+        }
         let policy_version = resolved
             .map_or(Some(carry::models::ScenarioCachePolicy::VERSION), |r| {
                 r.scenario_cache_policy.as_ref().map(|p| p.version)
@@ -408,6 +440,7 @@ impl Trajectory {
         self.receipts.as_mut().unwrap().configuration = Some(config.clone());
         let previous = self.receipts.as_ref().unwrap().anchor.clone();
         let traditional_previous = self.receipts.as_ref().unwrap().traditional_anchor.clone();
+        let history_previous = self.receipts.as_ref().unwrap().history_anchor.clone();
         let compatible = previous.as_ref().is_some_and(|a| {
             append_compatible(a, body, &config)
                 && at >= a.at
@@ -417,9 +450,15 @@ impl Trajectory {
         let traditional_compatible = traditional_previous.as_ref().is_some_and(|a| {
             a.configuration == config && at >= a.at && (self.carry_edited || compatible)
         });
-        if (previous.is_some() && !compatible && !self.carry_edited)
-            || (traditional_previous.is_some() && !traditional_compatible)
-        {
+        let history_compatible = history_previous.as_ref().is_some_and(|a| {
+            a.configuration == config
+                && at >= a.at
+                && (self.carry_edited
+                    || (append_compatible(a, body, &config)
+                        && native.input_tokens >= a.input
+                        && (items.len() > a.items || native.input_tokens == a.input)))
+        });
+        if history_previous.is_some() && !history_compatible {
             // Rewind, edit, configuration switch or negative total-input delta:
             // invalidate historical assumptions, not the current projection.
             self.reset_receipt_epoch();
@@ -428,11 +467,39 @@ impl Trajectory {
             .as_ref()
             .filter(|_| compatible)
             .map(|a| native.input_tokens - a.input);
-        let traditional = (native.input_tokens as i128)
+        let mut traditional = (native.input_tokens as i128)
             .saturating_add(self.restored)
             .saturating_sub(self.retired as i128)
             .saturating_add(self.summary as i128)
             .clamp(0, u64::MAX as i128) as u64;
+
+        let budget = self
+            .scenario
+            .context_window
+            .saturating_sub(self.scenario.reserve);
+        let fixed = projection_fixed_tokens(body);
+        let kept = self.scenario.keep_recent.max(fixed);
+        let mut initialized_now = false;
+        if self.scenario.valid()
+            && self.receipts.as_ref().unwrap().history_anchor.is_none()
+            && traditional > budget
+        {
+            let initialized = kept.saturating_add(self.scenario.summary);
+            if initialized > budget || initialized >= traditional {
+                self.result.excluded_unpriced_calls += 1;
+                self.reset_epoch();
+                return;
+            }
+            self.retired = self.retired.saturating_add(
+                traditional
+                    .saturating_sub(kept)
+                    .saturating_sub(self.summary),
+            );
+            self.summary = self.scenario.summary;
+            traditional = initialized;
+            self.traditional_edited = true;
+            initialized_now = true;
+        }
 
         // The alternative models an API-equivalent policy, not this route's
         // ability to request an explicit breakpoint or promise a future hit.
@@ -493,7 +560,7 @@ impl Trajectory {
         let total = traditional.saturating_add(retained_output);
         let summarize =
             self.scenario.valid() && total > self.scenario.context_window - self.scenario.reserve;
-        let discarded = total.saturating_sub(self.scenario.keep_recent);
+        let discarded = total.saturating_sub(kept);
         let summary_cost = if summarize {
             modeled_cost(
                 model,
@@ -508,6 +575,7 @@ impl Trajectory {
             Some(0.0)
         };
         if let (Some(traditional_cost), Some(summary_cost)) = (traditional_cost, summary_cost) {
+            self.result.initial_compactions += u64::from(initialized_now);
             self.result.carry_cost += carry;
             self.result.traditional_cost += traditional_cost + summary_cost;
             self.result.summary_cost += summary_cost;
@@ -526,7 +594,7 @@ impl Trajectory {
                 .retired
                 .saturating_add(discarded.saturating_sub(self.summary));
             self.summary = self.scenario.summary;
-            self.last_traditional_input = self.scenario.keep_recent.saturating_add(self.summary);
+            self.last_traditional_input = kept.saturating_add(self.summary);
             self.traditional_edited = true;
         }
         let anchor = Anchor {
@@ -539,6 +607,13 @@ impl Trajectory {
         };
         let receipts = self.receipts.as_mut().unwrap();
         receipts.anchor = Some(anchor.clone());
-        receipts.traditional_anchor = Some(anchor);
+        receipts.traditional_anchor = Some(anchor.clone());
+        receipts.history_anchor = Some(anchor);
     }
+}
+
+fn projection_fixed_tokens(body: &Value) -> u64 {
+    // Same local prompt-bearing overhead projection as the native estimator.
+    token_units(&json!({"instructions":body.get("instructions"),
+        "tools":body.get("tools"),"text":body.get("text")}))
 }

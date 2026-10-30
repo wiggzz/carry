@@ -80,6 +80,12 @@ pub struct CachePolicyBoundary {
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Estimate {
     #[serde(default)]
+    pub initialization_policy: String,
+    #[serde(default)]
+    pub initial_compactions: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_initialization_segment: Option<CachePolicySegment>,
+    #[serde(default)]
     pub counterfactual_cache_policy: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_cache_policy_segment: Option<CachePolicySegment>,
@@ -120,6 +126,9 @@ pub struct Estimate {
 /// comparable primary observations exist. Omitted reviewer expense is carry-only.
 #[derive(Debug, Serialize)]
 pub struct DashboardEstimate {
+    initialization_policy: String,
+    initial_compactions: u64,
+    legacy_initialization_segment: Option<CachePolicySegment>,
     counterfactual_cache_policy: String,
     legacy_cache_policy_segment: Option<CachePolicySegment>,
     cache_policy_boundaries: Vec<CachePolicyBoundary>,
@@ -149,6 +158,9 @@ impl Estimate {
     pub fn dashboard(self, pending: bool) -> DashboardEstimate {
         let available = self.priced;
         DashboardEstimate {
+            initialization_policy: self.initialization_policy,
+            initial_compactions: self.initial_compactions,
+            legacy_initialization_segment: self.legacy_initialization_segment,
             counterfactual_cache_policy: self.counterfactual_cache_policy,
             legacy_cache_policy_segment: self.legacy_cache_policy_segment,
             cache_policy_boundaries: self.cache_policy_boundaries,
@@ -311,6 +323,20 @@ impl Default for Trajectory {
 impl Trajectory {
     pub fn snapshot(&self) -> Estimate {
         let mut estimate = self.result.clone();
+        estimate.initialization_policy = if self
+            .receipts
+            .as_ref()
+            .is_some_and(|r| r.initialization_policy_version == Some(1))
+        {
+            if estimate.legacy_initialization_segment.is_some() {
+                "mixed_legacy_and_free_pre_window_v1"
+            } else {
+                "unrecognized_history_free_pre_window_v1"
+            }
+        } else {
+            "legacy_post_primary_compaction"
+        }
+        .into();
         let version = self
             .receipts
             .as_ref()
@@ -443,7 +469,7 @@ impl Trajectory {
 
     pub fn reset_epoch(&mut self) {
         if let Some(receipts) = &mut self.receipts {
-            receipts.invalidate();
+            receipts.forget_history();
         }
         // Totals survive actual rebases/native summaries; cache and restoration
         // assumptions do not cross an ancestry discontinuity.

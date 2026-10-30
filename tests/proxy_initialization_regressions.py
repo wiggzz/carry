@@ -3,7 +3,7 @@
 Small receipt tracers, large-wire restart/retry/growth, and fixed-overhead
 infeasibility share the executable used by hosted native integration tests.
 All native receipts are synthetic; these are not provider/tokenizer measurements.
-No initialization production change is present in this diagnostic candidate.
+Candidate execution is supplied by the hosted native integration wrapper.
 """
 import copy
 import unittest
@@ -80,6 +80,60 @@ class InitializationRegressions(unittest.TestCase):
                 estimate["traditional_cost"], 21000 * 2.5 / 1e6, places=12,
                 msg="first primary must use retained recent content plus replacement summary, cold",
             )
+
+    def test_legacy_initialization_upgrade_preserves_recorded_money(self):
+        import json
+
+        def primary(_body, n):
+            response = support.completed(response_id=f"legacy-initialization186-{n}")
+            response["usage"] = {"input_tokens": 10000 if n == 1 else 300000,
+                                 "output_tokens": 0,
+                                 "input_tokens_details": {"cached_tokens": 0}}
+            return 200, response
+
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+
+        def start():
+            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+                                  extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
+            self.harness.stack.callback(proxy.close)
+            return proxy
+
+        proxy = start()
+        history = [{"role": "user", "content": "owned legacy money fixture"}]
+        self.assertEqual(proxy.send(history, model="gpt-6.1-sol")[0], 200)
+        proxy.close()
+        checkpoint = next(self.harness.state.glob("*.json"))
+        saved = json.loads(checkpoint.read_text())
+        # Owned synthetic checkpoint: remove only the new estimand fields,
+        # retaining all historical receipts, native pricing and session state.
+        trajectory = saved["cost_trajectory"]
+        trajectory["receipts"].pop("initialization_policy_version", None)
+        trajectory["receipts"].pop("history_anchor", None)
+        for key in ["initialization_policy", "initial_compactions", "legacy_initialization_segment"]:
+            trajectory["result"].pop(key, None)
+        historical = copy.deepcopy(trajectory["result"])
+        checkpoint.write_text(json.dumps(saved))
+        proxy = start()
+        self.assertEqual(proxy.saved()["cost_trajectory"]["result"]["traditional_cost"],
+                         historical["traditional_cost"])
+        history.append({"role": "assistant", "content": "new unrecognized input"})
+        self.assertEqual(proxy.send(history, model="gpt-6.1-sol")[0], 200)
+        status, stats = proxy.request("GET", "/carry/dashboard/stats")
+        self.assertEqual(status, 200)
+        estimate = stats["sessions"][0]["cost_estimate"]
+        self.evidence.update(historical=historical, estimate=estimate, final=proxy.saved(),
+                             primaries=fixture.primaries, reviews=fixture.reviews)
+        self.assertAlmostEqual(estimate["observed_primary_cost"], 1.22, places=12)
+        self.assertAlmostEqual(estimate["traditional_cost"] - historical["traditional_cost"],
+                               0.0525, places=12)
+        self.assertEqual(estimate["summary_cost"], historical["summary_cost"])
+        self.assertEqual(estimate["initial_compactions"], 1)
+        self.assertEqual(estimate["initialization_policy"], "mixed_legacy_and_free_pre_window_v1")
+        boundary = estimate["legacy_initialization_segment"]
+        for key in ["carry_cost", "traditional_cost", "summary_cost", "traditional_compactions"]:
+            self.assertEqual(boundary[key], historical[key])
 
 
     def test_large_wire_initialization_survives_restart_retry_and_later_paid_compaction(self):
