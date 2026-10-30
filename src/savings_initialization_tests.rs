@@ -1,6 +1,45 @@
 // Issue186: native trace/report estimator, separate from proxy native receipts.
 // These tests intentionally precede production changes.
 #[test]
+fn initialization186_native_reserves_requested_output_before_first_primary() {
+    let scenario = Scenario {
+        context_window: 3000,
+        reserve: 100,
+        keep_recent: 1200,
+        summary: 20,
+    };
+    let mut body = json!({"model":"gpt-6.1-sol", "max_output_tokens":1, "input":[
+        {"role":"assistant", "content":" evidence".repeat(2400)},
+        {"role":"user", "content":" current".repeat(1200)}
+    ]});
+    let input = prompt_projection(&body).unwrap().2;
+    let protected = protected_prompt_tokens(&body).unwrap();
+    assert!(input > scenario.context_window - scenario.reserve);
+    assert!(protected + scenario.summary < scenario.context_window - scenario.reserve);
+    assert!(protected + scenario.summary + 2000 > scenario.context_window);
+
+    let mut small_output = Trajectory::with_scenario(scenario);
+    small_output.record(&json!({"event":"model_request", "data":{"step":1,"request":body}}));
+    let fitting = response(&mut small_output, input, 0, 0);
+    assert!(
+        fitting.priced,
+        "small output reservation leaves a feasible initialized prompt"
+    );
+    assert_eq!(fitting.initial_compactions, 1);
+    assert_eq!(fitting.summary_cost, 0.0);
+
+    body["max_output_tokens"] = json!(2000);
+    let mut large_output = Trajectory::with_scenario(scenario);
+    large_output.record(&json!({"event":"model_request", "data":{"step":1,"request":body}}));
+    let infeasible = response(&mut large_output, input, 0, 0);
+    assert!(infeasible.observed_priced);
+    assert_eq!(infeasible.observed_cost, fitting.observed_cost);
+    assert!(
+        !infeasible.priced,
+        "the requested output allowance and protected current input cannot both fit"
+    );
+}
+#[test]
 fn initialization186_native_first_primary_is_reduced_and_later_summary_is_paid() {
     let mut t = Trajectory::with_scenario(Scenario {
         context_window: 3000,
