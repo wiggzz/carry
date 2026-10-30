@@ -48,6 +48,24 @@ def ledger(body):
     raise AssertionError("review request must expose its actionable ledger")
 
 
+def stage_comparison_scenario(saved, scenario):
+    """Stage a synthetic threshold before any hypothetical summary.
+
+    These fixtures compress the test's units/window, not simulate a real
+    projection-policy change. Keep the typed decoder contract synchronized with
+    that fixture-only setup; changing production policy still segments history.
+    Never use this to relabel already summarized quantities or monetary totals.
+    """
+    trajectory = saved['cost_trajectory']
+    assert trajectory['retired'] == 0 and trajectory['summary'] == 0
+    assert trajectory['result']['traditional_compactions'] == 0
+    assert trajectory['result'].get('initial_compactions', 0) == 0
+    trajectory['scenario'] = scenario
+    if continuity := trajectory.get('history_continuity'):
+        continuity['contract']['keep_recent'] = scenario['keep_recent']
+        continuity['contract']['summary_tokens'] = scenario['summary']
+
+
 class Fixture:
     def __init__(self, primary, review):
         self.primary = primary
@@ -934,8 +952,8 @@ class StateRegressions(unittest.TestCase):
         # requests. Real provider endpoints are all loopback fixtures.
         path = next(self.state.glob("*.json"))
         saved = json.loads(path.read_text())
-        saved["cost_trajectory"]["scenario"] = {
-            "context_window": 2000, "reserve": 100, "keep_recent": 200, "summary": 50}
+        stage_comparison_scenario(saved, {
+            "context_window": 2000, "reserve": 100, "keep_recent": 200, "summary": 50})
         path.write_text(json.dumps(saved))
         proxy = self.proxy(fixture, options)
         delta = [{"role": "user", "content": "evidence " * 3000}]
@@ -977,8 +995,8 @@ class StateRegressions(unittest.TestCase):
         # Owned checkpoint only; force the modeled threshold, not live policy.
         path = next(self.state.glob("*.json"))
         saved = json.loads(path.read_text())
-        saved["cost_trajectory"]["scenario"] = {
-            "context_window": 2000, "reserve": 100, "keep_recent": 1500, "summary": 100}
+        stage_comparison_scenario(saved, {
+            "context_window": 2000, "reserve": 100, "keep_recent": 1500, "summary": 100})
         path.write_text(json.dumps(saved))
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send([{"role": "user", "content": "evidence " * 2000}],

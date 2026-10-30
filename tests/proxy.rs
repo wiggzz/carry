@@ -330,6 +330,28 @@ fn pr144_review_behavior_regressions() {
     );
 }
 
+// Identical-history primary money must be shared, never independently forecast.
+// This executes the portable loopback matrix with this source's native binary.
+#[test]
+fn no_op_receipt_parity_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_noop_parity.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute source-bound no-op receipt parity controls");
+    assert!(
+        output.status.success(),
+        "NO_OP_RECEIPT_PARITY HTTP controls failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // Issue188 tests-first accounting reproduction. Keep RED visible until the
 // route-specific write contract and immutable policy migration are implemented.
 #[test]

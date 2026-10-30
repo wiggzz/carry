@@ -1,3 +1,42 @@
+// Same primary histories share their actual partitions, including an observed
+// miss after a hit; forecast credit belongs only to divergent histories.
+#[test]
+fn no_op_receipt_parity_uses_observation_not_implicit_forecast() {
+    let mut trajectory = Trajectory::default();
+    let mut request = body();
+    let mut expected = 0.0;
+    for (index, cached) in [0, 60_000, 0].into_iter().enumerate() {
+        if index > 0 {
+            request["input"].as_array_mut().unwrap().push(json!({
+                "role":"user", "content":format!("native append {index}")
+            }));
+        }
+        let input = 62_719 + index as u64 * 100;
+        trajectory.primary(
+            &request,
+            &terminal(input, cached, 0, 100),
+            "parity",
+            100 + index as u64,
+            true,
+        );
+        let result = trajectory.snapshot();
+        expected += ((input - cached) as f64 * 2.0 + cached as f64 * 0.1 + 100.0 * 10.0) / 1e6;
+        assert!(result.priced);
+        assert_eq!(result.initial_compactions, 0);
+        assert_eq!(result.traditional_compactions, 0);
+        assert_eq!(result.matched_primary_responses, index as u64 + 1);
+        assert_eq!(result.excluded_unpriced_calls, 0);
+        assert!((result.observed_primary_cost - expected).abs() < 1e-12);
+        assert!((result.carry_cost - expected).abs() < 1e-12);
+        assert!(
+            (result.traditional_cost - expected).abs() < 1e-12,
+            "NO_OP_RECEIPT_PARITY: identical histories cannot invent writes or hits"
+        );
+        assert!(result.savings.abs() < 1e-12);
+        trajectory = serde_json::from_slice(&serde_json::to_vec(&trajectory).unwrap()).unwrap();
+    }
+}
+
 // Issue188: explicit-only with no breakpoints must not mask reviewer expense
 // with a synthetic write. Default/implicit paid-write controls stay separate.
 #[test]

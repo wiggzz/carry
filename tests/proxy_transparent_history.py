@@ -486,8 +486,8 @@ class TransparentHistory(unittest.TestCase):
         index = json.loads(path.read_text())
         owner = next(k for k,v in index["snapshots"].items() if v["primary"]["calls"] == 2)
         threshold = 100 + before["restored"] + before["restored"] // 2
-        index["snapshots"][owner]["cost_trajectory"]["scenario"] = {
-            "context_window":threshold + 100,"reserve":100,"keep_recent":100,"summary":50}
+        regressions.stage_comparison_scenario(index["snapshots"][owner], {
+            "context_window":threshold + 100,"reserve":100,"keep_recent":100,"summary":50})
         path.write_bytes(wire(index))
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)

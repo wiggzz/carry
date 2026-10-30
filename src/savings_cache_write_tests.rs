@@ -1,3 +1,48 @@
+// Native report/web adapters must not hide two equally invented cache costs
+// behind zero savings. Here native and local totals are explicitly equal; this
+// does not claim arbitrary native totals can be cast into local prompt units.
+#[test]
+fn no_op_receipt_parity_native_report_uses_reported_partitions() {
+    let mut trajectory = Trajectory::with_model("gpt-6.1-sol".into());
+    trajectory.record(&json!({"event":"run_started","data":{
+        "model":"gpt-6.1-sol", "cache_ttl_seconds":1800,
+        "implicit_cache_minimum_prefix_tokens":1024}}));
+    let mut body = json!({"model":"gpt-6.1-sol", "input":[{
+        "role":"user", "content":"unchanged native report prefix ".repeat(1000)}]});
+    let mut expected = 0.0;
+    for index in 0..3 {
+        if index > 0 {
+            body["input"].as_array_mut().unwrap().push(json!({
+                "role":"user", "content":format!("report append {index}")
+            }));
+        }
+        let input = prompt_projection(&body).unwrap().2;
+        assert!((1024..100_000).contains(&input));
+        let cached = if index == 1 { input / 2 } else { 0 };
+        trajectory.record(&json!({"event":"model_request","run_id":"native-parity",
+            "timestamp_ms":100 + index * 2,"data":{"step":index,
+            "transport":{"api_base":"https://api.openai.com/v1"}, "request":body}}));
+        let estimate = trajectory
+            .record(&json!({"event":"model_response","run_id":"native-parity",
+            "timestamp_ms":101 + index * 2,"data":{"step":index,"response_retries":0,
+            "usage":{"input_tokens":input,"cached_input_tokens":cached,
+            "cache_write_input_tokens":0,"output_tokens":100},"raw":{"output":[]}}}))
+            .unwrap();
+        expected += ((input - cached) as f64 * 2.0 + cached as f64 * 0.1 + 100.0 * 10.0) / 1e6;
+        assert!(estimate.priced && estimate.observed_priced);
+        assert_eq!(estimate.initial_compactions, 0);
+        assert_eq!(estimate.pi_compactions, 0);
+        assert_eq!(estimate.summary_cost, 0.0);
+        assert!((estimate.observed_cost - expected).abs() < 1e-12);
+        assert!(
+            (estimate.carry_cost - expected).abs() < 1e-12,
+            "NO_OP_NATIVE_PARITY: no unreported write/hit in an unchanged native primary"
+        );
+        assert!((estimate.pi_cost - expected).abs() < 1e-12);
+        assert!(estimate.savings.abs() < 1e-12);
+    }
+}
+
 // Issue188: explicit-only without breakpoints has no cache writes or reads.
 // Default/implicit modes must retain supported paid writes. See the official
 // prompt-caching guide; these are synthetic controls, not live billing evidence.

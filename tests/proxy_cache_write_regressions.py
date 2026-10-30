@@ -422,8 +422,8 @@ class CacheWriteRegressions(unittest.TestCase):
                     proxy.close()
                     if index == 0:
                         path = next(self.harness.state.glob("*.json"))
-                        saved["cost_trajectory"]["scenario"] = {"context_window":4000,
-                            "reserve":100,"keep_recent":1500,"summary":100}
+                        support.stage_comparison_scenario(saved, {"context_window":4000,
+                            "reserve":100,"keep_recent":1500,"summary":100})
                         path.write_text(json.dumps(saved))
                 self.assertEqual(fixture.reviews, [])
 
