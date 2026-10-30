@@ -540,6 +540,125 @@ mod tests {
         assert!(resumed.unresolved.is_none());
     }
 
+    // One fake-clock persisted-owner lifecycle. A full reported write alone has
+    // unknown timing. The separately supplied synthetic write-window proof is a
+    // new fixture contract, NOT a claim the existing transport records it. Its
+    // instantaneous bounds collapse dispatch/terminal time only in this fixture;
+    // real producer/transport-bound acceptance remains a separate gate. No read
+    // refresh contract is assumed. Baseline readers ignore the new window and
+    // reach the intended positive-credit assertion, rather than failing to build.
+    #[test]
+    fn observed_full_write_then_reads_keep_original_lifetime_across_restart() {
+        use carry::models::{Route, resolve_model};
+        let mut model = resolve_model(
+            "gpt-6.1-sol",
+            Route::new("https://api.openai.com/v1/responses", false),
+            None,
+            None,
+            0,
+            0,
+        )
+        .unwrap()
+        .with_scenario_cache_policy();
+        model.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 7;
+        let body = json!({"model":"gpt-6.1-sol", "input":[
+            {"role":"user","content":"synthetic written prefix ".repeat(2000)}]});
+        let write = json!({"input_tokens":2000,"output_tokens":1,
+            "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":2000}});
+        let hit = json!({"input_tokens":2000,"output_tokens":1,
+            "input_tokens_details":{"cached_tokens":2000,"cache_write_tokens":0}});
+        let miss = json!({"input_tokens":2000,"output_tokens":1,
+            "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}});
+        let credit = crate::proxy_savings::token_units(&body["input"]) as f64;
+        assert!(credit > 0.0);
+        let mut cache = Vec::new();
+        assert!(observe(
+            &mut cache,
+            &body,
+            &write,
+            Some(&model),
+            "scope",
+            100
+        ));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache[0].native_cached_fraction, 0.0,
+            "write is not a reported read"
+        );
+        assert_eq!(
+            reusable(&cache, &body, Some(&model), "scope", 101),
+            0.0,
+            "an unbounded terminal timestamp alone cannot locate the write"
+        );
+        let install_window = |cache: &mut Vec<CacheEvidence>, at| {
+            let mut saved = serde_json::to_value(&*cache).unwrap();
+            saved[0]["write_window"] = json!({"not_before":at,"not_after":at,"lifetime":7});
+            *cache = serde_json::from_value(saved).unwrap();
+        };
+        install_window(&mut cache, 100);
+        assert_eq!(
+            reusable(&cache, &body, Some(&model), "scope", 101),
+            credit,
+            "OBSERVED_WRITE_LIFETIME: a complete write must supply bounded forecast evidence, not globally disabled cache credit"
+        );
+
+        // Queries and restart cannot change the original event or paid usage.
+        let encoded = serde_json::to_vec(&cache).unwrap();
+        cache = serde_json::from_slice(&encoded).unwrap();
+        for at in [100, 106, 107, 200] {
+            assert_eq!(
+                reusable(&cache, &body, Some(&model), "scope", at),
+                if at < 107 { credit } else { 0.0 }
+            );
+            assert_eq!(serde_json::to_vec(&cache).unwrap(), encoded);
+        }
+        assert_eq!(reusable(&cache, &body, Some(&model), "other", 101), 0.0);
+        assert_eq!(reusable(&cache, &body, Some(&model), "scope", 99), 0.0);
+
+        // Neither changing today's TTL nor reporting another read establishes
+        // a new write. The old event still expires at100+7, not106+100.
+        model.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 100;
+        for at in [105, 106] {
+            assert!(observe(&mut cache, &body, &hit, Some(&model), "scope", at));
+            assert_eq!(reusable(&cache, &body, Some(&model), "scope", at), credit);
+            cache = serde_json::from_slice(&serde_json::to_vec(&cache).unwrap()).unwrap();
+        }
+        assert_eq!(
+            reusable(&cache, &body, Some(&model), "scope", 107),
+            0.0,
+            "OBSERVED_WRITE_LIFETIME: reads and a new policy cannot extend the original deadline"
+        );
+
+        // Terminal ordering still revokes a positive prefix. A later hit with
+        // unknown timing cannot resurrect it; an actual full write can rewarm.
+        assert!(observe(
+            &mut cache,
+            &body,
+            &miss,
+            Some(&model),
+            "scope",
+            106
+        ));
+        assert_eq!(reusable(&cache, &body, Some(&model), "scope", 106), 0.0);
+        assert!(observe(&mut cache, &body, &hit, Some(&model), "scope", 106));
+        assert_eq!(reusable(&cache, &body, Some(&model), "scope", 106), 0.0);
+        model.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 7;
+        assert!(observe(
+            &mut cache,
+            &body,
+            &write,
+            Some(&model),
+            "scope",
+            107
+        ));
+        install_window(&mut cache, 107);
+        cache = serde_json::from_slice(&serde_json::to_vec(&cache).unwrap()).unwrap();
+        assert_eq!(reusable(&cache, &body, Some(&model), "scope", 113), credit);
+        assert_eq!(reusable(&cache, &body, Some(&model), "scope", 114), 0.0);
+        assert_eq!(write["input_tokens_details"]["cache_write_tokens"], 2000);
+        assert_eq!(hit["input_tokens_details"]["cache_write_tokens"], 0);
+    }
+
     // A native read receipt proves this request's hit, not its write timestamp.
     // Keep it as an observation; a future guarantee needs timing/refresh proof.
     #[test]
