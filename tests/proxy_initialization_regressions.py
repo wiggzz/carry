@@ -351,6 +351,14 @@ class InitializationRegressions(unittest.TestCase):
             self.assertEqual(row[5], "$0.0525")
         with self.subTest(boundary="native report no charged initial summary"):
             self.assertEqual(row[7], "0")
+        # Rendered-product acceptance, not source inspection. Keep the existing
+        # numeric columns and money assertions independently exercised above.
+        with self.subTest(boundary="native report initialization disclosure"):
+            self.assertIn("1 free pre-window summaries", row[9])
+            self.assertIn("0 charged in-window summaries", row[9])
+            self.assertIn("counterfactual initialization assumption", row[9])
+        with self.subTest(boundary="native report does not contradict initialization"):
+            self.assertNotIn("No compaction is assumed before the first observed prompt", html)
 
     def test_native_report_later_paid_compaction_preserves_fixed_floor(self):
         import json
