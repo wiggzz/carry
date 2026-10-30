@@ -297,6 +297,31 @@ mod tests {
         assert_eq!(cache.eligible_at("scope", 114, 2100), 0);
     }
 
+    #[test]
+    fn modeled_write_storage_is_bounded_numeric_and_restart_safe() {
+        let mut cache = ModeledCache::default();
+        let mut maximum = 0;
+        for input in 2000..2160 {
+            let cached = cache.eligible_at("synthetic", 100, input);
+            cache.written("synthetic".into(), 100, 1800, input, cached);
+            let value = serde_json::to_value(&cache).unwrap();
+            let count = value["writes"].as_array().unwrap().len();
+            assert!(count <= 128);
+            maximum = maximum.max(count);
+        }
+        assert_eq!(maximum, 128);
+        let value = serde_json::to_value(&cache).unwrap();
+        let events = value["writes"].as_array().unwrap();
+        assert!(serde_json::to_vec(events).unwrap().len() < 8192);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.as_object().unwrap().values().all(Value::is_u64))
+        );
+        let resumed: ModeledCache = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(resumed).unwrap(), value);
+    }
+
     // A native read receipt proves this request's hit, not its write timestamp.
     // Keep it as an observation; a future guarantee needs timing/refresh proof.
     #[test]

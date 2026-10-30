@@ -1766,8 +1766,7 @@ fn receipt_discontinuities_never_attribute_a_removal_or_sibling_suffix() {
     }
 }
 
-#[test]
-fn receipt_bounded_anchor_restart_and_legacy_window_do_not_reprice_history() {
+fn receipt_many_appends() -> Trajectory {
     let mut t = Trajectory::default();
     let mut b = body();
     for n in 0..32 {
@@ -1777,12 +1776,35 @@ fn receipt_bounded_anchor_restart_and_legacy_window_do_not_reprice_history() {
             .push(json!({"role":"user","content":"private-canary ".repeat(1000)}));
         t.primary(&b, &terminal(2000 + n, 0, 0, 0), "route", 100 + n, true);
     }
+    t
+}
+
+#[test]
+fn receipt_bounded_anchor_restart_and_legacy_window_do_not_reprice_history() {
+    let t = receipt_many_appends();
     let receipt = state(&t)["receipts"].clone();
+    let events = &receipt["modeled_cache"]["writes"];
+    assert!(events.as_array().unwrap().len() <= 128);
+    assert!(serde_json::to_vec(events).unwrap().len() < 8192);
     assert!(
-        serde_json::to_vec(&receipt).unwrap().len() < 2048,
-        "one bounded numeric anchor, no prompt archive"
+        serde_json::to_vec(&receipt).unwrap().len() < 16384,
+        "bounded numeric anchors and modeled extents, no prompt archive"
     );
     assert!(!receipt.to_string().contains("private-canary"));
+    let resumed: Trajectory = serde_json::from_value(state(&t)).unwrap();
+    assert_eq!(state(&resumed)["receipts"], receipt);
+    assert_eq!(resumed.snapshot().carry_cost, t.snapshot().carry_cost);
+    assert_eq!(
+        resumed.snapshot().traditional_cost,
+        t.snapshot().traditional_cost
+    );
+}
+
+#[test]
+fn receipt_legacy_window_does_not_reprice_history() {
+    // Separate registration prevents a storage-shape failure from hiding these
+    // monetary/mixed-legacy controls. The original lifecycle is retained.
+    let t = receipt_many_appends();
     let mut legacy = state(&t);
     legacy.as_object_mut().unwrap().remove("receipts");
     let mut old: Trajectory = serde_json::from_value(legacy.clone()).unwrap();

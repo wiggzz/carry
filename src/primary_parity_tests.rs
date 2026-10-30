@@ -109,6 +109,78 @@ fn modeled_cache_append_and_new_policy_cannot_extend_old_prefix_deadline() {
     }
 }
 
+// Review5715769560 tests-first: live cache namespace production deliberately
+// unchanged until this exact-source differential reaches the intended failure.
+#[test]
+fn modeled_cache_equivalent_options_keep_warmth_in_both_quantity_adapters() {
+    let mut live = Trajectory::default();
+    let mut native = crate::savings::Trajectory::with_model("gpt-6.1-sol".into());
+    live.projected(100, 100, true);
+    native.record(&json!({"event":"run_started","data":{"model":"gpt-6.1-sol",
+        "cache_ttl_seconds":1800,"implicit_cache_minimum_prefix_tokens":1024}}));
+    native.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":0}}));
+    let mut request = json!({"model":"gpt-6.1-sol","max_output_tokens":1,"prompt_cache_key":"synthetic-semantic-scope",
+        "input":[{"role":"user","content":"synthetic semantic cache prefix ".repeat(1000)}]});
+    let input = crate::savings::prompt_projection(&request).unwrap().2;
+    assert!(input > 1024);
+    for (index, options) in [
+        None,
+        Some(json!({})),
+        Some(json!({"mode":"implicit","ttl":"30m"})),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        request
+            .as_object_mut()
+            .unwrap()
+            .remove("prompt_cache_options");
+        if let Some(options) = options {
+            request["prompt_cache_options"] = options;
+        }
+        live = serde_json::from_value(state(&live)).unwrap();
+        let before = live.snapshot();
+        let native_before = native.snapshot();
+        live.primary(
+            &request,
+            &terminal(input, 0, 0, 0),
+            "semantic-scope",
+            100 + index as u64,
+            true,
+        );
+        native.record(
+            &json!({"event":"model_request","timestamp_ms":(100+index)*1000,
+            "data":{"step":index,"route":"semantic-scope","request":request}}),
+        );
+        let n = native
+            .record(
+                &json!({"event":"model_response","timestamp_ms":(100+index)*1000,
+            "data":{"step":index,"usage":{"input_tokens":input,"output_tokens":0,
+            "cached_input_tokens":0,"cache_write_input_tokens":0},"raw":{"output":[]}}}),
+            )
+            .unwrap();
+        let after = live.snapshot();
+        assert!(after.priced && n.priced && n.observed_priced);
+        assert_eq!(after.excluded_unpriced_calls, 0);
+        assert_eq!(after.initial_compactions, 0);
+        assert_eq!(after.traditional_compactions, 0);
+        assert_eq!(after.summary_cost, 0.0);
+        let actual = input as f64 * 2.0 / 1e6;
+        assert!(
+            (after.observed_primary_cost - before.observed_primary_cost - actual).abs() < 1e-12
+        );
+        assert!((n.observed_cost - native_before.observed_cost - actual).abs() < 1e-12);
+        let expected = input as f64 * if index == 0 { 2.5 } else { 0.1 } / 1e6;
+        assert!((n.pi_cost - native_before.pi_cost - expected).abs() < 1e-12);
+        assert!(
+            (after.traditional_cost - before.traditional_cost - expected).abs() < 1e-12,
+            "SEMANTIC_CACHE_SCOPE: equivalent omitted/empty/default options cannot rename a live write"
+        );
+        assert!((after.traditional_cost - n.pi_cost).abs() < 1e-12);
+    }
+}
+
 fn cache_options_preserve_summarized_growth(initialized: bool) {
     let mut t = Trajectory::default();
     let mut request = body();

@@ -114,7 +114,8 @@ struct Prompt {
     fixed_input: u64,
     protected_input: u64,
     requested_output: Option<u64>,
-    cached_at_ms: Option<u64>,
+    request_at_ms: Option<u64>,
+    cache_lifetime_ms: Option<u64>,
     cache_mode: ScenarioCacheMode,
     write_tariff_known: bool,
 }
@@ -129,6 +130,7 @@ pub struct Trajectory {
     pending_step: Option<u64>,
     pending_run: Option<String>,
     previous: Option<Prompt>,
+    modeled_cache: crate::proxy_cache::ModeledCache,
     restored: i128,
     removed: u64,
     summary: u64,
@@ -167,6 +169,7 @@ impl Trajectory {
             pending_step: None,
             pending_run: None,
             previous: None,
+            modeled_cache: crate::proxy_cache::ModeledCache::default(),
             restored: 0,
             removed: 0,
             summary: 0,
@@ -235,7 +238,7 @@ impl Trajectory {
                 self.cache_minimum = data["implicit_cache_minimum_prefix_tokens"].as_u64();
                 if previous_minimum != self.cache_minimum_for(&self.last_model) {
                     // A prior prompt was not necessarily written under the new policy.
-                    self.previous = None;
+                    self.modeled_cache.clear();
                 }
                 let window = data["context_window"].as_u64().filter(|w| *w > 0);
                 self.scenario.context_window = window.unwrap_or(self.configured_window);
@@ -252,7 +255,7 @@ impl Trajectory {
                 }
             }
             "cache_expired" => {
-                self.previous = None;
+                self.modeled_cache.clear();
             }
             "model_request" => {
                 if self.pending_request {
@@ -264,7 +267,8 @@ impl Trajectory {
                 self.result.coverage.requests += 1;
                 self.pending = projection(data, &self.model);
                 if let Some(p) = self.pending.as_mut() {
-                    p.cached_at_ms = value["timestamp_ms"].as_u64();
+                    p.request_at_ms = value["timestamp_ms"].as_u64();
+                    p.cache_lifetime_ms = self.cache_ttl_ms;
                 }
                 if self.cache_ttl_ms.is_none() || value["timestamp_ms"].as_u64().is_none() {
                     self.result.coverage.unknown_expiry_requests += 1;
@@ -312,7 +316,7 @@ impl Trajectory {
                     self.result.coverage.unpriced_responses += 1;
                 }
                 let prompt = if matched { self.pending.take() } else { None };
-                if let (Some(mut prompt), Some(usage)) = (prompt, usage) {
+                if let (Some(prompt), Some(usage)) = (prompt, usage) {
                     let mut pi_input = (prompt.input as i128)
                         .saturating_add(self.restored)
                         .saturating_sub(self.removed as i128)
@@ -352,25 +356,29 @@ impl Trajectory {
                             && p.overhead == prompt.overhead
                             && p.route == prompt.route
                             && p.cache_mode == prompt.cache_mode
-                            && self
-                                .cache_ttl_ms
-                                .zip(p.cached_at_ms)
-                                .zip(prompt.cached_at_ms)
-                                .is_none_or(|((ttl, prev), now)| now >= prev && now - prev < ttl)
                     });
                     let append = self
                         .previous
                         .as_ref()
                         .is_some_and(|p| prompt.prefix.starts_with(&p.prefix));
 
-                    // Alternative prefixes are unknown after a native edit: declared append/frozen-size reuse.
-                    let pi_cached =
-                        if compatible && (append || self.carry_edited) && !self.pi_edited {
-                            self.last_pi_input.min(pi_input)
+                    // The local adapter owns projection compatibility; the same
+                    // write owner as live receipts owns deadlines and extents.
+                    // Native hits never seed this hypothetical branch.
+                    if !compatible || !(append || self.carry_edited) || self.pi_edited {
+                        self.modeled_cache.clear();
+                    }
+                    let minimum = self.cache_minimum_for(&prompt.model);
+                    let pi_cached = prompt.request_at_ms.map_or(0, |at| {
+                        let prefix = self.modeled_cache.eligible_at("native-local", at, pi_input);
+                        if prompt.cache_mode == ScenarioCacheMode::Implicit
+                            && minimum.is_some_and(|min| prefix >= min)
+                        {
+                            prefix
                         } else {
                             0
-                        };
-                    let minimum = self.cache_minimum_for(&prompt.model);
+                        }
+                    });
                     let pair = self.primary_history.price(observed, || {
                         if minimum.is_none() || prompt.cache_mode == ScenarioCacheMode::Unknown {
                             self.result.coverage.unknown_cache_requests += 1;
@@ -392,6 +400,23 @@ impl Trajectory {
                     } else {
                         self.scenario_available = false;
                     }
+                    if let (Some(at), Some(lifetime)) =
+                        (prompt.request_at_ms, prompt.cache_lifetime_ms)
+                        && prompt.cache_mode == ScenarioCacheMode::Implicit
+                        && minimum.is_some_and(|min| pi_input >= min)
+                    {
+                        // A dispatch-time population assumption, not a response
+                        // timestamp masquerading as an observed provider write.
+                        self.modeled_cache.written(
+                            "native-local".into(),
+                            at,
+                            lifetime,
+                            pi_input,
+                            pi_cached,
+                        );
+                    } else {
+                        self.modeled_cache.clear();
+                    }
                     self.last_pi_input = pi_input;
                     if let Some(output) = data["raw"].get("output").filter(|v| !v.is_null()) {
                         self.last_output_proxy = token_units(output);
@@ -400,7 +425,6 @@ impl Trajectory {
                         self.result.coverage.missing_output_projection += 1;
                     }
                     self.last_model = prompt.model.clone();
-                    prompt.cached_at_ms = value["timestamp_ms"].as_u64().or(prompt.cached_at_ms);
                     self.previous = Some(prompt);
                     self.carry_edited = false;
                     self.pi_edited = false;
@@ -435,6 +459,7 @@ impl Trajectory {
                         self.result.pi_cost += cost;
                         self.result.pi_compactions += 1;
                         self.pi_edited = true;
+                        self.modeled_cache.clear();
                         self.primary_history.diverge();
                         self.removed = self
                             .removed
@@ -588,7 +613,8 @@ fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
         prefix,
         overhead,
         route,
-        cached_at_ms: None,
+        request_at_ms: None,
+        cache_lifetime_ms: None,
         write_tariff_known: carry::models::cache_write_tariff_known(request),
         cache_mode: ScenarioCachePolicy::for_model(request["model"].as_str().unwrap_or(fallback))
             .request_mode(request),
