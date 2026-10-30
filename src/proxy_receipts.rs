@@ -392,6 +392,9 @@ impl Trajectory {
             }
         }
         let retained_output = retained_output_tokens(&response["output"]);
+        let budget = self
+            .scenario
+            .initial_input_budget(body["max_output_tokens"].as_u64());
         // An unchanged image-bearing request can share its exact receipt total
         // between both branches. A projected/restored/summary slice cannot use
         // base64 length or an invented per-image allocation as native tokens.
@@ -406,8 +409,9 @@ impl Trajectory {
                     .zip(retained_output)
                     .is_some_and(|(u, retained)| {
                         !self.scenario.valid()
-                            || u.input_tokens.saturating_add(retained)
-                                <= self.scenario.context_window - self.scenario.reserve
+                            || (u.input_tokens <= budget
+                                && u.input_tokens.saturating_add(retained)
+                                    <= self.scenario.context_window - self.scenario.reserve)
                     }));
         if !billable || !image_comparable || retained_output.is_none() {
             self.result.coverage.unmodeled_calls += 1;
@@ -482,9 +486,6 @@ impl Trajectory {
             .saturating_add(self.summary as i128)
             .clamp(0, u64::MAX as i128) as u64;
 
-        let budget = self
-            .scenario
-            .initial_input_budget(body["max_output_tokens"].as_u64());
         let fixed = projection_fixed_tokens(body);
         let kept = self.scenario.keep_recent.max(fixed);
         let mut initialized_now = false;
