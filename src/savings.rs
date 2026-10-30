@@ -54,6 +54,9 @@ pub struct Estimate {
     pub carry_cost: f64,
     pub pi_cost: f64,
     pub pi_compactions: usize,
+    /// Free pre-window summaries, never included in charged compactions.
+    pub initial_compactions: usize,
+    pub initialization_policy: &'static str,
     pub summary_cost: f64,
     pub priced: bool,
     pub observed_priced: bool,
@@ -68,6 +71,7 @@ struct Prompt {
     overhead: String,
     route: String,
     input: u64,
+    fixed_input: u64,
     cached_at_ms: Option<u64>,
     cache_mode: ScenarioCacheMode,
     write_tariff_known: bool,
@@ -90,6 +94,7 @@ pub struct Trajectory {
     last_output_proxy: u64,
     last_model: String,
     scenario_available: bool,
+    initialized: bool,
     carry_edited: bool,
     pi_edited: bool,
     cache_ttl_ms: Option<u64>,
@@ -126,6 +131,7 @@ impl Trajectory {
             last_output_proxy: 0,
             last_model: String::new(),
             scenario_available: true,
+            initialized: false,
             carry_edited: false,
             pi_edited: false,
             cache_ttl_ms: None,
@@ -135,6 +141,7 @@ impl Trajectory {
     }
     pub fn snapshot(&self) -> Estimate {
         let mut e = self.result.clone();
+        e.initialization_policy = "unrecognized_history_free_pre_window_v1";
         e.counterfactual_cache_policy =
             format!("conditional_model_cache_v{}", ScenarioCachePolicy::VERSION);
         e.coverage.unmatched_requests += usize::from(self.pending_request);
@@ -260,11 +267,32 @@ impl Trajectory {
                 }
                 let prompt = if matched { self.pending.take() } else { None };
                 if let (Some(mut prompt), Some(usage)) = (prompt, usage) {
-                    let pi_input = (prompt.input as i128)
+                    let mut pi_input = (prompt.input as i128)
                         .saturating_add(self.restored)
                         .saturating_sub(self.removed as i128)
                         .saturating_add(self.summary as i128)
                         .clamp(0, u64::MAX as i128) as u64;
+                    // Initialize before pricing the first compared primary.
+                    // Cache expiry does not erase known traditional history.
+                    if !self.initialized && self.scenario.valid() {
+                        let budget = self.scenario.context_window - self.scenario.reserve;
+                        if pi_input > budget {
+                            let kept = self.scenario.keep_recent.max(prompt.fixed_input);
+                            let compacted = kept.saturating_add(self.scenario.summary);
+                            if compacted > budget || compacted >= pi_input {
+                                self.scenario_available = false;
+                            } else {
+                                self.removed = self.removed.saturating_add(
+                                    pi_input.saturating_sub(kept).saturating_sub(self.summary),
+                                );
+                                self.summary = self.scenario.summary;
+                                pi_input = compacted;
+                                self.pi_edited = true;
+                                self.result.initial_compactions += 1;
+                            }
+                        }
+                        self.initialized = true;
+                    }
                     // Freeze the output count, not its rate: use each scenario input tier.
                     let carry_output =
                         scenario_output_cost(&prompt.model, prompt.input, usage.output_tokens);
@@ -466,12 +494,18 @@ pub(crate) fn prompt_projection(body: &Value) -> Option<(String, String, u64)> {
 fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
     let request = &data["request"];
     let (prefix, overhead, input) = prompt_projection(request)?;
+    // Fixed request overhead cannot be discarded to invent a fitting history.
+    let fixed_input = token_units(&json!({
+        "overhead": serde_json::from_str::<Value>(&overhead).ok()?,
+        "input": [],
+    }));
     // Semantic policy is compared separately; equivalent default spellings do
     // not change the real route/key or force an artificial cold request.
     let route=serde_json::to_string(&json!({"api_base":data["transport"].get("api_base"),"route":data.get("route"),"cache_key":request.get("prompt_cache_key")})).ok()?;
     Some(Prompt {
         model: request["model"].as_str().unwrap_or(fallback).to_owned(),
         input,
+        fixed_input,
         prefix,
         overhead,
         route,
