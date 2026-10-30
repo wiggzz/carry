@@ -659,6 +659,109 @@ mod tests {
         assert_eq!(hit["input_tokens_details"]["cache_write_tokens"], 0);
     }
 
+    // Non-instantaneous bounds are not a point write at response completion.
+    // The conservative deadline is earliest possible write + frozen lifetime;
+    // no positive credit is justified before the whole write could finish.
+    fn bounded_observation(
+        usage: Value,
+        window: Value,
+    ) -> (Vec<CacheEvidence>, Value, carry::models::ResolvedModel) {
+        use carry::models::{Route, resolve_model};
+        let mut model = resolve_model(
+            "gpt-6.1-sol",
+            Route::new("https://api.openai.com/v1/responses", false),
+            None,
+            None,
+            0,
+            0,
+        )
+        .unwrap()
+        .with_scenario_cache_policy();
+        model.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 7;
+        let body = json!({"model":"gpt-6.1-sol", "input":[
+            {"role":"user","content":"synthetic bounded prefix ".repeat(2000)}]});
+        let mut cache = Vec::new();
+        assert!(observe(
+            &mut cache,
+            &body,
+            &usage,
+            Some(&model),
+            "scope",
+            103
+        ));
+        assert_eq!(cache.len(), 1);
+        let mut saved = serde_json::to_value(cache).unwrap();
+        saved[0]["write_window"] = window;
+        (serde_json::from_value(saved).unwrap(), body, model)
+    }
+
+    #[test]
+    fn observed_noninstantaneous_write_uses_earliest_expiry_and_latest_completion() {
+        let (cache, body, mut model) = bounded_observation(
+            json!({"input_tokens":2000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":2000}}),
+            json!({"not_before":100,"not_after":103,"lifetime":7}),
+        );
+        let encoded = serde_json::to_vec(&cache).unwrap();
+        let cache: Vec<CacheEvidence> = serde_json::from_slice(&encoded).unwrap();
+        let credit = crate::proxy_savings::token_units(&body["input"]) as f64;
+        assert!(credit > 0.0);
+        for at in [99, 100, 102] {
+            assert_eq!(reusable(&cache, &body, Some(&model), "scope", at), 0.0);
+        }
+        assert_eq!(
+            reusable(&cache, &body, Some(&model), "scope", 103),
+            credit,
+            "OBSERVED_WRITE_BOUNDS: a whole write completed within [100,103] must be usable at103"
+        );
+        model.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 100;
+        for at in [106, 107, 109, 110] {
+            assert_eq!(
+                reusable(&cache, &body, Some(&model), "scope", at),
+                if at < 107 { credit } else { 0.0 }
+            );
+            assert_eq!(serde_json::to_vec(&cache).unwrap(), encoded);
+        }
+    }
+
+    #[test]
+    fn observed_partial_native_write_cannot_locate_a_local_prefix_even_with_time_bounds() {
+        let (cache, body, model) = bounded_observation(
+            json!({"input_tokens":2000,"input_tokens_details":{"cached_tokens":1000,"cache_write_tokens":1000}}),
+            json!({"not_before":100,"not_after":103,"lifetime":7}),
+        );
+        assert_eq!(
+            cache[0].native_cached_fraction, 0.5,
+            "raw usage remains an observation"
+        );
+        let encoded = serde_json::to_vec(&cache).unwrap();
+        assert_eq!(
+            reusable(&cache, &body, Some(&model), "scope", 104),
+            0.0,
+            "OBSERVED_WRITE_EXTENT: aggregate partial counts plus time bounds cannot identify local cached positions"
+        );
+        assert_eq!(serde_json::to_vec(&cache).unwrap(), encoded);
+    }
+
+    #[test]
+    fn observed_invalid_or_expired_by_completion_bounds_never_supply_credit() {
+        for window in [
+            json!({"not_before":104,"not_after":103,"lifetime":7}),
+            json!({"not_before":100,"not_after":103,"lifetime":0}),
+            json!({"not_before":100,"not_after":107,"lifetime":7}),
+            json!({"not_before":100,"not_after":108,"lifetime":7}),
+        ] {
+            let (cache, body, model) = bounded_observation(
+                json!({"input_tokens":2000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":2000}}),
+                window,
+            );
+            let encoded = serde_json::to_vec(&cache).unwrap();
+            for at in [99, 100, 103, 104, 106, 107, 108, 110] {
+                assert_eq!(reusable(&cache, &body, Some(&model), "scope", at), 0.0);
+                assert_eq!(serde_json::to_vec(&cache).unwrap(), encoded);
+            }
+        }
+    }
+
     // A native read receipt proves this request's hit, not its write timestamp.
     // Keep it as an observation; a future guarantee needs timing/refresh proof.
     #[test]

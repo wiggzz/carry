@@ -184,6 +184,14 @@ class LegacyAdapterLoads(unittest.TestCase):
                 self.assertEqual(after["summary_cost"], before["summary_cost"])
                 self.assertGreater(after["traditional_cost"], snapshots[step - 1]["traditional_cost"]
                                    if step else before["traditional_cost"])
+                previous_cost = snapshots[step - 1]["traditional_cost"] if step else before["traditional_cost"]
+                # Eventless legacy has no timed write: first continuation is
+                # cold, then the new hypothetical write warms only its prefix.
+                expected_increment = (21200 * 2.5 if step == 0 else
+                                      21200 * .1 + 100 * 2.5) / 1e6
+                self.assertAlmostEqual(after["traditional_cost"] - previous_cost,
+                                       expected_increment, places=12,
+                                       msg="LEGACY_ADAPTED_PRICE: cold once, then original prefix plus new suffix")
 
 
 def install_cases():
