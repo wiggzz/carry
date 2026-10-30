@@ -1780,6 +1780,22 @@ async fn forward_request(
         // Measure after choosing its actual input, including a zero delta for
         // pass-through. Receipt compatibility may preserve only this quantity.
         let canonical = json!(session.render_primary());
+        let (canonical_units, submitted_units, primary_edited) = if service.config.mode == Mode::Off
+        {
+            // Off never edits input. Its optional tracker can fail or be empty,
+            // so it cannot define a canonical-minus-sent delta.
+            (0, 0, false)
+        } else {
+            (
+                estimate(&canonical) as u64,
+                estimate(&outbound["input"]) as u64,
+                canonical != outbound["input"],
+            )
+        };
+        // Freeze the final transport representation before preparing legacy
+        // proof and reserving the attempt. Projection above uses client-native
+        // quantities; admission has already retained the client's output cap.
+        outbound = primary_wire_body(&service.config, &outbound);
         if let Some(t) = &mut session.cost_trajectory {
             t.load_receipt_history(
                 &outbound,
@@ -1795,17 +1811,7 @@ async fn forward_request(
                     .rev()
                     .map(|pair| &pair.primary),
             );
-            if service.config.mode == Mode::Off {
-                // Off never edits input. Its optional tracker can fail or be
-                // empty, so it cannot define a canonical-minus-sent delta.
-                t.projected(0, 0, false);
-            } else {
-                t.projected(
-                    estimate(&canonical) as u64,
-                    estimate(&outbound["input"]) as u64,
-                    canonical != outbound["input"],
-                );
-            }
+            t.projected(canonical_units, submitted_units, primary_edited);
         }
         let reviewed = session.clone();
         session.last_submitted_ids = session
@@ -1832,7 +1838,6 @@ async fn forward_request(
             .filter(|i| !projection.omitted.contains(&i.id))
             .map(|i| i.id)
             .collect();
-        outbound = primary_wire_body(&service.config, &outbound);
         let _ = trace(&service, &id, "primary_submitted", &outbound);
         journal(
             &service,
