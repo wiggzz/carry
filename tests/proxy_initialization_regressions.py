@@ -64,6 +64,84 @@ class InitializationRegressions(unittest.TestCase):
         self.assertAlmostEqual(estimate["carry_cost"], incoming * ordinary_rate / 1e6, places=12)
         return estimate
 
+    def output_allowance_history_control(self, *, initialized, change_cap):
+        # Native-total tracers, not provider/tokenizer measurements. The seeded
+        # path preserves a genuine charged summary on both baseline and candidate.
+        inputs = ([] if initialized else [10000]) + [300000, 300100, 300200, 300300, 300400]
+        changed_at = len(inputs) - 2
+
+        def primary(_body, n):
+            response = support.completed(response_id=f"history-contract-{n}")
+            response["usage"] = {"input_tokens": inputs[n - 1], "output_tokens": 0,
+                                 "input_tokens_details": {"cached_tokens": 0}}
+            return 200, response
+
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+        snapshots, wires, caps = [], [], []
+        history = [{"role": "assistant", "content": "owned native-input history contract"},
+                   {"role": "user", "content": "current request"}]
+        for index, _incoming in enumerate(inputs):
+            if index:
+                history.append({"role": "user", "content": f"append {index}"})
+            cap = 2 if change_cap and index >= changed_at else 1
+            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+                                  extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
+            self.harness.stack.callback(proxy.close)
+            if index:
+                self.assertEqual(proxy.saved()["cost_trajectory"], snapshots[-1],
+                                 "restart must preserve settled quantities and money")
+            wires.append(copy.deepcopy(history))
+            caps.append(cap)
+            self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=cap)[0], 200)
+            snapshots.append(copy.deepcopy(proxy.saved()["cost_trajectory"]))
+            proxy.close()
+        self.evidence.update(history_contract_snapshots=snapshots, primaries=fixture.primaries,
+                             reviews=fixture.reviews, initialized=initialized, change_cap=change_cap,
+                             basis="native receipt-domain contract; no inferred per-message quantities")
+        self.assertEqual(len(fixture.primaries), len(inputs))
+        self.assertEqual(fixture.reviews, [])
+        for index, snapshot in enumerate(snapshots):
+            self.assertEqual(fixture.primaries[index]["input"], wires[index])
+            self.assertEqual(fixture.primaries[index]["max_output_tokens"], caps[index])
+            expected_paid = sum(n * (4.0 if n > 272000 else 2.0) / 1e6
+                                for n in inputs[:index + 1])
+            self.assertAlmostEqual(snapshot["result"]["observed_primary_cost"], expected_paid, places=12)
+            self.assertAlmostEqual(snapshot["result"]["carry_cost"], expected_paid, places=12)
+            self.assertEqual(snapshot["result"]["excluded_unpriced_calls"], 0)
+        before = snapshots[changed_at - 1]
+        self.assertEqual(before["retired"], 280000)
+        self.assertEqual(before["summary"], 1000)
+        self.assertEqual(before["last_traditional_input"], 21200)
+        self.assertEqual(before["result"]["traditional_compactions"], int(not initialized))
+        self.assertEqual(before["result"]["summary_cost"] > 0.0, not initialized)
+        if initialized:
+            self.assertEqual(before["result"]["initial_compactions"], 1)
+        for offset, after in enumerate(snapshots[changed_at:]):
+            with self.subTest(boundary="output allowance is not history identity", append=offset):
+                self.assertEqual(after["result"]["summary_cost"], before["result"]["summary_cost"],
+                                 "fitting output allowance cannot charge another summary")
+                self.assertEqual(after["result"]["traditional_compactions"],
+                                 before["result"]["traditional_compactions"])
+                # Omitted legacy schema means zero initializations, not an error;
+                # the free-initialized arm explicitly proves its own new-schema precondition.
+                self.assertEqual(after["result"].get("initial_compactions", 0),
+                                 before["result"].get("initial_compactions", 0),
+                                 "fitting output allowance cannot grant another free initialization")
+                self.assertEqual(after["retired"], 280000)
+                self.assertEqual(after["summary"], 1000)
+                self.assertEqual(after["last_traditional_input"], 21300 + offset * 100,
+                                 "all accumulated growth must survive the allowance change")
+
+    def test_history_contract_unchanged_output_preserves_paid_growth(self):
+        self.output_allowance_history_control(initialized=False, change_cap=False)
+
+    def test_history_contract_changed_output_preserves_paid_growth(self):
+        self.output_allowance_history_control(initialized=False, change_cap=True)
+
+    def test_history_contract_changed_output_preserves_free_initialized_growth(self):
+        self.output_allowance_history_control(initialized=True, change_cap=True)
+
     def test_unknown_small_history_needs_no_initial_compaction(self):
         estimate = self.first_primary(10000)
         self.assertEqual(estimate["traditional_compactions"], 0)

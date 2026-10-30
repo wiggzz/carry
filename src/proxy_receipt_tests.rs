@@ -2,6 +2,98 @@
 use super::*;
 include!("proxy_cache_write_tests.rs");
 
+// Output allowance changes feasibility, not the native-input history contract.
+// Exercise both existing initialization and a real in-window paid summary.
+fn output_allowance_preserves_history(initialized: bool) {
+    let mut t = Trajectory::default();
+    let mut request = body();
+    request["max_output_tokens"] = json!(1);
+    if !initialized {
+        t.primary(&request, &terminal(10000, 0, 0, 0), "route", 99, true);
+        request["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"grow"}));
+    }
+    for (offset, input) in [300000, 300100, 300200].into_iter().enumerate() {
+        if offset > 0 {
+            request["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":format!("append {offset}")}));
+        }
+        t.primary(
+            &request,
+            &terminal(input, 0, 0, 0),
+            "route",
+            100 + offset as u64,
+            true,
+        );
+    }
+    assert_eq!(t.retired, 280000);
+    assert_eq!(t.summary, 1000);
+    assert_eq!(t.last_traditional_input, 21200);
+    let before = t.snapshot();
+    assert_eq!(before.initial_compactions, u64::from(initialized));
+    assert_eq!(before.traditional_compactions, u64::from(!initialized));
+    assert_eq!(before.summary_cost > 0.0, !initialized);
+    t = serde_json::from_value(state(&t)).unwrap();
+    request["max_output_tokens"] = json!(2);
+    for (offset, input) in [300300, 300400].into_iter().enumerate() {
+        request["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":format!("new allowance {offset}")}));
+        t.primary(
+            &request,
+            &terminal(input, 0, 0, 0),
+            "route",
+            103 + offset as u64,
+            true,
+        );
+        let after = t.snapshot();
+        assert!(
+            (after.observed_primary_cost
+                - before.observed_primary_cost
+                - (0..=offset)
+                    .map(|n| (300300 + n * 100) as f64 * 4.0 / 1e6)
+                    .sum::<f64>())
+            .abs()
+                < 1e-12
+        );
+        assert_eq!(
+            after.summary_cost, before.summary_cost,
+            "changing output allowance cannot charge another summary"
+        );
+        assert_eq!(
+            after.traditional_compactions,
+            before.traditional_compactions
+        );
+        assert_eq!(
+            after.initial_compactions, before.initial_compactions,
+            "changing output allowance cannot grant another free initialization"
+        );
+        assert_eq!(t.retired, 280000, "retain the original retired quantity");
+        assert_eq!(t.summary, 1000);
+        assert_eq!(
+            t.last_traditional_input,
+            21300 + offset as u64 * 100,
+            "retain every appended native-input token"
+        );
+        t = serde_json::from_value(state(&t)).unwrap();
+    }
+}
+
+#[test]
+fn history_contract_output_allowance_preserves_free_initialized_growth() {
+    output_allowance_preserves_history(true);
+}
+
+#[test]
+fn history_contract_output_allowance_preserves_paid_summary_growth() {
+    output_allowance_preserves_history(false);
+}
+
 // Exercise both free pre-window initialization (#186) and an in-window paid
 // summary after a small recognized prompt; migration preserves either history.
 #[test]
