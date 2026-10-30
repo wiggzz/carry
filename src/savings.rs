@@ -527,10 +527,17 @@ pub(crate) fn token_units(value: &Value) -> u64 {
         .len() as u64
 }
 
+/// Authoritative fixed prompt representation for local quantities and history
+/// continuity. Cache/transport/sampling controls are not model-visible input;
+/// callers must not reconstruct this projection with independent exclusions.
+pub(crate) fn prompt_overhead(body: &Value) -> Value {
+    json!({"instructions":body.get("instructions"),"tools":body.get("tools"),"text":body.get("text")})
+}
+
 /// Shared prompt-bearing projection, excluding transport and sampling fields.
 pub(crate) fn prompt_projection(body: &Value) -> Option<(String, String, u64)> {
     let input = body["input"].as_array()?;
-    let overhead = json!({"instructions":body.get("instructions"),"tools":body.get("tools"),"text":body.get("text")});
+    let overhead = prompt_overhead(body);
     let units = token_units(&json!({"overhead":overhead,"input":input}));
     let overhead = overhead.to_string();
     let serialized = serde_json::to_string(input).ok()?;
@@ -551,7 +558,7 @@ fn retained_prompt_tokens(body: &Value, current_turn: bool) -> Option<u64> {
         })
         .map(|(_, item)| item)
         .collect();
-    let overhead = json!({"instructions":body.get("instructions"),"tools":body.get("tools"),"text":body.get("text")});
+    let overhead = prompt_overhead(body);
     Some(token_units(&json!({"overhead":overhead,"input":retained})))
 }
 

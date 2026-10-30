@@ -1,8 +1,59 @@
 // Differential replay through both real coordinators. Quantity adapters remain
 // distinct: only this synthetic fixture deliberately equates their quantities.
 
-// Tests-first follow-up to review5714176642. History-contract production is
-// intentionally unchanged until these intended native failures execute.
+// Review5714176642: changing forecast policy cannot rename summarized history.
+// Tests-first lifetime tracer. No implicit provider read-refresh contract is
+// declared: reading at t=106 must not move the modeled t=100 write deadline.
+#[test]
+fn modeled_cache_read_does_not_extend_original_write_lifetime_across_restart() {
+    use carry::models::{Route, resolve_model};
+    let mut resolved = resolve_model(
+        "gpt-6.1-sol",
+        Route::new("https://api.openai.com/v1/responses", false),
+        None,
+        None,
+        0,
+        0,
+    )
+    .unwrap();
+    resolved.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 7;
+    let mut t = Trajectory::default();
+    // Genuine equal-token projection: the hypothetical branch owns its writes,
+    // rather than borrowing the actual receipt's cache partition.
+    t.projected(100, 100, true);
+    let request = body();
+    for (index, (at, cached)) in [(100, 0), (106, 2000), (107, 0)].into_iter().enumerate() {
+        let before = t.snapshot();
+        t.primary_resolved(
+            &request,
+            &terminal(2000, cached, 2000 - cached, 0),
+            "lifetime-fixture",
+            at,
+            true,
+            Some(&resolved),
+        );
+        let after = t.snapshot();
+        assert!(after.priced);
+        assert_eq!(after.excluded_unpriced_calls, 0);
+        assert_eq!(after.matched_primary_responses, index as u64 + 1);
+        assert_eq!(after.initial_compactions, 0);
+        assert_eq!(after.traditional_compactions, 0);
+        assert_eq!(after.summary_cost, 0.0);
+        let actual = (2000 - cached) as f64 * 2.5 / 1e6 + cached as f64 * 0.1 / 1e6;
+        assert!(
+            (after.observed_primary_cost - before.observed_primary_cost - actual).abs() < 1e-12
+        );
+        let forecast =
+            scenario_input_cost_resolved("gpt-6.1-sol", 2000, cached, Some(1024), Some(&resolved))
+                .unwrap();
+        assert!(
+            (after.traditional_cost - before.traditional_cost - forecast).abs() < 1e-12,
+            "ORIGINAL_WRITE_DEADLINE: a non-refreshing read cannot create another write"
+        );
+        t = serde_json::from_value(state(&t)).unwrap();
+    }
+}
+
 fn cache_options_preserve_summarized_growth(initialized: bool) {
     let mut t = Trajectory::default();
     let mut request = body();

@@ -34,25 +34,6 @@ impl HistoryContract {
         resolved: Option<&ResolvedModel>,
         scenario: Scenario,
     ) -> Self {
-        let mut prompt_settings = body.clone();
-        if let Some(object) = prompt_settings.as_object_mut() {
-            // Unknown settings remain conservatively prompt-bearing. These
-            // known controls describe transport, forecast or pricing, not input.
-            for key in [
-                "model",
-                "input",
-                "stream",
-                "store",
-                "metadata",
-                "include",
-                "max_output_tokens",
-                "prompt_cache_key",
-                "prompt_cache_retention",
-                "service_tier",
-            ] {
-                object.remove(key);
-            }
-        }
         Self {
             version: 1,
             quantity: QuantityBasis::ProviderRequestInputTotalV1,
@@ -63,7 +44,7 @@ impl HistoryContract {
             source_class: resolved.map(|r| r.route.class.clone()),
             prompt_settings_sha256: format!(
                 "{:x}",
-                Sha256::digest(serde_json::to_vec(&prompt_settings).unwrap())
+                Sha256::digest(serde_json::to_vec(&crate::savings::prompt_overhead(body)).unwrap())
             ),
             keep_recent: scenario.keep_recent,
             summary_tokens: scenario.summary,

@@ -192,3 +192,50 @@ pub(super) fn trim(cache: &mut Vec<CacheEvidence>, at: u64) {
         cache.remove(0);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A native read receipt proves this request's hit, not its write timestamp.
+    // Keep it as an observation; a future guarantee needs timing/refresh proof.
+    #[test]
+    fn observed_hit_without_write_timing_is_not_a_guaranteed_future_hit() {
+        use carry::models::{Route, resolve_model};
+        let resolved = resolve_model(
+            "gpt-6.1-sol",
+            Route::new("https://api.openai.com/v1/responses", false),
+            None,
+            None,
+            0,
+            0,
+        )
+        .unwrap();
+        let body = json!({"model":"gpt-6.1-sol", "input":[
+            {"role":"user","content":"synthetic prefix ".repeat(2000)}]});
+        let mut observations = Vec::new();
+        assert!(observe(
+            &mut observations,
+            &body,
+            &json!({"input_tokens":2000,"input_tokens_details":{"cached_tokens":2000,"cache_write_tokens":0}}),
+            Some(&resolved),
+            "synthetic-credential-scope",
+            100
+        ));
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].native_cached_fraction, 1.0);
+        let before = serde_json::to_vec(&observations).unwrap();
+        assert_eq!(
+            reusable(
+                &observations,
+                &body,
+                Some(&resolved),
+                "synthetic-credential-scope",
+                101
+            ),
+            0.0,
+            "UNKNOWN_WRITE_TIME: an observation timestamp is not a write timestamp"
+        );
+        assert_eq!(serde_json::to_vec(&observations).unwrap(), before);
+    }
+}
