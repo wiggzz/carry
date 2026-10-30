@@ -2,6 +2,7 @@
 use super::*;
 include!("proxy_cache_write_tests.rs");
 include!("primary_parity_tests.rs");
+include!("legacy_history_tests.rs");
 
 // Output allowance changes feasibility, not the native-input history contract.
 // Exercise both existing initialization and a real in-window paid summary.
