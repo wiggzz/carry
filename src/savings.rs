@@ -13,6 +13,13 @@ pub struct Scenario {
     pub summary: u64,
 }
 impl Scenario {
+    /// Economic headroom remains a floor; a larger client allowance also has
+    /// to fit. This is feasibility, not expected or billable generation.
+    pub(crate) fn initial_input_budget(&self, requested_output: Option<u64>) -> u64 {
+        self.context_window
+            .saturating_sub(self.reserve.max(requested_output.unwrap_or(0)))
+    }
+
     pub(crate) fn valid(&self) -> bool {
         self.context_window > self.reserve
             && self.keep_recent.saturating_add(self.summary) <= self.context_window - self.reserve
@@ -72,6 +79,7 @@ struct Prompt {
     route: String,
     input: u64,
     protected_input: u64,
+    requested_output: Option<u64>,
     cached_at_ms: Option<u64>,
     cache_mode: ScenarioCacheMode,
     write_tariff_known: bool,
@@ -275,7 +283,7 @@ impl Trajectory {
                     // Initialize before pricing the first compared primary.
                     // Cache expiry does not erase known traditional history.
                     if !self.initialized && self.scenario.valid() {
-                        let budget = self.scenario.context_window - self.scenario.reserve;
+                        let budget = self.scenario.initial_input_budget(prompt.requested_output);
                         if pi_input > budget {
                             let kept = self.scenario.keep_recent.max(prompt.protected_input);
                             let compacted = kept.saturating_add(self.scenario.summary);
@@ -512,6 +520,7 @@ fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
         model: request["model"].as_str().unwrap_or(fallback).to_owned(),
         input,
         protected_input,
+        requested_output: request["max_output_tokens"].as_u64(),
         prefix,
         overhead,
         route,

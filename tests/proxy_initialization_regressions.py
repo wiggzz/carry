@@ -288,6 +288,37 @@ class InitializationRegressions(unittest.TestCase):
         with self.subTest(boundary="native report no charged initial summary"):
             self.assertEqual(row[7], "0")
 
+    def test_requested_output_triggers_fitting_initialization_before_first_primary(self):
+        def primary(_body, _n):
+            response = support.completed()
+            response["usage"] = {"input_tokens": 201000, "output_tokens": 0,
+                                 "input_tokens_details": {"cached_tokens": 0}}
+            return 200, response
+
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+        proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+                              extra=["--primary-context-tokens", "1048576"],
+                              extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
+        self.harness.stack.callback(proxy.close)
+        history = [{"role": "assistant", "content": " evidence" * 200000},
+                   {"role": "user", "content": "current request"}]
+        self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=100000)[0], 200)
+        status, stats = proxy.request("GET", "/carry/dashboard/stats")
+        self.assertEqual(status, 200)
+        estimate = stats["sessions"][0]["cost_estimate"]
+        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["cost_trajectory"],
+                             primaries=fixture.primaries, reviews=fixture.reviews,
+                             basis="input alone fits; requested output triggers fitting initialization")
+        self.assertEqual(fixture.primaries[0]["input"], history)
+        self.assertEqual(fixture.primaries[0]["max_output_tokens"], 100000)
+        self.assertEqual(fixture.reviews, [])
+        self.assertAlmostEqual(estimate["observed_primary_cost"], 0.402, places=12)
+        self.assertAlmostEqual(estimate["traditional_cost"], 0.0525, places=12)
+        self.assertEqual(estimate["initial_compactions"], 1)
+        self.assertEqual(estimate["traditional_compactions"], 0)
+        self.assertEqual(estimate["summary_cost"], 0.0)
+
     def test_requested_output_that_cannot_fit_with_current_input_is_unavailable(self):
         def primary(_body, _n):
             response = support.completed()

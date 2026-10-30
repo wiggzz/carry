@@ -484,8 +484,7 @@ impl Trajectory {
 
         let budget = self
             .scenario
-            .context_window
-            .saturating_sub(self.scenario.reserve);
+            .initial_input_budget(body["max_output_tokens"].as_u64());
         let fixed = projection_fixed_tokens(body);
         let kept = self.scenario.keep_recent.max(fixed);
         let mut initialized_now = false;

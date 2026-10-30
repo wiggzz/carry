@@ -40,6 +40,34 @@ fn initialization186_native_reserves_requested_output_before_first_primary() {
     );
 }
 #[test]
+fn initialization186_native_output_allowance_triggers_fitting_initialization() {
+    let scenario = Scenario {
+        context_window: 3000,
+        reserve: 100,
+        keep_recent: 1200,
+        summary: 20,
+    };
+    let body = json!({"model":"gpt-6.1-sol", "max_output_tokens":1500, "input":[
+        {"role":"assistant", "content":" evidence".repeat(2000)},
+        {"role":"user", "content":"current"}
+    ]});
+    let input = prompt_projection(&body).unwrap().2;
+    assert!(input < scenario.context_window - scenario.reserve);
+    assert!(input + 1500 > scenario.context_window);
+    assert!(scenario.keep_recent + scenario.summary + 1500 <= scenario.context_window);
+    let mut t = Trajectory::with_scenario(scenario);
+    t.record(&json!({"event":"model_request", "data":{"step":1,"request":body}}));
+    let first = response(&mut t, input, 0, 0);
+    assert!(first.priced);
+    assert!(first.observed_priced);
+    assert_eq!(first.initial_compactions, 1);
+    assert_eq!(first.pi_compactions, 0);
+    assert_eq!(first.summary_cost, 0.0);
+    let cold = input_cost("gpt-6.1-sol", 1220, 0, Some(1024)).unwrap();
+    assert!((first.pi_cost - cold).abs() < 1e-12);
+}
+
+#[test]
 fn initialization186_native_first_primary_is_reduced_and_later_summary_is_paid() {
     let mut t = Trajectory::with_scenario(Scenario {
         context_window: 3000,
