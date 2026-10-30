@@ -440,6 +440,27 @@ fn legacy_history_session_load_http_regressions() {
     );
 }
 
+// The subscription adapter can remove options/fold instructions. Legacy proof
+// must be bound to that actual wire, not the pre-adaptation request (5718422718).
+#[test]
+fn legacy_history_adapted_wire_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_legacy_adapter.py"
+        ))
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute source-bound legacy adapted-wire controls");
+    assert!(
+        output.status.success(),
+        "LEGACY_ADAPTED_WIRE HTTP controls failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn proxy_cli_serves_health_and_forwards_opaque_json() {
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
