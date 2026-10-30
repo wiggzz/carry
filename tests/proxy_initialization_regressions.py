@@ -425,6 +425,55 @@ class InitializationRegressions(unittest.TestCase):
         self.assertGreaterEqual(marginal, 0.1,
                                 "cold third primary must retain at least 40000 fixed input tokens")
 
+    def hard_capacity_comparison(self, cap):
+        def primary(_body, _n):
+            response = support.completed()
+            response["usage"] = {"input_tokens": 60000, "output_tokens": 0,
+                                 "input_tokens_details": {"cached_tokens": 0}}
+            return 200, response
+
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+        proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+                              extra=["--primary-context-tokens", "50000"],
+                              extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
+        self.harness.stack.callback(proxy.close)
+        history = [{"role": "assistant", "content": "old synthetic history"},
+                   {"role": "user", "content": "current"}]
+        self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=cap)[0], 200)
+        status, stats = proxy.request("GET", "/carry/dashboard/stats")
+        self.assertEqual(status, 200)
+        estimate = stats["sessions"][0]["cost_estimate"]
+        saved = proxy.saved()
+        self.evidence.update(estimate=estimate, saved=saved, primaries=fixture.primaries,
+                             reviews=fixture.reviews,
+                             basis="synthetic receipt-domain hard-capacity tracer, not realistic oversized wire")
+        self.assertEqual(len(fixture.primaries), 1)
+        self.assertEqual(fixture.primaries[0]["input"], history)
+        self.assertEqual(fixture.primaries[0]["max_output_tokens"], cap)
+        self.assertEqual(fixture.reviews, [])
+        self.assertAlmostEqual(estimate["observed_primary_cost"], 0.12, places=12)
+        self.assertEqual(saved["primary"]["calls"], 1)
+        self.assertEqual(saved["cost_trajectory"]["result"]["summary_cost"], 0.0)
+        self.assertEqual(estimate["traditional_compactions"], 0)
+        return estimate
+
+    def test_hard_capacity_triggers_initialization_below_economic_budget(self):
+        estimate = self.hard_capacity_comparison(1)
+        self.assertAlmostEqual(estimate["traditional_cost"], 0.0525, places=12,
+                               msg="first compared primary must fit resolved hard capacity")
+        self.assertEqual(estimate["initial_compactions"], 1)
+        self.assertEqual(estimate["matched_primary_responses"], 1)
+
+    def test_hard_capacity_and_output_exclude_infeasible_retained_floor(self):
+        estimate = self.hard_capacity_comparison(40000)
+        self.assertIsNone(estimate["traditional_cost"],
+                          "21000 retained input plus 40000 output cannot fit 50000 hard capacity")
+        self.assertIsNone(estimate["savings"])
+        self.assertEqual(estimate["initial_compactions"], 0)
+        self.assertEqual(estimate["matched_primary_responses"], 0)
+        self.assertEqual(estimate["excluded_unpriced_calls"], 1)
+
     def image_output_comparison(self, cap):
         def primary(_body, _n):
             response = support.completed()

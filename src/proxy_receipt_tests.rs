@@ -46,6 +46,58 @@ fn initialization186_output_trigger_cannot_compact_unallocated_image_input() {
     }
 }
 
+#[test]
+fn initialization186_resolved_hard_capacity_bounds_the_counterfactual() {
+    use carry::models::{Route, resolve_model};
+    let resolved = resolve_model(
+        "gpt-6.1-sol",
+        Route::new("https://api.openai.com/v1/responses", false),
+        None,
+        Some(50000),
+        0,
+        0,
+    )
+    .unwrap();
+    assert_eq!(resolved.capacity_tokens, Some(50000));
+    for cap in [1, 40000] {
+        // Receipt-domain tracer, not a realistic oversized wire or provider
+        // measurement. The actual receipt stays paid even if comparison fails.
+        let request = json!({"model":"gpt-6.1-sol", "max_output_tokens":cap,
+            "input":[{"role":"assistant","content":"old synthetic history"},
+                     {"role":"user","content":"current"}]});
+        let mut t = Trajectory::default();
+        t.primary_resolved(
+            &request,
+            &terminal(60000, 0, 0, 0),
+            "route",
+            100,
+            true,
+            Some(&resolved),
+        );
+        let result = t.snapshot();
+        assert!((result.observed_primary_cost - 0.12).abs() < 1e-12);
+        assert_eq!(result.unavailable_primary_cost_calls, 0);
+        assert_eq!(result.summary_cost, 0.0);
+        assert_eq!(result.traditional_compactions, 0);
+        if cap == 1 {
+            assert_eq!(
+                result.initial_compactions, 1,
+                "a prompt below economic headroom but above hard capacity must initialize first"
+            );
+            assert_eq!(result.matched_primary_responses, 1);
+            assert!((result.traditional_cost - 0.0525).abs() < 1e-12);
+            assert!(t.last_traditional_input + cap <= 50000);
+        } else {
+            assert_eq!(result.initial_compactions, 0);
+            assert_eq!(
+                result.matched_primary_responses, 0,
+                "retained prompt plus requested output cannot fit the resolved hard capacity"
+            );
+            assert_eq!(result.excluded_unpriced_calls, 1);
+        }
+    }
+}
+
 // Joined #191/#192 acceptance, not a separately reproduced defect. Native
 // execution is pending the rebuilt joined-source hosted lane.
 #[test]
