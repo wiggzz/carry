@@ -108,8 +108,7 @@ struct Prompt {
     model: String,
     // Only the previous prompt-bearing prefix survives; never a history array.
     prefix: String,
-    overhead: String,
-    route: String,
+    cache_scope: String,
     input: u64,
     fixed_input: u64,
     protected_input: u64,
@@ -352,10 +351,7 @@ impl Trajectory {
                     let pi_output =
                         scenario_output_cost(&prompt.model, pi_input, usage.output_tokens);
                     let compatible = self.previous.as_ref().is_some_and(|p| {
-                        p.model == prompt.model
-                            && p.overhead == prompt.overhead
-                            && p.route == prompt.route
-                            && p.cache_mode == prompt.cache_mode
+                        p.cache_scope == prompt.cache_scope && p.cache_mode == prompt.cache_mode
                     });
                     let append = self
                         .previous
@@ -370,7 +366,9 @@ impl Trajectory {
                     }
                     let minimum = self.cache_minimum_for(&prompt.model);
                     let pi_cached = prompt.request_at_ms.map_or(0, |at| {
-                        let prefix = self.modeled_cache.eligible_at("native-local", at, pi_input);
+                        let prefix =
+                            self.modeled_cache
+                                .eligible_at(&prompt.cache_scope, at, pi_input);
                         if prompt.cache_mode == ScenarioCacheMode::Implicit
                             && minimum.is_some_and(|min| prefix >= min)
                         {
@@ -408,7 +406,7 @@ impl Trajectory {
                         // A dispatch-time population assumption, not a response
                         // timestamp masquerading as an observed provider write.
                         self.modeled_cache.written(
-                            "native-local".into(),
+                            prompt.cache_scope.clone(),
                             at,
                             lifetime,
                             pi_input,
@@ -599,20 +597,22 @@ pub(crate) fn fixed_prompt_tokens(body: &Value) -> Option<u64> {
 
 fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
     let request = &data["request"];
-    let (prefix, overhead, input) = prompt_projection(request)?;
+    let (prefix, _, input) = prompt_projection(request)?;
     let protected_input = protected_prompt_tokens(request)?;
-    // Semantic policy is compared separately; equivalent default spellings do
-    // not change the real route/key or force an artificial cold request.
-    let route=serde_json::to_string(&json!({"api_base":data["transport"].get("api_base"),"route":data.get("route"),"cache_key":request.get("prompt_cache_key")})).ok()?;
+    let model = request["model"].as_str().unwrap_or(fallback);
+    let cache_scope = crate::proxy_cache::modeled_scope(
+        request,
+        model,
+        (data["transport"].get("api_base"), data.get("route")),
+    );
     Some(Prompt {
-        model: request["model"].as_str().unwrap_or(fallback).to_owned(),
+        model: model.to_owned(),
         input,
         fixed_input: fixed_prompt_tokens(request)?,
         protected_input,
         requested_output: request["max_output_tokens"].as_u64(),
         prefix,
-        overhead,
-        route,
+        cache_scope,
         request_at_ms: None,
         cache_lifetime_ms: None,
         write_tariff_known: carry::models::cache_write_tariff_known(request),

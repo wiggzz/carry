@@ -28,6 +28,20 @@ pub(super) fn serialized_identity<T: Serialize + ?Sized>(value: &T) -> (usize, S
     (writer.bytes, format!("{:x}", writer.digest.finalize()))
 }
 
+/// Semantic namespace for a hypothetical prompt. Quantity adapters own their
+/// append/projection proof; this owner supplies the same fixed prompt/key/model
+/// boundary to both. Policy selects eligibility, each write owns its lifetime,
+/// and prices/audit/output controls cannot rename a still-compatible write.
+pub(crate) fn modeled_scope(body: &Value, model: &str, source: impl Serialize) -> String {
+    serialized_identity(&(
+        model,
+        source,
+        body.get("prompt_cache_key"),
+        crate::savings::prompt_overhead(body),
+    ))
+    .1
+}
+
 /// A conditional branch's writes, never provider observations or billed usage.
 /// Separate extents are necessary: appending a newly written suffix cannot move
 /// an older prefix's deadline. All times use the calling adapter's clock units.
@@ -271,6 +285,63 @@ pub(super) fn trim(cache: &mut Vec<CacheEvidence>, at: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Boundary acceptance for the shared semantic owner. The real-coordinator
+    // differential separately reproduces the original equivalent-options bug.
+    #[test]
+    fn modeled_namespace_preserves_writes_only_for_the_same_semantic_prompt_source() {
+        let body = json!({"model":"gpt-6.1-sol","prompt_cache_key":"synthetic-key",
+            "instructions":"fixed", "tools":[], "input":[{"role":"user","content":"prefix"}]});
+        let scope = modeled_scope(&body, "gpt-6.1-sol", "source");
+        let mut cache = ModeledCache::default();
+        cache.written(scope.clone(), 100, 7, 2000, 0);
+        let original = serde_json::to_vec(&cache).unwrap();
+        for controls in [
+            json!({"prompt_cache_options":{}}),
+            json!({"prompt_cache_options":{"mode":"implicit","ttl":"30m"}}),
+            json!({"prompt_cache_options":{"mode":"implicit","ttl":"2h"}}),
+            json!({"max_output_tokens":2,"temperature":0.5,"reasoning":{"effort":"high"},
+                "metadata":{"synthetic":"audit"},"store":false,"stream":true,"include":[]}),
+        ] {
+            let mut next = body.clone();
+            next.as_object_mut()
+                .unwrap()
+                .extend(controls.as_object().unwrap().clone());
+            let next_scope = modeled_scope(&next, "gpt-6.1-sol", "source");
+            assert_eq!(cache.eligible_at(&next_scope, 106, 2000), 2000);
+            // Even a newly requested TTL does not renew the original event.
+            assert_eq!(cache.eligible_at(&next_scope, 107, 2000), 0);
+            assert_eq!(serde_json::to_vec(&cache).unwrap(), original);
+        }
+        for settings in [
+            json!({"prompt_cache_key":"different-key"}),
+            json!({"instructions":"different fixed input"}),
+            json!({"tools":[{"type":"function","name":"different-tool"}]}),
+            json!({"text":{"format":{"type":"json_object"}}}),
+        ] {
+            let mut next = body.clone();
+            next.as_object_mut()
+                .unwrap()
+                .extend(settings.as_object().unwrap().clone());
+            assert_eq!(
+                cache.eligible_at(&modeled_scope(&next, "gpt-6.1-sol", "source"), 106, 2000),
+                0
+            );
+        }
+        assert_eq!(
+            cache.eligible_at(&modeled_scope(&body, "gpt-6-sol", "source"), 106, 2000),
+            0
+        );
+        assert_eq!(
+            cache.eligible_at(
+                &modeled_scope(&body, "gpt-6.1-sol", "other-source"),
+                106,
+                2000
+            ),
+            0
+        );
+        assert_eq!(serde_json::to_vec(&cache).unwrap(), original);
+    }
 
     #[test]
     fn modeled_prefix_queries_are_pure_and_suffix_writes_keep_original_deadlines() {

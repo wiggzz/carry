@@ -589,10 +589,10 @@ impl Trajectory {
         let ttl = resolved
             .and_then(|r| r.scenario_cache_policy.as_ref())
             .map_or(1800, |p| p.ttl_seconds);
-        // The full resolution remains audit/measurement identity, not cache
-        // identity: price, provenance and capacity changes do not rename writes.
-        // Typed history continuity above owns append/projection compatibility.
-        let cache_scope = digest(&(configuration(body, route, None), resolved.map(|r| &r.route)));
+        // Typed history continuity owns append/projection compatibility. The
+        // shared cache owner, not raw request settings, owns its namespace.
+        let cache_scope =
+            crate::proxy_cache::modeled_scope(body, model, (route, resolved.map(|r| &r.route)));
         let mode = request_cache_mode(body, model, resolved);
         let cache = &mut self.receipts.as_mut().unwrap().modeled_cache;
         if cache_policy_changed || self.traditional_edited {
