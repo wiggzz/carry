@@ -358,7 +358,7 @@ class InitializationRegressions(unittest.TestCase):
                 self.assertAlmostEqual(snapshots[index]["result"]["traditional_cost"]
                                        - snapshots[index - 1]["result"]["traditional_cost"],
                                        expected, places=12)
-        boundaries = snapshots[3]["result"]["cache_policy_boundaries"]
+        boundaries = snapshots[3]["result"].get("cache_policy_boundaries", [])
         self.assertEqual(len(boundaries), int(migrate))
         if migrate:
             self.assertEqual(boundaries[0]["previous_version"], 2)
@@ -367,7 +367,7 @@ class InitializationRegressions(unittest.TestCase):
                 self.assertEqual(boundaries[0]["cumulative"][key], snapshots[2]["result"][key])
             self.assertNotEqual(snapshots[2]["receipts"]["history_anchor"]["configuration"],
                                 snapshots[3]["receipts"]["history_anchor"]["configuration"])
-        self.assertEqual(snapshots[4]["result"]["cache_policy_boundaries"], boundaries)
+        self.assertEqual(snapshots[4]["result"].get("cache_policy_boundaries", []), boundaries)
 
     def test_initialized_history_unchanged_policy_stays_warm_across_restarts(self):
         self.initialized_policy_restart_control(migrate=False)
