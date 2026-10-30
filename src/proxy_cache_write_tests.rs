@@ -430,8 +430,16 @@ fn cache_write191_post_summary_cold_then_warm_obeys_mode_after_restart() {
         };
         let mut request = body();
         request["prompt_cache_options"] = json!({"mode":mode,"ttl":"30m"});
+        // Prime a recognized in-window history, then cross the threshold.
+        // Keep the original charged-summary/write-tariff controls unchanged.
+        t.primary(&request, &terminal(2800, 0, 0, 0), "fixture", 99, true);
+        request["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"in-window growth"}));
         t.primary(&request, &terminal(3000, 3000, 0, 0), "fixture", 100, true);
         let first = t.snapshot();
+        assert_eq!(first.initial_compactions, 0);
         assert!(first.priced);
         assert_eq!(first.traditional_compactions, 1);
         // Summary request is ordinary uncached at its own input tier.

@@ -288,6 +288,36 @@ class InitializationRegressions(unittest.TestCase):
         with self.subTest(boundary="native report no charged initial summary"):
             self.assertEqual(row[7], "0")
 
+    def test_current_user_request_that_cannot_fit_is_explicitly_unavailable(self):
+        def primary(_body, _n):
+            response = support.completed()
+            response["usage"] = {"input_tokens": 261000, "output_tokens": 0,
+                                 "input_tokens_details": {"cached_tokens": 0}}
+            return 200, response
+
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+        proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+                              extra=["--primary-context-tokens", "1048576"],
+                              extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
+        self.harness.stack.callback(proxy.close)
+        history = [{"role": "assistant", "content": " evidence" * 6000},
+                   {"role": "user", "content": " current" * 256000}]
+        self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
+        status, stats = proxy.request("GET", "/carry/dashboard/stats")
+        self.assertEqual(status, 200)
+        estimate = stats["sessions"][0]["cost_estimate"]
+        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["cost_trajectory"],
+                             primaries=fixture.primaries, reviews=fixture.reviews,
+                             basis="large protected current user request; synthetic receipt")
+        self.assertEqual(fixture.primaries[0]["input"], history)
+        self.assertEqual(fixture.reviews, [])
+        self.assertAlmostEqual(estimate["observed_primary_cost"], 261000 * 2.0 / 1e6, places=12)
+        self.assertEqual(proxy.saved()["primary"]["calls"], 1)
+        self.assertIsNone(estimate["traditional_cost"],
+                          "initialization cannot retire the current user request to invent feasibility")
+        self.assertIsNone(estimate["savings"])
+
     def test_fixed_instructions_that_cannot_fit_are_explicitly_unavailable(self):
         def primary(_body, _n):
             response = support.completed()

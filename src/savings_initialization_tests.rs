@@ -72,3 +72,25 @@ fn initialization186_native_fixed_overhead_infeasible_preserves_observed_money()
         "cannot compact fixed instructions to invent a feasible comparison"
     );
 }
+
+#[test]
+fn initialization186_native_current_user_infeasible_preserves_observed_money() {
+    let mut t = Trajectory::with_scenario(Scenario {
+        context_window: 3000,
+        reserve: 100,
+        keep_recent: 1200,
+        summary: 20,
+    });
+    let body = json!({"model":"gpt-6.1-sol", "input":[
+        {"role":"assistant", "content":" evidence".repeat(2000)},
+        {"role":"user", "content":" current".repeat(3000)}
+    ]});
+    t.record(&json!({"event":"model_request", "data":{"step":1,"request":body}}));
+    let estimate = response(&mut t, 5100, 0, 0);
+    assert!(estimate.observed_priced);
+    assert!(estimate.observed_cost > 0.0);
+    assert!(
+        !estimate.priced,
+        "initialization cannot retire the current user request to invent feasibility"
+    );
+}

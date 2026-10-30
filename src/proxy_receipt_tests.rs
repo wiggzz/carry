@@ -234,7 +234,16 @@ fn receipt_projection_preserves_legitimate_summary_retirement_and_failed_paid_sc
         },
         ..Trajectory::default()
     };
-    t.primary(&body(), &terminal(4000, 0, 0, 0), "route", 100, true);
+    // Establish an in-window trajectory before crossing the summary threshold.
+    // An already-oversized unknown first request now initializes for free.
+    let mut request = body();
+    t.primary(&request, &terminal(3000, 0, 0, 0), "route", 99, true);
+    request["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"in-window growth"}));
+    t.primary(&request, &terminal(4000, 0, 0, 0), "route", 100, true);
+    assert_eq!(t.snapshot().initial_compactions, 0);
     assert_eq!(t.snapshot().traditional_compactions, 1);
     let retired = t.retired;
     let summary = t.summary;
@@ -256,7 +265,7 @@ fn receipt_projection_preserves_legitimate_summary_retirement_and_failed_paid_sc
         assert_eq!(t.snapshot().traditional_compactions, 1);
         t = serde_json::from_value(state(&t)).unwrap();
     }
-    assert_eq!(t.snapshot().coverage.primary_responses, 4);
+    assert_eq!(t.snapshot().coverage.primary_responses, 5);
     assert_eq!(t.snapshot().excluded_failed_calls, 1);
 }
 
@@ -892,7 +901,15 @@ fn receipt_traditional_summary_is_cold_once_then_warms_its_own_prefix() {
         ..Trajectory::default()
     };
     let mut b = body();
+    // This test owns charged in-window summary/cache behavior, not unknown
+    // first-window initialization. Preserve its paid-summary assertions.
+    t.primary(&b, &terminal(2800, 0, 0, 0), "route", 99, true);
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"in-window growth"}));
     t.primary(&b, &terminal(3000, 3000, 0, 0), "route", 100, true);
+    assert_eq!(t.snapshot().initial_compactions, 0);
     assert_eq!(t.snapshot().traditional_compactions, 1);
     let before = t.snapshot();
     let mut t: Trajectory = serde_json::from_value(state(&t)).unwrap();

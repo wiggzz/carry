@@ -68,8 +68,13 @@ class NoodleRegressions(unittest.TestCase):
         self.assertEqual(after["shadow"]["calls"], 1)
         self.assertEqual(after["cost_trajectory"]["restored"], restored,
                          "receipt epoch reset must preserve this request's projection")
-        self.assertEqual(after["cost_trajectory"]["result"]["traditional_compactions"], 1)
-        self.assertGreater(after["cost_trajectory"]["result"]["summary_cost"], 0)
+        # Changed receipt settings genuinely lose trajectory recognition: the
+        # current projection still survives, but initialization is pre-window.
+        self.assertEqual(after["cost_trajectory"]["result"]["traditional_compactions"], 0)
+        self.assertEqual(after["cost_trajectory"]["result"]["summary_cost"], 0)
+        self.assertEqual(after["cost_trajectory"]["result"]["initial_compactions"], 1)
+        self.assertGreater(after["cost_trajectory"]["retired"], 0)
+        self.assertEqual(after["cost_trajectory"]["last_traditional_input"], 150)
         self.assertGreater(after["cost_trajectory"]["result"]["observed_primary_cost"],
                            before["cost_trajectory"]["result"]["observed_primary_cost"])
 
