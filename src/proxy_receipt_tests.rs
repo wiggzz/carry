@@ -98,6 +98,64 @@ fn initialization186_resolved_hard_capacity_bounds_the_counterfactual() {
     }
 }
 
+#[test]
+fn initialization186_omitted_output_uses_frozen_capacity_reserve() {
+    use carry::models::{Route, resolve_model};
+    for (cap, reserve) in [(Some(1_u64), 40000_u32), (None, 16384), (None, 40000)] {
+        let resolved = resolve_model(
+            "gpt-6.1-sol",
+            Route::new("https://api.openai.com/v1/responses", false),
+            None,
+            Some(50000),
+            reserve,
+            10,
+        )
+        .unwrap();
+        assert_eq!(resolved.capacity_tokens, Some(50000));
+        assert_eq!(resolved.ordinary.output_reserve, reserve);
+        let mut request = json!({"model":"gpt-6.1-sol",
+            "input":[{"role":"assistant","content":"old synthetic history"},
+                     {"role":"user","content":"current"}]});
+        if let Some(cap) = cap {
+            request["max_output_tokens"] = json!(cap);
+        }
+        let mut t = Trajectory::default();
+        t.primary_resolved(
+            &request,
+            &terminal(40000, 0, 0, 0),
+            "route",
+            100,
+            true,
+            Some(&resolved),
+        );
+        let result = t.snapshot();
+        assert!((result.observed_primary_cost - 0.08).abs() < 1e-12);
+        assert_eq!(result.unavailable_primary_cost_calls, 0);
+        assert_eq!(result.summary_cost, 0.0);
+        assert_eq!(result.traditional_compactions, 0);
+        if cap.is_some() {
+            assert_eq!(result.initial_compactions, 0);
+            assert_eq!(result.matched_primary_responses, 1);
+            assert!((result.traditional_cost - 0.1).abs() < 1e-12);
+        } else if reserve == 16384 {
+            assert_eq!(
+                result.initial_compactions, 1,
+                "omitted output must reserve frozen configured allowance"
+            );
+            assert_eq!(result.matched_primary_responses, 1);
+            assert!((result.traditional_cost - 0.0525).abs() < 1e-12);
+            assert!(t.last_traditional_input + u64::from(reserve) <= 50000);
+        } else {
+            assert_eq!(result.initial_compactions, 0);
+            assert_eq!(
+                result.matched_primary_responses, 0,
+                "retained floor plus fallback output cannot fit"
+            );
+            assert_eq!(result.excluded_unpriced_calls, 1);
+        }
+    }
+}
+
 // Joined #191/#192 acceptance, not a separately reproduced defect. Native
 // execution is pending the rebuilt joined-source hosted lane.
 #[test]

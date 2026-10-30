@@ -482,6 +482,69 @@ class InitializationRegressions(unittest.TestCase):
         self.assertEqual(estimate["matched_primary_responses"], 0)
         self.assertEqual(estimate["excluded_unpriced_calls"], 1)
 
+    def omitted_output_comparison(self, reserve=None, cap=None):
+        def primary(_body, _n):
+            response = support.completed()
+            response["usage"] = {"input_tokens": 40000, "output_tokens": 0,
+                                 "input_tokens_details": {"cached_tokens": 0}}
+            return 200, response
+
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+        extra = ["--primary-context-tokens", "50000"]
+        if reserve is not None:
+            extra.extend(["--primary-output-reserve-tokens", str(reserve)])
+        proxy = support.Proxy(self.harness.state, fixture, mode="audit", extra=extra,
+                              extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
+        self.harness.stack.callback(proxy.close)
+        history = [{"role": "assistant", "content": "old synthetic history"},
+                   {"role": "user", "content": "current"}]
+        fields = {} if cap is None else {"max_output_tokens": cap}
+        self.assertEqual(proxy.send(history, model="gpt-6.1-sol", **fields)[0], 200)
+        status, stats = proxy.request("GET", "/carry/dashboard/stats")
+        self.assertEqual(status, 200)
+        estimate = stats["sessions"][0]["cost_estimate"]
+        saved = proxy.saved()
+        self.evidence.update(estimate=estimate, saved=saved, primaries=fixture.primaries,
+                             reviews=fixture.reviews,
+                             basis="synthetic native receipt, omitted versus explicit output capacity tracer")
+        self.assertEqual(len(fixture.primaries), 1)
+        self.assertEqual(fixture.primaries[0]["input"], history)
+        if cap is None:
+            self.assertNotIn("max_output_tokens", fixture.primaries[0], "do not invent a wire cap")
+        else:
+            self.assertEqual(fixture.primaries[0]["max_output_tokens"], cap)
+        self.assertEqual(fixture.reviews, [])
+        self.assertAlmostEqual(estimate["observed_primary_cost"], 0.08, places=12)
+        self.assertEqual(saved["primary"]["calls"], 1)
+        resolution = saved["model_resolution"]["primary"]
+        self.assertEqual(resolution["capacity_tokens"], 50000)
+        self.assertEqual(resolution["ordinary"]["output_reserve"], 16384 if reserve is None else reserve)
+        self.assertEqual(saved["cost_trajectory"]["result"]["summary_cost"], 0.0)
+        self.assertEqual(estimate["traditional_compactions"], 0)
+        return estimate
+
+    def test_explicit_output_overrides_large_configured_capacity_reserve(self):
+        estimate = self.omitted_output_comparison(reserve=40000, cap=1)
+        self.assertAlmostEqual(estimate["traditional_cost"], 0.1, places=12)
+        self.assertEqual(estimate["initial_compactions"], 0)
+        self.assertEqual(estimate["matched_primary_responses"], 1)
+
+    def test_omitted_output_reserves_default_frozen_allowance(self):
+        estimate = self.omitted_output_comparison()
+        self.assertAlmostEqual(estimate["traditional_cost"], 0.0525, places=12,
+                               msg="40000 input plus default output reserve cannot fit 50000")
+        self.assertEqual(estimate["initial_compactions"], 1)
+        self.assertEqual(estimate["matched_primary_responses"], 1)
+
+    def test_omitted_output_excludes_custom_reserve_infeasible_floor(self):
+        estimate = self.omitted_output_comparison(reserve=40000)
+        self.assertIsNone(estimate["traditional_cost"], "21000 retained floor plus 40000 fallback cannot fit")
+        self.assertIsNone(estimate["savings"])
+        self.assertEqual(estimate["initial_compactions"], 0)
+        self.assertEqual(estimate["matched_primary_responses"], 0)
+        self.assertEqual(estimate["excluded_unpriced_calls"], 1)
+
     def image_output_comparison(self, cap):
         def primary(_body, _n):
             response = support.completed()
