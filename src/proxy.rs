@@ -3335,6 +3335,16 @@ async fn relay(
                     if commit.native {
                         trajectory.unmodeled_call();
                     } else {
+                        if let Some(current) = resolved {
+                            for prior in commit.candidate.model_resolution_history.iter().rev() {
+                                trajectory.rekey_receipt_policy(
+                                    &commit.outbound,
+                                    &commit.service.config.upstream_url,
+                                    &prior.primary,
+                                    current,
+                                );
+                            }
+                        }
                         trajectory.primary_resolved(
                             &commit.outbound,
                             &value,

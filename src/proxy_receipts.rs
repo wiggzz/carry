@@ -192,6 +192,51 @@ fn has_unpriced_modalities(value: &Value) -> bool {
 }
 
 impl Trajectory {
+    /// Advance only cache-policy identity after proving the old full contract.
+    /// Legacy checkpoints retain opaque configuration hashes, so excluding policy
+    /// fields from new hashes alone would discard their existing summary history.
+    pub(super) fn rekey_receipt_policy(
+        &mut self,
+        body: &Value,
+        route: &str,
+        prior: &ResolvedModel,
+        current: &ResolvedModel,
+    ) {
+        let Some(receipts) = self.receipts.as_mut() else {
+            return;
+        };
+        let prior_version = prior.scenario_cache_policy.as_ref().map(|p| p.version);
+        let current_version = current.scenario_cache_policy.as_ref().map(|p| p.version);
+        if receipts.scenario_cache_policy_version != prior_version
+            || prior_version == current_version
+        {
+            return;
+        }
+        let without_policy = |resolution: &ResolvedModel| {
+            let mut resolution = resolution.clone();
+            resolution.scenario_cache_policy = None;
+            resolution.provenance.remove("scenario_cache");
+            resolution
+        };
+        if digest(&without_policy(prior)) != digest(&without_policy(current)) {
+            return;
+        }
+        let previous = configuration(body, route, Some(prior));
+        if receipts.configuration.as_ref() != Some(&previous) {
+            return;
+        }
+        let next = configuration(body, route, Some(current));
+        receipts.configuration = Some(next.clone());
+        for anchor in [&mut receipts.anchor, &mut receipts.traditional_anchor]
+            .into_iter()
+            .flatten()
+        {
+            if anchor.configuration == previous {
+                anchor.configuration = next.clone();
+            }
+        }
+    }
+
     /// Freeze old sums on the first post-upgrade request, never reprice them.
     /// The new window starts from the retained input, not an invented empty chat.
     pub fn begin_receipt_window(&mut self) {
@@ -299,10 +344,25 @@ impl Trajectory {
             .as_ref()
             .unwrap()
             .scenario_cache_policy_version;
-        if previous_version != policy_version {
-            // Freeze cumulative provenance before ANY version transition, not
-            // just missing -> present. Never replay, reset money or overwrite
-            // earlier boundaries. The next comparison starts cold.
+        let cache_policy_changed = previous_version != policy_version;
+        if cache_policy_changed {
+            // A version-only frozen contract can be reconstructed, but is accepted
+            // only when its complete old digest matches. Actual upgrades with
+            // changed provenance use the original saved resolution at dispatch.
+            if let Some(current) = resolved {
+                let mut prior = current.clone();
+                if let Some(version) = previous_version {
+                    if let Some(policy) = &mut prior.scenario_cache_policy {
+                        policy.version = version;
+                    }
+                } else {
+                    prior.scenario_cache_policy = None;
+                    prior.provenance.remove("scenario_cache");
+                }
+                self.rekey_receipt_policy(body, route, &prior, current);
+            }
+            // Freeze cumulative provenance before ANY version transition. Cache
+            // becomes cold, but ancestry checks still own summary invalidation.
             let prior = self.snapshot();
             if prior.coverage.primary_responses > 0 || prior.coverage.reviewer_responses > 0 {
                 let cumulative = CachePolicySegment::from(&prior);
@@ -321,7 +381,6 @@ impl Trajectory {
                         cumulative,
                     });
             }
-            self.reset_receipt_epoch();
             self.receipts
                 .as_mut()
                 .unwrap()
@@ -402,6 +461,8 @@ impl Trajectory {
             .configuration
             .as_ref()
             .is_some_and(|prior| prior != &config)
+            || (cache_policy_changed
+                && self.receipts.as_ref().unwrap().configuration.as_ref() != Some(&config))
         {
             self.reset_receipt_epoch();
         }
@@ -456,9 +517,10 @@ impl Trajectory {
         let ttl = resolved
             .and_then(|r| r.scenario_cache_policy.as_ref())
             .map_or(1800, |p| p.ttl_seconds);
-        let warm = traditional_previous
-            .as_ref()
-            .is_some_and(|a| traditional_compatible && at - a.at < ttl)
+        let warm = !cache_policy_changed
+            && traditional_previous
+                .as_ref()
+                .is_some_and(|a| traditional_compatible && at - a.at < ttl)
             && !self.traditional_edited;
         // The alternative shares total-input units, never observed cache hits:
         // cache behavior is a conditional append-prefix scenario even before
