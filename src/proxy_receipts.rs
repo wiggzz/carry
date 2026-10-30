@@ -195,7 +195,7 @@ impl Trajectory {
     /// Advance only cache-policy identity after proving the old full contract.
     /// Legacy checkpoints retain opaque configuration hashes, so excluding policy
     /// fields from new hashes alone would discard their existing summary history.
-    pub(super) fn rekey_receipt_policy(
+    pub(crate) fn rekey_receipt_policy(
         &mut self,
         body: &Value,
         route: &str,
