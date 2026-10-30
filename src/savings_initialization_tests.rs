@@ -1,6 +1,61 @@
 // Issue186: native trace/report estimator, separate from proxy native receipts.
 // These tests intentionally precede production changes.
 #[test]
+fn initialization186_native_paid_compaction_retains_fixed_floor() {
+    let scenario = Scenario {
+        context_window: 3000,
+        reserve: 100,
+        keep_recent: 1200,
+        summary: 20,
+    };
+    // Fixed tools/instructions fit the economic budget but exceed keep_recent.
+    let mut body = json!({"model":"gpt-6.1-sol", "instructions":" fixed".repeat(1600),
+        "tools":[{"type":"function", "name":"owned", "description":"fixed tool",
+                  "parameters":{"type":"object", "properties":{}}}],
+        "input":[{"role":"assistant", "content":" evidence".repeat(4000)},
+                 {"role":"user", "content":"current"}]});
+    let protected = protected_prompt_tokens(&body).unwrap();
+    assert!(protected > scenario.keep_recent);
+    assert!(protected + scenario.summary < scenario.context_window - scenario.reserve);
+    let mut t = Trajectory::with_scenario(scenario);
+    t.record(&json!({"event":"model_request", "data":{"step":1,"request":body}}));
+    let first = response(&mut t, prompt_projection(&body).unwrap().2, 0, 0);
+    assert!(first.priced && first.observed_priced);
+    assert_eq!(first.initial_compactions, 1);
+    assert_eq!(first.pi_compactions, 0);
+    assert_eq!(first.summary_cost, 0.0);
+    body["input"].as_array_mut().unwrap().push(json!({
+        "role":"assistant", "content":" later".repeat(4000)
+    }));
+    t.record(&json!({"event":"model_request", "data":{"step":1,"request":body}}));
+    let second = response(&mut t, prompt_projection(&body).unwrap().2, 0, 0);
+    assert!(second.priced && second.observed_priced);
+    assert_eq!(second.initial_compactions, 1);
+    assert_eq!(second.pi_compactions, 1);
+    assert!(second.summary_cost > 0.0);
+    let fixed = token_units(&json!({"instructions":body.get("instructions"),
+        "tools":body.get("tools"),"text":body.get("text")}));
+    assert!(
+        t.last_pi_input >= fixed + scenario.summary,
+        "later paid compaction cannot retire fixed instructions/tools below their floor"
+    );
+    body["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user", "content":"continue"}));
+    let input = prompt_projection(&body).unwrap().2;
+    let modeled = (input as i128 - t.removed as i128 + t.summary as i128) as u64;
+    assert!(modeled >= fixed + scenario.summary);
+    let cold = input_cost("gpt-6.1-sol", modeled, 0, Some(1024)).unwrap();
+    t.record(&json!({"event":"model_request", "data":{"step":1,"request":body}}));
+    let third = response(&mut t, input, 0, 0);
+    assert!(third.priced && third.observed_priced);
+    assert_eq!(third.pi_compactions, 1);
+    assert_eq!(third.summary_cost, second.summary_cost);
+    assert!((third.pi_cost - second.pi_cost - cold).abs() < 1e-12);
+    assert!(third.observed_cost > second.observed_cost);
+}
+#[test]
 fn initialization186_native_reserves_requested_output_before_first_primary() {
     let scenario = Scenario {
         context_window: 3000,

@@ -288,6 +288,79 @@ class InitializationRegressions(unittest.TestCase):
         with self.subTest(boundary="native report no charged initial summary"):
             self.assertEqual(row[7], "0")
 
+    def test_native_report_later_paid_compaction_preserves_fixed_floor(self):
+        import json
+        import os
+        import subprocess
+        from html.parser import HTMLParser
+
+        class Cells(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.cells, self.cell = [], None
+
+            def handle_starttag(self, tag, _attrs):
+                if tag == "td":
+                    self.cell = ""
+
+            def handle_data(self, data):
+                if self.cell is not None:
+                    self.cell += data
+
+            def handle_endtag(self, tag):
+                if tag == "td" and self.cell is not None:
+                    self.cells.append(self.cell)
+                    self.cell = None
+
+        session = self.harness.state / "sessions" / "fixed-floor186"
+        session.mkdir(parents=True)
+        body = {"model": "gpt-6.1-sol", "instructions": " fixed" * 40000,
+                "tools": [{"type": "function", "name": "owned", "description": "fixed tool",
+                           "parameters": {"type": "object", "properties": {}}}],
+                "input": [{"role": "assistant", "content": " evidence" * 260000},
+                          {"role": "user", "content": "current"}]}
+        events = [{"event": "run_started", "data": {"model": "gpt-6.1-sol", "context_window": 272000,
+                   "cache_ttl_seconds": 1800, "implicit_cache_minimum_prefix_tokens": 1024}}]
+        rows = []
+        for step, incoming in enumerate([300000, 560000, 560100], 1):
+            if step == 2:
+                body["input"].append({"role": "assistant", "content": " later" * 260000})
+            elif step == 3:
+                body["input"].append({"role": "user", "content": "continue"})
+            events.extend([
+                {"event": "model_request", "run_id": "fixed-floor186", "timestamp_ms": step * 10,
+                 "data": {"step": step, "transport": {"api_base": "http://127.0.0.1:1"},
+                          "request": copy.deepcopy(body)}},
+                {"event": "model_response", "run_id": "fixed-floor186", "timestamp_ms": step * 10 + 1,
+                 "data": {"step": step, "usage": {"input_tokens": incoming, "output_tokens": 0},
+                          "raw": {"output": []}}}])
+            if step == 1:
+                continue
+            (session / "trace.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+            output = self.harness.state / f"fixed-floor-{step}.html"
+            env = {"PATH": "", "HOME": str(self.harness.state)}
+            if "TMPDIR" in os.environ:
+                env["TMPDIR"] = os.environ["TMPDIR"]
+            result = subprocess.run([os.environ["CARRY_TEST_BINARY"], "report", "cost", "--sessions",
+                                     str(session.parent), "--output", str(output)],
+                                    env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            parser = Cells()
+            parser.feed(output.read_text())
+            self.assertEqual(len(parser.cells), 10)
+            rows.append(parser.cells)
+        self.evidence.update(trace=events, rows=rows,
+                             basis="real offline CLI; synthetic receipts; fixed tools/instructions floor")
+        self.assertEqual(rows[0][2], "2/2")
+        self.assertEqual(rows[1][2], "3/3")
+        self.assertEqual(rows[0][3], "$3.4400")
+        self.assertEqual(rows[1][3], "$5.6804")
+        self.assertGreater(int(rows[0][7]), 0, "later in-window summary remains charged")
+        self.assertEqual(rows[1][7], rows[0][7], "no extra summary on third primary")
+        marginal = float(rows[1][5].removeprefix("$")) - float(rows[0][5].removeprefix("$"))
+        self.assertGreaterEqual(marginal, 0.1,
+                                "cold third primary must retain at least 40000 fixed input tokens")
+
     def test_requested_output_triggers_fitting_initialization_before_first_primary(self):
         def primary(_body, _n):
             response = support.completed()
