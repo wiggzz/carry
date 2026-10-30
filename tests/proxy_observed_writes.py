@@ -83,8 +83,13 @@ class ObservedWrites(unittest.TestCase):
             self.assertEqual(saved["shadow"]["calls"], 0)
             self.assertEqual(fixture.primaries[-1]["input"], history)
             if step:
-                self.assertEqual(len(records), 1)
-                self.assertEqual(records[0]["native_cached_fraction"], cached / 2000)
+                # Immutable write proof and the latest raw read observation are
+                # distinct facts; a read must not rewrite the original receipt.
+                expected_records = 2 if partition == "full" and step == 2 else 1
+                self.assertEqual(len(records), expected_records)
+                self.assertEqual(records[-1]["native_cached_fraction"], cached / 2000)
+                self.assertEqual(records[-1]["native_input_tokens"], 2000)
+                self.assertEqual(records[-1]["native_write_tokens"], written)
             snapshots.append(copy.deepcopy(records))
             brackets.append((before, after))
             wires.append(copy.deepcopy(fixture.primaries[-1]))
@@ -124,6 +129,11 @@ class ObservedWrites(unittest.TestCase):
                 self.assertIsNone(first_window, "partial/unlocated writes and reads do not prove whole-prefix timing")
         with self.subTest(stage="read_not_refresh"):
             self.assertEqual(snapshots[2][0].get("write_window"), first_window)
+            if partition == "full":
+                self.assertEqual(snapshots[2][0], snapshots[1][0],
+                                 "read cannot rewrite the original full-write fact")
+                self.assertIsNone(snapshots[2][-1].get("write_window"),
+                                  "latest read has no new write timing")
         for step in (3, 4):
             with self.subTest(stage="miss_then_unknown_hit", step=step):
                 self.assertIsNone(snapshots[step][0].get("write_window"))

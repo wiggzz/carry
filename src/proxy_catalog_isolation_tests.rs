@@ -1,7 +1,15 @@
 // Synthetic loopback receipts execute the real primary commit/cache path.
 async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
-    let router = Router::new().route("/primary", post(|| async {
-        axum::Json(json!({"id":"catalog-cache","status":"completed","output":[],"usage":{"input_tokens":10000,"output_tokens":1,"input_tokens_details":{"cached_tokens":9000}}}))
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let router = Router::new().route("/primary", post(move || {
+        let first = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        async move {
+            // Keep the original observed-read/unknown-route control. The later
+            // positive forecast has its own real, timed whole-input write.
+            let details = if first { json!({"cached_tokens":9000}) }
+                else { json!({"cached_tokens":0,"cache_write_tokens":10000}) };
+            axum::Json(json!({"id":"catalog-cache","status":"completed","output":[],"usage":{"input_tokens":10000,"output_tokens":1,"input_tokens_details":details}}))
+        }
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

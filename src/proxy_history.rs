@@ -624,7 +624,7 @@ pub(super) fn observe_cache(
     usage: &Value,
     resolved: Option<&ResolvedModel>,
     credential: &str,
-    at: u64,
+    time: crate::proxy_cache::ObservationTime,
 ) -> std::io::Result<Vec<CacheEvidence>> {
     let _guard = IO.lock().unwrap();
     let mut index = read(service)?;
@@ -634,7 +634,7 @@ pub(super) fn observe_cache(
         usage,
         resolved,
         credential,
-        at,
+        time,
     ) {
         let cache = index.upstream_cache.clone();
         let prior = index.snapshots.keys().cloned().collect();

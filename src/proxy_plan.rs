@@ -41,12 +41,15 @@ pub(super) fn plan(
     // Preserve each genuinely compatible warm boundary as a candidate. A past
     // outgoing omission has no role here: all candidates start from canonical H.
     for entry in &session.upstream_cache {
-        if entry.matches(
-            &wire,
-            config.model_resolution.as_ref().map(|p| &p.primary),
-            &config.primary_cache_auth,
-            now(),
-        ) {
+        if entry
+            .reusable_at(
+                &wire,
+                config.model_resolution.as_ref().map(|p| &p.primary),
+                &config.primary_cache_auth,
+                now(),
+            )
+            .is_some()
+        {
             // The subscription adapter moves leading native direction items
             // into instructions. Include those base-bound members plus the
             // actual wire prefix, not the same count of canonical positions.

@@ -1330,6 +1330,7 @@ struct Commit {
     observed_input: Vec<Value>,
     outbound: Value,
     native: bool,
+    dispatched_at: u64,
     _history_pin: history::Pin,
     _lock: OwnedMutexGuard<()>,
 }
@@ -1856,6 +1857,7 @@ async fn forward_request(
             observed_input: body["input"].as_array().cloned().unwrap_or_default(),
             outbound: outbound.clone(),
             native,
+            dispatched_at: now(),
             _history_pin: history_pin,
             _lock: lock,
         });
@@ -2471,6 +2473,7 @@ async fn review_chunk(
         reason: Some("fresh_prefix_projection"),
     };
     let mut diagnostic = json!({"reason": "review_transport_or_protocol_failure"});
+    let dispatched_at = now();
     let observed = async {
         let response = if codex_reviewer {
             send_codex(
@@ -2587,7 +2590,7 @@ async fn review_chunk(
                 &value["usage"],
                 resolved,
                 &service.config.reviewer_cache_auth,
-                now(),
+                crate::proxy_cache::ObservationTime::during(dispatched_at, now()),
             )
         {
             session.upstream_cache = cache;
@@ -3403,7 +3406,7 @@ async fn relay(
                         &value["usage"],
                         resolved,
                         &commit.service.config.primary_cache_auth,
-                        now(),
+                        crate::proxy_cache::ObservationTime::during(commit.dispatched_at, now()),
                     ) {
                         commit.candidate.upstream_cache = cache;
                     }
@@ -3607,18 +3610,28 @@ mod tests {
         owner.ingest(body["input"].as_array().unwrap()).unwrap();
         let at = now();
         let mut stale = owner.clone();
-        for cached in [0, 3000, 0] {
+        for cached in [0, 4000, 0] {
+            if cached > 0 {
+                // A timed full write, not this later read's timestamp, owns
+                // reusable coverage. Keep both facts through stale snapshots.
+                history::observe_cache(
+                    &service, &body,
+                    &json!({"input_tokens":4000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":4000}}),
+                    Some(&model), "same-auth",
+                    crate::proxy_cache::ObservationTime::during(at, at),
+                ).unwrap();
+            }
             owner.upstream_cache = history::observe_cache(
                 &service,
                 &body,
                 &json!({"input_tokens":4000,"input_tokens_details":{"cached_tokens":cached}}),
                 Some(&model),
                 "same-auth",
-                at,
+                at.into(),
             )
             .unwrap();
-            assert_eq!(owner.upstream_cache.len(), 1);
-            let evidence = &owner.upstream_cache[0];
+            assert_eq!(owner.upstream_cache.len(), if cached > 0 { 2 } else { 1 });
+            let evidence = owner.upstream_cache.last().unwrap();
             assert_eq!(evidence.at, at, "TTL seconds are not receipt ordering");
             assert_eq!(evidence.native_cached_fraction, cached as f64 / 4000.0);
             let read = crate::proxy_cache::reusable(
@@ -3646,7 +3659,15 @@ mod tests {
             json!({"input_tokens":4000}),
             json!({"input_tokens":4000,"input_tokens_details":{"cached_tokens":4001}}),
         ] {
-            history::observe_cache(&service, &body, &usage, Some(&model), "same-auth", at).unwrap();
+            history::observe_cache(
+                &service,
+                &body,
+                &usage,
+                Some(&model),
+                "same-auth",
+                at.into(),
+            )
+            .unwrap();
             assert_eq!(
                 history::cache(&service).unwrap()[0].native_cached_fraction,
                 0.0
@@ -3684,7 +3705,7 @@ mod tests {
             &json!({"input_tokens":4000,"input_tokens_details":{"cached_tokens":3000}}),
             Some(&model),
             "auth",
-            now()
+            now().into()
         ));
         assert_eq!(cache.len(), 1);
         assert_eq!(
@@ -3767,10 +3788,10 @@ mod tests {
         crate::proxy_cache::observe(
             &mut cache,
             &first,
-            &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":5000}}),
+            &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":10000}}),
             Some(&model),
             "fixture-auth",
-            now(),
+            crate::proxy_cache::ObservationTime::during(now(), now()),
         );
         assert!(
             crate::proxy_cache::reusable(&cache, &appended, Some(&model), "fixture-auth", now())

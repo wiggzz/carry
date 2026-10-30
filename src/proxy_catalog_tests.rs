@@ -440,10 +440,10 @@ fn primary_output_cap_reverses_warm_keep_vs_cold_tier_rewrite_with_zero_missing_
         crate::proxy_cache::observe(
             &mut session.upstream_cache,
             &primary_wire_body(&config, &body),
-            &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":10000}}),
+            &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":10000}}),
             config.model_resolution.as_ref().map(|p| &p.primary),
             &config.primary_cache_auth,
-            now(),
+            crate::proxy_cache::ObservationTime::during(now(), now()),
         );
         assert_eq!(session.upstream_cache.len(), 1);
         let (selected, report) = plan(&config, &session, &body);

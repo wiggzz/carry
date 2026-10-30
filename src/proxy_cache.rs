@@ -69,7 +69,50 @@ struct ModeledWrite {
 }
 impl ModeledWrite {
     fn eligible_at(&self, at: u64) -> bool {
-        at >= self.at && at - self.at < self.lifetime
+        write_eligible_at(self.at, self.at, self.lifetime, at)
+    }
+}
+
+/// A bounded write is usable only after its latest possible completion and
+/// before its earliest possible write's deadline. The same pure rule serves
+/// modeled point writes and observed transport intervals; reads never renew it.
+fn write_eligible_at(not_before: u64, not_after: u64, lifetime: u64, at: u64) -> bool {
+    not_before <= not_after && at >= not_after && at - not_before < lifetime
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub(super) struct WriteWindow {
+    pub not_before: u64,
+    pub not_after: u64,
+    pub lifetime: u64,
+}
+impl WriteWindow {
+    fn eligible_at(&self, at: u64) -> bool {
+        write_eligible_at(self.not_before, self.not_after, self.lifetime, at)
+    }
+}
+
+/// Terminal time is an observation, not a write. Dispatch supplies only a lower
+/// bound for a receipt reporting a complete write during that request.
+#[derive(Clone, Copy)]
+pub(super) struct ObservationTime {
+    pub at: u64,
+    dispatched_at: Option<u64>,
+}
+impl ObservationTime {
+    pub fn during(dispatched_at: u64, at: u64) -> Self {
+        Self {
+            at,
+            dispatched_at: Some(dispatched_at),
+        }
+    }
+}
+impl From<u64> for ObservationTime {
+    fn from(at: u64) -> Self {
+        Self {
+            at,
+            dispatched_at: None,
+        }
     }
 }
 impl ModeledCache {
@@ -194,6 +237,15 @@ pub(super) struct CacheEvidence {
     pub at: u64,
     pub ttl_seconds: u64,
     pub native_cached_fraction: f64,
+    // Raw receipt quantities prove a whole-input write; aggregate partial
+    // writes cannot locate any particular prefix in local estimated units.
+    // Legacy observations lack this proof and remain observations only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_write_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_window: Option<WriteWindow>,
 }
 
 pub(super) fn base(body: &Value) -> Value {
@@ -236,13 +288,37 @@ impl CacheEvidence {
         };
         resolved.is_some_and(|model| model.cache.is_some())
             && self.at <= at
-            && at - self.at < self.ttl_seconds
             && self.route.as_ref() == resolved.map(|r| &r.route)
             && self.credential_sha256 == credential
             && self.input_len <= input.len()
             && self.base_sha256 == serialized_identity(&base(body)).1
             && self.input_sha256 == input_identity(&input[..self.input_len])
             && (0.0..=1.0).contains(&self.native_cached_fraction)
+    }
+
+    fn written_prefix_at(&self, at: u64) -> Option<f64> {
+        let total = self.native_input_tokens?;
+        (total > 0
+            && self.native_write_tokens == Some(total)
+            && self.native_cached_fraction == 0.0
+            && self
+                .write_window
+                .is_some_and(|window| window.eligible_at(at)))
+        .then_some(self.estimated_tokens)
+    }
+
+    /// The same scoped proof owns both monetary forecast credit and planner
+    /// prefix preservation. Identity alone is not evidence of live retention.
+    pub fn reusable_at(
+        &self,
+        body: &Value,
+        resolved: Option<&carry::models::ResolvedModel>,
+        credential: &str,
+        at: u64,
+    ) -> Option<f64> {
+        self.matches(body, resolved, credential, at)
+            .then(|| self.written_prefix_at(at))
+            .flatten()
     }
 }
 
@@ -258,8 +334,7 @@ pub(super) fn reusable(
     }
     cache
         .iter()
-        .filter(|e| e.matches(body, resolved, credential, at))
-        .map(|e| e.estimated_tokens * e.native_cached_fraction)
+        .filter_map(|e| e.reusable_at(body, resolved, credential, at))
         .fold(0.0, f64::max)
         .min(crate::proxy_savings::token_units(body) as f64)
 }
@@ -270,8 +345,9 @@ pub(super) fn observe(
     usage: &Value,
     resolved: Option<&carry::models::ResolvedModel>,
     credential: &str,
-    at: u64,
+    time: ObservationTime,
 ) -> bool {
+    let at = time.at;
     let Some(input) = body["input"].as_array() else {
         return false;
     };
@@ -312,6 +388,22 @@ pub(super) fn observe(
         input.len()
     };
     let input = &input[..end];
+    let written = usage["input_tokens_details"]["cache_write_tokens"].as_u64();
+    let write_window = time.dispatched_at.and_then(|not_before| {
+        // Capability plus a full native write receipt supplies request-interval
+        // proof. Unknown/mixed lifetime and explicitly limited write extents do
+        // not establish whole-input retention. Never infer population from hits.
+        (written == Some(total)
+            && cached == 0
+            && end == body["input"].as_array().unwrap().len()
+            && carry::models::cache_write_tariff_known(body)
+            && not_before <= at)
+            .then_some(WriteWindow {
+                not_before,
+                not_after: at,
+                lifetime: ttl_seconds,
+            })
+    });
     let e = CacheEvidence {
         route: resolved.map(|r| r.route.clone()),
         credential_sha256: credential.into(),
@@ -322,17 +414,22 @@ pub(super) fn observe(
         at,
         ttl_seconds,
         native_cached_fraction: cached as f64 / total as f64,
+        native_input_tokens: Some(total),
+        native_write_tokens: written,
+        write_window,
     };
-    // This terminal covers every compatible older prefix, not only an equal
-    // input hash. Mutation order (under history::observe_cache), not TTL clock
-    // ties, decides which observation owns its forecast. Unrelated branches and
-    // namespaces remain independent; a later genuine rewarm can replace this.
+    // Keep an original timed write across full reads, never rewrite its raw
+    // quantities or expiry with the new hit. New misses/unlocated partial hits
+    // revoke compatible prefixes. Mutation order in the atomic history owner,
+    // not timestamp ties, orders observations. Keep one latest raw observation
+    // beside the immutable write fact; unrelated namespaces stay independent.
     cache.retain(|old| {
         old.base_sha256 != e.base_sha256
             || old.route != e.route
             || old.credential_sha256 != e.credential_sha256
             || old.input_len > input.len()
             || old.input_sha256 != input_identity(&input[..old.input_len])
+            || (cached == total && old.written_prefix_at(at).is_some())
     });
     cache.push(e);
     trim(cache, at);
@@ -340,7 +437,8 @@ pub(super) fn observe(
 }
 
 pub(super) fn trim(cache: &mut Vec<CacheEvidence>, at: u64) {
-    cache.retain(|e| e.at <= at && at - e.at < e.ttl_seconds);
+    cache
+        .retain(|e| e.at <= at && (e.written_prefix_at(at).is_some() || at - e.at < e.ttl_seconds));
     cache.sort_by_key(|e| e.at);
     while cache.len() > 128 || serde_json::to_vec(cache).unwrap().len() > 65536 {
         cache.remove(0);
@@ -578,7 +676,7 @@ mod tests {
             &write,
             Some(&model),
             "scope",
-            100
+            100u64.into()
         ));
         assert_eq!(cache.len(), 1);
         assert_eq!(
@@ -619,7 +717,14 @@ mod tests {
         // a new write. The old event still expires at100+7, not106+100.
         model.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 100;
         for at in [105, 106] {
-            assert!(observe(&mut cache, &body, &hit, Some(&model), "scope", at));
+            assert!(observe(
+                &mut cache,
+                &body,
+                &hit,
+                Some(&model),
+                "scope",
+                at.into()
+            ));
             assert_eq!(reusable(&cache, &body, Some(&model), "scope", at), credit);
             cache = serde_json::from_slice(&serde_json::to_vec(&cache).unwrap()).unwrap();
         }
@@ -637,10 +742,17 @@ mod tests {
             &miss,
             Some(&model),
             "scope",
-            106
+            106u64.into()
         ));
         assert_eq!(reusable(&cache, &body, Some(&model), "scope", 106), 0.0);
-        assert!(observe(&mut cache, &body, &hit, Some(&model), "scope", 106));
+        assert!(observe(
+            &mut cache,
+            &body,
+            &hit,
+            Some(&model),
+            "scope",
+            106u64.into()
+        ));
         assert_eq!(reusable(&cache, &body, Some(&model), "scope", 106), 0.0);
         model.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 7;
         assert!(observe(
@@ -649,7 +761,7 @@ mod tests {
             &write,
             Some(&model),
             "scope",
-            107
+            107u64.into()
         ));
         install_window(&mut cache, 107);
         cache = serde_json::from_slice(&serde_json::to_vec(&cache).unwrap()).unwrap();
@@ -687,7 +799,7 @@ mod tests {
             &usage,
             Some(&model),
             "scope",
-            103
+            103u64.into()
         ));
         assert_eq!(cache.len(), 1);
         let mut saved = serde_json::to_value(cache).unwrap();
@@ -785,7 +897,7 @@ mod tests {
             &json!({"input_tokens":2000,"input_tokens_details":{"cached_tokens":2000,"cache_write_tokens":0}}),
             Some(&resolved),
             "synthetic-credential-scope",
-            100
+            100u64.into()
         ));
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].native_cached_fraction, 1.0);
