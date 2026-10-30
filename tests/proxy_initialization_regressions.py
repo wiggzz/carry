@@ -361,6 +361,56 @@ class InitializationRegressions(unittest.TestCase):
         self.assertGreaterEqual(marginal, 0.1,
                                 "cold third primary must retain at least 40000 fixed input tokens")
 
+    def image_output_comparison(self, cap):
+        def primary(_body, _n):
+            response = support.completed()
+            response["usage"] = {"input_tokens": 201000, "output_tokens": 0,
+                                 "input_tokens_details": {"cached_tokens": 0}}
+            return 200, response
+
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+        proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+                              extra=["--primary-context-tokens", "1048576"],
+                              extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
+        self.harness.stack.callback(proxy.close)
+        history = [{"role": "assistant", "content": " evidence" * 200000},
+                   {"role": "user", "content": [
+                       {"type": "input_text", "text": "current image request"},
+                       {"type": "input_image", "image_url": "data:image/png;base64,fixture"}]}]
+        self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=cap)[0], 200)
+        status, stats = proxy.request("GET", "/carry/dashboard/stats")
+        self.assertEqual(status, 200)
+        estimate = stats["sessions"][0]["cost_estimate"]
+        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["cost_trajectory"],
+                             primaries=fixture.primaries, reviews=fixture.reviews,
+                             basis="synthetic image receipt; no projected-image allocation")
+        self.assertEqual(len(fixture.primaries), 1)
+        self.assertEqual(fixture.primaries[0]["input"], history)
+        self.assertEqual(fixture.primaries[0]["max_output_tokens"], cap)
+        self.assertEqual(fixture.reviews, [])
+        self.assertAlmostEqual(estimate["observed_primary_cost"], 0.402, places=12)
+        self.assertEqual(proxy.saved()["primary"]["calls"], 1)
+        self.assertEqual(estimate["traditional_compactions"], 0)
+        self.assertEqual(estimate["summary_cost"], 0.0)
+        return estimate
+
+    def test_unchanged_image_with_small_output_remains_priceable(self):
+        estimate = self.image_output_comparison(1)
+        self.assertAlmostEqual(estimate["traditional_cost"], 0.5025, places=12)
+        self.assertEqual(estimate["coverage"]["unmodeled_calls"], 0)
+        self.assertEqual(estimate["matched_primary_responses"], 1)
+        self.assertEqual(estimate.get("initial_compactions", 0), 0)
+
+    def test_output_triggered_image_initialization_is_unavailable(self):
+        estimate = self.image_output_comparison(100000)
+        self.assertIsNone(estimate["traditional_cost"],
+                          "initialization cannot allocate native image tokens to a projected slice")
+        self.assertIsNone(estimate["savings"])
+        self.assertEqual(estimate["coverage"]["unmodeled_calls"], 1)
+        self.assertEqual(estimate["excluded_unpriced_calls"], 1)
+        self.assertEqual(estimate["initial_compactions"], 0)
+
     def test_requested_output_triggers_fitting_initialization_before_first_primary(self):
         def primary(_body, _n):
             response = support.completed()

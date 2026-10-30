@@ -13,6 +13,39 @@ fn state(t: &Trajectory) -> Value {
     serde_json::to_value(t).unwrap()
 }
 
+// Tests-only follow-up to the output-aware initialization repair. An unchanged
+// image receipt is priceable, but it cannot allocate native tokens to a slice.
+#[test]
+fn initialization186_output_trigger_cannot_compact_unallocated_image_input() {
+    for cap in [1, 100000] {
+        let request = json!({"model":"gpt-6.1-sol", "max_output_tokens":cap,
+            "input":[{"role":"assistant", "content":" evidence".repeat(200000)},
+                {"role":"user", "content":[
+                    {"type":"input_text", "text":"current image request"},
+                    {"type":"input_image", "image_url":"data:image/png;base64,fixture"}]}]});
+        let mut t = Trajectory::default();
+        t.primary(&request, &terminal(201000, 0, 0, 0), "route", 100, true);
+        let result = t.snapshot();
+        assert!((result.observed_primary_cost - 0.402).abs() < 1e-12);
+        assert_eq!(result.unavailable_primary_cost_calls, 0);
+        assert_eq!(result.coverage.primary_responses, 1);
+        assert_eq!(
+            result.initial_compactions, 0,
+            "a projected image slice has no measured native token allocation"
+        );
+        assert_eq!(result.traditional_compactions, 0);
+        if cap == 1 {
+            assert_eq!(result.coverage.unmodeled_calls, 0);
+            assert_eq!(result.matched_primary_responses, 1);
+            assert!((result.traditional_cost - 0.5025).abs() < 1e-12);
+        } else {
+            assert_eq!(result.coverage.unmodeled_calls, 1);
+            assert_eq!(result.excluded_unpriced_calls, 1);
+            assert_eq!(result.matched_primary_responses, 0);
+        }
+    }
+}
+
 // Joined #191/#192 acceptance, not a separately reproduced defect. Native
 // execution is pending the rebuilt joined-source hosted lane.
 #[test]
