@@ -284,6 +284,97 @@ class InitializationRegressions(unittest.TestCase):
         self.assertEqual(changed["result"]["summary_cost"], 0.0)
         self.assertEqual(changed["result"]["traditional_compactions"], 0)
 
+    def initialized_policy_restart_control(self, *, migrate):
+        import json
+
+        def primary(_body, n):
+            response = support.completed(response_id=f"initialized-policy186-{n}")
+            response["usage"] = {"input_tokens": 300000 + (n - 1) * 100,
+                                 "output_tokens": 0,
+                                 "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}
+            return 200, response
+
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+        history = [{"role": "assistant", "content": "owned synthetic receipt history"},
+                   {"role": "user", "content": "current"}]
+        snapshots = []
+        wires = []
+        for index in range(5):
+            if index:
+                if migrate and index == 3:
+                    checkpoint = next(self.harness.state.glob("*.json"))
+                    saved = json.loads(checkpoint.read_text())
+                    # Synthetic future policy identity only, not a new tariff.
+                    # The recorded ledger and complete old digest stay intact.
+                    resolution = saved["model_resolution"]["primary"]
+                    self.assertEqual(resolution["scenario_cache_policy"]["version"], 2)
+                    resolution["scenario_cache_policy"]["version"] = 3
+                    checkpoint.write_text(json.dumps(saved))
+                history.append({"role": "user", "content": f"append {index}"})
+            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+                                  extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
+            self.harness.stack.callback(proxy.close)
+            if index:
+                self.assertEqual(proxy.saved()["cost_trajectory"], snapshots[-1],
+                                 "restart must not rewrite prior trajectory or money")
+            wires.append(copy.deepcopy(history))
+            self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
+            snapshots.append(copy.deepcopy(proxy.saved()["cost_trajectory"]))
+            proxy.close()
+        self.evidence.update(policy_snapshots=snapshots, primaries=fixture.primaries,
+                             reviews=fixture.reviews, migrate=migrate,
+                             basis="initialized receipt-domain history; synthetic policy identity and usage")
+        self.assertEqual(len(fixture.primaries), 5)
+        self.assertEqual(fixture.reviews, [])
+        first = snapshots[0]
+        self.assertIsNotNone(first["receipts"]["history_anchor"])
+        self.assertEqual(first["retired"], 280000)
+        self.assertEqual(first["summary"], 1000)
+        self.assertEqual(first["result"]["initial_compactions"], 1)
+        self.assertAlmostEqual(first["result"]["traditional_cost"], 0.0525, places=12)
+        for index, snapshot in enumerate(snapshots):
+            result = snapshot["result"]
+            self.assertEqual(fixture.primaries[index]["input"], wires[index])
+            self.assertEqual(fixture.primaries[index]["max_output_tokens"], 1)
+            self.assertAlmostEqual(result["observed_primary_cost"],
+                                   sum(300000 + n * 100 for n in range(index + 1)) * 4 / 1e6,
+                                   places=12)
+            self.assertEqual(result["summary_cost"], 0.0)
+            self.assertEqual(result["traditional_compactions"], 0)
+            self.assertEqual(result["excluded_unpriced_calls"], 0)
+            with self.subTest(boundary="initialization is not repeated", request=index + 1):
+                self.assertEqual(result["initial_compactions"], 1,
+                                 "policy-only cache coldness must not erase known traditional history")
+                self.assertEqual(snapshot["retired"], 280000)
+                self.assertEqual(snapshot["summary"], 1000)
+        # The history is warm before migration. A policy change is cold once,
+        # but retains every appended token rather than freely compacting again.
+        for index in range(1, 5):
+            previous_input = 21000 + (index - 1) * 100
+            expected = ((21000 + index * 100) * 2.5 if migrate and index == 3
+                        else previous_input * 0.1 + 100 * 2.5) / 1e6
+            with self.subTest(boundary="cold transition or warm append", request=index + 1):
+                self.assertAlmostEqual(snapshots[index]["result"]["traditional_cost"]
+                                       - snapshots[index - 1]["result"]["traditional_cost"],
+                                       expected, places=12)
+        boundaries = snapshots[3]["result"]["cache_policy_boundaries"]
+        self.assertEqual(len(boundaries), int(migrate))
+        if migrate:
+            self.assertEqual(boundaries[0]["previous_version"], 2)
+            self.assertEqual(boundaries[0]["next_version"], 3)
+            for key in ["carry_cost", "traditional_cost", "summary_cost", "traditional_compactions"]:
+                self.assertEqual(boundaries[0]["cumulative"][key], snapshots[2]["result"][key])
+            self.assertNotEqual(snapshots[2]["receipts"]["history_anchor"]["configuration"],
+                                snapshots[3]["receipts"]["history_anchor"]["configuration"])
+        self.assertEqual(snapshots[4]["result"]["cache_policy_boundaries"], boundaries)
+
+    def test_initialized_history_unchanged_policy_stays_warm_across_restarts(self):
+        self.initialized_policy_restart_control(migrate=False)
+
+    def test_initialized_history_policy_transition_is_cold_once_without_reinitialization(self):
+        self.initialized_policy_restart_control(migrate=True)
+
     def test_native_offline_report_prices_initialized_first_primary(self):
         import json
         import os
