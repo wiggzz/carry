@@ -22,6 +22,75 @@ class InitializationRegressions(unittest.TestCase):
     def cleanup_harness(self):
         self.assertTrue(self.harness.doCleanups(), "nested fixture cleanup failed")
 
+    def cache_options_history_control(self, initialized):
+        # Review5714176642: equivalent spelling and genuine forecast-policy
+        # changes cannot rename already summarized native-input history.
+        options = [None, {}, {"mode": "implicit", "ttl": "30m"},
+                   {"mode": "explicit", "ttl": "30m"}, None]
+        inputs = ([] if initialized else [10000]) + [300000] + [300100 + n * 100 for n in range(len(options))]
+        def primary(_body, n):
+            response = support.completed(response_id=f"cache-history-{n}")
+            response["usage"] = {"input_tokens": inputs[n - 1], "output_tokens": 0,
+                                 "input_tokens_details": {"cached_tokens": 0}}
+            return 200, response
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+        history = [{"role": "assistant", "content": "native history cache contract"},
+                   {"role": "user", "content": "current"}]
+        snapshots, expected_wires, expected_options = [], [], []
+        boundary = 1 if initialized else 2
+        for index, _incoming in enumerate(inputs):
+            if index:
+                history.append({"role": "user", "content": f"append {index}"})
+            option = options[index - boundary] if index >= boundary else None
+            fields = {} if option is None else {"prompt_cache_options": option}
+            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+                                  extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
+            self.harness.stack.callback(proxy.close)
+            if snapshots:
+                self.assertEqual(proxy.saved()["cost_trajectory"], snapshots[-1],
+                                 "restart preserves exact history and already settled money")
+            self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1, **fields)[0], 200)
+            expected_wires.append(copy.deepcopy(history))
+            expected_options.append(copy.deepcopy(option))
+            snapshots.append(copy.deepcopy(proxy.saved()["cost_trajectory"]))
+            proxy.close()
+        self.evidence.update(cache_options_history=snapshots, primaries=fixture.primaries,
+                             initialized=initialized, reviews=fixture.reviews)
+        self.assertEqual(len(fixture.primaries), len(inputs))
+        self.assertEqual(fixture.reviews, [])
+        for index, snapshot in enumerate(snapshots):
+            self.assertEqual(fixture.primaries[index]["input"], expected_wires[index])
+            if expected_options[index] is None:
+                self.assertNotIn("prompt_cache_options", fixture.primaries[index])
+            else:
+                self.assertEqual(fixture.primaries[index]["prompt_cache_options"], expected_options[index])
+            expected = sum(n * (4 if n > 272000 else 2) / 1e6 for n in inputs[:index + 1])
+            self.assertAlmostEqual(snapshot["result"]["observed_primary_cost"], expected, places=12)
+            self.assertAlmostEqual(snapshot["result"]["carry_cost"], expected, places=12)
+            self.assertEqual(snapshot["result"]["excluded_unpriced_calls"], 0)
+        before = snapshots[boundary - 1]
+        self.assertEqual(before["retired"], 280000)
+        self.assertEqual(before["summary"], 1000)
+        self.assertEqual(before["result"].get("initial_compactions", 0), int(initialized))
+        self.assertEqual(before["result"]["traditional_compactions"], int(not initialized))
+        for index, after in enumerate(snapshots[boundary:]):
+            with self.subTest(options=options[index]):
+                self.assertEqual(after["result"].get("initial_compactions", 0), int(initialized),
+                                 "CACHE_OPTIONS_HISTORY: forecast settings cannot grant initialization")
+                self.assertEqual(after["result"]["traditional_compactions"], int(not initialized))
+                self.assertEqual(after["result"]["summary_cost"], before["result"]["summary_cost"])
+                self.assertEqual(after["retired"], 280000)
+                self.assertEqual(after["summary"], 1000)
+                self.assertEqual(after["last_traditional_input"], 21100 + index * 100,
+                                 "every appended native input token survives cache-policy changes")
+
+    def test_cache_options_preserve_free_initialized_history_across_restart(self):
+        self.cache_options_history_control(True)
+
+    def test_cache_options_preserve_paid_summary_history_across_restart(self):
+        self.cache_options_history_control(False)
+
     def first_primary(self, incoming):
         def primary(_body, n):
             response = support.completed(response_id=f"initialization186-{n}")
@@ -453,6 +522,66 @@ class InitializationRegressions(unittest.TestCase):
 
     def test_initialized_history_policy_transition_is_cold_once_without_reinitialization(self):
         self.initialized_policy_restart_control(migrate=True)
+
+    def test_native_offline_report_noop_uses_receipts_across_replay(self):
+        import json
+        import os
+        import subprocess
+        from html.parser import HTMLParser
+
+        class Cells(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.cells, self.cell = [], None
+            def handle_starttag(self, tag, _attrs):
+                if tag == "td":
+                    self.cell = ""
+            def handle_data(self, data):
+                if self.cell is not None:
+                    self.cell += data
+            def handle_endtag(self, tag):
+                if tag == "td" and self.cell is not None:
+                    self.cells.append(self.cell)
+                    self.cell = None
+
+        session = self.harness.state / "sessions" / "noop-native"
+        session.mkdir(parents=True)
+        body = {"model": "gpt-6.1-sol", "input": [{"role": "user", "content": "native quantity differs from local"}]}
+        events = [{"event": "run_started", "data": {"model": "gpt-6.1-sol",
+                   "cache_ttl_seconds": 1800, "implicit_cache_minimum_prefix_tokens": 1024}}]
+        rows, expected = [], 0.0
+        for index, (incoming, cached, written) in enumerate([(62719, 0, 62719), (62819, 60000, 0), (62919, 0, 0)]):
+            if index:
+                body["input"].append({"role": "user", "content": f"append {index}"})
+            events.extend([
+                {"event": "model_request", "run_id": "noop-native", "timestamp_ms": index * 1000,
+                 "data": {"step": index, "route": "synthetic", "request": copy.deepcopy(body)}},
+                {"event": "model_response", "run_id": "noop-native", "timestamp_ms": index * 1000 + 1,
+                 "data": {"step": index, "usage": {"input_tokens": incoming, "output_tokens": 100,
+                 "cached_input_tokens": cached, "cache_write_input_tokens": written}, "raw": {"output": []}}}])
+            expected += ((incoming-cached-written)*2 + cached*.1 + written*2.5 + 100*10) / 1e6
+            (session / "trace.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+            output = self.harness.state / f"noop-native-{index}.html"
+            env = {"PATH": "", "HOME": str(self.harness.state)}
+            if "TMPDIR" in os.environ:
+                env["TMPDIR"] = os.environ["TMPDIR"]
+            result = subprocess.run([os.environ["CARRY_TEST_BINARY"], "report", "cost", "--sessions",
+                                     str(session.parent), "--output", str(output)],
+                                    env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            parser = Cells()
+            parser.feed(output.read_text())
+            self.assertEqual(len(parser.cells), 10)
+            rows.append({"cells": parser.cells, "expected": f"${expected:.4f}"})
+        self.evidence.update(trace=events, rows=rows, basis="actual native report CLI, synthetic receipt partitions and full trace replay")
+        for index, row in enumerate(rows):
+            self.assertEqual(row["cells"][2], f"{index+1}/{index+1}")
+            self.assertEqual(row["cells"][3], row["expected"], "observed money uses native partitions")
+            self.assertEqual(row["cells"][7], "0")
+            with self.subTest(primary=index + 1):
+                self.assertEqual(row["cells"][4], row["expected"], "NATIVE_REPORT_PARITY: do not simulate Carry's paid receipt")
+                self.assertEqual(row["cells"][5], row["expected"])
+                self.assertEqual(row["cells"][6], "$0.0000")
 
     def test_native_offline_report_prices_initialized_first_primary(self):
         import json

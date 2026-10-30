@@ -298,6 +298,8 @@ fn cache_write188_native_report_unknown_mode_preserves_observed_ledger() {
         "input":[{"role":"user", "content":"unknown contract ".repeat(1000)}]});
     let input = prompt_projection(&body).unwrap().2;
     let mut t = Trajectory::with_model("gpt-6.1-sol".into());
+    // This is an unknown hypothetical forecast, not an unchanged paid primary.
+    t.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":0}}));
     t.record(&json!({"event":"model_request","data":{"step":1,"request":body}}));
     let e = t
         .record(&json!({"event":"model_response","data":{"step":1,

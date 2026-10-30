@@ -1,9 +1,34 @@
-//! Conditional frozen-trajectory scenario using local o200k_base token estimates.
-//! Provider usage remains a separate modeled ledger.
+//! Observed primary money with a conditional local-quantity alternative.
+//! Local o200k_base estimates never reprice a paid provider receipt.
 use crate::openai::{Usage, estimated_cost_usd, prompt_cache_capabilities};
 use carry::models::{ScenarioCacheMode, ScenarioCachePolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+/// Lifetime equivalence, not equal token counts or the latest no-op. Missing
+/// persisted proof is divergent. Both quantity adapters use this decision owner;
+/// only a genuinely hypothetical primary may call its pure price forecast.
+#[derive(Clone, Copy, Default, Debug, Deserialize, Serialize)]
+#[serde(transparent)]
+pub(crate) struct PrimaryHistory(bool);
+impl PrimaryHistory {
+    pub(crate) fn identical() -> Self {
+        Self(true)
+    }
+
+    pub(crate) fn diverge(&mut self) {
+        self.0 = false;
+    }
+
+    pub(crate) fn price(
+        &self,
+        observed: Option<f64>,
+        forecast: impl FnOnce() -> Option<f64>,
+    ) -> Option<(f64, f64)> {
+        let observed = observed?;
+        Some((observed, if self.0 { observed } else { forecast()? }))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct Scenario {
@@ -114,6 +139,7 @@ pub struct Trajectory {
     initialized: bool,
     carry_edited: bool,
     pi_edited: bool,
+    primary_history: PrimaryHistory,
     cache_ttl_ms: Option<u64>,
     cache_minimum: Option<u64>,
     cache_metadata: bool,
@@ -151,6 +177,7 @@ impl Trajectory {
             initialized: false,
             carry_edited: false,
             pi_edited: false,
+            primary_history: PrimaryHistory::identical(),
             cache_ttl_ms: None,
             cache_minimum: None,
             cache_metadata: false,
@@ -216,6 +243,7 @@ impl Trajectory {
             }
             "context_compacted" => {
                 self.carry_edited = true;
+                self.primary_history.diverge();
                 if let Some(dropped) = data["compaction_token_delta"].as_i64() {
                     self.restored = self.restored.saturating_add(dropped as i128);
                 } else {
@@ -272,12 +300,13 @@ impl Trajectory {
                     self.result.coverage.missing_projection += 1;
                 }
                 let model = self.pending.as_ref().map_or(&self.model, |p| &p.model);
-                if let Some(cost) = usage.as_ref().and_then(|u| {
+                let observed = usage.as_ref().and_then(|u| {
                     (u.cache_write_input_tokens == 0
                         || self.pending.as_ref().is_some_and(|p| p.write_tariff_known))
                     .then(|| estimated_cost_usd(model, u))
                     .flatten()
-                }) {
+                });
+                if let Some(cost) = observed {
                     self.result.observed_cost += cost;
                 } else {
                     self.result.coverage.unpriced_responses += 1;
@@ -309,14 +338,13 @@ impl Trajectory {
                                 self.summary = self.scenario.summary;
                                 pi_input = compacted;
                                 self.pi_edited = true;
+                                self.primary_history.diverge();
                                 self.result.initial_compactions += 1;
                             }
                         }
                         self.initialized = true;
                     }
                     // Freeze the output count, not its rate: use each scenario input tier.
-                    let carry_output =
-                        scenario_output_cost(&prompt.model, prompt.input, usage.output_tokens);
                     let pi_output =
                         scenario_output_cost(&prompt.model, pi_input, usage.output_tokens);
                     let compatible = self.previous.as_ref().is_some_and(|p| {
@@ -334,11 +362,7 @@ impl Trajectory {
                         .previous
                         .as_ref()
                         .is_some_and(|p| prompt.prefix.starts_with(&p.prefix));
-                    let carry_cached = if compatible && append && !self.carry_edited {
-                        self.previous.as_ref().unwrap().input.min(prompt.input)
-                    } else {
-                        0
-                    };
+
                     // Alternative prefixes are unknown after a native edit: declared append/frozen-size reuse.
                     let pi_cached =
                         if compatible && (append || self.carry_edited) && !self.pi_edited {
@@ -347,30 +371,24 @@ impl Trajectory {
                             0
                         };
                     let minimum = self.cache_minimum_for(&prompt.model);
-                    if minimum.is_none() || prompt.cache_mode == ScenarioCacheMode::Unknown {
-                        self.result.coverage.unknown_cache_requests += 1;
-                    }
-                    let carry = scenario_input_cost_with_mode(
-                        &prompt.model,
-                        prompt.input,
-                        carry_cached,
-                        minimum,
-                        prompt.cache_mode,
-                        estimated_cost_usd,
-                    );
-                    let pi = scenario_input_cost_with_mode(
-                        &prompt.model,
-                        pi_input,
-                        pi_cached,
-                        minimum,
-                        prompt.cache_mode,
-                        estimated_cost_usd,
-                    );
-                    if let (Some(carry), Some(pi), Some(carry_output), Some(pi_output)) =
-                        (carry, pi, carry_output, pi_output)
-                    {
-                        self.result.carry_cost += carry + carry_output;
-                        self.result.pi_cost += pi + pi_output;
+                    let pair = self.primary_history.price(observed, || {
+                        if minimum.is_none() || prompt.cache_mode == ScenarioCacheMode::Unknown {
+                            self.result.coverage.unknown_cache_requests += 1;
+                        }
+                        Some(
+                            scenario_input_cost_with_mode(
+                                &prompt.model,
+                                pi_input,
+                                pi_cached,
+                                minimum,
+                                prompt.cache_mode,
+                                estimated_cost_usd,
+                            )? + pi_output?,
+                        )
+                    });
+                    if let Some((carry, pi)) = pair {
+                        self.result.carry_cost += carry;
+                        self.result.pi_cost += pi;
                     } else {
                         self.scenario_available = false;
                     }
@@ -417,6 +435,7 @@ impl Trajectory {
                         self.result.pi_cost += cost;
                         self.result.pi_compactions += 1;
                         self.pi_edited = true;
+                        self.primary_history.diverge();
                         self.removed = self
                             .removed
                             .saturating_add(discarded.saturating_sub(self.summary));
@@ -518,14 +537,32 @@ pub(crate) fn prompt_projection(body: &Value) -> Option<(String, String, u64)> {
     let prefix = format!("{overhead}{}", &serialized[..serialized.len() - 1]);
     Some((prefix, overhead, units))
 }
-/// Initialization may retire history, never fixed overhead or the current turn.
-/// Keep the same local prompt units as `prompt_projection` in both estimators.
-pub(crate) fn protected_prompt_tokens(body: &Value) -> Option<u64> {
+/// Fixed instruction roles and the current user suffix overlap: select their
+/// union before tokenizing, rather than adding two independently sized slices.
+fn retained_prompt_tokens(body: &Value, current_turn: bool) -> Option<u64> {
     let input = body["input"].as_array()?;
     let current = input.iter().rposition(|item| item["role"] == "user");
-    let protected = current.map_or(&input[input.len()..], |start| &input[start..]);
+    let retained: Vec<_> = input
+        .iter()
+        .enumerate()
+        .filter(|(index, item)| {
+            matches!(item["role"].as_str(), Some("system" | "developer"))
+                || (current_turn && current.is_some_and(|start| *index >= start))
+        })
+        .map(|(_, item)| item)
+        .collect();
     let overhead = json!({"instructions":body.get("instructions"),"tools":body.get("tools"),"text":body.get("text")});
-    Some(token_units(&json!({"overhead":overhead,"input":protected})))
+    Some(token_units(&json!({"overhead":overhead,"input":retained})))
+}
+
+/// Initialization may retire history, never fixed overhead or the current turn.
+pub(crate) fn protected_prompt_tokens(body: &Value) -> Option<u64> {
+    retained_prompt_tokens(body, true)
+}
+
+/// The same fixed floor survives every later hypothetical summary.
+pub(crate) fn fixed_prompt_tokens(body: &Value) -> Option<u64> {
+    retained_prompt_tokens(body, false)
 }
 
 fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
@@ -538,8 +575,7 @@ fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
     Some(Prompt {
         model: request["model"].as_str().unwrap_or(fallback).to_owned(),
         input,
-        fixed_input: token_units(&json!({"instructions":request.get("instructions"),
-            "tools":request.get("tools"),"text":request.get("text")})),
+        fixed_input: fixed_prompt_tokens(request)?,
         protected_input,
         requested_output: request["max_output_tokens"].as_u64(),
         prefix,
@@ -690,17 +726,18 @@ mod tests {
                 assert_eq!(estimate.summary_cost, 0.0);
                 estimate
             };
-            // Input telemetry deliberately stays at 17: each scenario branch must
-            // select its own tier from the local projection, not the native ledger.
+            // Actual telemetry stays at 17; only the hypothetical alternative
+            // selects a tier from local quantities. Neither reprices the other.
             let zero = replay(0_u64);
             let frozen = replay(FROZEN_OUTPUT);
             let input_cost =
                 |input: u64| input as f64 * if input > 272_000 { 5.0 } else { 2.5 } / 1_000_000.0;
             let output_cost = |input: u64| if input > 272_000 { 0.15 } else { 0.10 };
-            let carry_output = output_cost(carry_input);
+            let carry_output = 0.10;
             let pi_output = output_cost(pi_input);
             // Independent rate-card values; do not use the estimator as its oracle.
-            assert!((zero.carry_cost - input_cost(carry_input)).abs() < TOLERANCE);
+            let actual_input_cost = 17.0 * 2.0 / 1_000_000.0;
+            assert!((zero.carry_cost - actual_input_cost).abs() < TOLERANCE);
             assert!((zero.pi_cost - input_cost(pi_input)).abs() < TOLERANCE);
             assert!((frozen.observed_cost - zero.observed_cost - 0.10).abs() < TOLERANCE);
             assert!(
@@ -713,9 +750,9 @@ mod tests {
             );
             assert!(
                 (frozen.savings - zero.savings - (pi_output - carry_output)).abs() < TOLERANCE,
-                "cross-tier output contributes exactly +/-0.05 USD, not a common charge"
+                "the hypothetical output tier cannot replace the actual native tier"
             );
-            assert!((frozen.carry_cost - input_cost(carry_input) - carry_output).abs() < TOLERANCE);
+            assert!((frozen.carry_cost - actual_input_cost - carry_output).abs() < TOLERANCE);
             assert!((frozen.pi_cost - input_cost(pi_input) - pi_output).abs() < TOLERANCE);
         }
     }
@@ -756,7 +793,7 @@ mod tests {
         }
     }
     #[test]
-    fn monetary_scenario_does_not_depend_on_metered_input_units() {
+    fn local_counterfactual_quantity_does_not_revalue_metered_money() {
         fn replay(metered: u64) -> Estimate {
             let mut t = Trajectory::with_model("gpt-6-sol".into());
             for dropped in [0, 600] {
@@ -770,9 +807,11 @@ mod tests {
         }
         let a = replay(2000);
         let b = replay(20000);
-        assert!((a.savings - b.savings).abs() < 1e-12);
+        assert!((a.pi_cost - b.pi_cost).abs() < 1e-12);
         assert_ne!(a.observed_cost, b.observed_cost);
-        assert_ne!(b.carry_cost, b.observed_cost);
+        assert_eq!(a.carry_cost, a.observed_cost);
+        assert_eq!(b.carry_cost, b.observed_cost);
+        assert!((a.savings - b.savings - (b.observed_cost - a.observed_cost)).abs() < 1e-12);
     }
     #[test]
     fn response_boundary_charges_summary_without_duplicate_terminal_charge() {
@@ -828,16 +867,14 @@ mod tests {
         );
     }
     #[test]
-    fn cache_policy_charges_first_write_and_model_switch_symmetrically() {
+    fn unchanged_primary_and_model_switch_share_observed_money() {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         request(&mut t, 2000);
         let a = response(&mut t, 10000, 100, 0);
-        let units = t.previous.as_ref().unwrap().input;
         let write = estimated_cost_usd(
             "gpt-6-sol",
             &Usage {
-                input_tokens: units,
-                cache_write_input_tokens: units,
+                input_tokens: 10000,
                 output_tokens: 100,
                 ..Usage::default()
             },
@@ -851,8 +888,7 @@ mod tests {
         let switched = estimated_cost_usd(
             "gpt-5.6-sol",
             &Usage {
-                input_tokens: units,
-                cache_write_input_tokens: units,
+                input_tokens: 10000,
                 output_tokens: 100,
                 ..Usage::default()
             },
@@ -864,6 +900,7 @@ mod tests {
     #[test]
     fn priced_usage_with_unknown_cache_policy_excludes_savings() {
         let mut t = Trajectory::default();
+        t.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":0}}));
         t.record(&json!({"event":"run_started","data":{"model":"gpt-6-sol","implicit_cache_minimum_prefix_tokens":null}}));
         request(&mut t, 2000);
         let estimate = response(&mut t, 1000, 100, 900);
@@ -892,7 +929,7 @@ mod tests {
                 request(&mut t, 2000);
                 let after = response(&mut t, 10, 0, 0);
                 assert!(after.observed_priced);
-                assert_eq!(after.priced, !old_minimum.is_null());
+                assert!(after.priced);
                 assert_eq!(t.last_pi_input, carry_input + 600);
                 assert!((after.observed_cost - 2.0 * before.observed_cost).abs() < 1e-12);
                 let carry_delta = after.carry_cost - before.carry_cost;
@@ -903,10 +940,7 @@ mod tests {
                 );
                 actual.push((carry_delta * 1e9).round() as u64);
                 actual.push((pi_delta * 1e9).round() as u64);
-                expected.push(
-                    (input_cost("gpt-6-sol", carry_input, 0, Some(1024)).unwrap() * 1e9).round()
-                        as u64,
-                );
+                expected.push((before.observed_cost * 1e9).round() as u64);
                 expected.push((cold * 1e9).round() as u64);
             }
         }
@@ -915,6 +949,7 @@ mod tests {
     #[test]
     fn cache_policy_transition_uses_the_previous_request_model() {
         let mut t = Trajectory::default();
+        t.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":0}}));
         t.record(&json!({"event":"run_started","data":{"model":"gpt-6-sol","implicit_cache_minimum_prefix_tokens":null}}));
         request(&mut t, 2000);
         let before = response(&mut t, 10, 0, 0);
@@ -924,7 +959,7 @@ mod tests {
         t.record(&json!({"event":"model_request","data":{"step":1,"request":{"model":"gpt-6-sol","input":["a ".repeat(2000)],"tools":[]}}}));
         let after = response(&mut t, 10, 0, 0);
         let cold = input_cost("gpt-6-sol", units, 0, Some(1024)).unwrap();
-        assert!((after.carry_cost - before.carry_cost - cold).abs() < 1e-12);
+        assert!((after.carry_cost - before.carry_cost - before.observed_cost).abs() < 1e-12);
         assert!((after.pi_cost - before.pi_cost - cold).abs() < 1e-12);
     }
     #[test]
@@ -932,13 +967,12 @@ mod tests {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         request(&mut t, 1000);
         response(&mut t, 1000, 100, 0);
-        let units = t.previous.as_ref().unwrap().input;
         request(&mut t, 1000);
         let e = response(&mut t, 1000, 100, 0);
         let ordinary = estimated_cost_usd(
             "gpt-6-sol",
             &Usage {
-                input_tokens: units,
+                input_tokens: 1000,
                 output_tokens: 100,
                 ..Usage::default()
             },

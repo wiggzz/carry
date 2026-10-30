@@ -594,9 +594,7 @@ impl Trajectory {
         // Identical execution has one paid contribution. Only a genuinely
         // different history asks the cache/tariff forecast a hypothetical price.
         // Sharing the money does NOT seed divergent cache history with real hits.
-        let traditional_cost = if self.history.shares_primary() {
-            Some(carry)
-        } else {
+        let pair = self.history.price_primary(Some(carry), || {
             scenario_request_input_cost_resolved(
                 body,
                 model,
@@ -620,7 +618,7 @@ impl Trajectory {
                         )?,
                 )
             })
-        };
+        });
         // Only the explicit semantic projection can enter this estimate;
         // opaque transport size and billed output are not retained input units.
         let total = traditional.saturating_add(retained_output);
@@ -640,7 +638,7 @@ impl Trajectory {
         } else {
             Some(0.0)
         };
-        if let (Some(traditional_cost), Some(summary_cost)) = (traditional_cost, summary_cost) {
+        if let (Some((carry, traditional_cost)), Some(summary_cost)) = (pair, summary_cost) {
             self.result.initial_compactions += u64::from(initialized_now);
             self.result.carry_cost += carry;
             self.result.traditional_cost += traditional_cost + summary_cost;
@@ -677,6 +675,6 @@ impl Trajectory {
 }
 
 fn projection_fixed_tokens(body: &Value) -> u64 {
-    token_units(&json!({"instructions":body.get("instructions"),
-        "tools":body.get("tools"),"text":body.get("text")}))
+    // The receipt boundary has already validated the input array.
+    crate::savings::fixed_prompt_tokens(body).unwrap()
 }

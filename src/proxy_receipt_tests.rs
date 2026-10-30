@@ -1,6 +1,7 @@
 //! Synthetic receipts: the wire body deliberately does not predict provider units.
 use super::*;
 include!("proxy_cache_write_tests.rs");
+include!("primary_parity_tests.rs");
 
 // Output allowance changes feasibility, not the native-input history contract.
 // Exercise both existing initialization and a real in-window paid summary.
@@ -621,13 +622,7 @@ fn joined191192_image_receipts_obey_write_lifetime_without_erasing_known_money()
             assert_eq!(snapshot.coverage.unmodeled_calls, 0);
             assert_eq!(
                 snapshot.matched_primary_responses,
-                if breakpoint {
-                    0
-                } else if index < 3 {
-                    1
-                } else {
-                    2
-                }
+                if breakpoint || index < 3 { 1 } else { 2 }
             );
             t = serde_json::from_value(state(&t)).unwrap();
         }

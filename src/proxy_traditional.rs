@@ -109,7 +109,7 @@ pub(super) struct TraditionalHistoryState {
     // Proof for the entire comparison history, not a last-plan/no-op flag.
     // Missing legacy proof never opts into sharing a provider observation.
     #[serde(default)]
-    shared_primary_history: bool,
+    shared_primary_history: crate::savings::PrimaryHistory,
     pub(super) retired: u64,
     pub(super) summary: u64,
     pub(super) last_traditional_input: u64,
@@ -119,17 +119,21 @@ pub(super) struct TraditionalHistoryState {
 impl TraditionalHistoryState {
     pub(super) fn identical() -> Self {
         Self {
-            shared_primary_history: true,
+            shared_primary_history: crate::savings::PrimaryHistory::identical(),
             ..Self::default()
         }
     }
 
-    pub(super) fn shares_primary(&self) -> bool {
-        self.shared_primary_history
+    pub(super) fn price_primary(
+        &self,
+        observed: Option<f64>,
+        forecast: impl FnOnce() -> Option<f64>,
+    ) -> Option<(f64, f64)> {
+        self.shared_primary_history.price(observed, forecast)
     }
 
     pub(super) fn diverge(&mut self) {
-        self.shared_primary_history = false;
+        self.shared_primary_history.diverge();
     }
 
     pub(super) fn compatible(

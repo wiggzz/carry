@@ -260,8 +260,14 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertAlmostEqual(saved["primary"]["cost_usd"], expected, places=12)
             self.assertEqual(estimate["unavailable_primary_cost_calls"], int(index > 0))
             self.assertAlmostEqual(estimate["observed_primary_cost"], expected, places=12)
-            self.assertIsNone(estimate["traditional_cost"])
-            self.assertIsNone(estimate["savings"])
+            # A zero-write unchanged observation is known even when a future
+            # 12h write cannot be priced. Keep that exact matched subset; never
+            # backfill the later unsupported write or unknown continuation.
+            self.assertEqual(estimate["matched_primary_responses"], 1)
+            self.assertEqual(estimate["excluded_unpriced_calls"], index)
+            self.assertAlmostEqual(estimate["carry_cost"], 0.0041, places=12)
+            self.assertAlmostEqual(estimate["traditional_cost"], 0.0041, places=12)
+            self.assertEqual(estimate["savings"], 0.0)
             proxy.close()
 
     def test_breakpoint_override_and_mixed_lifetimes_keep_money_unknown_across_restart(self):
@@ -308,8 +314,11 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertAlmostEqual(saved["primary"]["cost_usd"], expected, places=12)
             self.assertEqual(estimate["unavailable_primary_cost_calls"], unknown)
             self.assertAlmostEqual(estimate["observed_primary_cost"], expected, places=12)
-            self.assertIsNone(estimate["traditional_cost"])
-            self.assertIsNone(estimate["savings"])
+            self.assertEqual(estimate["matched_primary_responses"], 1)
+            self.assertEqual(estimate["excluded_unpriced_calls"], index)
+            self.assertAlmostEqual(estimate["carry_cost"], 0.0051, places=12)
+            self.assertAlmostEqual(estimate["traditional_cost"], 0.0051, places=12)
+            self.assertEqual(estimate["savings"], 0.0)
             proxy.close()
 
     def test_typed_tool_output_lifetimes_preserve_money_across_restart(self):
@@ -357,8 +366,11 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertAlmostEqual(saved["primary"]["cost_usd"], expected, places=12)
             self.assertEqual(estimate["unavailable_primary_cost_calls"], unknown)
             self.assertAlmostEqual(estimate["observed_primary_cost"], expected, places=12)
-            self.assertIsNone(estimate["traditional_cost"])
-            self.assertIsNone(estimate["savings"])
+            self.assertEqual(estimate["matched_primary_responses"], 1)
+            self.assertEqual(estimate["excluded_unpriced_calls"], index)
+            self.assertAlmostEqual(estimate["carry_cost"], 0.0051, places=12)
+            self.assertAlmostEqual(estimate["traditional_cost"], 0.0051, places=12)
+            self.assertEqual(estimate["savings"], 0.0)
             proxy.close()
 
     def test_branch_specific_summary_tiers_and_cache_survive_restart(self):

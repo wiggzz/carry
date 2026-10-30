@@ -763,6 +763,9 @@ fn cache_write188_unknown_mode_ttl_or_explicit_extent_keeps_actual_money() {
             request["input"] = json!([{"role":"user","content":[{"type":"input_text","text":"prefix","prompt_cache_breakpoint":{"mode":"explicit"}}]}]);
         }
         let mut t = Trajectory::default();
+        // Unknown forecast metadata matters only for an independently edited
+        // alternative; it cannot invalidate an unchanged paid observation.
+        t.projected(0, 0, true);
         t.primary(&request, &terminal(2000, 0, 0, 0), "fixture", 100, true);
         let snapshot = t.snapshot();
         assert!((snapshot.observed_primary_cost - 0.004).abs() < 1e-12);
