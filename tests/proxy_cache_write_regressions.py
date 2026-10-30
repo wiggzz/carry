@@ -22,7 +22,7 @@ class CacheWriteRegressions(unittest.TestCase):
     def cleanup_harness(self):
         self.assertTrue(self.harness.doCleanups(), "nested fixture cleanup failed")
 
-    def summary_policy_control(self, *, migrate):
+    def summary_policy_control(self, *, migrate, migrate_at=1, requests=3):
         """Real producer/restart; native totals deliberately differ from wire size."""
         def primary(_body, n):
             response = support.completed(response_id=f"summary-policy-{n}")
@@ -35,9 +35,9 @@ class CacheWriteRegressions(unittest.TestCase):
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "user", "content": "synthetic large native receipt"}]
         snapshots = []
-        for index in range(3):
+        for index in range(requests):
             if index:
-                if migrate and index == 1:
+                if migrate and index == migrate_at:
                     path = next(self.harness.state.glob("*.json"))
                     saved = json.loads(path.read_text())
                     # Future version is fixture metadata, not an implemented tariff.
@@ -60,7 +60,7 @@ class CacheWriteRegressions(unittest.TestCase):
             proxy.close()
         self.evidence.update(summary_policy_snapshots=snapshots,
                              primaries=fixture.primaries, reviews=fixture.reviews)
-        self.assertEqual(len(fixture.primaries), 3)
+        self.assertEqual(len(fixture.primaries), requests)
         self.assertEqual(fixture.reviews, [])
         return snapshots
 
@@ -97,6 +97,32 @@ class CacheWriteRegressions(unittest.TestCase):
 
     def test_summary_continuity_cache_policy_migration_restart(self):
         self.assert_summary_survives_policy(self.summary_policy_control(migrate=True), migrate=True)
+
+    def test_warm_summary_policy_transition_cold_once_then_warm_restart(self):
+        snapshots = self.summary_policy_control(migrate=True, migrate_at=3, requests=5)
+        first = snapshots[0]
+        for snapshot in snapshots:
+            self.assertEqual(snapshot["estimate"]["traditional_compactions"], 1)
+            self.assertEqual(snapshot["estimate"]["summary_cost"], first["estimate"]["summary_cost"])
+            self.assertEqual(snapshot["trajectory"]["retired"], 280000)
+            self.assertEqual(snapshot["trajectory"]["summary"], 1000)
+        # The summarized branch is already warm before the transition. Thus its
+        # cold request cannot be explained by traditional_edited from a summary.
+        for index, expected in [
+            (2, (21100 * 0.1 + 100 * 2.5) / 1e6),
+            (3, 21300 * 2.5 / 1e6),
+            (4, (21300 * 0.1 + 100 * 2.5) / 1e6),
+        ]:
+            self.assertAlmostEqual(
+                snapshots[index]["estimate"]["traditional_cost"]
+                - snapshots[index - 1]["estimate"]["traditional_cost"],
+                expected, places=12)
+        self.assertFalse(snapshots[2]["estimate"]["cache_policy_boundaries"])
+        boundary = snapshots[3]["estimate"]["cache_policy_boundaries"]
+        self.assertEqual(len(boundary), 1)
+        self.assertEqual(boundary[0]["cumulative"]["traditional_cost"],
+                         snapshots[2]["estimate"]["traditional_cost"])
+        self.assertEqual(snapshots[4]["estimate"]["cache_policy_boundaries"], boundary)
 
     def run_control(self, inputs, *, restart=False, omit_write=False, paid_write=False):
         options = {"mode": "implicit" if paid_write else "explicit", "ttl": "30m"}
