@@ -649,16 +649,29 @@ pub(crate) fn remove_prompt_cache_breakpoints(value: &mut Value) {
     };
     object.remove("prompt_cache_breakpoint");
     if let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) {
-        for item in input {
-            let Some(item) = item.as_object_mut() else {
-                continue;
-            };
-            item.remove("prompt_cache_breakpoint");
-            if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
-                for block in content {
-                    if let Some(block) = block.as_object_mut() {
-                        block.remove("prompt_cache_breakpoint");
-                    }
+        remove_input_cache_breakpoints(input);
+    }
+}
+
+/// Model-visible input, with only protocol-owned cache annotations removed.
+/// Identity and local quantities use this same table as transport adaptation;
+/// caller metadata, schemas and opaque tool output are not recursively stripped.
+pub(crate) fn semantic_prompt_input(input: &[Value]) -> Vec<Value> {
+    let mut input = input.to_vec();
+    remove_input_cache_breakpoints(&mut input);
+    input
+}
+
+fn remove_input_cache_breakpoints(input: &mut [Value]) {
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        item.remove("prompt_cache_breakpoint");
+        if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
+            for block in content {
+                if let Some(block) = block.as_object_mut() {
+                    block.remove("prompt_cache_breakpoint");
                 }
             }
         }

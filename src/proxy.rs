@@ -1330,6 +1330,7 @@ struct Commit {
     observed_input: Vec<Value>,
     outbound: Value,
     native: bool,
+    dispatched_at: u64,
     _history_pin: history::Pin,
     _lock: OwnedMutexGuard<()>,
 }
@@ -1479,14 +1480,7 @@ async fn forward_request(
                 Sha256::digest(format!("carry-primary-{id}").as_bytes())
             ));
         }
-        if session.history_namespace != history_namespace {
-            // Conversation IDs belong to the observation's settings namespace,
-            // not to a reusable explicit session file.
-            session.history_conversation = None;
-            session.review_feedback = Value::Null;
-            session.review_feedback_generation = 0;
-        }
-        session.history_namespace = history_namespace;
+        history::bind_namespace(&mut session, history_namespace);
         session.history_shared = implicit;
         if requested_conversation.is_some() {
             session.history_conversation = requested_conversation;
@@ -1780,18 +1774,38 @@ async fn forward_request(
         // Measure after choosing its actual input, including a zero delta for
         // pass-through. Receipt compatibility may preserve only this quantity.
         let canonical = json!(session.render_primary());
+        let (canonical_units, submitted_units, primary_edited) = if service.config.mode == Mode::Off
+        {
+            // Off never edits input. Its optional tracker can fail or be empty,
+            // so it cannot define a canonical-minus-sent delta.
+            (0, 0, false)
+        } else {
+            (
+                estimate(&canonical) as u64,
+                estimate(&outbound["input"]) as u64,
+                canonical != outbound["input"],
+            )
+        };
+        // Freeze the final transport representation before preparing legacy
+        // proof and reserving the attempt. Projection above uses client-native
+        // quantities; admission has already retained the client's output cap.
+        outbound = primary_wire_body(&service.config, &outbound);
         if let Some(t) = &mut session.cost_trajectory {
-            if service.config.mode == Mode::Off {
-                // Off never edits input. Its optional tracker can fail or be
-                // empty, so it cannot define a canonical-minus-sent delta.
-                t.projected(0, 0, false);
-            } else {
-                t.projected(
-                    estimate(&canonical) as u64,
-                    estimate(&outbound["input"]) as u64,
-                    canonical != outbound["input"],
-                );
-            }
+            t.load_receipt_history(
+                &outbound,
+                &service.config.upstream_url,
+                service
+                    .config
+                    .model_resolution
+                    .as_ref()
+                    .map(|pair| &pair.primary),
+                session
+                    .model_resolution_history
+                    .iter()
+                    .rev()
+                    .map(|pair| &pair.primary),
+            );
+            t.projected(canonical_units, submitted_units, primary_edited);
         }
         let reviewed = session.clone();
         session.last_submitted_ids = session
@@ -1818,7 +1832,6 @@ async fn forward_request(
             .filter(|i| !projection.omitted.contains(&i.id))
             .map(|i| i.id)
             .collect();
-        outbound = primary_wire_body(&service.config, &outbound);
         let _ = trace(&service, &id, "primary_submitted", &outbound);
         journal(
             &service,
@@ -1837,6 +1850,7 @@ async fn forward_request(
             observed_input: body["input"].as_array().cloned().unwrap_or_default(),
             outbound: outbound.clone(),
             native,
+            dispatched_at: now(),
             _history_pin: history_pin,
             _lock: lock,
         });
@@ -2301,26 +2315,27 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
     current.background_review_pending = false;
     for receipt in &run.receipts {
         let resolved = before.model_resolution.as_ref().map(|p| &p.reviewer);
-        if let Some(usage) = &receipt.usage {
-            current.shadow.observe_with_rates(
+        let settled = if let Some(usage) = &receipt.usage {
+            current.shadow.settle_with_rates(
                 &receipt.model,
                 usage,
                 receipt.standard,
                 receipt_rates(&receipt.model, usage, resolved, receipt.write_tariff_known),
-            );
+            )
         } else {
             current.shadow.calls += 1;
             current.shadow.unavailable_cost_calls += 1;
-        }
+            None
+        };
         if let Some(t) = &mut current.cost_trajectory {
             if receipt.completed {
-                t.reviewer_usage_resolved(
+                t.reviewer_usage_settled(
                     &receipt.model,
                     receipt.input,
                     receipt.usage.as_ref().unwrap_or(&Value::Null),
                     receipt.standard,
                     resolved,
-                    receipt.write_tariff_known,
+                    settled,
                 );
             } else {
                 t.failed_reviewer_call();
@@ -2451,6 +2466,7 @@ async fn review_chunk(
         reason: Some("fresh_prefix_projection"),
     };
     let mut diagnostic = json!({"reason": "review_transport_or_protocol_failure"});
+    let dispatched_at = now();
     let observed = async {
         let response = if codex_reviewer {
             send_codex(
@@ -2535,7 +2551,7 @@ async fn review_chunk(
                 completed: value["status"] == "completed",
             });
         }
-        session.shadow.observe_with_rates(
+        let settled = session.shadow.settle_with_rates(
             &service.config.classifier_model,
             &value["usage"],
             value.get("service_tier").is_none_or(|v| v == "default"),
@@ -2547,12 +2563,18 @@ async fn review_chunk(
             ),
         );
         if let Some(trajectory) = &mut session.cost_trajectory {
-            trajectory.reviewer_resolved(
-                body,
-                &value,
-                value.get("service_tier").is_none_or(|v| v == "default"),
-                resolved,
-            );
+            if value["status"] == "completed" {
+                trajectory.reviewer_usage_settled(
+                    &service.config.classifier_model,
+                    crate::proxy_savings::token_units(body),
+                    &value["usage"],
+                    value.get("service_tier").is_none_or(|v| v == "default"),
+                    resolved,
+                    settled,
+                );
+            } else {
+                trajectory.failed_reviewer_call();
+            }
         }
         if value["status"] == "completed"
             && let Ok(cache) = history::observe_cache(
@@ -2561,7 +2583,7 @@ async fn review_chunk(
                 &value["usage"],
                 resolved,
                 &service.config.reviewer_cache_auth,
-                now(),
+                crate::proxy_cache::ObservationTime::during(dispatched_at, now()),
             )
         {
             session.upstream_cache = cache;
@@ -2940,9 +2962,10 @@ fn memory_admission_fits(config: &ProxyCli, session: &Session, omitted: &HashSet
 }
 
 fn primary_output_reserve(config: &ProxyCli, body: &Value) -> u64 {
-    body["max_output_tokens"]
-        .as_u64()
-        .unwrap_or(config.primary_output_reserve_tokens as u64)
+    carry::models::output_allowance(
+        body["max_output_tokens"].as_u64(),
+        u64::from(config.primary_output_reserve_tokens),
+    )
 }
 
 fn primary_required_tokens(config: &ProxyCli, body: &Value) -> f64 {
@@ -3319,7 +3342,7 @@ async fn relay(
                     .model_resolution
                     .as_ref()
                     .map(|p| &p.primary);
-                commit.candidate.primary.observe_with_rates(
+                let settled = commit.candidate.primary.settle_with_rates(
                     model,
                     &value["usage"],
                     standard(&commit.outbound)
@@ -3335,15 +3358,16 @@ async fn relay(
                     if commit.native {
                         trajectory.unmodeled_call();
                     } else {
-                        trajectory.primary_resolved(
-                            &commit.outbound,
-                            &value,
-                            &commit.service.config.upstream_url,
-                            now(),
-                            standard(&commit.outbound)
+                        trajectory.primary_settled(crate::proxy_savings::PrimaryObservation {
+                            body: &commit.outbound,
+                            response: &value,
+                            route: &commit.service.config.upstream_url,
+                            at: now(),
+                            standard: standard(&commit.outbound)
                                 && value.get("service_tier").is_none_or(|v| v == "default"),
                             resolved,
-                        );
+                            cost: settled,
+                        });
                     }
                 }
                 if commit.native {
@@ -3375,7 +3399,7 @@ async fn relay(
                         &value["usage"],
                         resolved,
                         &commit.service.config.primary_cache_auth,
-                        now(),
+                        crate::proxy_cache::ObservationTime::during(commit.dispatched_at, now()),
                     ) {
                         commit.candidate.upstream_cache = cache;
                     }
@@ -3579,18 +3603,28 @@ mod tests {
         owner.ingest(body["input"].as_array().unwrap()).unwrap();
         let at = now();
         let mut stale = owner.clone();
-        for cached in [0, 3000, 0] {
+        for cached in [0, 4000, 0] {
+            if cached > 0 {
+                // A timed full write, not this later read's timestamp, owns
+                // reusable coverage. Keep both facts through stale snapshots.
+                history::observe_cache(
+                    &service, &body,
+                    &json!({"input_tokens":4000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":4000}}),
+                    Some(&model), "same-auth",
+                    crate::proxy_cache::ObservationTime::during(at, at),
+                ).unwrap();
+            }
             owner.upstream_cache = history::observe_cache(
                 &service,
                 &body,
                 &json!({"input_tokens":4000,"input_tokens_details":{"cached_tokens":cached}}),
                 Some(&model),
                 "same-auth",
-                at,
+                at.into(),
             )
             .unwrap();
-            assert_eq!(owner.upstream_cache.len(), 1);
-            let evidence = &owner.upstream_cache[0];
+            assert_eq!(owner.upstream_cache.len(), if cached > 0 { 2 } else { 1 });
+            let evidence = owner.upstream_cache.last().unwrap();
             assert_eq!(evidence.at, at, "TTL seconds are not receipt ordering");
             assert_eq!(evidence.native_cached_fraction, cached as f64 / 4000.0);
             let read = crate::proxy_cache::reusable(
@@ -3618,7 +3652,15 @@ mod tests {
             json!({"input_tokens":4000}),
             json!({"input_tokens":4000,"input_tokens_details":{"cached_tokens":4001}}),
         ] {
-            history::observe_cache(&service, &body, &usage, Some(&model), "same-auth", at).unwrap();
+            history::observe_cache(
+                &service,
+                &body,
+                &usage,
+                Some(&model),
+                "same-auth",
+                at.into(),
+            )
+            .unwrap();
             assert_eq!(
                 history::cache(&service).unwrap()[0].native_cached_fraction,
                 0.0
@@ -3656,7 +3698,7 @@ mod tests {
             &json!({"input_tokens":4000,"input_tokens_details":{"cached_tokens":3000}}),
             Some(&model),
             "auth",
-            now()
+            now().into()
         ));
         assert_eq!(cache.len(), 1);
         assert_eq!(
@@ -3739,10 +3781,10 @@ mod tests {
         crate::proxy_cache::observe(
             &mut cache,
             &first,
-            &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":5000}}),
+            &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":10000}}),
             Some(&model),
             "fixture-auth",
-            now(),
+            crate::proxy_cache::ObservationTime::during(now(), now()),
         );
         assert!(
             crate::proxy_cache::reusable(&cache, &appended, Some(&model), "fixture-auth", now())
@@ -4089,6 +4131,9 @@ mod tests {
     }
     include!("proxy_catalog_isolation_tests.rs");
     include!("proxy_settlement_tests.rs");
+    mod namespace_controls {
+        include!("proxy_namespace_tests.rs");
+    }
     include!("proxy_semantic_tests.rs");
     include!("proxy_noodle_tests.rs");
     include!("proxy_pr154_tests.rs");

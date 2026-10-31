@@ -48,6 +48,24 @@ def ledger(body):
     raise AssertionError("review request must expose its actionable ledger")
 
 
+def stage_comparison_scenario(saved, scenario):
+    """Stage a synthetic threshold before any hypothetical summary.
+
+    These fixtures compress the test's units/window, not simulate a real
+    projection-policy change. Keep the typed decoder contract synchronized with
+    that fixture-only setup; changing production policy still segments history.
+    Never use this to relabel already summarized quantities or monetary totals.
+    """
+    trajectory = saved['cost_trajectory']
+    assert trajectory['retired'] == 0 and trajectory['summary'] == 0
+    assert trajectory['result']['traditional_compactions'] == 0
+    assert trajectory['result'].get('initial_compactions', 0) == 0
+    trajectory['scenario'] = scenario
+    if continuity := trajectory.get('history_continuity'):
+        continuity['contract']['keep_recent'] = scenario['keep_recent']
+        continuity['contract']['summary_tokens'] = scenario['summary']
+
+
 class Fixture:
     def __init__(self, primary, review):
         self.primary = primary
@@ -829,7 +847,8 @@ class StateRegressions(unittest.TestCase):
                 proxy = self.proxy(fixture, options)
                 seed = [{"role": "user", "content": "priced prefix " * 600}]
                 self.assertEqual(proxy.send(seed)[0], 200)
-                before = proxy.saved()["cost_trajectory"]["result"]
+                before_trajectory = proxy.saved()["cost_trajectory"]
+                before = before_trajectory["result"]
                 fields = {"model": "unknown-model" if variant == "unknown_model" else "gpt-6-astra"} if variant in ("unknown_model", "unknown_cache") else {}
                 self.assertEqual(proxy.send(seed, **fields)[0], 200)
                 omitted = proxy.saved()["cost_trajectory"]
@@ -866,7 +885,20 @@ class StateRegressions(unittest.TestCase):
                     continue
                 self.assertEqual(omitted["result"]["carry_cost"], before["carry_cost"], "omit both branches, never a partial pair")
                 self.assertEqual(omitted["result"]["traditional_cost"], before["traditional_cost"])
-                self.assertIsNone(omitted["receipts"]["anchor"], "an omitted primary cannot preserve a stale receipt anchor")
+                if variant == "unknown_model":
+                    # A new model's valid native receipt is a fresh quantity
+                    # anchor, even when its tariff is unavailable. It must not
+                    # preserve the former model's configuration or price it.
+                    anchor = omitted["receipts"]["anchor"]
+                    self.assertIsNotNone(anchor)
+                    self.assertNotEqual(anchor["configuration"],
+                                        before_trajectory["receipts"]["anchor"]["configuration"])
+                    self.assertEqual(anchor["input"], completed()["usage"]["input_tokens"])
+                    self.assertEqual(omitted["history_continuity"]["cursor"]["input"], anchor["input"])
+                    self.assertEqual(omitted["history_continuity"]["contract"]["model"], "unknown-model")
+                else:
+                    self.assertIsNone(omitted["receipts"]["anchor"],
+                                      "invalid/unmodeled quantities cannot preserve a stale receipt anchor")
                 estimate = stats["sessions"][0]["cost_estimate"]
                 self.assert_estimate_available(estimate, True, "unpriced calls must not hide priced comparisons")
                 self.assertEqual(estimate.get("excluded_unpriced_calls"), 1)
@@ -934,8 +966,8 @@ class StateRegressions(unittest.TestCase):
         # requests. Real provider endpoints are all loopback fixtures.
         path = next(self.state.glob("*.json"))
         saved = json.loads(path.read_text())
-        saved["cost_trajectory"]["scenario"] = {
-            "context_window": 2000, "reserve": 100, "keep_recent": 200, "summary": 50}
+        stage_comparison_scenario(saved, {
+            "context_window": 2000, "reserve": 100, "keep_recent": 200, "summary": 50})
         path.write_text(json.dumps(saved))
         proxy = self.proxy(fixture, options)
         delta = [{"role": "user", "content": "evidence " * 3000}]
@@ -977,8 +1009,8 @@ class StateRegressions(unittest.TestCase):
         # Owned checkpoint only; force the modeled threshold, not live policy.
         path = next(self.state.glob("*.json"))
         saved = json.loads(path.read_text())
-        saved["cost_trajectory"]["scenario"] = {
-            "context_window": 2000, "reserve": 100, "keep_recent": 1500, "summary": 100}
+        stage_comparison_scenario(saved, {
+            "context_window": 2000, "reserve": 100, "keep_recent": 1500, "summary": 100})
         path.write_text(json.dumps(saved))
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send([{"role": "user", "content": "evidence " * 2000}],

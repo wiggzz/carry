@@ -1,3 +1,42 @@
+// Same primary histories share their actual partitions, including an observed
+// miss after a hit; forecast credit belongs only to divergent histories.
+#[test]
+fn no_op_receipt_parity_uses_observation_not_implicit_forecast() {
+    let mut trajectory = Trajectory::default();
+    let mut request = body();
+    let mut expected = 0.0;
+    for (index, cached) in [0, 60_000, 0].into_iter().enumerate() {
+        if index > 0 {
+            request["input"].as_array_mut().unwrap().push(json!({
+                "role":"user", "content":format!("native append {index}")
+            }));
+        }
+        let input = 62_719 + index as u64 * 100;
+        trajectory.primary(
+            &request,
+            &terminal(input, cached, 0, 100),
+            "parity",
+            100 + index as u64,
+            true,
+        );
+        let result = trajectory.snapshot();
+        expected += ((input - cached) as f64 * 2.0 + cached as f64 * 0.1 + 100.0 * 10.0) / 1e6;
+        assert!(result.priced);
+        assert_eq!(result.initial_compactions, 0);
+        assert_eq!(result.traditional_compactions, 0);
+        assert_eq!(result.matched_primary_responses, index as u64 + 1);
+        assert_eq!(result.excluded_unpriced_calls, 0);
+        assert!((result.observed_primary_cost - expected).abs() < 1e-12);
+        assert!((result.carry_cost - expected).abs() < 1e-12);
+        assert!(
+            (result.traditional_cost - expected).abs() < 1e-12,
+            "NO_OP_RECEIPT_PARITY: identical histories cannot invent writes or hits"
+        );
+        assert!(result.savings.abs() < 1e-12);
+        trajectory = serde_json::from_slice(&serde_json::to_vec(&trajectory).unwrap()).unwrap();
+    }
+}
+
 // Issue188: explicit-only with no breakpoints must not mask reviewer expense
 // with a synthetic write. Default/implicit paid-write controls stay separate.
 #[test]
@@ -271,6 +310,7 @@ fn cache_write188_resolution_upgrade_keeps_old_money_and_disables_future_reads_a
     let mut request = body();
     request["prompt_cache_options"] = json!({"mode":"explicit", "ttl":"30m"});
     let mut t = Trajectory::default();
+    t.projected(100, 100, true);
     t.primary_resolved(
         &request,
         &terminal(2000, 0, 0, 0),
@@ -394,7 +434,9 @@ fn cache_write191_divergent_history_uses_frozen_branch_tiers_and_independent_cac
             } else {
                 (2.0, 0.1, 2.5, 10.0)
             };
-            traditional += (if mode == "implicit" {
+            traditional += (if index == 0 {
+                input as f64 * ordinary
+            } else if mode == "implicit" {
                 cached as f64 * read + (alternative - cached) as f64 * write
             } else {
                 alternative as f64 * ordinary
@@ -430,8 +472,16 @@ fn cache_write191_post_summary_cold_then_warm_obeys_mode_after_restart() {
         };
         let mut request = body();
         request["prompt_cache_options"] = json!({"mode":mode,"ttl":"30m"});
+        // Prime a recognized in-window history, then cross the threshold.
+        // Keep the original charged-summary/write-tariff controls unchanged.
+        t.primary(&request, &terminal(2800, 0, 0, 0), "fixture", 99, true);
+        request["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"in-window growth"}));
         t.primary(&request, &terminal(3000, 3000, 0, 0), "fixture", 100, true);
         let first = t.snapshot();
+        assert_eq!(first.initial_compactions, 0);
         assert!(first.priced);
         assert_eq!(first.traditional_compactions, 1);
         // Summary request is ordinary uncached at its own input tier.
@@ -713,6 +763,9 @@ fn cache_write188_unknown_mode_ttl_or_explicit_extent_keeps_actual_money() {
             request["input"] = json!([{"role":"user","content":[{"type":"input_text","text":"prefix","prompt_cache_breakpoint":{"mode":"explicit"}}]}]);
         }
         let mut t = Trajectory::default();
+        // Unknown forecast metadata matters only for an independently edited
+        // alternative; it cannot invalidate an unchanged paid observation.
+        t.projected(0, 0, true);
         t.primary(&request, &terminal(2000, 0, 0, 0), "fixture", 100, true);
         let snapshot = t.snapshot();
         assert!((snapshot.observed_primary_cost - 0.004).abs() < 1e-12);

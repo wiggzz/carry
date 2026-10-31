@@ -91,10 +91,10 @@ fn projection182_warm_reviewer_receipt_veto_expires_without_erasing_advice() {
     assert!(crate::proxy_cache::observe(
         &mut session.upstream_cache,
         &keep,
-        &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":10000}}),
+        &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":10000}}),
         config.model_resolution.as_ref().map(|p| &p.reviewer),
         &config.reviewer_cache_auth,
-        now(),
+        crate::proxy_cache::ObservationTime::during(now(), now()),
     ));
     let canonical = session.render_primary();
     let opinions = session.opinions.clone();
@@ -118,7 +118,12 @@ fn projection182_warm_reviewer_receipt_veto_expires_without_erasing_advice() {
     );
     // Age the genuine receipt, not a generic warm flag or semantic authority.
     for receipt in &mut session.upstream_cache {
-        receipt.at = now().saturating_sub(receipt.ttl_seconds + 1);
+        let window = receipt
+            .write_window
+            .as_mut()
+            .expect("timed whole-prefix write");
+        window.not_before = now().saturating_sub(window.lifetime + 1);
+        window.not_after = window.not_before;
     }
     assert!(plan(&config, &session, &main).0.is_some());
     assert_eq!(session.render_primary(), canonical);

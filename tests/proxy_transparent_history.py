@@ -333,7 +333,12 @@ class TransparentHistory(unittest.TestCase):
             value = completed(response_id=f"reversible_{n}")
             value["usage"]["input_tokens"] = max(100, len(wire(body["input"])) // 4)
             value["usage"]["input_tokens_details"]["cached_tokens"] = (
-                value["usage"]["input_tokens"] * 99 // 100)
+                value["usage"]["input_tokens"] * 99 // 100 if n in (1, 2) else
+                0 if n in (3, 5, 6) else value["usage"]["input_tokens"])
+            if n in (3, 5, 6):
+                # Only these actual whole-input writes establish original timing.
+                # Later full reads preserve that event, never refresh its deadline.
+                value["usage"]["input_tokens_details"]["cache_write_tokens"] = value["usage"]["input_tokens"]
             return 200, value
 
         def review(_body, _n):
@@ -345,6 +350,7 @@ class TransparentHistory(unittest.TestCase):
         history = [{"role": "user", "content": "PROTECTED_ORIGINAL_GOAL " + "direction " * 10000},
                    {"role": "assistant", "content": "REVERSIBLE_ORIGINAL_SOURCE " + "payload " * 6000},
                    {"role": "user", "content": "CURRENT_H_DIRECTION"}]
+        self.evidence.update(upstream=fixture.primaries,reviews=fixture.reviews)
         self.assertEqual(proxy.send(history)[0], 200)
         proxy.close()
         # The loopback destination cannot advertise official provider semantics.
@@ -363,6 +369,9 @@ class TransparentHistory(unittest.TestCase):
         warm = TransparentProxy(self.state, fixture, options, mode="audit")
         self.stack.callback(warm.close)
         self.assertEqual(warm.send(history)[0], 200)
+        self.assertEqual(warm.send(history)[0], 200)  # full write after original partial-read control
+        self.evidence["written"] = warm.checkpoint(history)[1]
+        self.assertGreater(warm.checkpoint(history)[1]["primary"]["cache_write_tokens"], 0)
         warm.close()
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
@@ -373,13 +382,13 @@ class TransparentHistory(unittest.TestCase):
         path = self.state / "history.index"
         index = json.loads(path.read_text())
         for entry in index.get("upstream_cache", []):
-            entry["at"] = 1
+            if entry.get("write_window"):
+                entry["write_window"]["not_before"] = entry["write_window"]["not_after"] = 1
         for snapshot in index["snapshots"].values():
             for field in ("primary_cache", "reviewer_cache", "upstream_cache"):
                 for entry in snapshot.get(field, []):
-                    entry["at"] = 1
-                    if "read_confirmed_at" in entry:
-                        entry["read_confirmed_at"] = 1
+                    if entry.get("write_window"):
+                        entry["write_window"]["not_before"] = entry["write_window"]["not_after"] = 1
         path.write_bytes(wire(index))
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
@@ -390,7 +399,8 @@ class TransparentHistory(unittest.TestCase):
         # Expire its new receipt before genuinely re-warming canonical H alone.
         index = json.loads(path.read_text())
         for entry in index["upstream_cache"]:
-            entry["at"] = 1
+            if entry.get("write_window"):
+                entry["write_window"]["not_before"] = entry["write_window"]["not_after"] = 1
         path.write_bytes(wire(index))
         # Audit mode genuinely dispatches canonical H. Only its terminal provider
         # receipt may re-warm that exact shape; no invented saved cache entries.
@@ -486,8 +496,8 @@ class TransparentHistory(unittest.TestCase):
         index = json.loads(path.read_text())
         owner = next(k for k,v in index["snapshots"].items() if v["primary"]["calls"] == 2)
         threshold = 100 + before["restored"] + before["restored"] // 2
-        index["snapshots"][owner]["cost_trajectory"]["scenario"] = {
-            "context_window":threshold + 100,"reserve":100,"keep_recent":100,"summary":50}
+        regressions.stage_comparison_scenario(index["snapshots"][owner], {
+            "context_window":threshold + 100,"reserve":100,"keep_recent":100,"summary":50})
         path.write_bytes(wire(index))
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
@@ -1024,7 +1034,7 @@ class TransparentHistory(unittest.TestCase):
 
     def test_history_empty_envelope_limits_two_requests_and_restart(self):
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"minimum_{n}")))
-        minimum = len(wire({"format": "carry-prefix-history-v3", "nodes": {},
+        minimum = len(wire({"format": "carry-prefix-history-v4", "nodes": {},
                             "upstream_cache": [], "tips": {}, "reviews": {},
                             "transcripts": {}, "snapshots": {}}))
         for limit in (2, minimum - 1):

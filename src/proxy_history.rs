@@ -97,8 +97,15 @@ fn pinned(service: &Service) -> HashSet<String> {
 }
 
 #[derive(Default, Serialize, Deserialize)]
-#[serde(tag = "format", rename = "carry-prefix-history-v3")]
+enum Format {
+    #[default]
+    #[serde(rename = "carry-prefix-history-v4")]
+    Current,
+}
+
+#[derive(Default, Serialize, Deserialize)]
 struct Index {
+    format: Format,
     nodes: BTreeMap<String, Node>,
     upstream_cache: Vec<CacheEvidence>,
     tips: BTreeMap<String, Reference>,
@@ -108,18 +115,18 @@ struct Index {
     #[serde(default)]
     snapshots: BTreeMap<String, Session>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 struct Node {
     parent: String,
     value: Value,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 struct Reference {
     session: String,
     namespace: String,
     at: u64,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 struct Transcript {
     namespace: String,
     external_id: String,
@@ -158,7 +165,12 @@ pub(super) fn validate_capacity(config: &ProxyCli) -> std::io::Result<()> {
 fn read(service: &Service) -> std::io::Result<Index> {
     match std::fs::read(service.config.state_dir.join("history.index")) {
         Ok(bytes) if bytes.len() <= service.config.history_max_bytes as usize => {
-            serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+            serde_json::from_slice(&bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported or invalid history index format",
+                )
+            })
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Index::default()),
         _ => Err(std::io::Error::other("history index unavailable")),
@@ -208,6 +220,13 @@ fn gc(index: &mut Index, pins: &HashSet<String>) {
     }
     index.nodes.retain(|key, _| reachable.contains(key));
 }
+fn within_capacity(service: &Service, index: &Index, bytes: usize) -> bool {
+    index.nodes.len() <= service.config.history_max_nodes as usize
+        && index.tips.len() + index.reviews.len() + index.transcripts.len()
+            <= service.config.history_max_references as usize
+        && bytes <= service.config.history_max_bytes as usize
+}
+
 fn prune(service: &Service, index: &mut Index) -> bool {
     let at = now();
     crate::proxy_cache::trim(&mut index.upstream_cache, at);
@@ -223,11 +242,7 @@ fn prune(service: &Service, index: &mut Index) -> bool {
         .retain(|_, r| r.at <= at && at - r.at < service.config.history_max_age_secs);
     loop {
         gc(index, &pins);
-        if index.nodes.len() <= service.config.history_max_nodes as usize
-            && index.tips.len() + index.reviews.len() + index.transcripts.len()
-                <= service.config.history_max_references as usize
-            && serde_json::to_vec(index).unwrap().len() <= service.config.history_max_bytes as usize
-        {
+        if within_capacity(service, index, serde_json::to_vec(index).unwrap().len()) {
             return true;
         }
         let review = index
@@ -273,8 +288,22 @@ fn prune(service: &Service, index: &mut Index) -> bool {
     }
 }
 
-/// Owner/settings identity is a boundary, not new authentication or native UI
-/// ancestry. Exact content identifies compatible histories within that boundary.
+fn read_failure(error: std::io::Error) -> Failure {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        failure(
+            StatusCode::CONFLICT,
+            "unsupported or invalid history index format",
+        )
+    } else {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "history index unavailable",
+        )
+    }
+}
+
+/// Observed ancestry owns model, fixed prompt, source and client/tenant fences.
+/// Reviewer validity and cache/pricing policy cannot rename paid quantity owners.
 pub(super) fn namespace(
     service: &Service,
     headers: &HeaderMap,
@@ -284,11 +313,33 @@ pub(super) fn namespace(
     if identity(headers)?.is_none() {
         owner.insert("x-carry-session", "carry-active-prefix".parse().unwrap());
     }
-    Ok(hash(
-        &json!({"policy":"carry-prefix-history-v3", "owner":identity(&owner)?,
-        "settings":semantic::scope(&service.config, &cache_base(body)),
-        "client_scope":stable_client_scope(body)}),
-    ))
+    let owner = identity(&owner)?;
+    let namespace = observed_namespace(&service.config, &owner, body);
+    let _guard = IO.lock().unwrap();
+    // Decode only the supported generation before any lookup or publication.
+    // Unsupported saved state is never migrated, reset or treated as empty.
+    read(service).map_err(read_failure)?;
+    Ok(namespace)
+}
+
+fn observed_namespace(config: &ProxyCli, owner: &Option<String>, body: &Value) -> String {
+    format!(
+        "observed-v1:{}",
+        hash(&json!({"owner":owner,
+        "model":body.get("model"), "prompt":crate::savings::prompt_overhead(body),
+        "upstream":config.upstream_url, "subscription":config.codex_login,
+        "client_scope":stable_client_scope(body)}))
+    )
+}
+
+/// A genuine scope change cannot borrow a conversation from the old checkpoint.
+pub(super) fn bind_namespace(session: &mut Session, namespace: Option<String>) {
+    if session.history_namespace != namespace {
+        session.history_conversation = None;
+        session.review_feedback = Value::Null;
+        session.review_feedback_generation = 0;
+        session.history_namespace = namespace;
+    }
 }
 
 pub(super) fn conversation(body: &Value) -> Option<&str> {
@@ -329,12 +380,7 @@ pub(super) fn expand(service: &Service, namespace: &str, body: &mut Value) -> Re
         return Ok(());
     };
     let _guard = IO.lock().unwrap();
-    let mut index = read(service).map_err(|_| {
-        failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "history index unavailable",
-        )
-    })?;
+    let mut index = read(service).map_err(read_failure)?;
     prune(service, &mut index);
     let reference = index
         .transcripts
@@ -379,12 +425,7 @@ pub(super) fn resolve(
     body: &Value,
 ) -> Result<(String, Pin), Failure> {
     let _guard = IO.lock().unwrap();
-    let mut index = read(service).map_err(|_| {
-        failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "history index unavailable",
-        )
-    })?;
+    let mut index = read(service).map_err(read_failure)?;
     // Pruning is a read-time projection. Those historical IDs remain occupied
     // in the on-disk generation until publication; pinning one would otherwise
     // make restore protect and resurrect exactly the snapshot just retired.
@@ -544,7 +585,10 @@ pub(super) fn advice(
     Ok(path(namespace, input)
         .iter()
         .rev()
-        .find_map(|key| index.reviews.get(key).cloned()))
+        .find_map(|key| index.reviews.get(key).cloned())
+        .filter(|record| {
+            record.policy.as_deref() == Some(semantic::scope(&service.config).as_str())
+        }))
 }
 
 pub(super) fn publish(
@@ -568,11 +612,12 @@ pub(super) fn publish(
         .last()
         .unwrap_or(&subject.history_namespace.clone().unwrap())
         .clone();
-    let record = semantic::Record::capture(reviewed);
+    let mut record = semantic::Record::capture(reviewed);
+    record.policy = Some(semantic::scope(&service.config));
     if index
         .reviews
         .get(&key)
-        .is_none_or(|old| old.generation < record.generation)
+        .is_none_or(|old| old.policy != record.policy || old.generation < record.generation)
     {
         index.reviews.insert(key, record);
     }
@@ -592,13 +637,24 @@ fn persist(
             "history capacity held by active owners",
         ));
     }
+    write_index(service, &index)?;
+    for stale in prior.into_iter().chain(owner.map(str::to_owned)) {
+        if !index.snapshots.contains_key(&stale) {
+            let _ = std::fs::remove_file(service.config.state_dir.join(format!("{stale}.json")));
+        }
+    }
+    Ok(())
+}
+
+// Admit exact bounded bytes before atomic publication. Retention belongs to prune.
+fn write_index(service: &Service, index: &Index) -> std::io::Result<()> {
     // Validate the exact bytes that will become authority before opening the
-    // temporary file. No failed publication may replace a readable generation.
-    let bytes = serde_json::to_vec(&index)?;
-    if bytes.len() > service.config.history_max_bytes as usize {
+    // temporary file. No failed admission may replace a readable generation.
+    let bytes = serde_json::to_vec(index)?;
+    if !within_capacity(service, index, bytes.len()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::StorageFull,
-            "history index exceeds configured byte bound",
+            "history index exceeds configured capacity",
         ));
     }
     let temporary = service.config.state_dir.join(".history-index.tmp");
@@ -606,13 +662,7 @@ fn persist(
     file.write_all(&bytes)?;
     file.sync_all()?;
     std::fs::rename(temporary, service.config.state_dir.join("history.index"))?;
-    File::open(&service.config.state_dir)?.sync_all()?;
-    for stale in prior.into_iter().chain(owner.map(str::to_owned)) {
-        if !index.snapshots.contains_key(&stale) {
-            let _ = std::fs::remove_file(service.config.state_dir.join(format!("{stale}.json")));
-        }
-    }
-    Ok(())
+    File::open(&service.config.state_dir)?.sync_all()
 }
 
 /// Only actual terminal observations mutate cache evidence. Session/reviewer
@@ -624,7 +674,7 @@ pub(super) fn observe_cache(
     usage: &Value,
     resolved: Option<&ResolvedModel>,
     credential: &str,
-    at: u64,
+    time: crate::proxy_cache::ObservationTime,
 ) -> std::io::Result<Vec<CacheEvidence>> {
     let _guard = IO.lock().unwrap();
     let mut index = read(service)?;
@@ -634,7 +684,7 @@ pub(super) fn observe_cache(
         usage,
         resolved,
         credential,
-        at,
+        time,
     ) {
         let cache = index.upstream_cache.clone();
         let prior = index.snapshots.keys().cloned().collect();

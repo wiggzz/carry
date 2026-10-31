@@ -28,6 +28,9 @@ pub fn accounting_basis_label() -> String {
 
 #[path = "proxy_receipts.rs"]
 mod receipts;
+#[path = "proxy_traditional.rs"]
+mod traditional;
+use traditional::{HistoryContract, TraditionalHistoryState};
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Coverage {
@@ -80,6 +83,12 @@ pub struct CachePolicyBoundary {
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Estimate {
     #[serde(default)]
+    pub initialization_policy: String,
+    #[serde(default)]
+    pub initial_compactions: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_initialization_segment: Option<CachePolicySegment>,
+    #[serde(default)]
     pub counterfactual_cache_policy: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_cache_policy_segment: Option<CachePolicySegment>,
@@ -120,6 +129,9 @@ pub struct Estimate {
 /// comparable primary observations exist. Omitted reviewer expense is carry-only.
 #[derive(Debug, Serialize)]
 pub struct DashboardEstimate {
+    initialization_policy: String,
+    initial_compactions: u64,
+    legacy_initialization_segment: Option<CachePolicySegment>,
     counterfactual_cache_policy: String,
     legacy_cache_policy_segment: Option<CachePolicySegment>,
     cache_policy_boundaries: Vec<CachePolicyBoundary>,
@@ -149,6 +161,9 @@ impl Estimate {
     pub fn dashboard(self, pending: bool) -> DashboardEstimate {
         let available = self.priced;
         DashboardEstimate {
+            initialization_policy: self.initialization_policy,
+            initial_compactions: self.initial_compactions,
+            legacy_initialization_segment: self.legacy_initialization_segment,
             counterfactual_cache_policy: self.counterfactual_cache_policy,
             legacy_cache_policy_segment: self.legacy_cache_policy_segment,
             cache_policy_boundaries: self.cache_policy_boundaries,
@@ -271,9 +286,8 @@ pub struct Trajectory {
     result: Estimate,
     previous: Option<Prompt>,
     restored: i128,
-    retired: u64,
-    summary: u64,
-    last_traditional_input: u64,
+    #[serde(flatten)]
+    history: TraditionalHistoryState,
     carry_edited: bool,
     traditional_edited: bool,
     available: bool,
@@ -286,6 +300,19 @@ pub struct Trajectory {
     #[serde(default)]
     priced_primary_responses: Option<u64>,
 }
+/// A terminal observation with money already settled under dispatch-frozen
+/// tariffs. Comparison may forecast another history, never reprice this one.
+#[derive(Clone, Copy)]
+pub struct PrimaryObservation<'a> {
+    pub body: &'a Value,
+    pub response: &'a Value,
+    pub route: &'a str,
+    pub at: u64,
+    pub standard: bool,
+    pub resolved: Option<&'a ResolvedModel>,
+    pub cost: Option<f64>,
+}
+
 impl Default for Trajectory {
     fn default() -> Self {
         Self {
@@ -297,9 +324,7 @@ impl Default for Trajectory {
             },
             previous: None,
             restored: 0,
-            retired: 0,
-            summary: 0,
-            last_traditional_input: 0,
+            history: TraditionalHistoryState::identical(),
             carry_edited: false,
             traditional_edited: false,
             available: true,
@@ -311,6 +336,20 @@ impl Default for Trajectory {
 impl Trajectory {
     pub fn snapshot(&self) -> Estimate {
         let mut estimate = self.result.clone();
+        estimate.initialization_policy = if self
+            .receipts
+            .as_ref()
+            .is_some_and(|r| r.initialization_policy_version == Some(1))
+        {
+            if estimate.legacy_initialization_segment.is_some() {
+                "mixed_legacy_and_free_pre_window_v1"
+            } else {
+                "unrecognized_history_free_pre_window_v1"
+            }
+        } else {
+            "legacy_post_primary_compaction"
+        }
+        .into();
         let version = self
             .receipts
             .as_ref()
@@ -443,15 +482,13 @@ impl Trajectory {
 
     pub fn reset_epoch(&mut self) {
         if let Some(receipts) = &mut self.receipts {
-            receipts.invalidate();
+            receipts.forget_history();
         }
         // Totals survive actual rebases/native summaries; cache and restoration
         // assumptions do not cross an ancestry discontinuity.
         self.previous = None;
         self.restored = 0;
-        self.retired = 0;
-        self.summary = 0;
-        self.last_traditional_input = 0;
+        self.history = TraditionalHistoryState::default();
         self.carry_edited = false;
         self.traditional_edited = false;
     }
@@ -471,6 +508,7 @@ impl Trajectory {
     pub fn projected(&mut self, before: u64, after: u64, edited: bool) {
         let restored = before as i128 - after as i128;
         if edited || self.restored != restored {
+            self.history.diverge();
             if let Some(receipts) = &mut self.receipts {
                 // Carry changed its wire, not the traditional history. The
                 // explicit edit bit preserves equal-token prefix invalidation.
@@ -487,6 +525,7 @@ impl Trajectory {
         self.reviewer_resolved(body, response, standard, None);
     }
 
+    #[cfg(test)]
     pub fn reviewer_resolved(
         &mut self,
         body: &Value,
@@ -513,6 +552,7 @@ impl Trajectory {
         self.reviewer_usage_resolved(model, input, usage, standard, None, true);
     }
 
+    #[cfg(test)]
     pub fn reviewer_usage_resolved(
         &mut self,
         model: &str,
@@ -522,8 +562,24 @@ impl Trajectory {
         resolved: Option<&ResolvedModel>,
         write_tariff_known: bool,
     ) {
+        let settled = receipts::receipt(usage)
+            .filter(|_| standard)
+            .and_then(|u| observed_cost(model, &u, resolved, write_tariff_known));
+        self.reviewer_usage_settled(model, input, usage, standard, resolved, settled);
+    }
+
+    /// Money is already frozen by the paid ledger, including delayed reviews.
+    pub fn reviewer_usage_settled(
+        &mut self,
+        model: &str,
+        input: u64,
+        usage: &Value,
+        standard: bool,
+        resolved: Option<&ResolvedModel>,
+        settled: Option<f64>,
+    ) {
         if self.receipts.is_some() {
-            self.observed_reviewer(model, usage, standard, resolved, write_tariff_known);
+            self.observed_reviewer(usage, standard, settled);
             return;
         }
         self.start_priced_subset();
@@ -573,6 +629,7 @@ impl Trajectory {
         self.primary_resolved(body, response, route, at, standard, None);
     }
 
+    #[cfg(test)]
     pub fn primary_resolved(
         &mut self,
         body: &Value,
@@ -582,10 +639,43 @@ impl Trajectory {
         standard: bool,
         resolved: Option<&ResolvedModel>,
     ) {
+        // Test callers use the same input-bound load boundary as real dispatch.
+        self.load_receipt_history(body, route, resolved, std::iter::empty());
+        let settled = receipts::receipt(&response["usage"])
+            .filter(|_| standard)
+            .and_then(|u| {
+                observed_cost(
+                    body["model"].as_str().unwrap_or(""),
+                    &u,
+                    resolved,
+                    carry::models::cache_write_tariff_known(body),
+                )
+            });
+        self.primary_settled(PrimaryObservation {
+            body,
+            response,
+            route,
+            at,
+            standard,
+            resolved,
+            cost: settled,
+        });
+    }
+
+    pub fn primary_settled(&mut self, primary: PrimaryObservation<'_>) {
         if self.receipts.is_some() {
-            self.observed_primary(body, response, route, at, standard, resolved);
+            self.observed_primary(primary);
             return;
         }
+        let PrimaryObservation {
+            body,
+            response,
+            route,
+            at,
+            standard,
+            resolved,
+            ..
+        } = primary;
         self.start_priced_subset();
         if has_native_modalities(body)
             || has_native_modalities(&response["output"])
@@ -620,8 +710,8 @@ impl Trajectory {
         }
         let traditional_input = (prompt.input as i128)
             .saturating_add(self.restored)
-            .saturating_sub(self.retired as i128)
-            .saturating_add(self.summary as i128)
+            .saturating_sub(self.history.retired as i128)
+            .saturating_add(self.history.summary as i128)
             .clamp(0, u64::MAX as i128) as u64;
         let compatible = self.previous.as_ref().is_some_and(|previous| {
             previous.model == prompt.model
@@ -643,7 +733,7 @@ impl Trajectory {
         // scenario explicitly assumes frozen-size append reuse until its summary.
         let traditional_cached =
             if compatible && (append || self.carry_edited) && !self.traditional_edited {
-                self.last_traditional_input.min(traditional_input)
+                self.history.last_traditional_input.min(traditional_input)
             } else {
                 0
             };
@@ -722,16 +812,13 @@ impl Trajectory {
             self.result.excluded_unpriced_calls += 1;
             false
         };
-        self.last_traditional_input = traditional_input;
+        self.history.last_traditional_input = traditional_input;
         self.carry_edited = false;
         self.traditional_edited = false;
         if summarize {
             self.result.traditional_compactions += 1;
-            self.retired = self
-                .retired
-                .saturating_add(discarded.saturating_sub(self.summary));
-            self.summary = self.scenario.summary;
-            self.last_traditional_input = self.scenario.keep_recent.saturating_add(self.summary);
+            self.history
+                .summarize(total, self.scenario.keep_recent, self.scenario.summary);
             self.traditional_edited = true;
         }
         // An unknown intervening primary must never leave a stale cache hit.
@@ -805,6 +892,7 @@ fn scenario_output_cost_resolved(
     }
 }
 
+#[cfg(test)]
 fn observed_cost(
     model: &str,
     usage: &Usage,
@@ -929,7 +1017,7 @@ mod tests {
                 if !crossing {
                     continue;
                 }
-                assert_eq!(trajectory.last_traditional_input, 1600);
+                assert_eq!(trajectory.history.last_traditional_input, 1600);
                 assert!(trajectory.traditional_edited);
                 let mut resumed: Trajectory =
                     serde_json::from_value(serde_json::to_value(&trajectory).unwrap()).unwrap();
@@ -942,8 +1030,8 @@ mod tests {
                     json!({"type": "function_call_output", "call_id": "call_1", "output": "ok"}),
                 );
                 let next_input = (projection(&next, "route", 101).unwrap().input as i128
-                    - resumed.retired as i128
-                    + resumed.summary as i128) as u64;
+                    - resumed.history.retired as i128
+                    + resumed.history.summary as i128) as u64;
                 let expected = scenario_input_cost("gpt-6-luna", next_input, 0, Some(1024))
                     .unwrap()
                     + crate::savings::scenario_output_cost("gpt-6-luna", next_input, 3).unwrap();
@@ -1675,7 +1763,7 @@ mod tests {
         trajectory.primary(&body, &response(100), "route", 100, true);
         let expected = projection(&body, "route", 100).unwrap().input - 10;
         assert_eq!(
-            trajectory.last_traditional_input, expected,
+            trajectory.history.last_traditional_input, expected,
             "net context growth must not inflate the traditional baseline"
         );
     }

@@ -229,5 +229,104 @@ class SimulatorTests(unittest.TestCase):
             self.assertEqual(provider.errors, ['more than four explicit WRITE slots'])
 
 
+class CacheRecordSchemaTests(unittest.TestCase):
+    """Persisted observations are not automatically reusable write proof."""
+    def setUp(self):
+        import hashlib
+        digest = lambda value: hashlib.sha256(json.dumps(value, sort_keys=True,
+            separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
+        self.body = body_for(1, 0, [])
+        length = len(self.body['input']) - 1
+        self.record = {'route': None, 'credential_sha256': 'fixture',
+            'base_sha256': digest({k: v for k, v in self.body.items() if k not in ('input', 'stream')}),
+            'input_sha256': digest(fixture.without_markers(self.body['input'][:length])),
+            'input_len': length, 'estimated_tokens': 500.0, 'at': 103,
+            'ttl_seconds': 1800, 'native_cached_fraction': 0.0}
+
+    def grade(self, record):
+        fixture.grade_cache_records([record], [self.body])
+
+    def test_legacy_raw_reads_and_optional_native_quantities_remain_observations(self):
+        for fraction in (0.0, .2, 1.0):
+            for extent in ({}, {'native_input_tokens': 10000},
+                           {'native_input_tokens': 10000, 'native_write_tokens': 0}):
+                record = dict(self.record, native_cached_fraction=fraction, **extent)
+                before = copy.deepcopy(record)
+                with self.subTest(fraction=fraction, extent=extent):
+                    self.grade(record)
+                    self.assertEqual(record, before)
+                    self.assertNotIn('write_window', record)
+
+    def test_partial_full_and_timed_writes_preserve_exact_raw_record(self):
+        for written in (1, 10000):
+            for timed in (False, True) if written == 10000 else (False,):
+                record = dict(self.record, native_input_tokens=10000, native_write_tokens=written)
+                if timed:
+                    record['write_window'] = {'not_before': 100, 'not_after': 103, 'lifetime': 1800}
+                before = copy.deepcopy(record)
+                with self.subTest(written=written, timed=timed):
+                    self.grade(record)
+                    self.assertEqual(record, before)
+
+    def test_schema_guard_rejects_extra_missing_and_invalid_numeric_fields(self):
+        required = set(self.record)
+        for key in required:
+            record = dict(self.record)
+            del record[key]
+            with self.subTest(missing=key), self.assertRaises(AssertionError):
+                self.grade(record)
+        for field in ('source', 'warm', 'native_output_tokens'):
+            with self.subTest(extra=field), self.assertRaises(AssertionError):
+                self.grade(dict(self.record, **{field: 'not part of the bounded evidence schema'}))
+        for key in ('input_len', 'at', 'ttl_seconds', 'native_input_tokens', 'native_write_tokens'):
+            for invalid in (-1, True, 1.5, '100', None, 2 ** 64):
+                record = dict(self.record, native_input_tokens=10000, native_write_tokens=0)
+                record[key] = invalid
+                with self.subTest(key=key, value=invalid), self.assertRaises(AssertionError):
+                    self.grade(record)
+        for key in ('estimated_tokens', 'native_cached_fraction'):
+            for invalid in (-1, True, '0.2', None, float('nan'), float('inf')):
+                with self.subTest(key=key, value=invalid), self.assertRaises(AssertionError):
+                    self.grade(dict(self.record, **{key: invalid}))
+        for extent in ({'native_write_tokens': 1},
+                       {'native_input_tokens': 0},
+                       {'native_input_tokens': 10000, 'native_write_tokens': 10001}):
+            with self.subTest(extent=extent), self.assertRaises(AssertionError):
+                self.grade(dict(self.record, **extent))
+
+    def test_write_window_requires_whole_uncached_extent_and_original_bounds(self):
+        record = dict(self.record, native_input_tokens=10000, native_write_tokens=10000,
+                      write_window={'not_before': 100, 'not_after': 103, 'lifetime': 1800})
+        mutations = [dict(record, native_cached_fraction=.2),
+                     dict(record, native_write_tokens=9999)]
+        for field in ('native_input_tokens', 'native_write_tokens'):
+            changed = copy.deepcopy(record)
+            del changed[field]
+            mutations.append(changed)
+        for field in ('not_before', 'not_after', 'lifetime'):
+            for invalid in (-1, True, 1.5, '100', None, 2 ** 64):
+                changed = copy.deepcopy(record)
+                changed['write_window'][field] = invalid
+                mutations.append(changed)
+            changed = copy.deepcopy(record)
+            del changed['write_window'][field]
+            mutations.append(changed)
+        for window in ({'not_before': 104, 'not_after': 103, 'lifetime': 1800},
+                       {'not_before': 100, 'not_after': 104, 'lifetime': 1800},
+                       {'not_before': 100, 'not_after': 103, 'lifetime': 7200},
+                       dict(record['write_window'], refreshed_at=103), None, [], 'write'):
+            mutations.append(dict(record, write_window=window))
+        for index, changed in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(AssertionError):
+                self.grade(changed)
+
+    def test_numeric_storage_count_and_byte_bounds_remain_enforced(self):
+        with self.assertRaises(AssertionError):
+            fixture.grade_cache_records([self.record] * 129, [self.body])
+        oversized = dict(self.record, credential_sha256='x' * 65536)
+        with self.assertRaises(AssertionError):
+            self.grade(oversized)
+
+
 if __name__ == '__main__':
     unittest.main()

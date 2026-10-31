@@ -5,8 +5,17 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Receipts {
     anchor: Option<Anchor>,
+    // Legacy decoder input only. New history has a typed quantity contract and
+    // cursor in TraditionalHistoryState, never this full-model cache digest.
+    #[serde(default)]
+    history_anchor: Option<Anchor>,
+    #[serde(default)]
+    pub(super) initialization_policy_version: Option<u32>,
+    // Legacy observation cursor only; never reinterpret its terminal time as a write.
     #[serde(default)]
     traditional_anchor: Option<Anchor>,
+    #[serde(default)]
+    modeled_cache: crate::proxy_cache::ModeledCache,
     #[serde(default)]
     pub scenario_cache_policy_version: Option<u32>,
     #[serde(default)]
@@ -19,7 +28,10 @@ impl Default for Receipts {
     fn default() -> Self {
         Self {
             anchor: None,
+            history_anchor: None,
+            initialization_policy_version: Some(1),
             traditional_anchor: None,
+            modeled_cache: crate::proxy_cache::ModeledCache::default(),
             configuration: None,
             scenario_cache_policy_version: Some(carry::models::ScenarioCachePolicy::VERSION),
             last_appended_input: None,
@@ -45,6 +57,12 @@ impl Receipts {
     pub(super) fn invalidate(&mut self) {
         self.invalidate_actual();
         self.traditional_anchor = None;
+        self.modeled_cache.clear();
+    }
+
+    pub(super) fn forget_history(&mut self) {
+        self.invalidate();
+        self.history_anchor = None;
     }
 
     pub(super) fn invalidate_actual(&mut self) {
@@ -80,43 +98,9 @@ fn append_compatible(anchor: &Anchor, body: &Value, configuration: &str) -> bool
 /// Explicit numeric partitions only. Absent optional write counts mean no
 /// reported write (Responses semantics); absent cache-read data is unknown.
 /// Reject contradictory aliases rather than clipping them into a priced call.
-fn receipt(usage: &Value) -> Option<Usage> {
-    fn partition(values: &[Option<&Value>], required: bool) -> Option<u64> {
-        let mut found = None;
-        for value in values.iter().flatten() {
-            let n = value.as_u64()?;
-            if found.is_some_and(|prior| prior != n) {
-                return None;
-            }
-            found = Some(n);
-        }
-        if required {
-            found
-        } else {
-            Some(found.unwrap_or(0))
-        }
-    }
-    let input = usage["input_tokens"].as_u64()?;
+pub(super) fn receipt(usage: &Value) -> Option<Usage> {
+    let (input, cached, written) = carry::core::CacheUsage::from_receipt(usage).partition()?;
     let output = usage["output_tokens"].as_u64()?;
-    let cached = partition(
-        &[
-            usage["input_tokens_details"].get("cached_tokens"),
-            usage.get("cached_input_tokens"),
-        ],
-        true,
-    )?;
-    let written = partition(
-        &[
-            usage["input_tokens_details"].get("cache_write_tokens"),
-            usage["input_tokens_details"].get("cache_creation_tokens"),
-            usage.get("cache_write_input_tokens"),
-            usage.get("cache_creation_input_tokens"),
-        ],
-        false,
-    )?;
-    if cached.checked_add(written)? > input {
-        return None;
-    }
     Some(Usage {
         input_tokens: input,
         output_tokens: output,
@@ -192,6 +176,62 @@ fn has_unpriced_modalities(value: &Value) -> bool {
 }
 
 impl Trajectory {
+    /// Input-bound legacy load normalization. Only the owner that has the real
+    /// adapted wire and frozen saved resolutions can prove an old opaque digest.
+    /// Called before the existing atomic paid-request reservation, never from
+    /// terminal settlement. New/typed histories do no reconstruction or scan.
+    pub(crate) fn load_receipt_history<'a>(
+        &mut self,
+        body: &Value,
+        route: &str,
+        current: Option<&'a ResolvedModel>,
+        prior: impl IntoIterator<Item = &'a ResolvedModel>,
+    ) {
+        use super::traditional::ReceiptHistoryLoad;
+        self.history.load_input_cursor(body);
+        if self.history.receipt_history_load.is_some() {
+            return;
+        }
+        if self.history.history_continuity.is_some() {
+            self.history.receipt_history_load = Some(ReceiptHistoryLoad::StructuredV1);
+            return;
+        }
+        self.history.receipt_history_load = Some(ReceiptHistoryLoad::ReadOnlyLegacyV1);
+        let Some(receipts) = &self.receipts else {
+            return;
+        };
+        let Some(anchor) = &receipts.history_anchor else {
+            return;
+        };
+        if receipts.configuration.as_ref() != Some(&anchor.configuration)
+            || receipts.initialization_policy_version != Some(1)
+            || !append_compatible(anchor, body, &anchor.configuration)
+        {
+            return;
+        }
+        let Some(current) = current else {
+            return;
+        };
+        let contract = HistoryContract::extract(body, route, Some(current), self.scenario);
+        // A bounded one-time adapter, not a growing normal-request audit scan.
+        // Exact old-contract evidence beyond this bound is unavailable, not a
+        // guessed match. Frozen monetary totals/cache events are never rewritten.
+        let proven = std::iter::once(current).chain(prior).take(64).any(|old| {
+            configuration(body, route, Some(old)) == anchor.configuration
+                && HistoryContract::extract(body, route, Some(old), self.scenario) == contract
+        });
+        if proven {
+            self.history.load_legacy_cursor(
+                contract,
+                anchor.prefix.clone(),
+                anchor.items,
+                anchor.input,
+                anchor.at,
+            );
+            self.history.load_input_cursor(body);
+        }
+    }
+
     /// Freeze old sums on the first post-upgrade request, never reprice them.
     /// The new window starts from the retained input, not an invented empty chat.
     pub fn begin_receipt_window(&mut self) {
@@ -205,6 +245,7 @@ impl Trajectory {
             ..Self::default()
         };
         self.receipts.as_mut().unwrap().legacy_estimate = Some(Box::new(legacy));
+        self.history.diverge();
     }
 
     pub fn receipt_prediction(
@@ -238,11 +279,9 @@ impl Trajectory {
 
     pub(super) fn observed_reviewer(
         &mut self,
-        model: &str,
         usage: &Value,
         standard: bool,
-        resolved: Option<&ResolvedModel>,
-        write_tariff_known: bool,
+        settled: Option<f64>,
     ) {
         self.result.coverage.reviewer_responses += 1;
         let native = receipt(usage);
@@ -254,10 +293,7 @@ impl Trajectory {
                         .as_u64()
                         .is_some_and(|n| n > 0)
                 });
-        let cost = native
-            .as_ref()
-            .filter(|_| text)
-            .and_then(|u| observed_cost(model, u, resolved, write_tariff_known));
+        let cost = native.as_ref().filter(|_| text).and(settled);
         if let Some(cost) = cost {
             self.result.observed_reviewer_cost += cost;
             self.result.reviewer_cost += cost;
@@ -277,18 +313,47 @@ impl Trajectory {
         }
     }
 
-    pub(super) fn observed_primary(
-        &mut self,
-        body: &Value,
-        response: &Value,
-        route: &str,
-        at: u64,
-        standard: bool,
-        resolved: Option<&ResolvedModel>,
-    ) {
+    pub(super) fn observed_primary(&mut self, primary: PrimaryObservation<'_>) {
+        let PrimaryObservation {
+            body,
+            response,
+            route,
+            at,
+            standard,
+            resolved,
+            cost: settled,
+        } = primary;
         if response["status"] != "completed" {
             self.failed_call();
             return;
+        }
+        if self.history.read_only_legacy() {
+            let (_, _, billable) =
+                self.record_primary_observation(body, response, standard, settled);
+            if !billable {
+                self.result.coverage.unmodeled_calls += 1;
+            }
+            self.result.excluded_unpriced_calls += 1;
+            return;
+        }
+        if self
+            .receipts
+            .as_ref()
+            .unwrap()
+            .initialization_policy_version
+            != Some(1)
+        {
+            // The legacy window is an immutable cumulative boundary, not an
+            // additive ledger. Begin only future comparisons with the new rule.
+            let prior = self.snapshot();
+            if prior.coverage.primary_responses > 0 || prior.coverage.reviewer_responses > 0 {
+                self.result.legacy_initialization_segment = Some(CachePolicySegment::from(&prior));
+            }
+            self.reset_receipt_epoch();
+            self.receipts
+                .as_mut()
+                .unwrap()
+                .initialization_policy_version = Some(1);
         }
         let policy_version = resolved
             .map_or(Some(carry::models::ScenarioCachePolicy::VERSION), |r| {
@@ -299,10 +364,10 @@ impl Trajectory {
             .as_ref()
             .unwrap()
             .scenario_cache_policy_version;
-        if previous_version != policy_version {
-            // Freeze cumulative provenance before ANY version transition, not
-            // just missing -> present. Never replay, reset money or overwrite
-            // earlier boundaries. The next comparison starts cold.
+        let cache_policy_changed = previous_version != policy_version;
+        if cache_policy_changed {
+            // Freeze cumulative provenance before ANY version transition. Cache
+            // becomes cold, but ancestry checks still own summary invalidation.
             let prior = self.snapshot();
             if prior.coverage.primary_responses > 0 || prior.coverage.reviewer_responses > 0 {
                 let cumulative = CachePolicySegment::from(&prior);
@@ -321,45 +386,26 @@ impl Trajectory {
                         cumulative,
                     });
             }
-            self.reset_receipt_epoch();
             self.receipts
                 .as_mut()
                 .unwrap()
                 .scenario_cache_policy_version = policy_version;
         }
-        self.result.coverage.primary_responses += 1;
-        let native = receipt(&response["usage"]);
         let model = body["model"].as_str().unwrap_or("");
         let projection = crate::savings::prompt_projection(body);
-        let billable = standard
-            && !has_unpriced_modalities(body)
-            && !has_native_modalities(&response["output"])
-            && !["input_tokens_details", "output_tokens_details"]
-                .iter()
-                .any(|f| {
-                    response["usage"][*f]["audio_tokens"]
-                        .as_u64()
-                        .is_some_and(|n| n > 0)
-                });
-        let observed = native.as_ref().filter(|_| billable).and_then(|u| {
-            observed_cost(
-                model,
-                u,
-                resolved,
-                carry::models::cache_write_tariff_known(body),
-            )
-        });
-        if let Some(cost) = observed {
-            self.result.observed_primary_cost += cost;
-        } else {
-            self.result.unavailable_primary_cost_calls += 1;
-            if native.is_none() {
-                self.result.coverage.missing_usage += 1;
-            } else if billable {
-                self.result.coverage.unknown_rate_calls += 1;
-            }
-        }
+        let (native, observed, billable) =
+            self.record_primary_observation(body, response, standard, settled);
         let retained_output = retained_output_tokens(&response["output"]);
+        let allowance = carry::models::output_allowance(
+            body["max_output_tokens"].as_u64(),
+            resolved.map_or(self.scenario.reserve, |r| {
+                u64::from(r.ordinary.output_reserve)
+            }),
+        );
+        let budget = self.scenario.initial_input_budget(
+            allowance,
+            resolved.and_then(|r| r.capacity_tokens.map(u64::from)),
+        );
         // An unchanged image-bearing request can share its exact receipt total
         // between both branches. A projected/restored/summary slice cannot use
         // base64 length or an invented per-image allocation as native tokens.
@@ -367,15 +413,16 @@ impl Trajectory {
         let image_comparable = !image_input
             || (!self.carry_edited
                 && self.restored == 0
-                && self.retired == 0
-                && self.summary == 0
+                && self.history.retired == 0
+                && self.history.summary == 0
                 && native
                     .as_ref()
                     .zip(retained_output)
                     .is_some_and(|(u, retained)| {
                         !self.scenario.valid()
-                            || u.input_tokens.saturating_add(retained)
-                                <= self.scenario.context_window - self.scenario.reserve
+                            || (u.input_tokens <= budget
+                                && u.input_tokens.saturating_add(retained)
+                                    <= self.scenario.context_window - self.scenario.reserve)
                     }));
         if !billable || !image_comparable || retained_output.is_none() {
             self.result.coverage.unmodeled_calls += 1;
@@ -383,43 +430,42 @@ impl Trajectory {
             self.reset_epoch();
             return;
         }
-        let (Some(native), Some(carry), Some((_, _, local)), Some(items), Some(retained_output)) = (
+        let (
+            Some(native),
+            Some((_, _, local)),
+            Some(items),
+            Some(retained_output),
+            Some(protected),
+        ) = (
             native,
-            observed,
             projection,
             body["input"].as_array(),
             retained_output,
-        ) else {
+            crate::savings::protected_prompt_tokens(body),
+        )
+        else {
             self.result.excluded_unpriced_calls += 1;
             self.reset_epoch();
             return;
         };
         let config = configuration(body, route, resolved);
-        if self
-            .receipts
-            .as_ref()
-            .unwrap()
-            .configuration
-            .as_ref()
-            .is_some_and(|prior| prior != &config)
-        {
-            self.reset_receipt_epoch();
-        }
+        let contract = HistoryContract::extract(body, route, resolved, self.scenario);
         self.receipts.as_mut().unwrap().configuration = Some(config.clone());
         let previous = self.receipts.as_ref().unwrap().anchor.clone();
-        let traditional_previous = self.receipts.as_ref().unwrap().traditional_anchor.clone();
+
+        let continuity =
+            self.history
+                .compatible(&contract, body, native.input_tokens, at, self.carry_edited);
+
         let compatible = previous.as_ref().is_some_and(|a| {
             append_compatible(a, body, &config)
                 && at >= a.at
                 && native.input_tokens >= a.input
                 && (items.len() > a.items || native.input_tokens == a.input)
         });
-        let traditional_compatible = traditional_previous.as_ref().is_some_and(|a| {
-            a.configuration == config && at >= a.at && (self.carry_edited || compatible)
-        });
-        if (previous.is_some() && !compatible && !self.carry_edited)
-            || (traditional_previous.is_some() && !traditional_compatible)
-        {
+
+        let history_compatible = continuity.unwrap_or(false);
+        if continuity.is_some() && !history_compatible {
             // Rewind, edit, configuration switch or negative total-input delta:
             // invalidate historical assumptions, not the current projection.
             self.reset_receipt_epoch();
@@ -428,11 +474,25 @@ impl Trajectory {
             .as_ref()
             .filter(|_| compatible)
             .map(|a| native.input_tokens - a.input);
-        let traditional = (native.input_tokens as i128)
-            .saturating_add(self.restored)
-            .saturating_sub(self.retired as i128)
-            .saturating_add(self.summary as i128)
-            .clamp(0, u64::MAX as i128) as u64;
+        let mut traditional = self.history.input(native.input_tokens, self.restored);
+
+        let fixed = projection_fixed_tokens(body);
+        let kept = self.scenario.keep_recent.max(fixed);
+        let mut initialized_now = false;
+        if self.scenario.valid() && !history_compatible && traditional > budget {
+            let initial_kept = kept.max(protected);
+            let initialized = initial_kept.saturating_add(self.scenario.summary);
+            if initialized > budget || initialized >= traditional {
+                self.result.excluded_unpriced_calls += 1;
+                self.reset_epoch();
+                return;
+            }
+            self.history
+                .summarize(traditional, initial_kept, self.scenario.summary);
+            traditional = initialized;
+            self.traditional_edited = true;
+            initialized_now = true;
+        }
 
         // The alternative models an API-equivalent policy, not this route's
         // ability to request an explicit breakpoint or promise a future hit.
@@ -456,23 +516,37 @@ impl Trajectory {
         let ttl = resolved
             .and_then(|r| r.scenario_cache_policy.as_ref())
             .map_or(1800, |p| p.ttl_seconds);
-        let warm = traditional_previous
-            .as_ref()
-            .is_some_and(|a| traditional_compatible && at - a.at < ttl)
-            && !self.traditional_edited;
-        // The alternative shares total-input units, never observed cache hits:
-        // cache behavior is a conditional append-prefix scenario even before
-        // the first hypothetical edit. The first request of an epoch is cold.
-        let traditional_cost = {
+        // Typed history continuity owns append/projection compatibility. The
+        // shared cache owner, not raw request settings, owns its namespace.
+        let cache_scope =
+            crate::proxy_cache::modeled_scope(body, model, (route, resolved.map(|r| &r.route)));
+        let mode = request_cache_mode(body, model, resolved);
+        let cache = &mut self.receipts.as_mut().unwrap().modeled_cache;
+        if cache_policy_changed || self.traditional_edited {
+            cache.clear();
+        }
+        let cached = if mode == carry::models::ScenarioCacheMode::Implicit {
+            cache
+                .eligible_at(&cache_scope, at, traditional)
+                .map(|prefix| {
+                    if minimum.is_some_and(|min| prefix >= min) {
+                        prefix
+                    } else {
+                        0
+                    }
+                })
+        } else {
+            Some(0)
+        };
+        // Identical execution has one paid contribution. Only a genuinely
+        // different history asks the cache/tariff forecast a hypothetical price.
+        // Sharing the money does NOT seed divergent cache history with real hits.
+        let pair = self.history.price_primary(observed, || {
             scenario_request_input_cost_resolved(
                 body,
                 model,
                 traditional,
-                if warm {
-                    self.last_traditional_input.min(traditional)
-                } else {
-                    0
-                },
+                cached?,
                 minimum,
                 resolved,
             )
@@ -487,13 +561,13 @@ impl Trajectory {
                         )?,
                 )
             })
-        };
+        });
         // Only the explicit semantic projection can enter this estimate;
         // opaque transport size and billed output are not retained input units.
         let total = traditional.saturating_add(retained_output);
         let summarize =
             self.scenario.valid() && total > self.scenario.context_window - self.scenario.reserve;
-        let discarded = total.saturating_sub(self.scenario.keep_recent);
+        let discarded = total.saturating_sub(kept);
         let summary_cost = if summarize {
             modeled_cost(
                 model,
@@ -507,28 +581,40 @@ impl Trajectory {
         } else {
             Some(0.0)
         };
-        if let (Some(traditional_cost), Some(summary_cost)) = (traditional_cost, summary_cost) {
+        // Quantity/projection transitions belong to history, not monetary-pair
+        // admission. An unavailable tariff excludes money without losing the
+        // successful native cursor or granting another free initialization.
+        self.result.initial_compactions += u64::from(initialized_now);
+        if let (Some((carry, traditional_cost)), Some(summary_cost)) = (pair, summary_cost) {
             self.result.carry_cost += carry;
             self.result.traditional_cost += traditional_cost + summary_cost;
             self.result.summary_cost += summary_cost;
             *self.priced_primary_responses.as_mut().unwrap() += 1;
         } else {
             self.result.excluded_unpriced_calls += 1;
-            self.reset_epoch();
-            return;
+            if cached.is_none() {
+                self.result.coverage.unknown_cache_requests += 1;
+            }
         }
-        self.last_traditional_input = traditional;
+        self.history.last_traditional_input = traditional;
+        let cache = &mut self.receipts.as_mut().unwrap().modeled_cache;
+        if mode == carry::models::ScenarioCacheMode::Implicit
+            && minimum.is_some_and(|min| traditional >= min)
+        {
+            cache.written(cache_scope, at, ttl, traditional);
+        } else {
+            cache.clear();
+        }
         self.carry_edited = false;
         self.traditional_edited = false;
         if summarize {
             self.result.traditional_compactions += 1;
-            self.retired = self
-                .retired
-                .saturating_add(discarded.saturating_sub(self.summary));
-            self.summary = self.scenario.summary;
-            self.last_traditional_input = self.scenario.keep_recent.saturating_add(self.summary);
+            self.history.summarize(total, kept, self.scenario.summary);
             self.traditional_edited = true;
+            self.receipts.as_mut().unwrap().modeled_cache.clear();
         }
+        self.history
+            .observe(contract, items, native.input_tokens, at);
         let anchor = Anchor {
             configuration: config,
             prefix: digest(items),
@@ -538,7 +624,46 @@ impl Trajectory {
             at,
         };
         let receipts = self.receipts.as_mut().unwrap();
-        receipts.anchor = Some(anchor.clone());
-        receipts.traditional_anchor = Some(anchor);
+        receipts.anchor = Some(anchor);
+        receipts.traditional_anchor = None;
+        receipts.history_anchor = None;
     }
+
+    fn record_primary_observation(
+        &mut self,
+        body: &Value,
+        response: &Value,
+        standard: bool,
+        settled: Option<f64>,
+    ) -> (Option<Usage>, Option<f64>, bool) {
+        self.result.coverage.primary_responses += 1;
+        let native = receipt(&response["usage"]);
+        let billable = standard
+            && !has_unpriced_modalities(body)
+            && !has_native_modalities(&response["output"])
+            && !["input_tokens_details", "output_tokens_details"]
+                .iter()
+                .any(|f| {
+                    response["usage"][*f]["audio_tokens"]
+                        .as_u64()
+                        .is_some_and(|n| n > 0)
+                });
+        let observed = native.as_ref().filter(|_| billable).and(settled);
+        if let Some(cost) = observed {
+            self.result.observed_primary_cost += cost;
+        } else {
+            self.result.unavailable_primary_cost_calls += 1;
+            if native.is_none() {
+                self.result.coverage.missing_usage += 1;
+            } else if billable {
+                self.result.coverage.unknown_rate_calls += 1;
+            }
+        }
+        (native, observed, billable)
+    }
+}
+
+fn projection_fixed_tokens(body: &Value) -> u64 {
+    // The receipt boundary has already validated the input array.
+    crate::savings::fixed_prompt_tokens(body).unwrap()
 }

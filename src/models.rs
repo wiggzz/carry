@@ -340,6 +340,12 @@ pub struct Provenance {
     pub operator_override: Option<u32>,
 }
 
+/// Explicit client caps override configured feasibility reserves, including zero.
+/// This allowance is not expected or billable generated output.
+pub fn output_allowance(requested: Option<u64>, configured_reserve: u64) -> u64 {
+    requested.unwrap_or(configured_reserve)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OrdinaryPolicy {
     pub derivation: String,

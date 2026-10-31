@@ -108,7 +108,7 @@ atomic old/new generations and diagnostic mirrors also occupy storage.
 
 ## Intentional fresh-state boundary
 
-This unmerged redesign uses `carry-prefix-history-v3` and session version 3.
+This unmerged redesign uses `carry-prefix-history-v4` and session version 3.
 Use a **new empty state directory** when adopting it. No legacy checkpoint loader,
 migration, fork-point API, permanent selection, retired-member map, reviewer replay
 or keep-lease compatibility is provided. No live directory is migrated or wiped

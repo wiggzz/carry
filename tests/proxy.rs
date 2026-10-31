@@ -285,6 +285,28 @@ fn pr144_review_behavior_regressions() {
     );
 }
 
+// Identical-history primary money must be shared, never independently forecast.
+// This executes the portable loopback matrix with this source's native binary.
+#[test]
+fn no_op_receipt_parity_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_noop_parity.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute source-bound no-op receipt parity controls");
+    assert!(
+        output.status.success(),
+        "NO_OP_RECEIPT_PARITY HTTP controls failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // Issue188 tests-first accounting reproduction. Keep RED visible until the
 // route-specific write contract and immutable policy migration are implemented.
 #[test]
@@ -324,6 +346,131 @@ fn cache_policy188_migration_http_regressions() {
     assert!(
         output.status.success(),
         "CACHE_POLICY_188 HTTP controls failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// Issue186 tests-first native executable acceptance, intentionally RED until
+// unknown-history initialization is implemented. Never run against a live proxy.
+#[test]
+fn initialization186_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_initialization_regressions.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute source-bound initialization controls");
+    assert!(
+        output.status.success(),
+        "INITIALIZATION_186 HTTP controls failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// Real owner routing: a cache TTL change cannot erase summarized quantities or
+// grant another initialization. Explicit and implicit controls restart each call.
+#[test]
+fn cache_ttl_session_history_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_session_history.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute source-bound Session TTL history controls");
+    assert!(
+        output.status.success(),
+        "SESSION_TTL_HISTORY HTTP controls failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// Real Session/file and canonical-index load acceptance is separate from the
+// Trajectory decoder probes. Older shapes have no modeled write events.
+#[test]
+fn legacy_history_session_load_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_legacy_history.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute source-bound legacy Session load controls");
+    assert!(
+        output.status.success(),
+        "LEGACY_SESSION_HISTORY HTTP controls failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// The subscription adapter can remove options/fold instructions. Legacy proof
+// must be bound to that actual wire, not the pre-adaptation request (5718422718).
+#[test]
+fn legacy_history_adapted_wire_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_legacy_adapter.py"
+        ))
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute source-bound legacy adapted-wire controls");
+    assert!(
+        output.status.success(),
+        "LEGACY_ADAPTED_WIRE HTTP controls failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn cache_partition_aliases_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_cache_partitions.py"
+        ))
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute actual cache-partition alias controls");
+    assert!(
+        output.status.success(),
+        "CACHE_PARTITION_PRODUCER HTTP controls failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn observed_write_transport_bounds_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_observed_writes.py"
+        ))
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute real observed-write producer controls");
+    assert!(
+        output.status.success(),
+        "OBSERVED_WRITE_PRODUCER HTTP controls failed:\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

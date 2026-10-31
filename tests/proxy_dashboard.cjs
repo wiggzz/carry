@@ -34,8 +34,7 @@ const document = {
       const found = find(root);
       if (found) return found;
     }
-    if (!elements.has(id)) elements.set(id, element());
-    return elements.get(id);
+    return elements.get(id) || null;
   },
   createElement: element,
 };
@@ -60,6 +59,11 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 const html = fs.readFileSync('src/proxy_dashboard.html', 'utf8');
+// Only delivered IDs exist; absent selectors must not invent fixture nodes.
+for (const match of html.matchAll(/\bid="([^"]+)"/g)) {
+  const node = element(); node.id = match[1]; elements.set(node.id, node);
+}
+assert.equal(document.getElementById('absent-fixture-node'), null);
 vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], sandbox);
 const cards = () => new Map([...elements.get('cards').children,...elements.get('cost-cards').children].map(card => card.children.map(item => item.textContent)));
 (async () => {
@@ -529,5 +533,33 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     assert.ok(!/reviewer cleanups/.test(walk(elements.get('sessions')).map(n=>n.textContent).join('\n')));
     console.log('private frozen producer smoke: ok (contents not logged)');
   }
+  // Initial summaries are a disclosed counterfactual, not paid in-window work.
+  const initializationMoney = cards().get('Estimated difference');
+  data.sessions = [session(1, 2)];
+  Object.assign(data.sessions[0].cost_estimate, {
+    initialization_policy:'unrecognized_history_free_pre_window_v1',
+    initial_compactions:3, traditional_compactions:2,
+  });
+  await vm.runInContext('refresh()', sandbox);
+  const initialization = () => byClass(firstSession(), 'initialization-assumption');
+  assert.ok(initialization(), 'render the backend initialization assumption');
+  assert.match(initialization().textContent, /3 free pre.window.*2 charged in.window/i);
+  assert.match(initialization().textContent, /assum.*not.*actual.*history/i);
+  assert.equal(cards().get('Estimated difference'), initializationMoney, 'disclosure does not recalculate backend money');
+  data.sessions[0].cost_estimate.initial_compactions=0;
+  await vm.runInContext('refresh()', sandbox);
+  assert.match(initialization().textContent, /0 free pre.window/, 'explicit zero remains known');
+  data.sessions[0].cost_estimate.initialization_policy='mixed_legacy_and_free_pre_window_v1';
+  data.sessions[0].cost_estimate.legacy_initialization_segment={traditional_cost:5};
+  await vm.runInContext('refresh()', sandbox);
+  assert.match(initialization().textContent, /legacy.*retained.*not repriced/i);
+  data.sessions[0].cost_estimate = {...data.sessions[0].cost_estimate,
+    savings:null, traditional_cost:null, carry_cost:null};
+  await vm.runInContext('refresh()', sandbox);
+  assert.match(initialization().textContent, /0 free pre.window/, 'known assumptions survive unavailable current comparison');
+  delete data.sessions[0].cost_estimate.initial_compactions;
+  delete data.sessions[0].cost_estimate.initialization_policy;
+  await vm.runInContext('refresh()', sandbox);
+  assert.ok(!initialization(), 'missing legacy metadata cannot invent zero initial summaries');
   console.log('proxy dashboard scenarios: ok');
 })().catch(error => { console.error(error); process.exitCode = 1; });

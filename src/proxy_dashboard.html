@@ -264,6 +264,10 @@ async function refresh(){
    const saved=document.createElement('p');saved.className='session-savings';saved.textContent='Estimated difference: '+savingsText(e)+(e?.savings<0?' · higher cost with Carry':'');
    const identity=document.createElement('div');identity.className='session-identity';identity.append(heading,status,requests);el.append(identity,saved);
    const costs=document.createElement('p');costs.className='session-costs';costs.textContent='With Carry '+money(e?.carry_cost)+' · Traditional '+money(e?.traditional_cost);el.append(costs);
+   if(e?.initial_compactions!=null&&['unrecognized_history_free_pre_window_v1','mixed_legacy_and_free_pre_window_v1'].includes(e.initialization_policy)){
+    const initial=document.createElement('p');initial.className='initialization-assumption';
+    initial.textContent='Traditional initialization assumption: '+fmt(e.initial_compactions)+' free pre-window summaries'+(e.traditional_compactions!=null?' · '+fmt(e.traditional_compactions)+' charged in-window summaries':'')+'. Assumed compaction before comparison, not the client’s actual past history.'+(e.initialization_policy==='mixed_legacy_and_free_pre_window_v1'?' Legacy monetary totals retained unchanged, not repriced.':'');el.append(initial);
+   }
    const meta=document.createElement('p');meta.className='session-meta';meta.textContent=sessionMeta(s);meta.title='Role reported by the client, not inferred from the title. Unknown roles stay unclassified.';identity.append(meta);
    if(issues.length){const warning=document.createElement('p');warning.className='diagnostics';warning.textContent=issues.join(' ');el.append(warning)}
    const details=disclosure('session:'+s.id,'Details','session-details');

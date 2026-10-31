@@ -508,9 +508,16 @@ fn generic_wire_cache_has_no_purpose_and_requires_exact_actual_namespace() {
     .with_scenario_cache_policy();
     let reviewer = primary.clone();
     let body = json!({"model":"gpt-6-luna","instructions":"direction","prompt_cache_key":"affinity","input":[{"role":"user","content":"data ".repeat(4000)}]});
-    let usage = json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":9000}});
+    let usage = json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":10000}});
     let mut cache = Vec::new();
-    crate::proxy_cache::observe(&mut cache, &body, &usage, Some(&reviewer), "same-auth", 100);
+    crate::proxy_cache::observe(
+        &mut cache,
+        &body,
+        &usage,
+        Some(&reviewer),
+        "same-auth",
+        crate::proxy_cache::ObservationTime::during(100, 100),
+    );
     let lookup = |body: &Value, r: &ResolvedModel, key: &str, at| {
         crate::proxy_cache::reusable(&cache, body, Some(r), key, at)
     };
@@ -548,7 +555,7 @@ fn generic_wire_cache_has_no_purpose_and_requires_exact_actual_namespace() {
         &Value::Null,
         Some(&primary),
         "same-auth",
-        100,
+        100u64.into(),
     );
     assert!(unknown.is_empty());
     crate::proxy_cache::observe(
@@ -557,7 +564,7 @@ fn generic_wire_cache_has_no_purpose_and_requires_exact_actual_namespace() {
         &json!({"input_tokens":100,"input_tokens_details":{"cached_tokens":0}}),
         Some(&primary),
         "same-auth",
-        100,
+        100u64.into(),
     );
     assert_eq!(
         crate::proxy_cache::reusable(&unknown, &body, Some(&primary), "same-auth", 101),
@@ -668,13 +675,20 @@ fn explicit_review_cache_boundary_excludes_current_ledger_and_preserves_native_s
     .unwrap()
     .with_scenario_cache_policy();
     let mut cache = Vec::new();
+    // A full native write of this explicitly bounded request proves the stable
+    // local prefix. Aggregate partial read counts on the larger request do not.
+    let mut written_prefix = body.clone();
+    written_prefix["input"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(boundaries[0]);
     crate::proxy_cache::observe(
         &mut cache,
-        &body,
-        &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":9000}}),
+        &written_prefix,
+        &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":10000}}),
         Some(&model),
         "same-auth",
-        100,
+        crate::proxy_cache::ObservationTime::during(100, 100),
     );
     assert!(
         crate::proxy_cache::reusable(&cache, &changed, Some(&model), "same-auth", 101) > 0.0,
