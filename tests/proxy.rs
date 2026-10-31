@@ -396,6 +396,30 @@ fn cache_policy188_migration_http_regressions() {
     );
 }
 
+// Native removal economics cannot borrow unlocated/default cache coverage.
+#[test]
+fn native_cache_proof_http_regression() {
+    let evidence = tempfile::tempdir().unwrap();
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/native_cache_proof.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .env("CARRY_TEST_EVIDENCE_DIR", evidence.path())
+        .output()
+        .expect("Python 3 must execute native cache-proof controls");
+    std::io::Write::write_all(&mut std::io::stdout(), &output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "NATIVE_CACHE_PROOF failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // Actual native JSON/SSE and report must consume the same raw partition facts.
 #[test]
 fn native_receipt_partitions_and_report_regression() {

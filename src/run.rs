@@ -23,10 +23,7 @@ use crate::{
     },
     log::RunLogger,
     mcp,
-    openai::{
-        ModelProgress, ModelReply, OpenAiClient, PromptCacheCapabilities, Usage,
-        prompt_cache_capabilities,
-    },
+    openai::{ModelProgress, ModelReply, OpenAiClient, PromptCacheCapabilities, Usage},
     protocol::{ActionKind, Step},
 };
 
@@ -352,6 +349,14 @@ impl CacheTracker {
     }
 
     fn observe(&mut self, usage: &Usage) {
+        // Receipts retain their native quantities/money, but cannot attest to
+        // cache entitlement on an unknown gateway or subscription transport.
+        let Some(capabilities) = self.capabilities else {
+            self.pending.clear();
+            self.pending_request_tokens = 0;
+            self.pending_history.clear();
+            return;
+        };
         let now = Instant::now();
         let cache_activity = usage.cached_input_tokens > 0 || usage.cache_write_input_tokens > 0;
         let estimated_cache_write = self
@@ -362,12 +367,6 @@ impl CacheTracker {
             self.implicit_cached_tokens = self.pending_request_tokens;
             self.implicit_prefix.clone_from(&self.pending_history);
         }
-        let Some(capabilities) = self.capabilities else {
-            self.pending.clear();
-            self.pending_request_tokens = 0;
-            self.pending_history.clear();
-            return;
-        };
         let readable = self
             .pending
             .iter()
@@ -530,14 +529,6 @@ impl Backend {
         }
     }
 
-    fn implicit_cache_minimum_prefix_tokens(&self, model: &str) -> Option<usize> {
-        match self {
-            Self::OpenAi(_) => prompt_cache_capabilities(model)
-                .map(|capabilities| capabilities.minimum_prefix_tokens),
-            Self::Scripted { .. } => None,
-        }
-    }
-
     fn request_body(
         &self,
         system_prompt: &str,
@@ -655,7 +646,7 @@ async fn run_loop(
     let system_prompt = system_prompt(&mcp_servers);
     let prompt_cache_capabilities = backend.prompt_cache_capabilities();
     let implicit_cache_minimum_prefix_tokens =
-        backend.implicit_cache_minimum_prefix_tokens(&config.model);
+        prompt_cache_capabilities.map(|capabilities| capabilities.minimum_prefix_tokens);
     tokio::fs::create_dir_all(config.session_dir.join("tools")).await?;
     let patch_baseline = capture_patch_baseline(&config).await?;
     let resumed = config.resume_context.is_some();
@@ -1956,7 +1947,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_reported_implicit_cache_is_tracked_without_explicit_capabilities() {
+    fn provider_reported_usage_does_not_attest_unknown_route_cache_entitlement() {
         let mut cache = CacheTracker::new(None);
         cache.begin_request_with_tokens(
             vec![RenderedBreakpoint {
@@ -1971,7 +1962,7 @@ mod tests {
         });
 
         let policy = cache.policy();
-        assert_eq!(policy.implicit_cached_tokens, 4_000);
+        assert_eq!(policy.implicit_cached_tokens, 0);
         assert!(policy.breakpoints.is_empty());
     }
 
@@ -2157,12 +2148,12 @@ mod tests {
     }
 
     #[test]
-    fn known_implicit_cache_estimates_an_unreported_write() {
+    fn model_minimum_alone_cannot_attest_an_unreported_unknown_route_write() {
         let mut cache = CacheTracker::new_with_implicit_minimum(None, Some(1_024));
         cache.begin_request_with_tokens(Vec::new(), 2_400);
         cache.observe(&Usage::default());
 
-        assert_eq!(cache.policy().implicit_cached_tokens, 2_400);
+        assert_eq!(cache.policy().implicit_cached_tokens, 0);
         assert!(cache.policy().breakpoints.is_empty());
     }
 

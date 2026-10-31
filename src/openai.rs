@@ -23,6 +23,7 @@ static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) use carry::models::PromptCacheCapabilities;
 
+#[cfg(test)]
 pub(crate) fn prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabilities> {
     carry::models::model_spec(model)?.cache
 }
@@ -278,10 +279,21 @@ impl OpenAiClient {
     }
 
     pub(crate) fn prompt_cache_capabilities(&self) -> Option<PromptCacheCapabilities> {
-        match self.auth {
-            RequestAuth::ApiKey(_) => prompt_cache_capabilities(&self.model),
-            RequestAuth::CodexSubscription { .. } => None,
-        }
+        // Native runs use the same exact destination/auth entitlement boundary
+        // as proxy dispatch. A familiar slug behind a gateway is not proof.
+        carry::models::resolve_model(
+            &self.model,
+            carry::models::Route::new(
+                &format!("{}/responses", self.api_base),
+                matches!(self.auth, RequestAuth::CodexSubscription { .. }),
+            ),
+            None,
+            None,
+            0,
+            0,
+        )
+        .ok()?
+        .cache
     }
 
     pub fn request_body(&self, system: &str, history: &[Value]) -> Value {
@@ -1144,6 +1156,41 @@ mod tests {
     #[test]
     fn astra_is_explicitly_recognized() {
         assert!(prompt_cache_capabilities("gpt-5.6-astra").is_some());
+    }
+
+    #[test]
+    fn native_cache_capabilities_require_the_resolved_destination_and_auth() {
+        for (base, model, known) in [
+            ("https://api.openai.com/v1", "gpt-6-sol", true),
+            ("https://api.openai.com/v1/", "gpt-6-sol", true),
+            ("https://api.openai.com/v1", "custom-model", false),
+            ("http://127.0.0.1:12345/v1", "gpt-6-sol", false),
+            ("https://gateway.invalid/v1", "gpt-6-sol", false),
+            ("https://api.openai.com/v1/alternate", "gpt-6-sol", false),
+        ] {
+            let client = OpenAiClient::new(
+                base.into(),
+                "synthetic-only".into(),
+                model.into(),
+                "medium".into(),
+            );
+            assert_eq!(
+                client.prompt_cache_capabilities().is_some(),
+                known,
+                "{base} {model}"
+            );
+        }
+        let client = OpenAiClient::new_with_auth(
+            "https://api.openai.com/v1".into(),
+            RequestAuth::CodexSubscription {
+                access_token: "synthetic-only".into(),
+                account_id: "synthetic-only".into(),
+                credential_home: None,
+            },
+            "gpt-6-sol".into(),
+            "medium".into(),
+        );
+        assert!(client.prompt_cache_capabilities().is_none());
     }
 
     #[test]
