@@ -91,5 +91,24 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(result[1], 124)
 
 
+    def test_timeout_kills_descendants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'tests').mkdir()
+            # The descendant inherits stdout. Killing only its parent would
+            # leave communicate() waiting and expose this survival marker.
+            (root / 'tests' / 'fixture.py').write_text(
+                'import subprocess, sys, time\n'
+                'subprocess.Popen([sys.executable, "-c", '
+                '\'import time; time.sleep(1); print("descendant survived", flush=True)\'])\n'
+                'print("descendant spawned", flush=True)\n'
+                'time.sleep(30)\n')
+            with patch.object(runner, 'ROOT', root):
+                result = runner.run_case('fixture.Case.test', '/built/carry', timeout=0.5)
+            self.assertEqual(result[1], 124)
+            self.assertIn('descendant spawned', result[3])
+            self.assertNotIn('descendant survived', result[3])
+
+
 if __name__ == '__main__':
     unittest.main()
