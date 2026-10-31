@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.17.0](https://github.com/wiggzz/carry/compare/v0.16.1...v0.17.0) (2026-10-31)
+
+
+### Features
+
+* simplify setup with a native installer and concise README ([#205](https://github.com/wiggzz/carry/issues/205)) ([ae06226](https://github.com/wiggzz/carry/commit/ae062262280c34076c9ea469d9c66dba39c56e2b))
+
+
+### Bug Fixes
+
+* **proxy:** pass through unknown models without review or pricing ([#204](https://github.com/wiggzz/carry/issues/204)) ([c3d5530](https://github.com/wiggzz/carry/commit/c3d55308e5e170100158aa9ce4ebdf21024d4a9a))
+
 ## [0.16.1](https://github.com/wiggzz/carry/compare/v0.16.0...v0.16.1) (2026-10-31)
 
 
