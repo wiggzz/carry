@@ -449,6 +449,8 @@ pub(super) fn trim(cache: &mut Vec<CacheEvidence>, at: u64) {
 mod tests {
     use super::*;
 
+    include!("proxy_cache_partition_tests.rs");
+
     // Existing exact-credit controls must remain known, never accept None as0.
     fn eligible(cache: &ModeledCache, scope: &str, at: u64, input: u64) -> u64 {
         cache
