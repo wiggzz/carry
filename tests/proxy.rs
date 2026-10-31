@@ -418,6 +418,28 @@ fn initialization186_http_regressions() {
     );
 }
 
+// Real owner routing: a cache TTL change cannot erase summarized quantities or
+// grant another initialization. Explicit and implicit controls restart each call.
+#[test]
+fn cache_ttl_session_history_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_session_history.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute source-bound Session TTL history controls");
+    assert!(
+        output.status.success(),
+        "SESSION_TTL_HISTORY HTTP controls failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // Real Session/file and canonical-index load acceptance is separate from the
 // Trajectory decoder probes. Older shapes have no modeled write events.
 #[test]
