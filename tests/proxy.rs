@@ -3512,6 +3512,64 @@ async fn reviewer_transport_preserves_encrypted_reasoning_and_native_tool_pairs(
 }
 
 #[tokio::test]
+async fn unknown_models_pass_through_without_context_or_pricing() {
+    for mode in ["compact", "audit"] {
+        for capacity in [None, Some("1024")] {
+            let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
+            let state = tempfile::tempdir().unwrap();
+            let mut options = vec!["--review-replayed-history"];
+            if let Some(capacity) = capacity {
+                options.extend(["--primary-context-tokens", capacity]);
+            }
+            let (_proxy, url) =
+                start_proxy_options(state.path(), fixture.address, mode, &options, "").await;
+            let request = json!({
+                "model":"codex-auto-review",
+                "input":[
+                    {"role":"user","content":"previous task"},
+                    {"role":"assistant","content":"historical output ".repeat(2000)},
+                    {"role":"user","content":"review this action"}
+                ],
+                "client_metadata":{"thread_source":"guardian_review"},
+                "max_output_tokens":2048,
+                "instructions":"client instructions",
+                "tools":[], "store":false, "prompt_cache_key":"approval-review"
+            });
+            // Both implicit native-client identity and explicit sessions must work.
+            for explicit in [false, true] {
+                let mut call = reqwest::Client::new()
+                    .post(format!("{url}/v1/responses"))
+                    .json(&request);
+                if explicit {
+                    call = call.header("x-carry-session", "unknown-explicit");
+                }
+                let response = call.send().await.unwrap();
+                let status = response.status();
+                let body = response.text().await.unwrap();
+                assert!(status.is_success(), "{mode} {capacity:?}: {status} {body}");
+                assert_eq!(fixture.requests.lock().await.last(), Some(&request));
+            }
+            let saved = settled(state.path()).await;
+            assert_eq!(saved.len(), 2);
+            for session in saved {
+                assert_eq!(session["primary"]["calls"], 1);
+                assert_eq!(session["primary"]["unavailable_cost_calls"], 1);
+                assert_eq!(session["shadow"]["calls"], 0);
+                assert_eq!(session["compactions"], 0);
+                assert!(session["model_resolution"]["primary"]["rates"].is_null());
+                assert_eq!(
+                    session["model_resolution"]["primary"]["capacity_tokens"],
+                    capacity
+                        .map(|_| json!(1024))
+                        .unwrap_or(serde_json::Value::Null)
+                );
+            }
+            assert!(fixture.reviews.lock().await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn unknown_primary_pricing_skips_reviews_that_cannot_produce_a_plan() {
     let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
     let state = tempfile::tempdir().unwrap();

@@ -236,8 +236,11 @@ requests **and** 25,000 newly reviewable native-source tokens, with bounded no-y
 backoff. `--review-replayed-history` declares prior completed exposure; it does not
 bypass protection or create synchronous review. Invalid advice items are isolated,
 and budget-rejected replacement facts preserve their supporting sources.
-Unknown primary pricing suppresses ordinary paid review. These are experimental
-planning assumptions, not demonstrated savings or cache-hit guarantees. See the
+Unknown primary context capacity or pricing makes that request forwarding-only:
+Carry preserves the client payload, skips review and rewriting, and leaves unknown
+costs unpriced. An explicit context override does not invent a tariff or enable
+review for an otherwise unknown model. These are experimental planning assumptions,
+not demonstrated savings or cache-hit guarantees. See the
 [history contract](docs/proxy-fork-continuity.md) for exact safety, capacity,
 retention and fresh-state boundaries; this redesign requires a new empty state
 directory and has no legacy checkpoint or synchronous-review compatibility.

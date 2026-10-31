@@ -585,8 +585,13 @@ class ReviewRegressions(unittest.TestCase):
         saved = proxy.saved()
         self.evidence.update(status=status, saved=saved, reviews=fixture.reviews,
                              primaries=fixture.primaries)
-        self.assertEqual(status, 413 if forced else 200)
-        self.assertEqual(len(fixture.primaries), 1 if forced else 2)
+        blocked = known and forced
+        self.assertEqual(status, 413 if blocked else 200)
+        self.assertEqual(len(fixture.primaries), 1 if blocked else 2)
+        if not known:
+            self.assertEqual(fixture.primaries[-1]["input"], history,
+                             "unknown models bypass Carry context admission unchanged")
+            self.assertEqual(saved["primary"]["unavailable_cost_calls"], 2)
         expected_reviews = int(known and not forced)
         self.assertEqual(len(fixture.reviews), expected_reviews,
                          "no capacity rescue review; unknown prices never authorize paid review")

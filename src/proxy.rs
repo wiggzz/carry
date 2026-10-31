@@ -1507,9 +1507,14 @@ async fn forward_request(
             // feasibility, memory and bootstrap check. Locks, metadata epoch,
             // background registry and directory lock remain process-shared.
             let mut effective = (*service).clone();
-            effective.config.primary_context_tokens = resolved.primary.capacity_tokens.ok_or_else(|| {
-                failure(StatusCode::BAD_REQUEST, "unknown primary context: provide model metadata or --primary-context-tokens")
-            })?;
+            effective.config.primary_context_tokens = resolved.primary.capacity_tokens.unwrap_or(0);
+            if resolved.primary.capacity_tokens.is_none() || resolved.primary.rates.is_none() {
+                // Unknown models are forwarding-only, not failed admission. Keep
+                // their unresolved facts for accounting without guessing a budget
+                // or tariff, even when an operator supplied a context override.
+                effective.config.mode = Mode::Off;
+                session.last_plan = json!({"reason":"unsupported_model_or_tier"});
+            }
             effective.config.classifier_max_input_tokens =
                 resolved.reviewer.capacity_tokens.unwrap_or(0);
             effective.config.model_resolution = Some(resolved);
