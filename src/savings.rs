@@ -53,6 +53,54 @@ impl Scenario {
         })
     }
 
+    /// A free summary is allowed only for unrecognized history before its first
+    /// compared request. Adapters supply their own quantity domain and proof.
+    pub(crate) fn initial_compaction(
+        &self,
+        recognized: bool,
+        input: u64,
+        protected: u64,
+        output_allowance: u64,
+        hard_capacity: Option<u64>,
+    ) -> Result<Option<u64>, ()> {
+        if recognized {
+            return Ok(None);
+        }
+        self.compaction(
+            input,
+            protected,
+            self.initial_input_budget(output_allowance, hard_capacity),
+        )
+    }
+
+    /// A successful response can advance quantities even when its money is
+    /// unavailable. Return the retained floor; charging remains adapter-owned.
+    pub(crate) fn response_compaction(
+        &self,
+        input: u64,
+        retained_output: u64,
+        fixed: u64,
+    ) -> Result<Option<u64>, ()> {
+        self.compaction(
+            input.saturating_add(retained_output),
+            fixed,
+            self.context_window.saturating_sub(self.reserve),
+        )
+    }
+
+    fn compaction(&self, total: u64, floor: u64, budget: u64) -> Result<Option<u64>, ()> {
+        if !self.valid() || total <= budget {
+            return Ok(None);
+        }
+        let kept = self.keep_recent.max(floor);
+        let compacted = kept.saturating_add(self.summary);
+        if compacted > budget || compacted >= total {
+            Err(())
+        } else {
+            Ok(Some(kept))
+        }
+    }
+
     pub(crate) fn valid(&self) -> bool {
         self.context_window > self.reserve
             && self.keep_recent.saturating_add(self.summary) <= self.context_window - self.reserve
@@ -137,6 +185,7 @@ pub struct Trajectory {
     last_output_proxy: u64,
     last_model: String,
     scenario_available: bool,
+    comparison_priced: bool,
     initialized: bool,
     carry_edited: bool,
     pi_edited: bool,
@@ -176,6 +225,7 @@ impl Trajectory {
             last_output_proxy: 0,
             last_model: String::new(),
             scenario_available: true,
+            comparison_priced: true,
             initialized: false,
             carry_edited: false,
             pi_edited: false,
@@ -204,6 +254,7 @@ impl Trajectory {
             &self.model
         };
         e.priced = self.scenario_available
+            && self.comparison_priced
             && self.scenario.valid()
             && e.observed_priced
             && e.coverage.unknown_cache_requests == 0
@@ -323,30 +374,31 @@ impl Trajectory {
                         .clamp(0, u64::MAX as i128) as u64;
                     // Initialize before pricing the first compared primary.
                     // Cache expiry does not erase known traditional history.
-                    if !self.initialized && self.scenario.valid() {
-                        let allowance = carry::models::output_allowance(
-                            prompt.requested_output,
-                            self.scenario.reserve,
-                        );
-                        let budget = self.scenario.initial_input_budget(allowance, None);
-                        if pi_input > budget {
-                            let kept = self.scenario.keep_recent.max(prompt.protected_input);
-                            let compacted = kept.saturating_add(self.scenario.summary);
-                            if compacted > budget || compacted >= pi_input {
-                                self.scenario_available = false;
-                            } else {
-                                self.removed = self.removed.saturating_add(
-                                    pi_input.saturating_sub(kept).saturating_sub(self.summary),
-                                );
-                                self.summary = self.scenario.summary;
-                                pi_input = compacted;
-                                self.pi_edited = true;
-                                self.primary_history.diverge();
-                                self.result.initial_compactions += 1;
-                            }
+                    let allowance = carry::models::output_allowance(
+                        prompt.requested_output,
+                        self.scenario.reserve,
+                    );
+                    match self.scenario.initial_compaction(
+                        self.initialized,
+                        pi_input,
+                        prompt.protected_input,
+                        allowance,
+                        None,
+                    ) {
+                        Ok(Some(kept)) => {
+                            self.removed = self.removed.saturating_add(
+                                pi_input.saturating_sub(kept).saturating_sub(self.summary),
+                            );
+                            self.summary = self.scenario.summary;
+                            pi_input = kept.saturating_add(self.summary);
+                            self.pi_edited = true;
+                            self.primary_history.diverge();
+                            self.result.initial_compactions += 1;
                         }
-                        self.initialized = true;
+                        Ok(None) => {}
+                        Err(()) => self.scenario_available = false,
                     }
+                    self.initialized |= self.scenario.valid();
                     // Freeze the output count, not its rate: use each scenario input tier.
                     let pi_output =
                         scenario_output_cost(&prompt.model, pi_input, usage.output_tokens);
@@ -402,7 +454,7 @@ impl Trajectory {
                         self.result.carry_cost += carry;
                         self.result.pi_cost += pi;
                     } else {
-                        self.scenario_available = false;
+                        self.comparison_priced = false;
                     }
                     if let (Some(at), Some(lifetime)) =
                         (prompt.request_at_ms, prompt.cache_lifetime_ms)
@@ -431,48 +483,50 @@ impl Trajectory {
                     self.previous = Some(prompt);
                     self.carry_edited = false;
                     self.pi_edited = false;
+                    // Quantities remain valid through monetary omissions. Do
+                    // not charge unavailable intervals or let them suppress a
+                    // later successful summary/projection transition.
+                    if self.scenario_available {
+                        let fixed = self.previous.as_ref().unwrap().fixed_input;
+                        match self.scenario.response_compaction(
+                            self.last_pi_input,
+                            self.last_output_proxy,
+                            fixed,
+                        ) {
+                            Ok(Some(kept)) => {
+                                let total =
+                                    self.last_pi_input.saturating_add(self.last_output_proxy);
+                                let discarded = total.saturating_sub(kept);
+                                let summary_usage = Usage {
+                                    input_tokens: discarded,
+                                    output_tokens: self.scenario.summary,
+                                    ..Usage::default()
+                                };
+                                if let Some(cost) = pair.and_then(|_| {
+                                    estimated_cost_usd(&self.last_model, &summary_usage)
+                                }) {
+                                    self.result.summary_cost += cost;
+                                    self.result.pi_cost += cost;
+                                } else {
+                                    self.comparison_priced = false;
+                                }
+                                self.result.pi_compactions += 1;
+                                self.pi_edited = true;
+                                self.modeled_cache.clear();
+                                self.primary_history.diverge();
+                                self.removed = self
+                                    .removed
+                                    .saturating_add(discarded.saturating_sub(self.summary));
+                                self.summary = self.scenario.summary;
+                                self.last_pi_input = kept.saturating_add(self.summary);
+                                self.last_output_proxy = 0;
+                            }
+                            Ok(None) => {}
+                            Err(()) => self.scenario_available = false,
+                        }
+                    }
                 } else {
                     self.scenario_available = false;
-                }
-                // Check after each response, not just after the whole agent run.
-                let total = self.last_pi_input.saturating_add(self.last_output_proxy);
-                if self.scenario_available
-                    && self.scenario.valid()
-                    && !self.last_model.is_empty()
-                    && total
-                        > self
-                            .scenario
-                            .context_window
-                            .saturating_sub(self.scenario.reserve)
-                {
-                    let kept = self
-                        .previous
-                        .as_ref()
-                        .map_or(self.scenario.keep_recent, |p| {
-                            self.scenario.keep_recent.max(p.fixed_input)
-                        });
-                    let discarded = total.saturating_sub(kept);
-                    let summary_usage = Usage {
-                        input_tokens: discarded,
-                        output_tokens: self.scenario.summary,
-                        ..Usage::default()
-                    };
-                    if let Some(cost) = estimated_cost_usd(&self.last_model, &summary_usage) {
-                        self.result.summary_cost += cost;
-                        self.result.pi_cost += cost;
-                        self.result.pi_compactions += 1;
-                        self.pi_edited = true;
-                        self.modeled_cache.clear();
-                        self.primary_history.diverge();
-                        self.removed = self
-                            .removed
-                            .saturating_add(discarded.saturating_sub(self.summary));
-                        self.summary = self.scenario.summary;
-                        self.last_pi_input = kept.saturating_add(self.summary);
-                        self.last_output_proxy = 0;
-                    } else {
-                        self.scenario_available = false;
-                    }
                 }
             }
             // Completion notifications must not charge the last summary twice.
@@ -639,6 +693,7 @@ mod tests {
     include!("savings_cache_write_tests.rs");
     include!("savings_cache_lifetime_tests.rs");
     include!("savings_initialization_tests.rs");
+    include!("savings_quantity_policy_tests.rs");
     fn request(t: &mut Trajectory, units: u64) {
         t.record(&json!({"event":"model_request","data":{"step":1,"request":{"input":["a ".repeat(units as usize)],"tools":[]}}}));
     }

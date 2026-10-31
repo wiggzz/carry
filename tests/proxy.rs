@@ -396,6 +396,29 @@ fn cache_policy188_migration_http_regressions() {
     );
 }
 
+// Real HTTP/Session and report adapters must retain successful quantity
+// transitions through unsupported monetary intervals.
+#[test]
+fn shared_quantity_policy_http_and_report_regression() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_quantity_policy.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute source-bound quantity-policy differential");
+    std::io::Write::write_all(&mut std::io::stdout(), &output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "SHARED_POLICY differential failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // Forecast eligibility is fixed at the actual primary dispatch, not delayed
 // terminal settlement. The fixture crosses expiry with a real held response.
 #[test]

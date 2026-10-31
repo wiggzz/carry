@@ -364,22 +364,27 @@ impl Trajectory {
         let mut traditional = self.history.input(native.input_tokens, self.restored);
 
         let fixed = projection_fixed_tokens(body);
-        let kept = self.scenario.keep_recent.max(fixed);
-        let mut initialized_now = false;
-        if self.scenario.valid() && !history_compatible && traditional > budget {
-            let initial_kept = kept.max(protected);
-            let initialized = initial_kept.saturating_add(self.scenario.summary);
-            if initialized > budget || initialized >= traditional {
+        let initialized_now = match self.scenario.initial_compaction(
+            history_compatible,
+            traditional,
+            protected,
+            allowance,
+            resolved.and_then(|r| r.capacity_tokens.map(u64::from)),
+        ) {
+            Ok(Some(kept)) => {
+                self.history
+                    .summarize(traditional, kept, self.scenario.summary);
+                traditional = self.history.last_traditional_input;
+                self.traditional_edited = true;
+                true
+            }
+            Ok(None) => false,
+            Err(()) => {
                 self.result.excluded_unpriced_calls += 1;
                 self.reset_epoch();
                 return;
             }
-            self.history
-                .summarize(traditional, initial_kept, self.scenario.summary);
-            traditional = initialized;
-            self.traditional_edited = true;
-            initialized_now = true;
-        }
+        };
 
         // The alternative models an API-equivalent policy, not this route's
         // ability to request an explicit breakpoint or promise a future hit.
@@ -452,14 +457,22 @@ impl Trajectory {
         // Only the explicit semantic projection can enter this estimate;
         // opaque transport size and billed output are not retained input units.
         let total = traditional.saturating_add(retained_output);
-        let summarize =
-            self.scenario.valid() && total > self.scenario.context_window - self.scenario.reserve;
-        let discarded = total.saturating_sub(kept);
-        let summary_cost = if summarize {
+        let kept = match self
+            .scenario
+            .response_compaction(traditional, retained_output, fixed)
+        {
+            Ok(kept) => kept,
+            Err(()) => {
+                self.result.excluded_unpriced_calls += 1;
+                self.reset_epoch();
+                return;
+            }
+        };
+        let summary_cost = if let Some(kept) = kept {
             modeled_cost(
                 model,
                 &Usage {
-                    input_tokens: discarded,
+                    input_tokens: total.saturating_sub(kept),
                     output_tokens: self.scenario.summary,
                     ..Usage::default()
                 },
@@ -494,7 +507,7 @@ impl Trajectory {
         }
         self.carry_edited = false;
         self.traditional_edited = false;
-        if summarize {
+        if let Some(kept) = kept {
             self.result.traditional_compactions += 1;
             self.history.summarize(total, kept, self.scenario.summary);
             self.traditional_edited = true;
