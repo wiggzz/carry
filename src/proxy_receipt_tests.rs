@@ -603,62 +603,86 @@ fn initialization186_omitted_output_uses_frozen_capacity_reserve() {
     }
 }
 
-// Joined #191/#192 acceptance, not a separately reproduced defect. Native
-// execution is pending the rebuilt joined-source hosted lane.
+// Joined #191/#192 acceptance. Unknown expense is excluded once; a later
+// independently known receipt must not inherit that monetary omission.
+fn image_receipts_through_write_tariff_gap(breakpoint: bool) {
+    let mut t = Trajectory::default();
+    let mut expected = 0.0;
+    let mut matched = 0;
+    let mut differences = Vec::new();
+    for (index, (ttl, written, priced)) in [
+        ("30m", 2000, true),
+        ("12h", 2000, false),
+        ("12h", 0, true),
+        ("30m", 2000, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut request = body();
+        request["prompt_cache_options"] = json!({"mode":"implicit","ttl":"30m"});
+        request["input"][0]["content"] = json!([
+            {"type":"input_text","text":"image source"},
+            {"type":"input_image","image_url":"data:image/png;base64,fixture"}
+        ]);
+        if breakpoint {
+            request["input"][0]["content"][1]["prompt_cache_breakpoint"] =
+                json!({"mode":"explicit","ttl":ttl});
+        } else {
+            request["prompt_cache_options"]["ttl"] = json!(ttl);
+        }
+        t.primary(
+            &request,
+            &terminal(4000, 1000, written, 5),
+            "joined-image-fixture",
+            100 + index as u64,
+            true,
+        );
+        if priced {
+            expected +=
+                ((3000 - written) as f64 * 2.0 + 1000.0 * 0.1 + written as f64 * 2.5 + 5.0 * 10.0)
+                    / 1e6;
+            matched += 1;
+        }
+        let snapshot = t.snapshot();
+        assert!((snapshot.observed_primary_cost - expected).abs() < 1e-12);
+        assert_eq!(
+            snapshot.unavailable_primary_cost_calls,
+            u64::from(index > 0)
+        );
+        assert_eq!(snapshot.coverage.unmodeled_calls, 0);
+        assert_eq!(snapshot.initial_compactions, 0);
+        assert_eq!(snapshot.traditional_compactions, 0);
+        assert_eq!(snapshot.summary_cost, 0.0);
+        assert_eq!(snapshot.reviewer_cost, 0.0);
+        if snapshot.matched_primary_responses != matched
+            || snapshot.excluded_unpriced_calls != u64::from(index > 0)
+            || (snapshot.carry_cost - expected).abs() >= 1e-12
+            || (snapshot.traditional_cost - expected).abs() >= 1e-12
+        {
+            differences.push(format!(
+                    "step {index}: known {expected}, Carry {}, traditional {}, matched {}/{matched}, excluded {}/{}",
+                    snapshot.carry_cost, snapshot.traditional_cost,
+                    snapshot.matched_primary_responses, snapshot.excluded_unpriced_calls,
+                    u64::from(index > 0)
+                ));
+        }
+        t = serde_json::from_value(state(&t)).unwrap();
+    }
+    assert!(
+        differences.is_empty(),
+        "IMAGE_TARIFF_GAP_PRIMARY_PARITY: {differences:?}"
+    );
+}
+
 #[test]
 fn joined191192_image_receipts_obey_write_lifetime_without_erasing_known_money() {
-    for breakpoint in [false, true] {
-        let mut t = Trajectory::default();
-        let mut expected = 0.0;
-        for (index, (ttl, written, priced)) in [
-            ("30m", 2000, true),
-            ("12h", 2000, false),
-            ("12h", 0, true),
-            ("30m", 2000, true),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut request = body();
-            request["prompt_cache_options"] = json!({"mode":"implicit","ttl":"30m"});
-            request["input"][0]["content"] = json!([
-                {"type":"input_text","text":"image source"},
-                {"type":"input_image","image_url":"data:image/png;base64,fixture"}
-            ]);
-            if breakpoint {
-                request["input"][0]["content"][1]["prompt_cache_breakpoint"] =
-                    json!({"mode":"explicit","ttl":ttl});
-            } else {
-                request["prompt_cache_options"]["ttl"] = json!(ttl);
-            }
-            t.primary(
-                &request,
-                &terminal(4000, 1000, written, 5),
-                "joined-image-fixture",
-                100 + index as u64,
-                true,
-            );
-            if priced {
-                expected += ((3000 - written) as f64 * 2.0
-                    + 1000.0 * 0.1
-                    + written as f64 * 2.5
-                    + 5.0 * 10.0)
-                    / 1e6;
-            }
-            let snapshot = t.snapshot();
-            assert!((snapshot.observed_primary_cost - expected).abs() < 1e-12);
-            assert_eq!(
-                snapshot.unavailable_primary_cost_calls,
-                u64::from(index > 0)
-            );
-            assert_eq!(snapshot.coverage.unmodeled_calls, 0);
-            assert_eq!(
-                snapshot.matched_primary_responses,
-                if breakpoint || index < 3 { 1 } else { 2 }
-            );
-            t = serde_json::from_value(state(&t)).unwrap();
-        }
-    }
+    image_receipts_through_write_tariff_gap(false);
+}
+
+#[test]
+fn joined191192_image_breakpoint_changes_keep_identical_primary_money() {
+    image_receipts_through_write_tariff_gap(true);
 }
 
 #[test]

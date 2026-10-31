@@ -119,6 +119,19 @@ fn history_through_tariff_gap(initialized: bool, unknown: bool) {
                 before.excluded_unpriced_calls + 1
             );
         }
+        if step == 1 {
+            // Recovery prices only the newly observed dispatch. The independent
+            // hypothetical cursor advanced through the unpriced interval: its
+            // original modeled write covers 21,300 of this 21,400-token prompt.
+            // Actual native expense still selects the long-input tariff.
+            let recovered_traditional = (21300.0 * 0.1 + 100.0 * 2.5) / 1e6;
+            assert!((after.carry_cost - before.carry_cost - actual_increment).abs() < 1e-12);
+            assert!(
+                (after.traditional_cost - before.traditional_cost - recovered_traditional).abs()
+                    < 1e-12,
+                "RECOVERED_NATIVE_HISTORY_PRICE: only the new known pair is admitted"
+            );
+        }
         let quantity = (
             t.history.retired,
             t.history.summary,

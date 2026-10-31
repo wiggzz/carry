@@ -847,7 +847,8 @@ class StateRegressions(unittest.TestCase):
                 proxy = self.proxy(fixture, options)
                 seed = [{"role": "user", "content": "priced prefix " * 600}]
                 self.assertEqual(proxy.send(seed)[0], 200)
-                before = proxy.saved()["cost_trajectory"]["result"]
+                before_trajectory = proxy.saved()["cost_trajectory"]
+                before = before_trajectory["result"]
                 fields = {"model": "unknown-model" if variant == "unknown_model" else "gpt-6-astra"} if variant in ("unknown_model", "unknown_cache") else {}
                 self.assertEqual(proxy.send(seed, **fields)[0], 200)
                 omitted = proxy.saved()["cost_trajectory"]
@@ -884,7 +885,20 @@ class StateRegressions(unittest.TestCase):
                     continue
                 self.assertEqual(omitted["result"]["carry_cost"], before["carry_cost"], "omit both branches, never a partial pair")
                 self.assertEqual(omitted["result"]["traditional_cost"], before["traditional_cost"])
-                self.assertIsNone(omitted["receipts"]["anchor"], "an omitted primary cannot preserve a stale receipt anchor")
+                if variant == "unknown_model":
+                    # A new model's valid native receipt is a fresh quantity
+                    # anchor, even when its tariff is unavailable. It must not
+                    # preserve the former model's configuration or price it.
+                    anchor = omitted["receipts"]["anchor"]
+                    self.assertIsNotNone(anchor)
+                    self.assertNotEqual(anchor["configuration"],
+                                        before_trajectory["receipts"]["anchor"]["configuration"])
+                    self.assertEqual(anchor["input"], completed()["usage"]["input_tokens"])
+                    self.assertEqual(omitted["history_continuity"]["cursor"]["input"], anchor["input"])
+                    self.assertEqual(omitted["history_continuity"]["contract"]["model"], "unknown-model")
+                else:
+                    self.assertIsNone(omitted["receipts"]["anchor"],
+                                      "invalid/unmodeled quantities cannot preserve a stale receipt anchor")
                 estimate = stats["sessions"][0]["cost_estimate"]
                 self.assert_estimate_available(estimate, True, "unpriced calls must not hide priced comparisons")
                 self.assertEqual(estimate.get("excluded_unpriced_calls"), 1)

@@ -260,13 +260,15 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertAlmostEqual(saved["primary"]["cost_usd"], expected, places=12)
             self.assertEqual(estimate["unavailable_primary_cost_calls"], int(index > 0))
             self.assertAlmostEqual(estimate["observed_primary_cost"], expected, places=12)
-            # A zero-write unchanged observation is known even when a future
-            # 12h write cannot be priced. Keep that exact matched subset; never
-            # backfill the later unsupported write or unknown continuation.
-            self.assertEqual(estimate["matched_primary_responses"], 1)
-            self.assertEqual(estimate["excluded_unpriced_calls"], index)
-            self.assertAlmostEqual(estimate["carry_cost"], 0.0041, places=12)
-            self.assertAlmostEqual(estimate["traditional_cost"], 0.0041, places=12)
+            # An unavailable paid-write tariff omits that receipt, not the
+            # independent native cursor or proof of identical primary histories.
+            # The later zero-write hit is known at its own dispatch; admitting it
+            # must neither backfill the unsupported write nor reprice old money.
+            unknown = int(index > 0)
+            self.assertEqual(estimate["matched_primary_responses"], index + 1 - unknown)
+            self.assertEqual(estimate["excluded_unpriced_calls"], unknown)
+            self.assertAlmostEqual(estimate["carry_cost"], expected, places=12)
+            self.assertAlmostEqual(estimate["traditional_cost"], expected, places=12)
             self.assertEqual(estimate["savings"], 0.0)
             proxy.close()
 
@@ -314,10 +316,10 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertAlmostEqual(saved["primary"]["cost_usd"], expected, places=12)
             self.assertEqual(estimate["unavailable_primary_cost_calls"], unknown)
             self.assertAlmostEqual(estimate["observed_primary_cost"], expected, places=12)
-            self.assertEqual(estimate["matched_primary_responses"], 1)
-            self.assertEqual(estimate["excluded_unpriced_calls"], index)
-            self.assertAlmostEqual(estimate["carry_cost"], 0.0051, places=12)
-            self.assertAlmostEqual(estimate["traditional_cost"], 0.0051, places=12)
+            self.assertEqual(estimate["matched_primary_responses"], index + 1 - unknown)
+            self.assertEqual(estimate["excluded_unpriced_calls"], unknown)
+            self.assertAlmostEqual(estimate["carry_cost"], expected, places=12)
+            self.assertAlmostEqual(estimate["traditional_cost"], expected, places=12)
             self.assertEqual(estimate["savings"], 0.0)
             proxy.close()
 
@@ -366,10 +368,10 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertAlmostEqual(saved["primary"]["cost_usd"], expected, places=12)
             self.assertEqual(estimate["unavailable_primary_cost_calls"], unknown)
             self.assertAlmostEqual(estimate["observed_primary_cost"], expected, places=12)
-            self.assertEqual(estimate["matched_primary_responses"], 1)
-            self.assertEqual(estimate["excluded_unpriced_calls"], index)
-            self.assertAlmostEqual(estimate["carry_cost"], 0.0051, places=12)
-            self.assertAlmostEqual(estimate["traditional_cost"], 0.0051, places=12)
+            self.assertEqual(estimate["matched_primary_responses"], index + 1 - unknown)
+            self.assertEqual(estimate["excluded_unpriced_calls"], unknown)
+            self.assertAlmostEqual(estimate["carry_cost"], expected, places=12)
+            self.assertAlmostEqual(estimate["traditional_cost"], expected, places=12)
             self.assertEqual(estimate["savings"], 0.0)
             proxy.close()
 
