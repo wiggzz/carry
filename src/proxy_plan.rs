@@ -21,9 +21,50 @@ pub(super) fn plan(
     body: &Value,
 ) -> (Option<Projection>, Value) {
     let canonical = Projection::canonical(session);
+    let groups = session.groups();
+    let eligible = groups
+        .iter()
+        .filter(|g| session.drop_authorized(g))
+        .collect::<Vec<_>>();
+    // The last dispatch identifies an alternative, never removal authority.
+    // Revalidate whole CURRENT cohorts, restoring revoked/protected members and
+    // retaining everything appended since that dispatch. Render current facts
+    // at their existing anchors rather than remembering another copy of input.
+    let submitted = session
+        .last_submitted_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let frontier = submitted.iter().copied().max().unwrap_or(0);
+    let omitted = eligible
+        .iter()
+        .filter(|g| {
+            g.members
+                .iter()
+                .all(|id| *id <= frontier && !submitted.contains(id))
+        })
+        .flat_map(|g| g.members.iter().copied())
+        .collect::<HashSet<_>>();
+    let continuation = Projection {
+        input: session.render_projection(&omitted),
+        omitted,
+    };
     let mut retained = body.clone();
-    retained["input"] = json!(canonical.input);
+    retained["input"] = json!(continuation.input);
+    let mut original = body.clone();
+    original["input"] = json!(canonical.input);
+    // Canonical replay is still an alternative (including genuine rewarming).
+    // An oversized canonical prompt does not force a new rewrite when the
+    // authorized continuation fits. Conversely, do not default to an oversized
+    // memory projection when the originals themselves fit.
+    let baseline = if !primary_fits(config, &retained) && primary_fits(config, &original) {
+        retained = original.clone();
+        &canonical
+    } else {
+        &continuation
+    };
     let wire = primary_wire_body(config, &retained);
+    let canonical_wire = primary_wire_body(config, &original);
     let forced = !primary_fits(config, &retained);
     let prediction = session.cost_trajectory.as_ref().and_then(|t| {
         t.receipt_prediction(
@@ -32,17 +73,12 @@ pub(super) fn plan(
             config.model_resolution.as_ref().map(|p| &p.primary),
         )
     });
-    let groups = session.groups();
-    let eligible = groups
-        .iter()
-        .filter(|g| session.drop_authorized(g))
-        .collect::<Vec<_>>();
-    let mut options = vec![HashSet::new()];
-    // Preserve each genuinely compatible warm boundary as a candidate. A past
-    // outgoing omission has no role here: all candidates start from canonical H.
+    let mut protected_options = vec![HashSet::new()];
+    // Preserve each genuinely compatible canonical warm boundary as another
+    // alternative, alongside the reauthorized previous projection below.
     for entry in &session.upstream_cache {
         if entry.matches(
-            &wire,
+            &canonical_wire,
             config.model_resolution.as_ref().map(|p| &p.primary),
             &config.primary_cache_auth,
             now(),
@@ -50,29 +86,40 @@ pub(super) fn plan(
             // The subscription adapter moves leading native direction items
             // into instructions. Include those base-bound members plus the
             // actual wire prefix, not the same count of canonical positions.
-            let leading = canonical.input.len() - wire["input"].as_array().unwrap().len();
+            let leading = canonical.input.len() - canonical_wire["input"].as_array().unwrap().len();
             let ids = session
                 .history
                 .iter()
                 .take(leading + entry.input_len)
                 .map(|i| i.id)
                 .collect::<HashSet<_>>();
-            options.push(ids);
+            protected_options.push(ids);
         }
     }
-    let review = review_body(config, session);
+    let mut options = protected_options
+        .into_iter()
+        .map(|protected| {
+            eligible
+                .iter()
+                .filter(|g| !g.members.iter().any(|id| protected.contains(id)))
+                .flat_map(|g| g.members.iter().copied())
+                .collect::<HashSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    if !baseline.omitted.is_empty() {
+        options.push(baseline.omitted.clone());
+        options.push(HashSet::new());
+    }
+    let review = review_body_projected(config, session, baseline);
     let due = admission::scheduled(config, session)["admitted"] == true;
     let mut best: Option<(Projection, f64, String)> = None;
     let mut reports = Vec::new();
     let mut seen = HashSet::new();
-    for protected in options {
-        let mut omitted = eligible
-            .iter()
-            .filter(|g| !g.members.iter().any(|id| protected.contains(id)))
-            .flat_map(|g| g.members.iter().copied())
-            .collect::<Vec<_>>();
+    for omitted in options {
+        let is_baseline = omitted == baseline.omitted;
+        let mut omitted = omitted.into_iter().collect::<Vec<_>>();
         omitted.sort_unstable();
-        if omitted.is_empty() || !seen.insert(omitted.clone()) {
+        if (omitted.is_empty() && baseline.omitted.is_empty()) || !seen.insert(omitted.clone()) {
             continue;
         }
         let omitted = omitted.into_iter().collect::<HashSet<_>>();
@@ -137,14 +184,20 @@ pub(super) fn plan(
             .map(|(p, s)| joint_decision(p, s, config.min_payback_percent));
         let mut members = projection.omitted.iter().copied().collect::<Vec<_>>();
         members.sort_unstable();
-        let id = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&members).unwrap())
-        );
-        reports.push(json!({"candidate_id":id,"action":"projection","removed_groups":eligible.iter().filter(|g| g.members.iter().all(|m| projection.omitted.contains(m))).map(|g|g.id).collect::<Vec<_>>(),"omitted_members":members,"feasible":feasible,"selection_joint":joint,"primary_retained_estimated_tokens":estimate(&compact),"primary_retained_required_tokens":required}));
-        if feasible && (forced || joint.is_some_and(|j| j.accepted)) {
+        let id = if members.is_empty() {
+            "keep".into()
+        } else {
+            format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&members).unwrap())
+            )
+        };
+        reports.push(json!({"candidate_id":id,"action":if members.is_empty() {"keep"} else {"projection"},"baseline":is_baseline,"removed_groups":eligible.iter().filter(|g| g.members.iter().all(|m| projection.omitted.contains(m))).map(|g|g.id).collect::<Vec<_>>(),"omitted_members":members,"feasible":feasible,"selection_joint":joint,"primary_retained_estimated_tokens":estimate(&compact),"primary_retained_required_tokens":required}));
+        if feasible && (is_baseline || forced || joint.is_some_and(|j| j.accepted)) {
             let score = if forced {
                 estimate(&compact)
+            } else if is_baseline {
+                0.0
             } else {
                 -joint.unwrap().savings
             };
@@ -153,7 +206,8 @@ pub(super) fn plan(
             }
         }
     }
-    let mut report = json!({"selected":best.is_some(),"forced":forced,"primary_fits":!forced,
+    let selected = best.as_ref().is_some_and(|(p, _, _)| !p.omitted.is_empty());
+    let mut report = json!({"selected":selected,"forced":forced,"primary_fits":!forced,
         "primary_cached_estimated_tokens":crate::proxy_cache::reusable(&session.upstream_cache,&wire,config.model_resolution.as_ref().map(|p|&p.primary),&config.primary_cache_auth,now()),
         "reviewer_fits":review_fits(config,&review),"primary_estimated_tokens":estimate(&wire),
         "primary_required_tokens":primary_required_tokens(config,&retained),"primary_receipt_prediction_tokens":prediction,
@@ -162,7 +216,7 @@ pub(super) fn plan(
         "primary_output_reserve_basis":if retained["max_output_tokens"].as_u64().is_some() {"request_max_output_tokens"} else {"configured_capacity_reserve"},
         "reviewer_estimated_tokens":estimate(&review),"primary_context_tokens":config.primary_context_tokens,
         "selected_candidate_id":best.as_ref().map(|(_,_,id)|id.as_str()).or(if forced {None} else {Some("keep")}),
-        "selected_action":if best.is_some() {"projection"} else {"keep"},
+        "selected_action":if selected {"projection"} else {"keep"},
         "payoff_requests":config.payoff_requests,"min_payback_percent":config.min_payback_percent,
         "cache_basis":"actual_compatible_wire_terminal_receipts_30_minute_ttl",
         "estimate_basis":"frozen_primary_horizon_and_actual_current_review_schedule",
@@ -197,7 +251,15 @@ pub(super) fn plan(
             .map(|p| p.primary.ordinary.total_budget)
     );
     report["model_resolution"] = json!(config.model_resolution);
-    (best.map(|(projection, _, _)| projection), report)
+    let mut baseline_members = baseline.omitted.iter().copied().collect::<Vec<_>>();
+    baseline_members.sort_unstable();
+    report["baseline_omitted_members"] = json!(baseline_members);
+    report["canonical_primary_required_tokens"] = json!(primary_required_tokens(config, &original));
+    (
+        best.map(|(projection, _, _)| projection)
+            .filter(|p| !p.omitted.is_empty()),
+        report,
+    )
 }
 
 /// One genuine no-fit acquisition, never an ordinary primary wait. The

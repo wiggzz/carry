@@ -422,7 +422,20 @@ jobs:
         run: cargo build --locked
 
       - name: Integration tests
+        env:
+          CARRY_TEST_MARGINAL_EVIDENCE_DIR: ${{ runner.temp }}/proxy-planner-marginal
         run: cargo test --locked --test '*' --no-fail-fast
+
+      # Only the credential-free marginal fixture writes here, outside target
+      # and its build cache. Preserve actual candidate/wire/receipt evidence.
+      - name: Retain synthetic marginal planner evidence
+        if: ${{ !cancelled() && steps.rust-build.outcome == 'success' }}
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: proxy-planner-marginal-${{ github.sha }}
+          path: ${{ runner.temp }}/proxy-planner-marginal
+          if-no-files-found: warn
+          retention-days: 7
 
       # Keep executing these cases even if a Rust integration target fails,
       # matching cargo test --no-fail-fast's previous coverage.
