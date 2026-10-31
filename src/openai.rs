@@ -23,7 +23,6 @@ static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) use carry::models::PromptCacheCapabilities;
 
-#[cfg(test)]
 pub(crate) fn prompt_cache_capabilities(model: &str) -> Option<PromptCacheCapabilities> {
     carry::models::model_spec(model)?.cache
 }
