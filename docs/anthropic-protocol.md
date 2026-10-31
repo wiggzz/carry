@@ -34,6 +34,19 @@ limits drifting between protocols; extracting it now would change the live
 Responses path while #196 owns ingress/finalization work. Coordinate that
 extraction with its owner before wiring the Messages route.
 
+This is a behavioral ownership boundary even though `proxy_sse.rs` itself is
+not in #196's changed-file list: `proxy.rs::relay` consumes its completion and
+usage observations to settle the receipts that #196 changes. The shared-framer
+migration is an integration gate, not a claim that this duplication is the
+finished architecture. Its common tests must cover every byte split of UTF-8
+and CRLF, LF/CR delimiters, BOM/comments, multiline data and event names,
+malformed UTF-8/JSON, incomplete final frames, and both one oversized frame and
+many small frames at the capture limit. Run each provider's semantic fixtures
+through that same decoder, plus existing relay tests proving unchanged bytes,
+completion/cancellation classification and usage settlement. Agree any intended
+behavior changes with the finalization owner before changing the live observer;
+do not conceal them as a mechanical extraction or duplicate its policy.
+
 ## Contract
 
 `decode_request` and `decode_message` check the native JSON envelope and return
