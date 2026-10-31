@@ -537,7 +537,7 @@ fn load(service: &Service, id: &str) -> Result<Session, Failure> {
                 .map_err(|_| {
                     failure(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "invalid proxy checkpoint",
+                        "unsupported or invalid proxy checkpoint",
                     )
                 })
         }
@@ -1786,25 +1786,11 @@ async fn forward_request(
                 canonical != outbound["input"],
             )
         };
-        // Freeze the final transport representation before preparing legacy
-        // proof and reserving the attempt. Projection above uses client-native
-        // quantities; admission has already retained the client's output cap.
+        // Freeze the final transport representation before reserving the attempt.
+        // Projection uses client-native quantities; admission has already retained
+        // the client's output cap.
         outbound = primary_wire_body(&service.config, &outbound);
         if let Some(t) = &mut session.cost_trajectory {
-            t.load_receipt_history(
-                &outbound,
-                &service.config.upstream_url,
-                service
-                    .config
-                    .model_resolution
-                    .as_ref()
-                    .map(|pair| &pair.primary),
-                session
-                    .model_resolution_history
-                    .iter()
-                    .rev()
-                    .map(|pair| &pair.primary),
-            );
             t.projected(canonical_units, submitted_units, primary_edited);
         }
         let reviewed = session.clone();

@@ -5,15 +5,8 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Receipts {
     anchor: Option<Anchor>,
-    // Legacy decoder input only. New history has a typed quantity contract and
-    // cursor in TraditionalHistoryState, never this full-model cache digest.
-    #[serde(default)]
-    history_anchor: Option<Anchor>,
     #[serde(default)]
     pub(super) initialization_policy_version: Option<u32>,
-    // Legacy observation cursor only; never reinterpret its terminal time as a write.
-    #[serde(default)]
-    traditional_anchor: Option<Anchor>,
     #[serde(default)]
     modeled_cache: crate::proxy_cache::ModeledCache,
     #[serde(default)]
@@ -28,9 +21,7 @@ impl Default for Receipts {
     fn default() -> Self {
         Self {
             anchor: None,
-            history_anchor: None,
             initialization_policy_version: Some(1),
-            traditional_anchor: None,
             modeled_cache: crate::proxy_cache::ModeledCache::default(),
             configuration: None,
             scenario_cache_policy_version: Some(carry::models::ScenarioCachePolicy::VERSION),
@@ -50,19 +41,12 @@ struct Anchor {
     items: usize,
     input: u64,
     local_input: u64,
-    at: u64,
 }
 
 impl Receipts {
     pub(super) fn invalidate(&mut self) {
         self.invalidate_actual();
-        self.traditional_anchor = None;
         self.modeled_cache.clear();
-    }
-
-    pub(super) fn forget_history(&mut self) {
-        self.invalidate();
-        self.history_anchor = None;
     }
 
     pub(super) fn invalidate_actual(&mut self) {
@@ -176,62 +160,6 @@ fn has_unpriced_modalities(value: &Value) -> bool {
 }
 
 impl Trajectory {
-    /// Input-bound legacy load normalization. Only the owner that has the real
-    /// adapted wire and frozen saved resolutions can prove an old opaque digest.
-    /// Called before the existing atomic paid-request reservation, never from
-    /// terminal settlement. New/typed histories do no reconstruction or scan.
-    pub(crate) fn load_receipt_history<'a>(
-        &mut self,
-        body: &Value,
-        route: &str,
-        current: Option<&'a ResolvedModel>,
-        prior: impl IntoIterator<Item = &'a ResolvedModel>,
-    ) {
-        use super::traditional::ReceiptHistoryLoad;
-        self.history.load_input_cursor(body);
-        if self.history.receipt_history_load.is_some() {
-            return;
-        }
-        if self.history.history_continuity.is_some() {
-            self.history.receipt_history_load = Some(ReceiptHistoryLoad::StructuredV1);
-            return;
-        }
-        self.history.receipt_history_load = Some(ReceiptHistoryLoad::ReadOnlyLegacyV1);
-        let Some(receipts) = &self.receipts else {
-            return;
-        };
-        let Some(anchor) = &receipts.history_anchor else {
-            return;
-        };
-        if receipts.configuration.as_ref() != Some(&anchor.configuration)
-            || receipts.initialization_policy_version != Some(1)
-            || !append_compatible(anchor, body, &anchor.configuration)
-        {
-            return;
-        }
-        let Some(current) = current else {
-            return;
-        };
-        let contract = HistoryContract::extract(body, route, Some(current), self.scenario);
-        // A bounded one-time adapter, not a growing normal-request audit scan.
-        // Exact old-contract evidence beyond this bound is unavailable, not a
-        // guessed match. Frozen monetary totals/cache events are never rewritten.
-        let proven = std::iter::once(current).chain(prior).take(64).any(|old| {
-            configuration(body, route, Some(old)) == anchor.configuration
-                && HistoryContract::extract(body, route, Some(old), self.scenario) == contract
-        });
-        if proven {
-            self.history.load_legacy_cursor(
-                contract,
-                anchor.prefix.clone(),
-                anchor.items,
-                anchor.input,
-                anchor.at,
-            );
-            self.history.load_input_cursor(body);
-        }
-    }
-
     /// Freeze old sums on the first post-upgrade request, never reprice them.
     /// The new window starts from the retained input, not an invented empty chat.
     pub fn begin_receipt_window(&mut self) {
@@ -325,15 +253,6 @@ impl Trajectory {
         } = primary;
         if response["status"] != "completed" {
             self.failed_call();
-            return;
-        }
-        if self.history.read_only_legacy() {
-            let (_, _, billable) =
-                self.record_primary_observation(body, response, standard, settled);
-            if !billable {
-                self.result.coverage.unmodeled_calls += 1;
-            }
-            self.result.excluded_unpriced_calls += 1;
             return;
         }
         if self
@@ -621,12 +540,9 @@ impl Trajectory {
             items: items.len(),
             input: native.input_tokens,
             local_input: local,
-            at,
         };
         let receipts = self.receipts.as_mut().unwrap();
         receipts.anchor = Some(anchor);
-        receipts.traditional_anchor = None;
-        receipts.history_anchor = None;
     }
 
     fn record_primary_observation(

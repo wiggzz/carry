@@ -396,9 +396,9 @@ fn cache_ttl_session_history_http_regressions() {
 }
 
 // Real Session/file and canonical-index load acceptance is separate from the
-// Trajectory decoder probes. Older shapes have no modeled write events.
+// Trajectory decoder probes. Current eventless history must restart cold once.
 #[test]
-fn legacy_history_session_load_http_regressions() {
+fn current_history_session_load_http_regressions() {
     let output = Command::new("python3")
         .arg("-B")
         .arg(concat!(
@@ -408,19 +408,19 @@ fn legacy_history_session_load_http_regressions() {
         .arg("-v")
         .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
-        .expect("Python 3 must execute source-bound legacy Session load controls");
+        .expect("Python 3 must execute source-bound current Session load controls");
     assert!(
         output.status.success(),
-        "LEGACY_SESSION_HISTORY HTTP controls failed:\n{}\n{}",
+        "CURRENT_SESSION_HISTORY HTTP controls failed:\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 }
 
-// The subscription adapter can remove options/fold instructions. Legacy proof
-// must be bound to that actual wire, not the pre-adaptation request (5718422718).
+// The subscription adapter can remove options/fold instructions. History
+// continuity follows that actual wire, not the pre-adaptation request.
 #[test]
-fn legacy_history_adapted_wire_http_regressions() {
+fn current_history_adapted_wire_http_regressions() {
     let output = Command::new("python3")
         .arg("-B")
         .arg(concat!(
@@ -429,10 +429,10 @@ fn legacy_history_adapted_wire_http_regressions() {
         ))
         .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
-        .expect("Python 3 must execute source-bound legacy adapted-wire controls");
+        .expect("Python 3 must execute source-bound current adapted-wire controls");
     assert!(
         output.status.success(),
-        "LEGACY_ADAPTED_WIRE HTTP controls failed:\n{}\n{}",
+        "CURRENT_ADAPTED_WIRE HTTP controls failed:\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

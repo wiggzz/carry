@@ -278,8 +278,17 @@ struct Prompt {
     at: u64,
 }
 
+/// Persisted accounting has one supported representation. Older experimental
+/// shapes are rejected by serde before Session can publish or extend authority.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum TrajectoryFormat {
+    #[serde(rename = "carry-accounting-v3")]
+    Current,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Trajectory {
+    format: TrajectoryFormat,
     #[serde(default)]
     receipts: Option<receipts::Receipts>,
     pub scenario: Scenario,
@@ -316,6 +325,7 @@ pub struct PrimaryObservation<'a> {
 impl Default for Trajectory {
     fn default() -> Self {
         Self {
+            format: TrajectoryFormat::Current,
             receipts: Some(receipts::Receipts::default()),
             scenario: Scenario::default(),
             result: Estimate {
@@ -482,7 +492,7 @@ impl Trajectory {
 
     pub fn reset_epoch(&mut self) {
         if let Some(receipts) = &mut self.receipts {
-            receipts.forget_history();
+            receipts.invalidate();
         }
         // Totals survive actual rebases/native summaries; cache and restoration
         // assumptions do not cross an ancestry discontinuity.
@@ -639,8 +649,6 @@ impl Trajectory {
         standard: bool,
         resolved: Option<&ResolvedModel>,
     ) {
-        // Test callers use the same input-bound load boundary as real dispatch.
-        self.load_receipt_history(body, route, resolved, std::iter::empty());
         let settled = receipts::receipt(&response["usage"])
             .filter(|_| standard)
             .and_then(|u| {

@@ -187,117 +187,11 @@ fn semantic_markers_preserve_paid_summary_growth_across_restart() {
     semantic_markers_preserve_summarized_growth(false);
 }
 
-fn legacy_raw_marker_cursor_continuation(exact: bool) {
-    use sha2::{Digest, Sha256};
-    let mut request = semantic_marker_body();
-    mark_semantic_body(&mut request, "30m");
-    let mut t = Trajectory::default();
-    t.primary(
-        &request,
-        &terminal(300000, 0, 0, 0),
-        "raw-cursor",
-        100,
-        true,
-    );
-    t.reviewer(&request, &terminal(100, 0, 0, 10), true);
-    let before = t.snapshot();
-    assert_eq!(
-        (
-            t.history.retired,
-            t.history.summary,
-            t.history.last_traditional_input
-        ),
-        (280000, 1000, 21000)
-    );
-    assert_eq!(before.initial_compactions, 1);
-    assert!(before.observed_primary_cost > 0.0 && before.observed_reviewer_cost > 0.0);
-    let mut saved = state(&t);
-    // Exact historical shape: no new cursor-schema field can be inherited from
-    // this candidate's serializer. The digest really names the old raw items.
-    saved["history_continuity"]["cursor"] = json!({
-        "prefix":format!("{:x}", Sha256::digest(serde_json::to_vec(&request["input"]).unwrap())),
-        "items":request["input"].as_array().unwrap().len(), "input":300000, "at":100});
-    let mut old_cursor = saved["history_continuity"].clone();
-    // The old serializer omitted this field; the new decoder emits its exact
-    // RawV1 default even when proof is unavailable. Normalize ONLY that known
-    // representation difference. Contract/prefix/items/input/time stay exact.
-    old_cursor["cursor"]["basis"] = json!("RawV1");
-    let mut differences = Vec::new();
-    let mut paid = before.observed_primary_cost;
-    for step in 0..2_u64 {
-        t = serde_json::from_value(saved).unwrap();
-        if !exact {
-            mark_semantic_body(&mut request, "12h");
-        }
-        request["input"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"role":"user","content":format!("raw continuation {step}")}));
-        let input = 300100 + step * 100;
-        t.primary(
-            &request,
-            &terminal(input, 0, 0, 0),
-            "raw-cursor",
-            101 + step,
-            true,
-        );
-        let after = t.snapshot();
-        paid += input as f64 * 4.0 / 1e6;
-        assert!((after.observed_primary_cost - paid).abs() < 1e-12);
-        assert_eq!(after.unavailable_primary_cost_calls, 0);
-        assert_eq!(
-            after.coverage.primary_responses,
-            before.coverage.primary_responses + step + 1
-        );
-        assert_eq!(after.observed_reviewer_cost, before.observed_reviewer_cost);
-        assert_eq!(after.reviewer_cost, before.reviewer_cost);
-        assert_eq!(after.carry_cost, before.carry_cost);
-        assert_eq!(after.traditional_cost, before.traditional_cost);
-        let quantity = (
-            t.history.retired,
-            t.history.summary,
-            t.history.last_traditional_input,
-        );
-        let expected = (280000, 1000, if exact { 21100 + step * 100 } else { 21000 });
-        if quantity != expected
-            || after.initial_compactions != 1
-            || after.traditional_compactions != 0
-            || after.summary_cost != before.summary_cost
-            || (!exact && state(&t)["history_continuity"] != old_cursor)
-        {
-            differences.push(format!(
-                "step {step}: {quantity:?} vs {expected:?}; initialization {}",
-                after.initial_compactions
-            ));
-        }
-        saved = state(&t);
-    }
-    assert!(
-        differences.is_empty(),
-        "LEGACY_RAW_SEMANTIC_PROOF: exact={exact}: {differences:?}"
-    );
-}
-
-#[test]
-fn legacy_raw_marker_cursor_exact_proof_retains_native_growth() {
-    legacy_raw_marker_cursor_continuation(true);
-}
-
-#[test]
-fn legacy_raw_marker_cursor_changed_policy_stays_read_only_not_reinitialized() {
-    legacy_raw_marker_cursor_continuation(false);
-}
-
-// Review4430659252: a cursor-format upgrade is not a history edit. This stages
-// the predecessor's exact raw cursor shape, not a previous executable. Paired
-// current-format controls exercise the same real coordinator and restarted
-// continuations. Noodle's actual old/new CLI probe remains separate evidence.
-fn legacy_raw_cursor_preserves_recorded_lifetime_proof(proof: Option<bool>) {
+// Current semantic cursors preserve explicit true, false and unknown lifetime
+// identity across restart. Cursor agreement alone never grants equality.
+fn semantic_cursor_preserves_recorded_lifetime_proof(proof: Option<bool>) {
     use carry::models::{ScenarioCacheMode, ScenarioCachePolicy};
-    use sha2::{Digest, Sha256};
-    // Keep this migration fixture's forecast supported. Caller-data marker
-    // lookalikes belong to the separate semantic-projection boundary test;
-    // their current Unknown cache mode would hide the lifetime-proof failure.
+    // Keep this forecast supported; marker lookalikes have separate coverage.
     let request = json!({"model":"gpt-6.1-sol", "max_output_tokens":1,
         "prompt_cache_options":{"mode":"implicit","ttl":"30m"},
         "input":[{"role":"user","content":"unchanged paid history"}]});
@@ -312,7 +206,7 @@ fn legacy_raw_cursor_preserves_recorded_lifetime_proof(proof: Option<bool>) {
         policy.minimum_prefix_tokens,
         None,
     )
-    .expect("migration fixture needs a priced cold forecast");
+    .expect("current fixture needs a priced cold forecast");
     let warm = scenario_request_input_cost_resolved(
         &request,
         "gpt-6.1-sol",
@@ -321,7 +215,7 @@ fn legacy_raw_cursor_preserves_recorded_lifetime_proof(proof: Option<bool>) {
         policy.minimum_prefix_tokens,
         None,
     )
-    .expect("migration fixture needs a priced warm forecast");
+    .expect("current fixture needs a priced warm forecast");
     assert!(cold > warm && warm > 0.0);
     let mut seed = Trajectory::default();
     seed.primary(
@@ -339,110 +233,85 @@ fn legacy_raw_cursor_preserves_recorded_lifetime_proof(proof: Option<bool>) {
     );
     assert_eq!(seed_snapshot.traditional_cost, seed_snapshot.carry_cost);
     assert_eq!(state(&seed)["shared_primary_history"], json!(true));
-    let mut controls = Vec::new();
-    let mut differences = Vec::new();
-    for raw in [false, true] {
-        let mut saved = state(&seed);
-        match proof {
-            Some(value) => saved["shared_primary_history"] = json!(value),
-            None => {
-                saved
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("shared_primary_history");
-            }
-        }
-        if raw {
-            saved["history_continuity"]["cursor"] = json!({
-                "prefix":format!("{:x}", Sha256::digest(serde_json::to_vec(&request["input"]).unwrap())),
-                "items":request["input"].as_array().unwrap().len(), "input":2000, "at":100});
-        }
-        let mut request = request.clone();
-        for step in 0..2_usize {
-            let mut t: Trajectory = serde_json::from_value(saved).unwrap();
-            request["input"]
-                .as_array_mut()
+    let mut saved = state(&seed);
+    match proof {
+        Some(value) => saved["shared_primary_history"] = json!(value),
+        None => {
+            saved
+                .as_object_mut()
                 .unwrap()
-                .push(json!({"role":"user","content":format!("same append {step}")}));
-            let frozen = serde_json::to_value(t.snapshot()).unwrap();
-            t.load_receipt_history(&request, "raw-lifetime-proof", None, std::iter::empty());
-            assert_eq!(serde_json::to_value(t.snapshot()).unwrap(), frozen);
-            let loaded = state(&t);
-            t.load_receipt_history(&request, "raw-lifetime-proof", None, std::iter::empty());
-            assert_eq!(state(&t), loaded, "cursor conversion must be idempotent");
-            assert_eq!(
-                state(&t)["history_continuity"]["cursor"]["basis"],
-                json!("SemanticV1")
-            );
-            t.primary(
-                &request,
-                &terminal(2100 + step as u64 * 100, 0, 0, 0),
-                "raw-lifetime-proof",
-                101 + step as u64,
-                true,
-            );
-            let after = t.snapshot();
-            let actual = if step == 0 { 0.0082 } else { 0.0126 };
-            // Every paid/quantity/count guard executes before the new semantic
-            // failure, so a changed proof cannot conceal a broken fixture.
-            assert!((after.observed_primary_cost - actual).abs() < 1e-12);
-            assert_eq!(after.carry_cost, after.observed_primary_cost);
-            assert_eq!(after.coverage.primary_responses, 2 + step as u64);
-            assert_eq!(after.matched_primary_responses, 2 + step as u64);
-            assert_eq!(after.unavailable_primary_cost_calls, 0);
-            assert_eq!(after.excluded_unpriced_calls, 0);
-            assert_eq!(after.coverage.missing_usage, 0);
-            assert_eq!(after.coverage.unmodeled_calls, 0);
-            assert_eq!(after.observed_reviewer_cost, 0.0);
-            assert_eq!(after.reviewer_cost, 0.0);
-            assert_eq!(after.initial_compactions, 0);
-            assert_eq!(after.traditional_compactions, 0);
-            assert_eq!(after.summary_cost, 0.0);
-            assert_eq!((t.history.retired, t.history.summary), (0, 0));
-            assert_eq!(t.history.last_traditional_input, 2100 + step as u64 * 100);
-            saved = state(&t);
-            let view = json!({"proof":saved["shared_primary_history"], "estimate":after});
-            if !raw {
-                assert_eq!(
-                    saved["shared_primary_history"],
-                    json!(proof.unwrap_or(false))
-                );
-                if proof == Some(true) {
-                    assert!((after.traditional_cost - actual).abs() < 1e-12);
-                } else {
-                    // Exact cursor agreement must NOT promote missing/false
-                    // lifetime proof or copy the observed primary onto it.
-                    assert!((after.traditional_cost - actual).abs() > 1e-6);
-                }
-                controls.push(view);
-            } else if view != controls[step] {
-                differences.push(format!(
-                    "step {step}: proof {} vs {:?}, traditional {} vs {}",
-                    saved["shared_primary_history"],
-                    proof.unwrap_or(false),
-                    after.traditional_cost,
-                    controls[step]["estimate"]["traditional_cost"]
-                ));
-            }
+                .remove("shared_primary_history");
         }
     }
-    assert!(
-        differences.is_empty(),
-        "RAW_CURSOR_LIFETIME_PROOF: {differences:?}"
-    );
+    let mut request = request.clone();
+    for step in 0..2_usize {
+        let mut t: Trajectory = serde_json::from_value(saved.clone()).unwrap();
+        let mut expected = saved.clone();
+        if proof.is_none() {
+            // Missing equality proof defaults only to unproven, never identical.
+            expected["shared_primary_history"] = json!(false);
+        }
+        assert_eq!(state(&t), expected);
+        assert_eq!(
+            state(&t)["history_continuity"]["cursor"]["basis"],
+            json!("SemanticV1")
+        );
+        request["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":format!("same append {step}")}));
+        t.primary(
+            &request,
+            &terminal(2100 + step as u64 * 100, 0, 0, 0),
+            "raw-lifetime-proof",
+            101 + step as u64,
+            true,
+        );
+        let after = t.snapshot();
+        let actual = if step == 0 { 0.0082 } else { 0.0126 };
+        // Every paid/quantity/count guard executes before the new semantic
+        // failure, so a changed proof cannot conceal a broken fixture.
+        assert!((after.observed_primary_cost - actual).abs() < 1e-12);
+        assert_eq!(after.carry_cost, after.observed_primary_cost);
+        assert_eq!(after.coverage.primary_responses, 2 + step as u64);
+        assert_eq!(after.matched_primary_responses, 2 + step as u64);
+        assert_eq!(after.unavailable_primary_cost_calls, 0);
+        assert_eq!(after.excluded_unpriced_calls, 0);
+        assert_eq!(after.coverage.missing_usage, 0);
+        assert_eq!(after.coverage.unmodeled_calls, 0);
+        assert_eq!(after.observed_reviewer_cost, 0.0);
+        assert_eq!(after.reviewer_cost, 0.0);
+        assert_eq!(after.initial_compactions, 0);
+        assert_eq!(after.traditional_compactions, 0);
+        assert_eq!(after.summary_cost, 0.0);
+        assert_eq!((t.history.retired, t.history.summary), (0, 0));
+        assert_eq!(t.history.last_traditional_input, 2100 + step as u64 * 100);
+        saved = state(&t);
+        assert_eq!(
+            saved["shared_primary_history"],
+            json!(proof.unwrap_or(false))
+        );
+        if proof == Some(true) {
+            assert!((after.traditional_cost - actual).abs() < 1e-12);
+        } else {
+            // Exact cursor agreement must NOT promote missing/false
+            // lifetime proof or copy the observed primary onto it.
+            assert!((after.traditional_cost - actual).abs() > 1e-6);
+        }
+    }
 }
 
 #[test]
-fn legacy_raw_cursor_preserves_true_lifetime_proof_across_restart() {
-    legacy_raw_cursor_preserves_recorded_lifetime_proof(Some(true));
+fn semantic_cursor_preserves_true_lifetime_proof_across_restart() {
+    semantic_cursor_preserves_recorded_lifetime_proof(Some(true));
 }
 
 #[test]
-fn legacy_raw_cursor_does_not_promote_false_lifetime_proof_across_restart() {
-    legacy_raw_cursor_preserves_recorded_lifetime_proof(Some(false));
+fn semantic_cursor_does_not_promote_false_lifetime_proof_across_restart() {
+    semantic_cursor_preserves_recorded_lifetime_proof(Some(false));
 }
 
 #[test]
-fn legacy_raw_cursor_does_not_infer_missing_lifetime_proof_across_restart() {
-    legacy_raw_cursor_preserves_recorded_lifetime_proof(None);
+fn semantic_cursor_does_not_infer_missing_lifetime_proof_across_restart() {
+    semantic_cursor_preserves_recorded_lifetime_proof(None);
 }

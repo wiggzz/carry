@@ -1,7 +1,5 @@
-// Tests-first load/continuation boundary for review5712117725. These are old
-// opaque receipt histories, not genuinely new windows and not typed cursors.
-// Older fixtures omit both the typed cursor and its load-schema disposition.
-fn legacy_history_continuation(proof: &str, initialized: bool) {
+// Current-format paid/free history, immutable boundaries and restarted growth.
+fn current_history_continuation(initialized: bool) {
     use carry::models::{Route, resolve_model};
     let current = resolve_model(
         "gpt-6.1-sol",
@@ -58,35 +56,11 @@ fn legacy_history_continuation(proof: &str, initialized: bool) {
     assert_eq!(t.history.summary, 1000);
     assert_eq!(t.history.last_traditional_input, 21300);
     let boundaries = serde_json::to_value(&before.cache_policy_boundaries).unwrap();
-    let mut legacy = state(&t);
-    legacy.as_object_mut().unwrap().remove("history_continuity");
-    legacy
-        .as_object_mut()
-        .unwrap()
-        .remove("receipt_history_load");
-    legacy
-        .as_object_mut()
-        .unwrap()
-        .remove("shared_primary_history");
-    legacy["receipts"]["history_anchor"] = legacy["receipts"]["anchor"].clone();
-    match proof {
-        "complete" => {}
-        "missing" => {
-            legacy["receipts"]["configuration"] = Value::Null;
-            legacy["receipts"]["history_anchor"] = Value::Null;
-            legacy["receipts"]["anchor"] = Value::Null;
-        }
-        "conflicting" => {
-            // A well-formed opaque digest, but not the frozen anchor's contract.
-            legacy["receipts"]["configuration"] = json!("0".repeat(64));
-        }
-        _ => unreachable!(),
-    }
-    // Decoder normalization is allowed; quantities/money cannot change and the
-    // normalized representation must be idempotent on a second load.
-    let mut normalized = None;
+    // The current representation must load identically before extension.
+    let mut saved = state(&t);
+    let frozen = saved.clone();
     for _ in 0..2 {
-        t = serde_json::from_value(legacy.clone()).unwrap();
+        t = serde_json::from_value(saved.clone()).unwrap();
         let loaded = t.snapshot();
         assert_eq!(loaded.observed_primary_cost, before.observed_primary_cost);
         assert_eq!(loaded.observed_reviewer_cost, before.observed_reviewer_cost);
@@ -105,11 +79,8 @@ fn legacy_history_continuation(proof: &str, initialized: bool) {
         assert_eq!(t.history.retired, 280000);
         assert_eq!(t.history.summary, 1000);
         assert_eq!(t.history.last_traditional_input, 21300);
-        legacy = state(&t);
-        if let Some(first) = &normalized {
-            assert_eq!(&legacy, first);
-        }
-        normalized = Some(legacy.clone());
+        saved = state(&t);
+        assert_eq!(saved, frozen);
     }
     let mut mismatches = Vec::new();
     let mut observed = before.observed_primary_cost;
@@ -145,25 +116,17 @@ fn legacy_history_continuation(proof: &str, initialized: bool) {
             serde_json::to_value(&after.cache_policy_boundaries).unwrap(),
             boundaries
         );
-        let expected_input = if proof == "complete" {
-            21400 + step * 100
-        } else {
-            21300
-        };
-        let expected_matched =
-            before.matched_primary_responses + if proof == "complete" { step + 1 } else { 0 };
-        let expected_excluded =
-            before.excluded_unpriced_calls + if proof == "complete" { 0 } else { step + 1 };
-        if proof == "complete" {
-            comparison += scenario_input_cost_resolved(
-                "gpt-6.1-sol",
-                expected_input,
-                expected_input - 100,
-                Some(1024),
-                Some(&current),
-            )
-            .unwrap();
-        }
+        let expected_input = 21400 + step * 100;
+        let expected_matched = before.matched_primary_responses + step + 1;
+        let expected_excluded = before.excluded_unpriced_calls;
+        comparison += scenario_input_cost_resolved(
+            "gpt-6.1-sol",
+            expected_input,
+            expected_input - 100,
+            Some(1024),
+            Some(&current),
+        )
+        .unwrap();
         if after.initial_compactions != before.initial_compactions
             || after.traditional_compactions != before.traditional_compactions
             || after.summary_cost != before.summary_cost
@@ -173,13 +136,8 @@ fn legacy_history_continuation(proof: &str, initialized: bool) {
             || after.matched_primary_responses != expected_matched
             || after.excluded_unpriced_calls != expected_excluded
             || (after.traditional_cost - comparison).abs() >= 1e-12
-            || (after.carry_cost
-                - if proof == "complete" {
-                    before.carry_cost + observed - before.observed_primary_cost
-                } else {
-                    before.carry_cost
-                })
-            .abs()
+            || (after.carry_cost - (before.carry_cost + observed - before.observed_primary_cost))
+                .abs()
                 >= 1e-12
         {
             mismatches.push(
@@ -195,33 +153,13 @@ fn legacy_history_continuation(proof: &str, initialized: bool) {
     }
     assert!(
         mismatches.is_empty(),
-        "LEGACY_HISTORY_PROOF: missing/conflicting proof must freeze legacy history and comparisons, never adopt/reinitialize it; proof={proof}, initialized={initialized}, mismatches={mismatches:?}"
+        "CURRENT_HISTORY_CONTINUITY: initialized={initialized}, mismatches={mismatches:?}"
     );
 }
 
 #[test]
-fn legacy_exact_contract_retains_growth_and_frozen_money_across_reloads() {
+fn current_history_retains_growth_and_frozen_money_across_reloads() {
     for initialized in [true, false] {
-        legacy_history_continuation("complete", initialized);
+        current_history_continuation(initialized);
     }
-}
-
-#[test]
-fn legacy_missing_contract_keeps_free_history_read_only_across_reloads() {
-    legacy_history_continuation("missing", true);
-}
-
-#[test]
-fn legacy_missing_contract_keeps_paid_history_read_only_across_reloads() {
-    legacy_history_continuation("missing", false);
-}
-
-#[test]
-fn legacy_conflicting_contract_keeps_free_history_read_only_across_reloads() {
-    legacy_history_continuation("conflicting", true);
-}
-
-#[test]
-fn legacy_conflicting_contract_keeps_paid_history_read_only_across_reloads() {
-    legacy_history_continuation("conflicting", false);
 }

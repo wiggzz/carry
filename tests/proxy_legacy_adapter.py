@@ -1,4 +1,4 @@
-"""Complete legacy proof must describe the final subscription wire.
+"""Current history continuity follows the final subscription wire.
 
 Real CLI/SSE, synthetic auth and native usage, loopback only. The control holds
 instructions/key fixed; independent arms add stripped options or fold instruction
@@ -47,7 +47,7 @@ class LegacyAdapterLoads(unittest.TestCase):
                   "prompt_cache_key": "legacy-adapter-stable-key"}
         if controls:
             # All these disappear on subscription transport. They must remain
-            # client-facing inputs to admission, not legacy wire proof inputs.
+            # client-facing inputs to admission, not wire proof inputs.
             fields.update(max_output_tokens=1, max_completion_tokens=1,
                           prompt_cache_options={"mode": "implicit", "ttl": "30m"},
                           prompt_cache_retention="30m", stream_options={})
@@ -107,29 +107,24 @@ class LegacyAdapterLoads(unittest.TestCase):
         paid_before = sum(n * (4 if n > 272000 else 2) / 1e6 for n in inputs[:3])
         self.assertAlmostEqual(before["observed_primary_cost"], paid_before, places=12)
 
-        # The proof is produced by actual adapted dispatch, never reconstructed
-        # by the fixture. Strip ONLY new owner/events to stage complete legacy.
+        # Current cursor proof comes from real adapted dispatch. Remove only
+        # modeled cache evidence; never rewrite the cursor or infer a write.
         checkpoint = next(self.harness.state.glob("*.json"))
         owner = checkpoint.stem
-        def older_shape(target):
+        def without_cache(target):
             trajectory = target["cost_trajectory"]
-            for name in ("history_continuity", "receipt_history_load", "shared_primary_history"):
-                trajectory.pop(name, None)
-            receipts = trajectory["receipts"]
-            receipts.pop("modeled_cache", None)
-            receipts["history_anchor"] = copy.deepcopy(receipts["anchor"])
-            self.assertIsNotNone(receipts["configuration"])
-            self.assertEqual(receipts["configuration"], receipts["history_anchor"]["configuration"])
-            self.assertEqual(receipts["history_anchor"]["items"], len(expected_wires[-1]["input"]))
-            self.assertEqual(receipts["history_anchor"]["input"], inputs[2])
+            trajectory["receipts"].pop("modeled_cache", None)
+            self.assertEqual(trajectory["history_continuity"]["cursor"]["items"],
+                             len(expected_wires[-1]["input"]))
+            self.assertEqual(trajectory["history_continuity"]["cursor"]["input"], inputs[2])
             return target
-        staged = older_shape(copy.deepcopy(saved))
+        staged = without_cache(copy.deepcopy(saved))
         checkpoint.write_text(json.dumps(staged))
         index_path = self.harness.state / "history.index"
         index = json.loads(index_path.read_text())
         if shared:
             self.assertIn(owner, index["snapshots"])
-            index["snapshots"][owner] = older_shape(index["snapshots"][owner])
+            index["snapshots"][owner] = without_cache(index["snapshots"][owner])
             self.assertEqual(index["snapshots"][owner]["cost_trajectory"], staged["cost_trajectory"])
             index_path.write_text(json.dumps(index))
         self.evidence.update(shared=shared, controls=controls, folded=folded,
@@ -174,7 +169,7 @@ class LegacyAdapterLoads(unittest.TestCase):
             trajectory = state["cost_trajectory"]
             with self.subTest(step=step, shared=shared, controls=controls, folded=folded):
                 self.assertEqual(after["matched_primary_responses"], 4 + step,
-                                 "LEGACY_ADAPTED_WIRE: unchanged native growth must remain comparable")
+                                 "CURRENT_ADAPTED_WIRE: unchanged native growth must remain comparable")
                 self.assertEqual(after["excluded_unpriced_calls"], 0)
                 self.assertEqual((trajectory["retired"], trajectory["summary"],
                                   trajectory["last_traditional_input"]),
@@ -185,13 +180,13 @@ class LegacyAdapterLoads(unittest.TestCase):
                 self.assertGreater(after["traditional_cost"], snapshots[step - 1]["traditional_cost"]
                                    if step else before["traditional_cost"])
                 previous_cost = snapshots[step - 1]["traditional_cost"] if step else before["traditional_cost"]
-                # Eventless legacy has no timed write: first continuation is
+                # Eventless current history has no timed write: first continuation is
                 # cold, then the new hypothetical write warms only its prefix.
                 expected_increment = (21200 * 2.5 if step == 0 else
                                       21200 * .1 + 100 * 2.5) / 1e6
                 self.assertAlmostEqual(after["traditional_cost"] - previous_cost,
                                        expected_increment, places=12,
-                                       msg="LEGACY_ADAPTED_PRICE: cold once, then original prefix plus new suffix")
+                                       msg="CURRENT_ADAPTED_PRICE: cold once, then original prefix plus new suffix")
 
 
 def install_cases():
@@ -202,7 +197,7 @@ def install_cases():
             owner = "indexed" if shared else "explicit"
             spelling = "stripped" if controls else "omitted"
             roles = "folded" if folded else "fixed"
-            setattr(LegacyAdapterLoads, f"test_{owner}_{spelling}_{roles}_legacy_restart", case)
+            setattr(LegacyAdapterLoads, f"test_{owner}_{spelling}_{roles}_current_restart", case)
 
 
 install_cases()

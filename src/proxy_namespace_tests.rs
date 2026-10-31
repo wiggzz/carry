@@ -346,28 +346,15 @@ fn unsupported_receipt_history_rejects_before_loading_persisted_authority() {
                 assert_eq!(std::fs::read(&mirror_path).unwrap(), mirror);
             }
             for shape in [
-                "opaque_anchor",
+                "unversioned",
                 "missing_cursor_basis",
                 "raw_cursor",
-                "read_only_legacy",
+                "unsupported_format",
             ] {
                 let mut unsupported = frozen.clone();
                 match shape {
-                    "opaque_anchor" => {
-                        unsupported
-                            .as_object_mut()
-                            .unwrap()
-                            .remove("history_continuity");
-                        unsupported
-                            .as_object_mut()
-                            .unwrap()
-                            .remove("receipt_history_load");
-                        unsupported
-                            .as_object_mut()
-                            .unwrap()
-                            .remove("shared_primary_history");
-                        unsupported["receipts"]["history_anchor"] =
-                            unsupported["receipts"]["anchor"].clone();
+                    "unversioned" => {
+                        unsupported.as_object_mut().unwrap().remove("format");
                     }
                     "missing_cursor_basis" => {
                         unsupported["history_continuity"]["cursor"]
@@ -378,8 +365,8 @@ fn unsupported_receipt_history_rejects_before_loading_persisted_authority() {
                     "raw_cursor" => {
                         unsupported["history_continuity"]["cursor"]["basis"] = json!("RawV1")
                     }
-                    "read_only_legacy" => {
-                        unsupported["receipt_history_load"] = json!("ReadOnlyLegacyV1")
+                    "unsupported_format" => {
+                        unsupported["format"] = json!("unsupported-accounting-format")
                     }
                     _ => unreachable!(),
                 }

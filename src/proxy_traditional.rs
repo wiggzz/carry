@@ -55,17 +55,14 @@ impl HistoryContract {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct NativeInputCursor {
-    #[serde(default)]
     basis: InputBasis,
     prefix: String,
     items: usize,
     input: u64,
     at: u64,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 enum InputBasis {
-    #[default]
-    RawV1,
     SemanticV1,
 }
 impl NativeInputCursor {
@@ -95,13 +92,12 @@ pub(super) struct HistoryContinuity {
     cursor: NativeInputCursor,
 }
 
-/// Kept in the existing atomic trajectory, with the old numeric field names for
-/// persisted readers. Cache eligibility and monetary interpretation have no
-/// mutable access through this API. The legacy decoder is a separate boundary.
+/// Kept in the existing atomic trajectory. Cache eligibility and monetary
+/// interpretation have no mutable access through this API.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct TraditionalHistoryState {
     // Proof for the entire comparison history, not a last-plan/no-op flag.
-    // Missing legacy proof never opts into sharing a provider observation.
+    // Missing proof never opts into sharing a provider observation.
     #[serde(default)]
     shared_primary_history: crate::savings::PrimaryHistory,
     pub(super) retired: u64,
@@ -109,16 +105,6 @@ pub(super) struct TraditionalHistoryState {
     pub(super) last_traditional_input: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) history_continuity: Option<HistoryContinuity>,
-    // Missing only in old checkpoints. The input-bound load adapter classifies
-    // those once, before reserving a paid request; settlement never reconstructs
-    // opaque history contracts or promotes unknown legacy history to a new one.
-    #[serde(default)]
-    pub(super) receipt_history_load: Option<ReceiptHistoryLoad>,
-}
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(super) enum ReceiptHistoryLoad {
-    StructuredV1,
-    ReadOnlyLegacyV1,
 }
 impl Default for TraditionalHistoryState {
     fn default() -> Self {
@@ -128,7 +114,6 @@ impl Default for TraditionalHistoryState {
             summary: 0,
             last_traditional_input: 0,
             history_continuity: None,
-            receipt_history_load: Some(ReceiptHistoryLoad::StructuredV1),
         }
     }
 }
@@ -150,66 +135,6 @@ impl TraditionalHistoryState {
 
     pub(super) fn diverge(&mut self) {
         self.shared_primary_history.diverge();
-    }
-
-    pub(super) fn read_only_legacy(&self) -> bool {
-        matches!(
-            self.receipt_history_load,
-            Some(ReceiptHistoryLoad::ReadOnlyLegacyV1)
-        )
-    }
-
-    /// One-time input-bound conversion of the old opaque raw-item cursor.
-    /// Only the exact prior raw prefix can prove which semantic input it named.
-    /// An unprovable prefix stays frozen/read-only, never a fresh history.
-    pub(super) fn load_input_cursor(&mut self, body: &Value) {
-        if self.read_only_legacy() {
-            return;
-        }
-        let Some(prior) = &mut self.history_continuity else {
-            return;
-        };
-        if prior.cursor.basis != InputBasis::RawV1 {
-            return;
-        }
-        let prefix = body["input"]
-            .as_array()
-            .and_then(|items| items.get(..prior.cursor.items));
-        if let Some(prefix) = prefix
-            && format!("{:x}", Sha256::digest(serde_json::to_vec(prefix).unwrap()))
-                == prior.cursor.prefix
-        {
-            prior.cursor.prefix = NativeInputCursor::prefix(prefix);
-            prior.cursor.basis = InputBasis::SemanticV1;
-            // Only the cursor representation changed. Preserve separately saved
-            // lifetime equality; a missing or false value remains unproven.
-        } else {
-            self.receipt_history_load = Some(ReceiptHistoryLoad::ReadOnlyLegacyV1);
-        }
-    }
-
-    pub(super) fn load_legacy_cursor(
-        &mut self,
-        contract: HistoryContract,
-        prefix: String,
-        items: usize,
-        input: u64,
-        at: u64,
-    ) {
-        self.history_continuity = Some(HistoryContinuity {
-            contract,
-            cursor: NativeInputCursor {
-                basis: InputBasis::RawV1,
-                prefix,
-                items,
-                input,
-                at,
-            },
-        });
-        // The legacy cursor proves continuity, not lifetime identity of both
-        // branches and not a provider write. Never manufacture sharing proof.
-        self.diverge();
-        self.receipt_history_load = Some(ReceiptHistoryLoad::StructuredV1);
     }
 
     pub(super) fn compatible(

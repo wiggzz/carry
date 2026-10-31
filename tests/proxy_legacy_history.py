@@ -1,8 +1,7 @@
-"""Legacy history through real Session loaders, not Trajectory serde alone.
+"""Current history through real explicit and canonical-index Session loaders.
 
-Synthetic native totals, loopback-only providers and private state. Old checkpoints
-have no modeled write events: an opaque response timestamp cannot supply one.
-Both explicit checkpoint and implicit canonical-index authority are exercised.
+Synthetic native totals, loopback-only providers and private state. Explicitly
+absent modeled write events cannot gain warmth from an observation timestamp.
 """
 import copy
 import http.client
@@ -41,7 +40,7 @@ class LegacyHistoryLoads(unittest.TestCase):
         self.addCleanup(lambda: self.assertTrue(self.harness.doCleanups(),
                                                "nested fixture cleanup failed"))
 
-    def lifecycle(self, *, shared, proof, initialized):
+    def lifecycle(self, *, shared, initialized):
         inputs = ([] if initialized else [10000]) + [300000, 300100, 300200, 300300,
                                                               300400, 300500]
         seed_count = len(inputs) - 2
@@ -103,38 +102,24 @@ class LegacyHistoryLoads(unittest.TestCase):
         paid_before = sum(n * (4 if n > 272000 else 2) / 1e6 for n in inputs[:seed_count])
         self.assertAlmostEqual(before["observed_primary_cost"], paid_before, places=12)
 
-        # Alter only owned checkpoint fixtures with the process stopped. An
-        # implicit mirror is NOT authority: stage the same older shape in its
-        # canonical index snapshot and prove which target was actually altered.
+        # Keep the current schema and exact cursor. Explicitly discard only
+        # hypothetical write evidence to exercise cold-once/rewarm behavior.
+        # Shared snapshots, not mirrors, are the authoritative load target.
         checkpoint = next(self.harness.state.glob("*.json"))
         owner = checkpoint.stem
-        def older_shape(target):
-            t = target["cost_trajectory"]
-            t.pop("history_continuity", None)
-            t.pop("receipt_history_load", None)
-            t.pop("shared_primary_history", None)
-            r = t["receipts"]
-            r.pop("modeled_cache", None)
-            r["history_anchor"] = copy.deepcopy(r["anchor"])
-            if proof == "missing":
-                r["configuration"] = None
-                r["anchor"] = None
-                r["history_anchor"] = None
-            elif proof == "conflicting":
-                r["configuration"] = "0" * 64
-            else:
-                self.assertEqual(proof, "complete")
+        def without_cache(target):
+            target["cost_trajectory"]["receipts"].pop("modeled_cache", None)
             return target
-        staged = older_shape(copy.deepcopy(saved))
+        staged = without_cache(copy.deepcopy(saved))
         checkpoint.write_text(json.dumps(staged))
         index_path = self.harness.state / "history.index"
         index = json.loads(index_path.read_text())
         if shared:
             self.assertIn(owner, index["snapshots"])
-            index["snapshots"][owner] = older_shape(index["snapshots"][owner])
+            index["snapshots"][owner] = without_cache(index["snapshots"][owner])
             self.assertEqual(index["snapshots"][owner]["cost_trajectory"], staged["cost_trajectory"])
             index_path.write_text(json.dumps(index))
-        self.evidence.update(shared=shared, proof=proof, initialized=initialized,
+        self.evidence.update(shared=shared, initialized=initialized,
                              before=before, staged=staged, owner=owner,
                              staged_index=index if shared else None)
 
@@ -150,7 +135,7 @@ class LegacyHistoryLoads(unittest.TestCase):
                         "traditional_compactions", "cache_policy_boundaries"):
                 expected = snapshots[-1] if snapshots else before
                 self.assertEqual(loaded.get(key), expected.get(key), f"load changed {key}")
-            history.append({"role": "user", "content": f"after older load {step}"})
+            history.append({"role": "user", "content": f"after restarted load {step}"})
             self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
             wires.append(copy.deepcopy(history))
             after = snapshot(proxy)
@@ -181,44 +166,34 @@ class LegacyHistoryLoads(unittest.TestCase):
         expected_comparison = before["traditional_cost"]
         for step, (after, state) in enumerate(zip(snapshots, states)):
             t = state["cost_trajectory"]
-            with self.subTest(step=step, shared=shared, proof=proof):
+            with self.subTest(step=step, shared=shared):
                 self.assertEqual(after.get("initial_compactions", 0), int(initialized),
-                                 "LEGACY_SESSION_HISTORY: load must not grant another initialization")
+                                 "CURRENT_SESSION_HISTORY: load must not grant another initialization")
                 self.assertEqual(after["traditional_compactions"], int(not initialized))
                 self.assertEqual(after["summary_cost"], before["summary_cost"])
                 self.assertEqual((t["retired"], t["summary"]), (280000, 1000))
-                if proof == "complete":
-                    incoming = 21400 + step * 100
-                    # Complete history proof is not cache-write evidence. The
-                    # first older eventless continuation must be cold; the next
-                    # has a genuinely new modeled event from that continuation.
-                    expected_comparison += (incoming * 2.5 if step == 0 else
-                                            21400 * .1 + 100 * 2.5) / 1e6
-                    self.assertEqual(t["last_traditional_input"], incoming)
-                    self.assertEqual(after["matched_primary_responses"],
-                                     before["matched_primary_responses"] + step + 1)
-                    self.assertEqual(after["excluded_unpriced_calls"], 0)
-                    self.assertAlmostEqual(after["traditional_cost"], expected_comparison, places=12,
-                                           msg="LEGACY_SESSION_CACHE: no write may be inferred from old observation time")
-                else:
-                    self.assertEqual(t["last_traditional_input"], 21300,
-                                     "LEGACY_SESSION_HISTORY: unproven legacy quantities are read-only")
-                    self.assertEqual(after["matched_primary_responses"], before["matched_primary_responses"],
-                                     "LEGACY_SESSION_HISTORY: unproven continuation cannot add matched pairs")
-                    self.assertEqual(after["excluded_unpriced_calls"], step + 1)
-                    self.assertEqual(after["traditional_cost"], before["traditional_cost"])
-                    self.assertEqual(after["carry_cost"], before["carry_cost"])
+                incoming = 21400 + step * 100
+                # Complete history proof is not cache-write evidence. The
+                # first eventless continuation must be cold; the next
+                # has a genuinely new modeled event from that continuation.
+                expected_comparison += (incoming * 2.5 if step == 0 else
+                                        21400 * .1 + 100 * 2.5) / 1e6
+                self.assertEqual(t["last_traditional_input"], incoming)
+                self.assertEqual(after["matched_primary_responses"],
+                                 before["matched_primary_responses"] + step + 1)
+                self.assertEqual(after["excluded_unpriced_calls"], 0)
+                self.assertAlmostEqual(after["traditional_cost"], expected_comparison, places=12,
+                                       msg="CURRENT_SESSION_CACHE: no write may be inferred from old observation time")
 
 
 def install_cases():
     for shared in (False, True):
-        for proof in ("complete", "missing", "conflicting"):
-            for initialized in (False, True):
-                def case(self, shared=shared, proof=proof, initialized=initialized):
-                    self.lifecycle(shared=shared, proof=proof, initialized=initialized)
-                owner = "indexed" if shared else "explicit"
-                history = "free" if initialized else "paid"
-                setattr(LegacyHistoryLoads, f"test_{owner}_{proof}_{history}_eventless_restart", case)
+        for initialized in (False, True):
+            def case(self, shared=shared, initialized=initialized):
+                self.lifecycle(shared=shared, initialized=initialized)
+            owner = "indexed" if shared else "explicit"
+            history = "free" if initialized else "paid"
+            setattr(LegacyHistoryLoads, f"test_{owner}_{history}_current_eventless_restart", case)
 
 
 install_cases()
