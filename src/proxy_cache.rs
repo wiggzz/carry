@@ -391,7 +391,7 @@ pub(super) fn observe(
         // Capability plus a full native write receipt supplies request-interval
         // proof. Unknown/mixed lifetime and explicitly limited write extents do
         // not establish whole-input retention. Never infer population from hits.
-        (quantities.partition() == Some((total, 0, total))
+        (quantities.whole_written_input() == Some(total)
             && end == body["input"].as_array().unwrap().len()
             && carry::models::cache_write_tariff_known(body)
             && not_before <= at)

@@ -348,7 +348,14 @@ impl CacheTracker {
         self.pending_history = history.to_vec();
     }
 
+    #[cfg(test)]
     fn observe(&mut self, usage: &Usage) {
+        // Existing native seam fixtures explicitly declare numeric receipts.
+        // Real transport observations below must preserve raw field presence.
+        self.observe_receipt(&serde_json::to_value(usage).unwrap());
+    }
+
+    fn observe_receipt(&mut self, usage: &Value) {
         // Receipts retain their native quantities/money, but cannot attest to
         // cache entitlement on an unknown gateway or subscription transport.
         let Some(capabilities) = self.capabilities else {
@@ -358,11 +365,13 @@ impl CacheTracker {
             return;
         };
         let now = Instant::now();
-        let cache_activity = usage.cached_input_tokens > 0 || usage.cache_write_input_tokens > 0;
-        let estimated_cache_write = self
-            .implicit_minimum_prefix_tokens
-            .is_some_and(|minimum| self.pending_request_tokens >= minimum);
-        if cache_activity || estimated_cache_write {
+        let quantities = carry::core::CacheUsage::from_receipt(usage);
+        let cached_input_tokens = quantities.read().map_or(0, |(_, cached)| cached);
+        let whole_write = quantities.whole_written_input().is_some_and(|input| {
+            self.implicit_minimum_prefix_tokens
+                .is_some_and(|minimum| input >= minimum as u64)
+        });
+        if whole_write {
             self.implicit_activity = Some(now);
             self.implicit_cached_tokens = self.pending_request_tokens;
             self.implicit_prefix.clone_from(&self.pending_history);
@@ -372,7 +381,7 @@ impl CacheTracker {
             .iter()
             .rev()
             .take(capabilities.max_read_breakpoints)
-            .filter(|breakpoint| breakpoint.prefix_tokens <= usage.cached_input_tokens as usize)
+            .filter(|breakpoint| breakpoint.prefix_tokens <= cached_input_tokens as usize)
             .filter(|breakpoint| {
                 self.breakpoints
                     .get(&breakpoint.generation)
@@ -386,7 +395,7 @@ impl CacheTracker {
             tracked.activity = Some(now);
         }
 
-        if usage.cache_write_input_tokens > 0 {
+        if whole_write {
             let explicit_write_slots =
                 capabilities
                     .max_write_breakpoints
@@ -905,7 +914,7 @@ async fn run_loop(
         }
         metrics.record(&reply.usage, reply.latency_ms, reply.response_retries);
         sent_model_request = true;
-        cache.observe(&reply.usage);
+        cache.observe_receipt(&reply.raw["usage"]);
         logger.raw_event(
             "model_response",
             json!({
@@ -1948,6 +1957,44 @@ mod tests {
     }
 
     #[test]
+    fn native_population_preserves_raw_partition_provenance() {
+        let history = [json!({"role":"user", "content":"synthetic exact local rendering"})];
+        let whole = json!({"input_tokens":5_000,
+            "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":5_000}});
+        let alternate = json!({"input_tokens":5_000,"cached_input_tokens":0,
+            "cache_creation_input_tokens":5_000});
+        let mut disagreeing_read = whole.clone();
+        disagreeing_read["cached_input_tokens"] = json!(1);
+        let mut disagreeing_write = whole.clone();
+        disagreeing_write["cache_creation_input_tokens"] = json!(1);
+        let mut malformed_write = whole.clone();
+        malformed_write["cache_creation_input_tokens"] = json!("5000");
+        let mut results = Vec::new();
+        for raw in [
+            whole,
+            alternate,
+            disagreeing_read,
+            disagreeing_write,
+            malformed_write,
+            json!({"input_tokens":5_000,"cache_write_input_tokens":5_000}),
+            json!({"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0}),
+            Value::Null,
+        ] {
+            let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+            cache.begin_request_with_history(Vec::new(), &history, 2_400);
+            cache.observe_receipt(&raw);
+            results.push(
+                cache
+                    .policy_for_history(&history, 1, 10)
+                    .implicit_cached_tokens,
+            );
+        }
+        // Full native counts locate the submitted rendering, not 5_000 local
+        // tokens. No output usage or monetary tariff is needed for this fact.
+        assert_eq!(results, [2_400, 2_400, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
     fn tracker_respects_resolved_minimum_and_write_slots() {
         let mut cache = CacheTracker::new(Some(PromptCacheCapabilities {
             minimum_prefix_tokens: 2_000,
@@ -1970,6 +2017,7 @@ mod tests {
             },
         ]);
         cache.observe(&Usage {
+            input_tokens: 9_000,
             cache_write_input_tokens: 9_000,
             ..Usage::default()
         });
@@ -2177,6 +2225,7 @@ mod tests {
         let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
         cache.begin_request_with_tokens(Vec::new(), 2_400);
         cache.observe(&Usage {
+            input_tokens: 2_400,
             cache_write_input_tokens: 2_400,
             ..Usage::default()
         });
@@ -2200,6 +2249,7 @@ mod tests {
         let original = vec![json!({"role": "user", "content": "original"})];
         cache.begin_request_with_history(Vec::new(), &original, 2_400);
         cache.observe(&Usage {
+            input_tokens: 2_400,
             cache_write_input_tokens: 2_400,
             ..Usage::default()
         });
@@ -2241,6 +2291,7 @@ mod tests {
             },
         ]);
         cache.observe(&Usage {
+            input_tokens: 7_200,
             cache_write_input_tokens: 7_200,
             ..Usage::default()
         });
@@ -2270,6 +2321,7 @@ mod tests {
             prefix_tokens: 1_200,
         }]);
         cache.observe(&Usage {
+            input_tokens: 1_200,
             cache_write_input_tokens: 1_200,
             ..Usage::default()
         });
@@ -2295,6 +2347,7 @@ mod tests {
                 .collect(),
         );
         cache.observe(&Usage {
+            input_tokens: 8_000,
             cache_write_input_tokens: 8_000,
             ..Usage::default()
         });

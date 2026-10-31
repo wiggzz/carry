@@ -131,6 +131,14 @@ impl CacheUsage {
         (written <= self.input?).then_some(written)
     }
 
+    /// A native full-input write locates the submitted rendering; partial or
+    /// conflicting aggregates cannot establish a local prefix. This is quantity
+    /// proof only: route entitlement and a bounded write clock remain separate.
+    pub fn whole_written_input(&self) -> Option<u64> {
+        let (input, cached, written) = self.partition()?;
+        (input > 0 && cached == 0 && written == input).then_some(input)
+    }
+
     /// Responses: absent optional writes mean no reported write for pricing;
     /// absent reads, invalid aliases and overlapping partitions remain unknown.
     pub fn partition(&self) -> Option<(u64, u64, u64)> {
