@@ -208,6 +208,13 @@ fn gc(index: &mut Index, pins: &HashSet<String>) {
     }
     index.nodes.retain(|key, _| reachable.contains(key));
 }
+fn within_capacity(service: &Service, index: &Index, bytes: usize) -> bool {
+    index.nodes.len() <= service.config.history_max_nodes as usize
+        && index.tips.len() + index.reviews.len() + index.transcripts.len()
+            <= service.config.history_max_references as usize
+        && bytes <= service.config.history_max_bytes as usize
+}
+
 fn prune(service: &Service, index: &mut Index) -> bool {
     let at = now();
     crate::proxy_cache::trim(&mut index.upstream_cache, at);
@@ -223,11 +230,7 @@ fn prune(service: &Service, index: &mut Index) -> bool {
         .retain(|_, r| r.at <= at && at - r.at < service.config.history_max_age_secs);
     loop {
         gc(index, &pins);
-        if index.nodes.len() <= service.config.history_max_nodes as usize
-            && index.tips.len() + index.reviews.len() + index.transcripts.len()
-                <= service.config.history_max_references as usize
-            && serde_json::to_vec(index).unwrap().len() <= service.config.history_max_bytes as usize
-        {
+        if within_capacity(service, index, serde_json::to_vec(index).unwrap().len()) {
             return true;
         }
         let review = index
@@ -304,8 +307,9 @@ pub(super) fn namespace(
             "history namespace upgrade unavailable",
         )
     })? {
-        let prior = index.snapshots.keys().cloned().collect();
-        persist(service, index, prior, None).map_err(|_| {
+        // A representation change may not evict retained authority to fit.
+        // Admit the complete generation through the same bounded atomic writer.
+        write_index(service, &index).map_err(|_| {
             failure(
                 StatusCode::INSUFFICIENT_STORAGE,
                 "history namespace upgrade not persisted",
@@ -630,13 +634,25 @@ fn persist(
             "history capacity held by active owners",
         ));
     }
+    write_index(service, &index)?;
+    for stale in prior.into_iter().chain(owner.map(str::to_owned)) {
+        if !index.snapshots.contains_key(&stale) {
+            let _ = std::fs::remove_file(service.config.state_dir.join(format!("{stale}.json")));
+        }
+    }
+    Ok(())
+}
+
+// Capacity admission and atomic publication do not imply retention eviction.
+// Ordinary updates prune first; migrations must fit without discarding proof.
+fn write_index(service: &Service, index: &Index) -> std::io::Result<()> {
     // Validate the exact bytes that will become authority before opening the
-    // temporary file. No failed publication may replace a readable generation.
-    let bytes = serde_json::to_vec(&index)?;
-    if bytes.len() > service.config.history_max_bytes as usize {
+    // temporary file. No failed admission may replace a readable generation.
+    let bytes = serde_json::to_vec(index)?;
+    if !within_capacity(service, index, bytes.len()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::StorageFull,
-            "history index exceeds configured byte bound",
+            "history index exceeds configured capacity",
         ));
     }
     let temporary = service.config.state_dir.join(".history-index.tmp");
@@ -644,13 +660,7 @@ fn persist(
     file.write_all(&bytes)?;
     file.sync_all()?;
     std::fs::rename(temporary, service.config.state_dir.join("history.index"))?;
-    File::open(&service.config.state_dir)?.sync_all()?;
-    for stale in prior.into_iter().chain(owner.map(str::to_owned)) {
-        if !index.snapshots.contains_key(&stale) {
-            let _ = std::fs::remove_file(service.config.state_dir.join(format!("{stale}.json")));
-        }
-    }
-    Ok(())
+    File::open(&service.config.state_dir)?.sync_all()
 }
 
 /// Only actual terminal observations mutate cache evidence. Session/reviewer
