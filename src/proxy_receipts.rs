@@ -41,6 +41,8 @@ struct Anchor {
     items: usize,
     input: u64,
     local_input: u64,
+    // Observation ordering for native append prediction, not cache write time.
+    at: u64,
 }
 
 impl Receipts {
@@ -540,6 +542,7 @@ impl Trajectory {
             items: items.len(),
             input: native.input_tokens,
             local_input: local,
+            at,
         };
         let receipts = self.receipts.as_mut().unwrap();
         receipts.anchor = Some(anchor);
