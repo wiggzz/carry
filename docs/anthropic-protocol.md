@@ -5,6 +5,35 @@
 bounded observation and unchanged wire relay. It is deliberately not connected
 to the live proxy yet; existing OpenAI requests are unaffected.
 
+## Shared code and provider boundaries
+
+The intended integration has one Carry policy path: protocol adapters supply
+native content groups, dependencies, terminal facts and usage observations to
+the existing planning, history/authority and accounting owners. Anthropic must
+not acquire a second Session, retention planner, reviewer policy, cache model,
+pricing calculator or persistence implementation. This slice implements none
+of those policies and does not yet connect to those shared owners.
+
+Provider event semantics stay in adapters. OpenAI Responses output-item events
+and terminal statuses differ from Messages block deltas, opaque signatures and
+cumulative usage. Sharing policy does not require converting Anthropic content
+to an OpenAI wire representation; native blocks must survive projection intact.
+Delivery and successful-turn commitment must still have one transport/finalization
+owner, rather than being inferred independently by each adapter.
+
+There is currently mechanical duplication: `src/proxy_sse.rs` and this module
+both buffer bytes, split SSE frames, join data lines and decode JSON. They do
+not share an SSE implementation today. A follow-up should extract a small
+provider-independent framer, exercised by both adapters' existing fixtures,
+without merging their event state machines. The migration must explicitly
+reconcile CR/BOM handling, malformed/trailing-frame behavior and capture budgets:
+the existing Responses observer bounds pending/output buffers separately, while
+this observer bounds all received bytes. Identical 4 MiB constants do not imply
+identical policy. Leaving that duplication indefinitely risks framing fixes and
+limits drifting between protocols; extracting it now would change the live
+Responses path while #196 owns ingress/finalization work. Coordinate that
+extraction with its owner before wiring the Messages route.
+
 ## Contract
 
 `decode_request` and `decode_message` check the native JSON envelope and return
