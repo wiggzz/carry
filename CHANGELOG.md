@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.1](https://github.com/wiggzz/carry/compare/v0.16.0...v0.16.1) (2026-10-31)
+
+
+### Bug Fixes
+
+* **planner:** preserve valid warm continuation before optional rewrites ([#202](https://github.com/wiggzz/carry/issues/202)) ([ca56ffc](https://github.com/wiggzz/carry/commit/ca56ffc7c17c123bb6ed732b3b5be02a18d93706))
+
 ## [0.16.0](https://github.com/wiggzz/carry/compare/v0.15.1...v0.16.0) (2026-10-31)
 
 
