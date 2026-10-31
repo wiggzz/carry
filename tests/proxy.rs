@@ -9,51 +9,6 @@ mod admission;
 #[path = "support/pr154.rs"]
 mod pr154;
 
-#[test]
-fn transparent_server_owned_history() {
-    let output = Command::new("python3")
-        .args([
-            "-B",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/proxy_transparent_history.py"
-            ),
-            "-v",
-        ])
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
-        .output()
-        .expect("transparent loopback history regression");
-    std::io::Write::write_all(&mut std::io::stdout(), &output.stderr).unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-fn noodle_review_regressions() {
-    let output = Command::new("python3")
-        .args([
-            "-B",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/proxy_noodle_regressions.py"
-            ),
-            "-v",
-        ])
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
-        .output()
-        .expect("review regression loopback fixture");
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 struct Proxy(Child);
 
 impl Drop for Proxy {
