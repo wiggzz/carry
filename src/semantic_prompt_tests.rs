@@ -293,8 +293,36 @@ fn legacy_raw_marker_cursor_changed_policy_stays_read_only_not_reinitialized() {
 // current-format controls exercise the same real coordinator and restarted
 // continuations. Noodle's actual old/new CLI probe remains separate evidence.
 fn legacy_raw_cursor_preserves_recorded_lifetime_proof(proof: Option<bool>) {
+    use carry::models::{ScenarioCacheMode, ScenarioCachePolicy};
     use sha2::{Digest, Sha256};
-    let request = semantic_marker_body();
+    // Keep this migration fixture's forecast supported. Caller-data marker
+    // lookalikes belong to the separate semantic-projection boundary test;
+    // their current Unknown cache mode would hide the lifetime-proof failure.
+    let request = json!({"model":"gpt-6.1-sol", "max_output_tokens":1,
+        "prompt_cache_options":{"mode":"implicit","ttl":"30m"},
+        "input":[{"role":"user","content":"unchanged paid history"}]});
+    let policy = ScenarioCachePolicy::for_model("gpt-6.1-sol");
+    assert_eq!(policy.request_mode(&request), ScenarioCacheMode::Implicit);
+    assert!(carry::models::cache_write_tariff_known(&request));
+    let cold = scenario_request_input_cost_resolved(
+        &request,
+        "gpt-6.1-sol",
+        2100,
+        0,
+        policy.minimum_prefix_tokens,
+        None,
+    )
+    .expect("migration fixture needs a priced cold forecast");
+    let warm = scenario_request_input_cost_resolved(
+        &request,
+        "gpt-6.1-sol",
+        2100,
+        2000,
+        policy.minimum_prefix_tokens,
+        None,
+    )
+    .expect("migration fixture needs a priced warm forecast");
+    assert!(cold > warm && warm > 0.0);
     let mut seed = Trajectory::default();
     seed.primary(
         &request,
