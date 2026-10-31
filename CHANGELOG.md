@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/wiggzz/carry/compare/v0.15.1...v0.16.0) (2026-10-31)
+
+
+### Features
+
+* **release:** add native macOS binaries and quick start ([#197](https://github.com/wiggzz/carry/issues/197)) ([dd6393c](https://github.com/wiggzz/carry/commit/dd6393c0160e08fe16e5cb665e34b1c005f3c20f))
+
 ## [0.15.1](https://github.com/wiggzz/carry/compare/v0.15.0...v0.15.1) (2026-10-29)
 
 
