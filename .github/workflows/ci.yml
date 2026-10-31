@@ -243,12 +243,12 @@ jobs:
             scripts.test_swebench_preparation_compat scripts.test_swebench_smoke \
             scripts.test_probe_matplotlib_preparation scripts.test_probe_pylint_evaluator scripts.test_probe_pylint_gold
 
-  # Preserve the existing required check name while making either lane's
+  # Preserve the existing required check name while making any lane's
   # failure, cancellation, or unexpected skip block the final check.
   ci-status:
     name: test
     if: always() && (github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe)
-    needs: [test, python, infra]
+    needs: [test, integration, native, python, infra]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -256,14 +256,18 @@ jobs:
         env:
           RUST_RESULT: ${{ needs.test.result }}
           PYTHON_RESULT: ${{ needs.python.result }}
+          INTEGRATION_RESULT: ${{ needs.integration.result }}
+          NATIVE_RESULT: ${{ needs.native.result }}
           INFRA_RESULT: ${{ needs.infra.result }}
         run: |
           test "$RUST_RESULT" = success
           test "$PYTHON_RESULT" = success
           test "$INFRA_RESULT" = success
+          test "$INTEGRATION_RESULT" = success
+          test "$NATIVE_RESULT" = success
 
   test:
-    name: Rust and native fixtures
+    name: Rust unit tests and lint
     if: github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -304,8 +308,9 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/git/db
             target
-          key: rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-version.outputs.version }}-musl-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}-${{ github.sha }}
+          key: rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-version.outputs.version }}-musl-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}-${{ github.job }}-${{ github.sha }}
           restore-keys: |
+            rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-version.outputs.version }}-musl-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}-${{ github.job }}-
             rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-version.outputs.version }}-musl-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}-
 
       - name: Format
@@ -349,22 +354,139 @@ jobs:
           PY
 
       - name: Unit tests
-        run: cargo test --locked --no-fail-fast
+        run: cargo test --locked --lib --bins --no-fail-fast
 
-      - name: Terminal editor PTY tests
-        run: python3 tests/terminal_editor.py
+      - name: Documentation tests
+        run: cargo test --locked --doc
 
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
 
-      # These Python contracts launch the debug binary and must not move to
-      # the source-only lane (where they would silently skip).
+      # A test/fixture failure must not discard successful compilation work.
+      # The cache is only a build accelerator; every check still executes.
+      - name: Save Rust build output even when later checks fail
+        if: ${{ !cancelled() && steps.rust-build.outcome == 'success' && steps.rust-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+  integration:
+    name: Rust and binary integration tests
+    if: github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust toolchain and portable target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Identify installed Rust version
+        id: rust-version
+        run: |
+          version=$(rustc --version)
+          version=${version#rustc }
+          version=${version%% *}
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      # PR caches are scoped to their merge ref; protected release jobs never
+      # restore this cache. Cache only public dependencies and CI build output.
+      - name: Restore Rust dependencies and build output
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            target
+          key: rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-version.outputs.version }}-musl-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-version.outputs.version }}-musl-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}-${{ github.job }}-
+            rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-version.outputs.version }}-musl-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}-
+
+      - name: Build terminal editor binary
+        id: rust-build
+        run: cargo build --locked
+
+      - name: Integration tests
+        run: cargo test --locked --test '*' --no-fail-fast
+
+      - name: Terminal editor PTY tests
+        run: python3 tests/terminal_editor.py
+
       - name: Proxy native binary contract tests
         run: |
           test -x target/debug/carry
           python3 -m unittest -v scripts/test_proxy_native_fixture.py
 
+      # A test/fixture failure must not discard successful compilation work.
+      # The cache is only a build accelerator; every check still executes.
+      - name: Save Rust build output even when later checks fail
+        if: ${{ !cancelled() && steps.rust-build.outcome == 'success' && steps.rust-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+  native:
+    name: Portable release and native fixtures
+    if: github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust toolchain and portable target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Identify installed Rust version
+        id: rust-version
+        run: |
+          version=$(rustc --version)
+          version=${version#rustc }
+          version=${version%% *}
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      # PR caches are scoped to their merge ref; protected release jobs never
+      # restore this cache. Cache only public dependencies and CI build output.
+      - name: Restore Rust dependencies and build output
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+            target
+          key: rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-version.outputs.version }}-musl-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-version.outputs.version }}-musl-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}-${{ github.job }}-
+            rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-version.outputs.version }}-musl-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs') }}-
+
       - name: Build one portable release binary
+        id: rust-build
         run: |
           cargo build --release --locked --target x86_64-unknown-linux-musl
           target/x86_64-unknown-linux-musl/release/carry --help >/dev/null

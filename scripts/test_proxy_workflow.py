@@ -94,7 +94,7 @@ class WorkflowProxyTests(unittest.TestCase):
     def test_ci_native_gateway_command_uses_built_binary_and_pinned_pi_prefix(self):
         import yaml
         workflow=yaml.safe_load((ROOT/'.github/workflows/ci.yml').read_text())
-        step=next(s for s in workflow['jobs']['test']['steps'] if s.get('name')==
+        step=next(s for s in workflow['jobs']['native']['steps'] if s.get('name')==
                   'Pinned Pi checkpoint policy through production gateway and integrated Carry')
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); binary=root/'bin'; binary.mkdir()
@@ -115,7 +115,7 @@ class WorkflowProxyTests(unittest.TestCase):
     def test_ci_reviewer_cache_command_uses_the_exact_built_binary(self):
         import yaml
         workflow=yaml.safe_load((ROOT/'.github/workflows/ci.yml').read_text())
-        step=next(s for s in workflow['jobs']['test']['steps'] if s.get('name')==
+        step=next(s for s in workflow['jobs']['native']['steps'] if s.get('name')==
                   'Reviewer stable cache boundaries through integrated Carry')
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); binary=root/'bin'; binary.mkdir()
