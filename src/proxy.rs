@@ -3376,7 +3376,7 @@ async fn relay(
                             body: &commit.outbound,
                             response: &value,
                             route: &commit.service.config.upstream_url,
-                            at: now(),
+                            at: commit.dispatched_at,
                             standard: standard(&commit.outbound)
                                 && value.get("service_tier").is_none_or(|v| v == "default"),
                             resolved,

@@ -396,6 +396,28 @@ fn cache_policy188_migration_http_regressions() {
     );
 }
 
+// Forecast eligibility is fixed at the actual primary dispatch, not delayed
+// terminal settlement. The fixture crosses expiry with a real held response.
+#[test]
+fn dispatch_clock_http_regression() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_dispatch_clock.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute source-bound dispatch-clock control");
+    assert!(
+        output.status.success(),
+        "DISPATCH_CLOCK HTTP control failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // Issue186 tests-first native executable acceptance, intentionally RED until
 // unknown-history initialization is implemented. Never run against a live proxy.
 #[test]

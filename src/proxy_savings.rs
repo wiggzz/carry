@@ -291,6 +291,8 @@ pub struct PrimaryObservation<'a> {
     pub body: &'a Value,
     pub response: &'a Value,
     pub route: &'a str,
+    /// Dispatch clock for this request's forecast/history; terminal latency must
+    /// not change eligibility or create later hypothetical cache writes.
     pub at: u64,
     pub standard: bool,
     pub resolved: Option<&'a ResolvedModel>,
