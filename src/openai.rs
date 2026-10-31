@@ -69,6 +69,36 @@ pub struct Usage {
     pub total_tokens: u64,
 }
 
+impl Usage {
+    /// Complete validated native partitions. Display counters alone cannot
+    /// establish that missing or contradictory receipt data was known zero.
+    pub(crate) fn from_receipt(usage: &Value) -> Option<Self> {
+        let (input, cached, written) = carry::core::CacheUsage::from_receipt(usage).partition()?;
+        Some(Self {
+            input_tokens: input,
+            cached_input_tokens: cached,
+            cache_write_input_tokens: written,
+            output_tokens: usage["output_tokens"].as_u64()?,
+            ..Self::default()
+        })
+    }
+}
+
+/// Actual native metering uses the same validated raw receipt owner as proxy
+/// settlement, not the lossy normalized counters used for terminal display.
+pub(crate) fn receipt_cost_usd(model: &str, raw: &Value) -> Option<f64> {
+    let usage = &raw["usage"];
+    let rates = usage["input_tokens"]
+        .as_u64()
+        .and_then(|input| carry::models::Rates::for_model(model, input as f64));
+    carry::core::UsageLedger::default().settle_with_rates(
+        model,
+        usage,
+        raw.get("service_tier").is_none_or(|tier| tier == "default"),
+        rates,
+    )
+}
+
 /// Modeled USD rates from scripts/swebench_smoke.py and published OpenAI pricing, not a billing quote.
 pub(crate) fn estimated_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
     let rates = carry::models::Rates::for_model(model, usage.input_tokens as f64)?;
@@ -616,14 +646,11 @@ fn function_calls(raw: &Value) -> Vec<&Value> {
 
 pub(crate) fn extract_usage(raw: &Value) -> Usage {
     let usage = &raw["usage"];
+    let quantities = carry::core::CacheUsage::from_receipt(usage);
     Usage {
-        input_tokens: usage["input_tokens"].as_u64().unwrap_or_default(),
-        cached_input_tokens: usage["input_tokens_details"]["cached_tokens"]
-            .as_u64()
-            .unwrap_or_default(),
-        cache_write_input_tokens: usage["input_tokens_details"]["cache_write_tokens"]
-            .as_u64()
-            .unwrap_or_default(),
+        input_tokens: quantities.input().unwrap_or_default(),
+        cached_input_tokens: quantities.read().map_or(0, |(_, cached)| cached),
+        cache_write_input_tokens: quantities.reported_write().unwrap_or_default(),
         output_tokens: usage["output_tokens"].as_u64().unwrap_or_default(),
         reasoning_tokens: usage["output_tokens_details"]["reasoning_tokens"]
             .as_u64()
@@ -958,6 +985,41 @@ mod tests {
         assert_eq!(estimated_cost_usd("gpt-5.6-luna", &usage), Some(0.258));
         assert_eq!(estimated_cost_usd("custom-model", &usage), None);
         assert_eq!(estimated_cost_usd("gpt-5.6-astra", &usage), None);
+    }
+
+    #[test]
+    fn native_receipt_money_preserves_unknown_partitions_and_tariffs() {
+        let raw = json!({"usage": {"input_tokens": 2000, "output_tokens": 4,
+            "cached_input_tokens": 700, "cache_creation_input_tokens": 300}});
+        assert!((receipt_cost_usd("gpt-6-sol", &raw).unwrap() - 0.00293).abs() < 1e-12);
+        let usage = Usage::from_receipt(&raw["usage"]).unwrap();
+        assert_eq!(
+            (usage.cached_input_tokens, usage.cache_write_input_tokens),
+            (700, 300)
+        );
+        assert_eq!(receipt_cost_usd("unknown-model", &raw), None);
+        assert_eq!(receipt_cost_usd("gpt-6-sol", &json!({})), None);
+        for (field, value) in [
+            ("service_tier", json!("priority")),
+            (
+                "usage",
+                json!({"input_tokens": 2000, "cached_input_tokens": 700}),
+            ),
+            (
+                "usage",
+                json!({"input_tokens": 2000, "output_tokens": 4,
+                "cached_input_tokens": 700, "input_tokens_details": {"cached_tokens": 701}}),
+            ),
+            (
+                "usage",
+                json!({"input_tokens": 2000, "output_tokens": 4,
+                "cached_input_tokens": 700, "input_tokens_details": {"audio_tokens": 1}}),
+            ),
+        ] {
+            let mut invalid = raw.clone();
+            invalid[field] = value;
+            assert_eq!(receipt_cost_usd("gpt-6-sol", &invalid), None, "{invalid}");
+        }
     }
 
     #[test]

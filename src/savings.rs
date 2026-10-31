@@ -346,7 +346,13 @@ impl Trajectory {
                     self.result.coverage.orphan_responses += 1;
                     self.scenario_available = false;
                 }
-                let usage = valid_usage(&data["usage"]);
+                // Real native traces retain raw receipt authority. Synthetic
+                // normalized trace records have their own explicit Usage contract.
+                let raw_receipt = data["raw"].get("usage");
+                let usage = match raw_receipt {
+                    Some(raw) => Usage::from_receipt(raw),
+                    None => valid_usage(&data["usage"]),
+                };
                 if usage.is_none() {
                     self.result.coverage.missing_usage += 1;
                 }
@@ -357,7 +363,10 @@ impl Trajectory {
                 let observed = usage.as_ref().and_then(|u| {
                     (u.cache_write_input_tokens == 0
                         || self.pending.as_ref().is_some_and(|p| p.write_tariff_known))
-                    .then(|| estimated_cost_usd(model, u))
+                    .then(|| match raw_receipt {
+                        Some(_) => crate::openai::receipt_cost_usd(model, &data["raw"]),
+                        None => estimated_cost_usd(model, u),
+                    })
                     .flatten()
                 });
                 if let Some(cost) = observed {

@@ -396,6 +396,30 @@ fn cache_policy188_migration_http_regressions() {
     );
 }
 
+// Actual native JSON/SSE and report must consume the same raw partition facts.
+#[test]
+fn native_receipt_partitions_and_report_regression() {
+    let evidence = tempfile::tempdir().unwrap();
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/native_receipt_partitions.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .env("CARRY_TEST_EVIDENCE_DIR", evidence.path())
+        .output()
+        .expect("Python 3 must execute actual native JSON/SSE receipt and report controls");
+    std::io::Write::write_all(&mut std::io::stdout(), &output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "NATIVE_RECEIPT partitions/report failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // Real HTTP/Session and report adapters must retain successful quantity
 // transitions through unsupported monetary intervals.
 #[test]

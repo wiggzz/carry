@@ -83,15 +83,7 @@ fn append_compatible(anchor: &Anchor, body: &Value, configuration: &str) -> bool
 /// reported write (Responses semantics); absent cache-read data is unknown.
 /// Reject contradictory aliases rather than clipping them into a priced call.
 pub(super) fn receipt(usage: &Value) -> Option<Usage> {
-    let (input, cached, written) = carry::core::CacheUsage::from_receipt(usage).partition()?;
-    let output = usage["output_tokens"].as_u64()?;
-    Some(Usage {
-        input_tokens: input,
-        output_tokens: output,
-        cached_input_tokens: cached,
-        cache_write_input_tokens: written,
-        ..Usage::default()
-    })
+    Usage::from_receipt(usage)
 }
 
 /// Estimate only semantic text that can be retained in the next input. Native

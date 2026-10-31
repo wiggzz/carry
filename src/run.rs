@@ -922,7 +922,7 @@ async fn run_loop(
                 "response_id": reply.response_id,
                 "latency_ms": reply.latency_ms,
                 "response_retries": reply.response_retries,
-                "estimated_cost_usd": crate::openai::estimated_cost_usd(&config.model, &reply.usage),
+                "estimated_cost_usd": crate::openai::receipt_cost_usd(&config.model, &reply.raw),
                 "usage": reply.usage,
                 "parsed": &reply.step,
                 "raw": reply.raw
