@@ -21,35 +21,35 @@ jobs:
         with:
           release-type: rust
 
-  publish-linux-binary:
+  build-binaries:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    uses: ./.github/workflows/release-binaries.yml
+    permissions:
+      contents: read
+    with:
+      ref: ${{ needs.release-please.outputs.tag_name }}
+      tag: ${{ needs.release-please.outputs.tag_name }}
+
+  publish-binaries:
+    needs: [release-please, build-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          pattern: release-binary-*
+          merge-multiple: true
+          path: assets
 
-      - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Build Linux binary
-        run: cargo +stable build --release --locked
-
-      - name: Package release assets
-        env:
-          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
-        run: |
-          asset_dir="carry-${TAG_NAME}-x86_64-unknown-linux-gnu"
-          mkdir "$asset_dir"
-          install -m 0755 target/release/carry "$asset_dir/carry"
-          tar -C "$asset_dir" -czf "$asset_dir.tar.gz" carry
-          sha256sum "$asset_dir.tar.gz" > SHA256SUMS
-
-      - name: Upload release assets
+      - name: Generate combined checksums and upload release assets
+        working-directory: assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
-        run: gh release upload "$TAG_NAME" "carry-${TAG_NAME}-x86_64-unknown-linux-gnu.tar.gz" SHA256SUMS --clobber
+        run: |
+          sha256sum carry-*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          gh release upload "$TAG_NAME" carry-*.tar.gz SHA256SUMS --clobber

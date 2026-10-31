@@ -12,21 +12,25 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CiWorkflowTests(unittest.TestCase):
-    def test_final_check_requires_all_three_lanes_to_succeed(self):
+    def test_final_check_requires_all_lanes_to_succeed(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
-        step = workflow['jobs']['ci-status']['steps'][0]
-        for results in itertools.product(('success', 'failure', 'cancelled', 'skipped', ''), repeat=3):
+        gate = workflow['jobs']['ci-status']
+        self.assertEqual(set(gate['needs']), {'test', 'integration', 'native', 'python', 'infra'})
+        step = gate['steps'][0]
+        self.assertEqual(set(step['env'].values()),
+                         {'${{ needs.' + lane + '.result }}' for lane in gate['needs']})
+        for results in itertools.product(('success', 'failure', 'cancelled', 'skipped', ''), repeat=5):
             with self.subTest(results=results):
                 env = {**os.environ, **dict(zip(
-                    ('RUST_RESULT', 'PYTHON_RESULT', 'INFRA_RESULT'), results))}
+                    ('RUST_RESULT', 'PYTHON_RESULT', 'INFRA_RESULT', 'INTEGRATION_RESULT', 'NATIVE_RESULT'), results))}
                 result = subprocess.run(['bash', '-euo', 'pipefail', '-c', step['run']],
                                         env=env, capture_output=True, text=True, timeout=5)
-                self.assertEqual(result.returncode == 0, results == ('success',) * 3,
+                self.assertEqual(result.returncode == 0, results == ('success',) * 5,
                                  result.stdout + result.stderr)
 
     def test_binary_contract_lane_fails_before_tests_if_binary_is_missing(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
-        step = next(s for s in workflow['jobs']['test']['steps']
+        step = next(s for s in workflow['jobs']['integration']['steps']
                     if s.get('name') == 'Proxy native binary contract tests')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
