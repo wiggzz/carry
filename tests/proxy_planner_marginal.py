@@ -56,6 +56,11 @@ class PlannerMarginalBaseline(unittest.TestCase):
             response = completed(response_id=f"resp_marginal_{n}")
             response["usage"]["input_tokens"] = 20000
             response["usage"]["input_tokens_details"]["cached_tokens"] = 20000 if n == 2 or n >= 4 else 0
+            # The first actual projected wire (R3) populates a whole-input
+            # synthetic write. Later read receipts do not invent write timing
+            # or refresh the deadline; the production dispatch/terminal owner
+            # records that interval. Not a claim about real provider residency.
+            response["usage"]["input_tokens_details"]["cache_write_tokens"] = 20000 if n == 3 else 0
             return 200, response
 
         def review(body, n):
@@ -187,6 +192,7 @@ class PlannerMarginalBaseline(unittest.TestCase):
             self.assertEqual(saved["primary"]["calls"], calls)
             self.assertEqual(saved["primary"]["input_tokens"], 20000 * calls)
             self.assertEqual(saved["primary"]["cached_tokens"], 20000 * (calls - 2))
+            self.assertEqual(saved["primary"]["cache_write_tokens"], 20000)
             self.assertEqual(saved["primary"]["output_tokens"], calls)
             self.assertEqual(saved["shadow"]["calls"], len(fixture.reviews))
             self.assertEqual(saved["shadow"]["input_tokens"], 100 * len(fixture.reviews))

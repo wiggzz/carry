@@ -350,6 +350,10 @@ fn unsupported_receipt_history_rejects_before_loading_persisted_authority() {
                 "missing_cursor_basis",
                 "raw_cursor",
                 "unsupported_format",
+                "missing_receipts",
+                "null_receipts",
+                "missing_priced_count",
+                "null_priced_count",
             ] {
                 let mut unsupported = frozen.clone();
                 match shape {
@@ -367,6 +371,21 @@ fn unsupported_receipt_history_rejects_before_loading_persisted_authority() {
                     }
                     "unsupported_format" => {
                         unsupported["format"] = json!("unsupported-accounting-format")
+                    }
+                    // A current tag cannot authorize the old proxy arithmetic
+                    // mode or reconstruct an absent matched-primary count.
+                    "missing_receipts" => {
+                        unsupported.as_object_mut().unwrap().remove("receipts");
+                    }
+                    "null_receipts" => unsupported["receipts"] = Value::Null,
+                    "missing_priced_count" => {
+                        unsupported
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("priced_primary_responses");
+                    }
+                    "null_priced_count" => {
+                        unsupported["priced_primary_responses"] = Value::Null;
                     }
                     _ => unreachable!(),
                 }
