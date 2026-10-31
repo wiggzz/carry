@@ -329,6 +329,46 @@ fn observed_namespace(config: &ProxyCli, owner: &Option<String>, body: &Value) -
     )
 }
 
+/// Reconcile file-local metadata with the already prepared observation authority.
+/// A representation upgrade can rename that authority without a new observation;
+/// a genuine scope change cannot borrow a conversation from the old checkpoint.
+pub(super) fn bind_namespace(
+    service: &Service,
+    id: &str,
+    session: &mut Session,
+    namespace: Option<String>,
+) -> Result<(), Failure> {
+    if session.history_namespace == namespace {
+        return Ok(());
+    }
+    let retained = if let (Some(namespace), Some(conversation)) = (
+        namespace.as_deref(),
+        session.history_conversation.as_deref(),
+    ) {
+        let _guard = IO.lock().unwrap();
+        let mut index = read(service).map_err(|_| {
+            failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "history index unavailable",
+            )
+        })?;
+        prune(service, &mut index);
+        index
+            .transcripts
+            .get(&hash(&(namespace, "conversation", conversation)))
+            .is_some_and(|reference| reference.session == id)
+    } else {
+        false
+    };
+    if !retained {
+        session.history_conversation = None;
+    }
+    session.review_feedback = Value::Null;
+    session.review_feedback_generation = 0;
+    session.history_namespace = namespace;
+    Ok(())
+}
+
 pub(super) fn conversation(body: &Value) -> Option<&str> {
     body["conversation"]
         .as_str()

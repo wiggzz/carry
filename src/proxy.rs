@@ -1480,14 +1480,7 @@ async fn forward_request(
                 Sha256::digest(format!("carry-primary-{id}").as_bytes())
             ));
         }
-        if session.history_namespace != history_namespace {
-            // Conversation IDs belong to the observation's settings namespace,
-            // not to a reusable explicit session file.
-            session.history_conversation = None;
-            session.review_feedback = Value::Null;
-            session.review_feedback_generation = 0;
-        }
-        session.history_namespace = history_namespace;
+        history::bind_namespace(&service, &id, &mut session, history_namespace)?;
         session.history_shared = implicit;
         if requested_conversation.is_some() {
             session.history_conversation = requested_conversation;
