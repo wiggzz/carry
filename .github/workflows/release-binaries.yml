@@ -1,0 +1,90 @@
+---
+name: Release binaries
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release-binaries.yml'
+      - '.github/workflows/release-please.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'src/**'
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      tag:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and smoke (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+      TAG_NAME: ${{ inputs.tag || 'ci' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --target "$TARGET"
+
+      - name: Build native release binary
+        run: |
+          test "$(rustc +stable -vV | sed -n 's/^host: //p')" = "$TARGET"
+          cargo +stable build --release --locked --target "$TARGET"
+
+      - name: Package and verify archive
+        run: |
+          asset_dir="carry-${TAG_NAME}-${TARGET}"
+          mkdir "$asset_dir" assets
+          install -m 0755 "target/$TARGET/release/carry" "$asset_dir/carry"
+          tar -C "$asset_dir" -czf "assets/$asset_dir.tar.gz" carry
+          cd assets
+          shasum -a 256 "$asset_dir.tar.gz" > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+          mkdir unpacked
+          tar -xzf "$asset_dir.tar.gz" -C unpacked
+          ./unpacked/carry --help
+          ./unpacked/carry --version
+
+      - name: Run packaged binary with an offline shell task
+        run: |
+          mkdir smoke-workspace
+          cat > steps.jsonl <<'JSONL'
+          {"action":{"kind":"shell","command":"printf native-smoke > smoke.txt","answer":null},"context":{"protected":[],"removable":[],"remember":[]}}
+          {"action":{"kind":"finish","command":null,"answer":"done"},"context":{"protected":[],"removable":[],"remember":[]}}
+          JSONL
+          ./assets/unpacked/carry --cwd "$PWD/smoke-workspace" \
+            --session-dir "$RUNNER_TEMP/carry-release-smoke" \
+            --scripted-steps "$PWD/steps.jsonl" --max-steps 2 -p 'run the command'
+          test "$(cat smoke-workspace/smoke.txt)" = native-smoke
+
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: release-binary-${{ matrix.target }}
+          path: assets/*.tar.gz
+          if-no-files-found: error
