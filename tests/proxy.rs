@@ -63,6 +63,45 @@ fn state_regression(selector: &str) {
     }
 }
 
+// Actual request planner regression, independent of traditional-cost accounting.
+#[test]
+fn marginal_planner_preserves_cheaper_valid_warm_projection() {
+    let evidence = tempfile::tempdir().unwrap();
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_planner_marginal.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .env("CARRY_TEST_EVIDENCE_DIR", evidence.path())
+        .output()
+        .expect("Python 3 must execute the loopback marginal planner regression");
+    if !output.status.success() {
+        let captured = evidence
+            .path()
+            .join("test_tiny_edit_cannot_beat_a_cheaper_valid_warm_continuation.json");
+        if let Ok(bytes) = std::fs::read(captured) {
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            eprintln!(
+                "MARGINAL_BASELINE evidence: {}",
+                json!({
+                    "comparison":value["comparison"],
+                    "control":value["keep_warm_control"]["selected"],
+                    "change":value["tiny_change"]["selected"]
+                })
+            );
+        }
+    }
+    assert!(
+        output.status.success(),
+        "MARGINAL_BASELINE HTTP fixture failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn accounting_basis_matches_current_and_retained_legacy_policy() {
     state_regression("accounting_basis_matches_current_and_retained_legacy_policy");
