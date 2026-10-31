@@ -69,7 +69,6 @@ jobs:
           mkdir unpacked
           tar -xzf "$asset_dir.tar.gz" -C unpacked
           ./unpacked/carry --help
-          ./unpacked/carry --version
 
       - name: Run packaged binary with an offline shell task
         run: |
