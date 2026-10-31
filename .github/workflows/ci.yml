@@ -234,6 +234,7 @@ jobs:
           scripts/test_validate_pr_title.py
           scripts/test_wait_for_ec2_termination.py
           scripts/test_ci_workflow.py
+          scripts/test_run_python_integration.py
 
       - name: Verify preparation against pinned SWE-bench recipes
         run: |
@@ -422,6 +423,12 @@ jobs:
 
       - name: Integration tests
         run: cargo test --locked --test '*' --no-fail-fast
+
+      # Keep executing these cases even if a Rust integration target fails,
+      # matching cargo test --no-fail-fast's previous coverage.
+      - name: Standalone Python black-box integration cases
+        if: ${{ !cancelled() && steps.rust-build.outcome == 'success' }}
+        run: python3 scripts/run_python_integration.py --jobs 2
 
       - name: Terminal editor PTY tests
         run: python3 tests/terminal_editor.py

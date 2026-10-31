@@ -361,8 +361,18 @@ killed.
 cargo fmt -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+python3 scripts/run_python_integration.py --jobs 2
 cargo build --release --locked
 ```
+
+On Unix, the standalone Python integration command builds this checkout with
+`cargo build --locked`, then runs every transparent-history and Noodle regression
+case against Cargo's reported executable. These two suites are no longer launched
+by `cargo test`; run both commands for complete coverage. Use `--list` to inspect
+the discovered cases without building, or `--jobs 1` for serial diagnosis. The
+default is two isolated case processes, each with its own state/evidence directory
+and a five-minute timeout. The remaining Rust proxy tests retain their Python
+fixtures and Rust-side assertions.
 
 The deterministic fixture smoke needs Docker but no model credential:
 
