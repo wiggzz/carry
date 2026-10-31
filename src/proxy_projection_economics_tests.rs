@@ -248,3 +248,173 @@ fn projection182_absent_pending_schedules_and_completed_spend_cannot_subsidize_s
         );
     }
 }
+
+// Additional acceptance for the HTTP-reproduced missing marginal baseline.
+// Staged last-submitted IDs identify a wire, never staged drop authority.
+fn marginal_projection_fixture() -> (ProxyCli, Session, Value) {
+    let (mut config, mut session, mut body) = fixture(Rates {
+        input: 1.0,
+        cached: 0.01,
+        write: 1.0,
+        output: 0.0,
+    });
+    config.payoff_requests = 1;
+    config.context_margin_percent = 0;
+    config.primary_context_tokens = 1_000_000;
+    config.min_payback_percent = 0;
+    session.last_submitted_ids = vec![1, 3];
+    let mut input = session.render_primary();
+    input.extend([
+        json!({"role":"assistant","content":"new disposable details ".repeat(50)}),
+        json!({"role":"user","content":"next task"}),
+    ]);
+    session.ingest(&input).unwrap();
+    for item in &mut session.history {
+        item.exposed = true;
+    }
+    session
+        .apply_advice(
+            &session.groups(),
+            &json!({"protected":[],"removable":[4],"memories":[]}),
+        )
+        .unwrap();
+    body["input"] = json!(input);
+    (config, session, body)
+}
+
+#[test]
+fn marginal_continuation_revalidates_advice_and_renders_current_memory_anchors() {
+    let (mut config, mut session, body) = marginal_projection_fixture();
+    config.min_payback_percent = 100;
+    let canonical = session.render_primary();
+    let prior_ids = session.last_submitted_ids.clone();
+    session.apply_advice(&session.groups(), &json!({"protected":[],"removable":[],"memories":[{"source_ids":[2],"text":"CURRENT_FACT"}]})).unwrap();
+    let (selected, report) = plan(&config, &session, &body);
+    let projection = selected.unwrap();
+    assert_eq!(report["baseline_omitted_members"], json!([2]));
+    assert_eq!(projection.omitted, HashSet::from([2]));
+    assert_eq!(projection.input[0], canonical[0]);
+    assert!(!projection.input.contains(&canonical[1]));
+    assert!(
+        projection.input[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("CURRENT_FACT")
+    );
+    assert_eq!(&projection.input[3..], &canonical[2..]);
+    assert_eq!(session.render_primary(), canonical);
+    assert_eq!(
+        session.last_submitted_ids, prior_ids,
+        "planning is read-only"
+    );
+    session
+        .apply_advice(
+            &session.groups(),
+            &json!({"protected":[2],"removable":[],"memories":[]}),
+        )
+        .unwrap();
+    let (selected, report) = plan(&config, &session, &body);
+    assert_eq!(report["baseline_omitted_members"], json!([]));
+    assert!(
+        selected.is_none(),
+        "past omission cannot override current protection: {report}"
+    );
+}
+
+#[test]
+fn marginal_capacity_uses_fitting_continuation_before_forcing_another_edit() {
+    let (mut config, session, body) = marginal_projection_fixture();
+    config.min_payback_percent = 100;
+    let required = |ids: HashSet<u64>| {
+        let mut view = body.clone();
+        view["input"] = json!(session.render_projection(&ids));
+        primary_required_tokens(&config, &view)
+    };
+    let prior = required(HashSet::from([2]));
+    let rewritten = required(HashSet::from([2, 4]));
+    let canonical = required(HashSet::new());
+    assert!(rewritten < prior && prior < canonical);
+    config.primary_context_tokens = prior.ceil() as u32;
+    let (selected, report) = plan(&config, &session, &body);
+    assert_eq!(
+        report["forced"], false,
+        "canonical overflow is not marginal pressure"
+    );
+    assert_eq!(selected.unwrap().omitted, HashSet::from([2]));
+    config.primary_context_tokens = rewritten.ceil() as u32;
+    config.model_resolution.as_mut().unwrap().primary.rates = None;
+    let (selected, report) = plan(&config, &session, &body);
+    assert_eq!(report["forced"], true);
+    assert_eq!(selected.unwrap().omitted, HashSet::from([2, 4]));
+    config.primary_context_tokens = 1;
+    let (selected, report) = plan(&config, &session, &body);
+    assert_eq!(report["forced"], true);
+    assert!(
+        selected.is_none(),
+        "no authorized alternative fits: {report}"
+    );
+}
+
+#[test]
+fn marginal_warm_veto_requires_current_scoped_cache_evidence_not_omission_history() {
+    let (mut config, mut session, body) = marginal_projection_fixture();
+    let model = &mut config.model_resolution.as_mut().unwrap().primary;
+    model.cache = resolve_model(
+        "gpt-6-sol",
+        Route::new("https://api.openai.com/v1/responses", false),
+        None,
+        None,
+        16384,
+        10,
+    )
+    .unwrap()
+    .cache;
+    model.scenario_cache_policy = model
+        .clone()
+        .with_scenario_cache_policy()
+        .scenario_cache_policy;
+    let mut prior = body.clone();
+    prior["input"] = json!(session.render_projection(&HashSet::from([2])));
+    let prior = primary_wire_body(&config, &prior);
+    assert!(crate::proxy_cache::observe(
+        &mut session.upstream_cache,
+        &prior,
+        &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":10000}}),
+        config.model_resolution.as_ref().map(|p| &p.primary),
+        &config.primary_cache_auth,
+        now()
+    ));
+    let (selected, report) = plan(&config, &session, &body);
+    assert_eq!(
+        selected.unwrap().omitted,
+        HashSet::from([2]),
+        "warm continuation wins: {report}"
+    );
+    assert!(report["primary_cached_estimated_tokens"].as_f64().unwrap() > 0.0);
+    for control in ["cold", "expired", "unknown", "route", "credential"] {
+        let mut cold = session.clone();
+        let mut config = config.clone();
+        match control {
+            "cold" => cold.upstream_cache.clear(),
+            "expired" => {
+                for entry in &mut cold.upstream_cache {
+                    entry.at = now().saturating_sub(entry.ttl_seconds + 1);
+                }
+            }
+            "unknown" => config.model_resolution.as_mut().unwrap().primary.cache = None,
+            "route" => {
+                config.model_resolution.as_mut().unwrap().primary.route =
+                    Route::new("https://other.invalid/v1/responses", false)
+            }
+            "credential" => config.primary_cache_auth = "different-fixture-key-digest".into(),
+            _ => unreachable!(),
+        }
+        let (selected, report) = plan(&config, &cold, &body);
+        assert_eq!(report["primary_cached_estimated_tokens"], 0.0, "{control}");
+        assert_eq!(
+            selected.unwrap().omitted,
+            HashSet::from([2, 4]),
+            "profitable cold rewrite {control}: {report}"
+        );
+    }
+}

@@ -1747,7 +1747,9 @@ async fn forward_request(
             logging::planned(&service, &id, &request_id, &report);
             let mut projected = outbound.clone();
             projected["input"] = json!(projection.input);
-            if report["forced"] == true && !primary_fits(&service.config, &projected) {
+            // Economics describes hypothetical alternatives; admission owns
+            // the actual mode-selected wire (canonical in audit mode).
+            if !primary_fits(&service.config, &projected) {
                 let _ = save(&service, &id, &session);
                 return Err(failure(
                     StatusCode::PAYLOAD_TOO_LARGE,
