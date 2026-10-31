@@ -199,8 +199,8 @@ fn traditional_summary_between_tool_requests_survives_restart() {
 }
 
 #[test]
-fn legacy_checkpoint_keeps_fail_closed_savings_policy() {
-    state_regression("legacy_checkpoint_keeps_fail_closed_savings_policy");
+fn failed_primary_policy_is_not_checkpoint_selectable() {
+    state_regression("failed_primary_policy_is_not_checkpoint_selectable");
 }
 
 #[test]

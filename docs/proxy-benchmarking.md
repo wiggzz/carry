@@ -464,8 +464,9 @@ use a smaller denominator. Omitted reviewer costs can overstate savings. The
 dashboard labels partial comparisons and separately counts omitted calls so
 pricing/usage coverage can be improved without hiding the available comparison.
 No comparable priced primary observations still means `Unavailable`, not zero.
-Older untracked history, an invalid scenario, or unreconstructable legacy failure
-accounting can still make a comparison unavailable. A pending background review
+Untracked history or an invalid scenario can still make a comparison unavailable.
+Unsupported persisted accounting formats are rejected, not migrated to another
+failure policy. A pending background review
 temporarily withholds the monetary comparison until its outcome is recorded;
 its coverage counters remain visible. The upgrade does not replay raw traces or
 invent missing receipts to reconstruct historical comparisons.

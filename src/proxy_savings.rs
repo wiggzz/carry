@@ -282,10 +282,6 @@ pub struct Trajectory {
     carry_edited: bool,
     traditional_edited: bool,
     available: bool,
-    // Old checkpoints retain their fail-closed accounting contract. Only new
-    // trajectories explicitly opt into excluding proven unsuccessful attempts.
-    #[serde(default)]
-    successful_requests_only: bool,
     priced_primary_responses: u64,
 }
 /// A terminal observation with money already settled under dispatch-frozen
@@ -316,7 +312,6 @@ impl Default for Trajectory {
             carry_edited: false,
             traditional_edited: false,
             available: true,
-            successful_requests_only: true,
             priced_primary_responses: 0,
         }
     }
@@ -392,11 +387,7 @@ impl Trajectory {
 
     fn record_failed_call(&mut self) {
         self.result.coverage.failed_calls += 1;
-        if self.successful_requests_only {
-            self.result.excluded_failed_calls += 1;
-        } else {
-            self.available = false;
-        }
+        self.result.excluded_failed_calls += 1;
     }
 
     pub fn unmodeled_call(&mut self) {
