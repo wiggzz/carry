@@ -1934,6 +1934,51 @@ mod tests {
     }
 
     #[test]
+    fn native_full_read_preserves_generation_original_write_deadline() {
+        let history = [json!({"role":"user", "content":"synthetic exact generation prefix"})];
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+        cache.begin_request_with_history(
+            vec![RenderedBreakpoint {
+                generation: 7,
+                prefix_tokens: 1_200,
+            }],
+            &history,
+            2_400,
+        );
+        cache.observe_receipt(&json!({"input_tokens":5_000, "cached_input_tokens":0,
+            "cache_write_input_tokens":5_000}));
+        assert_eq!(
+            cache.policy_for_history(&history, 1, 10).breakpoints,
+            vec![PricedBreakpoint {
+                generation: 7,
+                cached_tokens: 1_200
+            }]
+        );
+        let original = Instant::now() - CACHE_TTL + Duration::from_secs(10);
+        cache.implicit_activity = Some(original);
+        cache.breakpoints.get_mut(&7).unwrap().activity = Some(original);
+        cache.begin_request_with_history(
+            vec![RenderedBreakpoint {
+                generation: 7,
+                prefix_tokens: 1_200,
+            }],
+            &history,
+            2_400,
+        );
+        cache.observe_receipt(&json!({"input_tokens":5_000, "cached_input_tokens":5_000,
+            "cache_write_input_tokens":0}));
+        // Full native coverage corroborates the prior fact, not a new write.
+        // The native5000 and local1200 coordinates are intentionally unequal.
+        assert_eq!(cache.implicit_activity, Some(original));
+        assert_eq!(cache.breakpoints[&7].cached_tokens, 1_200);
+        assert_eq!(
+            cache.breakpoints[&7].activity,
+            Some(original),
+            "NATIVE_GENERATION_READ_RENEWAL: a full read cannot renew the original generation write"
+        );
+    }
+
+    #[test]
     fn native_qualified_compatible_newer_miss_revokes_original_credit() {
         let history = [json!({"role":"user", "content":"synthetic exact prefix"})];
         let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
