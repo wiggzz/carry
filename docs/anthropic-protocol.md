@@ -63,6 +63,11 @@ clean EOF or `finish(true)` on transport failure/cancellation/disconnect. Only
 does not prove downstream delivery, HTTP success or eligibility for persistence.
 The eventual wire-finalization owner must combine those facts. An incomplete
 observation's `message` is diagnostic partial content, never a successful turn.
+Initial stop reason/sequence must be absent or null; terminal evidence must come
+from a later message delta. Each delta's stop metadata is validated before it is
+merged, so a subsequent update cannot repair malformed earlier metadata into a
+successful observation. Empty/usage-only and nullable updates remain supported;
+they cannot by themselves establish a terminal stop reason.
 
 The observer checks the sequential message/block/delta/stop lifecycle. It
 assembles text, thinking and tool JSON, applies opaque signature replacements,
@@ -86,6 +91,14 @@ LF, CRLF and CR framing, multiline data, UTF-8 split across chunks and SSE
 comments are supported. Incomplete trailing frames never complete a message.
 
 ## Remaining integration
+
+Coverage is currently asymmetric: OpenAI has a live integrated path; this
+Anthropic module has protocol tests only. A pass-through endpoint will be a
+milestone, not completion of #171. Neutral integration requires the same shared
+policy owners and a cross-endpoint behavioral suite for removal, memories,
+tool dependencies, restart, cancellation/failure and accounting, with additional
+provider-specific protocol tests and explicit capability limits. That parity
+does not exist yet and must not be inferred from the foundation's green tests.
 
 Issue #171 remains open. Routing, version/beta headers, authentication, HTTP
 status/error handling, retry policy, cancellation propagation, Session/history,

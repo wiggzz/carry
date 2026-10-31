@@ -83,13 +83,16 @@ fn message_envelope(value: &Value) -> bool {
         && value.get("usage").is_none_or(Value::is_object)
 }
 
+fn valid_stop_metadata(message: &Value) -> bool {
+    message.get("stop_reason").is_none_or(|reason| {
+        reason.is_null() || reason.as_str().is_some_and(|reason| !reason.is_empty())
+    }) && message
+        .get("stop_sequence")
+        .is_none_or(|s| s.is_null() || s.is_string())
+}
+
 fn terminal_metadata(message: &Value) -> bool {
-    message["stop_reason"]
-        .as_str()
-        .is_some_and(|reason| !reason.is_empty())
-        && message
-            .get("stop_sequence")
-            .is_none_or(|s| s.is_null() || s.is_string())
+    valid_stop_metadata(message) && message["stop_reason"].is_string()
 }
 
 fn closed_block(block: &Value) -> bool {
@@ -264,6 +267,10 @@ impl Observer {
                 if self.phase != Phase::Start
                     || !message_envelope(message)
                     || message["content"].as_array().is_none_or(|c| !c.is_empty())
+                    // Terminal evidence must originate in message_delta, never
+                    // in the initial envelope. Missing fields remain compatible.
+                    || !message["stop_reason"].is_null()
+                    || !message["stop_sequence"].is_null()
                 {
                     return Err(Status::Invalid);
                 }
@@ -340,6 +347,12 @@ impl Observer {
                     .any(|key| !matches!(key.as_str(), "stop_reason" | "stop_sequence"))
                 {
                     return Err(Status::Unsupported);
+                }
+                // Validate each update before merging it: a later delta must
+                // not turn malformed earlier metadata into a successful stream.
+                // Empty/usage-only and nullable updates are still valid here.
+                if !valid_stop_metadata(&event["delta"]) {
+                    return Err(Status::Invalid);
                 }
                 let message = self.message.as_mut().ok_or(Status::Invalid)?;
                 for (key, value) in delta {

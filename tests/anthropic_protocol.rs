@@ -231,3 +231,162 @@ fn native_error_envelope_retains_details_without_treating_it_as_a_message() {
         Response::Message(message)
     );
 }
+
+fn metadata_stream(start: Value, deltas: &[Value]) -> Vec<Value> {
+    let mut events = vec![start];
+    events.extend(deltas.iter().enumerate().map(|(i, delta)| {
+        json!({"type":"message_delta", "delta":delta, "usage":{"output_tokens":i + 1}})
+    }));
+    events.push(json!({"type":"message_stop"}));
+    events
+}
+
+#[test]
+fn initial_stop_metadata_cannot_certify_or_be_repaired_by_later_deltas() {
+    // Crabby's exact counterexample: seeded reason + empty delta + stop.
+    // Also reject malformed initial sequences/types even if a later delta would
+    // overwrite them: invalid stream history must not be repaired into success.
+    for field in ["stop_reason", "stop_sequence"] {
+        for value in [
+            json!("end_turn"),
+            json!(""),
+            json!(false),
+            json!(7),
+            json!([]),
+            json!({}),
+        ] {
+            for deltas in [
+                vec![json!({})],
+                vec![json!({"stop_reason":"end_turn","stop_sequence":null})],
+            ] {
+                let mut start = fixture()[0].clone();
+                start["message"][field] = value.clone();
+                let events = metadata_stream(start, &deltas);
+                let bytes = wire(&events);
+                for chunk_size in [1, bytes.len()] {
+                    let mut observer = Observer::default();
+                    for chunk in bytes.chunks(chunk_size) {
+                        observer.feed(chunk);
+                    }
+                    let result = observer.finish(false);
+                    assert_eq!(
+                        result.status,
+                        Status::Invalid,
+                        "{field}={value}, deltas={deltas:?}"
+                    );
+                    assert_eq!(
+                        result.events,
+                        vec![events[0].clone()],
+                        "reject at the initial boundary"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_metadata_lifecycle_matrix_preserves_usage_only_updates() {
+    let cases = [
+        (vec![], Status::Invalid),
+        (vec![json!({})], Status::Invalid),
+        (vec![json!({}), json!({})], Status::Invalid),
+        (vec![json!({"stop_reason":null})], Status::Invalid),
+        (vec![json!({"stop_sequence":"END"})], Status::Invalid),
+        (vec![json!({"stop_reason":"end_turn"})], Status::Complete),
+        (
+            vec![json!({}), json!({"stop_reason":"end_turn"})],
+            Status::Complete,
+        ),
+        (
+            vec![
+                json!({"stop_reason":null,"stop_sequence":null}),
+                json!({"stop_reason":"end_turn"}),
+                json!({}),
+            ],
+            Status::Complete,
+        ),
+        (
+            vec![
+                json!({"stop_reason":"end_turn"}),
+                json!({"stop_reason":null}),
+            ],
+            Status::Invalid,
+        ),
+        (
+            vec![
+                json!({"stop_reason":"stop_sequence","stop_sequence":"END"}),
+                json!({}),
+            ],
+            Status::Complete,
+        ),
+        (
+            vec![json!({"stop_reason":"future_native_reason"}), json!({})],
+            Status::Complete,
+        ),
+    ];
+    // Preserve compatibility with omitted initial fields as well as native nulls.
+    for omitted in [false, true] {
+        for (deltas, expected) in &cases {
+            let mut start = fixture()[0].clone();
+            if omitted {
+                start["message"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("stop_reason");
+                start["message"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("stop_sequence");
+            }
+            let events = metadata_stream(start, deltas);
+            let result = observe(&wire(&events));
+            assert_eq!(
+                &result.status, expected,
+                "omitted={omitted}, deltas={deltas:?}"
+            );
+            assert_eq!(result.events, events);
+            if *expected == Status::Complete {
+                let message = result.message.unwrap();
+                assert_eq!(message["usage"]["output_tokens"], deltas.len());
+                assert_eq!(message["usage"]["cache_read_input_tokens"], 13);
+                assert_eq!(
+                    observe(&wire(&events[..events.len() - 1])).status,
+                    Status::Incomplete
+                );
+                let mut cancelled = Observer::default();
+                cancelled.feed(&wire(&events));
+                assert_eq!(cancelled.finish(true).status, Status::Cancelled);
+            }
+        }
+    }
+}
+
+#[test]
+fn malformed_delta_metadata_cannot_be_repaired_by_a_later_terminal_delta() {
+    for (field, values) in [
+        (
+            "stop_reason",
+            vec![json!(""), json!(false), json!(3), json!([]), json!({})],
+        ),
+        (
+            "stop_sequence",
+            vec![json!(false), json!(3), json!([]), json!({})],
+        ),
+    ] {
+        for value in values {
+            let mut delta = json!({});
+            delta[field] = value;
+            let events = metadata_stream(
+                fixture()[0].clone(),
+                &[
+                    delta,
+                    json!({"stop_reason":"end_turn", "stop_sequence":null}),
+                ],
+            );
+            let result = observe(&wire(&events));
+            assert_eq!(result.status, Status::Invalid, "{events:?}");
+            assert_eq!(result.events, events[..2]);
+        }
+    }
+}
