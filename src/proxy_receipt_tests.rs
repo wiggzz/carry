@@ -1790,7 +1790,7 @@ fn receipt_many_appends() -> Trajectory {
 }
 
 #[test]
-fn receipt_bounded_anchor_restart_and_legacy_window_do_not_reprice_history() {
+fn receipt_bounded_anchor_restart_does_not_reprice_history() {
     let t = receipt_many_appends();
     let receipt = state(&t)["receipts"].clone();
     let events = &receipt["modeled_cache"]["writes"];
@@ -1810,39 +1810,75 @@ fn receipt_bounded_anchor_restart_and_legacy_window_do_not_reprice_history() {
     );
 }
 
+// Current-receipt replacement for the retired local-JSON omission/summary
+// controls. Missing quantities omit the pair, not future paid-summary work.
 #[test]
-fn receipt_legacy_window_does_not_reprice_history() {
-    // Separate registration prevents a storage-shape failure from hiding these
-    // monetary/mixed-legacy controls. The original lifecycle is retained.
-    let t = receipt_many_appends();
-    let mut legacy = state(&t);
-    legacy.as_object_mut().unwrap().remove("receipts");
-    let mut old: Trajectory = serde_json::from_value(legacy.clone()).unwrap();
-    let before = old.snapshot();
-    let old_public = serde_json::to_value(old.snapshot().dashboard(false)).unwrap();
-    assert_eq!(old_public["accounting_basis"], "legacy_json_v1");
-    assert_eq!(
-        old_public["counterfactual_basis"],
-        "legacy_local_json_projection"
+fn receipt_priced_subset_recovers_into_paid_summary_after_unknown_quantities() {
+    let mut t = Trajectory {
+        scenario: Scenario {
+            context_window: 4000,
+            reserve: 100,
+            keep_recent: 1500,
+            summary: 100,
+        },
+        ..Trajectory::default()
+    };
+    let mut b = body();
+    t.primary(&b, &terminal(1000, 0, 0, 0), "route", 100, true);
+    t.reviewer(&b, &terminal(1000, 0, 0, 0), true);
+    let before = t.snapshot();
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"unknown attempt"}));
+    t.primary(
+        &b,
+        &json!({"status":"completed","output":[]}),
+        "route",
+        101,
+        true,
     );
-    let mut totals = DashboardTotals::default();
-    totals.observe(&old.snapshot().dashboard(false));
-    totals.observe(&t.snapshot().dashboard(false));
-    let current = serde_json::to_value(t.snapshot().dashboard(false)).unwrap();
-    assert_eq!(current["accounting_basis"], "receipt_anchored_v2");
-    let total = serde_json::to_value(totals).unwrap();
-    assert_eq!(total["included_sessions"], 1);
-    assert_eq!(total["legacy_sessions"], 1);
-    assert_eq!(total["carry_cost"], current["carry_cost"]);
-    old.begin_receipt_window();
-    old.primary(&body(), &terminal(100_000, 0, 0, 3), "route", 200, true);
-    let public = serde_json::to_value(old.snapshot().dashboard(false)).unwrap();
-    assert_eq!(public["accounting_basis"], "receipt_anchored_v2");
+    let omitted = t.snapshot();
+    assert!(omitted.priced);
+    assert_eq!(omitted.matched_primary_responses, 1);
+    assert_eq!(omitted.excluded_unpriced_calls, 1);
+    assert_eq!(omitted.carry_cost, before.carry_cost);
+    assert_eq!(omitted.traditional_cost, before.traditional_cost);
+    assert_eq!(omitted.reviewer_cost, before.reviewer_cost);
+    assert!(state(&t)["receipts"]["anchor"].is_null());
+    assert_eq!(state(&t)["receipts"]["modeled_cache"]["writes"], json!([]));
+    t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+    let mut growing = terminal(3800, 0, 0, 1000);
+    growing["output"] = json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible ".repeat(1000)}]}]);
+    t.primary(&b, &growing, "route", 102, true);
+    let summary = t.snapshot();
+    assert_eq!(summary.coverage.primary_responses, 3);
+    assert_eq!(summary.matched_primary_responses, 2);
+    assert_eq!(summary.excluded_unpriced_calls, 1);
+    assert_eq!(summary.initial_compactions, 0);
+    assert_eq!(summary.traditional_compactions, 1);
+    assert!(summary.summary_cost > 0.0);
+    assert!((summary.observed_primary_cost - (4800.0 * 2.0 + 1000.0 * 10.0) / 1e6).abs() < 1e-12);
     assert_eq!(
-        public["legacy_estimate"]["carry_cost"], before.carry_cost,
-        "legacy sums remain separate, never repriced or blended"
+        summary.observed_reviewer_cost,
+        before.observed_reviewer_cost
     );
-    assert_eq!(public["matched_primary_responses"], 1);
+    assert_eq!(t.history.last_traditional_input, 1600);
+    let next_native = t.history.retired + 1700 - t.history.summary;
+    t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .extend(growing["output"].as_array().unwrap().iter().cloned());
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"post-summary continuation"}));
+    t.primary(&b, &terminal(next_native, 0, 0, 0), "route", 103, true);
+    assert_eq!(t.snapshot().matched_primary_responses, 3);
+    assert_eq!(t.snapshot().traditional_compactions, 1);
+    assert_eq!(t.snapshot().summary_cost, summary.summary_cost);
+    assert_eq!(t.history.last_traditional_input, 1700);
 }
 
 #[test]

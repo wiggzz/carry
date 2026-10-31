@@ -1,4 +1,4 @@
-//! Receipt-based accounting, separate from the retained legacy JSON estimand.
+//! Receipt-based proxy accounting with dispatch-frozen observed money.
 use super::*;
 use sha2::{Digest, Sha256};
 
@@ -14,7 +14,6 @@ pub(super) struct Receipts {
     #[serde(default)]
     configuration: Option<String>,
     pub last_appended_input: Option<u64>,
-    pub legacy_estimate: Option<Box<Estimate>>,
     epochs: u64,
 }
 impl Default for Receipts {
@@ -26,7 +25,6 @@ impl Default for Receipts {
             configuration: None,
             scenario_cache_policy_version: Some(carry::models::ScenarioCachePolicy::VERSION),
             last_appended_input: None,
-            legacy_estimate: None,
             epochs: 0,
         }
     }
@@ -162,29 +160,13 @@ fn has_unpriced_modalities(value: &Value) -> bool {
 }
 
 impl Trajectory {
-    /// Freeze old sums on the first post-upgrade request, never reprice them.
-    /// The new window starts from the retained input, not an invented empty chat.
-    pub fn begin_receipt_window(&mut self) {
-        if self.receipts.is_some() {
-            return;
-        }
-        let legacy = self.snapshot();
-        let scenario = self.scenario;
-        *self = Self {
-            scenario,
-            ..Self::default()
-        };
-        self.receipts.as_mut().unwrap().legacy_estimate = Some(Box::new(legacy));
-        self.history.diverge();
-    }
-
     pub fn receipt_prediction(
         &self,
         body: &Value,
         route: &str,
         resolved: Option<&ResolvedModel>,
     ) -> Option<u64> {
-        let anchor = self.receipts.as_ref()?.anchor.as_ref()?;
+        let anchor = self.receipts.anchor.as_ref()?;
         if !append_compatible(anchor, body, &configuration(body, route, resolved)) {
             return None;
         }
@@ -257,13 +239,7 @@ impl Trajectory {
             self.failed_call();
             return;
         }
-        if self
-            .receipts
-            .as_ref()
-            .unwrap()
-            .initialization_policy_version
-            != Some(1)
-        {
+        if self.receipts.initialization_policy_version != Some(1) {
             // The legacy window is an immutable cumulative boundary, not an
             // additive ledger. Begin only future comparisons with the new rule.
             let prior = self.snapshot();
@@ -271,20 +247,13 @@ impl Trajectory {
                 self.result.legacy_initialization_segment = Some(CachePolicySegment::from(&prior));
             }
             self.reset_receipt_epoch();
-            self.receipts
-                .as_mut()
-                .unwrap()
-                .initialization_policy_version = Some(1);
+            self.receipts.initialization_policy_version = Some(1);
         }
         let policy_version = resolved
             .map_or(Some(carry::models::ScenarioCachePolicy::VERSION), |r| {
                 r.scenario_cache_policy.as_ref().map(|p| p.version)
             });
-        let previous_version = self
-            .receipts
-            .as_ref()
-            .unwrap()
-            .scenario_cache_policy_version;
+        let previous_version = self.receipts.scenario_cache_policy_version;
         let cache_policy_changed = previous_version != policy_version;
         if cache_policy_changed {
             // Freeze cumulative provenance before ANY version transition. Cache
@@ -307,10 +276,7 @@ impl Trajectory {
                         cumulative,
                     });
             }
-            self.receipts
-                .as_mut()
-                .unwrap()
-                .scenario_cache_policy_version = policy_version;
+            self.receipts.scenario_cache_policy_version = policy_version;
         }
         let model = body["model"].as_str().unwrap_or("");
         let projection = crate::savings::prompt_projection(body);
@@ -371,8 +337,8 @@ impl Trajectory {
         };
         let config = configuration(body, route, resolved);
         let contract = HistoryContract::extract(body, route, resolved, self.scenario);
-        self.receipts.as_mut().unwrap().configuration = Some(config.clone());
-        let previous = self.receipts.as_ref().unwrap().anchor.clone();
+        self.receipts.configuration = Some(config.clone());
+        let previous = self.receipts.anchor.clone();
 
         let continuity =
             self.history
@@ -391,7 +357,7 @@ impl Trajectory {
             // invalidate historical assumptions, not the current projection.
             self.reset_receipt_epoch();
         }
-        self.receipts.as_mut().unwrap().last_appended_input = previous
+        self.receipts.last_appended_input = previous
             .as_ref()
             .filter(|_| compatible)
             .map(|a| native.input_tokens - a.input);
@@ -442,7 +408,7 @@ impl Trajectory {
         let cache_scope =
             crate::proxy_cache::modeled_scope(body, model, (route, resolved.map(|r| &r.route)));
         let mode = request_cache_mode(body, model, resolved);
-        let cache = &mut self.receipts.as_mut().unwrap().modeled_cache;
+        let cache = &mut self.receipts.modeled_cache;
         if cache_policy_changed || self.traditional_edited {
             cache.clear();
         }
@@ -510,7 +476,7 @@ impl Trajectory {
             self.result.carry_cost += carry;
             self.result.traditional_cost += traditional_cost + summary_cost;
             self.result.summary_cost += summary_cost;
-            *self.priced_primary_responses.as_mut().unwrap() += 1;
+            self.priced_primary_responses += 1;
         } else {
             self.result.excluded_unpriced_calls += 1;
             if cached.is_none() {
@@ -518,7 +484,7 @@ impl Trajectory {
             }
         }
         self.history.last_traditional_input = traditional;
-        let cache = &mut self.receipts.as_mut().unwrap().modeled_cache;
+        let cache = &mut self.receipts.modeled_cache;
         if mode == carry::models::ScenarioCacheMode::Implicit
             && minimum.is_some_and(|min| traditional >= min)
         {
@@ -532,7 +498,7 @@ impl Trajectory {
             self.result.traditional_compactions += 1;
             self.history.summarize(total, kept, self.scenario.summary);
             self.traditional_edited = true;
-            self.receipts.as_mut().unwrap().modeled_cache.clear();
+            self.receipts.modeled_cache.clear();
         }
         self.history
             .observe(contract, items, native.input_tokens, at);
@@ -544,7 +510,7 @@ impl Trajectory {
             local_input: local,
             at,
         };
-        let receipts = self.receipts.as_mut().unwrap();
+        let receipts = &mut self.receipts;
         receipts.anchor = Some(anchor);
     }
 

@@ -416,6 +416,9 @@ fn initialization186_http_regressions() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // Passing fixtures retain measured per-request timings too, not only the
+    // wrapper's wall time. Payloads/deadlines and semantic assertions are fixed.
+    std::io::Write::write_all(&mut std::io::stdout(), &output.stdout).unwrap();
 }
 
 // Real owner routing: a cache TTL change cannot erase summarized quantities or

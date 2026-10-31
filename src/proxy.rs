@@ -1309,7 +1309,6 @@ struct ReviewRun {
 
 struct ReviewReceipt {
     model: String,
-    input: u64,
     usage: Option<Value>,
     write_tariff_known: bool,
     standard: bool,
@@ -1517,9 +1516,6 @@ async fn forward_request(
             let mut trajectory = crate::proxy_savings::Trajectory::default();
             trajectory.prior_untracked(session.primary.calls + session.shadow.calls);
             session.cost_trajectory = Some(trajectory);
-        }
-        if let Some(trajectory) = &mut session.cost_trajectory {
-            trajectory.begin_receipt_window();
         }
         if session.primary_pending {
             // The per-owner primary lock excludes a live predecessor. This is
@@ -2318,11 +2314,8 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
         if let Some(t) = &mut current.cost_trajectory {
             if receipt.completed {
                 t.reviewer_usage_settled(
-                    &receipt.model,
-                    receipt.input,
                     receipt.usage.as_ref().unwrap_or(&Value::Null),
                     receipt.standard,
-                    resolved,
                     settled,
                 );
             } else {
@@ -2532,7 +2525,6 @@ async fn review_chunk(
         if run.background {
             run.receipts.push(ReviewReceipt {
                 model: service.config.classifier_model.clone(),
-                input: crate::proxy_savings::token_units(body),
                 usage: Some(numeric_review_usage(&value["usage"])),
                 write_tariff_known: carry::models::cache_write_tariff_known(body),
                 standard: value.get("service_tier").is_none_or(|v| v == "default"),
@@ -2553,11 +2545,8 @@ async fn review_chunk(
         if let Some(trajectory) = &mut session.cost_trajectory {
             if value["status"] == "completed" {
                 trajectory.reviewer_usage_settled(
-                    &service.config.classifier_model,
-                    crate::proxy_savings::token_units(body),
                     &value["usage"],
                     value.get("service_tier").is_none_or(|v| v == "default"),
-                    resolved,
                     settled,
                 );
             } else {
@@ -2665,7 +2654,6 @@ async fn review_chunk(
         if run.background {
             run.receipts.push(ReviewReceipt {
                 model: String::new(),
-                input: 0,
                 usage: None,
                 write_tariff_known: false,
                 standard: false,

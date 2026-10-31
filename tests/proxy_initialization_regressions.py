@@ -6,6 +6,7 @@ All native receipts are synthetic; these are not provider/tokenizer measurements
 Candidate execution is supplied by the hosted native integration wrapper.
 """
 import copy
+import time
 import unittest
 
 import proxy_state_regressions as support
@@ -287,8 +288,35 @@ class InitializationRegressions(unittest.TestCase):
         # Real large serialized history, not a huge usage count on a tiny input.
         # Native receipts remain scripted, not a provider/tokenizer measurement.
         inputs = [260000, 260100, None, 260200, 510200]
+        timings = []
+        arrivals = []
+        self.evidence.update(request_timings=timings, provider_arrivals=arrivals)
+
+        def send(proxy, history):
+            record = {"request": len(timings) + 1,
+                      "input_bytes": len(support.wire(history)),
+                      "provider_before": len(arrivals)}
+            timings.append(record)
+            started = time.monotonic()
+            try:
+                result = proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1)
+                record["status"] = result[0]
+                return result
+            except Exception as error:
+                record["error"] = repr(error)
+                record["diagnostics"] = {
+                    path.name: path.read_text(errors="replace")[-4096:]
+                    for path in self.harness.state.glob("fixture-*.log")
+                }
+                raise
+            finally:
+                record["elapsed_seconds"] = time.monotonic() - started
+                record["provider_after"] = len(arrivals)
+                print("INITIALIZATION186_REQUEST " + support.json.dumps(record), flush=True)
 
         def primary(_body, n):
+            arrivals.append({"request": n, "monotonic_seconds": time.monotonic(),
+                             "wire_bytes": len(support.wire(_body))})
             incoming = inputs[n - 1]
             if incoming is None:
                 return 429, {"error": "owned initialization retry fixture"}
@@ -317,7 +345,7 @@ class InitializationRegressions(unittest.TestCase):
                    {"role": "assistant", "content": " evidence" * 260000},
                    {"role": "user", "content": "current request"}]
         proxy = start()
-        self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
+        self.assertEqual(send(proxy, history)[0], 200)
         first = snapshot(proxy)
         initialized = proxy.saved()
         proxy.close()
@@ -325,16 +353,16 @@ class InitializationRegressions(unittest.TestCase):
         self.assertEqual(proxy.saved()["cost_trajectory"], initialized["cost_trajectory"],
                          "restart must load the exact successful comparison before any new request")
         history.append({"role": "user", "content": "append after restart"})
-        self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
+        self.assertEqual(send(proxy, history)[0], 200)
         continued = snapshot(proxy)
         retry_history = history + [{"role": "user", "content": "retry once"}]
-        self.assertEqual(proxy.send(retry_history, model="gpt-6.1-sol", max_output_tokens=1)[0], 429)
+        self.assertEqual(send(proxy, retry_history)[0], 429)
         failed = snapshot(proxy)
-        self.assertEqual(proxy.send(retry_history, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
+        self.assertEqual(send(proxy, retry_history)[0], 200)
         retried = snapshot(proxy)
         growing = retry_history + [{"role": "assistant", "content": " later" * 250000},
                                    {"role": "user", "content": "continue after real growth"}]
-        self.assertEqual(proxy.send(growing, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
+        self.assertEqual(send(proxy, growing)[0], 200)
         later = snapshot(proxy)
         self.evidence.update(first=first, continued=continued, failed=failed, retried=retried,
                              later=later, initialized=initialized, final=proxy.saved(),
@@ -417,7 +445,10 @@ class InitializationRegressions(unittest.TestCase):
         self.assertEqual(first["result"]["initial_compactions"], 1)
         self.assertIsNotNone(first["history_continuity"])
         self.assertIsNone(failed["receipts"]["anchor"])
-        self.assertIsNone(failed["receipts"]["traditional_anchor"])
+        self.assertTrue(first["receipts"]["modeled_cache"]["writes"],
+                        "successful initialized history established a modeled write")
+        self.assertEqual(failed["receipts"]["modeled_cache"]["writes"], [],
+                         "failed primary invalidates hypothetical cache, not history")
         self.assertEqual(failed["history_continuity"], first["history_continuity"])
         self.assertEqual(restarted, failed, "restart preserves the failed-attempt boundary")
         self.assertEqual(retry["result"]["initial_compactions"], 1,

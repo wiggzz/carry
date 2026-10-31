@@ -118,20 +118,12 @@ fn cache_policy188_version_labels_and_first_legacy_segment_survive_later_transit
     )
     .unwrap();
     let mut trajectory = Trajectory::default();
-    trajectory
-        .receipts
-        .as_mut()
-        .unwrap()
-        .scenario_cache_policy_version = Some(7);
+    trajectory.receipts.scenario_cache_policy_version = Some(7);
     assert_eq!(
         trajectory.snapshot().counterfactual_cache_policy,
         "conditional_model_cache_v7"
     );
-    trajectory
-        .receipts
-        .as_mut()
-        .unwrap()
-        .scenario_cache_policy_version = None;
+    trajectory.receipts.scenario_cache_policy_version = None;
     let mut request = body();
     let mut original_legacy = Value::Null;
     let mut prior_boundaries = json!([]);
@@ -211,11 +203,7 @@ fn cache_policy188_present_version_boundaries_preserve_primary_and_reviewer_mone
     let mut trajectory = Trajectory::default();
     // Seed both the synthetic owner and dispatch contract before paid coverage.
     resolved.scenario_cache_policy.as_mut().unwrap().version = 1;
-    trajectory
-        .receipts
-        .as_mut()
-        .unwrap()
-        .scenario_cache_policy_version = Some(1);
+    trajectory.receipts.scenario_cache_policy_version = Some(1);
     let mut request = body();
     trajectory.reviewer_resolved(&request, &terminal(1000, 0, 0, 100), true, Some(&resolved));
     let mut snapshots = Vec::new();
