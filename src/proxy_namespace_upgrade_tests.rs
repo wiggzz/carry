@@ -292,6 +292,58 @@ fn reviewer_contract_changes_invalidate_advice_not_observed_history() {
     );
 }
 
+// Will withdrew predecessor-format continuation. Keep the current-format
+// restart control, but require unsupported persisted authority to be rejected
+// without migration, reinitialization or modification of any saved receipts.
+#[test]
+fn unsupported_namespace_rejects_without_rewriting_persisted_authority() {
+    let mut failures = Vec::new();
+    for legacy in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let service = checkpoint_service(directory.path());
+        let headers = HeaderMap::new();
+        let (body, original_namespace, id, _frozen) =
+            seed_namespace(&service, &headers, true, false, legacy);
+        drop(service);
+        let index_path = directory.path().join("history.index");
+        let mirror_path = directory.path().join(format!("{id}.json"));
+        let index = std::fs::read(&index_path).unwrap();
+        let mirror = std::fs::read(&mirror_path).unwrap();
+        for restart in 0..2 {
+            let service = checkpoint_service(directory.path());
+            let outcome = history::namespace(&service, &headers, &body);
+            match outcome {
+                Ok(namespace) if !legacy => assert_eq!(namespace, original_namespace),
+                Err((status, axum::Json(error))) if legacy => {
+                    if status != StatusCode::CONFLICT
+                        || !error["error"]["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("unsupported"))
+                    {
+                        failures.push(format!(
+                            "restart={restart}: not a clear unsupported-state rejection"
+                        ));
+                    }
+                }
+                _ => failures.push(format!(
+                    "legacy={legacy}, restart={restart}: unexpected acceptance/rejection"
+                )),
+            }
+            if std::fs::read(&index_path).unwrap() != index {
+                failures.push(format!(
+                    "legacy={legacy}, restart={restart}: rewrote authoritative index"
+                ));
+            }
+            assert_eq!(std::fs::read(&mirror_path).unwrap(), mirror);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "UNSUPPORTED_NAMESPACE_PERSISTENCE: {}",
+        failures.join("; ")
+    );
+}
+
 #[test]
 fn namespace_upgrade_preserves_paid_history_owner() {
     namespace_owner_upgrade(false);
