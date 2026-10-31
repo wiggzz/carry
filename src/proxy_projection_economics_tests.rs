@@ -384,10 +384,10 @@ fn marginal_warm_veto_requires_current_scoped_cache_evidence_not_omission_histor
     assert!(crate::proxy_cache::observe(
         &mut session.upstream_cache,
         &prior,
-        &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":10000}}),
+        &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":10000}}),
         config.model_resolution.as_ref().map(|p| &p.primary),
         &config.primary_cache_auth,
-        now()
+        crate::proxy_cache::ObservationTime::during(now(), now())
     ));
     let (selected, report) = plan(&config, &session, &body);
     assert_eq!(
@@ -403,7 +403,12 @@ fn marginal_warm_veto_requires_current_scoped_cache_evidence_not_omission_histor
             "cold" => cold.upstream_cache.clear(),
             "expired" => {
                 for entry in &mut cold.upstream_cache {
-                    entry.at = now().saturating_sub(entry.ttl_seconds + 1);
+                    let window = entry
+                        .write_window
+                        .as_mut()
+                        .expect("timed whole-prefix write");
+                    window.not_before = now().saturating_sub(window.lifetime + 1);
+                    window.not_after = window.not_before;
                 }
             }
             "unknown" => config.model_resolution.as_mut().unwrap().primary.cache = None,
