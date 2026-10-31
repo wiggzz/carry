@@ -1925,6 +1925,62 @@ mod tests {
     }
 
     #[test]
+    fn native_qualified_compatible_newer_miss_revokes_original_credit() {
+        let history = [json!({"role":"user", "content":"synthetic exact prefix"})];
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+        let full_write = json!({"input_tokens":5_000, "cached_input_tokens":0,
+            "cache_write_input_tokens":5_000});
+        cache.begin_request_with_history(Vec::new(), &history, 2_400);
+        cache.observe_receipt(&full_write);
+        assert_eq!(
+            cache
+                .policy_for_history(&history, 1, 10)
+                .implicit_cached_tokens,
+            2_400,
+            "positive whole-native-write/local-extent control"
+        );
+        cache.begin_request_with_history(Vec::new(), &history, 2_400);
+        cache.observe_receipt(&json!({"input_tokens":5_000, "cached_input_tokens":0,
+            "cache_write_input_tokens":0}));
+        assert_eq!(
+            cache
+                .policy_for_history(&history, 1, 10)
+                .implicit_cached_tokens,
+            0,
+            "NATIVE_NEWER_MISS: compatible latest miss cannot retain prior credit"
+        );
+    }
+
+    #[test]
+    fn native_qualified_full_read_does_not_rewrite_original_fact() {
+        let history = [json!({"role":"user", "content":"synthetic exact prefix"})];
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+        cache.begin_request_with_history(Vec::new(), &history, 2_400);
+        cache.observe_receipt(&json!({"input_tokens":5_000, "cached_input_tokens":0,
+            "cache_write_input_tokens":5_000}));
+        let original = Instant::now() - CACHE_TTL + Duration::from_secs(10);
+        cache.implicit_activity = Some(original);
+        cache.begin_request_with_history(Vec::new(), &history, 2_400);
+        cache.observe_receipt(&json!({"input_tokens":5_000, "cached_input_tokens":5_000,
+            "cache_write_input_tokens":0}));
+        // Existing population-gate acceptance, not a newly reproduced defect.
+        assert_eq!(cache.implicit_activity, Some(original));
+        assert_eq!(
+            cache
+                .policy_for_history(&history, 1, 10)
+                .implicit_cached_tokens,
+            2_400
+        );
+        cache.implicit_activity = Some(Instant::now() - CACHE_TTL);
+        assert_eq!(
+            cache
+                .policy_for_history(&history, 1, 10)
+                .implicit_cached_tokens,
+            0
+        );
+    }
+
+    #[test]
     fn qualified_native_receipts_need_located_write_proof() {
         let history = [json!({"role":"user", "content":"synthetic unchanged input"})];
         let mut coverage = Vec::new();
