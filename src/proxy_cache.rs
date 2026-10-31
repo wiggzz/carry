@@ -426,7 +426,8 @@ pub(super) fn observe(
             || old.credential_sha256 != e.credential_sha256
             || old.input_len > input.len()
             || old.input_sha256 != input_identity(&input[..old.input_len])
-            || (cached == total && old.written_prefix_at(at).is_some())
+            || (quantities.read_covers_whole_input() == Some(true)
+                && old.written_prefix_at(at).is_some())
     });
     cache.push(e);
     trim(cache, at);

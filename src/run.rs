@@ -366,6 +366,11 @@ impl CacheTracker {
         };
         let now = Instant::now();
         let quantities = carry::core::CacheUsage::from_receipt(usage);
+        if quantities.read_covers_whole_input() == Some(false)
+            && self.pending_history.starts_with(&self.implicit_prefix)
+        {
+            self.clear_implicit();
+        }
         let cached_input_tokens = quantities.read().map_or(0, |(_, cached)| cached);
         let whole_write = quantities.whole_written_input().is_some_and(|input| {
             self.implicit_minimum_prefix_tokens
@@ -485,10 +490,14 @@ impl CacheTracker {
             .is_some_and(|activity| activity.elapsed() >= CACHE_TTL)
     }
 
-    fn mark_compaction(&mut self, invalidated_generations: &[u64]) {
+    fn clear_implicit(&mut self) {
         self.implicit_activity = None;
         self.implicit_cached_tokens = 0;
         self.implicit_prefix.clear();
+    }
+
+    fn mark_compaction(&mut self, invalidated_generations: &[u64]) {
+        self.clear_implicit();
         for generation in invalidated_generations {
             self.breakpoints.remove(generation);
         }
@@ -1949,6 +1958,67 @@ mod tests {
             0,
             "NATIVE_NEWER_MISS: compatible latest miss cannot retain prior credit"
         );
+    }
+
+    #[test]
+    fn native_prior_prefix_reconciliation_preserves_unknown_and_unrelated_observations() {
+        let history = [json!({"role":"user", "content":"synthetic exact prefix"})];
+        let unrelated = [json!({"role":"user", "content":"different prefix"})];
+        let full_write = json!({"input_tokens":5_000, "cached_input_tokens":0,
+            "cache_write_input_tokens":5_000});
+        for (raw, compatible, expected) in [
+            (
+                json!({"input_tokens":5_000, "cached_input_tokens":0}),
+                true,
+                0,
+            ),
+            (
+                json!({"input_tokens":5_000, "cached_input_tokens":1_000}),
+                true,
+                0,
+            ),
+            (
+                json!({"input_tokens":5_000, "cached_input_tokens":5_000}),
+                true,
+                2_400,
+            ),
+            (
+                json!({"input_tokens":5_000, "cached_input_tokens":5_000,
+                "cache_write_input_tokens":"invalid"}),
+                true,
+                2_400,
+            ),
+            (json!({"input_tokens":5_000}), true, 2_400),
+            (
+                json!({"input_tokens":5_000, "cached_input_tokens":0,
+                "input_tokens_details":{"cached_tokens":1}}),
+                true,
+                2_400,
+            ),
+            (
+                json!({"input_tokens":5_000, "cached_input_tokens":0}),
+                false,
+                2_400,
+            ),
+            (full_write.clone(), true, 2_400),
+        ] {
+            let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+            cache.begin_request_with_history(Vec::new(), &history, 2_400);
+            cache.observe_receipt(&full_write);
+            cache.begin_request_with_history(
+                Vec::new(),
+                if compatible { &history } else { &unrelated },
+                2_400,
+            );
+            cache.observe_receipt(&raw);
+            assert_eq!(
+                cache
+                    .policy_for_history(&history, 1, 10)
+                    .implicit_cached_tokens,
+                expected,
+                "raw={raw}, compatible={compatible}"
+            );
+        }
     }
 
     #[test]

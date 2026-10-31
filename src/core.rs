@@ -125,6 +125,13 @@ impl CacheUsage {
         (cached <= input).then_some((input, cached))
     }
 
+    /// Only a validated whole-input read corroborates all prior prefix writes.
+    /// A partial/missing hit cannot locate a prefix in another quantity domain;
+    /// absent or contradictory read quantities are not an observed cache miss.
+    pub fn read_covers_whole_input(&self) -> Option<bool> {
+        self.read().map(|(input, cached)| cached == input)
+    }
+
     /// Retain explicit write presence for raw evidence; absence is not a write.
     pub fn reported_write(&self) -> Option<u64> {
         let written = self.written.ok()??;
