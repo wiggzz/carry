@@ -289,7 +289,6 @@ struct CacheTracker {
 
 #[derive(Debug)]
 struct TrackedBreakpoint {
-    prefix_tokens: usize,
     cached_tokens: usize,
     activity: Option<Instant>,
 }
@@ -336,9 +335,7 @@ impl CacheTracker {
         for breakpoint in &breakpoints {
             self.breakpoints
                 .entry(breakpoint.generation)
-                .and_modify(|tracked| tracked.prefix_tokens = breakpoint.prefix_tokens)
                 .or_insert(TrackedBreakpoint {
-                    prefix_tokens: breakpoint.prefix_tokens,
                     cached_tokens: 0,
                     activity: None,
                 });
@@ -371,7 +368,6 @@ impl CacheTracker {
         {
             self.clear_implicit();
         }
-        let cached_input_tokens = quantities.read().map_or(0, |(_, cached)| cached);
         let whole_write = quantities.whole_written_input().is_some_and(|input| {
             self.implicit_minimum_prefix_tokens
                 .is_some_and(|minimum| input >= minimum as u64)
@@ -381,25 +377,6 @@ impl CacheTracker {
             self.implicit_cached_tokens = self.pending_request_tokens;
             self.implicit_prefix.clone_from(&self.pending_history);
         }
-        let readable = self
-            .pending
-            .iter()
-            .rev()
-            .take(capabilities.max_read_breakpoints)
-            .filter(|breakpoint| breakpoint.prefix_tokens <= cached_input_tokens as usize)
-            .filter(|breakpoint| {
-                self.breakpoints
-                    .get(&breakpoint.generation)
-                    .is_some_and(|tracked| cache_alive(tracked.activity, now))
-            })
-            .max_by_key(|breakpoint| breakpoint.prefix_tokens)
-            .map(|breakpoint| breakpoint.generation);
-        if let Some(generation) = readable
-            && let Some(tracked) = self.breakpoints.get_mut(&generation)
-        {
-            tracked.activity = Some(now);
-        }
-
         if whole_write {
             let explicit_write_slots =
                 capabilities
@@ -2555,7 +2532,6 @@ mod tests {
                     (
                         generation,
                         TrackedBreakpoint {
-                            prefix_tokens: 1_200,
                             cached_tokens: 1_100,
                             activity: Some(now),
                         },
@@ -2588,7 +2564,6 @@ mod tests {
             breakpoints: HashMap::from([(
                 7,
                 TrackedBreakpoint {
-                    prefix_tokens: 1_200,
                     cached_tokens: 1_100,
                     activity: Some(Instant::now() - CACHE_TTL),
                 },
