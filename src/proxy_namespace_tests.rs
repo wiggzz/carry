@@ -313,6 +313,112 @@ fn unsupported_namespace_rejects_without_rewriting_persisted_authority() {
     );
 }
 
+// The supported index envelope must not make an older trajectory safe to load.
+// Exercise both explicit-file authority and canonical shared-index authority;
+// unsupported accounting state is an error, never a new/read-only history.
+#[test]
+fn unsupported_receipt_history_rejects_before_loading_persisted_authority() {
+    let mut failures = Vec::new();
+    for initialized in [true, false] {
+        for shared in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = checkpoint_service(directory.path());
+            let mut headers = HeaderMap::new();
+            if !shared {
+                headers.insert("x-carry-session", "receipt-format-control".parse().unwrap());
+            }
+            let (_, _, id, frozen) = seed_namespace(&service, &headers, shared, initialized);
+            drop(service);
+            let index_path = directory.path().join("history.index");
+            let mirror_path = directory.path().join(format!("{id}.json"));
+            let index = std::fs::read(&index_path).unwrap();
+            let mirror = std::fs::read(&mirror_path).unwrap();
+            // Supported current restart retains every paid/free quantity and
+            // frozen monetary field, without normalizing or writing either file.
+            for _ in 0..2 {
+                let service = checkpoint_service(directory.path());
+                let loaded = load(&service, &id).unwrap();
+                assert_eq!(
+                    serde_json::to_value(loaded.cost_trajectory.unwrap()).unwrap(),
+                    frozen
+                );
+                assert_eq!(std::fs::read(&index_path).unwrap(), index);
+                assert_eq!(std::fs::read(&mirror_path).unwrap(), mirror);
+            }
+            for shape in [
+                "opaque_anchor",
+                "missing_cursor_basis",
+                "raw_cursor",
+                "read_only_legacy",
+            ] {
+                let mut unsupported = frozen.clone();
+                match shape {
+                    "opaque_anchor" => {
+                        unsupported
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("history_continuity");
+                        unsupported
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("receipt_history_load");
+                        unsupported
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("shared_primary_history");
+                        unsupported["receipts"]["history_anchor"] =
+                            unsupported["receipts"]["anchor"].clone();
+                    }
+                    "missing_cursor_basis" => {
+                        unsupported["history_continuity"]["cursor"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("basis");
+                    }
+                    "raw_cursor" => {
+                        unsupported["history_continuity"]["cursor"]["basis"] = json!("RawV1")
+                    }
+                    "read_only_legacy" => {
+                        unsupported["receipt_history_load"] = json!("ReadOnlyLegacyV1")
+                    }
+                    _ => unreachable!(),
+                }
+                if shared {
+                    let mut saved: Value = serde_json::from_slice(&index).unwrap();
+                    saved["snapshots"][&id]["cost_trajectory"] = unsupported;
+                    std::fs::write(&index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+                    std::fs::write(&mirror_path, &mirror).unwrap();
+                } else {
+                    let mut saved: Value = serde_json::from_slice(&mirror).unwrap();
+                    saved["cost_trajectory"] = unsupported;
+                    std::fs::write(&mirror_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+                    std::fs::write(&index_path, &index).unwrap();
+                }
+                let staged_index = std::fs::read(&index_path).unwrap();
+                let staged_mirror = std::fs::read(&mirror_path).unwrap();
+                for restart in 0..2 {
+                    let service = checkpoint_service(directory.path());
+                    match load(&service, &id) {
+                        Ok(_) => failures.push(format!("initialized={initialized}, shared={shared}, shape={shape}, restart={restart}: accepted unsupported history")),
+                        Err(error) => {
+                            if !error.1["error"]["message"].as_str().is_some_and(|m| m.contains("unsupported")) {
+                                failures.push(format!("initialized={initialized}, shared={shared}, shape={shape}, restart={restart}: unclear unsupported-state error"));
+                            }
+                        }
+                    }
+                    assert_eq!(std::fs::read(&index_path).unwrap(), staged_index);
+                    assert_eq!(std::fs::read(&mirror_path).unwrap(), staged_mirror);
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "UNSUPPORTED_RECEIPT_HISTORY: {}",
+        failures.join("; ")
+    );
+}
+
 #[test]
 fn namespace_restart_preserves_paid_history_owner() {
     namespace_owner_restart(false);
