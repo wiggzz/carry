@@ -286,7 +286,7 @@ pub(super) fn namespace(
     }
     Ok(hash(
         &json!({"policy":"carry-prefix-history-v3", "owner":identity(&owner)?,
-        "settings":semantic::scope(&service.config, &cache_base(body)),
+        "settings":semantic::scope(&service.config, body),
         "client_scope":stable_client_scope(body)}),
     ))
 }

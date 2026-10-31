@@ -18,16 +18,17 @@ pub(super) struct Record {
     pub feedback: Value,
 }
 
-pub(super) fn scope(config: &ProxyCli, context: &Value) -> String {
-    let mut context = context.clone();
-    if let Some(object) = context.as_object_mut() {
-        object.remove("prompt_cache_key");
-    }
+/// History/advice identity uses the prompt, not a cache or transport request.
+/// Input ancestry is bound separately by the canonical prefix index. Reuse the
+/// quantity owner's fixed prompt so policy, prices and output controls cannot
+/// rename that ancestry; reviewer and upstream boundaries still fence advice.
+pub(super) fn scope(config: &ProxyCli, body: &Value) -> String {
     format!(
         "{:x}",
         Sha256::digest(
             serde_json::to_vec(&json!({
-                "policy":"carry-prefix-advice-v3", "context":context,
+                "policy":"carry-prefix-advice-v4",
+                "model":body.get("model"), "prompt":crate::savings::prompt_overhead(body),
                 "upstream":config.upstream_url, "subscription":config.codex_login,
                 "reviewer":config.classifier_model, "reviewer_url":config.classifier_url,
                 "reasoning":config.classifier_reasoning_effort,
