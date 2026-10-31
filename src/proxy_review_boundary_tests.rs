@@ -1,4 +1,75 @@
 // Actual render/dispatch and paid-owner boundaries; no parallel planner.
+#[tokio::test]
+async fn waiting_implicit_branch_releases_metadata_candidate_pin() {
+    let (sender, mut captures) = tokio::sync::mpsc::unbounded_channel();
+    let router = Router::new().route("/primary", post(move |axum::Json(body): axum::Json<Value>| {
+        let sender = sender.clone();
+        async move {
+            sender.send(body).unwrap();
+            // No response ID: the one-reference limit retains just the tip.
+            axum::Json(json!({"status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":1}}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.upstream_url = format!("http://{}/primary", listener.local_addr().unwrap());
+    service.config.history_max_references = 1;
+    service.config.review_min_primary_tokens = 1000000;
+    service.config.review_min_new_tokens = 1000000;
+    service.config.review_every_requests = 100;
+    service.config.bootstrap_min_input_bytes = 8388608;
+    let service = Arc::new(service);
+    let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let seed = json!({"model":"gpt-6-sol","input":[{"role":"user","content":"shared goal"}]});
+    let response = forward_request(
+        service.clone(), HeaderMap::new(),
+        Bytes::from(serde_json::to_vec(&seed).unwrap()), false, "seed".into(),
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(captures.recv().await.unwrap()["input"], seed["input"]);
+    let namespace = history::namespace(&service, &HeaderMap::new(), &seed).unwrap();
+    let (parent, pin) = history::candidate(&service, &namespace, &seed).unwrap().unwrap();
+    drop(pin);
+    let owner = session_lock(&service, &parent).await;
+    let (sender, mut waits) = tokio::sync::mpsc::unbounded_channel();
+    *service.lock_waits.lock().unwrap() = Some(sender);
+    let branch = json!({"model":"gpt-6-sol","input":[
+        {"role":"user","content":"shared goal"},
+        {"role":"assistant","content":"waiting branch"}
+    ]});
+    let pending = tokio::spawn({
+        let service = service.clone();
+        let body = Bytes::from(serde_json::to_vec(&branch).unwrap());
+        async move { forward_request(service, HeaderMap::new(), body, false, "branch".into()).await }
+    });
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waits.recv()).await.unwrap().unwrap(),
+        parent,
+    );
+    // Simulate the in-flight owner's completion while the branch waits for its
+    // lock. Its old prefix no longer selects this now-longer, divergent owner.
+    let mut advanced = load(&service, &parent).unwrap();
+    advanced.ingest(&[
+        seed["input"][0].clone(),
+        json!({"role":"assistant","content":"different branch"}),
+        json!({"role":"user","content":"advanced parent"}),
+    ]).unwrap();
+    save(&service, &parent, &advanced).unwrap();
+    drop(owner);
+    let response = tokio::time::timeout(Duration::from_secs(5), pending).await.unwrap().unwrap()
+        .expect("the metadata hint must not occupy the only pin needed by the actual branch");
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(captures.recv().await.unwrap()["input"], branch["input"]);
+    let (child, pin) = history::candidate(&service, &namespace, &branch).unwrap().unwrap();
+    assert_ne!(child, parent);
+    assert_eq!(load(&service, &child).unwrap().primary.calls, 1);
+    drop(pin);
+    provider.abort();
+}
+
 async fn review_capture_provider() -> (
     String,
     tokio::sync::mpsc::UnboundedReceiver<Value>,

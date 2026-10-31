@@ -419,6 +419,51 @@ pub(super) fn expand(service: &Service, namespace: &str, body: &mut Value) -> Re
     Ok(())
 }
 
+// A metadata hint, not history admission: absent/invalid ancestry or an unavailable
+// index must not block a request that may turn out to be forwarding-only. Pin a
+// live candidate so its frozen contracts can be read under its owner lock. The
+// normal resolver still selects/revalidates the owner for reviewable requests.
+pub(super) fn candidate(
+    service: &Service,
+    namespace: &str,
+    body: &Value,
+) -> Result<Option<(String, Pin)>, Failure> {
+    let _guard = IO.lock().unwrap();
+    let Ok(mut index) = read(service) else {
+        return Ok(None);
+    };
+    prune(service, &mut index);
+    let external = body["previous_response_id"]
+        .as_str()
+        .map(|id| ("response", id))
+        .or_else(|| conversation(body).map(|id| ("conversation", id)));
+    let owner = external
+        .and_then(|(kind, id)| index.transcripts.get(&hash(&(namespace, kind, id))))
+        .filter(|reference| index.snapshots.contains_key(&reference.session))
+        .map(|reference| reference.session.clone())
+        .or_else(|| {
+            body["input"]
+                .as_array()
+                .and_then(|input| prefix_owner(&index, namespace, input))
+        });
+    owner
+        .map(|id| pin(service, &id).map(|pin| (id, pin)))
+        .transpose()
+}
+
+fn prefix_owner(index: &Index, namespace: &str, input: &[Value]) -> Option<String> {
+    path(namespace, input)
+        .iter()
+        .rev()
+        .map(String::as_str)
+        .chain(std::iter::once(namespace))
+        .find_map(|key| {
+            let reference = index.tips.get(key)?;
+            let snapshot = index.snapshots.get(&reference.session)?;
+            (snapshot.history.len() <= input.len()).then(|| reference.session.clone())
+        })
+}
+
 pub(super) fn resolve(
     service: &Service,
     namespace: &str,
@@ -434,22 +479,16 @@ pub(super) fn resolve(
     let input = body["input"]
         .as_array()
         .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "array input required"))?;
-    let keys = path(namespace, input);
     // Routing has no semantic authority. Reuse only a compatible live owner;
     // every request independently looks up completed advice below.
-    for key in keys
-        .iter()
-        .rev()
-        .chain(std::iter::once(&namespace.to_owned()))
-    {
-        if let Some(reference) = index.tips.get(key)
-            && let Some(snapshot) = index.snapshots.get(&reference.session)
-            && snapshot.history.len() <= input.len()
-        {
-            return Ok((reference.session.clone(), pin(service, &reference.session)?));
-        }
+    if let Some(id) = prefix_owner(&index, namespace, input) {
+        return Ok((id.clone(), pin(service, &id)?));
     }
-    reserve(service, hash(&(namespace, keys.last())), &occupied)
+    reserve(
+        service,
+        hash(&(namespace, path(namespace, input).last())),
+        &occupied,
+    )
 }
 
 /// Selected checkpoints reference canonical nodes; the atomic index is their

@@ -953,33 +953,6 @@ fn freeze_reviewer_cache_policy(config: &ProxyCli, reviewer: &mut ResolvedModel)
         .insert("cache_policy".into(), provenance);
 }
 
-async fn session_resolution(
-    service: &Service,
-    session: &mut Session,
-    model: &str,
-    processing_tier: &str,
-    _fresh_child: bool,
-) -> Result<ResolvedPair, Failure> {
-    let (primary, reviewer) = resolved_catalog(
-        service,
-        model,
-        processing_tier,
-        session.model_resolution.as_ref(),
-    )
-    .await?;
-    let pair = ResolvedPair {
-        schema_version: 1,
-        primary,
-        reviewer,
-    };
-    if let Some(prior) = session.model_resolution.replace(pair.clone())
-        && serde_json::to_value(&prior).ok() != serde_json::to_value(&pair).ok()
-    {
-        session.model_resolution_history.push(prior);
-    }
-    Ok(pair)
-}
-
 async fn catalog(
     State(service): State<Arc<Service>>,
     headers: HeaderMap,
@@ -1389,28 +1362,33 @@ async fn forward_request(
         ));
     }
     let original_body = body.clone();
-    if service.config.mode != Mode::Off && body["background"] == true {
-        return Err(failure(
-            StatusCode::BAD_REQUEST,
-            "review modes do not support background",
-        ));
-    }
-    let implicit = service.config.mode != Mode::Off && id.is_none();
+    let configured_review = service.config.mode != Mode::Off;
+    let implicit = configured_review && id.is_none();
+    // Namespace is based on the client request and process policy, never on an
+    // effective budget/mode derived later for a particular primary attempt.
+    let namespace = configured_review
+        .then(|| history::namespace(&service, &headers, &body))
+        .transpose()?;
     let mut history_pin = None;
-    let mut history_namespace = None;
-    let requested_conversation = history::conversation(&body).map(str::to_owned);
-    if service.config.mode != Mode::Off {
-        let namespace = history::namespace(&service, &headers, &body)?;
-        history::expand(&service, &namespace, &mut body)?;
-        history_namespace = Some(namespace);
-    }
     if implicit {
-        let namespace = history_namespace.as_ref().unwrap();
-        let (selected, pin) = history::resolve(&service, namespace, &body)?;
-        id = Some(selected);
-        history_pin = Some(pin);
+        if let Some((selected, pin)) =
+            history::candidate(&service, namespace.as_ref().unwrap(), &body)?
+        {
+            id = Some(selected);
+            history_pin = Some(pin);
+        } else {
+            // Forwarding-only clients still get durable unpriced accounting,
+            // without requiring array input or an observed transcript owner.
+            id = Some(format!(
+                "{:x}",
+                Sha256::digest(
+                    format!("carry-forwarding-{}", namespace.as_ref().unwrap()).as_bytes()
+                )
+            ));
+        }
     }
-    let native = legacy_native
+    let requested_conversation = history::conversation(&body).map(str::to_owned);
+    let mut native = legacy_native
         || body["input"].as_array().is_some_and(|items| {
             items
                 .iter()
@@ -1440,39 +1418,123 @@ async fn forward_request(
     let mut outbound = body.clone();
     let mut commit = None;
     if let Some(mut id) = id {
-        let mut history_pin = match history_pin {
-            Some(pin) => pin,
-            None => history::pin(&service, &id)?,
-        };
-        let mut lock = session_lock(&service, &id).await;
-        let mut session = load(&service, &id)?;
-        if implicit {
-            loop {
-                // Every selected mutable tip can advance while its lock is awaited,
-                // including a replacement selected after an earlier wait.
-                let mut check = session.clone();
-                if session.history.is_empty()
-                    || check.ingest(body["input"].as_array().unwrap()).is_ok()
-                {
-                    break;
+        let mut history_pin = history_pin;
+        let mut lock;
+        let mut session;
+        loop {
+            // Inspect frozen metadata before waiting on the primary lock, so
+            // known-model ancestry errors still fail promptly. Revalidate that
+            // snapshot under the lock before committing the request contract.
+            let frozen = if configured_review {
+                load(&service, &id)?.model_resolution
+            } else {
+                None
+            };
+            let mut effective = (*service).clone();
+            if configured_review {
+                let model = original_body["model"]
+                    .as_str()
+                    .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "model is required"))?;
+                let (primary, reviewer) = resolved_catalog(
+                    &service,
+                    model,
+                    original_body["service_tier"].as_str().unwrap_or("default"),
+                    frozen.as_ref(),
+                )
+                .await?;
+                let resolved = ResolvedPair {
+                    schema_version: 1,
+                    primary,
+                    reviewer,
+                };
+                effective.config.primary_context_tokens =
+                    resolved.primary.capacity_tokens.unwrap_or(0);
+                effective.config.classifier_max_input_tokens =
+                    resolved.reviewer.capacity_tokens.unwrap_or(0);
+                if resolved.primary.capacity_tokens.is_none() || resolved.primary.rates.is_none() {
+                    effective.config.mode = Mode::Off;
                 }
+                effective.config.model_resolution = Some(resolved);
+            }
+            // Unknown contracts never enter review-mode ancestry/validation.
+            // Keep the raw request separate until its owner and decision settle.
+            body = original_body.clone();
+            if effective.config.mode != Mode::Off {
+                if body["background"] == true {
+                    return Err(failure(
+                        StatusCode::BAD_REQUEST,
+                        "review modes do not support background",
+                    ));
+                }
+                history::expand(&service, namespace.as_ref().unwrap(), &mut body)?;
+            }
+            lock = session_lock(&service, &id).await;
+            session = load(&service, &id)?;
+            if configured_review
+                && serde_json::to_value(&frozen).ok()
+                    != serde_json::to_value(&session.model_resolution).ok()
+            {
                 drop(lock);
+                continue;
+            }
+            if effective.config.mode != Mode::Off && implicit {
+                // The candidate was only a metadata hint. Release its pin
+                // before selecting the actual owner, so a parent-to-child
+                // move does not consume an extra history-owner slot.
+                drop(history_pin.take());
                 let (selected, pin) =
-                    history::resolve(&service, history_namespace.as_ref().unwrap(), &body)?;
-                if selected == id {
-                    // A stable exact tip rejected ingest for another reason (for
-                    // example its opaque checkpoint/item limit). Never spin.
+                    history::resolve(&service, namespace.as_ref().unwrap(), &body)?;
+                if selected != id {
+                    // A metadata hint or awaited mutable tip can differ from
+                    // the expanded request's owner. Re-resolve under that lock
+                    // before applying any frozen contract or paid work.
+                    drop(lock);
+                    id = selected;
+                    history_pin = Some(pin);
+                    continue;
+                }
+                history_pin = Some(pin);
+                let mut check = session.clone();
+                if !session.history.is_empty()
+                    && check.ingest(body["input"].as_array().unwrap()).is_err()
+                {
                     return Err(failure(
                         StatusCode::BAD_REQUEST,
                         "history incompatible with retained tip",
                     ));
                 }
-                id = selected;
-                history_pin = pin;
-                lock = session_lock(&service, &id).await;
-                session = load(&service, &id)?;
             }
+            if configured_review {
+                let resolved = effective.config.model_resolution.as_ref().unwrap();
+                if let Some(prior) = session.model_resolution.replace(resolved.clone())
+                    && serde_json::to_value(&prior).ok() != serde_json::to_value(resolved).ok()
+                {
+                    session.model_resolution_history.push(prior);
+                }
+                if effective.config.mode == Mode::Off {
+                    session.last_plan = json!({"reason":"unsupported_model_or_tier"});
+                }
+            }
+            // This single effective contract governs all downstream gates,
+            // projection, reviewers and accounting for the primary attempt.
+            service = Arc::new(effective);
+            outbound = body.clone();
+            break;
         }
+        let history_pin = match history_pin {
+            Some(pin) => pin,
+            None => history::pin(&service, &id)?,
+        };
+        native |= body["input"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["type"] == "compaction_trigger")
+        });
+        let history_namespace = if service.config.mode != Mode::Off {
+            namespace
+        } else {
+            None
+        };
         if service.config.codex_login && outbound.get("prompt_cache_key").is_none() {
             outbound["prompt_cache_key"] = json!(format!(
                 "{:x}",
@@ -1480,33 +1542,9 @@ async fn forward_request(
             ));
         }
         history::bind_namespace(&mut session, history_namespace);
-        session.history_shared = implicit;
+        session.history_shared = implicit && service.config.mode != Mode::Off;
         if requested_conversation.is_some() {
             session.history_conversation = requested_conversation;
-        }
-        if service.config.mode != Mode::Off {
-            let model = body["model"]
-                .as_str()
-                .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "model is required"))?;
-            let resolved = session_resolution(
-                &service,
-                &mut session,
-                model,
-                body["service_tier"].as_str().unwrap_or("default"),
-                false,
-            )
-            .await?;
-            // One request-scoped contract drives every existing primary/reviewer
-            // feasibility, memory and bootstrap check. Locks, metadata epoch,
-            // background registry and directory lock remain process-shared.
-            let mut effective = (*service).clone();
-            effective.config.primary_context_tokens = resolved.primary.capacity_tokens.ok_or_else(|| {
-                failure(StatusCode::BAD_REQUEST, "unknown primary context: provide model metadata or --primary-context-tokens")
-            })?;
-            effective.config.classifier_max_input_tokens =
-                resolved.reviewer.capacity_tokens.unwrap_or(0);
-            effective.config.model_resolution = Some(resolved);
-            service = Arc::new(effective);
         }
         let (kind, agent_name) = client_provenance(&body);
         if kind.is_some() || agent_name.is_some() {
