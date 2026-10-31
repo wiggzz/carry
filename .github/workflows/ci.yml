@@ -235,6 +235,7 @@ jobs:
           scripts/test_wait_for_ec2_termination.py
           scripts/test_ci_workflow.py
           scripts/test_run_python_integration.py
+          scripts/test_install.py
 
       - name: Verify preparation against pinned SWE-bench recipes
         run: |

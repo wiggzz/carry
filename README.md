@@ -19,15 +19,14 @@ billing guarantee.
 
 ## Install
 
-With Rust installed:
-
 ```sh
-cargo install --git https://github.com/wiggzz/carry.git --locked
+curl -fsSL https://raw.githubusercontent.com/wiggzz/carry/main/install.sh | sh
 ```
 
-Or download a binary from the [latest release](https://github.com/wiggzz/carry/releases/latest).
-See the [installation guide](docs/harness-usage.md#install-a-release) for platforms,
-checksum verification, and macOS notes.
+Downloads the matching release, verifies its checksum, and installs to
+`~/.local/bin`—no Rust toolchain required. See the
+[installation guide](docs/harness-usage.md#one-line-install) for supported platforms,
+manual downloads, and macOS notes.
 
 ## Use your favorite harness
 

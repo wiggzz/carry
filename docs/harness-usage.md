@@ -2,6 +2,18 @@
 
 [Back to Carry](../README.md)
 
+### One-line install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/wiggzz/carry/main/install.sh | sh
+```
+
+The installer detects Linux x86_64 or macOS Intel/Apple Silicon, downloads the
+matching latest release, verifies its SHA-256 checksum, and installs to
+`~/.local/bin`. No Rust toolchain is required. It prints a PATH hint if needed;
+set `CARRY_INSTALL_DIR` for the shell running the script to choose another directory.
+See the macOS notes below if Gatekeeper blocks the unsigned binary.
+
 ### Install a release
 
 Choose the archive for your system from the
