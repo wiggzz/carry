@@ -281,11 +281,28 @@ impl Trajectory {
                 if let Some(model) = data["model"].as_str() {
                     self.model = model.to_owned();
                 }
-                self.cache_ttl_ms = data["cache_ttl_seconds"]
-                    .as_u64()
-                    .map(|s| s.saturating_mul(1000));
-                self.cache_metadata = data.get("implicit_cache_minimum_prefix_tokens").is_some();
-                self.cache_minimum = data["implicit_cache_minimum_prefix_tokens"].as_u64();
+                if let Some(policy) = data.get("scenario_cache_policy") {
+                    // Explicit scenario authority wins even when unknown or
+                    // malformed. Native entitlement cannot fill its omissions.
+                    let policy = serde_json::from_value::<ScenarioCachePolicy>(policy.clone())
+                        .ok()
+                        .filter(|policy| policy.version == ScenarioCachePolicy::VERSION);
+                    self.cache_metadata = true;
+                    self.cache_minimum = policy
+                        .as_ref()
+                        .and_then(|policy| policy.minimum_prefix_tokens);
+                    self.cache_ttl_ms = policy
+                        .map(|policy| policy.ttl_seconds)
+                        .filter(|seconds| *seconds > 0)
+                        .map(|seconds| seconds.saturating_mul(1000));
+                } else {
+                    self.cache_ttl_ms = data["cache_ttl_seconds"]
+                        .as_u64()
+                        .map(|s| s.saturating_mul(1000));
+                    self.cache_metadata =
+                        data.get("implicit_cache_minimum_prefix_tokens").is_some();
+                    self.cache_minimum = data["implicit_cache_minimum_prefix_tokens"].as_u64();
+                }
                 if previous_minimum != self.cache_minimum_for(&self.last_model) {
                     // A prior prompt was not necessarily written under the new policy.
                     self.modeled_cache.clear();
@@ -1182,6 +1199,37 @@ mod tests {
         assert!(!e.priced);
         assert!(e.observed_priced);
     }
+    #[test]
+    fn declared_scenario_policy_is_independent_of_native_entitlement() {
+        for event in ["run_started", "session_resumed"] {
+            for native_minimum in [Value::Null, json!(1024)] {
+                let mut t = Trajectory::default();
+                t.record(&json!({"event":event,"data":{"model":"gpt-6-sol",
+                    "cache_ttl_seconds":1,
+                    "implicit_cache_minimum_prefix_tokens":native_minimum,
+                    "scenario_cache_policy":ScenarioCachePolicy::for_model("gpt-6-sol")}}));
+                assert_eq!(t.cache_minimum_for("gpt-6-sol"), Some(1024));
+                assert_eq!(t.cache_ttl_ms, Some(1_800_000));
+            }
+            for policy in [
+                Value::Null,
+                json!({"version":"invalid"}),
+                json!({"version":999,"minimum_prefix_tokens":1024,"ttl_seconds":1800}),
+                json!({"version":ScenarioCachePolicy::VERSION,"minimum_prefix_tokens":null,"ttl_seconds":1800}),
+            ] {
+                let mut t = Trajectory::default();
+                t.record(&json!({"event":event,"data":{"model":"gpt-6-sol",
+                    "cache_ttl_seconds":1800,"implicit_cache_minimum_prefix_tokens":1024,
+                    "scenario_cache_policy":policy}}));
+                assert_eq!(
+                    t.cache_minimum_for("gpt-6-sol"),
+                    None,
+                    "native support cannot fill an explicit unknown scenario contract"
+                );
+            }
+        }
+    }
+
     #[test]
     fn recorded_ttl_and_minimum_override_cache_assumptions() {
         let mut t = Trajectory::default();

@@ -13,6 +13,48 @@ import subprocess
 import threading
 import unittest
 
+from proxy_quantity_policy import Cells
+
+
+def report_policy_rows(test, binary, directory, events):
+    """Replay the native trace and a scenario-policy-only diagnostic control."""
+    rows = []
+    for label, declared_minimum in [('native', None), ('model-policy-control', 1024)]:
+        session = directory / label / 'session'
+        session.mkdir(parents=True)
+        replay_events = copy.deepcopy(events)
+        for event in replay_events:
+            if event['event'] in ('run_started', 'session_resumed'):
+                test.assertIsNone(event['data']['prompt_cache_capabilities'])
+                test.assertIsNone(event['data']['implicit_cache_minimum_prefix_tokens'])
+                if declared_minimum is not None:
+                    event['data']['implicit_cache_minimum_prefix_tokens'] = declared_minimum
+        # Remove only the diagnostic metadata override: all paid receipts,
+        # native route capability and exact request/projection bytes are equal.
+        restored = copy.deepcopy(replay_events)
+        for event in restored:
+            if event['event'] in ('run_started', 'session_resumed'):
+                event['data']['implicit_cache_minimum_prefix_tokens'] = None
+        test.assertEqual(restored, events)
+        (session / 'trace.jsonl').write_text(''.join(json.dumps(event) + '\n' for event in replay_events))
+        report = directory / (label + '.html')
+        process = subprocess.run([binary, 'report', 'cost', '--sessions', str(session.parent),
+                                  '--output', str(report)],
+                                 env={'PATH': '', 'HOME': str(directory), 'TMPDIR': str(directory)},
+                                 capture_output=True, timeout=15)
+        (directory / (label + '.stdout')).write_bytes(process.stdout)
+        (directory / (label + '.stderr')).write_bytes(process.stderr)
+        test.assertEqual(process.returncode, 0, process.stderr)
+        cells = Cells()
+        cells.feed(report.read_text())
+        test.assertEqual(len(cells.cells), 10, cells.cells)
+        test.assertEqual(cells.cells[2], '3/3')
+        test.assertEqual(cells.cells[3], '$0.0301')
+        test.assertIn('0 unpriced', cells.cells[9])
+        rows.append(cells.cells)
+    (directory / 'REPORT_POLICY.json').write_text(json.dumps(rows, indent=2) + '\n')
+    return rows
+
 
 class NativeTracker(unittest.TestCase):
     def test_unknown_route_and_receipts_cannot_invent_cache_veto(self):
@@ -143,6 +185,22 @@ class NativeTracker(unittest.TestCase):
                 self.assertEqual(case['retains_seed'], case['protected'],
                                  'NATIVE_CACHE_PROOF: unknown-route receipts/local estimates cannot invent cache-veto authority')
                 self.assertEqual(case['result']['compactions'], 0 if case['protected'] else 1)
+        report_captures = []
+        for case in captures:
+            if case['name'] != 'zero' or case['protected']:
+                continue
+            directory = root / ('report-policy-' + str(int(case['streaming'])))
+            directory.mkdir()
+            rows = report_policy_rows(self, binary, directory, case['events'])
+            # The trace has a real native Carry rewrite and no native cache
+            # entitlement. Its API-equivalent forecast is a separate contract.
+            self.assertEqual(rows[1][4:7], ['$0.0301', '$0.0218', '$-0.0083'])
+            report_captures.append((case['streaming'], rows))
+        self.assertEqual(len(report_captures), 2)
+        for streaming, rows in report_captures:
+            with self.subTest(streaming=streaming, gate='native-report-scenario'):
+                self.assertEqual(rows[0][4:7], rows[1][4:7],
+                    'NATIVE_REPORT_POLICY: absent native entitlement cannot erase an independent known API-equivalent scenario')
 
 
 if __name__ == '__main__':

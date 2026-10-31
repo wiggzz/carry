@@ -656,6 +656,9 @@ async fn run_loop(
     let prompt_cache_capabilities = backend.prompt_cache_capabilities();
     let implicit_cache_minimum_prefix_tokens =
         prompt_cache_capabilities.map(|capabilities| capabilities.minimum_prefix_tokens);
+    // Report forecasts are API-equivalent model assumptions, never native
+    // destination entitlement. Freeze their existing contract independently.
+    let scenario_cache_policy = carry::models::ScenarioCachePolicy::for_model(&config.model);
     tokio::fs::create_dir_all(config.session_dir.join("tools")).await?;
     let patch_baseline = capture_patch_baseline(&config).await?;
     let resumed = config.resume_context.is_some();
@@ -685,6 +688,7 @@ async fn run_loop(
                 "cache_ttl_seconds": CACHE_TTL.as_secs(),
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
+                "scenario_cache_policy": scenario_cache_policy,
                 "compaction_policy": config.compaction_mode,
                 "compaction_payoff_requests": config.compaction_payoff_requests,
                 "compaction_min_payback_percent": config.compaction_min_payback_percent,
@@ -708,6 +712,7 @@ async fn run_loop(
                 "cache_ttl_seconds": CACHE_TTL.as_secs(),
                 "prompt_cache_capabilities": prompt_cache_capabilities,
                 "implicit_cache_minimum_prefix_tokens": implicit_cache_minimum_prefix_tokens,
+                "scenario_cache_policy": scenario_cache_policy,
                 "compaction_policy": config.compaction_mode,
                 "compaction_payoff_requests": config.compaction_payoff_requests,
                 "compaction_min_payback_percent": config.compaction_min_payback_percent,
