@@ -64,7 +64,7 @@ fn quantity_policy_real_coordinators_preserve_summary_after_unknown_money() {
             // a claim that provider totals generally equal a local tokenizer.
             let input = prompt_projection(&body).unwrap().2;
             let writes = u64::from(step == 2) * 1000;
-            let response = json!({"output":[],"usage":{
+            let response = json!({"status":"completed","output":[],"usage":{
                 "input_tokens":input,"output_tokens":0,
                 "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":writes}
             }});
