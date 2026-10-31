@@ -1911,6 +1911,43 @@ mod tests {
     }
 
     #[test]
+    fn qualified_native_receipts_need_located_write_proof() {
+        let history = [json!({"role":"user", "content":"synthetic unchanged input"})];
+        let mut coverage = Vec::new();
+        for usage in [
+            Usage::default(),
+            Usage {
+                input_tokens: 5_000,
+                ..Usage::default()
+            },
+            Usage {
+                input_tokens: 5_000,
+                cached_input_tokens: 1_000,
+                ..Usage::default()
+            },
+            Usage {
+                input_tokens: 5_000,
+                cache_write_input_tokens: 1_000,
+                ..Usage::default()
+            },
+        ] {
+            let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+            cache.begin_request_with_history(Vec::new(), &history, 2_400);
+            cache.observe(&usage);
+            coverage.push(
+                cache
+                    .policy_for_history(&history, 1, 10)
+                    .implicit_cached_tokens,
+            );
+        }
+        assert_eq!(
+            coverage,
+            [0, 0, 0, 0],
+            "NATIVE_LOCATED_WRITE: entitlement, local size, absent usage and partial native counts cannot establish whole local coverage"
+        );
+    }
+
+    #[test]
     fn tracker_respects_resolved_minimum_and_write_slots() {
         let mut cache = CacheTracker::new(Some(PromptCacheCapabilities {
             minimum_prefix_tokens: 2_000,
