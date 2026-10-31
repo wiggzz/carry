@@ -99,42 +99,8 @@ fn append_compatible(anchor: &Anchor, body: &Value, configuration: &str) -> bool
 /// reported write (Responses semantics); absent cache-read data is unknown.
 /// Reject contradictory aliases rather than clipping them into a priced call.
 pub(super) fn receipt(usage: &Value) -> Option<Usage> {
-    fn partition(values: &[Option<&Value>], required: bool) -> Option<u64> {
-        let mut found = None;
-        for value in values.iter().flatten() {
-            let n = value.as_u64()?;
-            if found.is_some_and(|prior| prior != n) {
-                return None;
-            }
-            found = Some(n);
-        }
-        if required {
-            found
-        } else {
-            Some(found.unwrap_or(0))
-        }
-    }
-    let input = usage["input_tokens"].as_u64()?;
+    let (input, cached, written) = carry::core::CacheUsage::from_receipt(usage).partition()?;
     let output = usage["output_tokens"].as_u64()?;
-    let cached = partition(
-        &[
-            usage["input_tokens_details"].get("cached_tokens"),
-            usage.get("cached_input_tokens"),
-        ],
-        true,
-    )?;
-    let written = partition(
-        &[
-            usage["input_tokens_details"].get("cache_write_tokens"),
-            usage["input_tokens_details"].get("cache_creation_tokens"),
-            usage.get("cache_write_input_tokens"),
-            usage.get("cache_creation_input_tokens"),
-        ],
-        false,
-    )?;
-    if cached.checked_add(written)? > input {
-        return None;
-    }
     Some(Usage {
         input_tokens: input,
         output_tokens: output,

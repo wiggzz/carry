@@ -75,6 +75,71 @@ pub fn joint_decision(primary: ViewCosts, shadow: ViewCosts, min_percent: u8) ->
     }
 }
 
+/// Native receipt quantities, independent of output usage, prices or cache
+/// timing. All aliases must agree. A bad write cannot erase a valid read pair,
+/// but neither money nor reusable write proof may use an invalid full partition.
+#[derive(Clone, Copy, Debug)]
+pub struct CacheUsage {
+    input: Option<u64>,
+    cached: Option<u64>,
+    written: Result<Option<u64>, ()>,
+}
+
+impl CacheUsage {
+    pub fn from_receipt(usage: &Value) -> Self {
+        fn agreed(values: &[Option<&Value>]) -> Result<Option<u64>, ()> {
+            let mut found = None;
+            for value in values.iter().flatten() {
+                let n = value.as_u64().ok_or(())?;
+                if found.is_some_and(|prior| prior != n) {
+                    return Err(());
+                }
+                found = Some(n);
+            }
+            Ok(found)
+        }
+        Self {
+            input: usage["input_tokens"].as_u64(),
+            cached: agreed(&[
+                usage["input_tokens_details"].get("cached_tokens"),
+                usage.get("cached_input_tokens"),
+            ])
+            .ok()
+            .flatten(),
+            written: agreed(&[
+                usage["input_tokens_details"].get("cache_write_tokens"),
+                usage["input_tokens_details"].get("cache_creation_tokens"),
+                usage.get("cache_write_input_tokens"),
+                usage.get("cache_creation_input_tokens"),
+            ]),
+        }
+    }
+
+    pub fn input(&self) -> Option<u64> {
+        self.input
+    }
+
+    /// Read coverage does not depend on write validity or monetary availability.
+    pub fn read(&self) -> Option<(u64, u64)> {
+        let (input, cached) = (self.input?, self.cached?);
+        (cached <= input).then_some((input, cached))
+    }
+
+    /// Retain explicit write presence for raw evidence; absence is not a write.
+    pub fn reported_write(&self) -> Option<u64> {
+        let written = self.written.ok()??;
+        (written <= self.input?).then_some(written)
+    }
+
+    /// Responses: absent optional writes mean no reported write for pricing;
+    /// absent reads, invalid aliases and overlapping partitions remain unknown.
+    pub fn partition(&self) -> Option<(u64, u64, u64)> {
+        let (input, cached) = self.read()?;
+        let written = self.written.ok()?.unwrap_or(0);
+        (cached.checked_add(written)? <= input).then_some((input, cached, written))
+    }
+}
+
 /// Independently observed input/cache pairs, not inferred from monetary pricing.
 /// Legacy ledgers have no coverage; their historical numeric totals stay intact.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -133,12 +198,11 @@ impl UsageLedger {
         }
         let mut complete = self.calls.checked_add(1).is_some();
         self.calls = self.calls.saturating_add(1);
-        let input = usage["input_tokens"].as_u64();
+        let quantities = CacheUsage::from_receipt(usage);
+        let input = quantities.input();
         let output = usage["output_tokens"].as_u64();
-        let cached = usage["input_tokens_details"]["cached_tokens"].as_u64();
-        if let (Some(input), Some(cached)) = (input, cached)
-            && cached <= input
-        {
+        let cached = quantities.read().map(|(_, cached)| cached);
+        if let Some((input, cached)) = quantities.read() {
             let observed = &mut self.cache_observation;
             if let (Some(calls), Some(input), Some(cached)) = (
                 observed.calls.checked_add(1),
@@ -152,10 +216,7 @@ impl UsageLedger {
                 };
             }
         }
-        let written = usage["input_tokens_details"]["cache_write_tokens"]
-            .as_u64()
-            .or_else(|| usage["input_tokens_details"]["cache_creation_tokens"].as_u64())
-            .unwrap_or(0);
+        let written = quantities.reported_write().unwrap_or(0);
         // Commit all token partitions together, or retain the prior receipt totals.
         if let (Some(input), Some(output), Some(cached), Some(written)) = (
             self.input_tokens.checked_add(input.unwrap_or(0)),
@@ -171,8 +232,8 @@ impl UsageLedger {
             complete = false;
         }
         let mut settled = None;
-        if let (Some(input), Some(output), Some(cached), Some(rates)) =
-            (input, output, cached, rates)
+        if let (Some((input, cached, written)), Some(output), Some(rates)) =
+            (quantities.partition(), output, rates)
             && standard
             && !["input_tokens_details", "output_tokens_details"]
                 .iter()
@@ -181,7 +242,6 @@ impl UsageLedger {
                         .as_u64()
                         .is_some_and(|n| n > 0)
                 })
-            && cached.checked_add(written).is_some_and(|v| v <= input)
         {
             // Token overflow does not erase an independently priceable receipt.
             let cost = (input - cached - written) as f64 * rates.input

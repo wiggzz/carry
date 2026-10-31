@@ -364,13 +364,11 @@ pub(super) fn observe(
     if ttl_seconds == 0 {
         return false;
     }
-    let (Some(total), Some(cached)) = (
-        usage["input_tokens"].as_u64(),
-        usage["input_tokens_details"]["cached_tokens"].as_u64(),
-    ) else {
+    let quantities = carry::core::CacheUsage::from_receipt(usage);
+    let Some((total, cached)) = quantities.read() else {
         return false;
     };
-    if total < capability.minimum_prefix_tokens as u64 || cached > total {
+    if total < capability.minimum_prefix_tokens as u64 {
         return false;
     }
     let end = if body["prompt_cache_options"]["mode"] == "explicit" {
@@ -388,13 +386,12 @@ pub(super) fn observe(
         input.len()
     };
     let input = &input[..end];
-    let written = usage["input_tokens_details"]["cache_write_tokens"].as_u64();
+    let written = quantities.reported_write();
     let write_window = time.dispatched_at.and_then(|not_before| {
         // Capability plus a full native write receipt supplies request-interval
         // proof. Unknown/mixed lifetime and explicitly limited write extents do
         // not establish whole-input retention. Never infer population from hits.
-        (written == Some(total)
-            && cached == 0
+        (quantities.partition() == Some((total, 0, total))
             && end == body["input"].as_array().unwrap().len()
             && carry::models::cache_write_tariff_known(body)
             && not_before <= at)
