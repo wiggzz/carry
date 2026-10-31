@@ -416,6 +416,7 @@ async fn frozen_primary_is_independent_of_unresolved_reviewer_after_restart() {
                 };
                 let primary = checkpoint["model_resolution"]["primary"].clone();
                 let before_cost = checkpoint["primary"]["cost_usd"].as_f64().unwrap();
+                let before_recorded_calls = checkpoint["primary"]["calls"].as_u64().unwrap();
                 let before_unavailable = checkpoint["primary"]["unavailable_cost_calls"]
                     .as_u64()
                     .unwrap();
@@ -436,10 +437,16 @@ async fn frozen_primary_is_independent_of_unresolved_reviewer_after_restart() {
                 let label = format!(
                     "unknown_reviewer={unknown_reviewer},missing_discovery={missing_discovery},unknown_price={unknown_price}"
                 );
-                if status != 413 || f.primary_calls.load(Ordering::SeqCst) != before_calls {
+                let expected_status = if unknown_price { 200 } else { 413 };
+                if status != expected_status {
                     failures.push(format!(
-                        "{label}: saved primary admission widened; HTTP {status}"
+                        "{label}: expected HTTP {expected_status}, got {status}"
                     ));
+                }
+                if f.primary_calls.load(Ordering::SeqCst)
+                    != before_calls + usize::from(unknown_price)
+                {
+                    failures.push(format!("{label}: oversized upstream arrival count changed"));
                 }
                 body["max_output_tokens"] = json!(10);
                 assert_eq!(send(&url, "independent-contract", &body).await, 200);
@@ -449,15 +456,26 @@ async fn frozen_primary_is_independent_of_unresolved_reviewer_after_restart() {
                 }
                 let delta = after["primary"]["cost_usd"].as_f64().unwrap() - before_cost;
                 let expected = if unknown_price { 0.0 } else { 721.0 / 1e6 };
-                if (delta - expected).abs() > 1e-12
-                    || after["primary"]["unavailable_cost_calls"]
-                        != before_unavailable + u64::from(unknown_price)
-                {
+                if (delta - expected).abs() > 1e-12 {
                     failures.push(format!("{label}: frozen tariff changed"));
+                }
+                let completed = 1 + u64::from(unknown_price);
+                if f.primary_calls.load(Ordering::SeqCst) != before_calls + completed as usize
+                    || after["primary"]["calls"] != before_recorded_calls + completed
+                {
+                    failures.push(format!("{label}: completed primary count changed"));
+                }
+                if after["primary"]["unavailable_cost_calls"]
+                    != before_unavailable + if unknown_price { completed } else { 0 }
+                {
+                    failures.push(format!("{label}: unpriced primary count changed"));
                 }
                 if unknown_reviewer {
                     assert!(after["model_resolution"]["reviewer"]["capacity_tokens"].is_null());
+                }
+                if unknown_reviewer || unknown_price {
                     assert_eq!(f.review_calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(after["shadow"]["calls"], 0);
                 }
             }
         }
