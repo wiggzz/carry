@@ -430,14 +430,12 @@ impl Trajectory {
         }
         let (
             Some(native),
-            Some(carry),
             Some((_, _, local)),
             Some(items),
             Some(retained_output),
             Some(protected),
         ) = (
             native,
-            observed,
             projection,
             body["input"].as_array(),
             retained_output,
@@ -541,7 +539,7 @@ impl Trajectory {
         // Identical execution has one paid contribution. Only a genuinely
         // different history asks the cache/tariff forecast a hypothetical price.
         // Sharing the money does NOT seed divergent cache history with real hits.
-        let pair = self.history.price_primary(Some(carry), || {
+        let pair = self.history.price_primary(observed, || {
             scenario_request_input_cost_resolved(
                 body,
                 model,
@@ -581,21 +579,20 @@ impl Trajectory {
         } else {
             Some(0.0)
         };
+        // Quantity/projection transitions belong to history, not monetary-pair
+        // admission. An unavailable tariff excludes money without losing the
+        // successful native cursor or granting another free initialization.
+        self.result.initial_compactions += u64::from(initialized_now);
         if let (Some((carry, traditional_cost)), Some(summary_cost)) = (pair, summary_cost) {
-            self.result.initial_compactions += u64::from(initialized_now);
             self.result.carry_cost += carry;
             self.result.traditional_cost += traditional_cost + summary_cost;
             self.result.summary_cost += summary_cost;
             *self.priced_primary_responses.as_mut().unwrap() += 1;
         } else {
             self.result.excluded_unpriced_calls += 1;
-            if cached.is_some() {
-                self.reset_epoch();
-                return;
+            if cached.is_none() {
+                self.result.coverage.unknown_cache_requests += 1;
             }
-            // Retention uncertainty excludes this monetary pair, not the
-            // independent quantities/cursor or earlier frozen contributions.
-            self.result.coverage.unknown_cache_requests += 1;
         }
         self.history.last_traditional_input = traditional;
         let cache = &mut self.receipts.as_mut().unwrap().modeled_cache;
