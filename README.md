@@ -108,15 +108,60 @@ The generated HTML contains local session IDs: review it before sharing.
 
 ### Install a release
 
-Download the Linux x86_64 archive and `SHA256SUMS` from the
-[latest release](https://github.com/wiggzz/carry/releases/latest), then verify
-before installing:
+Choose the archive for your system from the
+[latest release](https://github.com/wiggzz/carry/releases/latest) and download its
+`SHA256SUMS` alongside it. macOS binaries are available starting with the first
+release containing this change; older releases contain only Linux binaries.
+
+| System | Archive suffix |
+| --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon (`uname -m` reports `arm64`) | `aarch64-apple-darwin.tar.gz` |
+| macOS Intel (`uname -m` reports `x86_64`) | `x86_64-apple-darwin.tar.gz` |
+
+#### macOS quick start
+
+In Terminal, change to the download directory. Set `archive` to the exact file
+you downloaded (replace `<version>`, including its `v` prefix):
 
 ```sh
-sha256sum -c SHA256SUMS
-mkdir -p ~/.local/bin
-tar -xzf carry-<version>-x86_64-unknown-linux-gnu.tar.gz
-install -m 0755 carry ~/.local/bin/carry
+archive='carry-<version>-aarch64-apple-darwin.tar.gz'
+# Intel Macs: use carry-<version>-x86_64-apple-darwin.tar.gz instead.
+grep -F "  $archive" SHA256SUMS | shasum -a 256 -c - &&
+  tar -xzf "$archive" &&
+  mkdir -p "$HOME/.local/bin" &&
+  install -m 0755 carry "$HOME/.local/bin/carry"
+export PATH="$HOME/.local/bin:$PATH"
+carry --help
+```
+
+The checksum command must report `OK` before installation. Add the `export PATH`
+line to `~/.zshrc` to keep Carry on your PATH in new Terminal windows.
+The macOS binaries are built and smoke-tested on macOS 15 for each architecture;
+older macOS versions are not tested. They are not Developer ID signed or
+notarized. If Gatekeeper blocks a verified download, follow Apple's
+[Open Anyway instructions](https://support.apple.com/en-us/102445) in System
+Settings → Privacy & Security, or build from source below.
+
+To run a first task, set `OPENAI_API_KEY` or use `carry login` as described under
+[Run an isolated task](#run-an-isolated-task), then run:
+
+```sh
+carry --cwd /path/to/disposable/repo -p 'Explain how this project is organized'
+```
+
+Tasks use your configured model provider and may incur usage costs. The
+`carry --help` check above does not call a model.
+
+#### Linux quick start
+
+```sh
+archive='carry-<version>-x86_64-unknown-linux-gnu.tar.gz'
+grep -F "  $archive" SHA256SUMS | sha256sum -c - &&
+  tar -xzf "$archive" &&
+  mkdir -p "$HOME/.local/bin" &&
+  install -m 0755 carry "$HOME/.local/bin/carry"
+export PATH="$HOME/.local/bin:$PATH"
 carry --help
 ```
 
@@ -340,4 +385,6 @@ checks.
 
 Contributions use Conventional Commit titles. CI runs formatting, Clippy, unit
 tests, a release build, and the scripted fixture. Release Please publishes the
-Linux x86_64 archive and checksum after its release PR merges.
+Linux x86_64 and macOS Intel/Apple Silicon archives with a combined `SHA256SUMS`
+after its release PR merges. Release builds and relevant pull requests use the
+same native build, archive verification, and offline shell smoke workflow.
