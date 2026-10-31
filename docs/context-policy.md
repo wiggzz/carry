@@ -2,7 +2,7 @@
 
 The native Carry agent keeps one chronological context ledger. It makes a context
 rewrite an explicit, inspectable decision instead of a periodic summary. For the
-standalone proxy, see the [proxy overview](../README.md#use-carry-as-a-standalone-context-proxy).
+standalone proxy, see the [proxy overview](../README.md#how-the-proxy-works).
 
 ## Item lifecycle
 
