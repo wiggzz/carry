@@ -4138,6 +4138,9 @@ mod tests {
     }
     include!("proxy_catalog_isolation_tests.rs");
     include!("proxy_settlement_tests.rs");
+    mod namespace_upgrade_controls {
+        include!("proxy_namespace_upgrade_tests.rs");
+    }
     include!("proxy_semantic_tests.rs");
     include!("proxy_noodle_tests.rs");
     include!("proxy_pr154_tests.rs");
