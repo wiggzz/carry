@@ -1,37 +1,63 @@
 # Carry
 
-Carry is an experimental coding agent built to reduce context cost without
-throwing away the evidence needed to finish the job. It gives a model a shell,
-records its work, and saves the resulting patch, trace, and usage record.
+A low-cost coding harness—or a context proxy for your favorite harness.
 
-> **Safety:** use a disposable checkout. Carry's shell is **not** a security
-> boundary. Do not give it your home directory, secrets, credentials, or unrelated
-> work.
+Carry manages stale context so your model can keep useful evidence without
+carrying every old tool result forever. Use its built-in harness, or keep your
+existing OpenAI Responses client and run Carry between it and the provider.
 
-## How Carry reduces cost
+## How the proxy works
 
-- **Model-directed context management.** Human-authored content is kept by
-default. The model can protect evidence, mark stale tool output removable, or
-save a concise learning from it. Model-protected items now receive keep leases by
-default: after eight later model turns non-human items become due for a batched
-review, issued when releasing due leases could make a rewrite worthwhile.
-The model can renew protection; reviewed, unrenewed items become eligible for
-compaction, not immediately deleted. Configure the positive lease length with
-`--keep-lease-turns N` or `CARRY_KEEP_LEASE_TURNS`. Human content remains kept by
-default unless its retention is explicitly changed.
-- **Cost-optimized compaction planning.** The default `economic` policy compares
-rewriting with retaining history over five requests, including the immediate next
-request. It rewrites only when modeled savings exceed 10% of the retain-path
-cost over that horizon; otherwise it keeps the existing history and prompt-cache
-reuse. The immediate next request need not be cheaper on its own.
-- **Inspectable results.** Each session retains `final.patch`, `result.json`,
-`trace.jsonl`, and shell output. The trace has no API headers or keys.
+Carry forwards your client's requests and reviews eligible history in the
+background. It keeps the original history and plans smaller contexts only when
+modeled savings justify the rewrite, accounting for review cost and prompt-cache
+reuse. A request that fits never waits for a review.
 
-Carry is an experiment, not a claim that compaction is always useful. See the
-[context-policy design](docs/context-policy.md) for the lifecycle and accounting
-rules.
+Unknown models pass through without Carry review or rewriting, and unknown costs
+stay unpriced. Savings are experimental, workload-dependent estimates—not a
+billing guarantee.
 
-## Evidence at a glance
+## Install
+
+With Rust installed:
+
+```sh
+cargo install --git https://github.com/wiggzz/carry.git --locked
+```
+
+Or download a binary from the [latest release](https://github.com/wiggzz/carry/releases/latest).
+See the [installation guide](docs/harness-usage.md#install-a-release) for platforms,
+checksum verification, and macOS notes.
+
+## Use your favorite harness
+
+```sh
+carry login   # or set OPENAI_API_KEY
+carry proxy
+```
+
+Point your client's OpenAI Responses base URL at `http://127.0.0.1:8787/v1`.
+The client chooses the primary model; Carry handles upstream authentication and
+opens a local usage dashboard. Reviews consume API or subscription capacity.
+
+See [proxy setup](docs/proxy-benchmarking.md#standalone-proxy) for client
+configuration, gateway authentication, and persistent state, or the
+[Pi launcher](docs/proxy-benchmarking.md#everyday-pi-launcher) for a ready-made wrapper.
+
+## Or use Carry's harness
+
+```sh
+carry --cwd /path/to/disposable/repo fix the failing tests
+```
+
+Run without a prompt for the browser UI; add `--interactive` for terminal follow-ups.
+Sessions retain the patch, trace, and usage record. See the
+[harness guide](docs/harness-usage.md) and `carry --help` for more.
+
+> **Safety:** Carry's shell is **not** a sandbox. Use a disposable checkout and
+> keep secrets, credentials, and unrelated work out of reach.
+
+## Harness benchmarks
 
 ### Official SWE-bench Verified 50
 
@@ -73,287 +99,11 @@ Read [benchmark evidence](docs/benchmark-results.md) for immutable run links,
 configuration, accounting, recovery provenance, and limitations. One run is
 useful evidence, not a general quality ranking.
 
-## Local session cost report
+## More
 
-Run `carry report cost` to generate an HTML report from local session traces and
-open it in your browser. Use `--sessions DIR` to select a different session home
-and `--output FILE` to save it elsewhere. Browser-launch failures do not prevent
-report generation; open the printed URL manually.
-
-The report and web UI separate **observed modeled usage cost** from an
-**experimental savings scenario**. The scenario asks how carrying stale context
-until a traditional summary boundary might compare with incremental pruning;
-it is not a measured Pi run or a bill-saving guarantee. Missing usage and
-unpriced responses remain visible rather than being assigned zero cost.
-
-### Potential savings in iterative work
-
-A private local-session audit covers **30 sessions with 1,370 completed model
-responses and 142 recorded Carry compactions**. On the **25 fully covered
-sessions (1,122 responses)** eligible for the default proxy scenario, incremental
-pruning modeled **39.2% lower cost** than retaining removed context until a
-Pi-style summary boundary. This is a conditional byte-proxy comparison—not
-measured provider or invoice savings. Evidence can become stale while a project
-continues, well before a conventional full-context summary is needed.
-
-See the [local-session case study](docs/local-session-cost-report.md) for the
-aggregate report, scenario assumptions and limitations. Potential savings
-depend on the workload, retained evidence, cache behavior and comparator—not
-conversation length alone. These traces are not a quality benchmark, and their
-prompts, tool output and session identities are not published.
-
-The generated HTML contains local session IDs: review it before sharing.
-
-## Install and try it
-
-### Install a release
-
-Choose the archive for your system from the
-[latest release](https://github.com/wiggzz/carry/releases/latest) and download its
-`SHA256SUMS` alongside it. macOS binaries are available starting with the first
-release containing this change; older releases contain only Linux binaries.
-
-| System | Archive suffix |
-| --- | --- |
-| Linux x86_64 | `x86_64-unknown-linux-gnu.tar.gz` |
-| macOS Apple Silicon (`uname -m` reports `arm64`) | `aarch64-apple-darwin.tar.gz` |
-| macOS Intel (`uname -m` reports `x86_64`) | `x86_64-apple-darwin.tar.gz` |
-
-#### macOS quick start
-
-In Terminal, change to the download directory. Set `archive` to the exact file
-you downloaded (replace `<version>`, including its `v` prefix):
-
-```sh
-archive='carry-<version>-aarch64-apple-darwin.tar.gz'
-# Intel Macs: use carry-<version>-x86_64-apple-darwin.tar.gz instead.
-grep -F "  $archive" SHA256SUMS | shasum -a 256 -c - &&
-  tar -xzf "$archive" &&
-  mkdir -p "$HOME/.local/bin" &&
-  install -m 0755 carry "$HOME/.local/bin/carry"
-export PATH="$HOME/.local/bin:$PATH"
-carry --help
-```
-
-The checksum command must report `OK` before installation. Add the `export PATH`
-line to `~/.zshrc` to keep Carry on your PATH in new Terminal windows.
-The macOS binaries are built and smoke-tested on macOS 15 for each architecture;
-older macOS versions are not tested. They are not Developer ID signed or
-notarized. If Gatekeeper blocks a verified download, follow Apple's
-[Open Anyway instructions](https://support.apple.com/en-us/102445) in System
-Settings → Privacy & Security, or build from source below.
-
-To run a first task, set `OPENAI_API_KEY` or use `carry login` as described under
-[Run an isolated task](#run-an-isolated-task), then run:
-
-```sh
-carry --cwd /path/to/disposable/repo -p 'Explain how this project is organized'
-```
-
-Tasks use your configured model provider and may incur usage costs. The
-`carry --help` check above does not call a model.
-
-#### Linux quick start
-
-```sh
-archive='carry-<version>-x86_64-unknown-linux-gnu.tar.gz'
-grep -F "  $archive" SHA256SUMS | sha256sum -c - &&
-  tar -xzf "$archive" &&
-  mkdir -p "$HOME/.local/bin" &&
-  install -m 0755 carry "$HOME/.local/bin/carry"
-export PATH="$HOME/.local/bin:$PATH"
-carry --help
-```
-
-### Build from source
-
-```sh
-git clone https://github.com/wiggzz/carry.git
-cd carry
-cargo build --release --locked
-./target/release/carry --help
-```
-
-### Run an isolated task
-
-Set an API key in the process environment and point Carry at a disposable
-checkout:
-
-```sh
-export OPENAI_API_KEY=...
-carry --cwd /path/to/disposable/repo fix the failing tests
-```
-
-An eligible ChatGPT subscription can use the Codex endpoint instead:
-
-```sh
-carry login
-# headless host:
-carry login --device-auth
-```
-
-`OPENAI_API_KEY` takes precedence and is required for a custom
-`OPENAI_BASE_URL`. Remove the stored subscription credential with `carry logout`.
-Use `-p` when the prompt begins with an option-like value.
-
-Run without a prompt to start the localhost-only HTML UI and open it in your
-default browser. Use `--no-open` on remote/headless machines or to open the printed
-URL yourself. Browser-launch failures do not stop the server.
-`--serve` remains an explicit alias. Use `--interactive` for terminal follow-ups
-and steering. Supplying a prompt still runs once in the terminal; use `--print`
-to explicitly select one-shot mode, including when piping a prompt from stdin:
-
-```sh
-carry --cwd ../project
-carry --port 9000
-carry --interactive -p "investigate the flaky test"
-printf 'explain the failing tests' | carry --print
-```
-
-### Use Carry as a standalone context proxy
-
-Run `carry proxy`, then
-connect a separate OpenAI Responses client to `http://127.0.0.1:8787/v1`.
-Full-history clients can omit `x-carry-session`: Carry automatically reuses
-compatible committed reviewed prefixes across forks, rewinds and restart, without
-a client adapter or fork-discovery API. Server-owned response/conversation indexes
-also expand observed delta histories; unknown ancestry is never fabricated.
-See [transparent history](docs/proxy-fork-continuity.md) for boundaries and limits.
-Canonical native history and completed prefix advice are separate from disposable
-primary/reviewer projections. Every request replans from the original history and
-current exact-wire cache evidence; a past omission is not permanent removal.
-Reviewers receive a fresh source/fact/ledger view, never prior reviewer answers.
-Ordinary review is asynchronous, including replay imports. A fitting primary
-never waits. Only a no-fit primary can acquire one bounded review when complete,
-exposed, unprotected source could make it fit; failure or no helpful advice leaves
-it locally rejected. Oversized reviewer inputs are skipped, not partially reviewed.
-
-Defaults are `--mode compact --login auto --payoff-requests 5`. Auto authentication
-prefers `CARRY_PROXY_UPSTREAM_KEY` or `OPENAI_API_KEY`, then a valid saved Carry
-subscription; `--login codex` or `--login api-key` selects explicitly. Ordinary
-review defaults require a 150,000-token retained-primary estimate, four completed
-requests **and** 25,000 newly reviewable native-source tokens, with bounded no-yield
-backoff. `--review-replayed-history` declares prior completed exposure; it does not
-bypass protection or create synchronous review. Invalid advice items are isolated,
-and budget-rejected replacement facts preserve their supporting sources.
-Unknown primary pricing suppresses ordinary paid review. These are experimental
-planning assumptions, not demonstrated savings or cache-hit guarantees. See the
-[history contract](docs/proxy-fork-continuity.md) for exact safety, capacity,
-retention and fresh-state boundaries; this redesign requires a new empty state
-directory and has no legacy checkpoint or synchronous-review compatibility.
-
-Authenticated `GET /v1/models` also works with `--login codex`: Carry queries the
-subscription catalog using the pinned Codex 0.147.0 discovery contract and returns
-its picker-visible IDs as an OpenAI-compatible list. It does not infer account
-availability from Carry's pricing table or require an API key. The `created` field
-is `0` because the subscription catalog supplies no creation timestamp. Catalog
-responses are limited to 8 MiB. Missing or incorrect local client credentials still
-return 401. Subscription credential, transport, upstream, or malformed catalog
-failures return a sanitized 502 rather than an invented fallback catalog.
-Explicit model configuration remains usable if discovery is unavailable. Discovery
-does not switch the configured authentication mode; API-key discovery remains an
-upstream relay. This adapter is fixture-tested, not live-account verified.
-
-Interactive startup opens the local, token-free stats dashboard. Reusing the
-state directory (by default `$CARRY_HOME/proxy` or `~/.carry/proxy`) preserves committed state
-and cumulative dashboard totals across restarts and working directories. Full per-session
-`.jsonl` request/response/plan logs are disabled by default; enable them explicitly
-with `carry proxy --verbose` for debugging. They contain sensitive task content and
-use bounded whole-file retention (64 KiB per record, 256 KiB per lane, 1 MiB total).
-A separate default operational journal in `STATE_DIR/diagnostics/*.jsonl` records
-sanitized, correlated review/compaction decisions (16 KiB per record, 64 KiB per
-lane, 256 KiB total). Oversized records are dropped, never truncated JSON. Logging
-is best-effort and independent of checkpoints and lifetime accounting. Dormant raw
-logs remain untouched on a default restart; enabling verbose capture brings legacy
-raw logs into retention. Export needed evidence before eviction and protect raw
-traces. See [diagnostic semantics](docs/proxy-benchmarking.md#bounded-proxy-diagnostics) and the
-[standalone proxy setup](docs/proxy-benchmarking.md#standalone-proxy)
-for API-key authentication, client configuration, and replay-import boundaries.
-Session identity uses stable client/thread/agent identifiers; per-turn telemetry
-is forwarded unchanged without splitting Carry state or reviewer cache affinity.
-The dashboard shows short first-user-message titles and orders sessions by their
-latest checkpoint update. Session titles are the only message excerpts returned
-by dashboard stats; memory contents remain private. Stats are gateway-wide across
-the proxy's state directory, not scoped to the caller's session or tenant. Titles
-can contain sensitive task text; protect remote stats access with the proxy token
-and authenticate any reverse proxy that presents itself as a loopback peer.
-
-### Terminal input and formatting
-
-In `--interactive` mode, Enter sends the draft. Alt+Enter or Ctrl+J inserts a
-newline; Shift+Enter also works when the terminal reports it distinctly. Pasted
-blocks are inserted without submitting (bracketed paste), preserving indentation
-and blank lines. Arrow keys edit the draft, including earlier lines. Ctrl+C clears
-the draft; Ctrl+D on empty input or `/quit` exits. `/help` lists commands. The old
-`/paste` and `/end` commands remain available for compatibility.
-
-The editor stays in the normal terminal screen. Status output is printed above
-the editable draft. While the editor is active, streamed answers are buffered to
-complete lines (the last partial line is flushed on completion) to avoid disruptive
-per-token redraws. Terminal shell commands are shown once when execution starts,
-not repeatedly while their arguments are being generated; the browser still shows
-live shell-call previews. On Unix, run `cargo build && python3 tests/terminal_editor.py`
-for the editor’s pseudo-terminal smoke tests.
-
-Reedline is used only when stdin, stdout, and stderr are terminals. If either output
-stream is redirected, Carry uses the compatible line-oriented reader (`/paste`,
-`/end`, and `/cancel` remain available) so terminal protocol bytes never enter
-redirected stdout.
-
-Answers use lightweight terminal Markdown styling: colored headings, bold text,
-inline/fenced code, and muted block quotes. Lists, links, and tables remain readable
-Markdown source; code is colored as a block, not syntax-highlighted. Redirected
-stdout, `NO_COLOR`, and `TERM=dumb` preserve the original Markdown without styling.
-Output stays in native terminal scrollback, without a live token-counter redraw.
-Your terminal's “scroll on output” setting controls whether new output scrolls
-you back down.
-
-Model answer/commentary text is previewed as it streams, in both the browser
-and a terminal (on stderr when it is a TTY). Complete streamed lines receive the
-same lightweight Markdown styling as completed answers. Previews are provisional;
-a fully streamed terminal answer is not printed a second time at completion.
-If streaming was incomplete or stdout is redirected, the complete answer is still
-printed; redirected stdout remains suitable for piping. Tool arguments and context bookkeeping are not displayed
-as raw JSON. Private reasoning is not shown.
-
-Each model response in the browser includes its own input, cached-input, output,
-and total token counts. The footer shows only estimated session cost in USD, using the repository’s
-benchmark rates (currently available for `gpt-5.6-luna`). This is not a billing
-quote. Missing pricing or older responses without cost metadata show compact token totals instead
-(e.g. `2.5m tokens (2.4m cached, 120k out)`), rather than an incomplete cost.
-
-In the browser, submitted messages stay beside the composer as “sending”, then
-“queued” once accepted. They move into the conversation when added to the model's
-context, rather than appearing among output before they have been consumed.
-Steering received during a finishing response starts another turn automatically.
-
-## Inspect a run
-
-Sessions live under `$CARRY_HOME/sessions` (or `~/.carry/sessions`). Continue a
-session by ID or path while writing the continuation elsewhere:
-
-```sh
-carry --resume 20260827-123456-abcdef --session-home /path/to/carry-home -p "continue"
-carry --resume /path/to/prior-session --session-dir /path/to/fresh-output -p "new task"
-```
-
-Each session includes:
-
-- `context-state.json` — atomically updated canonical context checkpoint
-- `final.patch` — the agent's resulting patch
-- `result.json` — outcome, usage, cost estimate, retries, and compactions
-- `trace.jsonl` and shell-output files — chronological execution evidence
-
-The default model for ordinary Carry runs is `gpt-6-sol`; choose another with
-`--model` or `OPENAI_MODEL`. SWE-bench benchmark entry points separately default
-to `gpt-6-luna` and pass that choice explicitly to Carry, so changing Carry's
-interactive default does not change benchmark costs. There is no default step
-limit; use `--max-steps N` only when a specific cap is required. Shell commands
-default to a 60-second wall-clock timeout. Set the session fallback with
-`--default-shell-timeout-secs N`. The model can set `timeout_secs` on an
-individual `shell` call to 1–300 seconds for work that needs a different limit;
-`null` uses the session default. A timed-out command and its process group are
-killed.
+- [Context-policy design](docs/context-policy.md) and [proxy history contract](docs/proxy-fork-continuity.md)
+- [Local session cost report and experimental savings scenario](docs/local-session-cost-report.md) (`carry report cost`)
+- [Benchmark isolation and maintainer operations](docs/benchmark-isolation.md)
 
 ## Development
 
@@ -365,36 +115,6 @@ python3 scripts/run_python_integration.py --jobs 2
 cargo build --release --locked
 ```
 
-On Unix, the standalone Python integration command builds this checkout with
-`cargo build --locked`, then runs every transparent-history and Noodle regression
-case against Cargo's reported executable. These two suites are no longer launched
-by `cargo test`; run both commands for complete coverage. Use `--list` to inspect
-the discovered cases without building, or `--jobs 1` for serial diagnosis. The
-default is two isolated case processes, each with its own state/evidence directory
-and a five-minute timeout. The remaining Rust proxy tests retain their Python
-fixtures and Rust-side assertions.
-
-The deterministic fixture smoke needs Docker but no model credential:
-
-```sh
-docker build --tag carry:dev .
-./scripts/run-fixture.sh clamp scripted
-```
-
-Live fixtures require `OPENAI_API_KEY`; Codex fixture comparisons also need a
-configured Codex CLI session. Neither runs in CI.
-
-## Maintainer operations
-
-The protected SWE-bench workflow is for maintainers. Read
-[benchmark isolation](docs/benchmark-isolation.md) and the
-[workflow](.github/workflows/run-swebench.yml) before dispatching it. Every
-model-bearing official run uses disposable containers, a model-key-only agent
-environment, credential-free grading, immutable task images, and exact cleanup
-checks.
-
-Contributions use Conventional Commit titles. CI runs formatting, Clippy, unit
-tests, a release build, and the scripted fixture. Release Please publishes the
-Linux x86_64 and macOS Intel/Apple Silicon archives with a combined `SHA256SUMS`
-after its release PR merges. Release builds and relevant pull requests use the
-same native build, archive verification, and offline shell smoke workflow.
+Run both Rust and Python tests for complete coverage. The Python runner builds
+this checkout and runs the transparent-history and Noodle regression suites.
+Contributions use Conventional Commit titles.
