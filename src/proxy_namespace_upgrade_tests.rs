@@ -112,6 +112,45 @@ fn seed_namespace(
     (body, namespace, id, frozen)
 }
 
+// Apply the same genuine scope table to both lookup surfaces. In particular,
+// an observed response ID is not a capability to borrow another scope's nodes.
+fn assert_namespace_fences(
+    service: &Service,
+    headers: &HeaderMap,
+    body: &Value,
+    id: &str,
+    frozen: &Value,
+) {
+    for boundary in ["model", "instructions", "tenant"] {
+        let mut different = body.clone();
+        let mut other_headers = headers.clone();
+        if boundary == "tenant" {
+            other_headers.insert("x-carry-tenant", "another-owner".parse().unwrap());
+        } else {
+            different[boundary] = json!("different-boundary");
+        }
+        let namespace = history::namespace(service, &other_headers, &different).unwrap();
+        let (selected, pin) = history::resolve(service, &namespace, &different).unwrap();
+        assert_ne!(selected, id, "{boundary} must fence owner lookup");
+        drop(pin);
+        different["input"] = json!([{"role":"user","content":"unrelated resume"}]);
+        different["previous_response_id"] = json!("legacy-observed-response");
+        let unchanged = different.clone();
+        let error = history::expand(service, &namespace, &mut different)
+            .expect_err("foreign scope must not expand a known external identifier");
+        assert_eq!(error.0, StatusCode::CONFLICT, "{boundary} expansion");
+        assert_eq!(
+            different, unchanged,
+            "rejected expansion must not expose ancestry"
+        );
+        assert_eq!(
+            serde_json::to_value(load(service, id).unwrap().cost_trajectory.unwrap()).unwrap(),
+            *frozen,
+            "scope rejection must leave all historic quantities and money frozen"
+        );
+    }
+}
+
 fn namespace_owner_upgrade(initialized: bool) {
     // The control uses the current producer; the regression uses the frozen
     // predecessor producer. Each has an isolated atomic index and restarted
@@ -135,21 +174,7 @@ fn namespace_owner_upgrade(initialized: bool) {
             .as_array_mut()
             .unwrap()
             .push(json!({"role":"user","content":"append after upgrade"}));
-        // Genuine model/owner/prompt boundaries must not borrow legacy ancestry.
-        for boundary in ["model", "instructions"] {
-            let mut different = body.clone();
-            different[boundary] = json!("different-boundary");
-            let namespace = history::namespace(&service, &headers, &different).unwrap();
-            let (selected, pin) = history::resolve(&service, &namespace, &different).unwrap();
-            assert_ne!(selected, id);
-            drop(pin);
-        }
-        let mut other_owner = headers.clone();
-        other_owner.insert("x-carry-tenant", "another-owner".parse().unwrap());
-        let other_namespace = history::namespace(&service, &other_owner, &body).unwrap();
-        let (other, pin) = history::resolve(&service, &other_namespace, &body).unwrap();
-        assert_ne!(other, id);
-        drop(pin);
+        assert_namespace_fences(&service, &headers, &body, &id, &frozen);
         let namespace = history::namespace(&service, &headers, &body).unwrap();
         let (selected, _pin) = history::resolve(&service, &namespace, &body).unwrap();
         assert_eq!(
@@ -198,12 +223,73 @@ fn namespace_transcript_upgrade(shared: bool) {
             serde_json::to_value(load(&service, &id).unwrap().cost_trajectory.unwrap()).unwrap(),
             frozen
         );
+        assert_namespace_fences(&service, &headers, &body, &id, &frozen);
         let namespace = history::namespace(&service, &headers, &resumed).unwrap();
         history::expand(&service, &namespace, &mut resumed).expect(
             "NAMESPACE_UPGRADE_TRANSCRIPT: a successfully observed identifier remains reachable across namespace upgrade");
         assert_eq!(resumed["input"], json!(expected));
         assert!(resumed.get("previous_response_id").is_none());
     }
+}
+
+#[test]
+fn reviewer_contract_changes_invalidate_advice_not_observed_history() {
+    let mut failures = Vec::new();
+    for boundary in [
+        "reviewer_model",
+        "reviewer_url",
+        "reasoning",
+        "reviewer_output",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let service = checkpoint_service(directory.path());
+        let headers = HeaderMap::new();
+        let (body, namespace, id, frozen) = seed_namespace(&service, &headers, true, false, false);
+        let subject = history::restore(&service, &id).unwrap();
+        history::publish(&service, &subject, &subject).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert!(
+            history::advice(&service, &namespace, input)
+                .unwrap()
+                .is_some()
+        );
+        drop(service);
+        let mut service = checkpoint_service(directory.path());
+        assert!(
+            history::advice(&service, &namespace, input)
+                .unwrap()
+                .is_some()
+        );
+        match boundary {
+            "reviewer_model" => service.config.classifier_model = "another-reviewer".into(),
+            "reviewer_url" => {
+                service.config.classifier_url = Some("http://127.0.0.1:1/other-reviewer".into())
+            }
+            "reasoning" => service.config.classifier_reasoning_effort = "high".into(),
+            "reviewer_output" => service.config.classifier_max_output_tokens += 1,
+            _ => unreachable!(),
+        }
+        let changed_namespace = history::namespace(&service, &headers, &body).unwrap();
+        let (selected, pin) = history::resolve(&service, &changed_namespace, &body).unwrap();
+        let advice = history::advice(&service, &changed_namespace, input).unwrap();
+        drop(pin);
+        assert_eq!(
+            serde_json::to_value(load(&service, &id).unwrap().cost_trajectory.unwrap()).unwrap(),
+            frozen,
+            "reviewer policy cannot rewrite historic money or quantities"
+        );
+        if selected != id {
+            failures.push(format!("{boundary}: renamed the observed history owner"));
+        }
+        if advice.is_some() {
+            failures.push(format!("{boundary}: reused incompatible completed advice"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "HISTORY_ADVICE_VALIDITY: {}",
+        failures.join("; ")
+    );
 }
 
 #[test]
