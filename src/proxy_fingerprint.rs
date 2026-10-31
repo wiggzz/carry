@@ -403,7 +403,7 @@ mod tests {
         let restart = capture(&body, Some(&first), &[8; 32]);
         assert!(restart["prior_prefix_equal"].is_null());
         assert!(restart["settings_equal"].is_null());
-        assert!(first.to_string().find("PRIVATE").is_none());
+        assert!(!first.to_string().contains("PRIVATE"));
         let transformed = crate::proxy::codex_body(&body);
         let raw = capture(&transformed, None, &[7; 32]);
         assert_ne!(raw["settings_fingerprint"], first["settings_fingerprint"]);
