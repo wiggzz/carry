@@ -391,3 +391,165 @@ fn namespace_upgrade_capacity_rejection_preserves_complete_generation() {
         }
     }
 }
+
+// Exercise the production request/settlement path, not only index preparation.
+// The predecessor is staged with its frozen producer; the separate actual CLI
+// old -> new replay has no checkpoint edits and reaches the same boundary.
+#[tokio::test]
+async fn namespace_upgrade_alternating_ids_retains_explicit_conversation() {
+    let received = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let captured = received.clone();
+    let app = Router::new().route(
+        "/responses",
+        post(move |axum::Json(body): axum::Json<Value>| {
+            let captured = captured.clone();
+            async move {
+                let mut requests = captured.lock().unwrap();
+                requests.push(body);
+                // Deliberately omit repeated conversation metadata.
+                axum::Json(json!({"id":format!("continued-{}", requests.len()),
+                    "status":"completed", "output":[{"role":"assistant","content":"new observed output"}],
+                    "usage":{"input_tokens":100,"output_tokens":1,
+                        "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/responses", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    struct StopServer(tokio::task::AbortHandle);
+    impl Drop for StopServer {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _server = StopServer(server.abort_handle());
+    for legacy in [false, true] {
+        received.lock().unwrap().clear();
+        let directory = tempfile::tempdir().unwrap();
+        let make_service = || {
+            let mut service = checkpoint_service(directory.path());
+            service.config.upstream_url = url.clone();
+            service.config.mode = Mode::Audit;
+            service.config.review_min_primary_tokens = 1_000_000;
+            service
+        };
+        let service = make_service();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-carry-session", "alternating-owner".parse().unwrap());
+        let (body, _old_namespace, id, frozen) =
+            seed_namespace(&service, &headers, false, false, legacy);
+        let mut seed = load(&service, &id).unwrap();
+        seed.history_conversation = Some("observed-conversation".into());
+        save_observed(
+            &service,
+            &id,
+            &seed,
+            Some((
+                body["input"].as_array().unwrap(),
+                &json!({
+                "id":"legacy-observed-response", "status":"completed",
+                "conversation":{"id":"observed-conversation"},
+                "output":[{"role":"assistant","content":"actually observed output"}]}),
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(seed.cost_trajectory.unwrap()).unwrap(),
+            frozen
+        );
+        drop(service);
+        let service = Arc::new(make_service());
+        assert_eq!(
+            serde_json::to_value(load(&service, &id).unwrap().cost_trajectory.unwrap()).unwrap(),
+            frozen
+        );
+        let delta = json!({"role":"user","content":"continue by response id"});
+        let mut resumed = body.clone();
+        resumed["input"] = json!([delta]);
+        resumed["previous_response_id"] = json!("legacy-observed-response");
+        let response = forward(
+            service.clone(),
+            headers.clone(),
+            Bytes::from(serde_json::to_vec(&resumed).unwrap()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&raw).unwrap()["id"],
+            "continued-1"
+        );
+        let middle = load(&service, &id).unwrap();
+        assert_eq!(middle.primary.calls, 1);
+        assert!((middle.primary.cost_usd - 0.00021).abs() < 1e-12);
+        assert_eq!(middle.shadow.calls, 0);
+        let mut expected = body["input"].as_array().unwrap().clone();
+        expected.extend([
+            json!({"role":"assistant","content":"actually observed output"}),
+            delta,
+        ]);
+        {
+            let requests = received.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["input"], json!(expected));
+            assert!(requests[0].get("previous_response_id").is_none());
+            assert!(requests[0].get("conversation").is_none());
+        }
+        drop(service);
+        let service = Arc::new(make_service());
+        let third = json!({"role":"user","content":"continue by conversation id"});
+        resumed
+            .as_object_mut()
+            .unwrap()
+            .remove("previous_response_id");
+        resumed["input"] = json!([third]);
+        resumed["conversation"] = json!("observed-conversation");
+        let outcome = forward(
+            service.clone(),
+            headers.clone(),
+            Bytes::from(serde_json::to_vec(&resumed).unwrap()),
+            false,
+        )
+        .await;
+        let status = match &outcome {
+            Ok(response) => response.status(),
+            Err(failure) => failure.0,
+        };
+        if status != StatusCode::OK {
+            assert_eq!(
+                received.lock().unwrap().len(),
+                1,
+                "rejection cannot send another paid request"
+            );
+            let after = load(&service, &id).unwrap();
+            assert_eq!(
+                serde_json::to_value(after.cost_trajectory.unwrap()).unwrap(),
+                serde_json::to_value(middle.cost_trajectory.unwrap()).unwrap()
+            );
+            assert_eq!(after.primary.calls, 1);
+            assert!((after.primary.cost_usd - 0.00021).abs() < 1e-12);
+        }
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "NAMESPACE_ALTERNATING_IDS: proven conversation must advance when the next response omits repeated metadata; legacy={legacy}"
+        );
+        let response = outcome.unwrap();
+        axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        expected.extend([
+            json!({"role":"assistant","content":"new observed output"}),
+            third,
+        ]);
+        let requests = received.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["input"], json!(expected));
+        assert!(requests[1].get("conversation").is_none());
+    }
+}
