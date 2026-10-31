@@ -52,6 +52,13 @@ class NativeReceipts(unittest.TestCase):
             else:
                 usage[field] = value
             cases.append((name, usage, counts, cost))
+        cases.extend([
+            ('missing-entire-usage', None, (0, 0), None),
+            ('null-entire-usage', None, (0, 0), None),
+            ('known-zero', {'input_tokens': 0, 'output_tokens': 0,
+                            'input_tokens_details': {'cached_tokens': 0, 'cache_write_tokens': 0}},
+             (0, 0), 0.0),
+        ])
         captures = []
         for streaming in (False, True):
             for name, usage, counts, cost in cases:
@@ -64,6 +71,8 @@ class NativeReceipts(unittest.TestCase):
                                    'arguments': json.dumps({'answer': 'done', 'context': {
                                        'protected': [], 'removable': [], 'remember': []}})}],
                        'usage': usage}
+                if name == 'missing-entire-usage':
+                    raw.pop('usage')
                 requests, errors = [], []
 
                 class Handler(http.server.BaseHTTPRequestHandler):
@@ -120,8 +129,9 @@ class NativeReceipts(unittest.TestCase):
                 self.assertEqual(logged_requests, requests)
                 self.assertFalse(any(event['event'] == 'shell_started' for event in events))
                 self.assertEqual(result['compactions'], 0)
-                self.assertEqual(result['usage']['input_tokens'], usage['input_tokens'] if isinstance(usage['input_tokens'], int) else 0)
-                self.assertEqual(result['usage']['output_tokens'], usage.get('output_tokens', 0))
+                expected_usage = usage or {}
+                self.assertEqual(result['usage']['input_tokens'], expected_usage.get('input_tokens', 0) if isinstance(expected_usage.get('input_tokens', 0), int) else 0)
+                self.assertEqual(result['usage']['output_tokens'], expected_usage.get('output_tokens', 0))
                 # Grade all complete wires/raw receipts/call/finish controls
                 # before independent parser/price assertions below.
                 report = directory / 'cost.html'
@@ -139,6 +149,29 @@ class NativeReceipts(unittest.TestCase):
                 captures.append({'streaming': streaming, 'name': name, 'requests': requests,
                                  'raw': raw, 'response': responses[0], 'result': result,
                                  'report': cells.cells, 'expected_counts': counts, 'expected_cost': cost})
+                if name == 'missing-entire-usage':
+                    # A supported normalized trace can retain raw output for
+                    # projection, but must explicitly select its usage contract.
+                    normalized = directory / 'normalized' / 'session'
+                    normalized.mkdir(parents=True)
+                    normalized_events = copy.deepcopy(events)
+                    for event in normalized_events:
+                        if event['event'] == 'model_response':
+                            event['data']['usage_source'] = 'normalized'
+                            event['data']['usage'] = {'input_tokens': 2000, 'output_tokens': 4,
+                                                     'cached_input_tokens': 0, 'cache_write_input_tokens': 0}
+                    (normalized / 'trace.jsonl').write_text(''.join(json.dumps(event) + '\n' for event in normalized_events))
+                    normalized_report = directory / 'normalized.html'
+                    replay = subprocess.run([binary, 'report', 'cost', '--sessions', str(normalized.parent),
+                                             '--output', str(normalized_report)],
+                                            env={'PATH': '', 'HOME': str(directory / 'home'), 'TMPDIR': str(directory)},
+                                            capture_output=True, timeout=15)
+                    self.assertEqual(replay.returncode, 0, replay.stderr)
+                    normalized_cells = Cells()
+                    normalized_cells.feed(normalized_report.read_text())
+                    self.assertEqual(normalized_cells.cells[2], '1/1')
+                    self.assertEqual(normalized_cells.cells[3], '$0.0040')
+                    self.assertIn('0 unpriced', normalized_cells.cells[9])
         (root / 'RESULT.json').write_text(json.dumps(captures, indent=2) + '\n')
         self.assertEqual(len(captures), len(cases) * 2)
         for case in captures:

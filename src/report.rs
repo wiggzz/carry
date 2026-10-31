@@ -263,7 +263,7 @@ mod tests {
             let mut events = vec![
                 serde_json::json!({"event":"run_started","data":{"model":"gpt-6-sol"}}),
                 serde_json::json!({"event":"model_request","data":{"step":1}}),
-                serde_json::json!({"event":"model_response","data":{"step":1,"usage":{"input_tokens":1000,"output_tokens":100}}}),
+                serde_json::json!({"event":"model_response","data":{"usage_source":"normalized","step":1,"usage":{"input_tokens":1000,"output_tokens":100}}}),
             ];
             if pending {
                 events.push(serde_json::json!({"event":"model_request","data":{"step":2}}));
@@ -315,7 +315,7 @@ mod tests {
         fs::write(session.join("trace.jsonl"), concat!(
             "{\"event\":\"run_started\",\"data\":{\"model\":\"gpt-6-sol\"}}\n",
             "{\"event\":\"model_request\",\"data\":{\"request\":{\"input\":[\"abc\"],\"tools\":[]}}}\n",
-            "{\"event\":\"model_response\",\"data\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":5},\"raw\":{\"output\":[]}}}\n",
+            "{\"event\":\"model_response\",\"data\":{\"usage_source\":\"normalized\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":5},\"raw\":{\"output\":[]}}}\n",
             "{\"event\":\"run_finished\",\"data\":{}}\n"
         )).unwrap();
         let session_two = dir.path().join("two");

@@ -604,7 +604,7 @@ class InitializationRegressions(unittest.TestCase):
                 {"event": "model_request", "run_id": "noop-native", "timestamp_ms": index * 1000,
                  "data": {"step": index, "route": "synthetic", "request": copy.deepcopy(body)}},
                 {"event": "model_response", "run_id": "noop-native", "timestamp_ms": index * 1000 + 1,
-                 "data": {"step": index, "usage": {"input_tokens": incoming, "output_tokens": 100,
+                 "data": {"usage_source":"normalized","step": index, "usage": {"input_tokens": incoming, "output_tokens": 100,
                  "cached_input_tokens": cached, "cache_write_input_tokens": written}, "raw": {"output": []}}}])
             expected += ((incoming-cached-written)*2 + cached*.1 + written*2.5 + 100*10) / 1e6
             (session / "trace.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
@@ -670,7 +670,7 @@ class InitializationRegressions(unittest.TestCase):
             {"event": "model_request", "run_id": "owned186", "timestamp_ms": 1,
              "data": {"step": 1, "transport": {"api_base": "http://127.0.0.1:1"}, "request": request}},
             {"event": "model_response", "run_id": "owned186", "timestamp_ms": 2,
-             "data": {"step": 1, "usage": {"input_tokens": 260000, "output_tokens": 0},
+             "data": {"usage_source":"normalized","step": 1, "usage": {"input_tokens": 260000, "output_tokens": 0},
                       "raw": {"output": []}}},
         ]
         (session / "trace.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
@@ -750,7 +750,7 @@ class InitializationRegressions(unittest.TestCase):
                  "data": {"step": step, "transport": {"api_base": "http://127.0.0.1:1"},
                           "request": copy.deepcopy(body)}},
                 {"event": "model_response", "run_id": "fixed-floor186", "timestamp_ms": step * 10 + 1,
-                 "data": {"step": step, "usage": {"input_tokens": incoming, "output_tokens": 0},
+                 "data": {"usage_source":"normalized","step": step, "usage": {"input_tokens": incoming, "output_tokens": 0},
                           "raw": {"output": []}}}])
             if step == 1:
                 continue

@@ -134,7 +134,7 @@ class QuantityPolicy(unittest.TestCase):
                     {'event': 'model_request', 'run_id': ttl, 'timestamp_ms': step * 1000,
                      'data': {'step': step, 'route': 'synthetic-policy', 'request': body}},
                     {'event': 'model_response', 'run_id': ttl, 'timestamp_ms': step * 1000 + 1,
-                     'data': {'step': step, 'usage': {'input_tokens': inputs[step - 1], 'output_tokens': 0,
+                     'data': {"usage_source":"normalized",'step': step, 'usage': {'input_tokens': inputs[step - 1], 'output_tokens': 0,
                               'cached_input_tokens': 0, 'cache_write_input_tokens': 1000 if step == 2 else 0},
                               'raw': {'output': []}}}])
             (session / 'trace.jsonl').write_text(''.join(json.dumps(event) + '\n' for event in events))

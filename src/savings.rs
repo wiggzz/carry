@@ -346,9 +346,11 @@ impl Trajectory {
                     self.result.coverage.orphan_responses += 1;
                     self.scenario_available = false;
                 }
-                // Real native traces retain raw receipt authority. Synthetic
-                // normalized trace records have their own explicit Usage contract.
-                let raw_receipt = data["raw"].get("usage");
+                // Missing native usage is unknown, never a switch to lossy
+                // display counters. Normalized trace producers explicitly own
+                // their input contract, even when retaining raw output items.
+                let raw_receipt =
+                    (data["usage_source"] != "normalized").then_some(&data["raw"]["usage"]);
                 let usage = match raw_receipt {
                     Some(raw) => Usage::from_receipt(raw),
                     None => valid_usage(&data["usage"]),
@@ -707,7 +709,37 @@ mod tests {
         t.record(&json!({"event":"model_request","data":{"step":1,"request":{"input":["a ".repeat(units as usize)],"tools":[]}}}));
     }
     fn response(t: &mut Trajectory, input: u64, output: u64, proxy_output: u64) -> Estimate {
-        t.record(&json!({"event":"model_response","data":{"step":1,"usage":{"input_tokens":input,"output_tokens":output},"raw":{"output":"a ".repeat(proxy_output as usize)}}})).unwrap()
+        t.record(&json!({"event":"model_response","data":{"usage_source":"normalized","step":1,"usage":{"input_tokens":input,"output_tokens":output},"raw":{"output":"a ".repeat(proxy_output as usize)}}})).unwrap()
+    }
+    #[test]
+    fn report_usage_authority_is_explicit_not_selected_by_receipt_absence() {
+        for source in [
+            Value::Null,
+            json!("provider_receipt"),
+            json!("unknown"),
+            json!(7),
+            json!("normalized"),
+        ] {
+            for raw in [
+                json!({"output":[]}),
+                json!({"output":[],"usage":null}),
+                json!(null),
+            ] {
+                let mut t = Trajectory::with_model("gpt-6-sol".into());
+                request(&mut t, 100);
+                let e = t
+                    .record(&json!({"event":"model_response","data":{
+                        "step":1,"usage_source":source,
+                        "usage":{"input_tokens":0,"output_tokens":0},"raw":raw
+                    }}))
+                    .unwrap();
+                let normalized = source == "normalized";
+                assert_eq!(e.observed_priced, normalized, "{source}: {raw}");
+                assert_eq!(e.coverage.missing_usage, usize::from(!normalized));
+                assert_eq!(e.coverage.unpriced_responses, usize::from(!normalized));
+                assert_eq!(e.observed_cost, 0.0);
+            }
+        }
     }
     #[test]
     fn session_projection_uses_the_same_tokenizer_as_the_proxy() {
@@ -740,7 +772,7 @@ mod tests {
                     summary: 100,
                 });
                 t.record(&json!({"event": "model_request", "data": {"request": body}}));
-                let estimate = t.record(&json!({"event": "model_response", "data": {
+                let estimate = t.record(&json!({"event": "model_response", "data": {"usage_source":"normalized",
                     "usage": {"input_tokens": 100, "output_tokens": 3}, "raw": {"output": output}
                 }})).unwrap();
                 assert!(estimate.priced);
@@ -764,7 +796,7 @@ mod tests {
                         + t.summary as i128) as u64;
                     let cold = input_cost("gpt-6-luna", next_input, 0, Some(1024)).unwrap()
                         + scenario_output_cost("gpt-6-luna", next_input, 3).unwrap();
-                    let after = t.record(&json!({"event": "model_response", "data": {
+                    let after = t.record(&json!({"event": "model_response", "data": {"usage_source":"normalized",
                         "usage": {"input_tokens": 100, "output_tokens": 3}, "raw": {"output": []}
                     }})).unwrap();
                     assert!(after.priced);
@@ -817,7 +849,7 @@ mod tests {
                 let estimate = trajectory
                     .record(&json!({
                         "event": "model_response", "run_id": "tier-test", "timestamp_ms": 101,
-                        "data": {
+                        "data": {"usage_source":"normalized",
                             "step": 1, "usage": {"input_tokens": 17, "output_tokens": output},
                             "raw": {"output": [{"type": "message", "role": "assistant",
                                 "content": [{"type": "output_text", "text": "done"}]}]}
@@ -1111,7 +1143,9 @@ mod tests {
         assert!(!pending.observed_priced);
         assert!(!pending.priced);
         let missing = t
-            .record(&json!({"event":"model_response","data":{"step":1}}))
+            .record(
+                &json!({"event":"model_response","data":{"usage_source":"normalized","step":1}}),
+            )
             .unwrap();
         assert_eq!(missing.coverage.missing_usage, 1);
         assert_eq!(missing.coverage.unmatched_requests, 0);
@@ -1123,18 +1157,18 @@ mod tests {
     fn response_identity_cannot_consume_a_different_pending_request() {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         t.record(&json!({"event":"model_request","run_id":"a","data":{"step":7,"request":{"input":["abc"]}}}));
-        let e=t.record(&json!({"event":"model_response","run_id":"b","data":{"step":8,"usage":{"input_tokens":10,"output_tokens":1},"raw":{"output":[]}}})).unwrap();
+        let e=t.record(&json!({"event":"model_response","run_id":"b","data":{"usage_source":"normalized","step":8,"usage":{"input_tokens":10,"output_tokens":1},"raw":{"output":[]}}})).unwrap();
         assert_eq!(e.coverage.unmatched_requests, 1);
         assert_eq!(e.coverage.orphan_responses, 1);
         assert!(!e.priced);
-        t.record(&json!({"event":"model_response","run_id":"a","data":{"step":7,"usage":{"input_tokens":10,"output_tokens":1},"raw":{"output":[]}}}));
+        t.record(&json!({"event":"model_response","run_id":"a","data":{"usage_source":"normalized","step":7,"usage":{"input_tokens":10,"output_tokens":1},"raw":{"output":[]}}}));
         assert_eq!(t.snapshot().coverage.unmatched_requests, 0);
     }
     #[test]
     fn retries_are_known_count_but_unknown_extra_charges() {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         request(&mut t, 2000);
-        let e=t.record(&json!({"event":"model_response","data":{"step":1,"response_retries":2,"usage":{"input_tokens":2000,"output_tokens":100},"raw":{"output":[]}}})).unwrap();
+        let e=t.record(&json!({"event":"model_response","data":{"usage_source":"normalized","step":1,"response_retries":2,"usage":{"input_tokens":2000,"output_tokens":100},"raw":{"output":[]}}})).unwrap();
         assert_eq!(e.coverage.retries, 2);
         assert!(!e.observed_priced);
         assert!(!e.priced);
@@ -1144,7 +1178,7 @@ mod tests {
     fn absent_output_projection_cannot_silently_skip_threshold_work() {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         request(&mut t, 240000);
-        let e=t.record(&json!({"event":"model_response","data":{"step":1,"usage":{"input_tokens":240000,"output_tokens":20000}}})).unwrap();
+        let e=t.record(&json!({"event":"model_response","data":{"usage_source":"normalized","step":1,"usage":{"input_tokens":240000,"output_tokens":20000}}})).unwrap();
         assert!(!e.priced);
         assert!(e.observed_priced);
     }
@@ -1154,7 +1188,7 @@ mod tests {
         t.record(&json!({"event":"run_started","data":{"model":"gpt-6-sol","cache_ttl_seconds":1,"implicit_cache_minimum_prefix_tokens":1024,"context_window":100000}}));
         let req = |time| json!({"event":"model_request","timestamp_ms":time,"data":{"step":1,"request":{"input":["a ".repeat(2000)],"tools":[]}}});
         t.record(&req(10));
-        let a=t.record(&json!({"event":"model_response","timestamp_ms":20,"data":{"step":1,"usage":{"input_tokens":2000,"output_tokens":100},"raw":{"output":[]}}})).unwrap();
+        let a=t.record(&json!({"event":"model_response","timestamp_ms":20,"data":{"usage_source":"normalized","step":1,"usage":{"input_tokens":2000,"output_tokens":100},"raw":{"output":[]}}})).unwrap();
         t.record(&req(1020));
         let b = response(&mut t, 2000, 100, 0);
         assert!((b.carry_cost - 2.0 * a.carry_cost).abs() < 1e-12);

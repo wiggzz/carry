@@ -21,7 +21,7 @@ fn native_modeled_write_deadline(change_lifetime: bool) {
             "data":{"step":step,"route":"synthetic-lifetime","request":request}}));
         let after = t
             .record(&json!({"event":"model_response","timestamp_ms":at*1000,
-            "data":{"step":step,"usage":{"input_tokens":input,"output_tokens":0,
+            "data":{"usage_source":"normalized","step":step,"usage":{"input_tokens":input,"output_tokens":0,
                 "cached_input_tokens":0,"cache_write_input_tokens":0},"raw":{"output":[]}}}))
             .unwrap();
         assert!(after.priced && after.observed_priced);
@@ -84,7 +84,7 @@ fn native_modeled_append_lifetime_and_replay_use_original_prefix_deadline() {
         let req = json!({"event":"model_request","timestamp_ms":at*1000,
             "data":{"step":step,"route":"synthetic-lifetime","request":request}});
         let res = json!({"event":"model_response","timestamp_ms":at*1000+500,
-            "data":{"step":step,"usage":{"input_tokens":input,"output_tokens":0,
+            "data":{"usage_source":"normalized","step":step,"usage":{"input_tokens":input,"output_tokens":0,
             "cached_input_tokens":0,"cache_write_input_tokens":0},"raw":{"output":[]}}});
         t.record(&req);
         t.record(&res);
@@ -127,7 +127,7 @@ fn native_missing_write_clock_cannot_borrow_native_hits_or_response_time() {
         t.record(&json!({"event":"model_request","data":{"step":step,"route":"synthetic-lifetime","request":request}}));
         let after = t
             .record(&json!({"event":"model_response","timestamp_ms":100000+step,
-            "data":{"step":step,"usage":{"input_tokens":input,"output_tokens":0,
+            "data":{"usage_source":"normalized","step":step,"usage":{"input_tokens":input,"output_tokens":0,
             "cached_input_tokens":input,"cache_write_input_tokens":0},"raw":{"output":[]}}}))
             .unwrap();
         assert!(after.observed_priced);

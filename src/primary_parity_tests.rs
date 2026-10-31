@@ -156,7 +156,7 @@ fn modeled_cache_equivalent_options_keep_warmth_in_both_quantity_adapters() {
         let n = native
             .record(
                 &json!({"event":"model_response","timestamp_ms":(100+index)*1000,
-            "data":{"step":index,"usage":{"input_tokens":input,"output_tokens":0,
+            "data":{"usage_source":"normalized","step":index,"usage":{"input_tokens":input,"output_tokens":0,
             "cached_input_tokens":0,"cache_write_input_tokens":0},"raw":{"output":[]}}}),
             )
             .unwrap();
@@ -223,7 +223,7 @@ fn modeled_write_pressure_costs(native_adapter: bool) {
         let req = json!({"event":"model_request","timestamp_ms":100000,
             "data":{"step":step,"route":"synthetic-pressure","request":request}});
         let res = json!({"event":"model_response","timestamp_ms":100000,
-            "data":{"step":step,"usage":{"input_tokens":input,"output_tokens":0,
+            "data":{"usage_source":"normalized","step":step,"usage":{"input_tokens":input,"output_tokens":0,
                 "cached_input_tokens":0,"cache_write_input_tokens":0},"raw":{"output":[]}}});
         native.record(&req);
         native.record(&res);
@@ -328,7 +328,7 @@ fn modeled_retention_unknown_costs(native_adapter: bool) {
         );
         native.record(
             &json!({"event":"model_response","timestamp_ms":(100+step)*1000,
-            "data":{"step":step,"usage":{"input_tokens":input,"output_tokens":0,
+            "data":{"usage_source":"normalized","step":step,"usage":{"input_tokens":input,"output_tokens":0,
                 "cached_input_tokens":0,"cache_write_input_tokens":0},"raw":{"output":[]}}}),
         );
         paid += input as f64 * 2.0 / 1e6;
@@ -524,7 +524,7 @@ fn native_and_proxy_share_noop_money_and_keep_divergence_after_later_noop() {
                     "data":{"step":index,"route":"official","request":request}}),
                 );
                 let local = native.record(&json!({"event":"model_response","timestamp_ms":(100+index)*1000,
-                    "data":{"step":index,"usage":{"input_tokens":input,"output_tokens":7,
+                    "data":{"usage_source":"normalized","step":index,"usage":{"input_tokens":input,"output_tokens":7,
                     "cached_input_tokens":cached,"cache_write_input_tokens":written},"raw":{"output":[]}}})).unwrap();
                 let live = proxy.snapshot();
                 assert!(local.priced && local.observed_priced && live.priced);

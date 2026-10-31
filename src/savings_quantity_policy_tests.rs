@@ -71,9 +71,11 @@ fn quantity_policy_real_coordinators_preserve_summary_after_unknown_money() {
             native.primary(&body, &response, "synthetic", step, true);
             local.record(&json!({"event":"model_request","timestamp_ms":step*1000,
                 "data":{"step":step,"route":"synthetic","request":body}}));
-            local.record(&json!({"event":"model_response","data":{"step":step,
+            local.record(
+                &json!({"event":"model_response","data":{"usage_source":"normalized","step":step,
                 "usage":{"input_tokens":input,"output_tokens":0,"cached_input_tokens":0,
-                         "cache_write_input_tokens":writes},"raw":{"output":[]}}}));
+                         "cache_write_input_tokens":writes},"raw":{"output":[]}}}),
+            );
             let a = native.snapshot();
             let b = local.snapshot();
             assert_eq!(a.initial_compactions, 0);

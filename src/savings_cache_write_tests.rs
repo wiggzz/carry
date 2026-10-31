@@ -24,7 +24,7 @@ fn no_op_receipt_parity_native_report_uses_reported_partitions() {
             "transport":{"api_base":"https://api.openai.com/v1"}, "request":body}}));
         let estimate = trajectory
             .record(&json!({"event":"model_response","run_id":"native-parity",
-            "timestamp_ms":101 + index * 2,"data":{"step":index,"response_retries":0,
+            "timestamp_ms":101 + index * 2,"data":{"usage_source":"normalized","step":index,"response_retries":0,
             "usage":{"input_tokens":input,"cached_input_tokens":cached,
             "cache_write_input_tokens":0,"output_tokens":100},"raw":{"output":[]}}}))
             .unwrap();
@@ -63,7 +63,7 @@ fn cache_write188_native_report_no_write_control_prices_both_branches_ordinary()
         "transport":{"api_base":"https://api.openai.com/v1"},"request":body}}));
     let estimate = t
         .record(&json!({"event":"model_response","run_id":"write-control",
-        "timestamp_ms":101,"data":{"step":1,"response_retries":0,
+        "timestamp_ms":101,"data":{"usage_source":"normalized","step":1,"response_retries":0,
         "usage":{"input_tokens":input,"cached_input_tokens":0,
         "cache_write_input_tokens":0,"output_tokens":100},"raw":{"output":[]}}}))
         .unwrap();
@@ -102,7 +102,7 @@ fn cache_write188_native_report_preserves_paid_implicit_writes() {
         "transport":{"api_base":"https://api.openai.com/v1"},"request":body}}));
     let estimate = t
         .record(&json!({"event":"model_response","run_id":"paid-control",
-        "timestamp_ms":101,"data":{"step":1,"response_retries":0,
+        "timestamp_ms":101,"data":{"usage_source":"normalized","step":1,"response_retries":0,
         "usage":{"input_tokens":input,"cached_input_tokens":0,
         "cache_write_input_tokens":input,"output_tokens":100},"raw":{"output":[]}}}))
         .unwrap();
@@ -152,7 +152,7 @@ fn cache_write191_native_equivalent_defaults_reuse_each_divergent_branch() {
             pi_expected +=
                 (pi_cached as f64 * 0.1 + (input + restored - pi_cached) as f64 * 2.5) / 1e6;
             t.record(&json!({"event":"model_request","timestamp_ms":100+index,"data":{"step":index,"route":"official","request":body}}));
-            let e = t.record(&json!({"event":"model_response","timestamp_ms":100+index,"data":{"step":index,"usage":{"input_tokens":input,"cached_input_tokens":cached,"cache_write_input_tokens":input-cached,"output_tokens":0},"raw":{"output":[]}}})).unwrap();
+            let e = t.record(&json!({"event":"model_response","timestamp_ms":100+index,"data":{"usage_source":"normalized","step":index,"usage":{"input_tokens":input,"cached_input_tokens":cached,"cache_write_input_tokens":input-cached,"output_tokens":0},"raw":{"output":[]}}})).unwrap();
             assert!(e.priced && e.observed_priced);
             assert_eq!(e.pi_compactions, 0);
             assert!(
@@ -179,7 +179,7 @@ fn cache_write191_native_unsupported_lifetime_is_not_observed_30m_cost() {
     {
         body["prompt_cache_options"] = json!({"mode":"implicit","ttl":ttl});
         t.record(&json!({"event":"model_request","data":{"step":index,"request":body}}));
-        let e = t.record(&json!({"event":"model_response","data":{"step":index,"usage":{"input_tokens":input,"cached_input_tokens":0,"cache_write_input_tokens":written,"output_tokens":0},"raw":{"output":[]}}})).unwrap();
+        let e = t.record(&json!({"event":"model_response","data":{"usage_source":"normalized","step":index,"usage":{"input_tokens":input,"cached_input_tokens":0,"cache_write_input_tokens":written,"output_tokens":0},"raw":{"output":[]}}})).unwrap();
         if ttl == "30m" || written == 0 {
             expected += input as f64 * if written == 0 { 2.0 } else { 2.5 } / 1e6;
         }
@@ -215,9 +215,11 @@ fn cache_write191_native_breakpoint_override_and_mixed_lifetimes_stay_unknown() 
         let written = if writes { input } else { 0 };
         t.record(&json!({"event":"model_request","data":{"step":index,"request":body}}));
         let e = t
-            .record(&json!({"event":"model_response","data":{"step":index,
+            .record(
+                &json!({"event":"model_response","data":{"usage_source":"normalized","step":index,
             "usage":{"input_tokens":input,"cached_input_tokens":0,
-                "cache_write_input_tokens":written,"output_tokens":0},"raw":{"output":[]}}}))
+                "cache_write_input_tokens":written,"output_tokens":0},"raw":{"output":[]}}}),
+            )
             .unwrap();
         if !lifetimes.contains(&"12h") || !writes {
             expected += input as f64 * if writes { 2.5 } else { 2.0 } / 1e6;
@@ -247,10 +249,12 @@ fn cache_write191_native_typed_tool_output_keeps_unsupported_writes_unknown() {
         let input = prompt_projection(&body).unwrap().2;
         t.record(&json!({"event":"model_request","data":{"step":index,"request":body}}));
         let e = t
-            .record(&json!({"event":"model_response","data":{"step":index,
+            .record(
+                &json!({"event":"model_response","data":{"usage_source":"normalized","step":index,
             "usage":{"input_tokens":input,"cached_input_tokens":0,
                 "cache_write_input_tokens":if writes {input} else {0},"output_tokens":0},
-            "raw":{"output":[]}}}))
+            "raw":{"output":[]}}}),
+            )
             .unwrap();
         if ttl == "30m" || !writes {
             expected += input as f64 * if writes { 2.5 } else { 2.0 } / 1e6;
@@ -278,7 +282,7 @@ fn cache_write188_native_report_mode_switch_never_reuses_disabled_cache() {
             "data":{"step":index,"transport":{"api_base":"https://api.openai.com/v1"},"request":body}}));
         let e = t
             .record(&json!({"event":"model_response", "timestamp_ms":101+index,
-            "data":{"step":index,"usage":{"input_tokens":input,"output_tokens":0,
+            "data":{"usage_source":"normalized","step":index,"usage":{"input_tokens":input,"output_tokens":0,
             "cached_input_tokens":0,"cache_write_input_tokens":writes},"raw":{"output":[]}}}))
             .unwrap();
         expected += input as f64 * if index == 0 { 2.5 } else { 2.0 } / 1e6;
@@ -302,9 +306,11 @@ fn cache_write188_native_report_unknown_mode_preserves_observed_ledger() {
     t.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":0}}));
     t.record(&json!({"event":"model_request","data":{"step":1,"request":body}}));
     let e = t
-        .record(&json!({"event":"model_response","data":{"step":1,
+        .record(
+            &json!({"event":"model_response","data":{"usage_source":"normalized","step":1,
         "usage":{"input_tokens":input,"output_tokens":0,
-        "cached_input_tokens":0,"cache_write_input_tokens":0},"raw":{"output":[]}}}))
+        "cached_input_tokens":0,"cache_write_input_tokens":0},"raw":{"output":[]}}}),
+        )
         .unwrap();
     assert!(e.observed_priced);
     assert!((e.observed_cost - input as f64 * 2.0 / 1e6).abs() < 1e-12);
