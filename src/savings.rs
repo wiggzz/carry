@@ -492,7 +492,8 @@ pub(crate) fn scenario_output_cost(model: &str, input: u64, output: u64) -> Opti
     carry::models::Rates::for_model(model, input as f64).map(|rates| output as f64 * rates.output)
 }
 
-/// Legacy/default implicit policy; request-aware consumers use the mode owner.
+/// Test shorthand for implicit policy; production consumers use the mode owner.
+#[cfg(test)]
 pub(crate) fn scenario_input_cost(
     model: &str,
     input: u64,

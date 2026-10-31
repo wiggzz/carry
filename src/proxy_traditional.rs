@@ -94,7 +94,7 @@ pub(super) struct HistoryContinuity {
 
 /// Kept in the existing atomic trajectory. Cache eligibility and monetary
 /// interpretation have no mutable access through this API.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub(super) struct TraditionalHistoryState {
     // Proof for the entire comparison history, not a last-plan/no-op flag.
     // Missing proof never opts into sharing a provider observation.
@@ -105,17 +105,6 @@ pub(super) struct TraditionalHistoryState {
     pub(super) last_traditional_input: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) history_continuity: Option<HistoryContinuity>,
-}
-impl Default for TraditionalHistoryState {
-    fn default() -> Self {
-        Self {
-            shared_primary_history: Default::default(),
-            retired: 0,
-            summary: 0,
-            last_traditional_input: 0,
-            history_continuity: None,
-        }
-    }
 }
 impl TraditionalHistoryState {
     pub(super) fn identical() -> Self {
