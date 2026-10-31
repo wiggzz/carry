@@ -1034,7 +1034,7 @@ class TransparentHistory(unittest.TestCase):
 
     def test_history_empty_envelope_limits_two_requests_and_restart(self):
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"minimum_{n}")))
-        minimum = len(wire({"format": "carry-prefix-history-v3", "nodes": {},
+        minimum = len(wire({"format": "carry-prefix-history-v4", "nodes": {},
                             "upstream_cache": [], "tips": {}, "reviews": {},
                             "transcripts": {}, "snapshots": {}}))
         for limit in (2, minimum - 1):

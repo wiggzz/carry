@@ -97,8 +97,15 @@ fn pinned(service: &Service) -> HashSet<String> {
 }
 
 #[derive(Default, Serialize, Deserialize)]
-#[serde(tag = "format", rename = "carry-prefix-history-v3")]
+enum Format {
+    #[default]
+    #[serde(rename = "carry-prefix-history-v4")]
+    Current,
+}
+
+#[derive(Default, Serialize, Deserialize)]
 struct Index {
+    format: Format,
     nodes: BTreeMap<String, Node>,
     upstream_cache: Vec<CacheEvidence>,
     tips: BTreeMap<String, Reference>,
@@ -158,7 +165,12 @@ pub(super) fn validate_capacity(config: &ProxyCli) -> std::io::Result<()> {
 fn read(service: &Service) -> std::io::Result<Index> {
     match std::fs::read(service.config.state_dir.join("history.index")) {
         Ok(bytes) if bytes.len() <= service.config.history_max_bytes as usize => {
-            serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+            serde_json::from_slice(&bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported or invalid history index format",
+                )
+            })
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Index::default()),
         _ => Err(std::io::Error::other("history index unavailable")),
@@ -276,10 +288,19 @@ fn prune(service: &Service, index: &mut Index) -> bool {
     }
 }
 
-// Compatibility belongs at the atomic index load boundary, not in owner or
-// external-ID lookup fallbacks. Both lookup surfaces use only the prepared key.
-#[path = "proxy_history_upgrade.rs"]
-mod upgrade;
+fn read_failure(error: std::io::Error) -> Failure {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        failure(
+            StatusCode::CONFLICT,
+            "unsupported or invalid history index format",
+        )
+    } else {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "history index unavailable",
+        )
+    }
+}
 
 /// Observed ancestry owns model, fixed prompt, source and client/tenant fences.
 /// Reviewer validity and cache/pricing policy cannot rename paid quantity owners.
@@ -295,27 +316,9 @@ pub(super) fn namespace(
     let owner = identity(&owner)?;
     let namespace = observed_namespace(&service.config, &owner, body);
     let _guard = IO.lock().unwrap();
-    let mut index = read(service).map_err(|_| {
-        failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "history index unavailable",
-        )
-    })?;
-    if upgrade::prepare(service, &mut index, &owner, body, &namespace).map_err(|_| {
-        failure(
-            StatusCode::CONFLICT,
-            "history namespace upgrade unavailable",
-        )
-    })? {
-        // A representation change may not evict retained authority to fit.
-        // Admit the complete generation through the same bounded atomic writer.
-        write_index(service, &index).map_err(|_| {
-            failure(
-                StatusCode::INSUFFICIENT_STORAGE,
-                "history namespace upgrade not persisted",
-            )
-        })?;
-    }
+    // Decode only the supported generation before any lookup or publication.
+    // Unsupported saved state is never migrated, reset or treated as empty.
+    read(service).map_err(read_failure)?;
     Ok(namespace)
 }
 
@@ -329,44 +332,14 @@ fn observed_namespace(config: &ProxyCli, owner: &Option<String>, body: &Value) -
     )
 }
 
-/// Reconcile file-local metadata with the already prepared observation authority.
-/// A representation upgrade can rename that authority without a new observation;
-/// a genuine scope change cannot borrow a conversation from the old checkpoint.
-pub(super) fn bind_namespace(
-    service: &Service,
-    id: &str,
-    session: &mut Session,
-    namespace: Option<String>,
-) -> Result<(), Failure> {
-    if session.history_namespace == namespace {
-        return Ok(());
-    }
-    let retained = if let (Some(namespace), Some(conversation)) = (
-        namespace.as_deref(),
-        session.history_conversation.as_deref(),
-    ) {
-        let _guard = IO.lock().unwrap();
-        let mut index = read(service).map_err(|_| {
-            failure(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "history index unavailable",
-            )
-        })?;
-        prune(service, &mut index);
-        index
-            .transcripts
-            .get(&hash(&(namespace, "conversation", conversation)))
-            .is_some_and(|reference| reference.session == id)
-    } else {
-        false
-    };
-    if !retained {
+/// A genuine scope change cannot borrow a conversation from the old checkpoint.
+pub(super) fn bind_namespace(session: &mut Session, namespace: Option<String>) {
+    if session.history_namespace != namespace {
         session.history_conversation = None;
+        session.review_feedback = Value::Null;
+        session.review_feedback_generation = 0;
+        session.history_namespace = namespace;
     }
-    session.review_feedback = Value::Null;
-    session.review_feedback_generation = 0;
-    session.history_namespace = namespace;
-    Ok(())
 }
 
 pub(super) fn conversation(body: &Value) -> Option<&str> {
@@ -407,12 +380,7 @@ pub(super) fn expand(service: &Service, namespace: &str, body: &mut Value) -> Re
         return Ok(());
     };
     let _guard = IO.lock().unwrap();
-    let mut index = read(service).map_err(|_| {
-        failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "history index unavailable",
-        )
-    })?;
+    let mut index = read(service).map_err(read_failure)?;
     prune(service, &mut index);
     let reference = index
         .transcripts
@@ -457,12 +425,7 @@ pub(super) fn resolve(
     body: &Value,
 ) -> Result<(String, Pin), Failure> {
     let _guard = IO.lock().unwrap();
-    let mut index = read(service).map_err(|_| {
-        failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "history index unavailable",
-        )
-    })?;
+    let mut index = read(service).map_err(read_failure)?;
     // Pruning is a read-time projection. Those historical IDs remain occupied
     // in the on-disk generation until publication; pinning one would otherwise
     // make restore protect and resurrect exactly the snapshot just retired.
@@ -683,8 +646,7 @@ fn persist(
     Ok(())
 }
 
-// Capacity admission and atomic publication do not imply retention eviction.
-// Ordinary updates prune first; migrations must fit without discarding proof.
+// Admit exact bounded bytes before atomic publication. Retention belongs to prune.
 fn write_index(service: &Service, index: &Index) -> std::io::Result<()> {
     // Validate the exact bytes that will become authority before opening the
     // temporary file. No failed admission may replace a readable generation.

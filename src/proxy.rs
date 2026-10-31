@@ -1480,7 +1480,7 @@ async fn forward_request(
                 Sha256::digest(format!("carry-primary-{id}").as_bytes())
             ));
         }
-        history::bind_namespace(&service, &id, &mut session, history_namespace)?;
+        history::bind_namespace(&mut session, history_namespace);
         session.history_shared = implicit;
         if requested_conversation.is_some() {
             session.history_conversation = requested_conversation;
@@ -4131,8 +4131,8 @@ mod tests {
     }
     include!("proxy_catalog_isolation_tests.rs");
     include!("proxy_settlement_tests.rs");
-    mod namespace_upgrade_controls {
-        include!("proxy_namespace_upgrade_tests.rs");
+    mod namespace_controls {
+        include!("proxy_namespace_tests.rs");
     }
     include!("proxy_semantic_tests.rs");
     include!("proxy_noodle_tests.rs");
