@@ -181,8 +181,8 @@ impl TraditionalHistoryState {
         {
             prior.cursor.prefix = NativeInputCursor::prefix(prefix);
             prior.cursor.basis = InputBasis::SemanticV1;
-            // Exact cursor proof is not lifetime-equality proof for old money.
-            self.diverge();
+            // Only the cursor representation changed. Preserve separately saved
+            // lifetime equality; a missing or false value remains unproven.
         } else {
             self.receipt_history_load = Some(ReceiptHistoryLoad::ReadOnlyLegacyV1);
         }
