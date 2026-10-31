@@ -6,6 +6,10 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Record {
+    /// Advice validity is not observed-history identity. Old records lacking a
+    /// proven reviewer contract stay unavailable rather than being reauthorized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
     pub generation: u64,
     pub at: u64,
     pub len: usize,
@@ -18,18 +22,14 @@ pub(super) struct Record {
     pub feedback: Value,
 }
 
-/// History/advice identity uses the prompt, not a cache or transport request.
-/// Input ancestry is bound separately by the canonical prefix index. Reuse the
-/// quantity owner's fixed prompt so policy, prices and output controls cannot
-/// rename that ancestry; reviewer and upstream boundaries still fence advice.
-pub(super) fn scope(config: &ProxyCli, body: &Value) -> String {
+/// The canonical history namespace already owns model, prompt and source
+/// identity. Only the reviewer contract belongs in completed-advice validity.
+pub(super) fn scope(config: &ProxyCli) -> String {
     format!(
         "{:x}",
         Sha256::digest(
             serde_json::to_vec(&json!({
-                "policy":"carry-prefix-advice-v4",
-                "model":body.get("model"), "prompt":crate::savings::prompt_overhead(body),
-                "upstream":config.upstream_url, "subscription":config.codex_login,
+                "policy":"carry-prefix-advice-v5",
                 "reviewer":config.classifier_model, "reviewer_url":config.classifier_url,
                 "reasoning":config.classifier_reasoning_effort,
                 "reviewer_output":config.classifier_max_output_tokens
@@ -48,6 +48,7 @@ impl Record {
             }
         }
         Self {
+            policy: None,
             generation: session.review_epoch,
             at: now(),
             len: session.history.len(),

@@ -108,18 +108,18 @@ struct Index {
     #[serde(default)]
     snapshots: BTreeMap<String, Session>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 struct Node {
     parent: String,
     value: Value,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 struct Reference {
     session: String,
     namespace: String,
     at: u64,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 struct Transcript {
     namespace: String,
     external_id: String,
@@ -273,8 +273,13 @@ fn prune(service: &Service, index: &mut Index) -> bool {
     }
 }
 
-/// Owner/settings identity is a boundary, not new authentication or native UI
-/// ancestry. Exact content identifies compatible histories within that boundary.
+// Compatibility belongs at the atomic index load boundary, not in owner or
+// external-ID lookup fallbacks. Both lookup surfaces use only the prepared key.
+#[path = "proxy_history_upgrade.rs"]
+mod upgrade;
+
+/// Observed ancestry owns model, fixed prompt, source and client/tenant fences.
+/// Reviewer validity and cache/pricing policy cannot rename paid quantity owners.
 pub(super) fn namespace(
     service: &Service,
     headers: &HeaderMap,
@@ -284,11 +289,40 @@ pub(super) fn namespace(
     if identity(headers)?.is_none() {
         owner.insert("x-carry-session", "carry-active-prefix".parse().unwrap());
     }
-    Ok(hash(
-        &json!({"policy":"carry-prefix-history-v3", "owner":identity(&owner)?,
-        "settings":semantic::scope(&service.config, body),
-        "client_scope":stable_client_scope(body)}),
-    ))
+    let owner = identity(&owner)?;
+    let namespace = observed_namespace(&service.config, &owner, body);
+    let _guard = IO.lock().unwrap();
+    let mut index = read(service).map_err(|_| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "history index unavailable",
+        )
+    })?;
+    if upgrade::prepare(service, &mut index, &owner, body, &namespace).map_err(|_| {
+        failure(
+            StatusCode::CONFLICT,
+            "history namespace upgrade unavailable",
+        )
+    })? {
+        let prior = index.snapshots.keys().cloned().collect();
+        persist(service, index, prior, None).map_err(|_| {
+            failure(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "history namespace upgrade not persisted",
+            )
+        })?;
+    }
+    Ok(namespace)
+}
+
+fn observed_namespace(config: &ProxyCli, owner: &Option<String>, body: &Value) -> String {
+    format!(
+        "observed-v1:{}",
+        hash(&json!({"owner":owner,
+        "model":body.get("model"), "prompt":crate::savings::prompt_overhead(body),
+        "upstream":config.upstream_url, "subscription":config.codex_login,
+        "client_scope":stable_client_scope(body)}))
+    )
 }
 
 pub(super) fn conversation(body: &Value) -> Option<&str> {
@@ -544,7 +578,10 @@ pub(super) fn advice(
     Ok(path(namespace, input)
         .iter()
         .rev()
-        .find_map(|key| index.reviews.get(key).cloned()))
+        .find_map(|key| index.reviews.get(key).cloned())
+        .filter(|record| {
+            record.policy.as_deref() == Some(semantic::scope(&service.config).as_str())
+        }))
 }
 
 pub(super) fn publish(
@@ -568,11 +605,12 @@ pub(super) fn publish(
         .last()
         .unwrap_or(&subject.history_namespace.clone().unwrap())
         .clone();
-    let record = semantic::Record::capture(reviewed);
+    let mut record = semantic::Record::capture(reviewed);
+    record.policy = Some(semantic::scope(&service.config));
     if index
         .reviews
         .get(&key)
-        .is_none_or(|old| old.generation < record.generation)
+        .is_none_or(|old| old.policy != record.policy || old.generation < record.generation)
     {
         index.reviews.insert(key, record);
     }
