@@ -129,6 +129,11 @@ explicitly for matched experiments. Bounded no-yield backoff does not manufactur
 new source. Review answers, memories and repeated old native content are not new
 source growth. Replay exposure declarations do not make review synchronous.
 
+When primary context capacity or pricing is unknown, the request is forwarded
+without review, rewriting, or Carry context-budget rejection. Unknown tariffs
+remain unpriced in accounting; a context override alone does not enable review.
+Upstream admission and errors still apply.
+
 Planning prices the configured primary input payoff horizon plus each reviewer
 view actually due now, including its output cap. It does not forecast reviewer
 answer replay or claim unknown in-flight work is free. Ordinary review does not

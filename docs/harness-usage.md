@@ -194,4 +194,3 @@ default to a 60-second wall-clock timeout. Set the session fallback with
 individual `shell` call to 1–300 seconds for work that needs a different limit;
 `null` uses the session default. A timed-out command and its process group are
 killed.
-

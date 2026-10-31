@@ -9,13 +9,14 @@ existing OpenAI Responses client and run Carry between it and the provider.
 ## How the proxy works
 
 Carry forwards your client's requests and reviews eligible history in the
-background. It keeps the original history and plans smaller contexts only when
-modeled savings justify the rewrite, accounting for review cost and prompt-cache
-reuse. A request that fits never waits for a review.
+background. It keeps the original history and plans smaller contexts when modeled
+savings or context limits justify a rewrite, accounting for review cost and
+prompt-cache reuse. A request that fits never waits for a review.
 
-Unknown models pass through without Carry review or rewriting, and unknown costs
-stay unpriced. Savings are experimental, workload-dependent estimates—not a
-billing guarantee.
+When primary capacity or pricing is unknown, requests pass through without Carry
+review, rewriting, or context-budget rejection. Unknown costs stay unpriced; a
+context override does not invent a tariff or enable review. Savings are
+experimental, workload-dependent estimates—not a billing guarantee.
 
 ## Install
 

@@ -3035,11 +3035,11 @@ async fn client_continuation_is_expanded_but_never_forwarded_upstream() {
         "",
     )
     .await;
-    let first = json!({"model": "fixture-model", "input": [{"role": "user", "content": "goal"}]});
+    let first = json!({"model": "gpt-6-luna", "input": [{"role": "user", "content": "goal"}]});
     let response = send(&url, &first, "a", "main").await;
     assert!(response.status().is_success());
     let _: serde_json::Value = response.json().await.unwrap();
-    let delta = json!({"model": "fixture-model", "previous_response_id": "resp_1", "input": [{"role": "user", "content": "next"}]});
+    let delta = json!({"model": "gpt-6-luna", "previous_response_id": "resp_1", "input": [{"role": "user", "content": "next"}]});
     let response = send(&url, &delta, "a", "main").await;
     assert!(
         response.status().is_success(),
@@ -3077,7 +3077,7 @@ async fn client_continuation_is_expanded_but_never_forwarded_upstream() {
         "",
     )
     .await;
-    let resumed = json!({"model": "fixture-model", "previous_response_id": "resp_2", "input": [{"role": "user", "content": "after restart"}]});
+    let resumed = json!({"model": "gpt-6-luna", "previous_response_id": "resp_2", "input": [{"role": "user", "content": "after restart"}]});
     let response = send(&url, &resumed, "a", "main").await;
     assert!(response.status().is_success());
     let _: serde_json::Value = response.json().await.unwrap();
@@ -3508,6 +3508,175 @@ async fn reviewer_transport_preserves_encrypted_reasoning_and_native_tool_pairs(
         }
         let forwarded = fixture.requests.lock().await;
         assert_eq!(forwarded[0]["input"], request["input"]);
+    }
+}
+
+#[tokio::test]
+async fn unknown_models_pass_through_without_context_or_pricing() {
+    for mode in ["compact", "audit"] {
+        for capacity in [None, Some("1024")] {
+            let fixture = fixture(json!({"protected": [], "removable": [], "memories": []})).await;
+            let state = tempfile::tempdir().unwrap();
+            let mut options = vec!["--review-replayed-history"];
+            if let Some(capacity) = capacity {
+                options.extend(["--primary-context-tokens", capacity]);
+            }
+            let (_proxy, url) =
+                start_proxy_options(state.path(), fixture.address, mode, &options, "").await;
+            let request = json!({
+                "model":"codex-auto-review",
+                "input":[
+                    {"role":"user","content":"previous task"},
+                    {"role":"assistant","content":"historical output ".repeat(2000)},
+                    {"role":"user","content":"review this action"}
+                ],
+                "client_metadata":{"thread_source":"guardian_review"},
+                "max_output_tokens":2048,
+                "instructions":"client instructions",
+                "tools":[], "store":false, "prompt_cache_key":"approval-review"
+            });
+            // Both implicit native-client identity and explicit sessions must work.
+            for explicit in [false, true] {
+                let mut call = reqwest::Client::new()
+                    .post(format!("{url}/v1/responses"))
+                    .json(&request);
+                if explicit {
+                    call = call.header("x-carry-session", "unknown-explicit");
+                }
+                let response = call.send().await.unwrap();
+                let status = response.status();
+                let body = response.text().await.unwrap();
+                assert!(status.is_success(), "{mode} {capacity:?}: {status} {body}");
+                assert_eq!(fixture.requests.lock().await.last(), Some(&request));
+            }
+            let saved = settled(state.path()).await;
+            assert_eq!(saved.len(), 2);
+            for session in saved {
+                assert_eq!(session["primary"]["calls"], 1);
+                assert_eq!(session["primary"]["unavailable_cost_calls"], 1);
+                assert_eq!(session["shadow"]["calls"], 0);
+                assert_eq!(session["compactions"], 0);
+                assert!(session["model_resolution"]["primary"]["rates"].is_null());
+                assert_eq!(
+                    session["model_resolution"]["primary"]["capacity_tokens"],
+                    capacity
+                        .map(|_| json!(1024))
+                        .unwrap_or(serde_json::Value::Null)
+                );
+            }
+            assert!(fixture.reviews.lock().await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn unknown_models_bypass_review_only_history_and_background_gates() {
+    for mode in ["compact", "audit"] {
+        for capacity in [None, Some("1024")] {
+            for explicit in [false, true] {
+                let fixture =
+                    fixture(json!({"protected": [], "removable": [], "memories": []})).await;
+                let state = tempfile::tempdir().unwrap();
+                let options = capacity
+                    .map(|v| vec!["--primary-context-tokens", v])
+                    .unwrap_or_default();
+                let (_proxy, url) =
+                    start_proxy_options(state.path(), fixture.address, mode, &options, "").await;
+                let client = reqwest::Client::new();
+                for model in ["codex-auto-review", "gpt-6-luna"] {
+                    let before_reviews = fixture.reviews.lock().await.len();
+                    let first = json!({"model":model,"input":[{"role":"user","content":"goal"}],"max_output_tokens":16});
+                    let mut cases = vec![(first.clone(), 200)];
+                    for (field, value, known_status) in [
+                        ("previous_response_id", json!("resp_json"), 200),
+                        ("previous_response_id", json!("unobserved-response"), 409),
+                        ("conversation", json!("unobserved-conversation"), 409),
+                        ("background", json!(true), 400),
+                    ] {
+                        let mut body = first.clone();
+                        body["input"] = json!([{"role":"user","content":"new delta"}]);
+                        body[field] = value;
+                        cases.push((
+                            body,
+                            if model == "codex-auto-review" {
+                                200
+                            } else {
+                                known_status
+                            },
+                        ));
+                    }
+                    cases.push((
+                        json!({"model":model,"input":"plain string input","max_output_tokens":16}),
+                        if model == "codex-auto-review" {
+                            200
+                        } else {
+                            400
+                        },
+                    ));
+                    for (body, status) in cases {
+                        let before = fixture.requests.lock().await.len();
+                        let mut call = client.post(format!("{url}/v1/responses")).json(&body);
+                        if explicit {
+                            call = call.header("x-carry-session", model);
+                        }
+                        let response = call.send().await.unwrap();
+                        let actual = response.status();
+                        let result = response.text().await.unwrap();
+                        assert_eq!(
+                            actual.as_u16(),
+                            status,
+                            "{mode} {capacity:?} explicit={explicit} {body}: {result}"
+                        );
+                        let requests = fixture.requests.lock().await;
+                        assert_eq!(requests.len(), before + usize::from(status == 200));
+                        if status == 200 {
+                            let forwarded = requests.last().unwrap();
+                            if model == "codex-auto-review"
+                                || body.get("previous_response_id").is_none()
+                            {
+                                assert_eq!(
+                                    forwarded, &body,
+                                    "forwarding-only must preserve the complete request"
+                                );
+                            } else {
+                                assert!(forwarded.get("previous_response_id").is_none());
+                                assert!(
+                                    forwarded["input"].as_array().unwrap().len()
+                                        > body["input"].as_array().unwrap().len()
+                                );
+                            }
+                        }
+                    }
+                    if model == "codex-auto-review" {
+                        assert_eq!(fixture.reviews.lock().await.len(), before_reviews);
+                    }
+                }
+                let saved = settled(state.path()).await;
+                let unknown = saved
+                    .iter()
+                    .filter(|s| s["model_resolution"]["primary"]["model"] == "codex-auto-review")
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    unknown
+                        .iter()
+                        .map(|s| s["primary"]["calls"].as_u64().unwrap())
+                        .sum::<u64>(),
+                    6
+                );
+                assert_eq!(
+                    unknown
+                        .iter()
+                        .map(|s| s["primary"]["unavailable_cost_calls"].as_u64().unwrap())
+                        .sum::<u64>(),
+                    6
+                );
+                for session in unknown {
+                    assert_eq!(session["shadow"]["calls"], 0);
+                    assert_eq!(session["compactions"], 0);
+                    assert!(session["model_resolution"]["primary"]["rates"].is_null());
+                }
+            }
+        }
     }
 }
 
