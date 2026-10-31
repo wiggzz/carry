@@ -311,3 +311,83 @@ fn namespace_upgrade_preserves_implicit_observed_transcript() {
 fn namespace_upgrade_preserves_explicit_observed_transcript() {
     namespace_transcript_upgrade(false);
 }
+
+#[test]
+fn namespace_upgrade_capacity_rejection_preserves_complete_generation() {
+    // A migration is not a retention request. Replacing a valid old generation
+    // must not silently evict observed transcript proof just to fit its new root.
+    // The roomy control also proves repeated preparation is a read-only no-op.
+    for roomy in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let service = checkpoint_service(directory.path());
+        let headers = HeaderMap::new();
+        let (body, old_namespace, id, frozen_money) =
+            seed_namespace(&service, &headers, true, false, true);
+        drop(service);
+        let mut service = checkpoint_service(directory.path());
+        let index_path = directory.path().join("history.index");
+        let mirror_path = directory.path().join(format!("{id}.json"));
+        let before = std::fs::read(&index_path).unwrap();
+        let mirror = std::fs::read(&mirror_path).unwrap();
+        let old: Value = serde_json::from_slice(&before).unwrap();
+        assert_eq!(old["tips"].as_object().unwrap().len(), 1);
+        assert_eq!(old["transcripts"].as_object().unwrap().len(), 1);
+        assert_eq!(old["snapshots"][&id]["cost_trajectory"], frozen_money);
+        service.config.history_max_bytes =
+            u32::try_from(before.len() + if roomy { 8192 } else { 0 }).unwrap();
+        let outcome = history::namespace(&service, &headers, &body);
+        let after = std::fs::read(&index_path).unwrap();
+        let current: Value = serde_json::from_slice(&after).unwrap();
+        assert_eq!(current["snapshots"][&id]["cost_trajectory"], frozen_money);
+        assert_eq!(std::fs::read(&mirror_path).unwrap(), mirror);
+        if roomy {
+            let namespace = outcome.unwrap();
+            assert_ne!(namespace, old_namespace);
+            assert_eq!(current["tips"].as_object().unwrap().len(), 1);
+            assert_eq!(current["transcripts"].as_object().unwrap().len(), 1);
+            let transcript = current["transcripts"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap();
+            let original = old["transcripts"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap();
+            assert_eq!(transcript["at"], original["at"]);
+            assert_eq!(transcript["session"], original["session"]);
+            let mut resumed = body.clone();
+            resumed["input"] = json!([]);
+            resumed["previous_response_id"] = json!("legacy-observed-response");
+            history::expand(&service, &namespace, &mut resumed).unwrap();
+            assert_eq!(
+                resumed["input"].as_array().unwrap().len(),
+                body["input"].as_array().unwrap().len() + 1
+            );
+            assert_eq!(
+                history::namespace(&service, &headers, &body).unwrap(),
+                namespace
+            );
+            assert_eq!(std::fs::read(&index_path).unwrap(), after);
+            drop(service);
+            let service = checkpoint_service(directory.path());
+            assert_eq!(
+                history::namespace(&service, &headers, &body).unwrap(),
+                namespace
+            );
+            assert_eq!(std::fs::read(&index_path).unwrap(), after);
+        } else {
+            let rejected = outcome.as_ref().err().map(|failure| failure.0)
+                == Some(StatusCode::INSUFFICIENT_STORAGE);
+            assert!(
+                rejected && after == before,
+                "NAMESPACE_UPGRADE_ATOMIC_CAPACITY: reject without replacing retained proof; status={:?}, unchanged={}",
+                outcome.as_ref().err().map(|failure| failure.0),
+                after == before
+            );
+        }
+    }
+}
