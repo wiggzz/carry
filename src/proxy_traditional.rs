@@ -55,14 +55,27 @@ impl HistoryContract {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct NativeInputCursor {
+    #[serde(default)]
+    basis: InputBasis,
     prefix: String,
     items: usize,
     input: u64,
     at: u64,
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+enum InputBasis {
+    #[default]
+    RawV1,
+    SemanticV1,
+}
 impl NativeInputCursor {
     fn prefix(items: &[Value]) -> String {
-        format!("{:x}", Sha256::digest(serde_json::to_vec(items).unwrap()))
+        format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&crate::openai::semantic_prompt_input(items)).unwrap()
+            )
+        )
     }
     fn matches(&self, body: &Value, input: u64, at: u64, projected: bool) -> bool {
         at >= self.at
@@ -146,6 +159,35 @@ impl TraditionalHistoryState {
         )
     }
 
+    /// One-time input-bound conversion of the old opaque raw-item cursor.
+    /// Only the exact prior raw prefix can prove which semantic input it named.
+    /// An unprovable prefix stays frozen/read-only, never a fresh history.
+    pub(super) fn load_input_cursor(&mut self, body: &Value) {
+        if self.read_only_legacy() {
+            return;
+        }
+        let Some(prior) = &mut self.history_continuity else {
+            return;
+        };
+        if prior.cursor.basis != InputBasis::RawV1 {
+            return;
+        }
+        let prefix = body["input"]
+            .as_array()
+            .and_then(|items| items.get(..prior.cursor.items));
+        if let Some(prefix) = prefix
+            && format!("{:x}", Sha256::digest(serde_json::to_vec(prefix).unwrap()))
+                == prior.cursor.prefix
+        {
+            prior.cursor.prefix = NativeInputCursor::prefix(prefix);
+            prior.cursor.basis = InputBasis::SemanticV1;
+            // Exact cursor proof is not lifetime-equality proof for old money.
+            self.diverge();
+        } else {
+            self.receipt_history_load = Some(ReceiptHistoryLoad::ReadOnlyLegacyV1);
+        }
+    }
+
     pub(super) fn load_legacy_cursor(
         &mut self,
         contract: HistoryContract,
@@ -157,6 +199,7 @@ impl TraditionalHistoryState {
         self.history_continuity = Some(HistoryContinuity {
             contract,
             cursor: NativeInputCursor {
+                basis: InputBasis::RawV1,
                 prefix,
                 items,
                 input,
@@ -209,6 +252,7 @@ impl TraditionalHistoryState {
         self.history_continuity = Some(HistoryContinuity {
             contract,
             cursor: NativeInputCursor {
+                basis: InputBasis::SemanticV1,
                 prefix: NativeInputCursor::prefix(items),
                 items: items.len(),
                 input,

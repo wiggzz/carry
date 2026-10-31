@@ -188,6 +188,7 @@ impl Trajectory {
         prior: impl IntoIterator<Item = &'a ResolvedModel>,
     ) {
         use super::traditional::ReceiptHistoryLoad;
+        self.history.load_input_cursor(body);
         if self.history.receipt_history_load.is_some() {
             return;
         }
@@ -227,6 +228,7 @@ impl Trajectory {
                 anchor.input,
                 anchor.at,
             );
+            self.history.load_input_cursor(body);
         }
     }
 

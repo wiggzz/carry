@@ -564,18 +564,18 @@ pub(crate) fn prompt_overhead(body: &Value) -> Value {
 
 /// Shared prompt-bearing projection, excluding transport and sampling fields.
 pub(crate) fn prompt_projection(body: &Value) -> Option<(String, String, u64)> {
-    let input = body["input"].as_array()?;
+    let input = crate::openai::semantic_prompt_input(body["input"].as_array()?);
     let overhead = prompt_overhead(body);
     let units = token_units(&json!({"overhead":overhead,"input":input}));
     let overhead = overhead.to_string();
-    let serialized = serde_json::to_string(input).ok()?;
+    let serialized = serde_json::to_string(&input).ok()?;
     let prefix = format!("{overhead}{}", &serialized[..serialized.len() - 1]);
     Some((prefix, overhead, units))
 }
 /// Fixed instruction roles and the current user suffix overlap: select their
 /// union before tokenizing, rather than adding two independently sized slices.
 fn retained_prompt_tokens(body: &Value, current_turn: bool) -> Option<u64> {
-    let input = body["input"].as_array()?;
+    let input = crate::openai::semantic_prompt_input(body["input"].as_array()?);
     let current = input.iter().rposition(|item| item["role"] == "user");
     let retained: Vec<_> = input
         .iter()
