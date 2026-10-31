@@ -292,7 +292,21 @@ class InitializationRegressions(unittest.TestCase):
         arrivals = []
         self.evidence.update(request_timings=timings, provider_arrivals=arrivals)
 
+        def journal_events(proxy):
+            events = []
+            for path in (self.harness.state / "diagnostics").glob("*.jsonl"):
+                for line in path.read_text().splitlines():
+                    try:
+                        event = support.json.loads(line)
+                    except ValueError:
+                        continue  # the best-effort journal may be mid-append
+                    if event.get("request_id", "").startswith(f"{proxy.process.pid}-"):
+                        events.append({key: event.get(key) for key in
+                                       ("event", "at", "request_id")})
+            return events
+
         def send(proxy, history):
+            previous = {event["request_id"] for event in journal_events(proxy)}
             record = {"request": len(timings) + 1,
                       "input_bytes": len(support.wire(history)),
                       "provider_before": len(arrivals)}
@@ -312,6 +326,8 @@ class InitializationRegressions(unittest.TestCase):
             finally:
                 record["elapsed_seconds"] = time.monotonic() - started
                 record["provider_after"] = len(arrivals)
+                record["journal_events"] = [event for event in journal_events(proxy)
+                                            if event["request_id"] not in previous]
                 print("INITIALIZATION186_REQUEST " + support.json.dumps(record), flush=True)
 
         def primary(_body, n):
