@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.17.1](https://github.com/wiggzz/carry/compare/v0.17.0...v0.17.1) (2026-11-01)
+
+
+### Bug Fixes
+
+* **cache:** freeze one clock for each proxy decision ([e575055](https://github.com/wiggzz/carry/commit/e5750555d47eea90a1531b6100572dfb0f9f05b5))
+* **cache:** preserve qualified native read coverage separately ([693f323](https://github.com/wiggzz/carry/commit/693f323c53ea2ca4edf15867c8eb53a4a03edc5f))
+* **cache:** require raw whole writes for native population ([db4b68e](https://github.com/wiggzz/carry/commit/db4b68e55f4e6718621f8dfd3f3df7cbeaae8790))
+* **cache:** retain original native write intervals ([e531c1d](https://github.com/wiggzz/carry/commit/e531c1ddc8b341941ceb09f1da7badb6453c4f2c))
+* **cache:** retain qualified read coverage separately from writes ([4d04199](https://github.com/wiggzz/carry/commit/4d041994ca09f4fd749c38c22e51914e7f703968))
+* **cache:** revoke native prefix credit after a newer miss ([1e45a0e](https://github.com/wiggzz/carry/commit/1e45a0e7236da2893426ce62af668c1507dbbcd9))
+* **cache:** revoke rendered generation credit after newer misses ([363a4aa](https://github.com/wiggzz/carry/commit/363a4aa96f1774883b1b0340aae283355c48dfd1))
+* **cache:** share qualified read coverage across modeled branches ([3694841](https://github.com/wiggzz/carry/commit/3694841698544bf06e13f43984f3804669829153))
+* **cache:** stop renewing native generations from cache reads ([9629fe5](https://github.com/wiggzz/carry/commit/9629fe5f198420afe6b749d69a4c592e2db4e5dc))
+* **metering:** share validated native receipt partitions ([1ea9a0f](https://github.com/wiggzz/carry/commit/1ea9a0f424f70bbfbb7daba22a69442734f96d65))
+* **native:** bind cache entitlement to the resolved route ([3e2194f](https://github.com/wiggzz/carry/commit/3e2194f795fe5854df4540e36b8c951cc85d4af8))
+* **native:** retain shared model policy for report forecasts ([e56b581](https://github.com/wiggzz/carry/commit/e56b581a3a66e2c3e0d4ad1cf9073b2e73f38a53))
+* **report:** require explicit normalized usage authority ([ada0ef9](https://github.com/wiggzz/carry/commit/ada0ef9b43d47c4b2e921e2947ee729cc568e333))
+* **report:** separate scenario policy from native entitlement ([ba7434d](https://github.com/wiggzz/carry/commit/ba7434ddb6b55cff0f48207ab3726fec01f2dbf3))
+* **savings:** separate observed money from traditional forecasts ([#196](https://github.com/wiggzz/carry/issues/196)) ([a291e04](https://github.com/wiggzz/carry/commit/a291e044165b3013202bc06119626fe5695f05b0))
+
 ## [0.17.0](https://github.com/wiggzz/carry/compare/v0.16.1...v0.17.0) (2026-10-31)
 
 
