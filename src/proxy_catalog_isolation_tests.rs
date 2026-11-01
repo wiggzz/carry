@@ -127,7 +127,7 @@ async fn catalog_r1_receipt_credit_is_bound_to_route_auth_class_and_restart() {
     let (_config, session, body) = catalog_cache_receipt().await;
     let exact = &session.model_resolution.as_ref().unwrap().primary;
     let cost = |cache: &[CacheEvidence], model: &ResolvedModel| {
-        resolved_view_costs(&body, &body, cache, "gpt-6-sol", 1, Some(model), "")
+        resolved_view_costs(&body, &body, cache, "gpt-6-sol", 1, Some(model), "", now())
             .unwrap()
             .keep
     };

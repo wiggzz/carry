@@ -151,6 +151,7 @@ fn undispatched_review_cannot_subsidize_a_warm_primary_losing_rewrite() {
             1,
             Some(&primary_model),
             &config.primary_cache_auth,
+            now(),
         )
         .unwrap();
         let review_keep = review_body(&config, &session);

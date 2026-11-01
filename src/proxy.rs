@@ -3027,6 +3027,8 @@ fn reviewer_rates(config: &ProxyCli, input: f64) -> Option<Rates> {
     }
 }
 
+// Keep the caller's decision clock explicit alongside route/credential proof.
+#[allow(clippy::too_many_arguments)]
 fn resolved_view_costs(
     keep: &Value,
     compact: &Value,
@@ -3035,6 +3037,7 @@ fn resolved_view_costs(
     requests: u64,
     resolved: Option<&ResolvedModel>,
     credential: &str,
+    at: u64,
 ) -> Option<ViewCosts> {
     let kt = estimate(keep);
     let ct = estimate(compact);
@@ -3060,7 +3063,7 @@ fn resolved_view_costs(
         input_cost(
             tokens,
             if resolved.is_none() || capability.is_some() {
-                crate::proxy_cache::reusable(cache, body, resolved, credential, now())
+                crate::proxy_cache::reusable(cache, body, resolved, credential, at)
             } else {
                 0.0
             },

@@ -107,6 +107,7 @@ fn identical_views_cannot_gain_or_lose_money_between_clock_reads() {
             1,
             Some(model),
             &config.primary_cache_auth,
+            now(),
         )
         .unwrap()
     };

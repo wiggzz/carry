@@ -20,6 +20,9 @@ pub(super) fn plan(
     session: &Session,
     body: &Value,
 ) -> (Option<Projection>, Value) {
+    // One decision, one eligibility instant: candidate enumeration, both lanes
+    // of every comparison and the report cannot straddle different deadlines.
+    let at = now();
     let canonical = Projection::canonical(session);
     let groups = session.groups();
     let eligible = groups
@@ -95,7 +98,7 @@ pub(super) fn plan(
                 &canonical_wire,
                 config.model_resolution.as_ref().map(|p| &p.primary),
                 &config.primary_cache_auth,
-                now(),
+                at,
             )
             .is_some()
         {
@@ -154,6 +157,7 @@ pub(super) fn plan(
             config.payoff_requests,
             config.model_resolution.as_ref().map(|p| &p.primary),
             &config.primary_cache_auth,
+            at,
         );
         let compact_review = review_body_projected(config, session, &projection);
         // Same actual scheduling on both views: a selected rewrite does not
@@ -170,6 +174,7 @@ pub(super) fn plan(
                 1,
                 config.model_resolution.as_ref().map(|p| &p.reviewer),
                 &config.reviewer_cache_auth,
+                at,
             )?;
             let rates = reviewer_rates(config, estimate(view))?;
             Some(input.keep + config.classifier_max_output_tokens as f64 * rates.output)
@@ -220,7 +225,7 @@ pub(super) fn plan(
     }
     let selected = best.as_ref().is_some_and(|(p, _, _)| !p.omitted.is_empty());
     let mut report = json!({"selected":selected,"forced":forced,"primary_fits":!forced,
-        "primary_cached_estimated_tokens":crate::proxy_cache::reusable(&session.upstream_cache,&wire,config.model_resolution.as_ref().map(|p|&p.primary),&config.primary_cache_auth,now()),
+        "primary_cached_estimated_tokens":crate::proxy_cache::reusable(&session.upstream_cache,&wire,config.model_resolution.as_ref().map(|p|&p.primary),&config.primary_cache_auth,at),
         "reviewer_fits":review_fits(config,&review),"primary_estimated_tokens":wire_tokens,
         "primary_required_tokens":baseline_required,"primary_receipt_prediction_tokens":prediction,
         "context_margin_percent":config.context_margin_percent,
