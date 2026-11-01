@@ -2,6 +2,7 @@
 use super::*;
 include!("proxy_cache_write_tests.rs");
 include!("primary_parity_tests.rs");
+include!("modeled_refresh_tests.rs");
 include!("legacy_history_tests.rs");
 include!("proxy_unknown_price_history_tests.rs");
 include!("semantic_prompt_tests.rs");
