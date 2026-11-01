@@ -278,19 +278,51 @@ impl RunMetrics {
 struct CacheTracker {
     capabilities: Option<PromptCacheCapabilities>,
     implicit_minimum_prefix_tokens: Option<usize>,
-    implicit_activity: Option<Instant>,
+    implicit_write: Option<MonotonicWrite>,
     implicit_cached_tokens: usize,
     implicit_prefix: Vec<serde_json::Value>,
     breakpoints: HashMap<u64, TrackedBreakpoint>,
     pending: Vec<RenderedBreakpoint>,
     pending_request_tokens: usize,
     pending_history: Vec<serde_json::Value>,
+    pending_write: Option<(Instant, Duration)>,
 }
 
 #[derive(Debug)]
 struct TrackedBreakpoint {
     cached_tokens: usize,
-    activity: Option<Instant>,
+    write: Option<MonotonicWrite>,
+}
+
+/// Clock-domain adapter only: the shared write owner decides eligibility.
+/// The lower bound is captured before transport, never inferred from usage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MonotonicWrite {
+    origin: Instant,
+    window: crate::proxy_cache::WriteWindow,
+}
+
+impl MonotonicWrite {
+    fn during(origin: Instant, terminal: Instant, lifetime: Duration) -> Option<Self> {
+        Some(Self {
+            origin,
+            window: crate::proxy_cache::WriteWindow {
+                not_before: 0,
+                not_after: terminal
+                    .checked_duration_since(origin)?
+                    .as_nanos()
+                    .try_into()
+                    .ok()?,
+                lifetime: lifetime.as_nanos().try_into().ok()?,
+            },
+        })
+    }
+
+    fn eligible_at(self, at: Instant) -> bool {
+        at.checked_duration_since(self.origin)
+            .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
+            .is_some_and(|at| self.window.eligible_at(at))
+    }
 }
 
 impl CacheTracker {
@@ -337,12 +369,13 @@ impl CacheTracker {
                 .entry(breakpoint.generation)
                 .or_insert(TrackedBreakpoint {
                     cached_tokens: 0,
-                    activity: None,
+                    write: None,
                 });
         }
         self.pending = breakpoints;
         self.pending_request_tokens = request_tokens;
         self.pending_history = history.to_vec();
+        self.pending_write = Some((Instant::now(), CACHE_TTL));
     }
 
     #[cfg(test)]
@@ -359,9 +392,14 @@ impl CacheTracker {
             self.pending.clear();
             self.pending_request_tokens = 0;
             self.pending_history.clear();
+            self.pending_write = None;
             return;
         };
         let now = Instant::now();
+        let write = self
+            .pending_write
+            .take()
+            .and_then(|(started, lifetime)| MonotonicWrite::during(started, now, lifetime));
         let quantities = carry::core::CacheUsage::from_receipt(usage);
         if quantities.read_covers_whole_input() == Some(false) {
             if self.pending_history.starts_with(&self.implicit_prefix) {
@@ -374,7 +412,7 @@ impl CacheTracker {
             for breakpoint in &self.pending {
                 if let Some(tracked) = self.breakpoints.get_mut(&breakpoint.generation) {
                     tracked.cached_tokens = 0;
-                    tracked.activity = None;
+                    tracked.write = None;
                 }
             }
         }
@@ -382,12 +420,10 @@ impl CacheTracker {
             self.implicit_minimum_prefix_tokens
                 .is_some_and(|minimum| input >= minimum as u64)
         });
-        if whole_write {
-            self.implicit_activity = Some(now);
+        if let Some(write) = write.filter(|_| whole_write) {
+            self.implicit_write = Some(write);
             self.implicit_cached_tokens = self.pending_request_tokens;
             self.implicit_prefix.clone_from(&self.pending_history);
-        }
-        if whole_write {
             let explicit_write_slots =
                 capabilities
                     .max_write_breakpoints
@@ -406,7 +442,7 @@ impl CacheTracker {
                     .get_mut(&breakpoint.generation)
                     .expect("pending breakpoints are tracked");
                 tracked.cached_tokens = breakpoint.prefix_tokens;
-                tracked.activity = Some(now);
+                tracked.write = Some(write);
             }
         }
         self.pending.clear();
@@ -442,7 +478,7 @@ impl CacheTracker {
         let mut breakpoints = self
             .breakpoints
             .iter()
-            .filter(|(_, tracked)| cache_alive(tracked.activity, now))
+            .filter(|(_, tracked)| cache_alive(tracked.write, now))
             .map(|(generation, tracked)| PricedBreakpoint {
                 generation: *generation,
                 cached_tokens: tracked.cached_tokens,
@@ -460,7 +496,7 @@ impl CacheTracker {
                 .unwrap()
                 .cache_ratios(),
             implicit_cached_tokens: if implicit_prefix_compatible
-                && cache_alive(self.implicit_activity, now)
+                && cache_alive(self.implicit_write, now)
             {
                 self.implicit_cached_tokens
             } else {
@@ -473,12 +509,13 @@ impl CacheTracker {
     }
 
     fn implicit_expired(&self) -> bool {
-        self.implicit_activity
-            .is_some_and(|activity| activity.elapsed() >= CACHE_TTL)
+        let now = Instant::now();
+        self.implicit_write
+            .is_some_and(|write| !write.eligible_at(now))
     }
 
     fn clear_implicit(&mut self) {
-        self.implicit_activity = None;
+        self.implicit_write = None;
         self.implicit_cached_tokens = 0;
         self.implicit_prefix.clear();
     }
@@ -491,8 +528,8 @@ impl CacheTracker {
     }
 }
 
-fn cache_alive(activity: Option<Instant>, now: Instant) -> bool {
-    activity.is_some_and(|activity| now.duration_since(activity) < CACHE_TTL)
+fn cache_alive(write: Option<MonotonicWrite>, now: Instant) -> bool {
+    write.is_some_and(|write| write.eligible_at(now))
 }
 
 impl Backend {
@@ -1949,12 +1986,62 @@ mod tests {
         let deadline = dispatch_bound + CACHE_TTL;
         assert_eq!(
             [
-                cache_alive(cache.implicit_activity, deadline),
-                cache_alive(cache.breakpoints[&7].activity, deadline),
+                cache_alive(cache.implicit_write, deadline),
+                cache_alive(cache.breakpoints[&7].write, deadline),
             ],
             [false, false],
             "NATIVE_TERMINAL_WRITE_CLOCK: terminal receipt cannot extend the original request write deadline"
         );
+    }
+
+    #[test]
+    fn native_write_window_uses_latest_completion_and_original_expiry() {
+        let start = Instant::now();
+        let lifetime = Duration::from_secs(60);
+        let write =
+            MonotonicWrite::during(start, start + Duration::from_secs(10), lifetime).unwrap();
+        for (offset, expected) in [(0, false), (9, false), (10, true), (59, true), (60, false)] {
+            assert_eq!(
+                cache_alive(Some(write), start + Duration::from_secs(offset)),
+                expected,
+                "original window, offset={offset}"
+            );
+        }
+        assert!(!cache_alive(Some(write), start - Duration::from_nanos(1)));
+        assert!(MonotonicWrite::during(start, start - Duration::from_nanos(1), lifetime).is_none());
+        let long_response = MonotonicWrite::during(start, start + lifetime, lifetime).unwrap();
+        for offset in [0, 59, 60, 61, 120] {
+            assert!(!cache_alive(
+                Some(long_response),
+                start + Duration::from_secs(offset)
+            ));
+        }
+    }
+
+    #[test]
+    fn native_whole_write_needs_a_still_usable_original_request_window() {
+        let history = [json!({"role":"user", "content":"synthetic exact generation prefix"})];
+        let receipt = json!({"input_tokens":5_000,"cached_input_tokens":0,
+            "cache_write_input_tokens":5_000});
+        for timing in [None, Some(Instant::now() - CACHE_TTL)] {
+            let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+            cache.begin_request_with_history(
+                vec![RenderedBreakpoint {
+                    generation: 7,
+                    prefix_tokens: 1_200,
+                }],
+                &history,
+                2_400,
+            );
+            // Synthetic missing/old dispatch bounds, not provider residency.
+            // Real terminal observation still constructs and queries the fact.
+            cache.pending_write = timing.map(|started| (started, CACHE_TTL));
+            cache.observe_receipt(&receipt);
+            let policy = cache.policy_for_history(&history, 1, 10);
+            assert_eq!(policy.implicit_cached_tokens, 0);
+            assert!(policy.breakpoints.is_empty());
+            assert_eq!(cache.implicit_expired(), timing.is_some());
+        }
     }
 
     #[test]
@@ -1979,8 +2066,9 @@ mod tests {
             }]
         );
         let original = Instant::now() - CACHE_TTL + Duration::from_secs(10);
-        cache.implicit_activity = Some(original);
-        cache.breakpoints.get_mut(&7).unwrap().activity = Some(original);
+        let original = MonotonicWrite::during(original, original, CACHE_TTL).unwrap();
+        cache.implicit_write = Some(original);
+        cache.breakpoints.get_mut(&7).unwrap().write = Some(original);
         cache.begin_request_with_history(
             vec![RenderedBreakpoint {
                 generation: 7,
@@ -1993,10 +2081,10 @@ mod tests {
             "cache_write_input_tokens":0}));
         // Full native coverage corroborates the prior fact, not a new write.
         // The native5000 and local1200 coordinates are intentionally unequal.
-        assert_eq!(cache.implicit_activity, Some(original));
+        assert_eq!(cache.implicit_write, Some(original));
         assert_eq!(cache.breakpoints[&7].cached_tokens, 1_200);
         assert_eq!(
-            cache.breakpoints[&7].activity,
+            cache.breakpoints[&7].write,
             Some(original),
             "NATIVE_GENERATION_READ_RENEWAL: a full read cannot renew the original generation write"
         );
@@ -2049,7 +2137,7 @@ mod tests {
                 2_400,
             );
             cache.observe_receipt(&whole_write);
-            let original = cache.breakpoints[&7].activity;
+            let original = cache.breakpoints[&7].write;
             cache.begin_request_with_history(
                 vec![RenderedBreakpoint {
                     generation,
@@ -2068,7 +2156,7 @@ mod tests {
             assert_eq!(actual, expected, "raw={raw}, generation={generation}");
             if expected > 0 && raw != whole_write {
                 assert_eq!(
-                    cache.breakpoints[&7].activity, original,
+                    cache.breakpoints[&7].write, original,
                     "reconciliation cannot renew an original write"
                 );
             }
@@ -2201,19 +2289,21 @@ mod tests {
         cache.observe_receipt(&json!({"input_tokens":5_000, "cached_input_tokens":0,
             "cache_write_input_tokens":5_000}));
         let original = Instant::now() - CACHE_TTL + Duration::from_secs(10);
-        cache.implicit_activity = Some(original);
+        let original = MonotonicWrite::during(original, original, CACHE_TTL).unwrap();
+        cache.implicit_write = Some(original);
         cache.begin_request_with_history(Vec::new(), &history, 2_400);
         cache.observe_receipt(&json!({"input_tokens":5_000, "cached_input_tokens":5_000,
             "cache_write_input_tokens":0}));
         // Existing population-gate acceptance, not a newly reproduced defect.
-        assert_eq!(cache.implicit_activity, Some(original));
+        assert_eq!(cache.implicit_write, Some(original));
         assert_eq!(
             cache
                 .policy_for_history(&history, 1, 10)
                 .implicit_cached_tokens,
             2_400
         );
-        cache.implicit_activity = Some(Instant::now() - CACHE_TTL);
+        let expired = Instant::now() - CACHE_TTL;
+        cache.implicit_write = MonotonicWrite::during(expired, expired, CACHE_TTL);
         assert_eq!(
             cache
                 .policy_for_history(&history, 1, 10)
@@ -2674,7 +2764,7 @@ mod tests {
                 ..openai_cache_capabilities()
             }),
             implicit_minimum_prefix_tokens: Some(openai_cache_capabilities().minimum_prefix_tokens),
-            implicit_activity: Some(now),
+            implicit_write: MonotonicWrite::during(now, now, CACHE_TTL),
             implicit_cached_tokens: 1_500,
             implicit_prefix: Vec::new(),
             breakpoints: (0..3)
@@ -2683,7 +2773,7 @@ mod tests {
                         generation,
                         TrackedBreakpoint {
                             cached_tokens: 1_100,
-                            activity: Some(now),
+                            write: MonotonicWrite::during(now, now, CACHE_TTL),
                         },
                     )
                 })
@@ -2691,6 +2781,7 @@ mod tests {
             pending: Vec::new(),
             pending_request_tokens: 0,
             pending_history: Vec::new(),
+            pending_write: None,
         };
 
         let mut generations = cache
@@ -2708,19 +2799,23 @@ mod tests {
         let mut cache = CacheTracker {
             capabilities: Some(openai_cache_capabilities()),
             implicit_minimum_prefix_tokens: Some(openai_cache_capabilities().minimum_prefix_tokens),
-            implicit_activity: None,
+            implicit_write: None,
             implicit_cached_tokens: 0,
             implicit_prefix: Vec::new(),
             breakpoints: HashMap::from([(
                 7,
                 TrackedBreakpoint {
                     cached_tokens: 1_100,
-                    activity: Some(Instant::now() - CACHE_TTL),
+                    write: {
+                        let expired = Instant::now() - CACHE_TTL;
+                        MonotonicWrite::during(expired, expired, CACHE_TTL)
+                    },
                 },
             )]),
             pending: Vec::new(),
             pending_request_tokens: 0,
             pending_history: Vec::new(),
+            pending_write: None,
         };
         cache.begin_request(vec![RenderedBreakpoint {
             generation: 7,

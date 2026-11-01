@@ -80,14 +80,14 @@ fn write_eligible_at(not_before: u64, not_after: u64, lifetime: u64, at: u64) ->
     not_before <= not_after && at >= not_after && at - not_before < lifetime
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub(super) struct WriteWindow {
     pub not_before: u64,
     pub not_after: u64,
     pub lifetime: u64,
 }
 impl WriteWindow {
-    fn eligible_at(&self, at: u64) -> bool {
+    pub(super) fn eligible_at(&self, at: u64) -> bool {
         write_eligible_at(self.not_before, self.not_after, self.lifetime, at)
     }
 }
