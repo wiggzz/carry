@@ -487,6 +487,18 @@ impl ScenarioCachePolicy {
         }
     }
 
+    /// Conditional API-equivalent coverage, not this route's entitlement or an
+    /// observed native hit. Only the frozen supported short implicit policy can
+    /// refresh a hypothetical read; custom/unknown policies keep their clocks.
+    pub fn read_refresh_seconds(&self, model: &str, body: &Value) -> Option<u64> {
+        (self.version == Self::VERSION
+            && self.ttl_seconds == SHORT_CACHE_LIFETIME_SECONDS
+            && self.minimum_prefix_tokens.is_some()
+            && model_spec(model).is_some_and(|spec| spec.cache.is_some())
+            && self.request_mode(body) == ScenarioCacheMode::Implicit)
+            .then_some(SHORT_CACHE_LIFETIME_SECONDS)
+    }
+
     pub fn for_model(model: &str) -> Self {
         Self {
             version: Self::VERSION,

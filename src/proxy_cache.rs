@@ -42,13 +42,17 @@ pub(crate) fn modeled_scope(body: &Value, model: &str, source: impl Serialize) -
     .1
 }
 
-/// A conditional branch's writes, never provider observations or billed usage.
-/// Separate extents are necessary: appending a newly written suffix cannot move
-/// an older prefix's deadline. All times use the calling adapter's clock units.
+/// A conditional branch's coverage, never provider observations or billed usage.
+/// Write/read extents retain independent deadlines: a suffix write or qualified
+/// read cannot rewrite an older write. Times use the calling adapter's units.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct ModeledCache {
     scope: String,
     writes: Vec<ModeledWrite>,
+    // Conditional read-derived coverage is not another write. Keep its own
+    // extent/deadline, including a larger earlier prefix when a read is shorter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reads: Vec<ModeledWrite>,
     // Bounded discarded suffix coverage is uncertainty, never a cache miss.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unresolved: Option<UnresolvedCoverage>,
@@ -75,7 +79,7 @@ impl ModeledWrite {
 
 /// A bounded write is usable only after its latest possible completion and
 /// before its earliest possible write's deadline. The same pure rule serves
-/// modeled point writes and observed transport intervals; reads never renew it.
+/// modeled points and observed transport intervals; existing facts never renew.
 fn write_eligible_at(not_before: u64, not_after: u64, lifetime: u64, at: u64) -> bool {
     not_before <= not_after && at >= not_after && at - not_before < lifetime
 }
@@ -126,7 +130,13 @@ impl ModeledCache {
         if self.scope != scope {
             return Some(0);
         }
-        let mut prefix = 0;
+        let mut prefix = self
+            .reads
+            .iter()
+            .filter(|read| read.eligible_at(at))
+            .map(|read| read.end)
+            .max()
+            .unwrap_or(0);
         for write in &self.writes {
             if write.start > prefix {
                 break;
@@ -164,9 +174,45 @@ impl ModeledCache {
         }
     }
 
-    /// Record the hypothetical request's uncached extent. The owner derives it;
-    /// callers cannot turn a missing/retired forecast into a new cold write.
-    /// There is no supported read-refresh contract in this whole-prefix model.
+    /// Settle one conditional request using its frozen policy. Never populate
+    /// this branch from actual native hits. Only already-eligible input can be
+    /// refreshed; newly written suffixes retain their own original write clocks.
+    pub(crate) fn requested(
+        &mut self,
+        scope: String,
+        at: u64,
+        lifetime: u64,
+        input: u64,
+        read_refresh: Option<u64>,
+    ) {
+        let read = read_refresh
+            .filter(|lifetime| *lifetime > 0)
+            .zip(self.eligible_at(&scope, at, input))
+            .filter(|(_, cached)| *cached > 0);
+        self.written(scope, at, lifetime, input);
+        if let Some((lifetime, cached)) = read {
+            let deadline = u128::from(at) + u128::from(lifetime);
+            self.reads.retain(|old| {
+                (old.at > at || old.eligible_at(at))
+                    && !(old.at <= at
+                        && old.end <= cached
+                        && u128::from(old.at) + u128::from(old.lifetime) <= deadline)
+            });
+            self.reads.push(ModeledWrite {
+                start: 0,
+                end: cached,
+                at,
+                lifetime,
+            });
+            if self.reads.len() > 128 {
+                let discarded = self.reads.pop().unwrap();
+                self.retain_uncertainty(0, discarded.end, discarded.at, discarded.lifetime);
+            }
+        }
+    }
+
+    /// Record only the hypothetical request's uncached extent. The owner
+    /// derives it; missing/retired forecasts cannot become new cold writes.
     pub(crate) fn written(&mut self, scope: String, at: u64, lifetime: u64, input: u64) {
         if lifetime == 0 {
             return;
@@ -483,6 +529,7 @@ mod tests {
 
     include!("proxy_cache_partition_tests.rs");
     include!("proxy_cache_refresh_tests.rs");
+    include!("modeled_cache_acceptance_tests.rs");
 
     // Existing exact-credit controls must remain known, never accept None as0.
     fn eligible(cache: &ModeledCache, scope: &str, at: u64, input: u64) -> u64 {

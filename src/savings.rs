@@ -163,6 +163,7 @@ struct Prompt {
     requested_output: Option<u64>,
     request_at_ms: Option<u64>,
     cache_lifetime_ms: Option<u64>,
+    cache_read_refresh_ms: Option<u64>,
     cache_mode: ScenarioCacheMode,
     write_tariff_known: bool,
 }
@@ -193,6 +194,7 @@ pub struct Trajectory {
     cache_ttl_ms: Option<u64>,
     cache_minimum: Option<u64>,
     cache_metadata: bool,
+    scenario_cache_policy: Option<ScenarioCachePolicy>,
 }
 impl Default for Trajectory {
     fn default() -> Self {
@@ -233,6 +235,7 @@ impl Trajectory {
             cache_ttl_ms: None,
             cache_minimum: None,
             cache_metadata: false,
+            scenario_cache_policy: None,
         }
     }
     pub fn snapshot(&self) -> Estimate {
@@ -292,10 +295,13 @@ impl Trajectory {
                         .as_ref()
                         .and_then(|policy| policy.minimum_prefix_tokens);
                     self.cache_ttl_ms = policy
+                        .as_ref()
                         .map(|policy| policy.ttl_seconds)
                         .filter(|seconds| *seconds > 0)
                         .map(|seconds| seconds.saturating_mul(1000));
+                    self.scenario_cache_policy = policy;
                 } else {
+                    self.scenario_cache_policy = None;
                     self.cache_ttl_ms = data["cache_ttl_seconds"]
                         .as_u64()
                         .map(|s| s.saturating_mul(1000));
@@ -336,6 +342,11 @@ impl Trajectory {
                 if let Some(p) = self.pending.as_mut() {
                     p.request_at_ms = value["timestamp_ms"].as_u64();
                     p.cache_lifetime_ms = self.cache_ttl_ms;
+                    p.cache_read_refresh_ms = self
+                        .scenario_cache_policy
+                        .as_ref()
+                        .and_then(|policy| policy.read_refresh_seconds(&p.model, &data["request"]))
+                        .map(|seconds| seconds.saturating_mul(1000));
                 }
                 if self.cache_ttl_ms.is_none() || value["timestamp_ms"].as_u64().is_none() {
                     self.result.coverage.unknown_expiry_requests += 1;
@@ -491,11 +502,12 @@ impl Trajectory {
                     {
                         // A dispatch-time population assumption, not a response
                         // timestamp masquerading as an observed provider write.
-                        self.modeled_cache.written(
+                        self.modeled_cache.requested(
                             prompt.cache_scope.clone(),
                             at,
                             lifetime,
                             pi_input,
+                            prompt.cache_read_refresh_ms,
                         );
                     } else {
                         self.modeled_cache.clear();
@@ -703,6 +715,7 @@ fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
         cache_scope,
         request_at_ms: None,
         cache_lifetime_ms: None,
+        cache_read_refresh_ms: None,
         write_tariff_known: carry::models::cache_write_tariff_known(request),
         cache_mode: ScenarioCachePolicy::for_model(request["model"].as_str().unwrap_or(fallback))
             .request_mode(request),

@@ -493,7 +493,10 @@ impl Trajectory {
         if mode == carry::models::ScenarioCacheMode::Implicit
             && minimum.is_some_and(|min| traditional >= min)
         {
-            cache.written(cache_scope, at, ttl, traditional);
+            let read_refresh = resolved
+                .and_then(|r| r.scenario_cache_policy.as_ref())
+                .and_then(|policy| policy.read_refresh_seconds(model, body));
+            cache.requested(cache_scope, at, ttl, traditional, read_refresh);
         } else {
             cache.clear();
         }
