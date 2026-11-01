@@ -1956,6 +1956,36 @@ mod tests {
     }
 
     #[test]
+    fn native_generation_newer_miss_revokes_original_credit() {
+        let history = [json!({"role":"user", "content":"synthetic exact generation prefix"})];
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+        let generation = || {
+            vec![RenderedBreakpoint {
+                generation: 7,
+                prefix_tokens: 1_200,
+            }]
+        };
+        cache.begin_request_with_history(generation(), &history, 2_400);
+        cache.observe_receipt(&json!({"input_tokens":5_000,"cached_input_tokens":0,
+            "cache_write_input_tokens":5_000}));
+        assert_eq!(
+            cache.policy().breakpoints,
+            vec![PricedBreakpoint {
+                generation: 7,
+                cached_tokens: 1_200
+            }],
+            "qualified whole-write positive with distinct native/local coordinates"
+        );
+        cache.begin_request_with_history(generation(), &history, 2_400);
+        cache.observe_receipt(&json!({"input_tokens":5_000,"cached_input_tokens":0,
+            "cache_write_input_tokens":0}));
+        assert!(
+            cache.policy().breakpoints.is_empty(),
+            "NATIVE_GENERATION_NEWER_MISS: current generation miss cannot retain earlier credit"
+        );
+    }
+
+    #[test]
     fn native_qualified_compatible_newer_miss_revokes_original_credit() {
         let history = [json!({"role":"user", "content":"synthetic exact prefix"})];
         let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
