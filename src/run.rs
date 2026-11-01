@@ -1932,6 +1932,7 @@ mod tests {
     use super::*;
     use crate::openai::PromptCacheCapabilities;
     include!("run_cache_scope_tests.rs");
+    include!("run_cache_refresh_tests.rs");
 
     #[test]
     fn human_message_event_preserves_submission_identity() {
