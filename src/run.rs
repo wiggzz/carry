@@ -1921,6 +1921,43 @@ mod tests {
     }
 
     #[test]
+    fn native_write_deadline_is_bounded_by_original_dispatch_not_terminal() {
+        let history = [json!({"role":"user", "content":"synthetic exact generation prefix"})];
+        let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+        cache.begin_request_with_history(
+            vec![RenderedBreakpoint {
+                generation: 7,
+                prefix_tokens: 1_200,
+            }],
+            &history,
+            2_400,
+        );
+        // The real dispatch is no later than this bound. Advance only the
+        // query clock; receipt counts alone cannot date the provider write.
+        let dispatch_bound = Instant::now();
+        cache.observe_receipt(&json!({"input_tokens":5_000,"cached_input_tokens":0,
+            "cache_write_input_tokens":5_000}));
+        let policy = cache.policy_for_history(&history, 1, 10);
+        assert_eq!(policy.implicit_cached_tokens, 2_400);
+        assert_eq!(
+            policy.breakpoints,
+            vec![PricedBreakpoint {
+                generation: 7,
+                cached_tokens: 1_200,
+            }]
+        );
+        let deadline = dispatch_bound + CACHE_TTL;
+        assert_eq!(
+            [
+                cache_alive(cache.implicit_activity, deadline),
+                cache_alive(cache.breakpoints[&7].activity, deadline),
+            ],
+            [false, false],
+            "NATIVE_TERMINAL_WRITE_CLOCK: terminal receipt cannot extend the original request write deadline"
+        );
+    }
+
+    #[test]
     fn native_full_read_preserves_generation_original_write_deadline() {
         let history = [json!({"role":"user", "content":"synthetic exact generation prefix"})];
         let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
