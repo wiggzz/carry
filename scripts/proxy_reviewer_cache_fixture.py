@@ -69,7 +69,8 @@ def grade_cache_records(records, history):
                                                ensure_ascii=False).encode()).hexdigest()
     required = {'route', 'credential_sha256', 'base_sha256', 'input_sha256',
                 'input_len', 'estimated_tokens', 'at', 'ttl_seconds', 'native_cached_fraction'}
-    optional = {'native_input_tokens', 'native_write_tokens', 'write_window'}
+    optional = {'native_input_tokens', 'native_write_tokens', 'write_window',
+                'native_read_tokens', 'read_window'}
     def unsigned(value):
         return type(value) is int and 0 <= value < 2 ** 64
     def nonnegative(value):
@@ -81,7 +82,7 @@ def grade_cache_records(records, history):
         assert nonnegative(record['estimated_tokens'])
         assert nonnegative(record['native_cached_fraction']) and record['native_cached_fraction'] <= 1
         assert record['at'] > 0 and record['ttl_seconds'] == 1800
-        for key in ('native_input_tokens', 'native_write_tokens'):
+        for key in ('native_input_tokens', 'native_write_tokens', 'native_read_tokens'):
             if key in record:
                 assert unsigned(record[key])
         if 'native_input_tokens' in record:
@@ -89,6 +90,9 @@ def grade_cache_records(records, history):
         if 'native_write_tokens' in record:
             assert 'native_input_tokens' in record
             assert record['native_write_tokens'] <= record['native_input_tokens']
+        if 'native_read_tokens' in record:
+            assert 'native_input_tokens' in record
+            assert record['native_read_tokens'] <= record['native_input_tokens']
         if 'write_window' in record:
             window = record['write_window']
             assert isinstance(window, dict) and set(window) == {'not_before', 'not_after', 'lifetime'}
@@ -98,6 +102,15 @@ def grade_cache_records(records, history):
             assert record.get('native_input_tokens', 0) > 0
             assert record.get('native_write_tokens') == record['native_input_tokens']
             assert record['native_cached_fraction'] == 0
+        if 'read_window' in record:
+            window = record['read_window']
+            assert isinstance(window, dict) and set(window) == {'not_before', 'not_after', 'lifetime'}
+            assert all(unsigned(value) for value in window.values())
+            assert window['not_before'] <= window['not_after'] == record['at']
+            assert window['lifetime'] == 1800
+            assert record.get('native_input_tokens', 0) > 0
+            assert record.get('native_read_tokens') == record['native_input_tokens']
+            assert record['native_cached_fraction'] == 1
         # A raw read or an untimed/partial write remains valid observation data;
         # this schema grader must not promote it to reusable prefix evidence.
         assert any(0 < record['input_len'] <= len(body['input'])

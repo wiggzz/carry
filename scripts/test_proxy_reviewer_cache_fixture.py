@@ -320,6 +320,32 @@ class CacheRecordSchemaTests(unittest.TestCase):
             with self.subTest(index=index), self.assertRaises(AssertionError):
                 self.grade(changed)
 
+    def test_independent_read_window_preserves_exact_raw_fields(self):
+        record = dict(self.record, native_input_tokens=10000, native_read_tokens=10000,
+                      native_write_tokens=0, native_cached_fraction=1.0,
+                      read_window={'not_before': 100, 'not_after': 103, 'lifetime': 1800})
+        before = copy.deepcopy(record)
+        self.grade(record)
+        self.assertEqual(record, before)
+        self.assertNotIn('write_window', record)
+        mutations = [dict(record, native_read_tokens=9999), dict(record, native_cached_fraction=.5)]
+        for field in ('native_input_tokens', 'native_read_tokens'):
+            changed = copy.deepcopy(record)
+            del changed[field]
+            mutations.append(changed)
+        for field in ('not_before', 'not_after', 'lifetime'):
+            for invalid in (-1, True, 1.5, '100', None, 2 ** 64):
+                changed = copy.deepcopy(record)
+                changed['read_window'][field] = invalid
+                mutations.append(changed)
+        mutations.append(dict(record, read_window={'not_before': 104, 'not_after': 103, 'lifetime': 1800}))
+        mutations.append(dict(record, read_window={'not_before': 100, 'not_after': 104, 'lifetime': 1800}))
+        mutations.append(dict(record, read_window={'not_before': 100, 'not_after': 103, 'lifetime': 43200}))
+        mutations.append(dict(record, read_window=None))
+        for index, changed in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(AssertionError):
+                self.grade(changed)
+
     def test_numeric_storage_count_and_byte_bounds_remain_enforced(self):
         with self.assertRaises(AssertionError):
             fixture.grade_cache_records([self.record] * 129, [self.body])

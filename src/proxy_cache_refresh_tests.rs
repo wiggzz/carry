@@ -128,7 +128,10 @@ fn bounded_full_read_needs_no_prior_write_or_scenario_price_and_never_adds_write
         let cost = ledger.settle_with_rates("gpt-6.1-sol", &usage, true, Some(rates));
         assert_eq!(ledger.calls, 1);
         assert_eq!(ledger.cache_write_tokens, 0);
-        if usage["cache_write_input_tokens"] == 0 {
+        // The existing Responses partition contract prices absent OPTIONAL
+        // writes as zero; only an invalid supplied write remains unpriced.
+        if usage.get("cache_write_input_tokens").is_none() || usage["cache_write_input_tokens"] == 0
+        {
             assert!((cost.unwrap() - (5000.0 * rates.cached + rates.output)).abs() < 1e-12);
         } else {
             assert!(
