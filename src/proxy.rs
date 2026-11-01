@@ -668,6 +668,10 @@ fn trace(service: &Service, id: &str, event: &str, data: &Value) -> std::io::Res
 }
 
 fn now() -> u64 {
+    #[cfg(test)]
+    if let Some(at) = tests::decision_clock_now() {
+        return at;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -4148,6 +4152,7 @@ mod tests {
     mod namespace_controls {
         include!("proxy_namespace_tests.rs");
     }
+    include!("proxy_clock_tests.rs");
     include!("proxy_semantic_tests.rs");
     include!("proxy_noodle_tests.rs");
     include!("proxy_pr154_tests.rs");
