@@ -286,6 +286,19 @@ struct CacheTracker {
     pending_request_tokens: usize,
     pending_history: Vec<serde_json::Value>,
     pending_write: Option<(Instant, Duration)>,
+    pending_read_lifetime: Option<Duration>,
+    read: Option<NativeReadCoverage>,
+}
+
+/// Latest whole-input read, located in its own submitted native rendering.
+/// A native run fixes its backend/key/system; a resumed run starts cold.
+#[derive(Debug)]
+struct NativeReadCoverage {
+    window: MonotonicWrite,
+    native_tokens: u64,
+    request_tokens: usize,
+    history: Vec<Value>,
+    breakpoints: Vec<RenderedBreakpoint>,
 }
 
 #[derive(Debug)]
@@ -376,6 +389,18 @@ impl CacheTracker {
         self.pending_request_tokens = request_tokens;
         self.pending_history = history.to_vec();
         self.pending_write = Some((Instant::now(), CACHE_TTL));
+        self.pending_read_lifetime = None;
+    }
+
+    fn begin_request_with_refresh(
+        &mut self,
+        breakpoints: Vec<RenderedBreakpoint>,
+        history: &[Value],
+        request_tokens: usize,
+        refresh_seconds: Option<u64>,
+    ) {
+        self.begin_request_with_history(breakpoints, history, request_tokens);
+        self.pending_read_lifetime = refresh_seconds.map(Duration::from_secs);
     }
 
     #[cfg(test)]
@@ -393,17 +418,33 @@ impl CacheTracker {
             self.pending_request_tokens = 0;
             self.pending_history.clear();
             self.pending_write = None;
+            self.pending_read_lifetime = None;
             return;
         };
         let now = Instant::now();
-        let write = self
-            .pending_write
+        let started = self.pending_write.take();
+        let write =
+            started.and_then(|(started, lifetime)| MonotonicWrite::during(started, now, lifetime));
+        let read_window = self
+            .pending_read_lifetime
             .take()
-            .and_then(|(started, lifetime)| MonotonicWrite::during(started, now, lifetime));
+            .and_then(|lifetime| MonotonicWrite::during(started?.0, now, lifetime));
         let quantities = carry::core::CacheUsage::from_receipt(usage);
         if quantities.read_covers_whole_input() == Some(false) {
             if self.pending_history.starts_with(&self.implicit_prefix) {
-                self.clear_implicit();
+                self.clear_implicit_write();
+            }
+            if let Some(read) = &mut self.read {
+                if self.pending_history.starts_with(&read.history) {
+                    read.request_tokens = 0;
+                    read.history.clear();
+                }
+                read.breakpoints.retain(|old| {
+                    !self
+                        .pending
+                        .iter()
+                        .any(|current| current.generation == old.generation)
+                });
             }
             // A partial native read cannot locate any of these local extents.
             // Reconcile only generations rendered by this request; unrelated
@@ -445,6 +486,17 @@ impl CacheTracker {
                 tracked.write = Some(write);
             }
         }
+        if quantities.read_covers_whole_input() == Some(true)
+            && let Some(window) = read_window
+        {
+            self.read = Some(NativeReadCoverage {
+                window,
+                native_tokens: quantities.read().unwrap().0,
+                request_tokens: self.pending_request_tokens,
+                history: self.pending_history.clone(),
+                breakpoints: self.pending.clone(),
+            });
+        }
         self.pending.clear();
         self.pending_request_tokens = 0;
         self.pending_history.clear();
@@ -452,7 +504,7 @@ impl CacheTracker {
 
     #[cfg(test)]
     fn policy(&self) -> CompactionPolicy {
-        self.policy_with_implicit_compatibility(true, 1, 10)
+        self.policy_with_implicit_compatibility(true, true, 1, 10)
     }
 
     fn policy_for_history(
@@ -463,6 +515,9 @@ impl CacheTracker {
     ) -> CompactionPolicy {
         self.policy_with_implicit_compatibility(
             history.starts_with(&self.implicit_prefix),
+            self.read
+                .as_ref()
+                .is_some_and(|read| history.starts_with(&read.history)),
             payoff_requests,
             min_payback_percent,
         )
@@ -471,6 +526,7 @@ impl CacheTracker {
     fn policy_with_implicit_compatibility(
         &self,
         implicit_prefix_compatible: bool,
+        read_prefix_compatible: bool,
         payoff_requests: u64,
         min_payback_percent: u8,
     ) -> CompactionPolicy {
@@ -484,6 +540,26 @@ impl CacheTracker {
                 cached_tokens: tracked.cached_tokens,
             })
             .collect::<Vec<_>>();
+        let read = self.read_at(now);
+        if let Some(read) = read {
+            for breakpoint in &read.breakpoints {
+                if self.capabilities.is_some_and(|capability| {
+                    breakpoint.prefix_tokens >= capability.minimum_prefix_tokens
+                }) {
+                    if let Some(priced) = breakpoints
+                        .iter_mut()
+                        .find(|priced| priced.generation == breakpoint.generation)
+                    {
+                        priced.cached_tokens = priced.cached_tokens.max(breakpoint.prefix_tokens);
+                    } else {
+                        breakpoints.push(PricedBreakpoint {
+                            generation: breakpoint.generation,
+                            cached_tokens: breakpoint.prefix_tokens,
+                        });
+                    }
+                }
+            }
+        }
         breakpoints.sort_by_key(|breakpoint| breakpoint.generation);
         let max_read_breakpoints = self
             .capabilities
@@ -495,13 +571,18 @@ impl CacheTracker {
             cache_ratios: carry::models::Rates::for_model("gpt-6-sol", 0.0)
                 .unwrap()
                 .cache_ratios(),
-            implicit_cached_tokens: if implicit_prefix_compatible
+            implicit_cached_tokens: (if implicit_prefix_compatible
                 && cache_alive(self.implicit_write, now)
             {
                 self.implicit_cached_tokens
             } else {
                 0
-            },
+            })
+            .max(if read_prefix_compatible {
+                read.map_or(0, |read| read.request_tokens)
+            } else {
+                0
+            }),
             breakpoints,
             payoff_requests,
             min_payback_percent,
@@ -510,20 +591,41 @@ impl CacheTracker {
 
     fn implicit_expired(&self) -> bool {
         let now = Instant::now();
-        self.implicit_write
-            .is_some_and(|write| !write.eligible_at(now))
+        (self.implicit_write.is_some() || self.read.is_some())
+            && !cache_alive(self.implicit_write, now)
+            && self.read_at(now).is_none()
     }
 
-    fn clear_implicit(&mut self) {
+    fn read_at(&self, now: Instant) -> Option<&NativeReadCoverage> {
+        self.read.as_ref().filter(|read| {
+            self.implicit_minimum_prefix_tokens
+                .is_some_and(|minimum| read.native_tokens >= minimum as u64)
+                && read.window.eligible_at(now)
+        })
+    }
+
+    fn clear_implicit_write(&mut self) {
         self.implicit_write = None;
         self.implicit_cached_tokens = 0;
         self.implicit_prefix.clear();
+    }
+
+    fn clear_implicit(&mut self) {
+        self.clear_implicit_write();
+        if let Some(read) = &mut self.read {
+            read.request_tokens = 0;
+            read.history.clear();
+        }
     }
 
     fn mark_compaction(&mut self, invalidated_generations: &[u64]) {
         self.clear_implicit();
         for generation in invalidated_generations {
             self.breakpoints.remove(generation);
+        }
+        if let Some(read) = &mut self.read {
+            read.breakpoints
+                .retain(|breakpoint| !invalidated_generations.contains(&breakpoint.generation));
         }
     }
 }
@@ -567,6 +669,13 @@ impl Backend {
     fn prompt_cache_capabilities(&self) -> Option<PromptCacheCapabilities> {
         match self {
             Self::OpenAi(client) => client.prompt_cache_capabilities(),
+            Self::Scripted { .. } => None,
+        }
+    }
+
+    fn cache_read_refresh_seconds(&self, body: &Value) -> Option<u64> {
+        match self {
+            Self::OpenAi(client) => client.cache_read_refresh_seconds(body),
             Self::Scripted { .. } => None,
         }
     }
@@ -842,13 +951,16 @@ async fn run_loop(
         step_index += 1;
         turn_step += 1;
         let history = context_state.input_items();
-        cache.begin_request_with_history(
+        let request = backend.request_body(&system_prompt, &history);
+        cache.begin_request_with_refresh(
             context_state.rendered_breakpoints(),
             &history,
             context_state.estimated_tokens(),
+            request
+                .as_ref()
+                .and_then(|body| backend.cache_read_refresh_seconds(body)),
         );
         protected_until_request.clear();
-        let request = backend.request_body(&system_prompt, &history);
         let request_started = Instant::now();
         logger.raw_event_silent(
             "model_request",
@@ -2784,6 +2896,8 @@ mod tests {
             pending_request_tokens: 0,
             pending_history: Vec::new(),
             pending_write: None,
+            pending_read_lifetime: None,
+            read: None,
         };
 
         let mut generations = cache
@@ -2818,6 +2932,8 @@ mod tests {
             pending_request_tokens: 0,
             pending_history: Vec::new(),
             pending_write: None,
+            pending_read_lifetime: None,
+            read: None,
         };
         cache.begin_request(vec![RenderedBreakpoint {
             generation: 7,

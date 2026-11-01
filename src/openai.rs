@@ -278,6 +278,14 @@ impl OpenAiClient {
     }
 
     pub(crate) fn prompt_cache_capabilities(&self) -> Option<PromptCacheCapabilities> {
+        self.resolved_model()?.cache
+    }
+
+    pub(crate) fn cache_read_refresh_seconds(&self, body: &Value) -> Option<u64> {
+        self.resolved_model()?.cache_read_refresh_seconds(body)
+    }
+
+    fn resolved_model(&self) -> Option<carry::models::ResolvedModel> {
         // Native runs use the same exact destination/auth entitlement boundary
         // as proxy dispatch. A familiar slug behind a gateway is not proof.
         carry::models::resolve_model(
@@ -291,8 +299,7 @@ impl OpenAiClient {
             0,
             0,
         )
-        .ok()?
-        .cache
+        .ok()
     }
 
     pub fn request_body(&self, system: &str, history: &[Value]) -> Value {
