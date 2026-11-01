@@ -363,10 +363,20 @@ impl CacheTracker {
         };
         let now = Instant::now();
         let quantities = carry::core::CacheUsage::from_receipt(usage);
-        if quantities.read_covers_whole_input() == Some(false)
-            && self.pending_history.starts_with(&self.implicit_prefix)
-        {
-            self.clear_implicit();
+        if quantities.read_covers_whole_input() == Some(false) {
+            if self.pending_history.starts_with(&self.implicit_prefix) {
+                self.clear_implicit();
+            }
+            // A partial native read cannot locate any of these local extents.
+            // Reconcile only generations rendered by this request; unrelated
+            // generations retain their original facts. A whole write below can
+            // repopulate the same slots, but a read cannot renew them.
+            for breakpoint in &self.pending {
+                if let Some(tracked) = self.breakpoints.get_mut(&breakpoint.generation) {
+                    tracked.cached_tokens = 0;
+                    tracked.activity = None;
+                }
+            }
         }
         let whole_write = quantities.whole_written_input().is_some_and(|input| {
             self.implicit_minimum_prefix_tokens
@@ -1953,6 +1963,79 @@ mod tests {
             Some(original),
             "NATIVE_GENERATION_READ_RENEWAL: a full read cannot renew the original generation write"
         );
+    }
+
+    #[test]
+    fn native_generation_reconciliation_preserves_unknown_unrelated_and_whole_writes() {
+        let history = [json!({"role":"user", "content":"synthetic exact generation prefix"})];
+        let whole_write = json!({"input_tokens":5_000,"cached_input_tokens":0,
+            "cache_write_input_tokens":5_000});
+        for (raw, generation, expected) in [
+            (json!({"input_tokens":5_000,"cached_input_tokens":0}), 7, 0),
+            (
+                json!({"input_tokens":5_000,"cached_input_tokens":1_000}),
+                7,
+                0,
+            ),
+            (
+                json!({"input_tokens":5_000,"cached_input_tokens":5_000}),
+                7,
+                1_200,
+            ),
+            (
+                json!({"input_tokens":5_000,"cached_input_tokens":5_000,
+                "cache_write_input_tokens":"invalid"}),
+                7,
+                1_200,
+            ),
+            (json!({"input_tokens":5_000}), 7, 1_200),
+            (
+                json!({"input_tokens":5_000,"cached_input_tokens":0,
+                "input_tokens_details":{"cached_tokens":1}}),
+                7,
+                1_200,
+            ),
+            (
+                json!({"input_tokens":5_000,"cached_input_tokens":0}),
+                8,
+                1_200,
+            ),
+            (whole_write.clone(), 7, 1_200),
+        ] {
+            let mut cache = CacheTracker::new(Some(openai_cache_capabilities()));
+            cache.begin_request_with_history(
+                vec![RenderedBreakpoint {
+                    generation: 7,
+                    prefix_tokens: 1_200,
+                }],
+                &history,
+                2_400,
+            );
+            cache.observe_receipt(&whole_write);
+            let original = cache.breakpoints[&7].activity;
+            cache.begin_request_with_history(
+                vec![RenderedBreakpoint {
+                    generation,
+                    prefix_tokens: 1_200,
+                }],
+                &history,
+                2_400,
+            );
+            cache.observe_receipt(&raw);
+            let actual = cache
+                .policy()
+                .breakpoints
+                .into_iter()
+                .find(|b| b.generation == 7)
+                .map_or(0, |b| b.cached_tokens);
+            assert_eq!(actual, expected, "raw={raw}, generation={generation}");
+            if expected > 0 && raw != whole_write {
+                assert_eq!(
+                    cache.breakpoints[&7].activity, original,
+                    "reconciliation cannot renew an original write"
+                );
+            }
+        }
     }
 
     #[test]
