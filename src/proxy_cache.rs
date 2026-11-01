@@ -246,6 +246,12 @@ pub(super) struct CacheEvidence {
     pub native_write_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_window: Option<WriteWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_read_tokens: Option<u64>,
+    // Separate full-read billing coverage. Never mutate the original write's
+    // receipt, window or paid charge when the provider contract grants a read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_window: Option<WriteWindow>,
 }
 
 pub(super) fn base(body: &Value) -> Value {
@@ -307,6 +313,19 @@ impl CacheEvidence {
         .then_some(self.estimated_tokens)
     }
 
+    // Read-derived coverage uses its own validated full extent and interval.
+    fn covered_prefix_at(&self, at: u64) -> Option<f64> {
+        self.written_prefix_at(at).or_else(|| {
+            let total = self.native_input_tokens?;
+            (total > 0
+                && self.native_read_tokens == Some(total)
+                && self
+                    .read_window
+                    .is_some_and(|window| window.eligible_at(at)))
+            .then_some(self.estimated_tokens)
+        })
+    }
+
     /// The same scoped proof owns both monetary forecast credit and planner
     /// prefix preservation. Identity alone is not evidence of live retention.
     pub fn reusable_at(
@@ -317,7 +336,7 @@ impl CacheEvidence {
         at: u64,
     ) -> Option<f64> {
         self.matches(body, resolved, credential, at)
-            .then(|| self.written_prefix_at(at))
+            .then(|| self.covered_prefix_at(at))
             .flatten()
     }
 }
@@ -361,7 +380,8 @@ pub(super) fn observe(
         .scenario_cache_policy
         .as_ref()
         .map_or(0, |p| p.ttl_seconds);
-    if ttl_seconds == 0 {
+    let read_lifetime = model.cache_read_refresh_seconds(body);
+    if ttl_seconds == 0 && read_lifetime.is_none() {
         return false;
     }
     let quantities = carry::core::CacheUsage::from_receipt(usage);
@@ -401,6 +421,18 @@ pub(super) fn observe(
                 lifetime: ttl_seconds,
             })
     });
+    let read_window = time.dispatched_at.and_then(|not_before| {
+        (quantities.read_covers_whole_input() == Some(true)
+            && end == body["input"].as_array().unwrap().len()
+            && not_before <= at)
+            .then_some(())
+            .and(read_lifetime)
+            .map(|lifetime| WriteWindow {
+                not_before,
+                not_after: at,
+                lifetime,
+            })
+    });
     let e = CacheEvidence {
         route: resolved.map(|r| r.route.clone()),
         credential_sha256: credential.into(),
@@ -414,6 +446,8 @@ pub(super) fn observe(
         native_input_tokens: Some(total),
         native_write_tokens: written,
         write_window,
+        native_read_tokens: Some(cached),
+        read_window,
     };
     // Keep an original timed write across full reads, never rewrite its raw
     // quantities or expiry with the new hit. New misses/unlocated partial hits
@@ -427,7 +461,7 @@ pub(super) fn observe(
             || old.input_len > input.len()
             || old.input_sha256 != input_identity(&input[..old.input_len])
             || (quantities.read_covers_whole_input() == Some(true)
-                && old.written_prefix_at(at).is_some())
+                && old.covered_prefix_at(at).is_some())
     });
     cache.push(e);
     trim(cache, at);
@@ -436,7 +470,7 @@ pub(super) fn observe(
 
 pub(super) fn trim(cache: &mut Vec<CacheEvidence>, at: u64) {
     cache
-        .retain(|e| e.at <= at && (e.written_prefix_at(at).is_some() || at - e.at < e.ttl_seconds));
+        .retain(|e| e.at <= at && (e.covered_prefix_at(at).is_some() || at - e.at < e.ttl_seconds));
     cache.sort_by_key(|e| e.at);
     while cache.len() > 128 || serde_json::to_vec(cache).unwrap().len() > 65536 {
         cache.remove(0);
