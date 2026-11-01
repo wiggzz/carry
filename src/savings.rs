@@ -1,9 +1,34 @@
-//! Conditional frozen-trajectory scenario using local o200k_base token estimates.
-//! Provider usage remains a separate modeled ledger.
+//! Observed primary money with a conditional local-quantity alternative.
+//! Local o200k_base estimates never reprice a paid provider receipt.
 use crate::openai::{Usage, estimated_cost_usd, prompt_cache_capabilities};
 use carry::models::{ScenarioCacheMode, ScenarioCachePolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+/// Lifetime equivalence, not equal token counts or the latest no-op. Missing
+/// persisted proof is divergent. Both quantity adapters use this decision owner;
+/// only a genuinely hypothetical primary may call its pure price forecast.
+#[derive(Clone, Copy, Default, Debug, Deserialize, Serialize)]
+#[serde(transparent)]
+pub(crate) struct PrimaryHistory(bool);
+impl PrimaryHistory {
+    pub(crate) fn identical() -> Self {
+        Self(true)
+    }
+
+    pub(crate) fn diverge(&mut self) {
+        self.0 = false;
+    }
+
+    pub(crate) fn price(
+        &self,
+        observed: Option<f64>,
+        forecast: impl FnOnce() -> Option<f64>,
+    ) -> Option<(f64, f64)> {
+        let observed = observed?;
+        Some((observed, if self.0 { observed } else { forecast()? }))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct Scenario {
@@ -13,6 +38,69 @@ pub struct Scenario {
     pub summary: u64,
 }
 impl Scenario {
+    /// Preserve economic headroom and fit requested output within any resolved
+    /// hard capacity. This is feasibility, not expected or billable generation.
+    pub(crate) fn initial_input_budget(
+        &self,
+        output_allowance: u64,
+        hard_capacity: Option<u64>,
+    ) -> u64 {
+        let economic = self
+            .context_window
+            .saturating_sub(self.reserve.max(output_allowance));
+        hard_capacity.map_or(economic, |capacity| {
+            economic.min(capacity.saturating_sub(output_allowance))
+        })
+    }
+
+    /// A free summary is allowed only for unrecognized history before its first
+    /// compared request. Adapters supply their own quantity domain and proof.
+    pub(crate) fn initial_compaction(
+        &self,
+        recognized: bool,
+        input: u64,
+        protected: u64,
+        output_allowance: u64,
+        hard_capacity: Option<u64>,
+    ) -> Result<Option<u64>, ()> {
+        if recognized {
+            return Ok(None);
+        }
+        self.compaction(
+            input,
+            protected,
+            self.initial_input_budget(output_allowance, hard_capacity),
+        )
+    }
+
+    /// A successful response can advance quantities even when its money is
+    /// unavailable. Return the retained floor; charging remains adapter-owned.
+    pub(crate) fn response_compaction(
+        &self,
+        input: u64,
+        retained_output: u64,
+        fixed: u64,
+    ) -> Result<Option<u64>, ()> {
+        self.compaction(
+            input.saturating_add(retained_output),
+            fixed,
+            self.context_window.saturating_sub(self.reserve),
+        )
+    }
+
+    fn compaction(&self, total: u64, floor: u64, budget: u64) -> Result<Option<u64>, ()> {
+        if !self.valid() || total <= budget {
+            return Ok(None);
+        }
+        let kept = self.keep_recent.max(floor);
+        let compacted = kept.saturating_add(self.summary);
+        if compacted > budget || compacted >= total {
+            Err(())
+        } else {
+            Ok(Some(kept))
+        }
+    }
+
     pub(crate) fn valid(&self) -> bool {
         self.context_window > self.reserve
             && self.keep_recent.saturating_add(self.summary) <= self.context_window - self.reserve
@@ -54,6 +142,9 @@ pub struct Estimate {
     pub carry_cost: f64,
     pub pi_cost: f64,
     pub pi_compactions: usize,
+    /// Free pre-window summaries, never included in charged compactions.
+    pub initial_compactions: usize,
+    pub initialization_policy: &'static str,
     pub summary_cost: f64,
     pub priced: bool,
     pub observed_priced: bool,
@@ -65,10 +156,14 @@ struct Prompt {
     model: String,
     // Only the previous prompt-bearing prefix survives; never a history array.
     prefix: String,
-    overhead: String,
-    route: String,
+    cache_scope: String,
     input: u64,
-    cached_at_ms: Option<u64>,
+    fixed_input: u64,
+    protected_input: u64,
+    requested_output: Option<u64>,
+    request_at_ms: Option<u64>,
+    cache_lifetime_ms: Option<u64>,
+    cache_read_refresh_ms: Option<u64>,
     cache_mode: ScenarioCacheMode,
     write_tariff_known: bool,
 }
@@ -83,6 +178,7 @@ pub struct Trajectory {
     pending_step: Option<u64>,
     pending_run: Option<String>,
     previous: Option<Prompt>,
+    modeled_cache: crate::proxy_cache::ModeledCache,
     restored: i128,
     removed: u64,
     summary: u64,
@@ -90,11 +186,15 @@ pub struct Trajectory {
     last_output_proxy: u64,
     last_model: String,
     scenario_available: bool,
+    comparison_priced: bool,
+    initialized: bool,
     carry_edited: bool,
     pi_edited: bool,
+    primary_history: PrimaryHistory,
     cache_ttl_ms: Option<u64>,
     cache_minimum: Option<u64>,
     cache_metadata: bool,
+    scenario_cache_policy: Option<ScenarioCachePolicy>,
 }
 impl Default for Trajectory {
     fn default() -> Self {
@@ -119,6 +219,7 @@ impl Trajectory {
             pending_step: None,
             pending_run: None,
             previous: None,
+            modeled_cache: crate::proxy_cache::ModeledCache::default(),
             restored: 0,
             removed: 0,
             summary: 0,
@@ -126,15 +227,20 @@ impl Trajectory {
             last_output_proxy: 0,
             last_model: String::new(),
             scenario_available: true,
+            comparison_priced: true,
+            initialized: false,
             carry_edited: false,
             pi_edited: false,
+            primary_history: PrimaryHistory::identical(),
             cache_ttl_ms: None,
             cache_minimum: None,
             cache_metadata: false,
+            scenario_cache_policy: None,
         }
     }
     pub fn snapshot(&self) -> Estimate {
         let mut e = self.result.clone();
+        e.initialization_policy = "unrecognized_history_free_pre_window_v1";
         e.counterfactual_cache_policy =
             format!("conditional_model_cache_v{}", ScenarioCachePolicy::VERSION);
         e.coverage.unmatched_requests += usize::from(self.pending_request);
@@ -151,6 +257,7 @@ impl Trajectory {
             &self.model
         };
         e.priced = self.scenario_available
+            && self.comparison_priced
             && self.scenario.valid()
             && e.observed_priced
             && e.coverage.unknown_cache_requests == 0
@@ -177,14 +284,34 @@ impl Trajectory {
                 if let Some(model) = data["model"].as_str() {
                     self.model = model.to_owned();
                 }
-                self.cache_ttl_ms = data["cache_ttl_seconds"]
-                    .as_u64()
-                    .map(|s| s.saturating_mul(1000));
-                self.cache_metadata = data.get("implicit_cache_minimum_prefix_tokens").is_some();
-                self.cache_minimum = data["implicit_cache_minimum_prefix_tokens"].as_u64();
+                if let Some(policy) = data.get("scenario_cache_policy") {
+                    // Explicit scenario authority wins even when unknown or
+                    // malformed. Native entitlement cannot fill its omissions.
+                    let policy = serde_json::from_value::<ScenarioCachePolicy>(policy.clone())
+                        .ok()
+                        .filter(|policy| policy.version == ScenarioCachePolicy::VERSION);
+                    self.cache_metadata = true;
+                    self.cache_minimum = policy
+                        .as_ref()
+                        .and_then(|policy| policy.minimum_prefix_tokens);
+                    self.cache_ttl_ms = policy
+                        .as_ref()
+                        .map(|policy| policy.ttl_seconds)
+                        .filter(|seconds| *seconds > 0)
+                        .map(|seconds| seconds.saturating_mul(1000));
+                    self.scenario_cache_policy = policy;
+                } else {
+                    self.scenario_cache_policy = None;
+                    self.cache_ttl_ms = data["cache_ttl_seconds"]
+                        .as_u64()
+                        .map(|s| s.saturating_mul(1000));
+                    self.cache_metadata =
+                        data.get("implicit_cache_minimum_prefix_tokens").is_some();
+                    self.cache_minimum = data["implicit_cache_minimum_prefix_tokens"].as_u64();
+                }
                 if previous_minimum != self.cache_minimum_for(&self.last_model) {
                     // A prior prompt was not necessarily written under the new policy.
-                    self.previous = None;
+                    self.modeled_cache.clear();
                 }
                 let window = data["context_window"].as_u64().filter(|w| *w > 0);
                 self.scenario.context_window = window.unwrap_or(self.configured_window);
@@ -192,6 +319,7 @@ impl Trajectory {
             }
             "context_compacted" => {
                 self.carry_edited = true;
+                self.primary_history.diverge();
                 if let Some(dropped) = data["compaction_token_delta"].as_i64() {
                     self.restored = self.restored.saturating_add(dropped as i128);
                 } else {
@@ -200,7 +328,7 @@ impl Trajectory {
                 }
             }
             "cache_expired" => {
-                self.previous = None;
+                self.modeled_cache.clear();
             }
             "model_request" => {
                 if self.pending_request {
@@ -212,7 +340,13 @@ impl Trajectory {
                 self.result.coverage.requests += 1;
                 self.pending = projection(data, &self.model);
                 if let Some(p) = self.pending.as_mut() {
-                    p.cached_at_ms = value["timestamp_ms"].as_u64();
+                    p.request_at_ms = value["timestamp_ms"].as_u64();
+                    p.cache_lifetime_ms = self.cache_ttl_ms;
+                    p.cache_read_refresh_ms = self
+                        .scenario_cache_policy
+                        .as_ref()
+                        .and_then(|policy| policy.read_refresh_seconds(&p.model, &data["request"]))
+                        .map(|seconds| seconds.saturating_mul(1000));
                 }
                 if self.cache_ttl_ms.is_none() || value["timestamp_ms"].as_u64().is_none() {
                     self.result.coverage.unknown_expiry_requests += 1;
@@ -240,7 +374,15 @@ impl Trajectory {
                     self.result.coverage.orphan_responses += 1;
                     self.scenario_available = false;
                 }
-                let usage = valid_usage(&data["usage"]);
+                // Missing native usage is unknown, never a switch to lossy
+                // display counters. Normalized trace producers explicitly own
+                // their input contract, even when retaining raw output items.
+                let raw_receipt =
+                    (data["usage_source"] != "normalized").then_some(&data["raw"]["usage"]);
+                let usage = match raw_receipt {
+                    Some(raw) => Usage::from_receipt(raw),
+                    None => valid_usage(&data["usage"]),
+                };
                 if usage.is_none() {
                     self.result.coverage.missing_usage += 1;
                 }
@@ -248,82 +390,127 @@ impl Trajectory {
                     self.result.coverage.missing_projection += 1;
                 }
                 let model = self.pending.as_ref().map_or(&self.model, |p| &p.model);
-                if let Some(cost) = usage.as_ref().and_then(|u| {
+                let observed = usage.as_ref().and_then(|u| {
                     (u.cache_write_input_tokens == 0
                         || self.pending.as_ref().is_some_and(|p| p.write_tariff_known))
-                    .then(|| estimated_cost_usd(model, u))
+                    .then(|| match raw_receipt {
+                        Some(_) => crate::openai::receipt_cost_usd(model, &data["raw"]),
+                        None => estimated_cost_usd(model, u),
+                    })
                     .flatten()
-                }) {
+                });
+                if let Some(cost) = observed {
                     self.result.observed_cost += cost;
                 } else {
                     self.result.coverage.unpriced_responses += 1;
                 }
                 let prompt = if matched { self.pending.take() } else { None };
-                if let (Some(mut prompt), Some(usage)) = (prompt, usage) {
-                    let pi_input = (prompt.input as i128)
+                if let (Some(prompt), Some(usage)) = (prompt, usage) {
+                    let mut pi_input = (prompt.input as i128)
                         .saturating_add(self.restored)
                         .saturating_sub(self.removed as i128)
                         .saturating_add(self.summary as i128)
                         .clamp(0, u64::MAX as i128) as u64;
+                    // Initialize before pricing the first compared primary.
+                    // Cache expiry does not erase known traditional history.
+                    let allowance = carry::models::output_allowance(
+                        prompt.requested_output,
+                        self.scenario.reserve,
+                    );
+                    match self.scenario.initial_compaction(
+                        self.initialized,
+                        pi_input,
+                        prompt.protected_input,
+                        allowance,
+                        None,
+                    ) {
+                        Ok(Some(kept)) => {
+                            self.removed = self.removed.saturating_add(
+                                pi_input.saturating_sub(kept).saturating_sub(self.summary),
+                            );
+                            self.summary = self.scenario.summary;
+                            pi_input = kept.saturating_add(self.summary);
+                            self.pi_edited = true;
+                            self.primary_history.diverge();
+                            self.result.initial_compactions += 1;
+                        }
+                        Ok(None) => {}
+                        Err(()) => self.scenario_available = false,
+                    }
+                    self.initialized |= self.scenario.valid();
                     // Freeze the output count, not its rate: use each scenario input tier.
-                    let carry_output =
-                        scenario_output_cost(&prompt.model, prompt.input, usage.output_tokens);
                     let pi_output =
                         scenario_output_cost(&prompt.model, pi_input, usage.output_tokens);
                     let compatible = self.previous.as_ref().is_some_and(|p| {
-                        p.model == prompt.model
-                            && p.overhead == prompt.overhead
-                            && p.route == prompt.route
-                            && p.cache_mode == prompt.cache_mode
-                            && self
-                                .cache_ttl_ms
-                                .zip(p.cached_at_ms)
-                                .zip(prompt.cached_at_ms)
-                                .is_none_or(|((ttl, prev), now)| now >= prev && now - prev < ttl)
+                        p.cache_scope == prompt.cache_scope && p.cache_mode == prompt.cache_mode
                     });
                     let append = self
                         .previous
                         .as_ref()
                         .is_some_and(|p| prompt.prefix.starts_with(&p.prefix));
-                    let carry_cached = if compatible && append && !self.carry_edited {
-                        self.previous.as_ref().unwrap().input.min(prompt.input)
-                    } else {
-                        0
-                    };
-                    // Alternative prefixes are unknown after a native edit: declared append/frozen-size reuse.
-                    let pi_cached =
-                        if compatible && (append || self.carry_edited) && !self.pi_edited {
-                            self.last_pi_input.min(pi_input)
-                        } else {
-                            0
-                        };
-                    let minimum = self.cache_minimum_for(&prompt.model);
-                    if minimum.is_none() || prompt.cache_mode == ScenarioCacheMode::Unknown {
-                        self.result.coverage.unknown_cache_requests += 1;
+
+                    // The local adapter owns projection compatibility; the same
+                    // write owner as live receipts owns deadlines and extents.
+                    // Native hits never seed this hypothetical branch.
+                    if !compatible || !(append || self.carry_edited) || self.pi_edited {
+                        self.modeled_cache.clear();
                     }
-                    let carry = scenario_input_cost_with_mode(
-                        &prompt.model,
-                        prompt.input,
-                        carry_cached,
-                        minimum,
-                        prompt.cache_mode,
-                        estimated_cost_usd,
-                    );
-                    let pi = scenario_input_cost_with_mode(
-                        &prompt.model,
-                        pi_input,
-                        pi_cached,
-                        minimum,
-                        prompt.cache_mode,
-                        estimated_cost_usd,
-                    );
-                    if let (Some(carry), Some(pi), Some(carry_output), Some(pi_output)) =
-                        (carry, pi, carry_output, pi_output)
-                    {
-                        self.result.carry_cost += carry + carry_output;
-                        self.result.pi_cost += pi + pi_output;
+                    let minimum = self.cache_minimum_for(&prompt.model);
+                    let pi_cached = if prompt.cache_mode == ScenarioCacheMode::Implicit {
+                        prompt.request_at_ms.map_or(Some(0), |at| {
+                            self.modeled_cache
+                                .eligible_at(&prompt.cache_scope, at, pi_input)
+                                .map(|prefix| {
+                                    if minimum.is_some_and(|min| prefix >= min) {
+                                        prefix
+                                    } else {
+                                        0
+                                    }
+                                })
+                        })
                     } else {
-                        self.scenario_available = false;
+                        Some(0)
+                    };
+                    let pair = self.primary_history.price(observed, || {
+                        if minimum.is_none()
+                            || prompt.cache_mode == ScenarioCacheMode::Unknown
+                            || pi_cached.is_none()
+                        {
+                            self.result.coverage.unknown_cache_requests += 1;
+                        }
+                        Some(
+                            scenario_input_cost_with_mode(
+                                &prompt.model,
+                                pi_input,
+                                pi_cached?,
+                                minimum,
+                                prompt.cache_mode,
+                                estimated_cost_usd,
+                            )? + pi_output?,
+                        )
+                    });
+                    if let Some((carry, pi)) = pair {
+                        self.result.carry_cost += carry;
+                        self.result.pi_cost += pi;
+                    } else {
+                        self.comparison_priced = false;
+                    }
+                    if let (Some(at), Some(lifetime)) =
+                        (prompt.request_at_ms, prompt.cache_lifetime_ms)
+                        && prompt.cache_mode == ScenarioCacheMode::Implicit
+                        && minimum.is_some_and(|min| pi_input >= min)
+                    {
+                        // A dispatch-time population assumption, not a response
+                        // timestamp masquerading as an observed provider write.
+                        self.modeled_cache.requested(
+                            prompt.cache_scope.clone(),
+                            at,
+                            lifetime,
+                            pi_input,
+                            prompt.cache_read_refresh_ms,
+                        );
+                    } else {
+                        self.modeled_cache.clear();
                     }
                     self.last_pi_input = pi_input;
                     if let Some(output) = data["raw"].get("output").filter(|v| !v.is_null()) {
@@ -333,44 +520,53 @@ impl Trajectory {
                         self.result.coverage.missing_output_projection += 1;
                     }
                     self.last_model = prompt.model.clone();
-                    prompt.cached_at_ms = value["timestamp_ms"].as_u64().or(prompt.cached_at_ms);
                     self.previous = Some(prompt);
                     self.carry_edited = false;
                     self.pi_edited = false;
+                    // Quantities remain valid through monetary omissions. Do
+                    // not charge unavailable intervals or let them suppress a
+                    // later successful summary/projection transition.
+                    if self.scenario_available {
+                        let fixed = self.previous.as_ref().unwrap().fixed_input;
+                        match self.scenario.response_compaction(
+                            self.last_pi_input,
+                            self.last_output_proxy,
+                            fixed,
+                        ) {
+                            Ok(Some(kept)) => {
+                                let total =
+                                    self.last_pi_input.saturating_add(self.last_output_proxy);
+                                let discarded = total.saturating_sub(kept);
+                                let summary_usage = Usage {
+                                    input_tokens: discarded,
+                                    output_tokens: self.scenario.summary,
+                                    ..Usage::default()
+                                };
+                                if let Some(cost) = pair.and_then(|_| {
+                                    estimated_cost_usd(&self.last_model, &summary_usage)
+                                }) {
+                                    self.result.summary_cost += cost;
+                                    self.result.pi_cost += cost;
+                                } else {
+                                    self.comparison_priced = false;
+                                }
+                                self.result.pi_compactions += 1;
+                                self.pi_edited = true;
+                                self.modeled_cache.clear();
+                                self.primary_history.diverge();
+                                self.removed = self
+                                    .removed
+                                    .saturating_add(discarded.saturating_sub(self.summary));
+                                self.summary = self.scenario.summary;
+                                self.last_pi_input = kept.saturating_add(self.summary);
+                                self.last_output_proxy = 0;
+                            }
+                            Ok(None) => {}
+                            Err(()) => self.scenario_available = false,
+                        }
+                    }
                 } else {
                     self.scenario_available = false;
-                }
-                // Check after each response, not just after the whole agent run.
-                let total = self.last_pi_input.saturating_add(self.last_output_proxy);
-                if self.scenario_available
-                    && self.scenario.valid()
-                    && !self.last_model.is_empty()
-                    && total
-                        > self
-                            .scenario
-                            .context_window
-                            .saturating_sub(self.scenario.reserve)
-                {
-                    let discarded = total.saturating_sub(self.scenario.keep_recent);
-                    let summary_usage = Usage {
-                        input_tokens: discarded,
-                        output_tokens: self.scenario.summary,
-                        ..Usage::default()
-                    };
-                    if let Some(cost) = estimated_cost_usd(&self.last_model, &summary_usage) {
-                        self.result.summary_cost += cost;
-                        self.result.pi_cost += cost;
-                        self.result.pi_compactions += 1;
-                        self.pi_edited = true;
-                        self.removed = self
-                            .removed
-                            .saturating_add(discarded.saturating_sub(self.summary));
-                        self.summary = self.scenario.summary;
-                        self.last_pi_input = self.scenario.keep_recent.saturating_add(self.summary);
-                        self.last_output_proxy = 0;
-                    } else {
-                        self.scenario_available = false;
-                    }
                 }
             }
             // Completion notifications must not charge the last summary twice.
@@ -390,7 +586,8 @@ pub(crate) fn scenario_output_cost(model: &str, input: u64, output: u64) -> Opti
     carry::models::Rates::for_model(model, input as f64).map(|rates| output as f64 * rates.output)
 }
 
-/// Legacy/default implicit policy; request-aware consumers use the mode owner.
+/// Test shorthand for implicit policy; production consumers use the mode owner.
+#[cfg(test)]
 pub(crate) fn scenario_input_cost(
     model: &str,
     input: u64,
@@ -453,29 +650,72 @@ pub(crate) fn token_units(value: &Value) -> u64 {
         .len() as u64
 }
 
+/// Authoritative fixed prompt representation for local quantities and history
+/// continuity. Cache/transport/sampling controls are not model-visible input;
+/// callers must not reconstruct this projection with independent exclusions.
+pub(crate) fn prompt_overhead(body: &Value) -> Value {
+    json!({"instructions":body.get("instructions"),"tools":body.get("tools"),"text":body.get("text")})
+}
+
 /// Shared prompt-bearing projection, excluding transport and sampling fields.
 pub(crate) fn prompt_projection(body: &Value) -> Option<(String, String, u64)> {
-    let input = body["input"].as_array()?;
-    let overhead = json!({"instructions":body.get("instructions"),"tools":body.get("tools"),"text":body.get("text")});
+    let input = crate::openai::semantic_prompt_input(body["input"].as_array()?);
+    let overhead = prompt_overhead(body);
     let units = token_units(&json!({"overhead":overhead,"input":input}));
     let overhead = overhead.to_string();
-    let serialized = serde_json::to_string(input).ok()?;
+    let serialized = serde_json::to_string(&input).ok()?;
     let prefix = format!("{overhead}{}", &serialized[..serialized.len() - 1]);
     Some((prefix, overhead, units))
 }
+/// Fixed instruction roles and the current user suffix overlap: select their
+/// union before tokenizing, rather than adding two independently sized slices.
+fn retained_prompt_tokens(body: &Value, current_turn: bool) -> Option<u64> {
+    let input = crate::openai::semantic_prompt_input(body["input"].as_array()?);
+    let current = input.iter().rposition(|item| item["role"] == "user");
+    let retained: Vec<_> = input
+        .iter()
+        .enumerate()
+        .filter(|(index, item)| {
+            matches!(item["role"].as_str(), Some("system" | "developer"))
+                || (current_turn && current.is_some_and(|start| *index >= start))
+        })
+        .map(|(_, item)| item)
+        .collect();
+    let overhead = prompt_overhead(body);
+    Some(token_units(&json!({"overhead":overhead,"input":retained})))
+}
+
+/// Initialization may retire history, never fixed overhead or the current turn.
+pub(crate) fn protected_prompt_tokens(body: &Value) -> Option<u64> {
+    retained_prompt_tokens(body, true)
+}
+
+/// The same fixed floor survives every later hypothetical summary.
+pub(crate) fn fixed_prompt_tokens(body: &Value) -> Option<u64> {
+    retained_prompt_tokens(body, false)
+}
+
 fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
     let request = &data["request"];
-    let (prefix, overhead, input) = prompt_projection(request)?;
-    // Semantic policy is compared separately; equivalent default spellings do
-    // not change the real route/key or force an artificial cold request.
-    let route=serde_json::to_string(&json!({"api_base":data["transport"].get("api_base"),"route":data.get("route"),"cache_key":request.get("prompt_cache_key")})).ok()?;
+    let (prefix, _, input) = prompt_projection(request)?;
+    let protected_input = protected_prompt_tokens(request)?;
+    let model = request["model"].as_str().unwrap_or(fallback);
+    let cache_scope = crate::proxy_cache::modeled_scope(
+        request,
+        model,
+        (data["transport"].get("api_base"), data.get("route")),
+    );
     Some(Prompt {
-        model: request["model"].as_str().unwrap_or(fallback).to_owned(),
+        model: model.to_owned(),
         input,
+        fixed_input: fixed_prompt_tokens(request)?,
+        protected_input,
+        requested_output: request["max_output_tokens"].as_u64(),
         prefix,
-        overhead,
-        route,
-        cached_at_ms: None,
+        cache_scope,
+        request_at_ms: None,
+        cache_lifetime_ms: None,
+        cache_read_refresh_ms: None,
         write_tariff_known: carry::models::cache_write_tariff_known(request),
         cache_mode: ScenarioCachePolicy::for_model(request["model"].as_str().unwrap_or(fallback))
             .request_mode(request),
@@ -492,11 +732,44 @@ pub fn savings_percent(savings: f64, carry_cost: f64) -> Option<f64> {
 mod tests {
     use super::*;
     include!("savings_cache_write_tests.rs");
+    include!("savings_cache_lifetime_tests.rs");
+    include!("savings_initialization_tests.rs");
+    include!("savings_quantity_policy_tests.rs");
     fn request(t: &mut Trajectory, units: u64) {
         t.record(&json!({"event":"model_request","data":{"step":1,"request":{"input":["a ".repeat(units as usize)],"tools":[]}}}));
     }
     fn response(t: &mut Trajectory, input: u64, output: u64, proxy_output: u64) -> Estimate {
-        t.record(&json!({"event":"model_response","data":{"step":1,"usage":{"input_tokens":input,"output_tokens":output},"raw":{"output":"a ".repeat(proxy_output as usize)}}})).unwrap()
+        t.record(&json!({"event":"model_response","data":{"usage_source":"normalized","step":1,"usage":{"input_tokens":input,"output_tokens":output},"raw":{"output":"a ".repeat(proxy_output as usize)}}})).unwrap()
+    }
+    #[test]
+    fn report_usage_authority_is_explicit_not_selected_by_receipt_absence() {
+        for source in [
+            Value::Null,
+            json!("provider_receipt"),
+            json!("unknown"),
+            json!(7),
+            json!("normalized"),
+        ] {
+            for raw in [
+                json!({"output":[]}),
+                json!({"output":[],"usage":null}),
+                json!(null),
+            ] {
+                let mut t = Trajectory::with_model("gpt-6-sol".into());
+                request(&mut t, 100);
+                let e = t
+                    .record(&json!({"event":"model_response","data":{
+                        "step":1,"usage_source":source,
+                        "usage":{"input_tokens":0,"output_tokens":0},"raw":raw
+                    }}))
+                    .unwrap();
+                let normalized = source == "normalized";
+                assert_eq!(e.observed_priced, normalized, "{source}: {raw}");
+                assert_eq!(e.coverage.missing_usage, usize::from(!normalized));
+                assert_eq!(e.coverage.unpriced_responses, usize::from(!normalized));
+                assert_eq!(e.observed_cost, 0.0);
+            }
+        }
     }
     #[test]
     fn session_projection_uses_the_same_tokenizer_as_the_proxy() {
@@ -529,7 +802,7 @@ mod tests {
                     summary: 100,
                 });
                 t.record(&json!({"event": "model_request", "data": {"request": body}}));
-                let estimate = t.record(&json!({"event": "model_response", "data": {
+                let estimate = t.record(&json!({"event": "model_response", "data": {"usage_source":"normalized",
                     "usage": {"input_tokens": 100, "output_tokens": 3}, "raw": {"output": output}
                 }})).unwrap();
                 assert!(estimate.priced);
@@ -553,7 +826,7 @@ mod tests {
                         + t.summary as i128) as u64;
                     let cold = input_cost("gpt-6-luna", next_input, 0, Some(1024)).unwrap()
                         + scenario_output_cost("gpt-6-luna", next_input, 3).unwrap();
-                    let after = t.record(&json!({"event": "model_response", "data": {
+                    let after = t.record(&json!({"event": "model_response", "data": {"usage_source":"normalized",
                         "usage": {"input_tokens": 100, "output_tokens": 3}, "raw": {"output": []}
                     }})).unwrap();
                     assert!(after.priced);
@@ -606,7 +879,7 @@ mod tests {
                 let estimate = trajectory
                     .record(&json!({
                         "event": "model_response", "run_id": "tier-test", "timestamp_ms": 101,
-                        "data": {
+                        "data": {"usage_source":"normalized",
                             "step": 1, "usage": {"input_tokens": 17, "output_tokens": output},
                             "raw": {"output": [{"type": "message", "role": "assistant",
                                 "content": [{"type": "output_text", "text": "done"}]}]}
@@ -619,17 +892,18 @@ mod tests {
                 assert_eq!(estimate.summary_cost, 0.0);
                 estimate
             };
-            // Input telemetry deliberately stays at 17: each scenario branch must
-            // select its own tier from the local projection, not the native ledger.
+            // Actual telemetry stays at 17; only the hypothetical alternative
+            // selects a tier from local quantities. Neither reprices the other.
             let zero = replay(0_u64);
             let frozen = replay(FROZEN_OUTPUT);
             let input_cost =
                 |input: u64| input as f64 * if input > 272_000 { 5.0 } else { 2.5 } / 1_000_000.0;
             let output_cost = |input: u64| if input > 272_000 { 0.15 } else { 0.10 };
-            let carry_output = output_cost(carry_input);
+            let carry_output = 0.10;
             let pi_output = output_cost(pi_input);
             // Independent rate-card values; do not use the estimator as its oracle.
-            assert!((zero.carry_cost - input_cost(carry_input)).abs() < TOLERANCE);
+            let actual_input_cost = 17.0 * 2.0 / 1_000_000.0;
+            assert!((zero.carry_cost - actual_input_cost).abs() < TOLERANCE);
             assert!((zero.pi_cost - input_cost(pi_input)).abs() < TOLERANCE);
             assert!((frozen.observed_cost - zero.observed_cost - 0.10).abs() < TOLERANCE);
             assert!(
@@ -642,9 +916,9 @@ mod tests {
             );
             assert!(
                 (frozen.savings - zero.savings - (pi_output - carry_output)).abs() < TOLERANCE,
-                "cross-tier output contributes exactly +/-0.05 USD, not a common charge"
+                "the hypothetical output tier cannot replace the actual native tier"
             );
-            assert!((frozen.carry_cost - input_cost(carry_input) - carry_output).abs() < TOLERANCE);
+            assert!((frozen.carry_cost - actual_input_cost - carry_output).abs() < TOLERANCE);
             assert!((frozen.pi_cost - input_cost(pi_input) - pi_output).abs() < TOLERANCE);
         }
     }
@@ -685,7 +959,7 @@ mod tests {
         }
     }
     #[test]
-    fn monetary_scenario_does_not_depend_on_metered_input_units() {
+    fn local_counterfactual_quantity_does_not_revalue_metered_money() {
         fn replay(metered: u64) -> Estimate {
             let mut t = Trajectory::with_model("gpt-6-sol".into());
             for dropped in [0, 600] {
@@ -699,9 +973,11 @@ mod tests {
         }
         let a = replay(2000);
         let b = replay(20000);
-        assert!((a.savings - b.savings).abs() < 1e-12);
+        assert!((a.pi_cost - b.pi_cost).abs() < 1e-12);
         assert_ne!(a.observed_cost, b.observed_cost);
-        assert_ne!(b.carry_cost, b.observed_cost);
+        assert_eq!(a.carry_cost, a.observed_cost);
+        assert_eq!(b.carry_cost, b.observed_cost);
+        assert!((a.savings - b.savings - (b.observed_cost - a.observed_cost)).abs() < 1e-12);
     }
     #[test]
     fn response_boundary_charges_summary_without_duplicate_terminal_charge() {
@@ -757,16 +1033,14 @@ mod tests {
         );
     }
     #[test]
-    fn cache_policy_charges_first_write_and_model_switch_symmetrically() {
+    fn unchanged_primary_and_model_switch_share_observed_money() {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         request(&mut t, 2000);
         let a = response(&mut t, 10000, 100, 0);
-        let units = t.previous.as_ref().unwrap().input;
         let write = estimated_cost_usd(
             "gpt-6-sol",
             &Usage {
-                input_tokens: units,
-                cache_write_input_tokens: units,
+                input_tokens: 10000,
                 output_tokens: 100,
                 ..Usage::default()
             },
@@ -780,8 +1054,7 @@ mod tests {
         let switched = estimated_cost_usd(
             "gpt-5.6-sol",
             &Usage {
-                input_tokens: units,
-                cache_write_input_tokens: units,
+                input_tokens: 10000,
                 output_tokens: 100,
                 ..Usage::default()
             },
@@ -793,6 +1066,7 @@ mod tests {
     #[test]
     fn priced_usage_with_unknown_cache_policy_excludes_savings() {
         let mut t = Trajectory::default();
+        t.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":0}}));
         t.record(&json!({"event":"run_started","data":{"model":"gpt-6-sol","implicit_cache_minimum_prefix_tokens":null}}));
         request(&mut t, 2000);
         let estimate = response(&mut t, 1000, 100, 900);
@@ -821,7 +1095,7 @@ mod tests {
                 request(&mut t, 2000);
                 let after = response(&mut t, 10, 0, 0);
                 assert!(after.observed_priced);
-                assert_eq!(after.priced, !old_minimum.is_null());
+                assert!(after.priced);
                 assert_eq!(t.last_pi_input, carry_input + 600);
                 assert!((after.observed_cost - 2.0 * before.observed_cost).abs() < 1e-12);
                 let carry_delta = after.carry_cost - before.carry_cost;
@@ -832,10 +1106,7 @@ mod tests {
                 );
                 actual.push((carry_delta * 1e9).round() as u64);
                 actual.push((pi_delta * 1e9).round() as u64);
-                expected.push(
-                    (input_cost("gpt-6-sol", carry_input, 0, Some(1024)).unwrap() * 1e9).round()
-                        as u64,
-                );
+                expected.push((before.observed_cost * 1e9).round() as u64);
                 expected.push((cold * 1e9).round() as u64);
             }
         }
@@ -844,6 +1115,7 @@ mod tests {
     #[test]
     fn cache_policy_transition_uses_the_previous_request_model() {
         let mut t = Trajectory::default();
+        t.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":0}}));
         t.record(&json!({"event":"run_started","data":{"model":"gpt-6-sol","implicit_cache_minimum_prefix_tokens":null}}));
         request(&mut t, 2000);
         let before = response(&mut t, 10, 0, 0);
@@ -853,7 +1125,7 @@ mod tests {
         t.record(&json!({"event":"model_request","data":{"step":1,"request":{"model":"gpt-6-sol","input":["a ".repeat(2000)],"tools":[]}}}));
         let after = response(&mut t, 10, 0, 0);
         let cold = input_cost("gpt-6-sol", units, 0, Some(1024)).unwrap();
-        assert!((after.carry_cost - before.carry_cost - cold).abs() < 1e-12);
+        assert!((after.carry_cost - before.carry_cost - before.observed_cost).abs() < 1e-12);
         assert!((after.pi_cost - before.pi_cost - cold).abs() < 1e-12);
     }
     #[test]
@@ -861,13 +1133,12 @@ mod tests {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         request(&mut t, 1000);
         response(&mut t, 1000, 100, 0);
-        let units = t.previous.as_ref().unwrap().input;
         request(&mut t, 1000);
         let e = response(&mut t, 1000, 100, 0);
         let ordinary = estimated_cost_usd(
             "gpt-6-sol",
             &Usage {
-                input_tokens: units,
+                input_tokens: 1000,
                 output_tokens: 100,
                 ..Usage::default()
             },
@@ -902,7 +1173,9 @@ mod tests {
         assert!(!pending.observed_priced);
         assert!(!pending.priced);
         let missing = t
-            .record(&json!({"event":"model_response","data":{"step":1}}))
+            .record(
+                &json!({"event":"model_response","data":{"usage_source":"normalized","step":1}}),
+            )
             .unwrap();
         assert_eq!(missing.coverage.missing_usage, 1);
         assert_eq!(missing.coverage.unmatched_requests, 0);
@@ -914,18 +1187,18 @@ mod tests {
     fn response_identity_cannot_consume_a_different_pending_request() {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         t.record(&json!({"event":"model_request","run_id":"a","data":{"step":7,"request":{"input":["abc"]}}}));
-        let e=t.record(&json!({"event":"model_response","run_id":"b","data":{"step":8,"usage":{"input_tokens":10,"output_tokens":1},"raw":{"output":[]}}})).unwrap();
+        let e=t.record(&json!({"event":"model_response","run_id":"b","data":{"usage_source":"normalized","step":8,"usage":{"input_tokens":10,"output_tokens":1},"raw":{"output":[]}}})).unwrap();
         assert_eq!(e.coverage.unmatched_requests, 1);
         assert_eq!(e.coverage.orphan_responses, 1);
         assert!(!e.priced);
-        t.record(&json!({"event":"model_response","run_id":"a","data":{"step":7,"usage":{"input_tokens":10,"output_tokens":1},"raw":{"output":[]}}}));
+        t.record(&json!({"event":"model_response","run_id":"a","data":{"usage_source":"normalized","step":7,"usage":{"input_tokens":10,"output_tokens":1},"raw":{"output":[]}}}));
         assert_eq!(t.snapshot().coverage.unmatched_requests, 0);
     }
     #[test]
     fn retries_are_known_count_but_unknown_extra_charges() {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         request(&mut t, 2000);
-        let e=t.record(&json!({"event":"model_response","data":{"step":1,"response_retries":2,"usage":{"input_tokens":2000,"output_tokens":100},"raw":{"output":[]}}})).unwrap();
+        let e=t.record(&json!({"event":"model_response","data":{"usage_source":"normalized","step":1,"response_retries":2,"usage":{"input_tokens":2000,"output_tokens":100},"raw":{"output":[]}}})).unwrap();
         assert_eq!(e.coverage.retries, 2);
         assert!(!e.observed_priced);
         assert!(!e.priced);
@@ -935,17 +1208,48 @@ mod tests {
     fn absent_output_projection_cannot_silently_skip_threshold_work() {
         let mut t = Trajectory::with_model("gpt-6-sol".into());
         request(&mut t, 240000);
-        let e=t.record(&json!({"event":"model_response","data":{"step":1,"usage":{"input_tokens":240000,"output_tokens":20000}}})).unwrap();
+        let e=t.record(&json!({"event":"model_response","data":{"usage_source":"normalized","step":1,"usage":{"input_tokens":240000,"output_tokens":20000}}})).unwrap();
         assert!(!e.priced);
         assert!(e.observed_priced);
     }
+    #[test]
+    fn declared_scenario_policy_is_independent_of_native_entitlement() {
+        for event in ["run_started", "session_resumed"] {
+            for native_minimum in [Value::Null, json!(1024)] {
+                let mut t = Trajectory::default();
+                t.record(&json!({"event":event,"data":{"model":"gpt-6-sol",
+                    "cache_ttl_seconds":1,
+                    "implicit_cache_minimum_prefix_tokens":native_minimum,
+                    "scenario_cache_policy":ScenarioCachePolicy::for_model("gpt-6-sol")}}));
+                assert_eq!(t.cache_minimum_for("gpt-6-sol"), Some(1024));
+                assert_eq!(t.cache_ttl_ms, Some(1_800_000));
+            }
+            for policy in [
+                Value::Null,
+                json!({"version":"invalid"}),
+                json!({"version":999,"minimum_prefix_tokens":1024,"ttl_seconds":1800}),
+                json!({"version":ScenarioCachePolicy::VERSION,"minimum_prefix_tokens":null,"ttl_seconds":1800}),
+            ] {
+                let mut t = Trajectory::default();
+                t.record(&json!({"event":event,"data":{"model":"gpt-6-sol",
+                    "cache_ttl_seconds":1800,"implicit_cache_minimum_prefix_tokens":1024,
+                    "scenario_cache_policy":policy}}));
+                assert_eq!(
+                    t.cache_minimum_for("gpt-6-sol"),
+                    None,
+                    "native support cannot fill an explicit unknown scenario contract"
+                );
+            }
+        }
+    }
+
     #[test]
     fn recorded_ttl_and_minimum_override_cache_assumptions() {
         let mut t = Trajectory::default();
         t.record(&json!({"event":"run_started","data":{"model":"gpt-6-sol","cache_ttl_seconds":1,"implicit_cache_minimum_prefix_tokens":1024,"context_window":100000}}));
         let req = |time| json!({"event":"model_request","timestamp_ms":time,"data":{"step":1,"request":{"input":["a ".repeat(2000)],"tools":[]}}});
         t.record(&req(10));
-        let a=t.record(&json!({"event":"model_response","timestamp_ms":20,"data":{"step":1,"usage":{"input_tokens":2000,"output_tokens":100},"raw":{"output":[]}}})).unwrap();
+        let a=t.record(&json!({"event":"model_response","timestamp_ms":20,"data":{"usage_source":"normalized","step":1,"usage":{"input_tokens":2000,"output_tokens":100},"raw":{"output":[]}}})).unwrap();
         t.record(&req(1020));
         let b = response(&mut t, 2000, 100, 0);
         assert!((b.carry_cost - 2.0 * a.carry_cost).abs() < 1e-12);

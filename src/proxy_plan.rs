@@ -20,6 +20,9 @@ pub(super) fn plan(
     session: &Session,
     body: &Value,
 ) -> (Option<Projection>, Value) {
+    // One decision, one eligibility instant: candidate enumeration, both lanes
+    // of every comparison and the report cannot straddle different deadlines.
+    let at = now();
     let canonical = Projection::canonical(session);
     let groups = session.groups();
     let eligible = groups
@@ -57,15 +60,28 @@ pub(super) fn plan(
     // An oversized canonical prompt does not force a new rewrite when the
     // authorized continuation fits. Conversely, do not default to an oversized
     // memory projection when the originals themselves fit.
-    let baseline = if !primary_fits(config, &retained) && primary_fits(config, &original) {
-        retained = original.clone();
-        &canonical
+    // These immutable views do not change while candidates are evaluated.
+    // Reuse their capacity measurements instead of tokenizing the same large
+    // input again for baseline selection, forced status and report fields.
+    let continuation_required = primary_required_tokens(config, &retained);
+    let canonical_required = if retained == original {
+        continuation_required
     } else {
-        &continuation
+        primary_required_tokens(config, &original)
     };
+    let continuation_fits = continuation_required <= config.primary_context_tokens as f64;
+    let (baseline, baseline_required) =
+        if !continuation_fits && canonical_required <= config.primary_context_tokens as f64 {
+            retained = original.clone();
+            (&canonical, canonical_required)
+        } else {
+            (&continuation, continuation_required)
+        };
     let wire = primary_wire_body(config, &retained);
     let canonical_wire = primary_wire_body(config, &original);
-    let forced = !primary_fits(config, &retained);
+    let wire_tokens = estimate(&wire);
+    let baseline_fits = baseline_required <= config.primary_context_tokens as f64;
+    let forced = !baseline_fits;
     let prediction = session.cost_trajectory.as_ref().and_then(|t| {
         t.receipt_prediction(
             &wire,
@@ -77,12 +93,15 @@ pub(super) fn plan(
     // Preserve each genuinely compatible canonical warm boundary as another
     // alternative, alongside the reauthorized previous projection below.
     for entry in &session.upstream_cache {
-        if entry.matches(
-            &canonical_wire,
-            config.model_resolution.as_ref().map(|p| &p.primary),
-            &config.primary_cache_auth,
-            now(),
-        ) {
+        if entry
+            .reusable_at(
+                &canonical_wire,
+                config.model_resolution.as_ref().map(|p| &p.primary),
+                &config.primary_cache_auth,
+                at,
+            )
+            .is_some()
+        {
             // The subscription adapter moves leading native direction items
             // into instructions. Include those base-bound members plus the
             // actual wire prefix, not the same count of canonical positions.
@@ -138,6 +157,7 @@ pub(super) fn plan(
             config.payoff_requests,
             config.model_resolution.as_ref().map(|p| &p.primary),
             &config.primary_cache_auth,
+            at,
         );
         let compact_review = review_body_projected(config, session, &projection);
         // Same actual scheduling on both views: a selected rewrite does not
@@ -154,6 +174,7 @@ pub(super) fn plan(
                 1,
                 config.model_resolution.as_ref().map(|p| &p.reviewer),
                 &config.reviewer_cache_auth,
+                at,
             )?;
             let rates = reviewer_rates(config, estimate(view))?;
             Some(input.keep + config.classifier_max_output_tokens as f64 * rates.output)
@@ -164,20 +185,16 @@ pub(super) fn plan(
         let output =
             body["max_output_tokens"].as_u64().unwrap_or(0) as f64 * config.payoff_requests as f64;
         let primary = primary.and_then(|cost| {
-            primary_rates(
-                config,
-                wire["model"].as_str().unwrap_or(""),
-                estimate(&wire),
-            )
-            .zip(primary_rates(
-                config,
-                compact["model"].as_str().unwrap_or(""),
-                estimate(&compact),
-            ))
-            .map(|(keep, drop)| ViewCosts {
-                keep: cost.keep + output * keep.output,
-                compact: cost.compact + output * drop.output,
-            })
+            primary_rates(config, wire["model"].as_str().unwrap_or(""), wire_tokens)
+                .zip(primary_rates(
+                    config,
+                    compact["model"].as_str().unwrap_or(""),
+                    estimate(&compact),
+                ))
+                .map(|(keep, drop)| ViewCosts {
+                    keep: cost.keep + output * keep.output,
+                    compact: cost.compact + output * drop.output,
+                })
         });
         let joint = primary
             .zip(shadow)
@@ -208,9 +225,9 @@ pub(super) fn plan(
     }
     let selected = best.as_ref().is_some_and(|(p, _, _)| !p.omitted.is_empty());
     let mut report = json!({"selected":selected,"forced":forced,"primary_fits":!forced,
-        "primary_cached_estimated_tokens":crate::proxy_cache::reusable(&session.upstream_cache,&wire,config.model_resolution.as_ref().map(|p|&p.primary),&config.primary_cache_auth,now()),
-        "reviewer_fits":review_fits(config,&review),"primary_estimated_tokens":estimate(&wire),
-        "primary_required_tokens":primary_required_tokens(config,&retained),"primary_receipt_prediction_tokens":prediction,
+        "primary_cached_estimated_tokens":crate::proxy_cache::reusable(&session.upstream_cache,&wire,config.model_resolution.as_ref().map(|p|&p.primary),&config.primary_cache_auth,at),
+        "reviewer_fits":review_fits(config,&review),"primary_estimated_tokens":wire_tokens,
+        "primary_required_tokens":baseline_required,"primary_receipt_prediction_tokens":prediction,
         "context_margin_percent":config.context_margin_percent,
         "primary_output_reserve_tokens":primary_output_reserve(config,&retained),
         "primary_output_reserve_basis":if retained["max_output_tokens"].as_u64().is_some() {"request_max_output_tokens"} else {"configured_capacity_reserve"},
@@ -221,13 +238,7 @@ pub(super) fn plan(
         "cache_basis":"actual_compatible_wire_terminal_receipts_30_minute_ttl",
         "estimate_basis":"frozen_primary_horizon_and_actual_current_review_schedule",
         "candidates":reports});
-    if primary_rates(
-        config,
-        wire["model"].as_str().unwrap_or(""),
-        estimate(&wire),
-    )
-    .is_none()
-    {
+    if primary_rates(config, wire["model"].as_str().unwrap_or(""), wire_tokens).is_none() {
         report["reason"] = json!("unsupported_model_or_tier");
     }
     report["reviewer_context_tokens"] = json!(
@@ -254,7 +265,7 @@ pub(super) fn plan(
     let mut baseline_members = baseline.omitted.iter().copied().collect::<Vec<_>>();
     baseline_members.sort_unstable();
     report["baseline_omitted_members"] = json!(baseline_members);
-    report["canonical_primary_required_tokens"] = json!(primary_required_tokens(config, &original));
+    report["canonical_primary_required_tokens"] = json!(canonical_required);
     (
         best.map(|(projection, _, _)| projection)
             .filter(|p| !p.omitted.is_empty()),

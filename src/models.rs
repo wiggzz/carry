@@ -19,6 +19,8 @@ const OPENAI_CACHE: PromptCacheCapabilities = PromptCacheCapabilities {
     implicit_breakpoint_uses_write_slot: true,
 };
 
+const SHORT_CACHE_LIFETIME_SECONDS: u64 = 1800;
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct Rates {
     pub input: f64,
@@ -340,6 +342,12 @@ pub struct Provenance {
     pub operator_override: Option<u32>,
 }
 
+/// Explicit client caps override configured feasibility reserves, including zero.
+/// This allowance is not expected or billable generated output.
+pub fn output_allowance(requested: Option<u64>, configured_reserve: u64) -> u64 {
+    requested.unwrap_or(configured_reserve)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OrdinaryPolicy {
     pub derivation: String,
@@ -391,6 +399,12 @@ pub enum ScenarioCacheMode {
 /// cache eligibility or transport entitlement: zero-write receipts remain priced
 /// even when the request's population/expiry contract is unknown.
 pub fn cache_write_tariff_known(body: &Value) -> bool {
+    short_cache_lifetimes(body)
+}
+
+// One typed lifetime validator for the currently supported 30-minute contract.
+// Callers still own separate monetary or route/observation prerequisites.
+fn short_cache_lifetimes(body: &Value) -> bool {
     fn supported_lifetime(options: &Value) -> bool {
         options
             .as_object()
@@ -473,13 +487,25 @@ impl ScenarioCachePolicy {
         }
     }
 
+    /// Conditional API-equivalent coverage, not this route's entitlement or an
+    /// observed native hit. Only the frozen supported short implicit policy can
+    /// refresh a hypothetical read; custom/unknown policies keep their clocks.
+    pub fn read_refresh_seconds(&self, model: &str, body: &Value) -> Option<u64> {
+        (self.version == Self::VERSION
+            && self.ttl_seconds == SHORT_CACHE_LIFETIME_SECONDS
+            && self.minimum_prefix_tokens.is_some()
+            && model_spec(model).is_some_and(|spec| spec.cache.is_some())
+            && self.request_mode(body) == ScenarioCacheMode::Implicit)
+            .then_some(SHORT_CACHE_LIFETIME_SECONDS)
+    }
+
     pub fn for_model(model: &str) -> Self {
         Self {
             version: Self::VERSION,
             minimum_prefix_tokens: model_spec(model)
                 .and_then(|s| s.cache)
                 .map(|c| c.minimum_prefix_tokens as u64),
-            ttl_seconds: 1800,
+            ttl_seconds: SHORT_CACHE_LIFETIME_SECONDS,
         }
     }
 }
@@ -506,6 +532,21 @@ pub struct ResolvedModel {
     pub raw_field_status: BTreeMap<String, String>,
 }
 impl ResolvedModel {
+    /// Documented billing coverage from a complete read, not another write or
+    /// physical KV residency. Scenario policy/capability injection alone cannot
+    /// confer this provider contract on an unknown route, auth class or model.
+    pub fn cache_read_refresh_seconds(&self, body: &Value) -> Option<u64> {
+        (self.route == Route::new("https://api.openai.com/v1/responses", false)
+            && self.cache.is_some()
+            && model_spec(&self.model).is_some_and(|spec| spec.cache.is_some())
+            && body["model"].as_str() == Some(self.model.as_str())
+            && short_cache_lifetimes(body)
+            && body["prompt_cache_options"]
+                .get("mode")
+                .is_none_or(|mode| matches!(mode.as_str(), Some("implicit" | "explicit"))))
+        .then_some(SHORT_CACHE_LIFETIME_SECONDS)
+    }
+
     /// Upgrade only prospective assumptions at the resolution boundary. Existing
     /// tariffs, route capability and historical monetary sums remain frozen.
     pub fn with_scenario_cache_policy(mut self) -> Self {

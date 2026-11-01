@@ -69,6 +69,36 @@ pub struct Usage {
     pub total_tokens: u64,
 }
 
+impl Usage {
+    /// Complete validated native partitions. Display counters alone cannot
+    /// establish that missing or contradictory receipt data was known zero.
+    pub(crate) fn from_receipt(usage: &Value) -> Option<Self> {
+        let (input, cached, written) = carry::core::CacheUsage::from_receipt(usage).partition()?;
+        Some(Self {
+            input_tokens: input,
+            cached_input_tokens: cached,
+            cache_write_input_tokens: written,
+            output_tokens: usage["output_tokens"].as_u64()?,
+            ..Self::default()
+        })
+    }
+}
+
+/// Actual native metering uses the same validated raw receipt owner as proxy
+/// settlement, not the lossy normalized counters used for terminal display.
+pub(crate) fn receipt_cost_usd(model: &str, raw: &Value) -> Option<f64> {
+    let usage = &raw["usage"];
+    let rates = usage["input_tokens"]
+        .as_u64()
+        .and_then(|input| carry::models::Rates::for_model(model, input as f64));
+    carry::core::UsageLedger::default().settle_with_rates(
+        model,
+        usage,
+        raw.get("service_tier").is_none_or(|tier| tier == "default"),
+        rates,
+    )
+}
+
 /// Modeled USD rates from scripts/swebench_smoke.py and published OpenAI pricing, not a billing quote.
 pub(crate) fn estimated_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
     let rates = carry::models::Rates::for_model(model, usage.input_tokens as f64)?;
@@ -248,10 +278,28 @@ impl OpenAiClient {
     }
 
     pub(crate) fn prompt_cache_capabilities(&self) -> Option<PromptCacheCapabilities> {
-        match self.auth {
-            RequestAuth::ApiKey(_) => prompt_cache_capabilities(&self.model),
-            RequestAuth::CodexSubscription { .. } => None,
-        }
+        self.resolved_model()?.cache
+    }
+
+    pub(crate) fn cache_read_refresh_seconds(&self, body: &Value) -> Option<u64> {
+        self.resolved_model()?.cache_read_refresh_seconds(body)
+    }
+
+    fn resolved_model(&self) -> Option<carry::models::ResolvedModel> {
+        // Native runs use the same exact destination/auth entitlement boundary
+        // as proxy dispatch. A familiar slug behind a gateway is not proof.
+        carry::models::resolve_model(
+            &self.model,
+            carry::models::Route::new(
+                &format!("{}/responses", self.api_base),
+                matches!(self.auth, RequestAuth::CodexSubscription { .. }),
+            ),
+            None,
+            None,
+            0,
+            0,
+        )
+        .ok()
     }
 
     pub fn request_body(&self, system: &str, history: &[Value]) -> Value {
@@ -616,14 +664,11 @@ fn function_calls(raw: &Value) -> Vec<&Value> {
 
 pub(crate) fn extract_usage(raw: &Value) -> Usage {
     let usage = &raw["usage"];
+    let quantities = carry::core::CacheUsage::from_receipt(usage);
     Usage {
-        input_tokens: usage["input_tokens"].as_u64().unwrap_or_default(),
-        cached_input_tokens: usage["input_tokens_details"]["cached_tokens"]
-            .as_u64()
-            .unwrap_or_default(),
-        cache_write_input_tokens: usage["input_tokens_details"]["cache_write_tokens"]
-            .as_u64()
-            .unwrap_or_default(),
+        input_tokens: quantities.input().unwrap_or_default(),
+        cached_input_tokens: quantities.read().map_or(0, |(_, cached)| cached),
+        cache_write_input_tokens: quantities.reported_write().unwrap_or_default(),
         output_tokens: usage["output_tokens"].as_u64().unwrap_or_default(),
         reasoning_tokens: usage["output_tokens_details"]["reasoning_tokens"]
             .as_u64()
@@ -649,16 +694,29 @@ pub(crate) fn remove_prompt_cache_breakpoints(value: &mut Value) {
     };
     object.remove("prompt_cache_breakpoint");
     if let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) {
-        for item in input {
-            let Some(item) = item.as_object_mut() else {
-                continue;
-            };
-            item.remove("prompt_cache_breakpoint");
-            if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
-                for block in content {
-                    if let Some(block) = block.as_object_mut() {
-                        block.remove("prompt_cache_breakpoint");
-                    }
+        remove_input_cache_breakpoints(input);
+    }
+}
+
+/// Model-visible input, with only protocol-owned cache annotations removed.
+/// Identity and local quantities use this same table as transport adaptation;
+/// caller metadata, schemas and opaque tool output are not recursively stripped.
+pub(crate) fn semantic_prompt_input(input: &[Value]) -> Vec<Value> {
+    let mut input = input.to_vec();
+    remove_input_cache_breakpoints(&mut input);
+    input
+}
+
+fn remove_input_cache_breakpoints(input: &mut [Value]) {
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        item.remove("prompt_cache_breakpoint");
+        if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
+            for block in content {
+                if let Some(block) = block.as_object_mut() {
+                    block.remove("prompt_cache_breakpoint");
                 }
             }
         }
@@ -948,6 +1006,41 @@ mod tests {
     }
 
     #[test]
+    fn native_receipt_money_preserves_unknown_partitions_and_tariffs() {
+        let raw = json!({"usage": {"input_tokens": 2000, "output_tokens": 4,
+            "cached_input_tokens": 700, "cache_creation_input_tokens": 300}});
+        assert!((receipt_cost_usd("gpt-6-sol", &raw).unwrap() - 0.00293).abs() < 1e-12);
+        let usage = Usage::from_receipt(&raw["usage"]).unwrap();
+        assert_eq!(
+            (usage.cached_input_tokens, usage.cache_write_input_tokens),
+            (700, 300)
+        );
+        assert_eq!(receipt_cost_usd("unknown-model", &raw), None);
+        assert_eq!(receipt_cost_usd("gpt-6-sol", &json!({})), None);
+        for (field, value) in [
+            ("service_tier", json!("priority")),
+            (
+                "usage",
+                json!({"input_tokens": 2000, "cached_input_tokens": 700}),
+            ),
+            (
+                "usage",
+                json!({"input_tokens": 2000, "output_tokens": 4,
+                "cached_input_tokens": 700, "input_tokens_details": {"cached_tokens": 701}}),
+            ),
+            (
+                "usage",
+                json!({"input_tokens": 2000, "output_tokens": 4,
+                "cached_input_tokens": 700, "input_tokens_details": {"audio_tokens": 1}}),
+            ),
+        ] {
+            let mut invalid = raw.clone();
+            invalid[field] = value;
+            assert_eq!(receipt_cost_usd("gpt-6-sol", &invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
     fn gpt61_sol_usage_and_planner_share_rates_and_cache_support() {
         let usage = Usage {
             input_tokens: 100_000,
@@ -1069,6 +1162,41 @@ mod tests {
     #[test]
     fn astra_is_explicitly_recognized() {
         assert!(prompt_cache_capabilities("gpt-5.6-astra").is_some());
+    }
+
+    #[test]
+    fn native_cache_capabilities_require_the_resolved_destination_and_auth() {
+        for (base, model, known) in [
+            ("https://api.openai.com/v1", "gpt-6-sol", true),
+            ("https://api.openai.com/v1/", "gpt-6-sol", true),
+            ("https://api.openai.com/v1", "custom-model", false),
+            ("http://127.0.0.1:12345/v1", "gpt-6-sol", false),
+            ("https://gateway.invalid/v1", "gpt-6-sol", false),
+            ("https://api.openai.com/v1/alternate", "gpt-6-sol", false),
+        ] {
+            let client = OpenAiClient::new(
+                base.into(),
+                "synthetic-only".into(),
+                model.into(),
+                "medium".into(),
+            );
+            assert_eq!(
+                client.prompt_cache_capabilities().is_some(),
+                known,
+                "{base} {model}"
+            );
+        }
+        let client = OpenAiClient::new_with_auth(
+            "https://api.openai.com/v1".into(),
+            RequestAuth::CodexSubscription {
+                access_token: "synthetic-only".into(),
+                account_id: "synthetic-only".into(),
+                credential_home: None,
+            },
+            "gpt-6-sol".into(),
+            "medium".into(),
+        );
+        assert!(client.prompt_cache_capabilities().is_none());
     }
 
     #[test]

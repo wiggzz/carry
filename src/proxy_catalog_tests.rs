@@ -38,7 +38,6 @@ fn cache_write191_dispatch_frozen_lifetime_censors_only_new_written_receipts() {
         let run = ReviewRun {
             receipts: vec![ReviewReceipt {
                 model,
-                input: 2000,
                 usage: Some(usage),
                 write_tariff_known: known,
                 standard: true,
@@ -93,7 +92,6 @@ fn joined191192_unpriced_write_settlement_keeps_independent_cache_observations()
         let run = ReviewRun {
             receipts: vec![ReviewReceipt {
                 model,
-                input: 2000,
                 usage: Some(usage),
                 write_tariff_known: false,
                 standard: true,
@@ -179,7 +177,6 @@ fn stale_background_receipts_keep_the_dispatched_frozen_tariff_not_current_slug_
     let run = ReviewRun {
         receipts: vec![ReviewReceipt {
             model: config.classifier_model.clone(),
-            input: 200,
             write_tariff_known: true,
             usage: Some(
                 json!({"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":10}}),
@@ -440,10 +437,10 @@ fn primary_output_cap_reverses_warm_keep_vs_cold_tier_rewrite_with_zero_missing_
         crate::proxy_cache::observe(
             &mut session.upstream_cache,
             &primary_wire_body(&config, &body),
-            &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":10000}}),
+            &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":10000}}),
             config.model_resolution.as_ref().map(|p| &p.primary),
             &config.primary_cache_auth,
-            now(),
+            crate::proxy_cache::ObservationTime::during(now(), now()),
         );
         assert_eq!(session.upstream_cache.len(), 1);
         let (selected, report) = plan(&config, &session, &body);

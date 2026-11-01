@@ -1,6 +1,408 @@
 //! Synthetic receipts: the wire body deliberately does not predict provider units.
 use super::*;
 include!("proxy_cache_write_tests.rs");
+include!("primary_parity_tests.rs");
+include!("modeled_refresh_tests.rs");
+include!("legacy_history_tests.rs");
+include!("proxy_unknown_price_history_tests.rs");
+include!("semantic_prompt_tests.rs");
+
+// Output allowance changes feasibility, not the native-input history contract.
+// Exercise both existing initialization and a real in-window paid summary.
+fn output_allowance_preserves_history(initialized: bool) {
+    let mut t = Trajectory::default();
+    let mut request = body();
+    request["max_output_tokens"] = json!(1);
+    if !initialized {
+        t.primary(&request, &terminal(10000, 0, 0, 0), "route", 99, true);
+        request["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"grow"}));
+    }
+    for (offset, input) in [300000, 300100, 300200].into_iter().enumerate() {
+        if offset > 0 {
+            request["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":format!("append {offset}")}));
+        }
+        t.primary(
+            &request,
+            &terminal(input, 0, 0, 0),
+            "route",
+            100 + offset as u64,
+            true,
+        );
+    }
+    assert_eq!(t.history.retired, 280000);
+    assert_eq!(t.history.summary, 1000);
+    assert_eq!(t.history.last_traditional_input, 21200);
+    let before = t.snapshot();
+    assert_eq!(before.initial_compactions, u64::from(initialized));
+    assert_eq!(before.traditional_compactions, u64::from(!initialized));
+    assert_eq!(before.summary_cost > 0.0, !initialized);
+    t = serde_json::from_value(state(&t)).unwrap();
+    request["max_output_tokens"] = json!(2);
+    for (offset, input) in [300300, 300400].into_iter().enumerate() {
+        request["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":format!("new allowance {offset}")}));
+        t.primary(
+            &request,
+            &terminal(input, 0, 0, 0),
+            "route",
+            103 + offset as u64,
+            true,
+        );
+        let after = t.snapshot();
+        assert!(
+            (after.observed_primary_cost
+                - before.observed_primary_cost
+                - (0..=offset)
+                    .map(|n| (300300 + n * 100) as f64 * 4.0 / 1e6)
+                    .sum::<f64>())
+            .abs()
+                < 1e-12
+        );
+        assert_eq!(
+            after.summary_cost, before.summary_cost,
+            "changing output allowance cannot charge another summary"
+        );
+        assert_eq!(
+            after.traditional_compactions,
+            before.traditional_compactions
+        );
+        assert_eq!(
+            after.initial_compactions, before.initial_compactions,
+            "changing output allowance cannot grant another free initialization"
+        );
+        assert_eq!(
+            t.history.retired, 280000,
+            "retain the original retired quantity"
+        );
+        assert_eq!(t.history.summary, 1000);
+        assert_eq!(
+            t.history.last_traditional_input,
+            21300 + offset as u64 * 100,
+            "retain every appended native-input token"
+        );
+        t = serde_json::from_value(state(&t)).unwrap();
+    }
+}
+
+// Review4424550949: input instruction roles are fixed, not old chat history.
+fn fixed_input_role_comparison(role: &str) {
+    let mut t = Trajectory {
+        scenario: Scenario {
+            context_window: 4000,
+            reserve: 100,
+            keep_recent: 1500,
+            summary: 100,
+        },
+        ..Trajectory::default()
+    };
+    let mut request = json!({"model":"gpt-6.1-sol", "max_output_tokens":1,
+        "input":[{"role":role,"content":" fixed".repeat(5000)},
+                 {"role":"user","content":"current request"}]});
+    for index in 0..2 {
+        if index > 0 {
+            request["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":"continue"}));
+        }
+        let before = t.snapshot();
+        let input = 5100 + index * 100;
+        t.primary(
+            &request,
+            &terminal(input, 0, 0, 0),
+            "fixed-role",
+            100 + index,
+            true,
+        );
+        let result = t.snapshot();
+        assert!(
+            (result.observed_primary_cost
+                - before.observed_primary_cost
+                - input as f64 * 2.0 / 1e6)
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(result.traditional_compactions, 0);
+        assert_eq!(result.summary_cost, 0.0);
+        if role == "assistant" {
+            assert_eq!(result.initial_compactions, 1);
+            assert_eq!(result.matched_primary_responses, index + 1);
+            assert!(result.priced);
+        } else {
+            assert_eq!(
+                result.matched_primary_responses, 0,
+                "FIXED_INPUT_ROLE: instruction messages cannot be hypothetically retired"
+            );
+            assert_eq!(result.initial_compactions, 0);
+            assert!(!result.priced);
+        }
+        t = serde_json::from_value(state(&t)).unwrap();
+    }
+}
+#[test]
+fn fixed_input_system_role_cannot_be_retired_across_restart() {
+    fixed_input_role_comparison("system");
+}
+#[test]
+fn fixed_input_developer_role_cannot_be_retired_across_restart() {
+    fixed_input_role_comparison("developer");
+}
+#[test]
+fn fixed_input_assistant_history_can_be_retired_across_restart() {
+    fixed_input_role_comparison("assistant");
+}
+
+#[test]
+fn history_contract_output_allowance_preserves_free_initialized_growth() {
+    output_allowance_preserves_history(true);
+}
+
+#[test]
+fn history_contract_output_allowance_preserves_paid_summary_growth() {
+    output_allowance_preserves_history(false);
+}
+
+// Exercise both free pre-window initialization (#186) and an in-window paid
+// summary after a small recognized prompt; policy changes preserve either history.
+#[test]
+fn receipt_policy_transition_preserves_current_summary_and_growth() {
+    use carry::models::{Route, resolve_model};
+    for version in [None, Some(1), Some(2)] {
+        for (projected, initialized) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut prior = resolve_model(
+                "gpt-6.1-sol",
+                Route::new("https://api.openai.com/v1/responses", false),
+                None,
+                None,
+                0,
+                0,
+            )
+            .unwrap();
+            if let Some(version) = version {
+                prior.scenario_cache_policy.as_mut().unwrap().version = version;
+                prior.provenance.get_mut("scenario_cache").unwrap().revision =
+                    "old-frozen-policy".into();
+            } else {
+                prior.scenario_cache_policy = None;
+                prior.provenance.remove("scenario_cache");
+            }
+            let mut current = prior.clone().with_scenario_cache_policy();
+            if version == Some(2) {
+                current.scenario_cache_policy.as_mut().unwrap().version = 3;
+            }
+            let mut t = Trajectory {
+                scenario: Scenario {
+                    context_window: 4000,
+                    reserve: 100,
+                    keep_recent: 1500,
+                    summary: 500,
+                },
+                ..Trajectory::default()
+            };
+            let mut b = body();
+            b["max_output_tokens"] = json!(1);
+            if !initialized {
+                t.primary_resolved(
+                    &b,
+                    &terminal(1000, 0, 0, 0),
+                    "route",
+                    99,
+                    true,
+                    Some(&prior),
+                );
+                b["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"role":"user","content":"grow"}));
+            }
+            t.primary_resolved(
+                &b,
+                &terminal(5000, 0, 0, 0),
+                "route",
+                100,
+                true,
+                Some(&prior),
+            );
+            assert_eq!(t.history.retired, 3500);
+            assert_eq!(t.history.summary, 500);
+            let before = t.snapshot();
+            assert_eq!(before.initial_compactions, u64::from(initialized));
+            assert_eq!(before.traditional_compactions, u64::from(!initialized));
+            assert_eq!(before.summary_cost > 0.0, !initialized);
+            t = serde_json::from_value(state(&t)).unwrap();
+            b["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":"append"}));
+            if projected {
+                t.projected(5100, 3000, true);
+            }
+            t.primary_resolved(
+                &b,
+                &terminal(if projected { 3000 } else { 5100 }, 0, 0, 0),
+                "route",
+                101,
+                true,
+                Some(&current),
+            );
+            let after = t.snapshot();
+            assert_eq!(
+                after.traditional_compactions,
+                u64::from(!initialized),
+                "{version:?}, projection={projected}"
+            );
+            assert_eq!(after.initial_compactions, u64::from(initialized));
+            assert_eq!(after.summary_cost, before.summary_cost);
+            assert_eq!(t.history.retired, 3500);
+            assert_eq!(t.history.summary, 500);
+            assert_eq!(t.history.last_traditional_input, 2100);
+            let cold =
+                scenario_input_cost_resolved("gpt-6.1-sol", 2100, 0, Some(1024), Some(&current))
+                    .unwrap();
+            assert!((after.traditional_cost - before.traditional_cost - cold).abs() < 1e-12);
+            let boundaries = &after.cache_policy_boundaries;
+            let boundary = boundaries.last().unwrap();
+            assert_eq!(boundary.previous_version, version);
+            assert_eq!(
+                boundary.next_version,
+                current.scenario_cache_policy.as_ref().map(|p| p.version)
+            );
+            assert_eq!(
+                boundary.cumulative.traditional_cost,
+                before.traditional_cost
+            );
+            assert_eq!(boundary.cumulative.summary_cost, before.summary_cost);
+            t = serde_json::from_value(state(&t)).unwrap();
+            b["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":"warm"}));
+            t.primary_resolved(
+                &b,
+                &terminal(if projected { 3100 } else { 5200 }, 0, 0, 0),
+                "route",
+                102,
+                true,
+                Some(&current),
+            );
+            let warm =
+                scenario_input_cost_resolved("gpt-6.1-sol", 2200, 2100, Some(1024), Some(&current))
+                    .unwrap();
+            assert!((t.snapshot().traditional_cost - after.traditional_cost - warm).abs() < 1e-12);
+            assert_eq!(
+                t.snapshot().traditional_compactions,
+                u64::from(!initialized)
+            );
+            assert_eq!(t.snapshot().initial_compactions, u64::from(initialized));
+            assert_eq!(
+                serde_json::to_value(t.snapshot().cache_policy_boundaries).unwrap(),
+                serde_json::to_value(boundaries).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn receipt_policy_transition_does_not_bypass_trajectory_guards() {
+    use carry::models::{Route, resolve_model};
+    for change in [
+        "instructions",
+        "tools",
+        "route",
+        "auth",
+        "tier",
+        "rates",
+        "edit",
+        "shorter",
+        "clock",
+        "input",
+        "reset",
+    ] {
+        let prior = resolve_model(
+            "gpt-6.1-sol",
+            Route::new("https://api.openai.com/v1/responses", false),
+            None,
+            None,
+            0,
+            0,
+        )
+        .unwrap();
+        let mut current = prior.clone();
+        current.scenario_cache_policy.as_mut().unwrap().version = 3;
+        let mut t = Trajectory {
+            scenario: Scenario {
+                context_window: 4000,
+                reserve: 100,
+                keep_recent: 1500,
+                summary: 500,
+            },
+            ..Trajectory::default()
+        };
+        let mut b = body();
+        b["max_output_tokens"] = json!(1);
+        t.primary_resolved(
+            &b,
+            &terminal(5000, 0, 0, 0),
+            "route",
+            100,
+            true,
+            Some(&prior),
+        );
+        t = serde_json::from_value(state(&t)).unwrap();
+        b["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"append"}));
+        let mut route = "route";
+        let mut at = 101;
+        let mut input = 5100;
+        match change {
+            "instructions" => b["instructions"] = json!("new"),
+            "tools" => b["tools"] = json!([{"type":"function","name":"new"}]),
+            "route" => route = "other",
+            "auth" => current.route = Route::new("https://api.openai.com/v1/responses", true),
+            "tier" => current.route.processing_tier = "priority".into(),
+            "rates" => current.rates.as_mut().unwrap().input *= 2.0,
+            "edit" => b["input"][0]["content"] = json!("edited ancestor"),
+            "shorter" => b["input"] = json!([]),
+            "clock" => at = 99,
+            "input" => input = 4900,
+            "reset" => t.reset_epoch(),
+            _ => unreachable!(),
+        }
+        t.primary_resolved(
+            &b,
+            &terminal(input, 0, 0, 0),
+            route,
+            at,
+            true,
+            Some(&current),
+        );
+        assert_eq!(
+            t.snapshot().initial_compactions,
+            if matches!(change, "rates" | "tier") {
+                1
+            } else {
+                2
+            },
+            "{change}: pricing is not a history contract; ancestry guards remain"
+        );
+        if matches!(change, "rates" | "tier") {
+            assert_eq!(t.history.retired, 3500);
+            assert_eq!(t.history.summary, 500);
+            assert_eq!(t.history.last_traditional_input, 2100);
+        }
+    }
+}
 
 fn body() -> Value {
     json!({"model":"gpt-6.1-sol","input":[{"role":"user","content":"fixed source"}]})
@@ -13,68 +415,229 @@ fn state(t: &Trajectory) -> Value {
     serde_json::to_value(t).unwrap()
 }
 
-// Joined #191/#192 acceptance, not a separately reproduced defect. Native
-// execution is pending the rebuilt joined-source hosted lane.
+// Tests-only follow-up to the output-aware initialization repair. An unchanged
+// image receipt is priceable, but it cannot allocate native tokens to a slice.
 #[test]
-fn joined191192_image_receipts_obey_write_lifetime_without_erasing_known_money() {
-    for breakpoint in [false, true] {
+fn initialization186_output_trigger_cannot_compact_unallocated_image_input() {
+    for cap in [1, 100000] {
+        let request = json!({"model":"gpt-6.1-sol", "max_output_tokens":cap,
+            "input":[{"role":"assistant", "content":" evidence".repeat(200000)},
+                {"role":"user", "content":[
+                    {"type":"input_text", "text":"current image request"},
+                    {"type":"input_image", "image_url":"data:image/png;base64,fixture"}]}]});
         let mut t = Trajectory::default();
-        let mut expected = 0.0;
-        for (index, (ttl, written, priced)) in [
-            ("30m", 2000, true),
-            ("12h", 2000, false),
-            ("12h", 0, true),
-            ("30m", 2000, true),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut request = body();
-            request["prompt_cache_options"] = json!({"mode":"implicit","ttl":"30m"});
-            request["input"][0]["content"] = json!([
-                {"type":"input_text","text":"image source"},
-                {"type":"input_image","image_url":"data:image/png;base64,fixture"}
-            ]);
-            if breakpoint {
-                request["input"][0]["content"][1]["prompt_cache_breakpoint"] =
-                    json!({"mode":"explicit","ttl":ttl});
-            } else {
-                request["prompt_cache_options"]["ttl"] = json!(ttl);
-            }
-            t.primary(
-                &request,
-                &terminal(4000, 1000, written, 5),
-                "joined-image-fixture",
-                100 + index as u64,
-                true,
-            );
-            if priced {
-                expected += ((3000 - written) as f64 * 2.0
-                    + 1000.0 * 0.1
-                    + written as f64 * 2.5
-                    + 5.0 * 10.0)
-                    / 1e6;
-            }
-            let snapshot = t.snapshot();
-            assert!((snapshot.observed_primary_cost - expected).abs() < 1e-12);
-            assert_eq!(
-                snapshot.unavailable_primary_cost_calls,
-                u64::from(index > 0)
-            );
-            assert_eq!(snapshot.coverage.unmodeled_calls, 0);
-            assert_eq!(
-                snapshot.matched_primary_responses,
-                if breakpoint {
-                    0
-                } else if index < 3 {
-                    1
-                } else {
-                    2
-                }
-            );
-            t = serde_json::from_value(state(&t)).unwrap();
+        t.primary(&request, &terminal(201000, 0, 0, 0), "route", 100, true);
+        let result = t.snapshot();
+        assert!((result.observed_primary_cost - 0.402).abs() < 1e-12);
+        assert_eq!(result.unavailable_primary_cost_calls, 0);
+        assert_eq!(result.coverage.primary_responses, 1);
+        assert_eq!(
+            result.initial_compactions, 0,
+            "a projected image slice has no measured native token allocation"
+        );
+        assert_eq!(result.traditional_compactions, 0);
+        if cap == 1 {
+            assert_eq!(result.coverage.unmodeled_calls, 0);
+            assert_eq!(result.matched_primary_responses, 1);
+            assert!((result.traditional_cost - result.observed_primary_cost).abs() < 1e-12);
+        } else {
+            assert_eq!(result.coverage.unmodeled_calls, 1);
+            assert_eq!(result.excluded_unpriced_calls, 1);
+            assert_eq!(result.matched_primary_responses, 0);
         }
     }
+}
+
+#[test]
+fn initialization186_resolved_hard_capacity_bounds_the_counterfactual() {
+    use carry::models::{Route, resolve_model};
+    let resolved = resolve_model(
+        "gpt-6.1-sol",
+        Route::new("https://api.openai.com/v1/responses", false),
+        None,
+        Some(50000),
+        0,
+        0,
+    )
+    .unwrap();
+    assert_eq!(resolved.capacity_tokens, Some(50000));
+    for cap in [1, 40000] {
+        // Receipt-domain tracer, not a realistic oversized wire or provider
+        // measurement. The actual receipt stays paid even if comparison fails.
+        let request = json!({"model":"gpt-6.1-sol", "max_output_tokens":cap,
+            "input":[{"role":"assistant","content":"old synthetic history"},
+                     {"role":"user","content":"current"}]});
+        let mut t = Trajectory::default();
+        t.primary_resolved(
+            &request,
+            &terminal(60000, 0, 0, 0),
+            "route",
+            100,
+            true,
+            Some(&resolved),
+        );
+        let result = t.snapshot();
+        assert!((result.observed_primary_cost - 0.12).abs() < 1e-12);
+        assert_eq!(result.unavailable_primary_cost_calls, 0);
+        assert_eq!(result.summary_cost, 0.0);
+        assert_eq!(result.traditional_compactions, 0);
+        if cap == 1 {
+            assert_eq!(
+                result.initial_compactions, 1,
+                "a prompt below economic headroom but above hard capacity must initialize first"
+            );
+            assert_eq!(result.matched_primary_responses, 1);
+            assert!((result.traditional_cost - 0.0525).abs() < 1e-12);
+            assert!(t.history.last_traditional_input + cap <= 50000);
+        } else {
+            assert_eq!(result.initial_compactions, 0);
+            assert_eq!(
+                result.matched_primary_responses, 0,
+                "retained prompt plus requested output cannot fit the resolved hard capacity"
+            );
+            assert_eq!(result.excluded_unpriced_calls, 1);
+        }
+    }
+}
+
+#[test]
+fn initialization186_omitted_output_uses_frozen_capacity_reserve() {
+    use carry::models::{Route, resolve_model};
+    for (cap, reserve) in [(Some(1_u64), 40000_u32), (None, 16384), (None, 40000)] {
+        let resolved = resolve_model(
+            "gpt-6.1-sol",
+            Route::new("https://api.openai.com/v1/responses", false),
+            None,
+            Some(50000),
+            reserve,
+            10,
+        )
+        .unwrap();
+        assert_eq!(resolved.capacity_tokens, Some(50000));
+        assert_eq!(resolved.ordinary.output_reserve, reserve);
+        let mut request = json!({"model":"gpt-6.1-sol",
+            "input":[{"role":"assistant","content":"old synthetic history"},
+                     {"role":"user","content":"current"}]});
+        if let Some(cap) = cap {
+            request["max_output_tokens"] = json!(cap);
+        }
+        let mut t = Trajectory::default();
+        t.primary_resolved(
+            &request,
+            &terminal(40000, 0, 0, 0),
+            "route",
+            100,
+            true,
+            Some(&resolved),
+        );
+        let result = t.snapshot();
+        assert!((result.observed_primary_cost - 0.08).abs() < 1e-12);
+        assert_eq!(result.unavailable_primary_cost_calls, 0);
+        assert_eq!(result.summary_cost, 0.0);
+        assert_eq!(result.traditional_compactions, 0);
+        if cap.is_some() {
+            assert_eq!(result.initial_compactions, 0);
+            assert_eq!(result.matched_primary_responses, 1);
+            assert!((result.traditional_cost - result.observed_primary_cost).abs() < 1e-12);
+        } else if reserve == 16384 {
+            assert_eq!(
+                result.initial_compactions, 1,
+                "omitted output must reserve frozen configured allowance"
+            );
+            assert_eq!(result.matched_primary_responses, 1);
+            assert!((result.traditional_cost - 0.0525).abs() < 1e-12);
+            assert!(t.history.last_traditional_input + u64::from(reserve) <= 50000);
+        } else {
+            assert_eq!(result.initial_compactions, 0);
+            assert_eq!(
+                result.matched_primary_responses, 0,
+                "retained floor plus fallback output cannot fit"
+            );
+            assert_eq!(result.excluded_unpriced_calls, 1);
+        }
+    }
+}
+
+// Joined #191/#192 acceptance. Unknown expense is excluded once; a later
+// independently known receipt must not inherit that monetary omission.
+fn image_receipts_through_write_tariff_gap(breakpoint: bool) {
+    let mut t = Trajectory::default();
+    let mut expected = 0.0;
+    let mut matched = 0;
+    let mut differences = Vec::new();
+    for (index, (ttl, written, priced)) in [
+        ("30m", 2000, true),
+        ("12h", 2000, false),
+        ("12h", 0, true),
+        ("30m", 2000, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut request = body();
+        request["prompt_cache_options"] = json!({"mode":"implicit","ttl":"30m"});
+        request["input"][0]["content"] = json!([
+            {"type":"input_text","text":"image source"},
+            {"type":"input_image","image_url":"data:image/png;base64,fixture"}
+        ]);
+        if breakpoint {
+            request["input"][0]["content"][1]["prompt_cache_breakpoint"] =
+                json!({"mode":"explicit","ttl":ttl});
+        } else {
+            request["prompt_cache_options"]["ttl"] = json!(ttl);
+        }
+        t.primary(
+            &request,
+            &terminal(4000, 1000, written, 5),
+            "joined-image-fixture",
+            100 + index as u64,
+            true,
+        );
+        if priced {
+            expected +=
+                ((3000 - written) as f64 * 2.0 + 1000.0 * 0.1 + written as f64 * 2.5 + 5.0 * 10.0)
+                    / 1e6;
+            matched += 1;
+        }
+        let snapshot = t.snapshot();
+        assert!((snapshot.observed_primary_cost - expected).abs() < 1e-12);
+        assert_eq!(
+            snapshot.unavailable_primary_cost_calls,
+            u64::from(index > 0)
+        );
+        assert_eq!(snapshot.coverage.unmodeled_calls, 0);
+        assert_eq!(snapshot.initial_compactions, 0);
+        assert_eq!(snapshot.traditional_compactions, 0);
+        assert_eq!(snapshot.summary_cost, 0.0);
+        assert_eq!(snapshot.reviewer_cost, 0.0);
+        if snapshot.matched_primary_responses != matched
+            || snapshot.excluded_unpriced_calls != u64::from(index > 0)
+            || (snapshot.carry_cost - expected).abs() >= 1e-12
+            || (snapshot.traditional_cost - expected).abs() >= 1e-12
+        {
+            differences.push(format!(
+                    "step {index}: known {expected}, Carry {}, traditional {}, matched {}/{matched}, excluded {}/{}",
+                    snapshot.carry_cost, snapshot.traditional_cost,
+                    snapshot.matched_primary_responses, snapshot.excluded_unpriced_calls,
+                    u64::from(index > 0)
+                ));
+        }
+        t = serde_json::from_value(state(&t)).unwrap();
+    }
+    assert!(
+        differences.is_empty(),
+        "IMAGE_TARIFF_GAP_PRIMARY_PARITY: {differences:?}"
+    );
+}
+
+#[test]
+fn joined191192_image_receipts_obey_write_lifetime_without_erasing_known_money() {
+    image_receipts_through_write_tariff_gap(false);
+}
+
+#[test]
+fn joined191192_image_breakpoint_changes_keep_identical_primary_money() {
+    image_receipts_through_write_tariff_gap(true);
 }
 
 #[test]
@@ -92,7 +655,7 @@ fn receipt_image_input_uses_native_totals_not_encoded_payload_length() {
         assert_eq!(first.unavailable_primary_cost_calls, 0);
         assert_eq!(first.matched_primary_responses, 1);
         assert_eq!(first.coverage.unmodeled_calls, 0);
-        assert_eq!(t.last_traditional_input, 4000);
+        assert_eq!(t.history.last_traditional_input, 4000);
         assert_eq!(t.receipt_prediction(&request, "route", None), Some(4000));
         costs.push(first.observed_primary_cost);
         t = serde_json::from_value(state(&t)).unwrap();
@@ -185,6 +748,9 @@ fn receipt_current_projection_repeats_changes_and_retains_without_accumulation()
         ..Trajectory::default()
     };
     let mut retained = projected.clone();
+    // Both controls forecast a distinct history; the latest zero projection
+    // does not prove their previous executions were equal to the paid path.
+    retained.projected(100, 100, true);
     // Two copies of the original 1000-unit omission would cross 3500;
     // neither the real 3000-unit original nor any current projection does.
     for (i, difference) in [1000_i128, 1000, 500, 1500, -200, 0]
@@ -234,10 +800,19 @@ fn receipt_projection_preserves_legitimate_summary_retirement_and_failed_paid_sc
         },
         ..Trajectory::default()
     };
-    t.primary(&body(), &terminal(4000, 0, 0, 0), "route", 100, true);
+    // Establish an in-window trajectory before crossing the summary threshold.
+    // An already-oversized unknown first request now initializes for free.
+    let mut request = body();
+    t.primary(&request, &terminal(3000, 0, 0, 0), "route", 99, true);
+    request["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"in-window growth"}));
+    t.primary(&request, &terminal(4000, 0, 0, 0), "route", 100, true);
+    assert_eq!(t.snapshot().initial_compactions, 0);
     assert_eq!(t.snapshot().traditional_compactions, 1);
-    let retired = t.retired;
-    let summary = t.summary;
+    let retired = t.history.retired;
+    let summary = t.history.summary;
     for at in [101, 102, 103] {
         t.projected(5000, 4000, true);
         let before = t.snapshot();
@@ -250,13 +825,13 @@ fn receipt_projection_preserves_legitimate_summary_retirement_and_failed_paid_sc
             assert_eq!(t.snapshot().coverage.failed_calls, 1);
         }
         t.primary(&body(), &terminal(3500, 0, 0, 0), "route", at, true);
-        assert_eq!(t.retired, retired);
-        assert_eq!(t.summary, summary);
-        assert_eq!(t.last_traditional_input, 4500 - retired + summary);
+        assert_eq!(t.history.retired, retired);
+        assert_eq!(t.history.summary, summary);
+        assert_eq!(t.history.last_traditional_input, 4500 - retired + summary);
         assert_eq!(t.snapshot().traditional_compactions, 1);
         t = serde_json::from_value(state(&t)).unwrap();
     }
-    assert_eq!(t.snapshot().coverage.primary_responses, 4);
+    assert_eq!(t.snapshot().coverage.primary_responses, 5);
     assert_eq!(t.snapshot().excluded_failed_calls, 1);
 }
 
@@ -267,11 +842,11 @@ fn receipt_equal_size_projection_edit_invalidates_actual_not_traditional_anchor(
     t.projected(100, 100, true);
     assert_eq!(t.restored, 0);
     assert!(state(&t)["receipts"]["anchor"].is_null());
-    assert!(state(&t)["receipts"]["traditional_anchor"].is_object());
+    assert!(state(&t)["receipts"]["modeled_cache"]["writes"][0].is_object());
     let mut edited = body();
     edited["input"][0]["content"] = json!("different equal-size synthetic memory");
     t.primary(&edited, &terminal(2000, 0, 0, 0), "route", 101, true);
-    assert_eq!(t.last_traditional_input, 2000);
+    assert_eq!(t.history.last_traditional_input, 2000);
     assert!(state(&t)["receipts"]["last_appended_input"].is_null());
 }
 
@@ -426,6 +1001,8 @@ fn receipt_counterfactual_cache_is_conditional_not_copied_from_actual_hits() {
         (2000, 1800),
     ] {
         let mut t = Trajectory::default();
+        // A genuine equal-token rewrite keeps this a divergent-forecast control.
+        t.projected(100, 100, true);
         t.primary(&body(), &terminal(input, input, 0, 0), "route", 100, true);
         let before = t.snapshot();
         let mut appended = body();
@@ -462,6 +1039,8 @@ fn receipt_subscription_traditional_cache_uses_model_policy_not_transport_capabi
             resolve_model(model, Route::new(endpoint, subscription), None, None, 0, 0).unwrap();
         let route_cache = resolved.cache;
         let mut t = Trajectory::default();
+        // A genuine equal-token rewrite keeps this a divergent-forecast control.
+        t.projected(100, 100, true);
         // A real hit does not warm the hypothetical branch's first request.
         t.primary_resolved(
             &body(),
@@ -561,6 +1140,8 @@ fn receipt_failed_reviewer_does_not_invalidate_primary_or_traditional_cache() {
     for status in ["failed", "incomplete"] {
         for restart in [false, true] {
             let mut t = Trajectory::default();
+            // A genuine equal-token rewrite keeps this a divergent-forecast control.
+            t.projected(100, 100, true);
             t.primary(&body(), &terminal(2000, 0, 0, 0), "route", 100, true);
             let before = t.snapshot();
             let mut failed = terminal(1000, 0, 0, 10);
@@ -607,6 +1188,8 @@ fn receipt_frozen_scenario_policy_and_tariff_survive_restart_without_route_credi
     policy.minimum_prefix_tokens = Some(1500);
     policy.ttl_seconds = 7;
     let mut t = Trajectory::default();
+    // A genuine equal-token rewrite keeps this a divergent-forecast control.
+    t.projected(100, 100, true);
     t.primary_resolved(
         &body(),
         &terminal(2000, 1000, 0, 0),
@@ -672,6 +1255,8 @@ fn receipt_policy_upgrade_freezes_legacy_segment_and_starts_cold() {
         .remove("scenario_cache");
     let old_resolution: ResolvedModel = serde_json::from_value(old_resolution).unwrap();
     let mut t = Trajectory::default();
+    // A genuine equal-token rewrite keeps this a divergent-forecast control.
+    t.projected(100, 100, true);
     t.primary_resolved(
         &body(),
         &terminal(2000, 1000, 0, 0),
@@ -783,6 +1368,8 @@ fn receipt_traditional_cache_invalidations_are_independent_and_conservative() {
         )
         .unwrap();
         let mut t = Trajectory::default();
+        // A genuine equal-token rewrite keeps this a divergent-forecast control.
+        t.projected(100, 100, true);
         t.primary_resolved(
             &body(),
             &terminal(2000, 0, 0, 0),
@@ -859,7 +1446,7 @@ fn receipt_traditional_summary_is_cold_then_rewarms_its_own_prefix() {
     let before = t.snapshot();
     // A real continuation includes the retained visible output in total input.
     // Keep that measured quantity, rather than an inconsistent nominal 3900.
-    let next_input = t.retired + 1700 - t.summary;
+    let next_input = t.history.retired + 1700 - t.history.summary;
     for (at, input, traditional_input, cached) in [
         (101, next_input, 1700, 0),
         (102, next_input + 100, 1800, 1700),
@@ -892,7 +1479,15 @@ fn receipt_traditional_summary_is_cold_once_then_warms_its_own_prefix() {
         ..Trajectory::default()
     };
     let mut b = body();
+    // This test owns charged in-window summary/cache behavior, not unknown
+    // first-window initialization. Preserve its paid-summary assertions.
+    t.primary(&b, &terminal(2800, 0, 0, 0), "route", 99, true);
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"in-window growth"}));
     t.primary(&b, &terminal(3000, 3000, 0, 0), "route", 100, true);
+    assert_eq!(t.snapshot().initial_compactions, 0);
     assert_eq!(t.snapshot().traditional_compactions, 1);
     let before = t.snapshot();
     let mut t: Trajectory = serde_json::from_value(state(&t)).unwrap();
@@ -942,6 +1537,8 @@ fn receipt_unknown_scenario_cache_policy_stays_uncached_and_unknown_rates_stay_u
         .unwrap()
         .minimum_prefix_tokens = None;
     let mut t = Trajectory::default();
+    // A genuine equal-token rewrite keeps this a divergent-forecast control.
+    t.projected(100, 100, true);
     let mut b = body();
     for at in 100..102 {
         b["input"]
@@ -1072,12 +1669,8 @@ fn receipt_fixed_body_changes_both_branches_and_both_actual_lanes() {
             "actual primary must use native partitions"
         );
         assert!(
-            (primary.traditional_cost
-                - scenario_input_cost("gpt-6.1-sol", input, 0, Some(1024)).unwrap()
-                - scenario_output_cost_resolved("gpt-6.1-sol", input, 10, None).unwrap())
-            .abs()
-                < 1e-12,
-            "the counterfactual must share the native input basis, not unchanged JSON tokens"
+            (primary.traditional_cost - expected).abs() < 1e-12,
+            "identical execution shares native money, not imagined cache partitions"
         );
         t.reviewer(&body(), &r, true);
         assert!(
@@ -1184,8 +1777,7 @@ fn receipt_discontinuities_never_attribute_a_removal_or_sibling_suffix() {
     }
 }
 
-#[test]
-fn receipt_bounded_anchor_restart_and_legacy_window_do_not_reprice_history() {
+fn receipt_many_appends() -> Trajectory {
     let mut t = Trajectory::default();
     let mut b = body();
     for n in 0..32 {
@@ -1195,40 +1787,99 @@ fn receipt_bounded_anchor_restart_and_legacy_window_do_not_reprice_history() {
             .push(json!({"role":"user","content":"private-canary ".repeat(1000)}));
         t.primary(&b, &terminal(2000 + n, 0, 0, 0), "route", 100 + n, true);
     }
+    t
+}
+
+#[test]
+fn receipt_bounded_anchor_restart_does_not_reprice_history() {
+    let t = receipt_many_appends();
     let receipt = state(&t)["receipts"].clone();
+    let events = &receipt["modeled_cache"]["writes"];
+    assert!(events.as_array().unwrap().len() <= 128);
+    assert!(serde_json::to_vec(events).unwrap().len() < 8192);
     assert!(
-        serde_json::to_vec(&receipt).unwrap().len() < 2048,
-        "one bounded numeric anchor, no prompt archive"
+        serde_json::to_vec(&receipt).unwrap().len() < 16384,
+        "bounded numeric anchors and modeled extents, no prompt archive"
     );
     assert!(!receipt.to_string().contains("private-canary"));
-    let mut legacy = state(&t);
-    legacy.as_object_mut().unwrap().remove("receipts");
-    let mut old: Trajectory = serde_json::from_value(legacy.clone()).unwrap();
-    let before = old.snapshot();
-    let old_public = serde_json::to_value(old.snapshot().dashboard(false)).unwrap();
-    assert_eq!(old_public["accounting_basis"], "legacy_json_v1");
+    let resumed: Trajectory = serde_json::from_value(state(&t)).unwrap();
+    assert_eq!(state(&resumed)["receipts"], receipt);
+    assert_eq!(resumed.snapshot().carry_cost, t.snapshot().carry_cost);
     assert_eq!(
-        old_public["counterfactual_basis"],
-        "legacy_local_json_projection"
+        resumed.snapshot().traditional_cost,
+        t.snapshot().traditional_cost
     );
-    let mut totals = DashboardTotals::default();
-    totals.observe(&old.snapshot().dashboard(false));
-    totals.observe(&t.snapshot().dashboard(false));
-    let current = serde_json::to_value(t.snapshot().dashboard(false)).unwrap();
-    assert_eq!(current["accounting_basis"], "receipt_anchored_v2");
-    let total = serde_json::to_value(totals).unwrap();
-    assert_eq!(total["included_sessions"], 1);
-    assert_eq!(total["legacy_sessions"], 1);
-    assert_eq!(total["carry_cost"], current["carry_cost"]);
-    old.begin_receipt_window();
-    old.primary(&body(), &terminal(100_000, 0, 0, 3), "route", 200, true);
-    let public = serde_json::to_value(old.snapshot().dashboard(false)).unwrap();
-    assert_eq!(public["accounting_basis"], "receipt_anchored_v2");
+}
+
+// Current-receipt replacement for the retired local-JSON omission/summary
+// controls. Missing quantities omit the pair, not future paid-summary work.
+#[test]
+fn receipt_priced_subset_recovers_into_paid_summary_after_unknown_quantities() {
+    let mut t = Trajectory {
+        scenario: Scenario {
+            context_window: 4000,
+            reserve: 100,
+            keep_recent: 1500,
+            summary: 100,
+        },
+        ..Trajectory::default()
+    };
+    let mut b = body();
+    t.primary(&b, &terminal(1000, 0, 0, 0), "route", 100, true);
+    t.reviewer(&b, &terminal(1000, 0, 0, 0), true);
+    let before = t.snapshot();
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"unknown attempt"}));
+    t.primary(
+        &b,
+        &json!({"status":"completed","output":[]}),
+        "route",
+        101,
+        true,
+    );
+    let omitted = t.snapshot();
+    assert!(omitted.priced);
+    assert_eq!(omitted.matched_primary_responses, 1);
+    assert_eq!(omitted.excluded_unpriced_calls, 1);
+    assert_eq!(omitted.carry_cost, before.carry_cost);
+    assert_eq!(omitted.traditional_cost, before.traditional_cost);
+    assert_eq!(omitted.reviewer_cost, before.reviewer_cost);
+    assert!(state(&t)["receipts"]["anchor"].is_null());
+    assert_eq!(state(&t)["receipts"]["modeled_cache"]["writes"], json!([]));
+    t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+    let mut growing = terminal(3800, 0, 0, 1000);
+    growing["output"] = json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible ".repeat(1000)}]}]);
+    t.primary(&b, &growing, "route", 102, true);
+    let summary = t.snapshot();
+    assert_eq!(summary.coverage.primary_responses, 3);
+    assert_eq!(summary.matched_primary_responses, 2);
+    assert_eq!(summary.excluded_unpriced_calls, 1);
+    assert_eq!(summary.initial_compactions, 0);
+    assert_eq!(summary.traditional_compactions, 1);
+    assert!(summary.summary_cost > 0.0);
+    assert!((summary.observed_primary_cost - (4800.0 * 2.0 + 1000.0 * 10.0) / 1e6).abs() < 1e-12);
     assert_eq!(
-        public["legacy_estimate"]["carry_cost"], before.carry_cost,
-        "legacy sums remain separate, never repriced or blended"
+        summary.observed_reviewer_cost,
+        before.observed_reviewer_cost
     );
-    assert_eq!(public["matched_primary_responses"], 1);
+    assert_eq!(t.history.last_traditional_input, 1600);
+    let next_native = t.history.retired + 1700 - t.history.summary;
+    t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .extend(growing["output"].as_array().unwrap().iter().cloned());
+    b["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"post-summary continuation"}));
+    t.primary(&b, &terminal(next_native, 0, 0, 0), "route", 103, true);
+    assert_eq!(t.snapshot().matched_primary_responses, 3);
+    assert_eq!(t.snapshot().traditional_compactions, 1);
+    assert_eq!(t.snapshot().summary_cost, summary.summary_cost);
+    assert_eq!(t.history.last_traditional_input, 1700);
 }
 
 #[test]

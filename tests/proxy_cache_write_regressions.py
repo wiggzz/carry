@@ -4,6 +4,8 @@ No-write requests explicitly disable implicit caching and supply no breakpoints.
 Default/implicit GPT-5.6+ caching can charge writes: separate positive controls
 must preserve those charges. All receipts are synthetic, not live tariff proof.
 """
+import copy
+import json
 import unittest
 
 import proxy_state_regressions as support
@@ -19,6 +21,113 @@ class CacheWriteRegressions(unittest.TestCase):
 
     def cleanup_harness(self):
         self.assertTrue(self.harness.doCleanups(), "nested fixture cleanup failed")
+
+    def summary_policy_control(self, *, migrate, migrate_at=1, requests=3):
+        """Real producer/restart; native totals deliberately differ from wire size."""
+        def primary(_body, n):
+            response = support.completed(response_id=f"summary-policy-{n}")
+            response["usage"] = {
+                "input_tokens": 300000 + (n - 1) * 100, "output_tokens": 0,
+                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}
+            return 200, response
+
+        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected review"))
+        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
+        history = [{"role": "user", "content": "synthetic large native receipt"}]
+        snapshots = []
+        for index in range(requests):
+            if index:
+                if migrate and index == migrate_at:
+                    path = next(self.harness.state.glob("*.json"))
+                    saved = json.loads(path.read_text())
+                    # Future version is fixture metadata, not an implemented tariff.
+                    saved["model_resolution"]["primary"]["scenario_cache_policy"]["version"] = 3
+                    path.write_text(json.dumps(saved))
+                history.append({"role": "user", "content": f"append {index}"})
+            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+                                  extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
+            self.harness.stack.callback(proxy.close)
+            self.assertEqual(proxy.send(history, model="gpt-6.1-sol")[0], 200)
+            status, stats = proxy.request("GET", "/carry/dashboard/stats")
+            self.assertEqual(status, 200)
+            self.assertEqual(len(stats["sessions"]), 1)
+            saved = proxy.saved()
+            snapshots.append(copy.deepcopy({
+                "estimate": stats["sessions"][0]["cost_estimate"],
+                "trajectory": saved["cost_trajectory"]}))
+            self.assertEqual(saved["compactions"], 0)
+            self.assertEqual(fixture.primaries[-1]["input"], history)
+            proxy.close()
+        self.evidence.update(summary_policy_snapshots=snapshots,
+                             primaries=fixture.primaries, reviews=fixture.reviews)
+        self.assertEqual(len(fixture.primaries), requests)
+        self.assertEqual(fixture.reviews, [])
+        return snapshots
+
+    def assert_summary_survives_policy(self, snapshots, *, migrate):
+        first, second, third = snapshots
+        self.assertEqual(first["trajectory"]["retired"], 280000)
+        self.assertEqual(first["trajectory"]["summary"], 1000)
+        self.assertEqual(first["trajectory"]["last_traditional_input"], 21000)
+        for index, snapshot in enumerate(snapshots):
+            estimate = snapshot["estimate"]
+            self.assertEqual(estimate["initial_compactions"], 1,
+                             "cache-only policy changes must not resurrect retired history")
+            self.assertEqual(estimate["traditional_compactions"], 0)
+            self.assertEqual(estimate["summary_cost"], 0.0)
+            self.assertEqual(estimate["summary_cost"], first["estimate"]["summary_cost"])
+            self.assertEqual(snapshot["trajectory"]["retired"], 280000)
+            self.assertEqual(snapshot["trajectory"]["summary"], 1000)
+            self.assertEqual(estimate["matched_primary_responses"], index + 1)
+            self.assertEqual(estimate["excluded_unpriced_calls"], 0)
+        # Free initialization precedes the first primary, so its next append is
+        # warm unless the policy changes. The transition alone makes it cold.
+        self.assertAlmostEqual(second["estimate"]["traditional_cost"] - first["estimate"]["traditional_cost"],
+                               (21100 * 2.5 if migrate else 21000 * 0.1 + 100 * 2.5) / 1e6,
+                               places=12)
+        self.assertAlmostEqual(third["estimate"]["traditional_cost"] - second["estimate"]["traditional_cost"],
+                               (21100 * 0.1 + 100 * 2.5) / 1e6, places=12)
+        boundaries = second["estimate"]["cache_policy_boundaries"]
+        self.assertEqual(len(boundaries), int(migrate))
+        if migrate:
+            self.assertEqual(boundaries[0]["previous_version"], 2)
+            self.assertEqual(boundaries[0]["next_version"], 3)
+            self.assertEqual(boundaries[0]["cumulative"]["traditional_cost"], first["estimate"]["traditional_cost"])
+            self.assertEqual(third["estimate"]["cache_policy_boundaries"], boundaries)
+
+    def test_summary_continuity_unchanged_policy_restart(self):
+        self.assert_summary_survives_policy(self.summary_policy_control(migrate=False), migrate=False)
+
+    def test_summary_continuity_cache_policy_migration_restart(self):
+        self.assert_summary_survives_policy(self.summary_policy_control(migrate=True), migrate=True)
+
+    def test_warm_summary_policy_transition_cold_once_then_warm_restart(self):
+        snapshots = self.summary_policy_control(migrate=True, migrate_at=3, requests=5)
+        first = snapshots[0]
+        for snapshot in snapshots:
+            self.assertEqual(snapshot["estimate"]["initial_compactions"], 1)
+            self.assertEqual(snapshot["estimate"]["traditional_compactions"], 0)
+            self.assertEqual(snapshot["estimate"]["summary_cost"], 0.0)
+            self.assertEqual(snapshot["estimate"]["summary_cost"], first["estimate"]["summary_cost"])
+            self.assertEqual(snapshot["trajectory"]["retired"], 280000)
+            self.assertEqual(snapshot["trajectory"]["summary"], 1000)
+        # The summarized branch is already warm before the transition. Thus its
+        # cold request cannot be explained by traditional_edited from a summary.
+        for index, expected in [
+            (2, (21100 * 0.1 + 100 * 2.5) / 1e6),
+            (3, 21300 * 2.5 / 1e6),
+            (4, (21300 * 0.1 + 100 * 2.5) / 1e6),
+        ]:
+            self.assertAlmostEqual(
+                snapshots[index]["estimate"]["traditional_cost"]
+                - snapshots[index - 1]["estimate"]["traditional_cost"],
+                expected, places=12)
+        self.assertFalse(snapshots[2]["estimate"]["cache_policy_boundaries"])
+        boundary = snapshots[3]["estimate"]["cache_policy_boundaries"]
+        self.assertEqual(len(boundary), 1)
+        self.assertEqual(boundary[0]["cumulative"]["traditional_cost"],
+                         snapshots[2]["estimate"]["traditional_cost"])
+        self.assertEqual(snapshots[4]["estimate"]["cache_policy_boundaries"], boundary)
 
     def run_control(self, inputs, *, restart=False, omit_write=False, paid_write=False):
         options = {"mode": "implicit" if paid_write else "explicit", "ttl": "30m"}
@@ -151,8 +260,16 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertAlmostEqual(saved["primary"]["cost_usd"], expected, places=12)
             self.assertEqual(estimate["unavailable_primary_cost_calls"], int(index > 0))
             self.assertAlmostEqual(estimate["observed_primary_cost"], expected, places=12)
-            self.assertIsNone(estimate["traditional_cost"])
-            self.assertIsNone(estimate["savings"])
+            # An unavailable paid-write tariff omits that receipt, not the
+            # independent native cursor or proof of identical primary histories.
+            # The later zero-write hit is known at its own dispatch; admitting it
+            # must neither backfill the unsupported write nor reprice old money.
+            unknown = int(index > 0)
+            self.assertEqual(estimate["matched_primary_responses"], index + 1 - unknown)
+            self.assertEqual(estimate["excluded_unpriced_calls"], unknown)
+            self.assertAlmostEqual(estimate["carry_cost"], expected, places=12)
+            self.assertAlmostEqual(estimate["traditional_cost"], expected, places=12)
+            self.assertEqual(estimate["savings"], 0.0)
             proxy.close()
 
     def test_breakpoint_override_and_mixed_lifetimes_keep_money_unknown_across_restart(self):
@@ -199,8 +316,11 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertAlmostEqual(saved["primary"]["cost_usd"], expected, places=12)
             self.assertEqual(estimate["unavailable_primary_cost_calls"], unknown)
             self.assertAlmostEqual(estimate["observed_primary_cost"], expected, places=12)
-            self.assertIsNone(estimate["traditional_cost"])
-            self.assertIsNone(estimate["savings"])
+            self.assertEqual(estimate["matched_primary_responses"], index + 1 - unknown)
+            self.assertEqual(estimate["excluded_unpriced_calls"], unknown)
+            self.assertAlmostEqual(estimate["carry_cost"], expected, places=12)
+            self.assertAlmostEqual(estimate["traditional_cost"], expected, places=12)
+            self.assertEqual(estimate["savings"], 0.0)
             proxy.close()
 
     def test_typed_tool_output_lifetimes_preserve_money_across_restart(self):
@@ -248,8 +368,11 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertAlmostEqual(saved["primary"]["cost_usd"], expected, places=12)
             self.assertEqual(estimate["unavailable_primary_cost_calls"], unknown)
             self.assertAlmostEqual(estimate["observed_primary_cost"], expected, places=12)
-            self.assertIsNone(estimate["traditional_cost"])
-            self.assertIsNone(estimate["savings"])
+            self.assertEqual(estimate["matched_primary_responses"], index + 1 - unknown)
+            self.assertEqual(estimate["excluded_unpriced_calls"], unknown)
+            self.assertAlmostEqual(estimate["carry_cost"], expected, places=12)
+            self.assertAlmostEqual(estimate["traditional_cost"], expected, places=12)
+            self.assertEqual(estimate["savings"], 0.0)
             proxy.close()
 
     def test_branch_specific_summary_tiers_and_cache_survive_restart(self):
@@ -313,8 +436,8 @@ class CacheWriteRegressions(unittest.TestCase):
                     proxy.close()
                     if index == 0:
                         path = next(self.harness.state.glob("*.json"))
-                        saved["cost_trajectory"]["scenario"] = {"context_window":4000,
-                            "reserve":100,"keep_recent":1500,"summary":100}
+                        support.stage_comparison_scenario(saved, {"context_window":4000,
+                            "reserve":100,"keep_recent":1500,"summary":100})
                         path.write_text(json.dumps(saved))
                 self.assertEqual(fixture.reviews, [])
 

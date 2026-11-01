@@ -240,10 +240,10 @@ fn adapted_wire_cache_prefix_protects_cached_native_members_not_canonical_positi
     crate::proxy_cache::observe(
         &mut session.upstream_cache,
         &cached,
-        &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":9000}}),
+        &json!({"input_tokens":10000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":10000}}),
         Some(&model),
         &config.primary_cache_auth,
-        now(),
+        crate::proxy_cache::ObservationTime::during(now(), now()),
     );
     assert_eq!(session.upstream_cache.len(), 1);
     assert_eq!(session.upstream_cache[0].input_len, 2);

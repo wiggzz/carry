@@ -100,6 +100,16 @@ Carry's live web UI and the offline report use the same estimator. Consult the
 report's coverage and scenario labels rather than treating its percentage as a
 billing claim.
 
+Native `model_response` records price only the validated provider receipt in
+`data.raw.usage`; `data.usage` is a lossy display projection, not a fallback when
+native usage is absent or invalid. A complete all-zero receipt is known zero;
+an absent receipt is unpriced. Intentionally normalized trace producers must
+set `data.usage_source` to `"normalized"` to price `data.usage` under that explicit
+contract. They may retain `data.raw.output` for prompt-growth projection. A
+missing or unrecognized usage source keeps the native-receipt contract; it does
+not infer normalized authority from receipt absence. Existing archived figures
+above are historical and are not repriced by this contract change.
+
 ## Interpretation
 
 This archive motivates evaluating repeated, interactive work rather than

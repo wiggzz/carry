@@ -84,6 +84,14 @@ async fn admission_effective_env_policy_cli_precedence_and_actual_forwarding() {
         )
         .await;
         assert!(response.status().is_success());
+        // Headers are not primary completion: consume EOF before inspecting
+        // durable counters, otherwise dropping the body can cancel the request.
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            body,
+            json!({"id":"admission-primary","status":"completed","output":[],
+            "usage":{"input_tokens":10,"output_tokens":1}})
+        );
     }
     let metrics: serde_json::Value = reqwest::Client::new()
         .get(format!("{url}/carry/metrics"))
