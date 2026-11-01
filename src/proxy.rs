@@ -4151,6 +4151,7 @@ mod tests {
         include!("proxy_catalog_tests.rs");
     }
     include!("proxy_catalog_isolation_tests.rs");
+    include!("proxy_qualified_producer_tests.rs");
     include!("proxy_settlement_tests.rs");
     mod namespace_controls {
         include!("proxy_namespace_tests.rs");

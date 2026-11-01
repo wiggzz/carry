@@ -85,6 +85,12 @@ class DispatchClock(unittest.TestCase):
         original = {'start': 0, 'end': 21100, 'at': clock['expires'] - 1800,
                     'lifetime': 1800}
         cache['writes'] = [original]
+        # This tracer isolates the non-refreshing dispatch clock. Qualified 30m
+        # reads now legitimately have separate coverage (tested independently).
+        # Declare a frozen synthetic custom policy and stage ONLY a point write,
+        # not a fresh read left over from this fixture's earlier setup request.
+        cache.pop('reads', None)
+        staged['model_resolution']['primary']['scenario_cache_policy']['ttl_seconds'] = 1799
         cache.pop('unresolved', None)
         checkpoint = next(self.harness.state.glob('*.json'))
         checkpoint.write_text(json.dumps(staged))
