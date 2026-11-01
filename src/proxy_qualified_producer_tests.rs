@@ -48,7 +48,9 @@ async fn synthetic_qualified_terminal_restart(sse: bool) {
     )
     .unwrap()
     .with_scenario_cache_policy();
-    let rates = resolved.rates.unwrap();
+    // Catalog rates are dollars per million; settlement consumes this owner's
+    // input-tier-qualified dollars-per-token conversion.
+    let rates = resolved.rates_for_input(5000.0).unwrap();
     initial.config.model_resolution = Some(ResolvedPair {
         schema_version: 1,
         primary: resolved.clone(),
