@@ -437,29 +437,36 @@ async fn frozen_primary_is_independent_of_unresolved_reviewer_after_restart() {
                 let label = format!(
                     "unknown_reviewer={unknown_reviewer},missing_discovery={missing_discovery},unknown_price={unknown_price}"
                 );
-                let expected_status = if unknown_price { 200 } else { 413 };
+                let expected_status = 200;
                 if status != expected_status {
                     failures.push(format!(
                         "{label}: expected HTTP {expected_status}, got {status}"
                     ));
                 }
-                if f.primary_calls.load(Ordering::SeqCst)
-                    != before_calls + usize::from(unknown_price)
-                {
+                if f.primary_calls.load(Ordering::SeqCst) != before_calls + 1 {
                     failures.push(format!("{label}: oversized upstream arrival count changed"));
                 }
                 body["max_output_tokens"] = json!(10);
                 assert_eq!(send(&url, "independent-contract", &body).await, 200);
+                assert_eq!(
+                    f.primary_calls.load(Ordering::SeqCst),
+                    before_calls + 2,
+                    "both oversized and fitting attempts must actually reach upstream"
+                );
                 let (_, after) = saved(state.path());
                 if after["model_resolution"]["primary"] != primary {
                     failures.push(format!("{label}: valid primary contract was replaced"));
                 }
                 let delta = after["primary"]["cost_usd"].as_f64().unwrap() - before_cost;
-                let expected = if unknown_price { 0.0 } else { 721.0 / 1e6 };
+                let expected = if unknown_price {
+                    0.0
+                } else {
+                    2.0 * 721.0 / 1e6
+                };
                 if (delta - expected).abs() > 1e-12 {
                     failures.push(format!("{label}: frozen tariff changed"));
                 }
-                let completed = 1 + u64::from(unknown_price);
+                let completed = 2;
                 if f.primary_calls.load(Ordering::SeqCst) != before_calls + completed as usize
                     || after["primary"]["calls"] != before_recorded_calls + completed
                 {
@@ -493,7 +500,7 @@ async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
     let (_, checkpoint) = saved(state.path());
     assert_eq!(
         checkpoint["last_plan"]["primary_context_tokens"], 40000,
-        "catalog capacity must reach the real admission gate"
+        "catalog capacity must guide planning without blocking provider admission"
     );
     assert_eq!(checkpoint["last_plan"]["reviewer_context_tokens"], 6000);
     assert_dashboard_capacity(&url, 40000, 6000).await;
@@ -501,21 +508,27 @@ async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
         checkpoint["model_resolution"]["primary"]["capacity_tokens"],
         40000
     );
-    let input = checkpoint["last_plan"]["primary_estimated_tokens"]
-        .as_f64()
-        .unwrap() as u64;
-    for (delta, status) in [(-1, 200), (0, 200), (1, 413)] {
+    let input = checkpoint["last_primary_dispatch"]["receipt_input_tokens"]
+        .as_u64()
+        .unwrap();
+    for delta in [-1, 0, 1] {
         body["max_output_tokens"] = json!((40000 - input) as i64 + delta);
         let before = f.primary_calls.load(Ordering::SeqCst);
         assert_eq!(
             send(&url, "one", &body).await,
-            status,
-            "exact capacity boundary delta={delta}"
+            200,
+            "estimated capacity boundary delta={delta} must not block primary dispatch"
         );
+        assert_eq!(f.primary_calls.load(Ordering::SeqCst), before + 1);
+        let (_, after) = saved(state.path());
         assert_eq!(
-            f.primary_calls.load(Ordering::SeqCst),
-            before + usize::from(status == 200)
+            after["last_plan"]["primary_required_tokens"]
+                .as_f64()
+                .unwrap(),
+            (40000 + delta) as f64,
+            "planning still accounts for the actual native input and output reserve"
         );
+        assert_eq!(after["last_plan"]["primary_fits"], delta <= 0);
     }
     assert_eq!(
         f.metadata_calls.load(Ordering::SeqCst),
@@ -523,22 +536,34 @@ async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
         "no candidate/request metadata fetch loop"
     );
     let (path, checkpoint) = saved(state.path());
-    let before_cost = checkpoint["primary"]["cost_usd"].clone();
+    let before_cost = checkpoint["primary"]["cost_usd"].as_f64().unwrap();
+    let primary_contract = checkpoint["model_resolution"]["primary"].clone();
+    let rates = &primary_contract["rates"];
+    let receipt_cost =
+        (100.0 * rates["input"].as_f64().unwrap() + rates["output"].as_f64().unwrap()) / 1e6;
     drop(child);
     f.metadata.lock().await["models"][0]["context_window"] = json!(60000);
     let (child, url) = start(f.home.path(), state.path(), f.address, true, &[]).await;
     body["max_output_tokens"] = json!(40001 - input);
+    let before_calls = f.primary_calls.load(Ordering::SeqCst);
     assert_eq!(
         send(&url, "one", &body).await,
-        413,
-        "saved route epoch must not silently adopt new metadata"
+        200,
+        "the frozen capacity contract still cannot reject a primary request"
     );
+    assert_eq!(f.primary_calls.load(Ordering::SeqCst), before_calls + 1);
     assert_dashboard_capacity(&url, 40000, 6000).await;
     let (_, mut checkpoint) = saved(state.path());
-    assert_eq!(
-        checkpoint["primary"]["cost_usd"], before_cost,
-        "no historical repricing on restart"
+    assert!(
+        (checkpoint["primary"]["cost_usd"].as_f64().unwrap() - before_cost - receipt_cost).abs()
+            < 1e-12,
+        "restart adds only the new receipt, without repricing historical usage"
     );
+    assert_eq!(
+        checkpoint["model_resolution"]["primary"], primary_contract,
+        "saved route epoch must not silently adopt newly advertised capacity"
+    );
+    assert_eq!(checkpoint["last_plan"]["primary_fits"], false);
     assert_eq!(
         checkpoint["model_resolution"]["primary"]["capacity_tokens"],
         40000
@@ -550,11 +575,13 @@ async fn advertised_capacity_controls_real_dispatch_and_survives_restart() {
         .remove("model_resolution");
     std::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
     let (_child, url) = start(f.home.path(), state.path(), f.address, true, &[]).await;
+    let before_calls = f.primary_calls.load(Ordering::SeqCst);
     assert_eq!(
         send(&url, "one", &body).await,
         200,
         "missing historical contract resolves forward policy from the catalog without repricing history"
     );
+    assert_eq!(f.primary_calls.load(Ordering::SeqCst), before_calls + 1);
     let (_, checkpoint) = saved(state.path());
     assert_eq!(checkpoint["last_plan"]["primary_context_tokens"], 60000);
     assert_dashboard_capacity(&url, 60000, 6000).await;

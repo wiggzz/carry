@@ -439,6 +439,8 @@ pub(super) fn planned(service: &Service, id: &str, request_id: &str, report: &Va
         "primary_fits",
         "reviewer_fits",
         "primary_estimated_tokens",
+        "primary_input_basis",
+        "primary_admission",
         "reviewer_estimated_tokens",
         "primary_required_tokens",
         "reviewer_required_tokens",

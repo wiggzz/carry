@@ -54,13 +54,15 @@ class PlannerMarginalBaseline(unittest.TestCase):
 
         def primary(_body, n):
             response = completed(response_id=f"resp_marginal_{n}")
-            response["usage"]["input_tokens"] = 20000
-            response["usage"]["input_tokens_details"]["cached_tokens"] = 20000 if n == 2 or n >= 4 else 0
+            # The inherited removable block alone is about 24k text tokens.
+            # Native totals must cover it now that the planner uses receipts.
+            response["usage"]["input_tokens"] = 60000
+            response["usage"]["input_tokens_details"]["cached_tokens"] = 60000 if n == 2 or n >= 4 else 0
             # The first actual projected wire (R3) populates a whole-input
             # synthetic write. Later read receipts do not invent write timing
             # or refresh the deadline; the production dispatch/terminal owner
             # records that interval. Not a claim about real provider residency.
-            response["usage"]["input_tokens_details"]["cache_write_tokens"] = 20000 if n == 3 else 0
+            response["usage"]["input_tokens_details"]["cache_write_tokens"] = 60000 if n == 3 else 0
             return 200, response
 
         def review(body, n):
@@ -179,27 +181,31 @@ class PlannerMarginalBaseline(unittest.TestCase):
                 counts = len(fixture.primaries), len(fixture.reviews)
                 status, response = proxy.send(appended)
                 captured["audit_capacity_response"] = {"status": status, "body": response}
-                self.assertEqual(status, 413, "ACTUAL_AUDIT_CAPACITY: reject the actual oversized canonical wire")
-                self.assertEqual((len(fixture.primaries), len(fixture.reviews)), counts)
-                self.assertEqual({role: proxy.saved()[role] for role in before}, before)
+                self.assertEqual(status, 200,
+                                 "audit forwards canonical input even when only a compact projection was estimated to fit")
+                self.assertEqual((len(fixture.primaries), len(fixture.reviews)), (counts[0] + 1, counts[1] + 1))
+                self.assertEqual(fixture.primaries[-1]["input"], appended,
+                                 "audit must not borrow projection authority to fit a local estimate")
                 saved = proxy.saved()
+                self.assertEqual(saved["primary"]["calls"], before["primary"]["calls"] + 1)
+                self.assertEqual(saved["primary"]["input_tokens"], before["primary"]["input_tokens"] + 60000)
             captured.update(primaries=copy.deepcopy(fixture.primaries), decision_checkpoint=decision,
                             reviews=copy.deepcopy(fixture.reviews),
                             fixture_errors=copy.deepcopy(fixture.errors), final_checkpoint=saved)
             self.assertEqual(fixture.errors, [])
-            self.assertEqual(len(fixture.primaries), 9 if followups else (6 if audit_guard else 5))
+            self.assertEqual(len(fixture.primaries), 9 if followups else (7 if audit_guard else 5))
             calls = len(fixture.primaries)
             self.assertEqual(saved["primary"]["calls"], calls)
-            self.assertEqual(saved["primary"]["input_tokens"], 20000 * calls)
-            self.assertEqual(saved["primary"]["cached_tokens"], 20000 * (calls - 2))
-            self.assertEqual(saved["primary"]["cache_write_tokens"], 20000)
+            self.assertEqual(saved["primary"]["input_tokens"], 60000 * calls)
+            self.assertEqual(saved["primary"]["cached_tokens"], 60000 * (calls - 2))
+            self.assertEqual(saved["primary"]["cache_write_tokens"], 60000)
             self.assertEqual(saved["primary"]["output_tokens"], calls)
             self.assertEqual(saved["shadow"]["calls"], len(fixture.reviews))
             self.assertEqual(saved["shadow"]["input_tokens"], 100 * len(fixture.reviews))
             self.assertEqual(saved["shadow"]["output_tokens"], len(fixture.reviews))
             self.assertEqual(fixture.primaries[2]["input"], fixture.primaries[3]["input"],
                              "R3/R4 must actually transmit the same prior projection")
-            self.assertNotIn(history[1], fixture.primaries[3]["input"])
+            self.assertFalse(history[1] in fixture.primaries[3]["input"], "R4 must preserve the authorized large omission")
             self.assertIn(history[3], fixture.primaries[3]["input"])
             # Both possible outgoing projections must retain every other input
             # in order. Do not require the tiny edit: retaining it may be better.

@@ -9,6 +9,10 @@ pub(super) struct Receipts {
     pub(super) initialization_policy_version: Option<u32>,
     #[serde(default)]
     modeled_cache: crate::proxy_cache::ModeledCache,
+    // Initialization belongs to the observed comparison window, not to every
+    // later namespace change or known edit, which really can invalidate cache.
+    #[serde(default)]
+    cache_initialized: bool,
     #[serde(default)]
     pub scenario_cache_policy_version: Option<u32>,
     #[serde(default)]
@@ -22,6 +26,7 @@ impl Default for Receipts {
             anchor: None,
             initialization_policy_version: Some(1),
             modeled_cache: crate::proxy_cache::ModeledCache::default(),
+            cache_initialized: false,
             configuration: None,
             scenario_cache_policy_version: Some(carry::models::ScenarioCachePolicy::VERSION),
             last_appended_input: None,
@@ -38,7 +43,6 @@ struct Anchor {
     prefix: String,
     items: usize,
     input: u64,
-    local_input: u64,
     // Observation ordering for native append prediction, not cache write time.
     at: u64,
 }
@@ -152,35 +156,6 @@ fn has_unpriced_modalities(value: &Value) -> bool {
 }
 
 impl Trajectory {
-    pub fn receipt_prediction(
-        &self,
-        body: &Value,
-        route: &str,
-        resolved: Option<&ResolvedModel>,
-    ) -> Option<u64> {
-        let anchor = self.receipts.anchor.as_ref()?;
-        if !append_compatible(anchor, body, &configuration(body, route, resolved)) {
-            return None;
-        }
-        let items = body["input"].as_array()?;
-        if items.len() == anchor.items {
-            return Some(anchor.input);
-        }
-        if has_native_modalities(&json!(&items[anchor.items..])) {
-            // A receipt measured the old prefix, not a newly appended image.
-            // Never tokenize its URL/base64 and present that as image units.
-            return None;
-        }
-        let (_, _, local) = crate::savings::prompt_projection(body)?;
-        // Only the appended block is estimated. Never scale individual messages
-        // by a global calibration ratio or add billed/hidden output to input.
-        Some(
-            anchor
-                .input
-                .saturating_add(local.saturating_sub(anchor.local_input)),
-        )
-    }
-
     pub(super) fn observed_reviewer(
         &mut self,
         usage: &Value,
@@ -271,7 +246,6 @@ impl Trajectory {
             self.receipts.scenario_cache_policy_version = policy_version;
         }
         let model = body["model"].as_str().unwrap_or("");
-        let projection = crate::savings::prompt_projection(body);
         let (native, observed, billable) =
             self.record_primary_observation(body, response, standard, settled);
         let retained_output = retained_output_tokens(&response["output"]);
@@ -285,43 +259,37 @@ impl Trajectory {
             allowance,
             resolved.and_then(|r| r.capacity_tokens.map(u64::from)),
         );
-        // An unchanged image-bearing request can share its exact receipt total
-        // between both branches. A projected/restored/summary slice cannot use
-        // base64 length or an invented per-image allocation as native tokens.
-        let image_input = has_native_modalities(body);
-        let image_comparable = !image_input
-            || (!self.carry_edited
-                && self.restored == 0
+        // Opaque native input can share a receipt or a whole measured-block
+        // projection, never a ciphertext/base64 length. Summaries still lack a
+        // native allocation for an arbitrary opaque retained slice.
+        let opaque = crate::savings::prompt_has_opaque(body);
+        let opaque_comparable = !opaque
+            || (self.projection_known
                 && self.history.retired == 0
                 && self.history.summary == 0
                 && native
                     .as_ref()
                     .zip(retained_output)
-                    .is_some_and(|(u, retained)| {
+                    .is_some_and(|(usage, retained)| {
+                        let traditional = (usage.input_tokens as i128 + self.restored)
+                            .clamp(0, u64::MAX as i128)
+                            as u64;
                         !self.scenario.valid()
-                            || (u.input_tokens <= budget
-                                && u.input_tokens.saturating_add(retained)
-                                    <= self.scenario.context_window - self.scenario.reserve)
+                            || (traditional <= budget
+                                && traditional.saturating_add(retained)
+                                    <= self
+                                        .scenario
+                                        .context_window
+                                        .saturating_sub(self.scenario.reserve))
                     }));
-        if !billable || !image_comparable || retained_output.is_none() {
+        if !billable || !self.projection_known || !opaque_comparable || retained_output.is_none() {
             self.result.coverage.unmodeled_calls += 1;
             self.result.excluded_unpriced_calls += 1;
             self.reset_epoch();
             return;
         }
-        let (
-            Some(native),
-            Some((_, _, local)),
-            Some(items),
-            Some(retained_output),
-            Some(protected),
-        ) = (
-            native,
-            projection,
-            body["input"].as_array(),
-            retained_output,
-            crate::savings::protected_prompt_tokens(body),
-        )
+        let (Some(native), Some(items), Some(retained_output)) =
+            (native, body["input"].as_array(), retained_output)
         else {
             self.result.excluded_unpriced_calls += 1;
             self.reset_epoch();
@@ -355,7 +323,13 @@ impl Trajectory {
             .map(|a| native.input_tokens - a.input);
         let mut traditional = self.history.input(native.input_tokens, self.restored);
 
-        let fixed = projection_fixed_tokens(body);
+        // Native totals decide whether a hypothetical summary is needed.
+        // Count its protected slice only when that decision needs the floor.
+        let protected = if self.scenario.valid() && !history_compatible && traditional > budget {
+            crate::savings::protected_prompt_tokens(body).unwrap_or(0)
+        } else {
+            0
+        };
         let initialized_now = match self.scenario.initial_compaction(
             history_compatible,
             traditional,
@@ -409,6 +383,21 @@ impl Trajectory {
         if cache_policy_changed || self.traditional_edited {
             cache.clear();
         }
+        if !self.receipts.cache_initialized
+            && !self.traditional_edited
+            && mode == carry::models::ScenarioCacheMode::Implicit
+            && ttl > 0
+        {
+            let inherited = self.result.cache_initializations.prefix(
+                traditional,
+                minimum,
+                self.history
+                    .is_identical()
+                    .then_some(native.cached_input_tokens),
+            );
+            cache.inherit(cache_scope.clone(), at, ttl, inherited);
+        }
+        self.receipts.cache_initialized = true;
         let cached = if mode == carry::models::ScenarioCacheMode::Implicit {
             cache
                 .eligible_at(&cache_scope, at, traditional)
@@ -424,7 +413,8 @@ impl Trajectory {
         };
         // Identical execution has one paid contribution. Only a genuinely
         // different history asks the cache/tariff forecast a hypothetical price.
-        // Sharing the money does NOT seed divergent cache history with real hits.
+        // Only an identical initial prompt inherits real cache evidence. After
+        // divergence the modeled branch evolves independently of native hits.
         let pair = self.history.price_primary(observed, || {
             scenario_request_input_cost_resolved(
                 body,
@@ -449,6 +439,17 @@ impl Trajectory {
         // Only the explicit semantic projection can enter this estimate;
         // opaque transport size and billed output are not retained input units.
         let total = traditional.saturating_add(retained_output);
+        let fixed = if self.scenario.valid()
+            && total
+                > self
+                    .scenario
+                    .context_window
+                    .saturating_sub(self.scenario.reserve)
+        {
+            projection_fixed_tokens(body)
+        } else {
+            0
+        };
         let kept = match self
             .scenario
             .response_compaction(traditional, retained_output, fixed)
@@ -515,7 +516,6 @@ impl Trajectory {
             prefix: digest(items),
             items: items.len(),
             input: native.input_tokens,
-            local_input: local,
             at,
         };
         let receipts = &mut self.receipts;

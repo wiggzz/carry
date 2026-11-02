@@ -180,3 +180,40 @@ fn capacity_ordinary_target_and_legacy_modeled_rates_are_separate() {
         0
     );
 }
+
+#[test]
+fn forecast_cache_population_rates_follow_route_without_mutating_frozen_tariffs() {
+    for (endpoint, subscription) in [
+        ("https://api.openai.com/v1/responses", false),
+        ("https://chatgpt.com/backend-api/codex/responses", true),
+        ("http://127.0.0.1:12345/responses", true),
+        ("https://gateway.invalid/v1/responses", false),
+    ] {
+        let resolved = resolve_model(
+            "gpt-6.1-sol",
+            Route::new(endpoint, subscription),
+            None,
+            None,
+            0,
+            0,
+        )
+        .unwrap();
+        let frozen = serde_json::to_value(&resolved).unwrap();
+        for input in [2000.0, 300000.0] {
+            let native = resolved.rates_for_input(input).unwrap();
+            let forecast = resolved.forecast_rates_for_input(input).unwrap();
+            assert_eq!(forecast.input, native.input);
+            assert_eq!(forecast.cached, native.cached);
+            assert_eq!(forecast.output, native.output);
+            assert_eq!(
+                forecast.write,
+                if subscription {
+                    native.input
+                } else {
+                    native.write
+                }
+            );
+        }
+        assert_eq!(serde_json::to_value(&resolved).unwrap(), frozen);
+    }
+}

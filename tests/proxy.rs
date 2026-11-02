@@ -1775,11 +1775,22 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
             post(move |axum::Json(body): axum::Json<serde_json::Value>| {
                 let captured = captured.clone();
                 async move {
+                    let seed = body["input"].as_array().unwrap().len() == 1;
+                    let input_tokens = if seed {
+                        100
+                    } else if body.to_string().contains("DISCARD_SOURCE_PAYLOAD_") {
+                        20000
+                    } else {
+                        2000
+                    };
                     captured.lock().await.push(body);
+                    let output = if seed { json!([]) } else {
+                        json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}])
+                    };
                     axum::Json(json!({
                         "id": "resp_fixture", "status": "completed",
-                        "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}],
-                        "usage": {"input_tokens": 20000, "output_tokens": 1, "input_tokens_details": {"cached_tokens": 0}}
+                        "output": output,
+                        "usage": {"input_tokens": input_tokens, "output_tokens": 1, "input_tokens_details": {"cached_tokens": 0}}
                     }))
                 }
             }),
@@ -1822,12 +1833,20 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let temp = tempfile::tempdir().unwrap();
-    // This fixture tests exposure earned by a live primary, not replay import.
+    // Live primary receipts measure the whole opaque cohort. Capacity relief
+    // exercises semantic authority without assuming reviewer opaque quantities.
     let (_proxy, url) = start_proxy_options(
         temp.path(),
         address,
         "compact",
-        &["--bootstrap-min-input-bytes", "8388608"],
+        &[
+            "--bootstrap-min-input-bytes",
+            "8388608",
+            "--primary-context-tokens",
+            "16000",
+            "--primary-output-reserve-tokens",
+            "1",
+        ],
         "",
     )
     .await;
@@ -1842,7 +1861,19 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         {"role": "user", "content": "finish original task"}
     ]);
     let client = reqwest::Client::new();
-    let request = json!({"model": "gpt-6-luna", "input": input, "store": false});
+    let full_request = json!({"model": "gpt-6-luna", "input": input, "store": false});
+    let mut request = full_request.clone();
+    request["input"].as_array_mut().unwrap().pop();
+    let seed = json!({"model":"gpt-6-luna","input":[request["input"][0].clone()],"store":false});
+    let response = client
+        .post(format!("{url}/v1/responses"))
+        .header("x-carry-session", "fixture-session")
+        .json(&seed)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    response.bytes().await.unwrap();
     let first: serde_json::Value = client
         .post(format!("{url}/v1/responses"))
         .header("x-carry-session", "fixture-session")
@@ -1853,12 +1884,12 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         .json()
         .await
         .unwrap();
-    assert_eq!(primary.lock().await[0], request);
+    assert_eq!(primary.lock().await[1], request);
     assert!(
         shadow.lock().await.is_empty(),
         "unexposed groups cannot be reviewed"
     );
-    let mut second = request.clone();
+    let mut second = full_request;
     second["input"]
         .as_array_mut()
         .unwrap()
@@ -1879,7 +1910,7 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     settled(temp.path()).await;
     assert_eq!(shadow.lock().await.len(), 1);
     assert!(
-        primary.lock().await[1]
+        primary.lock().await[2]
             .to_string()
             .contains("DISCARD_SOURCE_PAYLOAD_")
     );
@@ -1890,7 +1921,14 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         temp.path(),
         address,
         "compact",
-        &["--bootstrap-min-input-bytes", "8388608"],
+        &[
+            "--bootstrap-min-input-bytes",
+            "8388608",
+            "--primary-context-tokens",
+            "16000",
+            "--primary-output-reserve-tokens",
+            "1",
+        ],
         "",
     )
     .await;
@@ -1903,7 +1941,7 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         .unwrap();
     assert!(third.status().is_success());
     third.bytes().await.unwrap();
-    let sent = primary.lock().await[2].clone();
+    let sent = primary.lock().await[3].clone();
     assert!(!sent.to_string().contains("DISCARD_SOURCE_PAYLOAD_"));
     assert!(!sent.to_string().contains("opaque-reasoning"));
     assert!(sent.to_string().contains("both tools succeeded"));
@@ -1971,7 +2009,7 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
     let estimate = &cost_stats["sessions"][0]["cost_estimate"];
     assert!(estimate.get("priced").is_none());
     assert!(estimate["carry_cost"].is_number());
-    assert_eq!(estimate["coverage"]["primary_responses"], 3);
+    assert_eq!(estimate["coverage"]["primary_responses"], 4);
     assert_eq!(
         estimate["coverage"]["reviewer_responses"],
         shadow.lock().await.len()
@@ -2004,12 +2042,12 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         "NATIVE_CHECKPOINT"
     );
     assert_eq!(
-        primary.lock().await[3]["input"],
+        primary.lock().await[4]["input"],
         second["input"],
         "native compaction is a separate canonical-history operation"
     );
     assert!(
-        primary.lock().await[3]
+        primary.lock().await[4]
             .to_string()
             .contains("DISCARD_SOURCE_PAYLOAD_"),
         "canonical source stays available to native compaction, with complete cohorts"
@@ -2036,7 +2074,7 @@ async fn compact_removes_atomic_cohort_from_primary_and_active_shadow() {
         .unwrap();
     assert!(response.status().is_success());
     let _ = response.bytes().await.unwrap();
-    assert_eq!(primary.lock().await[4], resumed);
+    assert_eq!(primary.lock().await[5], resumed);
     server.abort();
 }
 
@@ -2057,6 +2095,10 @@ const COMPLETED_SSE: &str = "event: response.output_text.delta\r\ndata: {\"type\
 const FAILED_SSE: &str = "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"usage\":{\"input_tokens\":22,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0}}}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
 
 async fn fixture(advice: serde_json::Value) -> Fixture {
+    fixture_with_input_tokens(advice, 11).await
+}
+
+async fn fixture_with_input_tokens(advice: serde_json::Value, input_tokens: u64) -> Fixture {
     use axum::{
         Router,
         body::{Body, Bytes},
@@ -2108,7 +2150,7 @@ async fn fixture(advice: serde_json::Value) -> Fixture {
                     _ => axum::Json(json!({
                         "id": "resp_json", "status": "completed",
                         "output": [{"type": "message", "id": "msg_native", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "done", "annotations": [], "logprobs": []}]}],
-                        "usage": {"input_tokens": 11, "output_tokens": 2, "input_tokens_details": {"cached_tokens": 0}}
+                        "usage": {"input_tokens": input_tokens, "output_tokens": 2, "input_tokens_details": {"cached_tokens": 0}}
                     })).into_response(),
                 }
             }
@@ -2235,7 +2277,11 @@ async fn send(
 #[tokio::test]
 async fn explicit_replay_reviews_after_first_primary_without_exposing_fresh_tool_results() {
     for mode in ["compact", "audit", "off"] {
-        let fixture = fixture(json!({"protected": [1], "removable": [2], "memories": []})).await;
+        let fixture = fixture_with_input_tokens(
+            json!({"protected": [1], "removable": [2], "memories": []}),
+            100000,
+        )
+        .await;
         let state = tempfile::tempdir().unwrap();
         let (proxy, url) = start_proxy_options(
             state.path(),
@@ -3356,7 +3402,11 @@ async fn client_continuation_is_expanded_but_never_forwarded_upstream() {
 
 #[tokio::test]
 async fn implicit_history_reuses_removals_and_keeps_divergent_history_separate() {
-    let fixture = fixture(json!({"protected": [1], "removable": [2], "memories": []})).await;
+    let fixture = fixture_with_input_tokens(
+        json!({"protected": [1], "removable": [2], "memories": []}),
+        100000,
+    )
+    .await;
     let state = tempfile::tempdir().unwrap();
     let (proxy, url) = start_proxy(state.path(), fixture.address, "compact").await;
     let original = json!({"model": "gpt-6-luna", "input": [

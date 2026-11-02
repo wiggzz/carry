@@ -147,7 +147,7 @@ fn cache_write191_native_equivalent_defaults_reuse_each_divergent_branch() {
             }
             let input = prompt_projection(&body).unwrap().2;
             let cached = previous.min(input);
-            let pi_cached = if index == 0 { 0 } else { previous + restored };
+            let pi_cached = if index == 0 { input + restored } else { previous + restored };
             carry_expected += (cached as f64 * 0.1 + (input - cached) as f64 * 2.5) / 1e6;
             pi_expected +=
                 (pi_cached as f64 * 0.1 + (input + restored - pi_cached) as f64 * 2.5) / 1e6;

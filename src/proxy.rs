@@ -1125,6 +1125,8 @@ fn dashboard_plan(session: &Session) -> Value {
         "primary_required_tokens": last_plan["primary_required_tokens"].as_f64(),
         "reviewer_required_tokens": last_plan["reviewer_required_tokens"].as_f64(),
         "primary_estimated_tokens": last_plan["primary_estimated_tokens"].as_f64(),
+        "primary_input_basis": last_plan["primary_input_basis"],
+        "primary_admission": last_plan["primary_admission"],
         "primary_retained_estimated_tokens": after_input,
         "primary_retained_required_tokens": after_required,
         "context_margin_percent": margin,
@@ -1944,17 +1946,9 @@ async fn forward_request(
             session.last_plan = report.clone();
             let _ = trace(&service, &id, "paired_plan", &report);
             logging::planned(&service, &id, &request_id, &report);
-            let mut projected = outbound.clone();
-            projected["input"] = json!(projection.input);
-            // Economics describes hypothetical alternatives; admission owns
-            // the actual mode-selected wire (canonical in audit mode).
-            if !primary_fits(&service.config, &projected) {
-                let _ = save(&service, &id, &session);
-                return Err(failure(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "no permitted projection fits the primary context budget",
-                ));
-            }
+            // Capacity quantities guide projection/review planning only. A
+            // local estimate (especially opaque native input) cannot reject a
+            // caller's primary request; let the provider enforce its limits.
             if !projection.omitted.is_empty() {
                 session.compactions += 1;
             }
@@ -1981,33 +1975,31 @@ async fn forward_request(
         // Measure after choosing its actual input, including a zero delta for
         // pass-through. Receipt compatibility may preserve only this quantity.
         let canonical = json!(session.render_primary());
-        let (canonical_units, submitted_units, primary_edited) = if service.config.mode == Mode::Off
-        {
-            // Off never edits input. Its optional tracker can fail or be empty,
-            // so it cannot define a canonical-minus-sent delta.
-            (0, 0, false)
+        let primary_edited = service.config.mode != Mode::Off && canonical != outbound["input"];
+        // Freeze the actual wire before both measurement and metering. Native
+        // payloads keep their identity; their encoded bytes are never tokens.
+        outbound = primary_wire_body(&service.config, &outbound);
+        let mut canonical_body = body.clone();
+        canonical_body["input"] = canonical.clone();
+        let canonical_wire = primary_wire_body(&service.config, &canonical_body);
+        let restored = if service.config.mode == Mode::Off {
+            Some(0)
         } else {
-            (
-                estimate(&canonical) as u64,
-                estimate(&outbound["input"]) as u64,
-                canonical != outbound["input"],
+            session.primary_input.restoration(
+                &canonical_wire,
+                &outbound,
+                &service.config.upstream_url,
+                service.config.model_resolution.as_ref().map(|p| &p.primary),
             )
         };
-        // Freeze the final transport representation before reserving the attempt.
-        // Projection uses client-native quantities; admission has already retained
-        // the client's output cap.
-        outbound = primary_wire_body(&service.config, &outbound);
         if let Some(t) = &mut session.cost_trajectory {
-            t.projected(canonical_units, submitted_units, primary_edited);
+            t.projected_input(restored, primary_edited);
         }
         // Numeric snapshots use the shared prompt-bearing projection, never allowance.
         // The planner owns the reauthorized continuation membership.
-        let mut canonical_body = body.clone();
-        canonical_body["input"] = canonical.clone();
         let baseline = report["baseline_omitted_members"]
             .as_array()
             .map(|ids| ids.iter().filter_map(Value::as_u64).collect::<HashSet<_>>());
-        let canonical_wire = primary_wire_body(&service.config, &canonical_body);
         // An empty continuation omission set is exactly the canonical input;
         // avoid cloning/adapting another large request for that common case.
         let continuation_wire = baseline
@@ -2019,16 +2011,42 @@ async fn forward_request(
                 primary_wire_body(&service.config, &continuation_body)
             });
         let mut counts = PromptTokenCounts::default();
+        let resolved = service
+            .config
+            .model_resolution
+            .as_ref()
+            .map(|pair| &pair.primary);
         let mut measurement = dispatch_measurement(&request_id, "primary", &outbound);
+        measurement.outgoing_input_tokens = session
+            .primary_input
+            .known_estimate(&outbound, &service.config.upstream_url, resolved)
+            .map(|input| input.tokens);
+        measurement.basis =
+            "receipt_first_or_local_visible_text_not_encoded_native_payloads".into();
         // Seed with the outgoing measurement already computed at the boundary.
         counts
             .0
             .push((&outbound, measurement.outgoing_input_tokens));
-        measurement.caller_input_tokens = counts.count(&original_body);
-        measurement.canonical_input_tokens = counts.count(&canonical_wire);
-        measurement.continuation_input_tokens = baseline
-            .as_ref()
-            .and_then(|_| counts.count(continuation_wire.as_ref().unwrap_or(&canonical_wire)));
+        measurement.caller_input_tokens = counts.measured(
+            &original_body,
+            &session.primary_input,
+            &service.config.upstream_url,
+            resolved,
+        );
+        measurement.canonical_input_tokens = counts.measured(
+            &canonical_wire,
+            &session.primary_input,
+            &service.config.upstream_url,
+            resolved,
+        );
+        measurement.continuation_input_tokens = baseline.as_ref().and_then(|_| {
+            counts.measured(
+                continuation_wire.as_ref().unwrap_or(&canonical_wire),
+                &session.primary_input,
+                &service.config.upstream_url,
+                resolved,
+            )
+        });
         let shrink = baseline.as_ref().is_some_and(|prior| {
             projection.omitted.iter().any(|id| !prior.contains(id))
                 && measurement
@@ -2477,7 +2495,7 @@ async fn dispatch_review_for(
     let view =
         crate::proxy_state::ReviewedView::new(session, &session.groups_for(&projection.omitted));
     let body = review_body_for_view(&service.config, session, &projection, &view);
-    if !review_fits(&service.config, &body)
+    if !review_fits_measured(&service.config, session, &body)
         || !service.background_reviews.lock().await.insert(id.clone())
     {
         return;
@@ -2576,6 +2594,7 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
             .map(|r| &r.request_id)
     {
         current.last_reviewer_dispatch = reviewed.last_reviewer_dispatch.clone();
+        current.reviewer_input = reviewed.reviewer_input.clone();
     }
     for receipt in &run.receipts {
         let resolved = before.model_resolution.as_ref().map(|p| &p.reviewer);
@@ -2642,7 +2661,7 @@ async fn run_review(
     let view =
         crate::proxy_state::ReviewedView::new(session, &session.groups_for(&projection.omitted));
     let body = review_body_for_view(&service.config, session, projection, &view);
-    if !review_fits(&service.config, &body) {
+    if !review_fits_measured(&service.config, session, &body) {
         return false;
     }
     review_chunk(service, id, session, &body, &view, run).await
@@ -2701,7 +2720,10 @@ async fn review_chunk(
         &run.request_id,
         &review_attempt_id,
         "review_started",
-        &json!({"background":run.background,"source_group_count":view.groups().count(),"estimated_tokens":estimate(body),"required_tokens":reviewer_required_tokens(&service.config,body),"context_tokens":service.config.classifier_max_input_tokens}),
+        &json!({"background":run.background,"source_group_count":view.groups().count(),"estimated_tokens":session.reviewer_input.known_estimate(body,
+            service.config.classifier_url.as_deref().unwrap_or(&service.config.upstream_url),
+            service.config.model_resolution.as_ref().map(|p|&p.reviewer)).map(|input|input.tokens),
+            "required_tokens":reviewer_required_measured(&service.config,session,body),"context_tokens":service.config.classifier_max_input_tokens}),
     );
     let _ = trace(service, id, "shadow_submitted", body);
     session.last_review_request = session.completed_requests;
@@ -2735,6 +2757,19 @@ async fn review_chunk(
         .take()
         .filter(|record| run.background && record.request_id == run.request_id)
         .unwrap_or_else(|| dispatch_measurement(&review_attempt_id, "reviewer", body));
+    measurement.outgoing_input_tokens = session
+        .reviewer_input
+        .estimate(
+            body,
+            service
+                .config
+                .classifier_url
+                .as_deref()
+                .unwrap_or(&service.config.upstream_url),
+            resolved,
+        )
+        .map(|input| input.tokens);
+    measurement.basis = "receipt_first_or_local_visible_text_not_encoded_native_payloads".into();
     measurement.request_id = review_attempt_id.clone();
     measurement.parent_request_id = Some(run.request_id.clone());
     measurement.at = dispatched_at;
@@ -2838,6 +2873,19 @@ async fn review_chunk(
                 carry::models::cache_write_tariff_known(body),
             ),
         );
+        if value["status"] == "completed" {
+            session.reviewer_input.observe(
+                body,
+                &value["usage"],
+                service
+                    .config
+                    .classifier_url
+                    .as_deref()
+                    .unwrap_or(&service.config.upstream_url),
+                resolved,
+                dispatched_at,
+            );
+        }
         if let Some(trajectory) = &mut session.cost_trajectory {
             if value["status"] == "completed" {
                 trajectory.reviewer_usage_settled(
@@ -3225,7 +3273,26 @@ fn cache_base(body: &Value) -> Value {
 struct PromptTokenCounts<'a>(Vec<(&'a Value, Option<u64>)>);
 
 impl<'a> PromptTokenCounts<'a> {
+    #[cfg(test)]
     fn count(&mut self, body: &'a Value) -> Option<u64> {
+        self.count_with(body, || crate::savings::prompt_input_tokens(body))
+    }
+
+    fn measured(
+        &mut self,
+        body: &'a Value,
+        measured: &crate::proxy_quantity::InputMeasurements,
+        route: &str,
+        resolved: Option<&ResolvedModel>,
+    ) -> Option<u64> {
+        self.count_with(body, || {
+            measured
+                .known_estimate(body, route, resolved)
+                .map(|input| input.tokens)
+        })
+    }
+
+    fn count_with(&mut self, body: &'a Value, count: impl FnOnce() -> Option<u64>) -> Option<u64> {
         if let Some((_, units)) = self.0.iter().find(|(prior, _)| {
             ["input", "instructions", "tools", "text"]
                 .iter()
@@ -3233,7 +3300,7 @@ impl<'a> PromptTokenCounts<'a> {
         }) {
             return *units;
         }
-        let units = crate::savings::prompt_input_tokens(body);
+        let units = count();
         self.0.push((body, units));
         units
     }
@@ -3250,11 +3317,11 @@ fn dispatch_measurement(
         lane: lane.into(),
         at: now(),
         model: body.get("model").and_then(Value::as_str).map(str::to_owned),
-        basis: "o200k_semantic_prompt_projection_local_estimate_not_provider_usage".into(),
+        basis: "unmeasured_until_planning_or_provider_receipt".into(),
         caller_input_tokens: None,
         canonical_input_tokens: None,
         continuation_input_tokens: None,
-        outgoing_input_tokens: crate::savings::prompt_input_tokens(body),
+        outgoing_input_tokens: None,
         receipt_input_tokens: None,
         receipt_output_tokens: None,
         outcome: "dispatched".into(),
@@ -3274,8 +3341,12 @@ fn finish_measurement(
     }
 }
 
+#[cfg(test)]
 fn estimate(body: &Value) -> f64 {
-    crate::proxy_savings::token_units(body) as f64
+    let quantities = crate::proxy_quantity::InputMeasurements::default();
+    quantities
+        .visible_prompt_tokens(body)
+        .unwrap_or_else(|| quantities.visible_text_tokens(body)) as f64
 }
 
 fn memory_admission_fits(config: &ProxyCli, session: &Session, omitted: &HashSet<u64>) -> bool {
@@ -3285,7 +3356,11 @@ fn memory_admission_fits(config: &ProxyCli, session: &Session, omitted: &HashSet
         input: session.render_projection(omitted),
     };
     bytes <= config.classifier_max_input_bytes as usize / 2
-        && review_fits(config, &review_body_projected(config, session, &projection))
+        && review_fits_measured(
+            config,
+            session,
+            &review_body_projected(config, session, &projection),
+        )
 }
 
 fn primary_output_reserve(config: &ProxyCli, body: &Value) -> u64 {
@@ -3295,24 +3370,67 @@ fn primary_output_reserve(config: &ProxyCli, body: &Value) -> u64 {
     )
 }
 
-fn primary_required_tokens(config: &ProxyCli, body: &Value) -> f64 {
-    let reserve = primary_output_reserve(config, body);
-    // Count the adapted input, but reserve the client's allowance even when
-    // subscription transport must remove its unsupported output-cap field.
-    estimate(&primary_wire_body(config, body))
-        * (1.0 + f64::from(config.context_margin_percent) / 100.0)
-        + reserve as f64
+fn primary_input_estimate(
+    config: &ProxyCli,
+    session: &Session,
+    body: &Value,
+) -> Option<crate::proxy_quantity::InputEstimate> {
+    session.primary_input.estimate(
+        &primary_wire_body(config, body),
+        &config.upstream_url,
+        config.model_resolution.as_ref().map(|p| &p.primary),
+    )
 }
 
+fn primary_required_input(config: &ProxyCli, body: &Value, input: u64) -> f64 {
+    input as f64 * (1.0 + f64::from(config.context_margin_percent) / 100.0)
+        + primary_output_reserve(config, body) as f64
+}
+
+#[cfg(test)]
+fn primary_required_tokens(config: &ProxyCli, body: &Value) -> f64 {
+    // Heuristic for exceptional review only; never primary request admission.
+    let wire = primary_wire_body(config, body);
+    let local = estimate(&wire) as u64;
+    primary_required_input(config, body, local)
+}
+
+#[cfg(test)]
 fn primary_fits(config: &ProxyCli, body: &Value) -> bool {
     primary_required_tokens(config, body) <= config.primary_context_tokens as f64
 }
 
+#[cfg(test)]
 fn reviewer_required_tokens(config: &ProxyCli, body: &Value) -> f64 {
     estimate(body) * (1.0 + f64::from(config.context_margin_percent) / 100.0)
         + config.classifier_max_output_tokens as f64
 }
 
+fn reviewer_required_measured(config: &ProxyCli, session: &Session, body: &Value) -> f64 {
+    let input = session
+        .reviewer_input
+        .estimate(
+            body,
+            config
+                .classifier_url
+                .as_deref()
+                .unwrap_or(&config.upstream_url),
+            config.model_resolution.as_ref().map(|p| &p.reviewer),
+        )
+        .map(|input| input.tokens)
+        .or_else(|| session.reviewer_input.visible_prompt_tokens(body))
+        .unwrap_or(0);
+    input as f64 * (1.0 + f64::from(config.context_margin_percent) / 100.0)
+        + config.classifier_max_output_tokens as f64
+}
+
+fn review_fits_measured(config: &ProxyCli, session: &Session, body: &Value) -> bool {
+    crate::proxy_cache::serialized_identity(body).0 <= config.classifier_max_input_bytes as usize
+        && reviewer_required_measured(config, session, body)
+            <= config.classifier_max_input_tokens as f64
+}
+
+#[cfg(test)]
 fn review_fits(config: &ProxyCli, body: &Value) -> bool {
     crate::proxy_cache::serialized_identity(body).0 <= config.classifier_max_input_bytes as usize
         && reviewer_required_tokens(config, body) <= config.classifier_max_input_tokens as f64
@@ -3337,6 +3455,7 @@ fn reviewer_rates(config: &ProxyCli, input: f64) -> Option<Rates> {
 }
 
 // Keep the caller's decision clock explicit alongside route/credential proof.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn resolved_view_costs(
     keep: &Value,
@@ -3348,20 +3467,54 @@ fn resolved_view_costs(
     credential: &str,
     at: u64,
 ) -> Option<ViewCosts> {
-    let kt = estimate(keep);
-    let ct = estimate(compact);
+    let input = crate::proxy_quantity::InputMeasurements::default();
+    resolved_input_costs(
+        keep,
+        compact,
+        cache,
+        model,
+        requests,
+        resolved,
+        credential,
+        at,
+        input.estimate(keep, "", resolved)?,
+        input.estimate(compact, "", resolved)?,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolved_input_costs(
+    keep: &Value,
+    compact: &Value,
+    cache: &[CacheEvidence],
+    model: &str,
+    requests: u64,
+    resolved: Option<&ResolvedModel>,
+    credential: &str,
+    at: u64,
+    keep_input: crate::proxy_quantity::InputEstimate,
+    compact_input: crate::proxy_quantity::InputEstimate,
+) -> Option<ViewCosts> {
+    let kt = keep_input.tokens as f64;
+    let ct = compact_input.tokens as f64;
     let rates = |tokens| match resolved {
-        Some(r) if r.model == model => r.rates_for_input(tokens),
+        Some(r) if r.model == model => r.forecast_rates_for_input(tokens),
         Some(_) => None,
         None => Rates::for_model(model, tokens),
     };
     let kr = rates(kt)?;
     let cr = rates(ct)?;
-    let capability = match resolved {
-        Some(r) => r.cache,
-        None => crate::openai::prompt_cache_capabilities(model),
+    let minimum = match resolved {
+        Some(r) => match r.route.class {
+            RouteClass::CodexSubscription | RouteClass::SyntheticSubscription => r
+                .scenario_cache_policy
+                .as_ref()
+                .and_then(|p| p.minimum_prefix_tokens),
+            _ => r.cache.map(|cap| cap.minimum_prefix_tokens as u64),
+        },
+        None => carry::models::ScenarioCachePolicy::for_model(model).minimum_prefix_tokens,
     };
-    let first = |body: &Value, tokens: f64, rates: Rates| {
+    let first = |body: &Value, input: crate::proxy_quantity::InputEstimate, rates: Rates| {
         let explicit_write = body["input"].as_array().into_iter().flatten().any(|item| {
             item["content"]
                 .as_array()
@@ -3370,11 +3523,16 @@ fn resolved_view_costs(
                 .any(|block| block["prompt_cache_breakpoint"]["mode"] == "explicit")
         });
         input_cost(
-            tokens,
-            if resolved.is_none() || capability.is_some() {
+            input.tokens as f64,
+            if input.basis == crate::proxy_quantity::EstimateBasis::LocalVisibleText {
                 crate::proxy_cache::reusable(cache, body, resolved, credential, at)
             } else {
-                0.0
+                cache
+                    .iter()
+                    .filter(|entry| entry.reusable_at(body, resolved, credential, at).is_some())
+                    .filter_map(|entry| entry.native_input_tokens)
+                    .max()
+                    .unwrap_or(0) as f64
             },
             if explicit_write && resolved.is_none_or(|r| r.explicit_cache_transport) {
                 rates.write
@@ -3384,10 +3542,10 @@ fn resolved_view_costs(
             rates.cached,
         )
     };
-    let keep_first = first(keep, kt, kr);
-    let compact_first = first(compact, ct, cr);
-    // Native evidence can price the first call even when future cache support is unknown.
-    let minimum = capability.map(|cap| cap.minimum_prefix_tokens as f64);
+    let keep_first = first(keep, keep_input, kr);
+    let compact_first = first(compact, compact_input, cr);
+    // Future hits use the scenario policy, not explicit transport capability.
+    let minimum = minimum.map(|tokens| tokens as f64);
     // Future hits are a fixed-history sensitivity assumption, not guaranteed.
     Some(ViewCosts {
         keep: horizon_cost(
@@ -3690,6 +3848,15 @@ async fn relay(
                         carry::models::cache_write_tariff_known(&commit.outbound),
                     ),
                 );
+                if !commit.native {
+                    commit.candidate.primary_input.observe(
+                        &commit.outbound,
+                        &value["usage"],
+                        &commit.service.config.upstream_url,
+                        resolved,
+                        commit.dispatched_at,
+                    );
+                }
                 if let Some(trajectory) = &mut commit.candidate.cost_trajectory {
                     if commit.native {
                         trajectory.unmodeled_call();
@@ -4221,6 +4388,29 @@ mod tests {
             "schema": {"type": "object", "properties": {}, "required": [], "additionalProperties": false}
         }}});
         assert_eq!(codex_body(&body)["text"], body["text"]);
+    }
+
+    #[test]
+    fn planner_uses_actual_input_receipt_independent_of_money_and_restoration() {
+        let config =
+            ProxyCli::parse_from(["carry", "--upstream-url", "http://127.0.0.1:9/responses"]);
+        let body =
+            json!({"model":"gpt-6.1-sol","input":[{"role":"user","content":"tiny visible input"}]});
+        let mut session = Session::default();
+        session.ingest(body["input"].as_array().unwrap()).unwrap();
+        let wire = primary_wire_body(&config, &body);
+        session.primary_input.observe(
+            &wire,
+            &json!({"input_tokens":56000}),
+            &config.upstream_url,
+            None,
+            now(),
+        );
+        // No cost trajectory, tariff or comparison proof is required to use an
+        // actual input observation for the real request's planning quantity.
+        let (_, report) = plan(&config, &session, &body);
+        assert_eq!(report["primary_estimated_tokens"], 56000);
+        assert_eq!(report["primary_input_basis"], "provider_receipt");
     }
 
     #[tokio::test]

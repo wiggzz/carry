@@ -2,6 +2,8 @@
 // adapter switched to the shared modeled-write owner. Keep these bodies intact.
 fn native_modeled_write_deadline(change_lifetime: bool) {
     let mut t = Trajectory::with_model("gpt-6.1-sol".into());
+    // Known-cold control: this tests write deadlines, not inherited startup cache.
+    t.cache_initialized = true;
     t.record(&json!({"event":"run_started","data":{
         "model":"gpt-6.1-sol","cache_ttl_seconds":7,
         "implicit_cache_minimum_prefix_tokens":1024}}));
@@ -63,7 +65,7 @@ fn native_modeled_append_lifetime_and_replay_use_original_prefix_deadline() {
     let mut request = json!({"model":"gpt-6.1-sol","max_output_tokens":1,
         "input":[{"role":"user","content":"synthetic lifetime prefix ".repeat(1000)}]});
     let first_input = prompt_projection(&request).unwrap().2;
-    let mut t = Trajectory::default();
+    let mut t = Trajectory { cache_initialized: true, ..Default::default() };
     for event in &events {
         t.record(event);
     }
@@ -105,7 +107,7 @@ fn native_modeled_append_lifetime_and_replay_use_original_prefix_deadline() {
             scenario_input_cost("gpt-6.1-sol", input, cached, Some(1024), estimated_cost_usd)
                 .unwrap();
         assert!((after.pi_cost - before.pi_cost - expected).abs() < 1e-12);
-        let mut replay = Trajectory::default();
+        let mut replay = Trajectory { cache_initialized: true, ..Default::default() };
         for event in &events {
             replay.record(event);
         }

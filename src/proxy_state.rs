@@ -234,6 +234,12 @@ pub(super) struct Session {
     pub upstream_cache: Vec<CacheEvidence>,
     #[serde(default)]
     pub cost_trajectory: Option<crate::proxy_savings::Trajectory>,
+    /// Provider input quantities survive monetary/comparison omissions. Only
+    /// hashes and numeric measured batches are retained, never another prompt.
+    #[serde(default)]
+    pub primary_input: crate::proxy_quantity::InputMeasurements,
+    #[serde(default)]
+    pub reviewer_input: crate::proxy_quantity::InputMeasurements,
     pub primary: UsageLedger,
     pub shadow: UsageLedger,
     pub completed_requests: u64,
@@ -475,6 +481,8 @@ impl Session {
 
     pub fn reset_active(&mut self) {
         self.review_epoch = self.review_epoch.saturating_add(1);
+        self.primary_input = Default::default();
+        self.reviewer_input = Default::default();
         if let Some(trajectory) = &mut self.cost_trajectory {
             trajectory.reset_epoch();
         }
