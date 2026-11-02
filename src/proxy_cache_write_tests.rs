@@ -309,7 +309,7 @@ fn cache_write188_resolution_upgrade_keeps_old_money_and_disables_future_reads_a
     );
     let before = t.snapshot();
     assert!((before.observed_primary_cost - 0.004).abs() < 1e-12);
-    assert!((before.traditional_cost - 0.005).abs() < 1e-12);
+    assert!((before.traditional_cost - 0.0002).abs() < 1e-12);
     let upgraded = old.clone().with_scenario_cache_policy();
     assert_eq!(upgraded.scenario_cache_policy.as_ref().unwrap().version, 2);
     assert_eq!(

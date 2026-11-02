@@ -18,11 +18,10 @@ fn modeled_cache_read_does_not_extend_original_write_lifetime_across_restart() {
     .unwrap();
     resolved.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 7;
     let mut t = Trajectory::default();
-    // Genuine equal-token projection: the hypothetical branch owns its writes,
-    // rather than borrowing the actual receipt's cache partition.
-    t.projected(100, 100, true);
+    // Start with a known cold shared receipt, then diverge the next request.
     let request = body();
     for (index, (at, cached)) in [(100, 0), (106, 2000), (107, 0)].into_iter().enumerate() {
+        if index == 1 { t.projected(100, 100, true); }
         let before = t.snapshot();
         t.primary_resolved(
             &request,
@@ -68,13 +67,14 @@ fn modeled_cache_append_and_new_policy_cannot_extend_old_prefix_deadline() {
     .unwrap();
     resolved.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 7;
     let mut t = Trajectory::default();
-    t.projected(100, 100, true);
+    // Initial actual cache state is known; only later requests diverge.
     let mut request = body();
     for (index, (at, input, cached)) in [(100, 2000, 0), (106, 2100, 2000), (107, 2100, 0)]
         .into_iter()
         .enumerate()
     {
         if index == 1 {
+            t.projected(100, 100, true);
             // New lifetime applies only to newly written extents. The original
             // prefix still expires at107, including across serialization.
             resolved.scenario_cache_policy.as_mut().unwrap().ttl_seconds = 100;
@@ -99,6 +99,7 @@ fn modeled_cache_append_and_new_policy_cannot_extend_old_prefix_deadline() {
         let forecast =
             scenario_input_cost_resolved("gpt-6.1-sol", input, cached, Some(1024), Some(&resolved))
                 .unwrap();
+        let forecast = if index == 0 { input as f64 * 2.0 / 1e6 } else { forecast };
         assert!((after.traditional_cost - before.traditional_cost - forecast).abs() < 1e-12);
         assert!(
             (after.observed_primary_cost - before.observed_primary_cost - input as f64 * 2.0 / 1e6)
@@ -171,7 +172,7 @@ fn modeled_cache_equivalent_options_keep_warmth_in_both_quantity_adapters() {
             (after.observed_primary_cost - before.observed_primary_cost - actual).abs() < 1e-12
         );
         assert!((n.observed_cost - native_before.observed_cost - actual).abs() < 1e-12);
-        let expected = input as f64 * if index == 0 { 2.5 } else { 0.1 } / 1e6;
+        let expected = input as f64 * 0.1 / 1e6;
         assert!((n.pi_cost - native_before.pi_cost - expected).abs() < 1e-12);
         assert!(
             (after.traditional_cost - before.traditional_cost - expected).abs() < 1e-12,
@@ -183,14 +184,12 @@ fn modeled_cache_equivalent_options_keep_warmth_in_both_quantity_adapters() {
 
 // Review5716439062: exercise the real consumers past the 128-event retention
 // boundary, not just the container's serialized length. Both histories really
-// diverge before the first request; observed zero-write receipts stay independent.
+// diverge after the initial known-cold request; observed receipts stay independent.
 fn modeled_write_pressure_costs(native_adapter: bool) {
     let mut live = Trajectory::default();
-    live.projected(100, 100, true);
     let mut events = vec![
         json!({"event":"run_started","data":{"model":"gpt-6.1-sol",
             "cache_ttl_seconds":1800,"implicit_cache_minimum_prefix_tokens":1024}}),
-        json!({"event":"context_compacted","data":{"compaction_token_delta":0}}),
     ];
     let mut native = crate::savings::Trajectory::default();
     for event in &events {
@@ -202,6 +201,12 @@ fn modeled_write_pressure_costs(native_adapter: bool) {
     let mut previous_input = 0;
     let mut mismatches = Vec::new();
     for step in 0..132 {
+        if step == 1 {
+            live.projected(100, 100, true);
+            let edit = json!({"event":"context_compacted","data":{"compaction_token_delta":0}});
+            native.record(&edit);
+            events.push(edit);
+        }
         if step > 0 {
             request["input"]
                 .as_array_mut()
@@ -250,7 +255,9 @@ fn modeled_write_pressure_costs(native_adapter: bool) {
         assert!((n.carry_cost - native_before.carry_cost - actual).abs() < 1e-12);
         // Every write is at100 with lifetime1800. No expiry, native hit, cache
         // policy change or summary can justify making this prefix cold.
-        let expected = (previous_input as f64 * 0.1 + (input - previous_input) as f64 * 2.5) / 1e6;
+        let expected = if step == 0 { input as f64 * 2.0 / 1e6 } else {
+            (previous_input as f64 * 0.1 + (input - previous_input) as f64 * 2.5) / 1e6
+        };
         let delta = if native_adapter {
             n.pi_cost - native_before.pi_cost
         } else {
@@ -295,17 +302,19 @@ fn modeled_write_pressure_keeps_native_report_money_across_replay() {
 // or reset independent history. Each real adapter has its own registration.
 fn modeled_retention_unknown_costs(native_adapter: bool) {
     let mut live = Trajectory::default();
-    live.projected(100, 100, true);
     let mut native = crate::savings::Trajectory::with_model("gpt-6.1-sol".into());
     native.record(&json!({"event":"run_started","data":{"model":"gpt-6.1-sol",
         "cache_ttl_seconds":1800,"implicit_cache_minimum_prefix_tokens":1024}}));
-    native.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":0}}));
     let mut request = json!({"model":"gpt-6.1-sol","max_output_tokens":1,
         "input":[{"role":"user","content":"synthetic different-clock prefix ".repeat(400)}]});
     let mut paid = 0.0;
     let mut forecast = 0.0;
     let mut previous = 0;
     for step in 0..132_u64 {
+        if step == 1 {
+            live.projected(100, 100, true);
+            native.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":0}}));
+        }
         if step > 0 {
             request["input"]
                 .as_array_mut()
@@ -333,7 +342,9 @@ fn modeled_retention_unknown_costs(native_adapter: bool) {
         );
         paid += input as f64 * 2.0 / 1e6;
         if step <= 128 {
-            forecast += (previous as f64 * 0.1 + (input - previous) as f64 * 2.5) / 1e6;
+            forecast += if step == 0 { input as f64 * 2.0 / 1e6 } else {
+                (previous as f64 * 0.1 + (input - previous) as f64 * 2.5) / 1e6
+            };
         }
         let l = live.snapshot();
         let n = native.snapshot();

@@ -228,10 +228,10 @@ fn planner_prices_only_scheduled_review_views_including_output_cap() {
             (&keep, "future_shadow_keep", !compact_only),
             (&compact, "future_shadow_compact", true),
         ] {
-            let rates = reviewer_rates(&config, estimate(view)).unwrap();
             let expected = if scheduled {
-                estimate(view) * rates.input
-                    + config.classifier_max_output_tokens as f64 * rates.output
+                let input = estimate(view);
+                let rates = reviewer_rates(&config, input).unwrap();
+                input * rates.input + config.classifier_max_output_tokens as f64 * rates.output
             } else {
                 0.0
             };

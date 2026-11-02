@@ -296,3 +296,66 @@ fn initialization186_native_current_user_infeasible_preserves_observed_money() {
         "initialization cannot retire the current user request to invent feasibility"
     );
 }
+
+#[test]
+fn native_first_cache_initialization_records_observed_or_ideal_quantity_basis() {
+    let request = json!({"model":"gpt-6.1-sol", "input":[{
+        "role":"user", "content":"inherited native report prefix ".repeat(1000)
+    }]});
+    let local_input = prompt_projection(&request).unwrap().2;
+    for (divergent, native_matches) in [(false, true), (false, false), (true, true)] {
+        let mut t = Trajectory::with_model("gpt-6.1-sol".into());
+        t.record(&json!({"event":"run_started","data":{
+            "model":"gpt-6.1-sol", "cache_ttl_seconds":1800,
+            "implicit_cache_minimum_prefix_tokens":1024
+        }}));
+        if divergent {
+            t.record(&json!({"event":"context_compacted","data":{
+                "compaction_token_delta":100
+            }}));
+        }
+        let native_input = if native_matches { local_input } else { 17 };
+        let cached = native_input / 2;
+        t.record(&json!({"event":"model_request","timestamp_ms":100,
+            "data":{"step":1,"request":request}}));
+        let estimate = t
+            .record(&json!({"event":"model_response","timestamp_ms":101,
+            "data":{"usage_source":"normalized","step":1,
+                "usage":{"input_tokens":native_input,"cached_input_tokens":cached,
+                    "cache_write_input_tokens":0,"output_tokens":0},
+                "raw":{"output":[]}}}))
+            .unwrap();
+        assert!(estimate.priced && estimate.observed_priced);
+        let observed = !divergent && native_matches;
+        assert_eq!(
+            estimate.cache_initializations.observed,
+            u64::from(observed)
+        );
+        assert_eq!(
+            estimate.cache_initializations.assumed_ideal,
+            u64::from(!observed)
+        );
+        let expected = if observed {
+            cached
+        } else {
+            local_input + if divergent { 100 } else { 0 }
+        };
+        assert_eq!(
+            serde_json::to_value(&t.modeled_cache).unwrap()["reads"][0]["end"],
+            expected
+        );
+        if !divergent {
+            assert_eq!(estimate.carry_cost, estimate.pi_cost);
+        } else {
+            let input_cost = scenario_input_cost(
+                "gpt-6.1-sol",
+                expected,
+                expected,
+                Some(1024),
+                estimated_cost_usd,
+            )
+            .unwrap();
+            assert!((estimate.pi_cost - input_cost).abs() < 1e-12);
+        }
+    }
+}

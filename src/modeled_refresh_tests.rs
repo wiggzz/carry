@@ -33,7 +33,7 @@ fn modeled_refresh_coordinator(report: bool) {
     let mut original_writes = None;
     let mut mismatches = Vec::new();
     let mut changed_original_writes = Vec::new();
-    for (step, (at, warm)) in [(100, false), (1899, true), (1901, true), (3701, false)]
+    for (step, (at, warm)) in [(100, true), (1899, true), (1901, true), (3701, false)]
         .into_iter()
         .enumerate()
     {

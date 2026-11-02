@@ -16,6 +16,9 @@ pub fn accounting_policy() -> Value {
         "counterfactual_cache_policy": format!("conditional_model_cache_v{}", carry::models::ScenarioCachePolicy::VERSION),
         "retained_counterfactual_cache_policy": "legacy_route_cache_v0",
         "cache_policy_upgrade": "prospective_cold_boundary_with_immutable_legacy_segment_no_repricing",
+        "counterfactual_cache_initialization": "observed_identical_else_ideal_eligible_prefix_v1",
+        "inherited_cache_remaining_lifetime": "full_modeled_policy_lifetime_favoring_baseline_not_observed_residency",
+        "failed_primary_cache": "retain_prior_coverage_until_its_deadline",
         "opaque_output_retention": "unknown_not_ciphertext_length",
         "claim": "conditional_counterfactual_not_measured_savings"})
 }
@@ -83,6 +86,8 @@ pub struct CachePolicyBoundary {
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Estimate {
     #[serde(default)]
+    pub cache_initializations: crate::proxy_cache::CacheInitializations,
+    #[serde(default)]
     pub initialization_policy: String,
     #[serde(default)]
     pub initial_compactions: u64,
@@ -127,6 +132,7 @@ pub struct Estimate {
 /// comparable primary observations exist. Omitted reviewer expense is carry-only.
 #[derive(Debug, Serialize)]
 pub struct DashboardEstimate {
+    cache_initializations: crate::proxy_cache::CacheInitializations,
     initialization_policy: String,
     initial_compactions: u64,
     legacy_initialization_segment: Option<CachePolicySegment>,
@@ -158,6 +164,7 @@ impl Estimate {
     pub fn dashboard(self, pending: bool) -> DashboardEstimate {
         let available = self.priced;
         DashboardEstimate {
+            cache_initializations: self.cache_initializations,
             initialization_policy: self.initialization_policy,
             initial_compactions: self.initial_compactions,
             legacy_initialization_segment: self.legacy_initialization_segment,
@@ -277,6 +284,8 @@ pub struct Trajectory {
     pub scenario: Scenario,
     result: Estimate,
     restored: i128,
+    #[serde(default = "known_projection")]
+    projection_known: bool,
     #[serde(flatten)]
     history: TraditionalHistoryState,
     carry_edited: bool,
@@ -299,6 +308,10 @@ pub struct PrimaryObservation<'a> {
     pub cost: Option<f64>,
 }
 
+fn known_projection() -> bool {
+    true
+}
+
 impl Default for Trajectory {
     fn default() -> Self {
         Self {
@@ -310,6 +323,7 @@ impl Default for Trajectory {
                 ..Estimate::default()
             },
             restored: 0,
+            projection_known: true,
             history: TraditionalHistoryState::identical(),
             carry_edited: false,
             traditional_edited: false,
@@ -376,9 +390,9 @@ impl Trajectory {
     }
 
     pub fn failed_call(&mut self) {
-        // A failed primary cannot promise reuse, but must not discard the
-        // successful scenario's restoration or hypothetical summary.
-        self.receipts.invalidate();
+        // Failure invalidates actual quantity continuity, not prior successful
+        // hypothetical cache coverage. Existing deadlines still govern reuse.
+        self.receipts.invalidate_actual();
         self.record_failed_call();
     }
 
@@ -423,8 +437,16 @@ impl Trajectory {
 
     /// Complete current canonical-minus-sent projection, not an additive edit.
     /// Historical charges and the alternative's own summary remain untouched.
+    #[cfg(test)]
     pub fn projected(&mut self, before: u64, after: u64, edited: bool) {
-        let restored = before as i128 - after as i128;
+        self.projected_input(Some(before as i128 - after as i128), edited);
+    }
+
+    /// A projection can be unknown without losing the actual billed receipt.
+    /// Unknown native payloads must never become a zero-token savings claim.
+    pub fn projected_input(&mut self, restored: Option<i128>, edited: bool) {
+        self.projection_known = restored.is_some();
+        let restored = restored.unwrap_or(0);
         if edited || self.restored != restored {
             self.history.diverge();
             // Carry changed its wire, not the traditional history. The
@@ -615,7 +637,14 @@ fn observed_cost(
     if usage.cache_write_input_tokens > 0 && !write_tariff_known {
         return None;
     }
-    modeled_cost(model, usage, resolved)
+    let Some(resolved) = resolved else {
+        return estimated_cost_usd(model, usage);
+    };
+    if resolved.model != model {
+        return None;
+    }
+    let rates = resolved.rates_for_input(usage.input_tokens as f64)?;
+    Some(cost_at_rates(usage, rates))
 }
 
 fn modeled_cost(model: &str, usage: &Usage, resolved: Option<&ResolvedModel>) -> Option<f64> {
@@ -625,17 +654,19 @@ fn modeled_cost(model: &str, usage: &Usage, resolved: Option<&ResolvedModel>) ->
     if resolved.model != model {
         return None;
     }
-    let rates = resolved.rates_for_input(usage.input_tokens as f64)?;
+    let rates = resolved.forecast_rates_for_input(usage.input_tokens as f64)?;
+    Some(cost_at_rates(usage, rates))
+}
+
+fn cost_at_rates(usage: &Usage, rates: carry::models::Rates) -> f64 {
     let cached = usage.cached_input_tokens.min(usage.input_tokens);
     let written = usage
         .cache_write_input_tokens
         .min(usage.input_tokens - cached);
-    Some(
-        (usage.input_tokens - cached - written) as f64 * rates.input
-            + cached as f64 * rates.cached
-            + written as f64 * rates.write
-            + usage.output_tokens as f64 * rates.output,
-    )
+    (usage.input_tokens - cached - written) as f64 * rates.input
+        + cached as f64 * rates.cached
+        + written as f64 * rates.write
+        + usage.output_tokens as f64 * rates.output
 }
 
 fn has_native_modalities(value: &Value) -> bool {
@@ -1000,5 +1031,109 @@ mod tests {
         assert!(trajectory.snapshot().priced);
         assert!(trajectory.snapshot().carry_cost > 0.0);
         assert_eq!(trajectory.snapshot().coverage.unknown_cache_requests, 0);
+    }
+}
+
+#[cfg(test)]
+mod subscription_pricing_tests {
+    use super::*;
+    use carry::models::{Route, resolve_model};
+
+    #[test]
+    fn subscription_counterfactual_cache_misses_have_no_write_surcharge() {
+        for endpoint in [
+            "https://chatgpt.com/backend-api/codex/responses",
+            "http://127.0.0.1:12345/responses",
+        ] {
+            let resolved =
+                resolve_model("gpt-6.1-sol", Route::new(endpoint, true), None, None, 0, 0).unwrap();
+            for input in [2000, 300000] {
+                let rates = resolved.rates_for_input(input as f64).unwrap();
+                let usage = Usage {
+                    input_tokens: input,
+                    cached_input_tokens: input / 2,
+                    cache_write_input_tokens: input / 2,
+                    output_tokens: 13,
+                    ..Usage::default()
+                };
+                let expected =
+                    input as f64 / 2.0 * (rates.input + rates.cached) + 13.0 * rates.output;
+                assert!(
+                    (modeled_cost("gpt-6.1-sol", &usage, Some(&resolved)).unwrap() - expected)
+                        .abs()
+                        < 1e-12,
+                    "subscription cache population must not receive an API write surcharge"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn api_counterfactual_keeps_its_documented_cache_write_tariff() {
+        let resolved = resolve_model(
+            "gpt-6.1-sol",
+            Route::new("https://api.openai.com/v1/responses", false),
+            None,
+            None,
+            0,
+            0,
+        )
+        .unwrap();
+        let usage = Usage {
+            input_tokens: 2000,
+            cache_write_input_tokens: 2000,
+            ..Usage::default()
+        };
+        let rates = resolved.rates_for_input(2000.0).unwrap();
+        assert!(rates.write > rates.input);
+        assert!(
+            (modeled_cost("gpt-6.1-sol", &usage, Some(&resolved)).unwrap() - 2000.0 * rates.write)
+                .abs()
+                < 1e-12
+        );
+    }
+}
+
+#[cfg(test)]
+mod quantity_owner_migration_tests {
+    use super::*;
+
+    #[test]
+    fn native_receipt_settlement_does_not_tokenize_unchanged_input() {
+        let body = json!({"model":"gpt-6.1-sol","input":[{
+            "role":"user","content":"large already measured source ".repeat(20000)
+        }]});
+        let response = json!({"status":"completed","output":[],"usage":{
+            "input_tokens":2000,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}
+        }});
+        let mut trajectory = Trajectory::default();
+        crate::prompt_quantity::reset_token_work();
+        trajectory.primary(&body, &response, "route", 100, true);
+        assert_eq!(trajectory.snapshot().matched_primary_responses, 1);
+        assert_eq!(
+            crate::prompt_quantity::token_work(),
+            (0, 0),
+            "native totals below compaction thresholds need no input tokenization"
+        );
+    }
+
+    #[test]
+    fn comparison_receipt_anchors_do_not_create_native_quantity_authority() {
+        let body = json!({"model":"gpt-6.1-sol","input":[{"role":"user","content":"task"}]});
+        let response = json!({"status":"completed","output":[],"usage":{
+            "input_tokens":2000,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}
+        }});
+        let mut trajectory = Trajectory::default();
+        trajectory.primary(&body, &response, "route", 100, true);
+        let mut legacy = serde_json::to_value(&trajectory).unwrap();
+        legacy["receipts"]["anchor"]["local_input"] = json!(900000);
+        legacy["receipts"]["anchor"]["local_quantity_version"] = json!(0);
+        let restored: Trajectory = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            restored.snapshot().carry_cost,
+            trajectory.snapshot().carry_cost
+        );
+        let measurements = crate::proxy_quantity::InputMeasurements::default();
+        assert!(measurements.predict(&body, "route", None).is_none());
     }
 }

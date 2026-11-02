@@ -650,26 +650,38 @@ fn receipt_image_input_uses_native_totals_not_encoded_payload_length() {
             {"type":"input_image","image_url":format!("data:image/png;base64,{payload}")}
         ]);
         let mut t = Trajectory::default();
-        t.primary(&request, &terminal(4000, 1000, 0, 5), "route", 100, true);
+        let receipt = terminal(4000, 1000, 0, 5);
+        let mut quantities = crate::proxy_quantity::InputMeasurements::default();
+        quantities.observe(&request, &receipt["usage"], "route", None, 100);
+        t.primary(&request, &receipt, "route", 100, true);
         let first = t.snapshot();
         assert_eq!(first.unavailable_primary_cost_calls, 0);
         assert_eq!(first.matched_primary_responses, 1);
         assert_eq!(first.coverage.unmodeled_calls, 0);
         assert_eq!(t.history.last_traditional_input, 4000);
-        assert_eq!(t.receipt_prediction(&request, "route", None), Some(4000));
+        assert_eq!(
+            quantities.predict(&request, "route", None).unwrap().tokens,
+            4000
+        );
         costs.push(first.observed_primary_cost);
         t = serde_json::from_value(state(&t)).unwrap();
-        t.primary(&request, &terminal(4000, 3000, 0, 5), "route", 101, true);
+        quantities = serde_json::from_value(serde_json::to_value(&quantities).unwrap()).unwrap();
+        let receipt = terminal(4000, 3000, 0, 5);
+        quantities.observe(&request, &receipt["usage"], "route", None, 101);
+        t.primary(&request, &receipt, "route", 101, true);
         assert_eq!(t.snapshot().matched_primary_responses, 2);
         assert_eq!(state(&t)["receipts"]["last_appended_input"], 0);
         let mut appended = request.clone();
         appended["input"].as_array_mut().unwrap().push(json!({
             "role":"user","content":[{"type":"input_image","image_url":"new unmeasured image"}]
         }));
-        assert_eq!(t.receipt_prediction(&appended, "route", None), None);
+        assert!(
+            quantities.predict(&appended, "route", None).is_none(),
+            "the previous receipt cannot assign input units to a new image"
+        );
         // A changed multimodal projection has no measured allocation for its
         // restored image/material. Keep known expense, omit that comparison.
-        t.projected(2000, 1000, true);
+        t.projected_input(None, true);
         let before = t.snapshot().observed_primary_cost;
         t.primary(&request, &terminal(3000, 0, 0, 5), "route", 102, true);
         let after = t.snapshot();
@@ -1025,6 +1037,109 @@ fn receipt_counterfactual_cache_is_conditional_not_copied_from_actual_hits() {
 }
 
 #[test]
+fn receipt_first_divergent_request_assumes_ideal_baseline_cache() {
+    for actual_cached in [0, 1500] {
+        let mut t = Trajectory::default();
+        t.projected(1500, 500, true);
+        t.primary(
+            &body(),
+            &terminal(2000, actual_cached, 0, 0),
+            "route",
+            100,
+            true,
+        );
+        let expected = scenario_input_cost("gpt-6.1-sol", 3000, 3000, Some(1024)).unwrap();
+        assert!(
+            (t.snapshot().traditional_cost - expected).abs() < 1e-12,
+            "unknown inherited baseline cache must not manufacture a cold-start saving"
+        );
+        assert_eq!(
+            state(&t)["result"]["cache_initializations"]["assumed_ideal"],
+            1,
+            "assumed warmth must remain distinguishable from observed coverage"
+        );
+        let mut t: Trajectory = serde_json::from_value(state(&t)).unwrap();
+        let before = t.snapshot();
+        let mut appended = body();
+        appended["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"append"}));
+        t.primary(&appended, &terminal(2100, 0, 0, 0), "route", 101, true);
+        let expected = scenario_input_cost("gpt-6.1-sol", 3100, 3000, Some(1024)).unwrap();
+        assert!((t.snapshot().traditional_cost - before.traditional_cost - expected).abs() < 1e-12);
+        assert_eq!(
+            state(&t)["result"]["cache_initializations"]["assumed_ideal"],
+            1
+        );
+    }
+}
+
+#[test]
+fn receipt_first_identical_request_preserves_observed_inherited_cache_partition() {
+    let mut t = Trajectory::default();
+    t.primary(&body(), &terminal(2000, 1500, 0, 0), "route", 100, true);
+    assert_eq!(t.snapshot().carry_cost, t.snapshot().traditional_cost);
+    let state = state(&t);
+    assert_eq!(
+        state["receipts"]["modeled_cache"]["writes"][0]["start"], 1500,
+        "an inherited cache read is not a fresh full-input write"
+    );
+    assert_eq!(state["receipts"]["modeled_cache"]["reads"][0]["end"], 1500);
+    assert_eq!(state["result"]["cache_initializations"]["observed"], 1);
+}
+
+#[test]
+fn receipt_failed_primary_preserves_valid_baseline_cache_across_restart() {
+    let mut t = Trajectory::default();
+    t.projected(100, 100, true);
+    let receipt = terminal(2000, 0, 0, 0);
+    let mut quantities = crate::proxy_quantity::InputMeasurements::default();
+    quantities.observe(&body(), &receipt["usage"], "route", None, 100);
+    t.primary(&body(), &receipt, "route", 100, true);
+    let before = t.snapshot();
+    let cache_before = state(&t)["receipts"]["modeled_cache"].clone();
+    let quantities_before = serde_json::to_value(&quantities).unwrap();
+    t.failed_call();
+    assert_eq!(
+        state(&t)["receipts"]["modeled_cache"],
+        cache_before,
+        "a transport failure does not prove provider cache eviction"
+    );
+    assert_eq!(
+        serde_json::to_value(&quantities).unwrap(),
+        quantities_before,
+        "a failed primary does not supply a new native input measurement"
+    );
+    assert_eq!(
+        quantities.predict(&body(), "route", None).unwrap().tokens,
+        2000,
+        "the last successful whole-prompt measurement remains valid independently of cache state"
+    );
+    let mut failed_opaque = body();
+    failed_opaque["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":[
+            {"type":"input_image","image_url":"new image in the failed attempt"}
+        ]}));
+    assert!(
+        quantities.predict(&failed_opaque, "route", None).is_none(),
+        "a failed attempt must not invent a native size for its new image"
+    );
+    let mut t: Trajectory = serde_json::from_value(state(&t)).unwrap();
+    let mut appended = body();
+    appended["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"append"}));
+    t.primary(&appended, &terminal(2100, 0, 0, 0), "route", 101, true);
+    let expected = scenario_input_cost("gpt-6.1-sol", 2100, 2000, Some(1024)).unwrap();
+    assert!((t.snapshot().traditional_cost - before.traditional_cost - expected).abs() < 1e-12);
+    assert_eq!(t.snapshot().coverage.failed_calls, 1);
+}
+
+#[test]
 fn receipt_subscription_traditional_cache_uses_model_policy_not_transport_capability() {
     use carry::models::{Route, resolve_model};
 
@@ -1041,7 +1156,7 @@ fn receipt_subscription_traditional_cache_uses_model_policy_not_transport_capabi
         let mut t = Trajectory::default();
         // A genuine equal-token rewrite keeps this a divergent-forecast control.
         t.projected(100, 100, true);
-        // A real hit does not warm the hypothetical branch's first request.
+        // Unknown inherited traditional cache receives ideal eligible coverage.
         t.primary_resolved(
             &body(),
             &terminal(2000, 2000, 0, 0),
@@ -1051,7 +1166,7 @@ fn receipt_subscription_traditional_cache_uses_model_policy_not_transport_capabi
             Some(&resolved),
         );
         let cold = t.snapshot();
-        let expected_cold = scenario_input_cost(model, 2000, 0, Some(1024)).unwrap();
+        let expected_cold = scenario_input_cost(model, 2000, 2000, Some(1024)).unwrap();
         assert!(
             (cold.traditional_cost - expected_cold).abs() < 1e-12,
             "{endpoint}: model-level cache economics must not be disabled by transport uncertainty"
@@ -1072,7 +1187,8 @@ fn receipt_subscription_traditional_cache_uses_model_policy_not_transport_capabi
             Some(&resolved),
         );
         let warm = t.snapshot();
-        let expected_warm = scenario_input_cost(model, 2100, 2000, Some(1024)).unwrap();
+        let rates = resolved.forecast_rates_for_input(2100.0).unwrap();
+        let expected_warm = 2000.0 * rates.cached + 100.0 * rates.write;
         assert!((warm.traditional_cost - cold.traditional_cost - expected_warm).abs() < 1e-12);
         assert_eq!(warm.coverage.unknown_cache_requests, 0);
         assert_eq!(
@@ -1142,20 +1258,30 @@ fn receipt_failed_reviewer_does_not_invalidate_primary_or_traditional_cache() {
             let mut t = Trajectory::default();
             // A genuine equal-token rewrite keeps this a divergent-forecast control.
             t.projected(100, 100, true);
-            t.primary(&body(), &terminal(2000, 0, 0, 0), "route", 100, true);
+            let receipt = terminal(2000, 0, 0, 0);
+            let mut quantities = crate::proxy_quantity::InputMeasurements::default();
+            quantities.observe(&body(), &receipt["usage"], "route", None, 100);
+            t.primary(&body(), &receipt, "route", 100, true);
             let before = t.snapshot();
             let mut failed = terminal(1000, 0, 0, 10);
             failed["status"] = json!(status);
             t.reviewer_resolved(&body(), &failed, true, None);
             if restart {
                 t = serde_json::from_value(state(&t)).unwrap();
+                quantities =
+                    serde_json::from_value(serde_json::to_value(&quantities).unwrap()).unwrap();
             }
             let mut next = body();
             next["input"]
                 .as_array_mut()
                 .unwrap()
                 .push(json!({"role":"user","content":"continue"}));
-            assert!(t.receipt_prediction(&next, "route", None).is_some());
+            let appended = next["input"].as_array().unwrap().last().unwrap();
+            assert_eq!(
+                quantities.predict(&next, "route", None).unwrap().tokens,
+                2000 + crate::savings::local_text_tokens(appended),
+                "reviewer failure cannot erase the measured primary prefix or cause it to be retokenized"
+            );
             t.primary(&next, &terminal(2100, 0, 0, 0), "route", 101, true);
             let after = t.snapshot();
             let expected = scenario_input_cost("gpt-6.1-sol", 2100, 2000, Some(1024)).unwrap();
@@ -1198,7 +1324,7 @@ fn receipt_frozen_scenario_policy_and_tariff_survive_restart_without_route_credi
         true,
         Some(&resolved),
     );
-    assert!((t.snapshot().traditional_cost - 0.018).abs() < 1e-12);
+    assert!((t.snapshot().traditional_cost - 0.0002).abs() < 1e-12);
     let checkpoint = json!({"trajectory":t,"resolved":resolved});
     let mut t: Trajectory = serde_json::from_value(checkpoint["trajectory"].clone()).unwrap();
     let resolved: ResolvedModel = serde_json::from_value(checkpoint["resolved"].clone()).unwrap();
@@ -1215,7 +1341,7 @@ fn receipt_frozen_scenario_policy_and_tariff_survive_restart_without_route_credi
         true,
         Some(&resolved),
     );
-    assert!((t.snapshot().traditional_cost - 0.0191).abs() < 1e-12);
+    assert!((t.snapshot().traditional_cost - 0.0011).abs() < 1e-12);
     let before = t.snapshot();
     b["input"]
         .as_array_mut()
@@ -1229,7 +1355,7 @@ fn receipt_frozen_scenario_policy_and_tariff_survive_restart_without_route_credi
         true,
         Some(&resolved),
     );
-    assert!((t.snapshot().traditional_cost - before.traditional_cost - 0.0198).abs() < 1e-12);
+    assert!((t.snapshot().traditional_cost - before.traditional_cost - 0.0154).abs() < 1e-12);
 }
 
 #[test]
@@ -1316,7 +1442,7 @@ fn receipt_policy_upgrade_freezes_legacy_segment_and_starts_cold() {
         segment.matched_primary_responses,
         before.matched_primary_responses
     );
-    let cold = scenario_input_cost("gpt-6.1-sol", 2100, 0, Some(1024)).unwrap();
+    let cold = 2100.0 * 2.0 / 1e6;
     assert!((mixed.traditional_cost - before.traditional_cost - cold).abs() < 1e-12);
     let mut t: Trajectory = serde_json::from_value(state(&t)).unwrap();
     b["input"]
@@ -1332,7 +1458,7 @@ fn receipt_policy_upgrade_freezes_legacy_segment_and_starts_cold() {
         Some(&upgraded),
     );
     let after = t.snapshot();
-    let warm = scenario_input_cost("gpt-6.1-sol", 2200, 2100, Some(1024)).unwrap();
+    let warm = (2100.0 * 0.1 + 100.0 * 2.0) / 1e6;
     assert!((after.traditional_cost - mixed.traditional_cost - warm).abs() < 1e-12);
     assert_eq!(
         serde_json::to_value(after.legacy_cache_policy_segment).unwrap(),
@@ -1354,7 +1480,6 @@ fn receipt_traditional_cache_invalidations_are_independent_and_conservative() {
         "tier",
         "model",
         "fork",
-        "unknown_call",
         "backward_time",
         "edit",
     ] {
@@ -1399,7 +1524,6 @@ fn receipt_traditional_cache_invalidations_are_independent_and_conservative() {
                     resolve_model("gpt-6-luna", resolved.route.clone(), None, None, 0, 0).unwrap();
             }
             "fork" => t.reset_epoch(),
-            "unknown_call" => t.failed_call(),
             "backward_time" => at = 99,
             "edit" => b["input"][0]["content"] = json!("unannounced edit"),
             _ => unreachable!(),
@@ -1920,4 +2044,36 @@ fn receipt_missing_conflicting_and_failed_usage_remain_unknown_not_projected() {
         assert_eq!(t.snapshot().carry_cost, 0.0, "{variant}");
         assert_eq!(t.snapshot().traditional_cost, 0.0, "{variant}");
     }
+}
+
+#[test]
+fn unknown_restoration_preserves_expense_without_inventing_a_comparison() {
+    let mut t = Trajectory::default();
+    t.projected_input(None, true);
+    t.primary(&body(), &terminal(4000, 3000, 0, 5), "route", 100, true);
+    let measured = t.snapshot();
+    assert!(measured.observed_primary_cost > 0.0);
+    assert_eq!(measured.unavailable_primary_cost_calls, 0);
+    assert_eq!(
+        measured.matched_primary_responses, 0,
+        "an unknown restoration is not a measured zero-token omission"
+    );
+}
+
+#[test]
+fn measured_opaque_projection_can_compare_native_input_without_decoding_payloads() {
+    let mut request = body();
+    request["input"][0]["content"] = json!([
+        {"type":"input_text","text":"retained native image"},
+        {"type":"input_image","image_url":"data:image/png;base64,opaque"}
+    ]);
+    let mut t = Trajectory::default();
+    t.projected_input(Some(1000), true);
+    t.primary(&request, &terminal(4000, 3000, 0, 5), "route", 100, true);
+    let measured = t.snapshot();
+    assert_eq!(
+        measured.matched_primary_responses, 1,
+        "a supplied measured block delta does not require local image tokenization"
+    );
+    assert_eq!(t.history.last_traditional_input, 5000);
 }

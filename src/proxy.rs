@@ -189,6 +189,7 @@ struct Service {
     auth_token: Option<String>,
     locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     background_reviews: Arc<Mutex<HashSet<String>>>,
+    text_quantities: crate::proxy_quantity::TextMemo,
     // Advice authority belongs to the live worker, independently of whether a
     // changed-direction checkpoint can be published. Cleared on settlement.
     #[cfg(test)]
@@ -381,6 +382,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         config,
         locks: Arc::new(Mutex::new(HashMap::new())),
         background_reviews: Arc::new(Mutex::new(HashSet::new())),
+        text_quantities: Default::default(),
         #[cfg(test)]
         lock_waits: Arc::new(std::sync::Mutex::new(None)),
         _directory_lock: Arc::new(directory_lock),
@@ -432,6 +434,10 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         .route("/carry/metrics", get(metrics))
         .route("/carry/dashboard", get(dashboard))
         .route("/carry/dashboard/stats", get(dashboard_stats))
+        .route(
+            "/carry/dashboard/transcript/{id}",
+            get(dashboard_transcript),
+        )
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(service);
     axum::serve(
@@ -518,6 +524,21 @@ async fn session_lock(service: &Service, id: &str) -> OwnedMutexGuard<()> {
 const CHECKPOINT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 fn load(service: &Service, id: &str) -> Result<Session, Failure> {
+    let mut session = load_with_restore(service, id, || history::restore(service, id))?;
+    session
+        .primary_input
+        .use_text_memo(&service.text_quantities);
+    session
+        .reviewer_input
+        .use_text_memo(&service.text_quantities);
+    Ok(session)
+}
+
+fn load_with_restore(
+    service: &Service,
+    id: &str,
+    restore: impl FnOnce() -> std::io::Result<Session>,
+) -> Result<Session, Failure> {
     let path = service.config.state_dir.join(format!("{id}.json"));
     match std::fs::read(path) {
         Ok(bytes) if bytes.len() <= CHECKPOINT_MAX_BYTES => {
@@ -529,7 +550,7 @@ fn load(service: &Service, id: &str) -> Result<Session, Failure> {
                         )));
                     }
                     if session.history_shared {
-                        history::restore(service, id).map_err(serde_json::Error::io)
+                        restore().map_err(serde_json::Error::io)
                     } else {
                         Ok(session)
                     }
@@ -570,7 +591,12 @@ fn save(service: &Service, id: &str, session: &Session) -> std::io::Result<()> {
 /// advice, or removal state may leak through this fallback. The normal hard
 /// limits still apply. If even this cannot publish, the predispatch pending
 /// marker remains canonical and restart conservatively censors the attempt.
-fn save_paid_accounting(service: &Service, id: &str, paid: &Session) -> std::io::Result<()> {
+fn save_paid_accounting(
+    service: &Service,
+    id: &str,
+    paid: &Session,
+    request_id: &str,
+) -> std::io::Result<()> {
     let mut durable = load_existing(service, id)
         .map_err(|_| std::io::Error::other("paid accounting authority unavailable"))?;
     let calls = paid.primary.calls.saturating_sub(durable.primary.calls)
@@ -582,6 +608,32 @@ fn save_paid_accounting(service: &Service, id: &str, paid: &Session) -> std::io:
     durable.primary_pending = paid.primary_pending;
     durable.background_review_pending = paid.background_review_pending;
     durable.cost_trajectory = paid.cost_trajectory.clone();
+    for (target, source, lane) in [
+        (
+            &mut durable.last_primary_dispatch,
+            &paid.last_primary_dispatch,
+            "primary",
+        ),
+        (
+            &mut durable.last_reviewer_dispatch,
+            &paid.last_reviewer_dispatch,
+            "reviewer",
+        ),
+    ] {
+        if let Some(record) = source
+            && record.lane == lane
+            && matches!(record.outcome.as_str(), "completed" | "failed")
+            && match lane {
+                "primary" => record.request_id == request_id,
+                _ => record.parent_request_id.as_deref() == Some(request_id),
+            }
+        {
+            *target = Some(record.clone());
+            if lane == "primary" {
+                durable.last_failure = paid.last_failure.clone();
+            }
+        }
+    }
     if calls > 0
         && let Some(trajectory) = &mut durable.cost_trajectory
     {
@@ -1069,6 +1121,8 @@ fn dashboard_plan(session: &Session) -> Value {
     json!({
         "selected": last_plan["selected"].as_bool().unwrap_or(false),
         "selected_candidate_id": selected_id,
+        "candidates": last_plan["candidates"],
+        "baseline_omitted_members": last_plan["baseline_omitted_members"],
         "selected_action": last_plan["selected_action"].as_str(),
         "primary_output_allowance_tokens": last_plan["primary_output_allowance_tokens"].as_u64(),
         "primary_output_allowance_basis": last_plan["primary_output_allowance_basis"].as_str(),
@@ -1080,6 +1134,8 @@ fn dashboard_plan(session: &Session) -> Value {
         "primary_required_tokens": last_plan["primary_required_tokens"].as_f64(),
         "reviewer_required_tokens": last_plan["reviewer_required_tokens"].as_f64(),
         "primary_estimated_tokens": last_plan["primary_estimated_tokens"].as_f64(),
+        "primary_input_basis": last_plan["primary_input_basis"],
+        "primary_admission": last_plan["primary_admission"],
         "primary_retained_estimated_tokens": after_input,
         "primary_retained_required_tokens": after_required,
         "context_margin_percent": margin,
@@ -1105,6 +1161,108 @@ fn dashboard_plan(session: &Session) -> Value {
     })
 }
 
+fn load_dashboard_session(
+    service: &Service,
+    id: &str,
+    history: &std::io::Result<history::ReadView>,
+) -> Result<Session, Failure> {
+    // Without a readable generation, a mirror cannot establish that it is an
+    // explicit checkpoint rather than a shared owner's diagnostic copy.
+    let view = history.as_ref().map_err(|_| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "history index unavailable",
+        )
+    })?;
+    match view.shared(id) {
+        Ok(Some(session)) => return Ok(session),
+        Err(_) => {
+            return Err(failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "shared authority unavailable",
+            ));
+        }
+        Ok(None) => {}
+    }
+    // Explicit checkpoints remain authoritative. A shared owner's diagnostic
+    // mirror cannot replace missing, expired or corrupt index authority.
+    if !service
+        .config
+        .state_dir
+        .join(format!("{id}.json"))
+        .is_file()
+    {
+        return Err(failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "checkpoint unavailable",
+        ));
+    }
+    let session = load_with_restore(service, id, || view.restore(id))?;
+    // A compact checkpoint's frontier is an index dependency, independent of
+    // its mutable shared flag. Only self-contained explicit checkpoints may
+    // stand alone when the index is absent or contains no selected owner.
+    if session.history_frontier.is_some() {
+        return Err(failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "shared checkpoint authority unavailable",
+        ));
+    }
+    Ok(session)
+}
+
+async fn dashboard_transcript(
+    State(service): State<Arc<Service>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Response, Failure> {
+    // Same access policy as dashboard stats: the private LAN/tailnet relay
+    // connects over loopback. Non-loopback callers retain gateway auth.
+    authorize_dashboard(&service, &headers, peer)?;
+    if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(failure(StatusCode::BAD_REQUEST, "invalid session id"));
+    }
+    let history = history::ReadView::new(&service);
+    let mut session = load_dashboard_session(&service, &id, &history)?;
+    let canonical = session
+        .history
+        .iter()
+        .map(|i| i.value.clone())
+        .collect::<Vec<_>>();
+    if let Some(namespace) = &session.history_namespace
+        && let Some(record) = history
+            .as_ref()
+            .ok()
+            .and_then(|view| view.advice(namespace, &canonical))
+    {
+        record.apply(&mut session);
+    }
+    let mut response = axum::Json(json!({
+        "canonical_input": canonical,
+        "current_replacement_memories": session.memories,
+        "last_primary_wire": null,
+        "last_reviewer_wire": null,
+        "availability": "Current retained canonical source and applicable memories only. Exact historical primary/reviewer dispatch bodies are not retained by this endpoint; unavailable, not reconstructed. Existing retention limits apply."
+    })).into_response();
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    response
+        .headers_mut()
+        .insert("x-content-type-options", "nosniff".parse().unwrap());
+    Ok(response)
+}
+
+fn dashboard_current_failure(session: &Session) -> Option<&Value> {
+    let dispatch = session.last_primary_dispatch.as_ref()?;
+    let failure = session.last_failure.as_ref()?;
+    // Legacy failures lack request identity and cannot establish current state.
+    (dispatch.lane == "primary"
+        && dispatch.outcome == "failed"
+        && failure["request_id"].as_str() == Some(dispatch.request_id.as_str()))
+    .then_some(failure)
+}
+
 async fn dashboard_stats(
     State(service): State<Arc<Service>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1120,6 +1278,7 @@ async fn dashboard_stats(
     let mut sessions = Vec::new();
     let mut unavailable_sessions = 0u64;
     let mut cost_estimate = crate::proxy_savings::DashboardTotals::default();
+    let history = history::ReadView::new(&service);
     for entry in entries {
         let Ok(entry) = entry else {
             unavailable_sessions += 1;
@@ -1139,7 +1298,7 @@ async fn dashboard_stats(
             unavailable_sessions += 1;
             continue;
         }
-        let Ok(mut session) = load(&service, id) else {
+        let Ok(mut session) = load_dashboard_session(&service, id, &history) else {
             unavailable_sessions += 1;
             continue;
         };
@@ -1149,16 +1308,32 @@ async fn dashboard_stats(
                 .iter()
                 .map(|i| i.value.clone())
                 .collect::<Vec<_>>();
-            if let Ok(Some(record)) = history::advice(&service, namespace, &input) {
+            if let Some(record) = history
+                .as_ref()
+                .ok()
+                .and_then(|view| view.advice(namespace, &input))
+            {
                 record.apply(&mut session);
             }
         }
-        let retained = session.last_submitted_ids.len();
+        let submitted = session
+            .last_submitted_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let retained = session
+            .history
+            .iter()
+            .filter(|item| submitted.contains(&item.id))
+            .count();
+        // Mutually exclusive source states: omitted in the last dispatch, then
+        // current eligibility/protection among the sources that were submitted.
+        // Memories are additive facts, never part of the source denominator.
         let groups = session.groups();
         let removable = groups
             .iter()
             .filter(|g| session.drop_authorized(g))
-            .map(|g| g.members.len())
+            .map(|g| g.members.iter().filter(|id| submitted.contains(id)).count())
             .sum::<usize>();
         let protected = groups
             .iter()
@@ -1171,7 +1346,7 @@ async fn dashboard_stats(
                             .is_some_and(|opinion| opinion == "keep")
                     })
             })
-            .map(|g| g.members.len())
+            .map(|g| g.members.iter().filter(|id| submitted.contains(id)).count())
             .sum::<usize>();
         let planner = dashboard_plan(&session);
         let estimate = session
@@ -1196,12 +1371,15 @@ async fn dashboard_stats(
             .is_some_and(|lock| lock.try_lock().is_err());
         sessions.push(json!({
             "updated_at": updated_at, "processing": processing,
-            "last_failure": session.last_failure, "planner": planner,
+            "last_failure": dashboard_current_failure(&session), "planner": planner,
             "id": id, "title": session.title(), "primary": session.primary, "shadow": session.shadow,
             "client": session.client,
             "cost_estimate": estimate,
             "background_review_pending": session.background_review_pending,
             "completed_requests": session.completed_requests,
+            "last_primary_dispatch": session.last_primary_dispatch,
+            "last_reviewer_dispatch": session.last_reviewer_dispatch,
+            "rewrites": session.rewrites,
             "compactions": session.compactions, "native_compactions": session.native_compactions,
             "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews, "partial_reviews": session.partial_reviews,
             "failed_primaries": session.failed_primaries,
@@ -1777,17 +1955,9 @@ async fn forward_request(
             session.last_plan = report.clone();
             let _ = trace(&service, &id, "paired_plan", &report);
             logging::planned(&service, &id, &request_id, &report);
-            let mut projected = outbound.clone();
-            projected["input"] = json!(projection.input);
-            // Economics describes hypothetical alternatives; admission owns
-            // the actual mode-selected wire (canonical in audit mode).
-            if !primary_fits(&service.config, &projected) {
-                let _ = save(&service, &id, &session);
-                return Err(failure(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "no permitted projection fits the primary context budget",
-                ));
-            }
+            // Capacity quantities guide projection/review planning only. A
+            // local estimate (especially opaque native input) cannot reject a
+            // caller's primary request; let the provider enforce its limits.
             if !projection.omitted.is_empty() {
                 session.compactions += 1;
             }
@@ -1814,32 +1984,107 @@ async fn forward_request(
         // Measure after choosing its actual input, including a zero delta for
         // pass-through. Receipt compatibility may preserve only this quantity.
         let canonical = json!(session.render_primary());
-        let (canonical_units, submitted_units, primary_edited) = if service.config.mode == Mode::Off
-        {
-            // Off never edits input. Its optional tracker can fail or be empty,
-            // so it cannot define a canonical-minus-sent delta.
-            (0, 0, false)
+        let primary_edited = service.config.mode != Mode::Off && canonical != outbound["input"];
+        // Freeze the actual wire before both measurement and metering. Native
+        // payloads keep their identity; their encoded bytes are never tokens.
+        outbound = primary_wire_body(&service.config, &outbound);
+        let mut canonical_body = body.clone();
+        canonical_body["input"] = canonical.clone();
+        let canonical_wire = primary_wire_body(&service.config, &canonical_body);
+        let restored = if service.config.mode == Mode::Off {
+            Some(0)
         } else {
-            (
-                estimate(&canonical) as u64,
-                estimate(&outbound["input"]) as u64,
-                canonical != outbound["input"],
+            session.primary_input.restoration(
+                &canonical_wire,
+                &outbound,
+                &service.config.upstream_url,
+                service.config.model_resolution.as_ref().map(|p| &p.primary),
             )
         };
-        // Freeze the final transport representation before reserving the attempt.
-        // Projection uses client-native quantities; admission has already retained
-        // the client's output cap.
-        outbound = primary_wire_body(&service.config, &outbound);
         if let Some(t) = &mut session.cost_trajectory {
-            t.projected(canonical_units, submitted_units, primary_edited);
+            t.projected_input(restored, primary_edited);
         }
-        let reviewed = session.clone();
+        // Numeric snapshots use the shared prompt-bearing projection, never allowance.
+        // The planner owns the reauthorized continuation membership.
+        let baseline = report["baseline_omitted_members"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(Value::as_u64).collect::<HashSet<_>>());
+        // An empty continuation omission set is exactly the canonical input;
+        // avoid cloning/adapting another large request for that common case.
+        let continuation_wire = baseline
+            .as_ref()
+            .filter(|ids| !ids.is_empty())
+            .map(|omitted| {
+                let mut continuation_body = canonical_body.clone();
+                continuation_body["input"] = json!(session.render_projection(omitted));
+                primary_wire_body(&service.config, &continuation_body)
+            });
+        let mut counts = PromptTokenCounts::default();
+        let resolved = service
+            .config
+            .model_resolution
+            .as_ref()
+            .map(|pair| &pair.primary);
+        let mut measurement = dispatch_measurement(&request_id, "primary", &outbound);
+        measurement.outgoing_input_tokens = session
+            .primary_input
+            .known_estimate(&outbound, &service.config.upstream_url, resolved)
+            .map(|input| input.tokens);
+        measurement.basis =
+            "receipt_first_or_local_visible_text_not_encoded_native_payloads".into();
+        // Seed with the outgoing measurement already computed at the boundary.
+        counts
+            .0
+            .push((&outbound, measurement.outgoing_input_tokens));
+        measurement.caller_input_tokens = counts.measured(
+            &original_body,
+            &session.primary_input,
+            &service.config.upstream_url,
+            resolved,
+        );
+        measurement.canonical_input_tokens = counts.measured(
+            &canonical_wire,
+            &session.primary_input,
+            &service.config.upstream_url,
+            resolved,
+        );
+        measurement.continuation_input_tokens = baseline.as_ref().and_then(|_| {
+            counts.measured(
+                continuation_wire.as_ref().unwrap_or(&canonical_wire),
+                &session.primary_input,
+                &service.config.upstream_url,
+                resolved,
+            )
+        });
+        let shrink = baseline.as_ref().is_some_and(|prior| {
+            projection.omitted.iter().any(|id| !prior.contains(id))
+                && measurement
+                    .outgoing_input_tokens
+                    .zip(measurement.continuation_input_tokens)
+                    .is_some_and(|(out, before)| out < before)
+        });
+        let rewrites = session
+            .rewrites
+            .get_or_insert_with(|| crate::proxy_state::RewriteCount {
+                prior_unknown: session.primary.calls > 0
+                    || session.completed_requests > 0
+                    || session.compactions > 1,
+                ..Default::default()
+            });
+        if shrink {
+            rewrites.dispatched = rewrites.dispatched.saturating_add(1);
+            rewrites.forced = rewrites
+                .forced
+                .saturating_add(u64::from(report["forced"] == true));
+        }
+        session.last_primary_dispatch = Some(measurement);
         session.last_submitted_ids = session
             .history
             .iter()
             .filter(|i| !projection.omitted.contains(&i.id))
             .map(|i| i.id)
             .collect();
+        let reviewed = session.clone();
         let mut reserved = session.clone();
         reserved.primary_pending = true;
         save(&service, &id, &reserved).map_err(|error| {
@@ -1956,17 +2201,23 @@ async fn forward_request(
         }
         Err(_) => {
             if let Some(mut commit) = commit {
-                commit.reviewed.last_failure =
-                    Some(json!({"at": now(), "reason": "upstream transport or timeout"}));
+                commit.reviewed.last_failure = Some(json!({"at": now(),
+                    "request_id": commit.request_id, "reason": "upstream transport or timeout"}));
                 commit.reviewed.primary_pending = false;
                 commit.reviewed.failed_primaries += 1;
+                finish_measurement(&mut commit.reviewed.last_primary_dispatch, None, false);
                 if let Some(trajectory) = &mut commit.reviewed.cost_trajectory {
                     trajectory.failed_call();
                 }
                 commit.reviewed.primary.calls += 1;
                 commit.reviewed.primary.unavailable_cost_calls += 1;
                 if save(&service, &commit.id, &commit.reviewed).is_err() {
-                    let _ = save_paid_accounting(&service, &commit.id, &commit.reviewed);
+                    let _ = save_paid_accounting(
+                        &service,
+                        &commit.id,
+                        &commit.reviewed,
+                        &commit.request_id,
+                    );
                 }
                 logging::usage(
                     &service,
@@ -2253,7 +2504,7 @@ async fn dispatch_review_for(
     let view =
         crate::proxy_state::ReviewedView::new(session, &session.groups_for(&projection.omitted));
     let body = review_body_for_view(&service.config, session, &projection, &view);
-    if !review_fits(&service.config, &body)
+    if !review_fits_measured(&service.config, session, &body)
         || !service.background_reviews.lock().await.insert(id.clone())
     {
         return;
@@ -2266,6 +2517,7 @@ async fn dispatch_review_for(
     session.bootstrap_review_attempted |= session.bootstrap_review_pending;
     session.last_review_request = session.completed_requests;
     session.review_epoch = next_review_generation();
+    session.last_reviewer_dispatch = Some(dispatch_measurement(&request_id, "reviewer", &body));
     if save(&service, &id, session).is_err() {
         session.background_review_pending = false;
         service.background_reviews.lock().await.remove(&id);
@@ -2292,7 +2544,7 @@ async fn dispatch_review_for(
         let completion = if let Ok(mut current) = load_existing(&service, &id) {
             settle_review(&mut current, &before, &reviewed, &run);
             let settled = save(&service, &id, &current)
-                .or_else(|_| save_paid_accounting(&service, &id, &current))
+                .or_else(|_| save_paid_accounting(&service, &id, &current, &run.request_id))
                 .is_ok();
             // Reusable completion cannot precede its known durable receipt.
             // The paid owner may have advanced; semantic authority still keys H.
@@ -2339,6 +2591,20 @@ async fn dispatch_review_for(
 
 fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, run: &ReviewRun) {
     current.background_review_pending = false;
+    // A delayed reviewer may finish after primary advancement, not after a
+    // newer reviewer attempt. Never copy an entire stale Session snapshot.
+    if current
+        .last_reviewer_dispatch
+        .as_ref()
+        .map(|r| &r.request_id)
+        == before
+            .last_reviewer_dispatch
+            .as_ref()
+            .map(|r| &r.request_id)
+    {
+        current.last_reviewer_dispatch = reviewed.last_reviewer_dispatch.clone();
+        current.reviewer_input = reviewed.reviewer_input.clone();
+    }
     for receipt in &run.receipts {
         let resolved = before.model_resolution.as_ref().map(|p| &p.reviewer);
         let settled = if let Some(usage) = &receipt.usage {
@@ -2404,7 +2670,7 @@ async fn run_review(
     let view =
         crate::proxy_state::ReviewedView::new(session, &session.groups_for(&projection.omitted));
     let body = review_body_for_view(&service.config, session, projection, &view);
-    if !review_fits(&service.config, &body) {
+    if !review_fits_measured(&service.config, session, &body) {
         return false;
     }
     review_chunk(service, id, session, &body, &view, run).await
@@ -2463,7 +2729,10 @@ async fn review_chunk(
         &run.request_id,
         &review_attempt_id,
         "review_started",
-        &json!({"background":run.background,"source_group_count":view.groups().count(),"estimated_tokens":estimate(body),"required_tokens":reviewer_required_tokens(&service.config,body),"context_tokens":service.config.classifier_max_input_tokens}),
+        &json!({"background":run.background,"source_group_count":view.groups().count(),"estimated_tokens":session.reviewer_input.known_estimate(body,
+            service.config.classifier_url.as_deref().unwrap_or(&service.config.upstream_url),
+            service.config.model_resolution.as_ref().map(|p|&p.reviewer)).map(|input|input.tokens),
+            "required_tokens":reviewer_required_measured(&service.config,session,body),"context_tokens":service.config.classifier_max_input_tokens}),
     );
     let _ = trace(service, id, "shadow_submitted", body);
     session.last_review_request = session.completed_requests;
@@ -2490,6 +2759,30 @@ async fn review_chunk(
     };
     let mut diagnostic = json!({"reason": "review_transport_or_protocol_failure"});
     let dispatched_at = now();
+    // A background attempt uses exactly the body measured when it was queued.
+    // Bootstrap/chunk attempts with other bodies must measure their own input.
+    let mut measurement = session
+        .last_reviewer_dispatch
+        .take()
+        .filter(|record| run.background && record.request_id == run.request_id)
+        .unwrap_or_else(|| dispatch_measurement(&review_attempt_id, "reviewer", body));
+    measurement.outgoing_input_tokens = session
+        .reviewer_input
+        .estimate(
+            body,
+            service
+                .config
+                .classifier_url
+                .as_deref()
+                .unwrap_or(&service.config.upstream_url),
+            resolved,
+        )
+        .map(|input| input.tokens);
+    measurement.basis = "receipt_first_or_local_visible_text_not_encoded_native_payloads".into();
+    measurement.request_id = review_attempt_id.clone();
+    measurement.parent_request_id = Some(run.request_id.clone());
+    measurement.at = dispatched_at;
+    session.last_reviewer_dispatch = Some(measurement);
     let observed = async {
         let response = if codex_reviewer {
             send_codex(
@@ -2554,6 +2847,11 @@ async fn review_chunk(
     .ok()
     .flatten();
     let mut valid = false;
+    finish_measurement(
+        &mut session.last_reviewer_dispatch,
+        value.as_ref(),
+        value.as_ref().is_some_and(|v| v["status"] == "completed"),
+    );
     session.review_feedback_generation = session.review_epoch;
     session.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"review did not complete with a valid JSON advice object; return the required schema"}]});
     if let Some(value) = value {
@@ -2584,6 +2882,19 @@ async fn review_chunk(
                 carry::models::cache_write_tariff_known(body),
             ),
         );
+        if value["status"] == "completed" {
+            session.reviewer_input.observe(
+                body,
+                &value["usage"],
+                service
+                    .config
+                    .classifier_url
+                    .as_deref()
+                    .unwrap_or(&service.config.upstream_url),
+                resolved,
+                dispatched_at,
+            );
+        }
         if let Some(trajectory) = &mut session.cost_trajectory {
             if value["status"] == "completed" {
                 trajectory.reviewer_usage_settled(
@@ -2965,8 +3276,86 @@ fn cache_base(body: &Value) -> Value {
     base
 }
 
+/// Borrowed, request-local quantities only: no raw-body retention or cross-request
+/// cache. Transport/sampling fields cannot create another prompt measurement.
+#[derive(Default)]
+struct PromptTokenCounts<'a>(Vec<(&'a Value, Option<u64>)>);
+
+impl<'a> PromptTokenCounts<'a> {
+    #[cfg(test)]
+    fn count(&mut self, body: &'a Value) -> Option<u64> {
+        self.count_with(body, || crate::savings::prompt_input_tokens(body))
+    }
+
+    fn measured(
+        &mut self,
+        body: &'a Value,
+        measured: &crate::proxy_quantity::InputMeasurements,
+        route: &str,
+        resolved: Option<&ResolvedModel>,
+    ) -> Option<u64> {
+        self.count_with(body, || {
+            measured
+                .known_estimate(body, route, resolved)
+                .map(|input| input.tokens)
+        })
+    }
+
+    fn count_with(&mut self, body: &'a Value, count: impl FnOnce() -> Option<u64>) -> Option<u64> {
+        if let Some((_, units)) = self.0.iter().find(|(prior, _)| {
+            ["input", "instructions", "tools", "text"]
+                .iter()
+                .all(|key| prior.get(*key) == body.get(*key))
+        }) {
+            return *units;
+        }
+        let units = count();
+        self.0.push((body, units));
+        units
+    }
+}
+
+fn dispatch_measurement(
+    request_id: &str,
+    lane: &str,
+    body: &Value,
+) -> crate::proxy_state::DispatchMeasurement {
+    crate::proxy_state::DispatchMeasurement {
+        request_id: request_id.into(),
+        parent_request_id: None,
+        lane: lane.into(),
+        at: now(),
+        model: body.get("model").and_then(Value::as_str).map(str::to_owned),
+        basis: "unmeasured_until_planning_or_provider_receipt".into(),
+        caller_input_tokens: None,
+        canonical_input_tokens: None,
+        continuation_input_tokens: None,
+        outgoing_input_tokens: None,
+        receipt_input_tokens: None,
+        receipt_output_tokens: None,
+        outcome: "dispatched".into(),
+    }
+}
+
+fn finish_measurement(
+    record: &mut Option<crate::proxy_state::DispatchMeasurement>,
+    value: Option<&Value>,
+    completed: bool,
+) {
+    if let Some(record) = record {
+        record.outcome = if completed { "completed" } else { "failed" }.into();
+        record.receipt_input_tokens =
+            value.and_then(|v| carry::core::CacheUsage::from_receipt(&v["usage"]).input());
+        record.receipt_output_tokens = value.and_then(|v| v["usage"]["output_tokens"].as_u64());
+    }
+}
+
+#[cfg(test)]
 fn estimate(body: &Value) -> f64 {
-    crate::proxy_savings::token_units(body) as f64
+    let quantities = crate::proxy_quantity::InputMeasurements::default();
+    quantities
+        .visible_prompt_tokens(body)
+        .unwrap_or_else(|| quantities.visible_text_tokens(body)) as f64
 }
 
 fn memory_admission_fits(config: &ProxyCli, session: &Session, omitted: &HashSet<u64>) -> bool {
@@ -2976,7 +3365,11 @@ fn memory_admission_fits(config: &ProxyCli, session: &Session, omitted: &HashSet
         input: session.render_projection(omitted),
     };
     bytes <= config.classifier_max_input_bytes as usize / 2
-        && review_fits(config, &review_body_projected(config, session, &projection))
+        && review_fits_measured(
+            config,
+            session,
+            &review_body_projected(config, session, &projection),
+        )
 }
 
 fn primary_output_reserve(config: &ProxyCli, body: &Value) -> u64 {
@@ -2986,24 +3379,67 @@ fn primary_output_reserve(config: &ProxyCli, body: &Value) -> u64 {
     )
 }
 
-fn primary_required_tokens(config: &ProxyCli, body: &Value) -> f64 {
-    let reserve = primary_output_reserve(config, body);
-    // Count the adapted input, but reserve the client's allowance even when
-    // subscription transport must remove its unsupported output-cap field.
-    estimate(&primary_wire_body(config, body))
-        * (1.0 + f64::from(config.context_margin_percent) / 100.0)
-        + reserve as f64
+fn primary_input_estimate(
+    config: &ProxyCli,
+    session: &Session,
+    body: &Value,
+) -> Option<crate::proxy_quantity::InputEstimate> {
+    session.primary_input.estimate(
+        &primary_wire_body(config, body),
+        &config.upstream_url,
+        config.model_resolution.as_ref().map(|p| &p.primary),
+    )
 }
 
+fn primary_required_input(config: &ProxyCli, body: &Value, input: u64) -> f64 {
+    input as f64 * (1.0 + f64::from(config.context_margin_percent) / 100.0)
+        + primary_output_reserve(config, body) as f64
+}
+
+#[cfg(test)]
+fn primary_required_tokens(config: &ProxyCli, body: &Value) -> f64 {
+    // Heuristic for exceptional review only; never primary request admission.
+    let wire = primary_wire_body(config, body);
+    let local = estimate(&wire) as u64;
+    primary_required_input(config, body, local)
+}
+
+#[cfg(test)]
 fn primary_fits(config: &ProxyCli, body: &Value) -> bool {
     primary_required_tokens(config, body) <= config.primary_context_tokens as f64
 }
 
+#[cfg(test)]
 fn reviewer_required_tokens(config: &ProxyCli, body: &Value) -> f64 {
     estimate(body) * (1.0 + f64::from(config.context_margin_percent) / 100.0)
         + config.classifier_max_output_tokens as f64
 }
 
+fn reviewer_required_measured(config: &ProxyCli, session: &Session, body: &Value) -> f64 {
+    let input = session
+        .reviewer_input
+        .estimate(
+            body,
+            config
+                .classifier_url
+                .as_deref()
+                .unwrap_or(&config.upstream_url),
+            config.model_resolution.as_ref().map(|p| &p.reviewer),
+        )
+        .map(|input| input.tokens)
+        .or_else(|| session.reviewer_input.visible_prompt_tokens(body))
+        .unwrap_or(0);
+    input as f64 * (1.0 + f64::from(config.context_margin_percent) / 100.0)
+        + config.classifier_max_output_tokens as f64
+}
+
+fn review_fits_measured(config: &ProxyCli, session: &Session, body: &Value) -> bool {
+    crate::proxy_cache::serialized_identity(body).0 <= config.classifier_max_input_bytes as usize
+        && reviewer_required_measured(config, session, body)
+            <= config.classifier_max_input_tokens as f64
+}
+
+#[cfg(test)]
 fn review_fits(config: &ProxyCli, body: &Value) -> bool {
     crate::proxy_cache::serialized_identity(body).0 <= config.classifier_max_input_bytes as usize
         && reviewer_required_tokens(config, body) <= config.classifier_max_input_tokens as f64
@@ -3028,6 +3464,7 @@ fn reviewer_rates(config: &ProxyCli, input: f64) -> Option<Rates> {
 }
 
 // Keep the caller's decision clock explicit alongside route/credential proof.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn resolved_view_costs(
     keep: &Value,
@@ -3039,20 +3476,54 @@ fn resolved_view_costs(
     credential: &str,
     at: u64,
 ) -> Option<ViewCosts> {
-    let kt = estimate(keep);
-    let ct = estimate(compact);
+    let input = crate::proxy_quantity::InputMeasurements::default();
+    resolved_input_costs(
+        keep,
+        compact,
+        cache,
+        model,
+        requests,
+        resolved,
+        credential,
+        at,
+        input.estimate(keep, "", resolved)?,
+        input.estimate(compact, "", resolved)?,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolved_input_costs(
+    keep: &Value,
+    compact: &Value,
+    cache: &[CacheEvidence],
+    model: &str,
+    requests: u64,
+    resolved: Option<&ResolvedModel>,
+    credential: &str,
+    at: u64,
+    keep_input: crate::proxy_quantity::InputEstimate,
+    compact_input: crate::proxy_quantity::InputEstimate,
+) -> Option<ViewCosts> {
+    let kt = keep_input.tokens as f64;
+    let ct = compact_input.tokens as f64;
     let rates = |tokens| match resolved {
-        Some(r) if r.model == model => r.rates_for_input(tokens),
+        Some(r) if r.model == model => r.forecast_rates_for_input(tokens),
         Some(_) => None,
         None => Rates::for_model(model, tokens),
     };
     let kr = rates(kt)?;
     let cr = rates(ct)?;
-    let capability = match resolved {
-        Some(r) => r.cache,
-        None => crate::openai::prompt_cache_capabilities(model),
+    let minimum = match resolved {
+        Some(r) => match r.route.class {
+            RouteClass::CodexSubscription | RouteClass::SyntheticSubscription => r
+                .scenario_cache_policy
+                .as_ref()
+                .and_then(|p| p.minimum_prefix_tokens),
+            _ => r.cache.map(|cap| cap.minimum_prefix_tokens as u64),
+        },
+        None => carry::models::ScenarioCachePolicy::for_model(model).minimum_prefix_tokens,
     };
-    let first = |body: &Value, tokens: f64, rates: Rates| {
+    let first = |body: &Value, input: crate::proxy_quantity::InputEstimate, rates: Rates| {
         let explicit_write = body["input"].as_array().into_iter().flatten().any(|item| {
             item["content"]
                 .as_array()
@@ -3061,11 +3532,16 @@ fn resolved_view_costs(
                 .any(|block| block["prompt_cache_breakpoint"]["mode"] == "explicit")
         });
         input_cost(
-            tokens,
-            if resolved.is_none() || capability.is_some() {
+            input.tokens as f64,
+            if input.basis == crate::proxy_quantity::EstimateBasis::LocalVisibleText {
                 crate::proxy_cache::reusable(cache, body, resolved, credential, at)
             } else {
-                0.0
+                cache
+                    .iter()
+                    .filter(|entry| entry.reusable_at(body, resolved, credential, at).is_some())
+                    .filter_map(|entry| entry.native_input_tokens)
+                    .max()
+                    .unwrap_or(0) as f64
             },
             if explicit_write && resolved.is_none_or(|r| r.explicit_cache_transport) {
                 rates.write
@@ -3075,10 +3551,10 @@ fn resolved_view_costs(
             rates.cached,
         )
     };
-    let keep_first = first(keep, kt, kr);
-    let compact_first = first(compact, ct, cr);
-    // Native evidence can price the first call even when future cache support is unknown.
-    let minimum = capability.map(|cap| cap.minimum_prefix_tokens as f64);
+    let keep_first = first(keep, keep_input, kr);
+    let compact_first = first(compact, compact_input, cr);
+    // Future hits use the scenario policy, not explicit transport capability.
+    let minimum = minimum.map(|tokens| tokens as f64);
     // Future hits are a fixed-history sensitivity assumption, not guaranteed.
     Some(ViewCosts {
         keep: horizon_cost(
@@ -3355,6 +3831,12 @@ async fn relay(
             });
             if complete_transport && status.is_success() && completed {
                 commit.candidate.primary_pending = false;
+                commit.candidate.last_failure = None;
+                finish_measurement(
+                    &mut commit.candidate.last_primary_dispatch,
+                    observed.as_ref(),
+                    true,
+                );
                 let value = observed.unwrap();
                 let model = commit.outbound["model"].as_str().unwrap_or("");
                 let resolved = commit
@@ -3375,6 +3857,15 @@ async fn relay(
                         carry::models::cache_write_tariff_known(&commit.outbound),
                     ),
                 );
+                if !commit.native {
+                    commit.candidate.primary_input.observe(
+                        &commit.outbound,
+                        &value["usage"],
+                        &commit.service.config.upstream_url,
+                        resolved,
+                        commit.dispatched_at,
+                    );
+                }
                 if let Some(trajectory) = &mut commit.candidate.cost_trajectory {
                     if commit.native {
                         trajectory.unmodeled_call();
@@ -3435,9 +3926,13 @@ async fn relay(
                 )
                 .is_err()
                 {
-                    let accounting_committed =
-                        save_paid_accounting(&commit.service, &commit.id, &commit.candidate)
-                            .is_ok();
+                    let accounting_committed = save_paid_accounting(
+                        &commit.service,
+                        &commit.id,
+                        &commit.candidate,
+                        &commit.request_id,
+                    )
+                    .is_ok();
                     journal(
                         &commit.service,
                         &commit.id,
@@ -3471,8 +3966,15 @@ async fn relay(
                     stream_end
                 };
                 commit.reviewed.primary_pending = false;
-                commit.reviewed.last_failure = Some(json!({"at": now(), "reason": reason,
-                    "http_status": status.as_u16(), "complete_transport": complete_transport}));
+                finish_measurement(
+                    &mut commit.reviewed.last_primary_dispatch,
+                    observed.as_ref(),
+                    false,
+                );
+                commit.reviewed.last_failure = Some(
+                    json!({"at": now(), "request_id": commit.request_id, "reason": reason,
+                    "http_status": status.as_u16(), "complete_transport": complete_transport}),
+                );
                 commit.reviewed.primary_pending = false;
                 commit.reviewed.failed_primaries += 1;
                 if let Some(trajectory) = &mut commit.reviewed.cost_trajectory {
@@ -3502,7 +4004,12 @@ async fn relay(
                     commit.reviewed.primary.unavailable_cost_calls += 1;
                 }
                 if save(&commit.service, &commit.id, &commit.reviewed).is_err() {
-                    let _ = save_paid_accounting(&commit.service, &commit.id, &commit.reviewed);
+                    let _ = save_paid_accounting(
+                        &commit.service,
+                        &commit.id,
+                        &commit.reviewed,
+                        &commit.request_id,
+                    );
                 }
                 let _ = trace(
                     &commit.service,
@@ -3596,9 +4103,164 @@ mod tests {
             auth_token: None,
             locks: Arc::new(Mutex::new(HashMap::new())),
             background_reviews: Arc::new(Mutex::new(HashSet::new())),
+            text_quantities: Default::default(),
             #[cfg(test)]
             lock_waits: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    #[test]
+    fn section_quantities_survive_request_loads_but_not_service_restart() {
+        use crate::prompt_quantity::{reset_tokenized_bytes, tokenized_bytes};
+        for shared in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = checkpoint_service(directory.path());
+            let mut session = load(&service, "quantities").unwrap();
+            session.history_shared = shared;
+            session.history_namespace = Some("quantity-test".into());
+            observe_source(&mut session, &"large unchanged history ".repeat(10000));
+            observe_source(&mut session, "current request");
+            let first = review_body(&service.config, &session);
+            reset_tokenized_bytes();
+            assert!(review_fits_measured(&service.config, &session, &first));
+            assert!(tokenized_bytes() > 200000);
+            session.reviewer_input.observe(
+                &first,
+                &json!({"input_tokens":50000}),
+                &service.config.upstream_url,
+                None,
+                100,
+            );
+            save(&service, "quantities", &session).unwrap();
+            for append in [true, false] {
+                let mut session = load(&service, "quantities").unwrap();
+                if append {
+                    observe_source(&mut session, "small append");
+                }
+                session.completed_requests += 1;
+                session.review_feedback = json!({"attempt":session.completed_requests});
+                let next = review_body(&service.config, &session);
+                assert_ne!(first, next);
+                reset_tokenized_bytes();
+                assert!(review_fits_measured(&service.config, &session, &next));
+                assert!(
+                    tokenized_bytes() < 20000,
+                    "ordinary request reload retokenized unchanged prefix: {} bytes",
+                    tokenized_bytes()
+                );
+                session.reviewer_input.observe(
+                    &next,
+                    &json!({"input_tokens":50100}),
+                    &service.config.upstream_url,
+                    None,
+                    101 + session.completed_requests,
+                );
+                save(&service, "quantities", &session).unwrap();
+            }
+            let restarted = checkpoint_service(directory.path());
+            let mut session = load(&restarted, "quantities").unwrap();
+            // An exact receipt survives restart without any local BPE work.
+            let same = review_body(&restarted.config, &session);
+            reset_tokenized_bytes();
+            assert!(review_fits_measured(&restarted.config, &session, &same));
+            assert_eq!(tokenized_bytes(), 0);
+            observe_source(&mut session, "after restart");
+            let changed = review_body(&restarted.config, &session);
+            reset_tokenized_bytes();
+            assert!(review_fits_measured(&restarted.config, &session, &changed));
+            assert!(
+                tokenized_bytes() > 200000,
+                "restart must not restore local memo"
+            );
+        }
+    }
+
+    #[test]
+    fn loaded_quantities_keep_receipts_and_unknown_native_input_separate() {
+        use crate::prompt_quantity::{reset_tokenized_bytes, tokenized_bytes};
+        let directory = tempfile::tempdir().unwrap();
+        let service = checkpoint_service(directory.path());
+        let mut body = json!({"model":"gpt-6-luna", "input":[
+            {"role":"user","content":"unchanged large prefix ".repeat(10000)}]});
+        let session = load(&service, "primary").unwrap();
+        session
+            .primary_input
+            .estimate(&body, "route", None)
+            .unwrap();
+        save(&service, "primary", &session).unwrap();
+        let mut session = load(&service, "primary").unwrap();
+        reset_tokenized_bytes();
+        // Missing receipts may reuse local units, but never claim a native count.
+        assert_eq!(
+            session
+                .primary_input
+                .estimate(&body, "route", None)
+                .unwrap()
+                .basis,
+            crate::proxy_quantity::EstimateBasis::LocalVisibleText
+        );
+        assert_eq!(tokenized_bytes(), 0);
+        session
+            .primary_input
+            .observe(&body, &json!({"input_tokens":50000}), "route", None, 1);
+        save(&service, "primary", &session).unwrap();
+        let mut session = load(&service, "primary").unwrap();
+        body["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"small append"}));
+        reset_tokenized_bytes();
+        assert!(
+            session
+                .primary_input
+                .predict(&body, "route", None)
+                .unwrap()
+                .tokens
+                > 50000
+        );
+        assert!(tokenized_bytes() < 1000);
+        session
+            .primary_input
+            .observe(&body, &json!({"input_tokens":50020}), "route", None, 2);
+        save(&service, "primary", &session).unwrap();
+        let session = load(&service, "primary").unwrap();
+        reset_tokenized_bytes();
+        assert_eq!(
+            session
+                .primary_input
+                .predict(&body, "route", None)
+                .unwrap()
+                .tokens,
+            50020
+        );
+        assert_eq!(tokenized_bytes(), 0);
+        body["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"reasoning","encrypted_content":"unknown"}));
+        assert!(
+            session
+                .primary_input
+                .estimate(&body, "route", None)
+                .is_none()
+        );
+        assert!(
+            session
+                .primary_input
+                .known_estimate(&body, "route", None)
+                .is_none()
+        );
+        assert_eq!(tokenized_bytes(), 0);
+        // Reviewer capacity may need a visible floor; the shared memo still
+        // cannot turn the new opaque section into a native quantity.
+        assert!(review_fits_measured(&service.config, &session, &body));
+        assert!(tokenized_bytes() < 1000);
+        assert!(
+            session
+                .reviewer_input
+                .estimate(&body, "route", None)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3892,6 +4554,29 @@ mod tests {
         assert_eq!(codex_body(&body)["text"], body["text"]);
     }
 
+    #[test]
+    fn planner_uses_actual_input_receipt_independent_of_money_and_restoration() {
+        let config =
+            ProxyCli::parse_from(["carry", "--upstream-url", "http://127.0.0.1:9/responses"]);
+        let body =
+            json!({"model":"gpt-6.1-sol","input":[{"role":"user","content":"tiny visible input"}]});
+        let mut session = Session::default();
+        session.ingest(body["input"].as_array().unwrap()).unwrap();
+        let wire = primary_wire_body(&config, &body);
+        session.primary_input.observe(
+            &wire,
+            &json!({"input_tokens":56000}),
+            &config.upstream_url,
+            None,
+            now(),
+        );
+        // No cost trajectory, tariff or comparison proof is required to use an
+        // actual input observation for the real request's planning quantity.
+        let (_, report) = plan(&config, &session, &body);
+        assert_eq!(report["primary_estimated_tokens"], 56000);
+        assert_eq!(report["primary_input_basis"], "provider_receipt");
+    }
+
     #[tokio::test]
     async fn dashboard_exposes_only_typed_scenario_estimate() {
         let directory = tempfile::tempdir().unwrap();
@@ -3948,7 +4633,7 @@ mod tests {
         assert_eq!(stats["cost_estimate"]["excluded_sessions"], 1);
         assert_eq!(stats["sessions"][0]["title"], "First task with details");
         assert_eq!(stats["sessions"][0]["context"]["removable_items"], 0);
-        assert_eq!(stats["sessions"][0]["context"]["protected_items"], 1);
+        assert_eq!(stats["sessions"][0]["context"]["protected_items"], 0);
         assert_eq!(stats["sessions"][0]["context"]["memories"], 0);
         assert!(stats["sessions"][0]["planner"].is_object());
         assert!(!String::from_utf8_lossy(&bytes).contains("must not leak"));
@@ -4162,4 +4847,5 @@ mod tests {
     include!("proxy_pr154_tests.rs");
     include!("proxy_log_controls.rs");
     include!("proxy_admission_tests.rs");
+    include!("proxy_dashboard_tests.rs");
 }

@@ -206,7 +206,7 @@ fn stale_background_receipts_keep_the_dispatched_frozen_tariff_not_current_slug_
 }
 
 #[test]
-fn receipt_prediction_uses_measured_prefix_without_relaxing_capacity_reservation() {
+fn receipt_prediction_uses_measured_prefix_and_preserves_output_reservation() {
     let (config, mut session, main) = fixture(Rates {
         input: 7.0,
         cached: 0.7,
@@ -219,16 +219,24 @@ fn receipt_prediction_uses_measured_prefix_without_relaxing_capacity_reservation
     let mut trajectory = crate::proxy_savings::Trajectory::default();
     trajectory.primary_resolved(&wire, &json!({"status":"completed","output":[],"usage":{"input_tokens":20000,"output_tokens":0,"input_tokens_details":{"cached_tokens":0}}}), &config.upstream_url, now(), true, config.model_resolution.as_ref().map(|p| &p.primary));
     session.cost_trajectory = Some(trajectory);
+    session.primary_input.observe(
+        &wire,
+        &json!({"input_tokens":20000}),
+        &config.upstream_url,
+        config.model_resolution.as_ref().map(|p| &p.primary),
+        now(),
+    );
     let (_, report) = plan(&config, &session, &main);
     assert_eq!(
         report["primary_receipt_prediction_tokens"], 20000,
         "planning must distinguish measured history from estimates of new content"
     );
-    assert!(
-        report["primary_required_tokens"].as_f64().unwrap()
-            >= primary_required_tokens(&config, &main),
-        "receipt predictions cannot weaken existing capacity guards"
+    assert_eq!(report["primary_estimated_tokens"], 20000);
+    assert_eq!(
+        report["primary_required_tokens"],
+        primary_required_input(&config, &main, 20000)
     );
+    assert_eq!(report["primary_admission"], "provider_enforced");
 }
 
 #[test]

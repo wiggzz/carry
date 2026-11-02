@@ -117,6 +117,11 @@ class LegacyAdapterLoads(unittest.TestCase):
             self.assertEqual(trajectory["history_continuity"]["cursor"]["items"],
                              len(expected_wires[-1]["input"]))
             self.assertEqual(trajectory["history_continuity"]["cursor"]["input"], inputs[2])
+            # Operational quantity evidence belongs to the final dispatched
+            # wire, independently of the traditional-cost cursor/cache.
+            measured = target["primary_input"]["anchor"]
+            self.assertEqual(measured["input"], inputs[2])
+            self.assertEqual(measured["prompt"]["item_count"], len(expected_wires[-1]["input"]))
             return target
         staged = without_cache(copy.deepcopy(saved))
         checkpoint.write_text(json.dumps(staged))
@@ -182,8 +187,11 @@ class LegacyAdapterLoads(unittest.TestCase):
                 previous_cost = snapshots[step - 1]["traditional_cost"] if step else before["traditional_cost"]
                 # Eventless current history has no timed write: first continuation is
                 # cold, then the new hypothetical write warms only its prefix.
-                expected_increment = (21200 * 2.5 if step == 0 else
-                                      21200 * .1 + 100 * 2.5) / 1e6
+                # Codex credit accounting has no separate cache-write premium.
+                # Preserve cold/warm coverage while applying the same ordinary
+                # input rate to newly processed tokens in both branches.
+                expected_increment = (21200 * 2.0 if step == 0 else
+                                      21200 * .1 + 100 * 2.0) / 1e6
                 self.assertAlmostEqual(after["traditional_cost"] - previous_cost,
                                        expected_increment, places=12,
                                        msg="CURRENT_ADAPTED_PRICE: cold once, then original prefix plus new suffix")

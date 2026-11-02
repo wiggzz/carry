@@ -42,6 +42,35 @@ pub(crate) fn modeled_scope(body: &Value, model: &str, source: impl Serialize) -
     .1
 }
 
+/// Initialization provenance is separate from conditional writes and never
+/// asserts that an unknown inherited provider cache was physically observed.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CacheInitializations {
+    pub observed: u64,
+    pub assumed_ideal: u64,
+}
+impl CacheInitializations {
+    pub(crate) fn prefix(
+        &mut self,
+        input: u64,
+        minimum: Option<u64>,
+        observed: Option<u64>,
+    ) -> u64 {
+        let cached = if let Some(cached) = observed {
+            self.observed += 1;
+            cached.min(input)
+        } else {
+            self.assumed_ideal += 1;
+            input
+        };
+        if minimum.is_some_and(|min| cached >= min) {
+            cached
+        } else {
+            0
+        }
+    }
+}
+
 /// A conditional branch's coverage, never provider observations or billed usage.
 /// Write/read extents retain independent deadlines: a suffix write or qualified
 /// read cannot rewrite an older write. Times use the calling adapter's units.
@@ -124,6 +153,22 @@ impl ModeledCache {
         *self = Self::default();
     }
 
+    /// Initialize a comparison segment from shared observed coverage, or from
+    /// the explicitly ideal inherited-cache assumption. This is read coverage,
+    /// never a paid write. Its modeled remaining lifetime favors the baseline.
+    pub(crate) fn inherit(&mut self, scope: String, at: u64, lifetime: u64, cached: u64) {
+        self.clear();
+        self.scope = scope;
+        if cached > 0 && lifetime > 0 {
+            self.reads.push(ModeledWrite {
+                start: 0,
+                end: cached,
+                at,
+                lifetime,
+            });
+        }
+    }
+
     /// Pure read-time contiguous-prefix query. Neither expiry nor a cache read
     /// records a write, refreshes a deadline, or consults today's policy TTL.
     pub(crate) fn eligible_at(&self, scope: &str, at: u64, input: u64) -> Option<u64> {
@@ -174,9 +219,10 @@ impl ModeledCache {
         }
     }
 
-    /// Settle one conditional request using its frozen policy. Never populate
-    /// this branch from actual native hits. Only already-eligible input can be
-    /// refreshed; newly written suffixes retain their own original write clocks.
+    /// Settle one conditional request using its frozen policy. After initial
+    /// inheritance, divergent native hits cannot populate this branch. Only
+    /// already-eligible input can be refreshed; newly written suffixes retain
+    /// their own original write clocks.
     pub(crate) fn requested(
         &mut self,
         scope: String,
@@ -401,7 +447,6 @@ pub(super) fn reusable(
         .iter()
         .filter_map(|e| e.reusable_at(body, resolved, credential, at))
         .fold(0.0, f64::max)
-        .min(crate::proxy_savings::token_units(body) as f64)
 }
 
 pub(super) fn observe(
@@ -485,7 +530,11 @@ pub(super) fn observe(
         base_sha256: serialized_identity(&base(body)).1,
         input_sha256: input_identity(input),
         input_len: input.len(),
-        estimated_tokens: crate::proxy_savings::token_units(&json!(input)) as f64,
+        estimated_tokens: if write_window.is_some() || read_window.is_some() {
+            crate::proxy_savings::token_units(&json!(input)) as f64
+        } else {
+            0.0
+        },
         at,
         ttl_seconds,
         native_cached_fraction: cached as f64 / total as f64,
@@ -773,6 +822,7 @@ mod tests {
         let install_window = |cache: &mut Vec<CacheEvidence>, at| {
             let mut saved = serde_json::to_value(&*cache).unwrap();
             saved[0]["write_window"] = json!({"not_before":at,"not_after":at,"lifetime":7});
+            saved[0]["estimated_tokens"] = json!(credit);
             *cache = serde_json::from_value(saved).unwrap();
         };
         install_window(&mut cache, 100);
@@ -886,6 +936,8 @@ mod tests {
         assert_eq!(cache.len(), 1);
         let mut saved = serde_json::to_value(cache).unwrap();
         saved[0]["write_window"] = window;
+        saved[0]["estimated_tokens"] =
+            json!(crate::proxy_savings::token_units(&body["input"]) as f64);
         (serde_json::from_value(saved).unwrap(), body, model)
     }
 

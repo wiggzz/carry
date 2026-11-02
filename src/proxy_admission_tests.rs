@@ -25,6 +25,7 @@ fn ordinary_admission_floor_age_and_unique_native_growth_are_conjunctive() {
     let mut session = admission_subject();
     let main = admission_main(&session);
     let primary = admission::primary_tokens(&config, &session, &main) as u32;
+    config.review_min_primary_tokens = 0;
     let growth =
         admission::decision(&config, &session, &main, false)["new_native_source_estimated_tokens"]
             .as_f64()
@@ -180,4 +181,52 @@ fn ordinary_policy_defaults_and_explicit_bounds_are_not_legacy_aliases() {
     assert_eq!(config.review_min_new_tokens, 0);
     assert_eq!(config.review_every_requests, 1);
     assert_eq!(admission::multiplier(&config, &admission_subject()), 1);
+}
+
+#[test]
+fn opaque_payload_is_unknown_not_infinite_and_does_not_disable_visible_review_policy() {
+    let mut config = ProxyCli::try_parse_from(["carry proxy"]).unwrap();
+    let mut session = admission_subject();
+    session.history[1].value = json!({"type":"reasoning","summary":[],"encrypted_content":"abCD".repeat(20000)});
+    config.review_min_primary_tokens = 0;
+    config.review_min_new_tokens = 0;
+    let decision = admission::decision(&config, &session, &admission_main(&session), false);
+    assert_eq!(decision["primary_estimated_tokens"], Value::Null);
+    assert_eq!(decision["admitted"], true,
+        "unknown native quantity must not disable a zero-floor review policy");
+    config.review_min_primary_tokens = 150000;
+    let decision = admission::decision(&config, &session, &admission_main(&session), false);
+    assert_eq!(decision["admitted"], false,
+        "ciphertext length cannot manufacture primary context pressure");
+}
+
+#[test]
+fn cadence_and_explicit_primary_quantity_do_not_eagerly_tokenize_history() {
+    let config = ProxyCli::try_parse_from(["carry proxy"]).unwrap();
+    let mut session = admission_subject();
+    session.completed_requests = 0;
+    session.history[1].value["content"] = json!("large unchanged history ".repeat(10000));
+    let main = admission_main(&session);
+    crate::prompt_quantity::reset_tokenized_bytes();
+    let decision = admission::decision_with_primary(
+        &config, &session, &main, false, false, Some(200000.0),
+    );
+    assert_eq!(decision["reason"], "cadence");
+    assert_eq!(crate::prompt_quantity::tokenized_bytes(), 0,
+        "a cadence-blocked review needs no prompt or growth tokenization");
+}
+
+#[test]
+fn known_primary_quantity_does_not_recount_visible_history_for_diagnostics() {
+    let mut config = ProxyCli::try_parse_from(["carry proxy"]).unwrap();
+    config.review_min_new_tokens = 0;
+    let session = admission_subject();
+    crate::prompt_quantity::reset_tokenized_bytes();
+    let decision = admission::decision_with_primary(
+        &config, &session, &admission_main(&session), false, false, Some(200000.0),
+    );
+    assert_eq!(decision["admitted"], true);
+    assert_eq!(crate::prompt_quantity::tokenized_bytes(), 0,
+        "provided native input and a zero growth floor need no text estimate");
+    assert_eq!(decision["primary_local_visible_text_tokens"], Value::Null);
 }

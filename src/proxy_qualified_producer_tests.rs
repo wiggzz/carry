@@ -128,6 +128,17 @@ async fn synthetic_qualified_terminal_restart(sse: bool) {
         assert_eq!(saved.primary.calls, step);
         assert_eq!(saved.completed_requests, step - u64::from(step >= 3));
         assert_eq!(saved.failed_primaries, u64::from(step >= 3));
+        if step == 3 {
+            assert_eq!(
+                saved.last_failure.as_ref().unwrap()["request_id"],
+                format!("qualified-{step}")
+            );
+        } else {
+            assert!(
+                saved.last_failure.is_none(),
+                "a completed primary clears the current failure"
+            );
+        }
         assert_eq!(saved.shadow.calls, 0);
         assert_eq!(saved.compactions, 0);
         assert_eq!(

@@ -470,7 +470,8 @@ class TransparentHistory(unittest.TestCase):
 
     def test_repeated_projection_prices_current_omission_once_after_restart(self):
         """Real advice/planner/receipts: identical H and N must not invent growth."""
-        fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"projection_{n}")),
+        fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"projection_{n}",
+                input_tokens=10000 if history[1] in _b["input"] else 100)),
             lambda _b,_n: (200, advice_response({"protected":[], "removable":[2], "memories":[]})))
         history = [{"role":"user","content":"PROJECTION_GOAL"},
                    {"role":"assistant","content":"REMOVABLE_SOURCE " + "payload " * 3000},
@@ -507,7 +508,7 @@ class TransparentHistory(unittest.TestCase):
                              primary_wires=fixture.primaries, review_wires=fixture.reviews)
         self.assertEqual(fixture.primaries[-1], first_wire, "same canonical H chooses the same omission")
         self.assertEqual(second["primary"]["calls"], 3)
-        self.assertEqual(second["primary"]["input_tokens"], 300)
+        self.assertEqual(second["primary"]["input_tokens"], 10200)
         self.assertEqual(second["shadow"]["calls"], 1)
         self.assertEqual(after["last_traditional_input"], before["last_traditional_input"],
                          "repeated disposable omission must not accumulate restoration")
@@ -564,7 +565,8 @@ class TransparentHistory(unittest.TestCase):
         self.assertNotIn(original[1],fixture.primaries[-1]["input"],"seven-day review retention must not expire after one day")
 
     def test_no_fit_acquires_one_bounded_review_before_primary(self):
-        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"fit_{n}")),
+        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"fit_{n}",
+                input_tokens=60000 if h[1] in _b["input"] else 100)),
             lambda _b,n: (200,advice_response({"protected":[],"removable":[2],"memories":[]})))
         h = [{"role":"user","content":"goal"},{"role":"assistant","content":"bulky output " * 12000},
              {"role":"user","content":"current task"}]
@@ -573,14 +575,14 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(len(fixture.reviews),0)
         proxy.close()
         proxy = self.proxy(fixture,["--review-every-requests","100","--classifier-cache-policy","disabled",
-            "--primary-context-tokens","5000","--primary-output-reserve-tokens","1","--context-margin-percent","0"])
+            "--primary-context-tokens","50000","--primary-output-reserve-tokens","1","--context-margin-percent","0"])
         self.assertEqual(proxy.send(h)[0],200,"genuine no-fit may acquire one useful review before primary")
         self.assertEqual(len(fixture.reviews),1)
         self.assertNotIn(h[1],fixture.primaries[-1]["input"])
         self.assertEqual(proxy.saved()["shadow"]["calls"],1)
         self.evidence.update(primaries=fixture.primaries,reviews=fixture.reviews,state=proxy.saved())
 
-    def test_no_fit_exception_failure_no_help_and_timeout_never_send_primary(self):
+    def test_no_fit_exception_failure_no_help_and_timeout_forward_unchanged(self):
         original_state = self.state
         for outcome in ("failure", "no_help", "timeout"):
             with self.subTest(outcome=outcome):
@@ -591,7 +593,7 @@ class TransparentHistory(unittest.TestCase):
                     if outcome == "failure":
                         return 503, {"error": "synthetic failure"}
                     return 200, advice_response({"protected": [], "removable": [], "memories": []})
-                fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"nohelp_{n}")), review)
+                fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"nohelp_{n}", input_tokens=60000)), review)
                 history = [{"role":"user","content":"goal"},
                            {"role":"assistant","content":"UNREVIEWED_SOURCE " * 3000},
                            {"role":"user","content":"current"}]
@@ -599,14 +601,17 @@ class TransparentHistory(unittest.TestCase):
                 proxy = self.proxy(fixture, options)
                 self.assertEqual(proxy.send(history)[0], 200)
                 proxy.close()
-                proxy = self.proxy(fixture, options + ["--primary-context-tokens","5000",
+                proxy = self.proxy(fixture, options + ["--primary-context-tokens","50000",
                     "--primary-output-reserve-tokens","1","--context-margin-percent","0",
                     "--classifier-timeout-secs","1"])
                 started = time.monotonic()
-                self.assertEqual(proxy.send(history)[0], 413)
+                self.assertEqual(proxy.send(history)[0], 200,
+                                 "unhelpful review cannot turn a size estimate into primary rejection")
                 self.assertLess(time.monotonic() - started, 4, "one bounded exceptional attempt including planning/persistence")
                 self.assertEqual(len(fixture.reviews), 1)
-                self.assertEqual(len(fixture.primaries), 1, "no unqualified source removal or overflowing primary")
+                self.assertEqual(len(fixture.primaries), 2)
+                self.assertEqual(fixture.primaries[-1]["input"], history,
+                                 "failed or unhelpful review grants no source-removal authority")
                 saved = json.loads(proxy.checkpoint(history)[0].read_text())
                 self.assertEqual(saved["shadow"]["calls"], 1)
                 self.assertEqual(saved["shadow"]["unavailable_cost_calls"], int(outcome != "no_help"))
@@ -631,7 +636,8 @@ class TransparentHistory(unittest.TestCase):
                 self.assertTrue(release.wait(10))
                 return 200,advice_response({"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"MERGED_ORIGINAL_FACT"}]})
             self.fail("no extra review while captured projection is held")
-        fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"merged_{n}")),review)
+        fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"merged_{n}",
+            input_tokens=100000 if h[2] in _b["input"] else 50000 if h[1] in _b["input"] else 100)),review)
         h = [{"role":"user","content":"original goal"},
              {"role":"assistant","content":"LEFT_SOURCE " * 3000},
              {"role":"user","content":"OLD_SEPARATOR " * 10000},
@@ -766,7 +772,8 @@ class TransparentHistory(unittest.TestCase):
             ids = ledger(body)["eligible_group_ids"]
             return 200, advice_response({"protected": [i for i in ids if i == 1], "removable": [i for i in ids if i != 1],
                 "memories": [{"source_ids": [2], "text": "A_FACT"}] if n == 1 else []})
-        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")), review)
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}",
+            input_tokens=10000 if history[1] in _b["input"] else 100)), review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
                    "--classifier-cache-policy", "disabled"]
         proxy = TransparentProxy(self.state, fixture, options)
@@ -845,7 +852,7 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(len(fixture.primaries), count)
 
 
-    def seed(self, env=None, review=None, extra=(), history=None):
+    def seed(self, env=None, review=None, extra=(), history=None, primary_input_tokens=100):
         history = history or [{"role": "user", "content": "PROTECTED_GOAL"},
                    {"role": "assistant", "content": "RAW_A " + "payload " * 6000},
                    {"role": "user", "content": "A_BOUNDARY"}]
@@ -854,7 +861,7 @@ class TransparentHistory(unittest.TestCase):
             return 200, advice_response({"protected": [i for i in ids if i == 1],
                 "removable": [i for i in ids if i != 1],
                 "memories": [{"source_ids": [2], "text": "A_FACT"}] if n == 1 else []})
-        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")), review or default_review)
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}", input_tokens=primary_input_tokens)), review or default_review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
                    "--classifier-cache-policy", "disabled", *extra]
         proxy = TransparentProxy(self.state, fixture, options, env)
@@ -1384,7 +1391,7 @@ class TransparentHistory(unittest.TestCase):
         import threading
         held, release = threading.Event(), threading.Event()
         self.stack.callback(release.set)
-        proxy, fixture, history, options = self.seed()
+        proxy, fixture, history, options = self.seed(primary_input_tokens=10000)
         owner_primaries, owner_receipts = [], []
         review_seen = threading.Event()
         original_review = fixture.review
@@ -1430,7 +1437,7 @@ class TransparentHistory(unittest.TestCase):
             self.assertEqual(pending.result()[0], 200)
         _, after = proxy.checkpoint(parent)
         self.assertEqual(after["primary"]["calls"], 2)
-        self.assertEqual(after["primary"]["input_tokens"], 200)
+        self.assertEqual(after["primary"]["input_tokens"], 10100)
         self.assertEqual(after["primary"]["output_tokens"], 2)
         self.assertEqual(after["primary"]["unavailable_cost_calls"], 0)
         self.assertFalse(after["background_review_pending"])
@@ -1452,7 +1459,7 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(parent)[0], 200)
         _, resumed = proxy.checkpoint(parent)
         self.assertEqual(resumed["primary"]["calls"], 3)
-        self.assertEqual(resumed["primary"]["input_tokens"], 300)
+        self.assertEqual(resumed["primary"]["input_tokens"], 10200)
         self.assertEqual(resumed["primary"]["output_tokens"], 3)
         self.assertEqual(resumed["primary"]["unavailable_cost_calls"], 0)
         owner_wires = [body for body in fixture.reviews if any("HELD_PRIMARY" in json.dumps(item) for item in body["input"])]
@@ -1568,8 +1575,11 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(history + [{"role": "user", "content": "FITTING_CHILD"}])[0], 200)
         self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
         counts = (len(fixture.primaries), len(fixture.reviews))
-        self.assertEqual(proxy.send(history + [{"role": "user", "content": "PROTECTED_SUFFIX " * 10000}])[0], 413)
-        self.assertEqual((len(fixture.primaries), len(fixture.reviews)), counts)
+        oversized = history + [{"role": "user", "content": "PROTECTED_SUFFIX " * 10000}]
+        self.assertEqual(proxy.send(oversized)[0], 200,
+                         "even an oversized protected suffix must reach the provider")
+        self.assertEqual((len(fixture.primaries), len(fixture.reviews)), (counts[0] + 1, counts[1]))
+        self.assertEqual(fixture.primaries[-1]["input"][-1], oversized[-1])
         fresh = [{"role": "user", "content": "FRESH_NO_ADVICE"}]
         self.assertEqual(proxy.send(fresh)[0], 200)
         self.assertEqual(fixture.primaries[-1]["input"], fresh)

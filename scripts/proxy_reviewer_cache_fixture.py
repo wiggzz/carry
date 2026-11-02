@@ -219,8 +219,16 @@ class Provider:
                         owner.primary_raw_hashes.append(hashlib.sha256(wire).hexdigest())
                         output = []
                         cached = 0
+                    # Native quantities are declared by the simulator, never
+                    # inferred from ciphertext length. Appending the complete
+                    # coupled cohort adds 20k native units; omitting it removes
+                    # those same units. A constant total falsely measured zero.
+                    native_input = 10000
+                    if self.path != '/classifier' and owner.case == 'coupled':
+                        if any(item.get('id') == 'reasoning-native' for item in body['input']):
+                            native_input += 20000
                     value = {'id': 'fixture', 'model': body['model'], 'status': 'completed',
-                             'output': output, 'usage': {'input_tokens': 10000,
+                             'output': output, 'usage': {'input_tokens': native_input,
                              'output_tokens': 10, 'input_tokens_details': {'cached_tokens': cached}}}
                     if owner.case == 'missing-usage' and self.path == '/classifier':
                         if len(owner.reviews) == 1:
@@ -437,8 +445,10 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
                         if case == 'missing-usage':
                             index = json.loads((directory / 'state' / 'history.index').read_text())
                             credit_snapshots.append({'turn': turn,
-                                'read_credit': sum(e['estimated_tokens'] * e['native_cached_fraction']
-                                                   for e in index['upstream_cache'])})
+                                'native_cached_tokens': sum(e.get('native_read_tokens', 0)
+                                                           for e in index['upstream_cache']),
+                                'forecast_prefix_units': sum(e['estimated_tokens']
+                                                             for e in index['upstream_cache'])})
                 finally:
                     process.terminate()
                     process.wait(timeout=5)
@@ -464,8 +474,17 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
         if case == 'missing-usage':
             assert sent[2] == sent[3] and sent_hashes[2] == sent_hashes[3], 'read probe must repeat the full unchanged native payload'
             assert provider.receipts[2]['synthetic_cached_tokens'] > 0, 'read-credit assertion requires an actual transmitted matching prefix and cached-read receipt'
-            assert credit_snapshots[1]['read_credit'] == credit_snapshots[2]['read_credit'] == 0
-            assert credit_snapshots[3]['read_credit'] > 0, 'only an explicit cached-read receipt may grant credit'
+            assert credit_snapshots[1]['native_cached_tokens'] == credit_snapshots[2]['native_cached_tokens'] == 0
+            assert credit_snapshots[3]['native_cached_tokens'] == provider.receipts[2]['synthetic_cached_tokens'] > 0, \
+                'the actual read receipt must retain its observed native quantity'
+            if enabled:
+                assert all(s['forecast_prefix_units'] == 0 for s in credit_snapshots), \
+                    'partial-prefix receipts do not prove full-input future coverage'
+            else:
+                assert credit_snapshots[2]['forecast_prefix_units'] > 0, \
+                    'the implicit full-input write must preserve its independent coverage'
+                assert credit_snapshots[3]['forecast_prefix_units'] == credit_snapshots[2]['forecast_prefix_units'], \
+                    'a partial read must not grow full-write coverage'
             assert state['shadow']['unavailable_cost_calls'] >= 1, 'missing usage must remain unknown in metering'
         records = json.loads((directory / 'state' / 'history.index').read_text())['upstream_cache']
         if policy_arg == 'auto':

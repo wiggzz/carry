@@ -111,8 +111,8 @@ fn undispatched_review_cannot_subsidize_a_warm_primary_losing_rewrite() {
     session.review_context = cache_base(&body);
     let actual = admission::primary_tokens(&config, &session, &session.review_context);
     let inflated = admission::primary_tokens(&config, &session, &body);
-    assert!(inflated > actual);
-    config.review_min_primary_tokens = ((actual + inflated) / 2.0) as u32;
+    assert_eq!(inflated, actual, "transport metadata is not prompt input");
+    config.review_min_primary_tokens = actual as u32 + 1;
     assert_eq!(
         admission::decision(&config, &session, &session.review_context, false)["reason"],
         "primary_floor"
