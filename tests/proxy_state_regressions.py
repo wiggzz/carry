@@ -24,9 +24,9 @@ def wire(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
 
 
-def completed(output=(), response_id="resp_fixture"):
+def completed(output=(), response_id="resp_fixture", *, input_tokens=100):
     return {"id": response_id, "status": "completed", "output": list(output),
-            "usage": {"input_tokens": 100, "output_tokens": 1,
+            "usage": {"input_tokens": input_tokens, "output_tokens": 1,
                       "input_tokens_details": {"cached_tokens": 0}}}
 
 

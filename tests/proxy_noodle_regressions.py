@@ -33,7 +33,9 @@ class NoodleRegressions(unittest.TestCase):
         path.write_bytes(wire(index))
 
     def test_changed_cap_preserves_current_projection_and_summary_threshold_after_restart(self):
-        fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"cap_{n}")),
+        # Native fixture quantities stay coherent when the large source is omitted.
+        fixture = self.fixture(lambda b,n: (200, completed(response_id=f"cap_{n}",
+            input_tokens=6000 if "NOODLE_SOURCE" in json.dumps(b) else 100)),
             lambda _b,_n: (200, advice_response({"protected":[], "removable":[2], "memories":[]})))
         h = self.history()
         options = ["--payoff-requests","1","--classifier-cache-policy","disabled"]
@@ -64,7 +66,7 @@ class NoodleRegressions(unittest.TestCase):
         self.evidence.update(before=before, after=after, primary=fixture.primaries, reviews=fixture.reviews)
         self.assertNotIn(h[1], fixture.primaries[-1]["input"])
         self.assertEqual(after["primary"]["calls"], 3)
-        self.assertEqual(after["primary"]["input_tokens"], 300)
+        self.assertEqual(after["primary"]["input_tokens"], 6200)
         self.assertEqual(after["shadow"]["calls"], 1)
         self.assertEqual(after["cost_trajectory"]["restored"], restored,
                          "receipt epoch reset must preserve this request's projection")
@@ -136,7 +138,9 @@ class NoodleRegressions(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.state = root / mode
                 self.state.mkdir()
-                fixture = self.fixture(lambda _b,n: (200, completed(response_id=f"mode_{mode}_{n}")),
+                # Full and projected wires receive distinct provider measurements.
+                fixture = self.fixture(lambda b,n: (200, completed(response_id=f"mode_{mode}_{n}",
+                    input_tokens=6000 if "NOODLE_SOURCE" in json.dumps(b) else 100)),
                     lambda _b,_n: (200, advice_response({"protected":[],"removable":[2],"memories":[]})))
                 h = self.history()
                 options = ["--payoff-requests","1","--classifier-cache-policy","disabled"]
@@ -179,12 +183,14 @@ class NoodleRegressions(unittest.TestCase):
                 self.assertEqual(len(fixture.reviews),1)
                 for n, saved in enumerate(snapshots,3):
                     self.assertEqual(saved["primary"]["calls"],n)
-                    self.assertEqual(saved["primary"]["input_tokens"],100*n)
+                    self.assertEqual(saved["primary"]["input_tokens"],6000*(n-1)+100)
                     self.assertEqual(saved["primary"]["output_tokens"],n)
                     self.assertEqual(saved["shadow"],compact["shadow"])
                     result = saved["cost_trajectory"]["result"]
                     self.assertAlmostEqual(result["observed_primary_cost"],
-                        compact["cost_trajectory"]["result"]["observed_primary_cost"]*n/2,places=12)
+                        compact["cost_trajectory"]["result"]["observed_primary_cost"] + (n-2) *
+                        (6000 * saved["model_resolution"]["primary"]["rates"]["input"] +
+                         saved["model_resolution"]["primary"]["rates"]["output"]) / 1_000_000,places=12)
                     self.assertEqual(result["traditional_compactions"],0)
                 # Grade each current quantity independently, retaining all wire
                 # and paid evidence even on the intentionally failing baseline.
@@ -192,10 +198,10 @@ class NoodleRegressions(unittest.TestCase):
                     with self.subTest(mode=mode,request=label):
                         self.assertEqual(saved["cost_trajectory"]["restored"],0,
                                          "full current wire must replace prior compact restoration")
-                        self.assertEqual(saved["cost_trajectory"]["last_traditional_input"],100)
+                        self.assertEqual(saved["cost_trajectory"]["last_traditional_input"],6000)
                 self.assertEqual(resumed["cost_trajectory"]["restored"],compact["cost_trajectory"]["restored"])
                 self.assertEqual(resumed["primary"]["calls"],6)
-                self.assertEqual(resumed["primary"]["input_tokens"],600)
+                self.assertEqual(resumed["primary"]["input_tokens"],24200)
                 self.assertEqual(resumed["shadow"],compact["shadow"])
                 proxy.close()
         self.state = root
@@ -304,7 +310,7 @@ class NoodleRegressions(unittest.TestCase):
         self.assertEqual(cold["primary"]["cached_tokens"],39600)
 
     def test_planning_and_dispatch_share_metadata_stripped_floor(self):
-        fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"floor_{n}")),
+        fixture = self.fixture(lambda _b,n:(200,completed(response_id=f"floor_{n}", input_tokens=4000)),
             lambda _b,_n:(200,advice_response({"protected":[],"removable":[2],"memories":[]})))
         h = self.history()
         options = ["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled",
@@ -319,7 +325,9 @@ class NoodleRegressions(unittest.TestCase):
         self.assertEqual(len(fixture.reviews),1)
         self.assertEqual(decisions[-1]["reason"],"primary_floor")
         self.assertLess(decisions[-1]["primary_estimated_tokens"],5000)
-        self.assertGreater(saved["last_plan"]["primary_estimated_tokens"],5000)
+        self.assertEqual(saved["last_plan"]["primary_estimated_tokens"],4000,
+                         "planner reuses native input; diagnostic metadata adds no model input")
+        self.assertEqual(decisions[-1]["primary_estimated_tokens"],4000)
         candidates = saved["last_plan"]["candidates"]
         self.assertTrue(candidates)
         for candidate in candidates:
