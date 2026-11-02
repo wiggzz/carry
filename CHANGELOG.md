@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.18.0](https://github.com/wiggzz/carry/compare/v0.17.1...v0.18.0) (2026-11-02)
+
+
+### Features
+
+* **dashboard:** clarify session diagnostics and dispatch measurements ([5e743a8](https://github.com/wiggzz/carry/commit/5e743a8909d52a36b0fd347df0e9f0d4f82fd29a))
+* **proxy:** combine session diagnostics with receipt-first planning ([#210](https://github.com/wiggzz/carry/issues/210)) ([30649a1](https://github.com/wiggzz/carry/commit/30649a1ba299a15b9bbf674397e6f4bc6e0637b6))
+
+
+### Bug Fixes
+
+* **proxy:** retain bounded text quantities across request loads ([8472c9d](https://github.com/wiggzz/carry/commit/8472c9d8d5e8b846fc2c94bbe2e2baf46668c848))
+
+
+### Performance Improvements
+
+* **planner:** reuse receipt quantities and count only changed text ([bf0e036](https://github.com/wiggzz/carry/commit/bf0e036e4e4e19cb4e1e74d8640dc6934b08a8db))
+
 ## [0.17.1](https://github.com/wiggzz/carry/compare/v0.17.0...v0.17.1) (2026-11-01)
 
 
