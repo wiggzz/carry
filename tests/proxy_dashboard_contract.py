@@ -235,7 +235,7 @@ class DashboardDispatchContract(unittest.TestCase):
             self.assertEqual(headers["cache-control"], "no-store")
             self.assertEqual(fixture.errors, [])
 
-    def test_response_id_dispatch_does_not_invent_a_caller_only_quantity(self):
+    def test_response_id_dispatch_reuses_only_known_caller_fragment_quantities(self):
         with contextlib.ExitStack() as stack:
             root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
             fixture = Fixture(lambda body, n: (200, completed(response_id=f"resp_caller_{n}")), lambda body, n: (200, advice_response({"protected": [], "removable": [], "memories": []})))
@@ -250,10 +250,12 @@ class DashboardDispatchContract(unittest.TestCase):
             self.assertEqual(status, 200, response)
             row = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["last_primary_dispatch"]
             self.assertGreater(first["caller_input_tokens"], 0)
-            # Only the expanded prompt was needed by the planner. Do not
-            # tokenize the caller-only fragment for telemetry or copy the
-            # expanded prompt's anchored quantity into that smaller fragment.
-            self.assertIsNone(row["caller_input_tokens"])
+            # The prior request counted the common overhead and this request
+            # counted the append for planning. Their local quantities survive
+            # reload, so telemetry can reuse them without another BPE pass or
+            # copying the expanded prompt's native receipt into the fragment.
+            self.assertGreater(row["caller_input_tokens"], 0)
+            self.assertLess(row["caller_input_tokens"], row["outgoing_input_tokens"])
             self.assertEqual(row["canonical_input_tokens"], row["outgoing_input_tokens"])
             self.assertEqual(row["continuation_input_tokens"], row["outgoing_input_tokens"])
             self.assertGreater(row["outgoing_input_tokens"], first["receipt_input_tokens"])
