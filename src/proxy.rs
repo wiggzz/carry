@@ -189,6 +189,7 @@ struct Service {
     auth_token: Option<String>,
     locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     background_reviews: Arc<Mutex<HashSet<String>>>,
+    text_quantities: crate::proxy_quantity::TextMemo,
     // Advice authority belongs to the live worker, independently of whether a
     // changed-direction checkpoint can be published. Cleared on settlement.
     #[cfg(test)]
@@ -381,6 +382,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         config,
         locks: Arc::new(Mutex::new(HashMap::new())),
         background_reviews: Arc::new(Mutex::new(HashSet::new())),
+        text_quantities: Default::default(),
         #[cfg(test)]
         lock_waits: Arc::new(std::sync::Mutex::new(None)),
         _directory_lock: Arc::new(directory_lock),
@@ -522,7 +524,14 @@ async fn session_lock(service: &Service, id: &str) -> OwnedMutexGuard<()> {
 const CHECKPOINT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 fn load(service: &Service, id: &str) -> Result<Session, Failure> {
-    load_with_restore(service, id, || history::restore(service, id))
+    let mut session = load_with_restore(service, id, || history::restore(service, id))?;
+    session
+        .primary_input
+        .use_text_memo(&service.text_quantities);
+    session
+        .reviewer_input
+        .use_text_memo(&service.text_quantities);
+    Ok(session)
 }
 
 fn load_with_restore(
@@ -4094,9 +4103,164 @@ mod tests {
             auth_token: None,
             locks: Arc::new(Mutex::new(HashMap::new())),
             background_reviews: Arc::new(Mutex::new(HashSet::new())),
+            text_quantities: Default::default(),
             #[cfg(test)]
             lock_waits: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    #[test]
+    fn section_quantities_survive_request_loads_but_not_service_restart() {
+        use crate::prompt_quantity::{reset_tokenized_bytes, tokenized_bytes};
+        for shared in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = checkpoint_service(directory.path());
+            let mut session = load(&service, "quantities").unwrap();
+            session.history_shared = shared;
+            session.history_namespace = Some("quantity-test".into());
+            observe_source(&mut session, &"large unchanged history ".repeat(10000));
+            observe_source(&mut session, "current request");
+            let first = review_body(&service.config, &session);
+            reset_tokenized_bytes();
+            assert!(review_fits_measured(&service.config, &session, &first));
+            assert!(tokenized_bytes() > 200000);
+            session.reviewer_input.observe(
+                &first,
+                &json!({"input_tokens":50000}),
+                &service.config.upstream_url,
+                None,
+                100,
+            );
+            save(&service, "quantities", &session).unwrap();
+            for append in [true, false] {
+                let mut session = load(&service, "quantities").unwrap();
+                if append {
+                    observe_source(&mut session, "small append");
+                }
+                session.completed_requests += 1;
+                session.review_feedback = json!({"attempt":session.completed_requests});
+                let next = review_body(&service.config, &session);
+                assert_ne!(first, next);
+                reset_tokenized_bytes();
+                assert!(review_fits_measured(&service.config, &session, &next));
+                assert!(
+                    tokenized_bytes() < 20000,
+                    "ordinary request reload retokenized unchanged prefix: {} bytes",
+                    tokenized_bytes()
+                );
+                session.reviewer_input.observe(
+                    &next,
+                    &json!({"input_tokens":50100}),
+                    &service.config.upstream_url,
+                    None,
+                    101 + session.completed_requests,
+                );
+                save(&service, "quantities", &session).unwrap();
+            }
+            let restarted = checkpoint_service(directory.path());
+            let mut session = load(&restarted, "quantities").unwrap();
+            // An exact receipt survives restart without any local BPE work.
+            let same = review_body(&restarted.config, &session);
+            reset_tokenized_bytes();
+            assert!(review_fits_measured(&restarted.config, &session, &same));
+            assert_eq!(tokenized_bytes(), 0);
+            observe_source(&mut session, "after restart");
+            let changed = review_body(&restarted.config, &session);
+            reset_tokenized_bytes();
+            assert!(review_fits_measured(&restarted.config, &session, &changed));
+            assert!(
+                tokenized_bytes() > 200000,
+                "restart must not restore local memo"
+            );
+        }
+    }
+
+    #[test]
+    fn loaded_quantities_keep_receipts_and_unknown_native_input_separate() {
+        use crate::prompt_quantity::{reset_tokenized_bytes, tokenized_bytes};
+        let directory = tempfile::tempdir().unwrap();
+        let service = checkpoint_service(directory.path());
+        let mut body = json!({"model":"gpt-6-luna", "input":[
+            {"role":"user","content":"unchanged large prefix ".repeat(10000)}]});
+        let session = load(&service, "primary").unwrap();
+        session
+            .primary_input
+            .estimate(&body, "route", None)
+            .unwrap();
+        save(&service, "primary", &session).unwrap();
+        let mut session = load(&service, "primary").unwrap();
+        reset_tokenized_bytes();
+        // Missing receipts may reuse local units, but never claim a native count.
+        assert_eq!(
+            session
+                .primary_input
+                .estimate(&body, "route", None)
+                .unwrap()
+                .basis,
+            crate::proxy_quantity::EstimateBasis::LocalVisibleText
+        );
+        assert_eq!(tokenized_bytes(), 0);
+        session
+            .primary_input
+            .observe(&body, &json!({"input_tokens":50000}), "route", None, 1);
+        save(&service, "primary", &session).unwrap();
+        let mut session = load(&service, "primary").unwrap();
+        body["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"small append"}));
+        reset_tokenized_bytes();
+        assert!(
+            session
+                .primary_input
+                .predict(&body, "route", None)
+                .unwrap()
+                .tokens
+                > 50000
+        );
+        assert!(tokenized_bytes() < 1000);
+        session
+            .primary_input
+            .observe(&body, &json!({"input_tokens":50020}), "route", None, 2);
+        save(&service, "primary", &session).unwrap();
+        let session = load(&service, "primary").unwrap();
+        reset_tokenized_bytes();
+        assert_eq!(
+            session
+                .primary_input
+                .predict(&body, "route", None)
+                .unwrap()
+                .tokens,
+            50020
+        );
+        assert_eq!(tokenized_bytes(), 0);
+        body["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"reasoning","encrypted_content":"unknown"}));
+        assert!(
+            session
+                .primary_input
+                .estimate(&body, "route", None)
+                .is_none()
+        );
+        assert!(
+            session
+                .primary_input
+                .known_estimate(&body, "route", None)
+                .is_none()
+        );
+        assert_eq!(tokenized_bytes(), 0);
+        // Reviewer capacity may need a visible floor; the shared memo still
+        // cannot turn the new opaque section into a native quantity.
+        assert!(review_fits_measured(&service.config, &session, &body));
+        assert!(tokenized_bytes() < 1000);
+        assert!(
+            session
+                .reviewer_input
+                .estimate(&body, "route", None)
+                .is_none()
+        );
     }
 
     #[tokio::test]

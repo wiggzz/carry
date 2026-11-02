@@ -9,6 +9,10 @@ use std::sync::{Arc, Mutex};
 
 const MAX_MEASURED_ITEMS: usize = 4096;
 
+// One bounded process-owned memo, shared across ordinary checkpoint loads.
+// Only content identities and local section units; no source or native authority.
+pub(crate) type TextMemo = Arc<Mutex<BTreeMap<String, u64>>>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EstimateBasis {
@@ -29,10 +33,10 @@ pub(crate) struct InputMeasurements {
     contract: String,
     anchor: Option<Anchor>,
     blocks: VecDeque<MeasuredBlock>,
-    // Pure section quantities survive session clones, never process restart.
+    // Pure section quantities are reattached by the service on request load.
     // They cannot grant receipt/cache/lineage authority and retain no source.
     #[serde(skip)]
-    text: Arc<Mutex<BTreeMap<String, u64>>>,
+    text: TextMemo,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -170,6 +174,10 @@ fn changes<'a>(from: &'a [Item], to: &'a [Item]) -> Option<(Vec<&'a Item>, Vec<&
 }
 
 impl InputMeasurements {
+    pub(crate) fn use_text_memo(&mut self, memo: &TextMemo) {
+        self.text = memo.clone();
+    }
+
     /// Count a visible section only when a consumer asks for that quantity.
     /// The memo is bounded and content addressed; no native facts are inferred.
     pub(crate) fn visible_text_tokens(&self, value: &Value) -> u64 {

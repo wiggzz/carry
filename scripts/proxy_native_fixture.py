@@ -365,6 +365,17 @@ class Fixture:
                             value['usage']['input_tokens']=50000
                             value['usage']['total_tokens']=50010
                             value['usage']['input_tokens_details']['cache_write_tokens']=50000
+                        if outer.case == 'compact':
+                            # Declare native quantities for the fixture's long
+                            # fixed prefix and whole disposable tool cohort.
+                            # The prior constant 1k receipt could not represent
+                            # either the prefix or a nonzero cohort append.
+                            cohort = any(item.get('call_id') in ('call_fixture_1_a', 'call_fixture_1_b')
+                                         for item in body.get('input', []))
+                            native_input = 40000 + (20000 if cohort else 0)
+                            value['usage']['input_tokens'] = native_input
+                            value['usage']['total_tokens'] = native_input + 10
+                            value['usage']['input_tokens_details']['cache_write_tokens'] = native_input
                         outer.responses.append(value)
                         events = [{'type':'response.created','response':{**value,'output':[],'status':'in_progress'}}]
                         for index, item in enumerate(output):

@@ -15,6 +15,7 @@ class ShadowContractProvider:
     """Real HTTP wire capture; no model, credentials or synthesized proxy state."""
     def __init__(self):
         self.primary = []
+        self.primary_input_tokens = lambda body: 100
         self.shadow = []
         self.advice = lambda review: {'protected': [], 'removable': [], 'memories': []}
         outer = self
@@ -32,7 +33,7 @@ class ShadowContractProvider:
                 value = {'status': 'failed' if failed else 'completed',
                          'output': [{'type': 'message', 'role': 'assistant', 'content': [
                              {'type': 'output_text', 'text': json.dumps(advice)}]}] if review else [],
-                         'usage': {'input_tokens': 100, 'output_tokens': 1,
+                         'usage': {'input_tokens': 100 if review else outer.primary_input_tokens(body), 'output_tokens': 1,
                                    'input_tokens_details': {'cached_tokens': 0}}}
                 raw = json.dumps(value).encode()
                 self.send_response(200)
@@ -752,6 +753,12 @@ class NativeProviderFixtureTests(unittest.TestCase):
             body = {'model': 'gpt-6-luna', 'input': [
                 {'role': 'user', 'content': 'RETIRE_HUMAN_SOURCE ' * 3000},
                 {'role': 'user', 'content': 'current task'}]}
+            # Declared native quantities for the two fixture states. The old
+            # 100-token total was smaller than this long source's visible delta,
+            # making the intended retirement candidate arithmetically impossible.
+            provider.primary_input_tokens = lambda body: (20000 if any(
+                'RETIRE_HUMAN_SOURCE' in item.get('content', '')
+                for item in body['input']) else 1000)
             fact = 'the original requirement is JADE42'
             provider.advice = lambda review: {'protected': [], 'removable': [],
                 'memories': [{'source_ids': [1], 'text': fact}]}
