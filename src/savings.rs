@@ -657,13 +657,22 @@ pub(crate) fn prompt_overhead(body: &Value) -> Value {
     json!({"instructions":body.get("instructions"),"tools":body.get("tools"),"text":body.get("text")})
 }
 
+fn semantic_prompt(body: &Value) -> Option<Value> {
+    let input = crate::openai::semantic_prompt_input(body["input"].as_array()?);
+    Some(json!({"overhead":prompt_overhead(body),"input":input}))
+}
+
+/// Count-only consumers do not need history/cache prefix strings.
+pub(crate) fn prompt_input_tokens(body: &Value) -> Option<u64> {
+    Some(token_units(&semantic_prompt(body)?))
+}
+
 /// Shared prompt-bearing projection, excluding transport and sampling fields.
 pub(crate) fn prompt_projection(body: &Value) -> Option<(String, String, u64)> {
-    let input = crate::openai::semantic_prompt_input(body["input"].as_array()?);
-    let overhead = prompt_overhead(body);
-    let units = token_units(&json!({"overhead":overhead,"input":input}));
-    let overhead = overhead.to_string();
-    let serialized = serde_json::to_string(&input).ok()?;
+    let prompt = semantic_prompt(body)?;
+    let units = token_units(&prompt);
+    let overhead = prompt["overhead"].to_string();
+    let serialized = serde_json::to_string(&prompt["input"]).ok()?;
     let prefix = format!("{overhead}{}", &serialized[..serialized.len() - 1]);
     Some((prefix, overhead, units))
 }

@@ -511,14 +511,71 @@ pub(super) fn compact(session: &Session) -> Session {
 }
 
 pub(super) fn restore(service: &Service, id: &str) -> std::io::Result<Session> {
-    let _guard = IO.lock().unwrap();
-    let mut index = read(service)?;
-    prune(service, &mut index);
-    let session = index
-        .snapshots
-        .remove(id)
-        .ok_or_else(|| std::io::Error::other("selected history unavailable"))?;
-    canonical(&index, session)
+    ReadView::new(service)?.restore(id)
+}
+
+/// One bounded, read-only authority generation for a dashboard poll. Never keep
+/// this across requests: expiry, revocation and owner pins are resolved afresh.
+pub(super) struct ReadView {
+    index: Index,
+    shared_owners: HashSet<String>,
+    policy: String,
+}
+
+impl ReadView {
+    pub(super) fn new(service: &Service) -> std::io::Result<Self> {
+        let _guard = IO.lock().unwrap();
+        let mut index = read(service)?;
+        // Expiry/capacity remove readable snapshots, not their identity as
+        // diagnostic-mirror owners in this generation.
+        let shared_owners = index
+            .snapshots
+            .iter()
+            .filter(|(_, session)| session.history_shared)
+            .map(|(id, _)| id.clone())
+            .collect();
+        prune(service, &mut index);
+        Ok(Self {
+            index,
+            shared_owners,
+            policy: semantic::scope(&service.config),
+        })
+    }
+
+    pub(super) fn restore(&self, id: &str) -> std::io::Result<Session> {
+        let session = self
+            .index
+            .snapshots
+            .get(id)
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("selected history unavailable"))?;
+        canonical(&self.index, session)
+    }
+
+    pub(super) fn shared(&self, id: &str) -> std::io::Result<Option<Session>> {
+        let Some(session) = self.index.snapshots.get(id).filter(|s| s.history_shared) else {
+            if self.shared_owners.contains(id) {
+                return Err(std::io::Error::other("selected history unavailable"));
+            }
+            return Ok(None);
+        };
+        if !matches!(session.version, 0 | 3) {
+            return Err(std::io::Error::other(
+                "unsupported shared checkpoint format",
+            ));
+        }
+        self.restore(id).map(Some)
+    }
+
+    pub(super) fn advice(&self, namespace: &str, input: &[Value]) -> Option<semantic::Record> {
+        // Newest record at the longest cut wins, even if its individual actions
+        // are invalid. Never fall back to an older record or a diagnostic mirror.
+        path(namespace, input)
+            .iter()
+            .rev()
+            .find_map(|key| self.index.reviews.get(key).cloned())
+            .filter(|record| record.policy.as_deref() == Some(self.policy.as_str()))
+    }
 }
 
 fn canonical(index: &Index, mut session: Session) -> std::io::Result<Session> {
@@ -616,18 +673,7 @@ pub(super) fn advice(
     namespace: &str,
     input: &[Value],
 ) -> std::io::Result<Option<semantic::Record>> {
-    let _guard = IO.lock().unwrap();
-    let mut index = read(service)?;
-    prune(service, &mut index);
-    // Select the newest record at the longest cut FIRST. Invalid individual
-    // actions fail closed; never fall back to an older record/fact.
-    Ok(path(namespace, input)
-        .iter()
-        .rev()
-        .find_map(|key| index.reviews.get(key).cloned())
-        .filter(|record| {
-            record.policy.as_deref() == Some(semantic::scope(&service.config).as_str())
-        }))
+    Ok(ReadView::new(service)?.advice(namespace, input))
 }
 
 pub(super) fn publish(

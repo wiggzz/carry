@@ -158,7 +158,41 @@ pub(super) struct ReviewAdmission {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(super) struct RewriteCount {
+    pub dispatched: u64,
+    pub forced: u64,
+    pub prior_unknown: bool,
+}
+
+/// Bounded numeric-only observation; never stores another raw prompt copy.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct DispatchMeasurement {
+    pub request_id: String,
+    #[serde(default)]
+    pub parent_request_id: Option<String>,
+    pub lane: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub at: u64,
+    pub basis: String,
+    pub caller_input_tokens: Option<u64>,
+    pub canonical_input_tokens: Option<u64>,
+    pub continuation_input_tokens: Option<u64>,
+    pub outgoing_input_tokens: Option<u64>,
+    pub receipt_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub receipt_output_tokens: Option<u64>,
+    pub outcome: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(super) struct Session {
+    #[serde(default)]
+    pub last_primary_dispatch: Option<DispatchMeasurement>,
+    #[serde(default)]
+    pub last_reviewer_dispatch: Option<DispatchMeasurement>,
+    #[serde(default)]
+    pub rewrites: Option<RewriteCount>,
     pub version: u32,
     #[serde(default)]
     pub title: Option<String>,
