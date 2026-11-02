@@ -432,6 +432,10 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         .route("/carry/metrics", get(metrics))
         .route("/carry/dashboard", get(dashboard))
         .route("/carry/dashboard/stats", get(dashboard_stats))
+        .route(
+            "/carry/dashboard/transcript/{id}",
+            get(dashboard_transcript),
+        )
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(service);
     axum::serve(
@@ -518,6 +522,14 @@ async fn session_lock(service: &Service, id: &str) -> OwnedMutexGuard<()> {
 const CHECKPOINT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 fn load(service: &Service, id: &str) -> Result<Session, Failure> {
+    load_with_restore(service, id, || history::restore(service, id))
+}
+
+fn load_with_restore(
+    service: &Service,
+    id: &str,
+    restore: impl FnOnce() -> std::io::Result<Session>,
+) -> Result<Session, Failure> {
     let path = service.config.state_dir.join(format!("{id}.json"));
     match std::fs::read(path) {
         Ok(bytes) if bytes.len() <= CHECKPOINT_MAX_BYTES => {
@@ -529,7 +541,7 @@ fn load(service: &Service, id: &str) -> Result<Session, Failure> {
                         )));
                     }
                     if session.history_shared {
-                        history::restore(service, id).map_err(serde_json::Error::io)
+                        restore().map_err(serde_json::Error::io)
                     } else {
                         Ok(session)
                     }
@@ -570,7 +582,12 @@ fn save(service: &Service, id: &str, session: &Session) -> std::io::Result<()> {
 /// advice, or removal state may leak through this fallback. The normal hard
 /// limits still apply. If even this cannot publish, the predispatch pending
 /// marker remains canonical and restart conservatively censors the attempt.
-fn save_paid_accounting(service: &Service, id: &str, paid: &Session) -> std::io::Result<()> {
+fn save_paid_accounting(
+    service: &Service,
+    id: &str,
+    paid: &Session,
+    request_id: &str,
+) -> std::io::Result<()> {
     let mut durable = load_existing(service, id)
         .map_err(|_| std::io::Error::other("paid accounting authority unavailable"))?;
     let calls = paid.primary.calls.saturating_sub(durable.primary.calls)
@@ -582,6 +599,32 @@ fn save_paid_accounting(service: &Service, id: &str, paid: &Session) -> std::io:
     durable.primary_pending = paid.primary_pending;
     durable.background_review_pending = paid.background_review_pending;
     durable.cost_trajectory = paid.cost_trajectory.clone();
+    for (target, source, lane) in [
+        (
+            &mut durable.last_primary_dispatch,
+            &paid.last_primary_dispatch,
+            "primary",
+        ),
+        (
+            &mut durable.last_reviewer_dispatch,
+            &paid.last_reviewer_dispatch,
+            "reviewer",
+        ),
+    ] {
+        if let Some(record) = source
+            && record.lane == lane
+            && matches!(record.outcome.as_str(), "completed" | "failed")
+            && match lane {
+                "primary" => record.request_id == request_id,
+                _ => record.parent_request_id.as_deref() == Some(request_id),
+            }
+        {
+            *target = Some(record.clone());
+            if lane == "primary" {
+                durable.last_failure = paid.last_failure.clone();
+            }
+        }
+    }
     if calls > 0
         && let Some(trajectory) = &mut durable.cost_trajectory
     {
@@ -1069,6 +1112,8 @@ fn dashboard_plan(session: &Session) -> Value {
     json!({
         "selected": last_plan["selected"].as_bool().unwrap_or(false),
         "selected_candidate_id": selected_id,
+        "candidates": last_plan["candidates"],
+        "baseline_omitted_members": last_plan["baseline_omitted_members"],
         "selected_action": last_plan["selected_action"].as_str(),
         "primary_output_allowance_tokens": last_plan["primary_output_allowance_tokens"].as_u64(),
         "primary_output_allowance_basis": last_plan["primary_output_allowance_basis"].as_str(),
@@ -1105,6 +1150,108 @@ fn dashboard_plan(session: &Session) -> Value {
     })
 }
 
+fn load_dashboard_session(
+    service: &Service,
+    id: &str,
+    history: &std::io::Result<history::ReadView>,
+) -> Result<Session, Failure> {
+    // Without a readable generation, a mirror cannot establish that it is an
+    // explicit checkpoint rather than a shared owner's diagnostic copy.
+    let view = history.as_ref().map_err(|_| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "history index unavailable",
+        )
+    })?;
+    match view.shared(id) {
+        Ok(Some(session)) => return Ok(session),
+        Err(_) => {
+            return Err(failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "shared authority unavailable",
+            ));
+        }
+        Ok(None) => {}
+    }
+    // Explicit checkpoints remain authoritative. A shared owner's diagnostic
+    // mirror cannot replace missing, expired or corrupt index authority.
+    if !service
+        .config
+        .state_dir
+        .join(format!("{id}.json"))
+        .is_file()
+    {
+        return Err(failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "checkpoint unavailable",
+        ));
+    }
+    let session = load_with_restore(service, id, || view.restore(id))?;
+    // A compact checkpoint's frontier is an index dependency, independent of
+    // its mutable shared flag. Only self-contained explicit checkpoints may
+    // stand alone when the index is absent or contains no selected owner.
+    if session.history_frontier.is_some() {
+        return Err(failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "shared checkpoint authority unavailable",
+        ));
+    }
+    Ok(session)
+}
+
+async fn dashboard_transcript(
+    State(service): State<Arc<Service>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Response, Failure> {
+    // Same access policy as dashboard stats: the private LAN/tailnet relay
+    // connects over loopback. Non-loopback callers retain gateway auth.
+    authorize_dashboard(&service, &headers, peer)?;
+    if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(failure(StatusCode::BAD_REQUEST, "invalid session id"));
+    }
+    let history = history::ReadView::new(&service);
+    let mut session = load_dashboard_session(&service, &id, &history)?;
+    let canonical = session
+        .history
+        .iter()
+        .map(|i| i.value.clone())
+        .collect::<Vec<_>>();
+    if let Some(namespace) = &session.history_namespace
+        && let Some(record) = history
+            .as_ref()
+            .ok()
+            .and_then(|view| view.advice(namespace, &canonical))
+    {
+        record.apply(&mut session);
+    }
+    let mut response = axum::Json(json!({
+        "canonical_input": canonical,
+        "current_replacement_memories": session.memories,
+        "last_primary_wire": null,
+        "last_reviewer_wire": null,
+        "availability": "Current retained canonical source and applicable memories only. Exact historical primary/reviewer dispatch bodies are not retained by this endpoint; unavailable, not reconstructed. Existing retention limits apply."
+    })).into_response();
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    response
+        .headers_mut()
+        .insert("x-content-type-options", "nosniff".parse().unwrap());
+    Ok(response)
+}
+
+fn dashboard_current_failure(session: &Session) -> Option<&Value> {
+    let dispatch = session.last_primary_dispatch.as_ref()?;
+    let failure = session.last_failure.as_ref()?;
+    // Legacy failures lack request identity and cannot establish current state.
+    (dispatch.lane == "primary"
+        && dispatch.outcome == "failed"
+        && failure["request_id"].as_str() == Some(dispatch.request_id.as_str()))
+    .then_some(failure)
+}
+
 async fn dashboard_stats(
     State(service): State<Arc<Service>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1120,6 +1267,7 @@ async fn dashboard_stats(
     let mut sessions = Vec::new();
     let mut unavailable_sessions = 0u64;
     let mut cost_estimate = crate::proxy_savings::DashboardTotals::default();
+    let history = history::ReadView::new(&service);
     for entry in entries {
         let Ok(entry) = entry else {
             unavailable_sessions += 1;
@@ -1139,7 +1287,7 @@ async fn dashboard_stats(
             unavailable_sessions += 1;
             continue;
         }
-        let Ok(mut session) = load(&service, id) else {
+        let Ok(mut session) = load_dashboard_session(&service, id, &history) else {
             unavailable_sessions += 1;
             continue;
         };
@@ -1149,16 +1297,32 @@ async fn dashboard_stats(
                 .iter()
                 .map(|i| i.value.clone())
                 .collect::<Vec<_>>();
-            if let Ok(Some(record)) = history::advice(&service, namespace, &input) {
+            if let Some(record) = history
+                .as_ref()
+                .ok()
+                .and_then(|view| view.advice(namespace, &input))
+            {
                 record.apply(&mut session);
             }
         }
-        let retained = session.last_submitted_ids.len();
+        let submitted = session
+            .last_submitted_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let retained = session
+            .history
+            .iter()
+            .filter(|item| submitted.contains(&item.id))
+            .count();
+        // Mutually exclusive source states: omitted in the last dispatch, then
+        // current eligibility/protection among the sources that were submitted.
+        // Memories are additive facts, never part of the source denominator.
         let groups = session.groups();
         let removable = groups
             .iter()
             .filter(|g| session.drop_authorized(g))
-            .map(|g| g.members.len())
+            .map(|g| g.members.iter().filter(|id| submitted.contains(id)).count())
             .sum::<usize>();
         let protected = groups
             .iter()
@@ -1171,7 +1335,7 @@ async fn dashboard_stats(
                             .is_some_and(|opinion| opinion == "keep")
                     })
             })
-            .map(|g| g.members.len())
+            .map(|g| g.members.iter().filter(|id| submitted.contains(id)).count())
             .sum::<usize>();
         let planner = dashboard_plan(&session);
         let estimate = session
@@ -1196,12 +1360,15 @@ async fn dashboard_stats(
             .is_some_and(|lock| lock.try_lock().is_err());
         sessions.push(json!({
             "updated_at": updated_at, "processing": processing,
-            "last_failure": session.last_failure, "planner": planner,
+            "last_failure": dashboard_current_failure(&session), "planner": planner,
             "id": id, "title": session.title(), "primary": session.primary, "shadow": session.shadow,
             "client": session.client,
             "cost_estimate": estimate,
             "background_review_pending": session.background_review_pending,
             "completed_requests": session.completed_requests,
+            "last_primary_dispatch": session.last_primary_dispatch,
+            "last_reviewer_dispatch": session.last_reviewer_dispatch,
+            "rewrites": session.rewrites,
             "compactions": session.compactions, "native_compactions": session.native_compactions,
             "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews, "partial_reviews": session.partial_reviews,
             "failed_primaries": session.failed_primaries,
@@ -1833,13 +2000,64 @@ async fn forward_request(
         if let Some(t) = &mut session.cost_trajectory {
             t.projected(canonical_units, submitted_units, primary_edited);
         }
-        let reviewed = session.clone();
+        // Numeric snapshots use the shared prompt-bearing projection, never allowance.
+        // The planner owns the reauthorized continuation membership.
+        let mut canonical_body = body.clone();
+        canonical_body["input"] = canonical.clone();
+        let baseline = report["baseline_omitted_members"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(Value::as_u64).collect::<HashSet<_>>());
+        let canonical_wire = primary_wire_body(&service.config, &canonical_body);
+        // An empty continuation omission set is exactly the canonical input;
+        // avoid cloning/adapting another large request for that common case.
+        let continuation_wire = baseline
+            .as_ref()
+            .filter(|ids| !ids.is_empty())
+            .map(|omitted| {
+                let mut continuation_body = canonical_body.clone();
+                continuation_body["input"] = json!(session.render_projection(omitted));
+                primary_wire_body(&service.config, &continuation_body)
+            });
+        let mut counts = PromptTokenCounts::default();
+        let mut measurement = dispatch_measurement(&request_id, "primary", &outbound);
+        // Seed with the outgoing measurement already computed at the boundary.
+        counts
+            .0
+            .push((&outbound, measurement.outgoing_input_tokens));
+        measurement.caller_input_tokens = counts.count(&original_body);
+        measurement.canonical_input_tokens = counts.count(&canonical_wire);
+        measurement.continuation_input_tokens = baseline
+            .as_ref()
+            .and_then(|_| counts.count(continuation_wire.as_ref().unwrap_or(&canonical_wire)));
+        let shrink = baseline.as_ref().is_some_and(|prior| {
+            projection.omitted.iter().any(|id| !prior.contains(id))
+                && measurement
+                    .outgoing_input_tokens
+                    .zip(measurement.continuation_input_tokens)
+                    .is_some_and(|(out, before)| out < before)
+        });
+        let rewrites = session
+            .rewrites
+            .get_or_insert_with(|| crate::proxy_state::RewriteCount {
+                prior_unknown: session.primary.calls > 0
+                    || session.completed_requests > 0
+                    || session.compactions > 1,
+                ..Default::default()
+            });
+        if shrink {
+            rewrites.dispatched = rewrites.dispatched.saturating_add(1);
+            rewrites.forced = rewrites
+                .forced
+                .saturating_add(u64::from(report["forced"] == true));
+        }
+        session.last_primary_dispatch = Some(measurement);
         session.last_submitted_ids = session
             .history
             .iter()
             .filter(|i| !projection.omitted.contains(&i.id))
             .map(|i| i.id)
             .collect();
+        let reviewed = session.clone();
         let mut reserved = session.clone();
         reserved.primary_pending = true;
         save(&service, &id, &reserved).map_err(|error| {
@@ -1956,17 +2174,23 @@ async fn forward_request(
         }
         Err(_) => {
             if let Some(mut commit) = commit {
-                commit.reviewed.last_failure =
-                    Some(json!({"at": now(), "reason": "upstream transport or timeout"}));
+                commit.reviewed.last_failure = Some(json!({"at": now(),
+                    "request_id": commit.request_id, "reason": "upstream transport or timeout"}));
                 commit.reviewed.primary_pending = false;
                 commit.reviewed.failed_primaries += 1;
+                finish_measurement(&mut commit.reviewed.last_primary_dispatch, None, false);
                 if let Some(trajectory) = &mut commit.reviewed.cost_trajectory {
                     trajectory.failed_call();
                 }
                 commit.reviewed.primary.calls += 1;
                 commit.reviewed.primary.unavailable_cost_calls += 1;
                 if save(&service, &commit.id, &commit.reviewed).is_err() {
-                    let _ = save_paid_accounting(&service, &commit.id, &commit.reviewed);
+                    let _ = save_paid_accounting(
+                        &service,
+                        &commit.id,
+                        &commit.reviewed,
+                        &commit.request_id,
+                    );
                 }
                 logging::usage(
                     &service,
@@ -2266,6 +2490,7 @@ async fn dispatch_review_for(
     session.bootstrap_review_attempted |= session.bootstrap_review_pending;
     session.last_review_request = session.completed_requests;
     session.review_epoch = next_review_generation();
+    session.last_reviewer_dispatch = Some(dispatch_measurement(&request_id, "reviewer", &body));
     if save(&service, &id, session).is_err() {
         session.background_review_pending = false;
         service.background_reviews.lock().await.remove(&id);
@@ -2292,7 +2517,7 @@ async fn dispatch_review_for(
         let completion = if let Ok(mut current) = load_existing(&service, &id) {
             settle_review(&mut current, &before, &reviewed, &run);
             let settled = save(&service, &id, &current)
-                .or_else(|_| save_paid_accounting(&service, &id, &current))
+                .or_else(|_| save_paid_accounting(&service, &id, &current, &run.request_id))
                 .is_ok();
             // Reusable completion cannot precede its known durable receipt.
             // The paid owner may have advanced; semantic authority still keys H.
@@ -2339,6 +2564,19 @@ async fn dispatch_review_for(
 
 fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, run: &ReviewRun) {
     current.background_review_pending = false;
+    // A delayed reviewer may finish after primary advancement, not after a
+    // newer reviewer attempt. Never copy an entire stale Session snapshot.
+    if current
+        .last_reviewer_dispatch
+        .as_ref()
+        .map(|r| &r.request_id)
+        == before
+            .last_reviewer_dispatch
+            .as_ref()
+            .map(|r| &r.request_id)
+    {
+        current.last_reviewer_dispatch = reviewed.last_reviewer_dispatch.clone();
+    }
     for receipt in &run.receipts {
         let resolved = before.model_resolution.as_ref().map(|p| &p.reviewer);
         let settled = if let Some(usage) = &receipt.usage {
@@ -2490,6 +2728,17 @@ async fn review_chunk(
     };
     let mut diagnostic = json!({"reason": "review_transport_or_protocol_failure"});
     let dispatched_at = now();
+    // A background attempt uses exactly the body measured when it was queued.
+    // Bootstrap/chunk attempts with other bodies must measure their own input.
+    let mut measurement = session
+        .last_reviewer_dispatch
+        .take()
+        .filter(|record| run.background && record.request_id == run.request_id)
+        .unwrap_or_else(|| dispatch_measurement(&review_attempt_id, "reviewer", body));
+    measurement.request_id = review_attempt_id.clone();
+    measurement.parent_request_id = Some(run.request_id.clone());
+    measurement.at = dispatched_at;
+    session.last_reviewer_dispatch = Some(measurement);
     let observed = async {
         let response = if codex_reviewer {
             send_codex(
@@ -2554,6 +2803,11 @@ async fn review_chunk(
     .ok()
     .flatten();
     let mut valid = false;
+    finish_measurement(
+        &mut session.last_reviewer_dispatch,
+        value.as_ref(),
+        value.as_ref().is_some_and(|v| v["status"] == "completed"),
+    );
     session.review_feedback_generation = session.review_epoch;
     session.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"review did not complete with a valid JSON advice object; return the required schema"}]});
     if let Some(value) = value {
@@ -2965,6 +3219,61 @@ fn cache_base(body: &Value) -> Value {
     base
 }
 
+/// Borrowed, request-local quantities only: no raw-body retention or cross-request
+/// cache. Transport/sampling fields cannot create another prompt measurement.
+#[derive(Default)]
+struct PromptTokenCounts<'a>(Vec<(&'a Value, Option<u64>)>);
+
+impl<'a> PromptTokenCounts<'a> {
+    fn count(&mut self, body: &'a Value) -> Option<u64> {
+        if let Some((_, units)) = self.0.iter().find(|(prior, _)| {
+            ["input", "instructions", "tools", "text"]
+                .iter()
+                .all(|key| prior.get(*key) == body.get(*key))
+        }) {
+            return *units;
+        }
+        let units = crate::savings::prompt_input_tokens(body);
+        self.0.push((body, units));
+        units
+    }
+}
+
+fn dispatch_measurement(
+    request_id: &str,
+    lane: &str,
+    body: &Value,
+) -> crate::proxy_state::DispatchMeasurement {
+    crate::proxy_state::DispatchMeasurement {
+        request_id: request_id.into(),
+        parent_request_id: None,
+        lane: lane.into(),
+        at: now(),
+        model: body.get("model").and_then(Value::as_str).map(str::to_owned),
+        basis: "o200k_semantic_prompt_projection_local_estimate_not_provider_usage".into(),
+        caller_input_tokens: None,
+        canonical_input_tokens: None,
+        continuation_input_tokens: None,
+        outgoing_input_tokens: crate::savings::prompt_input_tokens(body),
+        receipt_input_tokens: None,
+        receipt_output_tokens: None,
+        outcome: "dispatched".into(),
+    }
+}
+
+fn finish_measurement(
+    record: &mut Option<crate::proxy_state::DispatchMeasurement>,
+    value: Option<&Value>,
+    completed: bool,
+) {
+    if let Some(record) = record {
+        record.outcome = if completed { "completed" } else { "failed" }.into();
+        record.receipt_input_tokens =
+            value.and_then(|v| carry::core::CacheUsage::from_receipt(&v["usage"]).input());
+        record.receipt_output_tokens = value.and_then(|v| v["usage"]["output_tokens"].as_u64());
+    }
+}
+
 fn estimate(body: &Value) -> f64 {
     crate::proxy_savings::token_units(body) as f64
 }
@@ -3355,6 +3664,12 @@ async fn relay(
             });
             if complete_transport && status.is_success() && completed {
                 commit.candidate.primary_pending = false;
+                commit.candidate.last_failure = None;
+                finish_measurement(
+                    &mut commit.candidate.last_primary_dispatch,
+                    observed.as_ref(),
+                    true,
+                );
                 let value = observed.unwrap();
                 let model = commit.outbound["model"].as_str().unwrap_or("");
                 let resolved = commit
@@ -3435,9 +3750,13 @@ async fn relay(
                 )
                 .is_err()
                 {
-                    let accounting_committed =
-                        save_paid_accounting(&commit.service, &commit.id, &commit.candidate)
-                            .is_ok();
+                    let accounting_committed = save_paid_accounting(
+                        &commit.service,
+                        &commit.id,
+                        &commit.candidate,
+                        &commit.request_id,
+                    )
+                    .is_ok();
                     journal(
                         &commit.service,
                         &commit.id,
@@ -3471,8 +3790,15 @@ async fn relay(
                     stream_end
                 };
                 commit.reviewed.primary_pending = false;
-                commit.reviewed.last_failure = Some(json!({"at": now(), "reason": reason,
-                    "http_status": status.as_u16(), "complete_transport": complete_transport}));
+                finish_measurement(
+                    &mut commit.reviewed.last_primary_dispatch,
+                    observed.as_ref(),
+                    false,
+                );
+                commit.reviewed.last_failure = Some(
+                    json!({"at": now(), "request_id": commit.request_id, "reason": reason,
+                    "http_status": status.as_u16(), "complete_transport": complete_transport}),
+                );
                 commit.reviewed.primary_pending = false;
                 commit.reviewed.failed_primaries += 1;
                 if let Some(trajectory) = &mut commit.reviewed.cost_trajectory {
@@ -3502,7 +3828,12 @@ async fn relay(
                     commit.reviewed.primary.unavailable_cost_calls += 1;
                 }
                 if save(&commit.service, &commit.id, &commit.reviewed).is_err() {
-                    let _ = save_paid_accounting(&commit.service, &commit.id, &commit.reviewed);
+                    let _ = save_paid_accounting(
+                        &commit.service,
+                        &commit.id,
+                        &commit.reviewed,
+                        &commit.request_id,
+                    );
                 }
                 let _ = trace(
                     &commit.service,
@@ -3948,7 +4279,7 @@ mod tests {
         assert_eq!(stats["cost_estimate"]["excluded_sessions"], 1);
         assert_eq!(stats["sessions"][0]["title"], "First task with details");
         assert_eq!(stats["sessions"][0]["context"]["removable_items"], 0);
-        assert_eq!(stats["sessions"][0]["context"]["protected_items"], 1);
+        assert_eq!(stats["sessions"][0]["context"]["protected_items"], 0);
         assert_eq!(stats["sessions"][0]["context"]["memories"], 0);
         assert!(stats["sessions"][0]["planner"].is_object());
         assert!(!String::from_utf8_lossy(&bytes).contains("must not leak"));
@@ -4162,4 +4493,5 @@ mod tests {
     include!("proxy_pr154_tests.rs");
     include!("proxy_log_controls.rs");
     include!("proxy_admission_tests.rs");
+    include!("proxy_dashboard_tests.rs");
 }

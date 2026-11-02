@@ -63,6 +63,26 @@ fn state_regression(selector: &str) {
     }
 }
 
+#[test]
+fn dashboard_dispatch_contract() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_dashboard_contract.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must run the credential-free dashboard fixture");
+    assert!(
+        output.status.success(),
+        "dashboard fixture failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // Actual request planner regression, independent of traditional-cost accounting.
 #[test]
 fn marginal_planner_preserves_cheaper_valid_warm_projection() {
@@ -1366,7 +1386,9 @@ async fn dashboard_is_public_locally_and_reports_stats_without_conversation_cont
         200,
         "dashboard shell must be available in a browser"
     );
-    assert!(shell.text().await.unwrap().contains("<h1>Carry</h1>"));
+    let html = shell.text().await.unwrap();
+    assert!(html.contains("id=\"sessions\""));
+    assert!(html.contains("id=\"status\""));
     let stats_url = format!("{url}/carry/dashboard/stats");
     assert_eq!(client.get(&stats_url).send().await.unwrap().status(), 200);
     for endpoint in ["/v1/models", "/carry/metrics"] {
