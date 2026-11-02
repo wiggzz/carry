@@ -25,7 +25,20 @@ p { color: var(--muted); margin: 8px 0; }
 #status { padding: 12px 0; margin-bottom: 12px; }
 #status.error, .warning, .diagnostics, .loss .value { color: #edc887; }
 .estimate-notice { color: #d0dbea; }
-.cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }
+.cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 12px 0; }
+#cost-cards { display:flex; flex-wrap:wrap; gap:8px 24px; border-bottom:1px solid var(--border); padding-bottom:12px; }
+#cost-cards .card { padding:0; border:0; background:none; }
+#cost-cards .value { font-size:15px; letter-spacing:0; }
+.dispatch-inputs, .candidate-table, .lane-summary { grid-column:1 / -1; min-width:0; }
+.dispatch-inputs { display:grid; grid-template-columns:1fr 1fr; gap:4px 20px; padding-top:6px; }
+.dispatch-inputs p { font-size:13px; }
+.dispatch-inputs .dispatch-note { grid-column:1 / -1; }
+.dispatch-inputs progress { width:100%; height:8px; accent-color:#65c9a3; }
+.candidate-table { border-top:1px solid var(--border); }
+.candidate-table td, .candidate-table th, .lane-summary td, .lane-summary th { padding:6px 10px; }
+.candidate-table caption { text-align:left; padding:8px 10px; color:var(--muted); }
+#usage-strip { font-variant-numeric:tabular-nums; color:#d0dbea; }
+.cache-share progress { display:block; height:5px; width:110px; accent-color:#74a9ec; }
 .card { background: #1a2432; border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; min-width: 0; }
 .label { color: var(--muted); font-size: 14px; }
 .value { font-size: 25px; font-weight: 600; letter-spacing: -.5px; font-variant-numeric: tabular-nums; margin-top: 4px; overflow-wrap: anywhere; }
@@ -78,7 +91,9 @@ input { width: min(65vw, 480px); }
   header { display: block; }
   .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .card { padding: 12px; }
-  .card:last-child { grid-column: 1 / -1; }
+  .card:last-child { grid-column: auto; }
+  .dispatch-inputs { grid-template-columns:1fr; }
+  .dispatch-inputs .dispatch-note { grid-column:auto; }
   .value { font-size: clamp(18px, 5.5vw, 23px); }
   .capacity-grid { grid-template-columns: 1fr; }
   .session { padding: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 12px; }
@@ -92,23 +107,26 @@ input { width: min(65vw, 480px); }
 <div id="status" role="status">Connecting…</div>
 <main>
 <section aria-label="Cost comparison">
-<p class="estimate-notice">Usage-based cost estimate at API rates — not subscription bills or measured savings.</p>
+<h2>All requests</h2><p class="estimate-notice">Receipt-priced API equivalents · projected comparison, not subscription bills.</p>
 <div class="cards" id="cards"></div>
+<p id="usage-strip" class="coverage"></p>
 <p id="estimate-coverage" class="coverage"></p>
 <p id="observed-cost-summary" class="coverage"></p>
-<details id="estimate-details"><summary>How this is estimated</summary>
+<details id="estimate-details"><summary>Measurement and comparison bases</summary>
+<div class="cards" id="cost-cards"></div>
 <p>With Carry includes completed primary and reviewer costs. Traditional models the same recorded activity with conventional summaries. The difference is hypothetical; cache and summary assumptions can affect it even without a Carry rewrite. Costs cover the available accounting window, not necessarily the whole conversation.</p>
 <p id="accounting-detail"></p>
 <p id="config"></p>
 <p id="assumptions"></p>
 <p>Unavailable comparisons are excluded, not treated as zero. Failed or unpriced calls are excluded where noted; observed usage has separate cost coverage.</p>
-<div class="cards" id="cost-cards"></div>
-<div class="scroll" tabindex="0" role="region" aria-label="Recorded usage by lane"><table><thead><tr><th>Lane</th><th>Calls</th><th>Input tokens</th><th>Cached reads</th><th>Read share</th><th>Cache writes</th><th>Output tokens</th><th>API-equivalent cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
-<p class="scope">This proxy’s saved histories only. Activity counts may span more history than the cost comparison. Retained bytes are serialized input, not tokens. Titles are shortened opening messages; roles are client-reported, never inferred from titles. Full messages, memories and credentials are not shown.</p>
-<details><summary>Inspect stats JSON</summary><pre id="raw"></pre></details>
 </details></section>
+<section aria-label="Usage by lane"><h2>Primary / reviewer</h2>
+<div class="scroll" tabindex="0" role="region" aria-label="Recorded usage by lane"><table><thead><tr><th>Lane</th><th>Settled calls</th><th>Input tokens</th><th>Cached reads</th><th>Native cache share / coverage</th><th>Cache writes</th><th>Output tokens</th><th>API-equivalent cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
+<p class="scope">Saved histories only. Activity can span more history than the comparison window. Cache shares use native receipts, never planner predictions. Source transcripts are fetched only when opened; historical wire bodies are not retained.</p>
+<details><summary>Inspect stats JSON</summary><pre id="raw"></pre></details>
+</section>
 <section aria-labelledby="conversations-heading">
-<h2 id="conversations-heading">Conversations</h2><p class="section-note">Stable history-ID order; polling activity does not reorder rows. Matching opening messages are grouped, not merged. Recent means active in the last five minutes.</p>
+<h2 id="conversations-heading">By session</h2><p class="section-note">Stable history-ID order; polling activity does not reorder rows. Matching opening messages are grouped, not merged. Recent means active in the last five minutes.</p>
 <div id="sessions" class="session-grid"></div>
 <details id="background-traffic"><summary id="background-summary">Client background requests</summary>
 <p>Client-generated calls such as title generation and safety assessment. These are separate from Carry’s reviewer; their usage remains included in all totals.</p>
@@ -141,6 +159,63 @@ function sourceLabel(s){return sourceNames[s.client?.kind]||'Unclassified'}
 function sessionMeta(s){const agent=s.client?.agent_name?.split('/').filter(Boolean).pop();return sourceLabel(s)+(agent&&agent!=='root'?' · '+agent:'')+' · '+s.id.slice(0,8)}
 function row(values){const tr=document.createElement('tr');for(const value of values){const td=document.createElement('td');td.textContent=value;tr.append(td)}return tr}
 function card(label,value){const el=document.createElement('div');el.className='card';const l=document.createElement('div');l.className='label';l.textContent=label;const v=document.createElement('div');v.className='value';v.textContent=value;el.append(l,v);return el}
+// Last-dispatch facts and saved planner rows: no economic recomputation here.
+function note(parent,text,className='legend'){const p=document.createElement('p');p.className=className;p.textContent=text;parent.append(p);return p}
+function dispatchInputs(s){
+ const el=document.createElement('div');el.className='dispatch-inputs';const p=s.last_primary_dispatch;
+ if(!p){note(el,'Primary last-dispatch input unavailable','dispatch-note');return el}
+ const scale=Math.max(p.caller_input_tokens||0,p.outgoing_input_tokens||0,1);
+ for(const [label,value] of [['Caller at proxy',p.caller_input_tokens],['Selected upstream wire',p.outgoing_input_tokens]]){
+  const block=document.createElement('div');note(block,label+' · '+(value==null?'unknown':fmt(value)+' tokens, local estimate'));
+  if(value!=null){const bar=document.createElement('progress');bar.max=scale;bar.value=value;bar.setAttribute('aria-label',label+' local input estimate');block.append(bar)}el.append(block);
+ }
+ note(el,'Canonical/restored '+(p.canonical_input_tokens==null?'unknown':fmt(p.canonical_input_tokens))+' · valid continuation '+(p.continuation_input_tokens==null?'unavailable':fmt(p.continuation_input_tokens))+' · provider input '+(p.receipt_input_tokens==null?'unavailable':fmt(p.receipt_input_tokens))+' · '+p.outcome+' · '+p.request_id,'dispatch-note');
+ return el;
+}
+function laneSummary(s){
+ const wrap=document.createElement('div');wrap.className='lane-summary';const scroll=document.createElement('div');scroll.className='scroll';scroll.setAttribute('tabindex','0');
+ const table=document.createElement('table');table.append(row(['Lane','Settled calls','Observed cost','Native cache / coverage','Last dispatched input · local estimate','Provider input']));
+ for(const [name,key,record] of [['Primary','primary',s.last_primary_dispatch],['Reviewer','shadow',s.last_reviewer_dispatch]]){
+  const l=s[key]||{},o=l.cache_observation||{},share=o.input_tokens?((100*(o.cached_tokens||0)/o.input_tokens).toFixed(1)+'%'+(o.calls===l.calls?'':' known subset')):'unknown';
+  const r=row([name,fmt(l.calls||0),money(l.cost_usd)+(l.unavailable_cost_calls?' · '+fmt(l.unavailable_cost_calls)+' unpriced':''),share+' · '+fmt(o.calls||0)+' / '+fmt(l.calls||0),record?(record.outgoing_input_tokens==null?'unavailable':fmt(record.outgoing_input_tokens))+' · '+record.outcome:'unavailable',record?.receipt_input_tokens==null?'unavailable':fmt(record.receipt_input_tokens)]);
+  if(o.input_tokens>0){const bar=document.createElement('progress');bar.max=o.input_tokens;bar.value=o.cached_tokens;bar.setAttribute('aria-label',name+' native cache share'+(o.calls===l.calls?'':' known subset'));r.children[3].append(bar)}
+  table.append(r);
+ }
+ scroll.append(table);wrap.append(scroll);return wrap;
+}
+function candidateTable(p){
+ const wrap=document.createElement('div');wrap.className='candidate-table';
+ note(wrap,'Saved planner · '+(p.payoff_requests==null?'unknown horizon':fmt(p.payoff_requests)+'-request horizon')+' · '+(p.forced?'forced capacity choice':'economic choice')+' · not realized savings');
+ if(!p.candidates?.length){note(wrap,'No saved candidate rows');return wrap}
+ const scroll=document.createElement('div');scroll.className='scroll';scroll.setAttribute('tabindex','0');const table=document.createElement('table');
+ table.append(row(['Action / identity','Input est.','Fit','Keep','Candidate','Projected difference','Primary keep → candidate','Reviewer keep → candidate']));
+ for(const c of p.candidates){const j=c.selection_joint||{};
+  const r=row([(c.action||'unknown')+' · '+(c.candidate_id===p.selected_candidate_id?'selected'+(p.forced?' / forced':'')+' · ':'')+(c.baseline?'baseline · ':'')+(c.candidate_id||'unknown').slice(0,12),c.primary_retained_estimated_tokens==null?'unavailable':fmt(c.primary_retained_estimated_tokens),c.feasible==null?'unknown':c.feasible?'yes':'no',money(j.keep),money(j.compact),money(j.savings),money(j.primary_keep)+' → '+money(j.primary_compact),money(j.future_shadow_keep)+' → '+money(j.future_shadow_compact)]);
+  r.id='candidate:'+c.candidate_id;r.children[0].title=c.candidate_id||'';table.append(r);
+ }
+ scroll.append(table);wrap.append(scroll);return wrap;
+}
+const transcriptText=new Map();
+const transcriptRequests=new Map();
+function transcriptView(s){
+ const detail=disclosure('transcript:'+s.id,'Source / projection / reviewer transcript','transcript-view');
+ const body=document.createElement('pre');body.textContent=transcriptText.get(s.id)||'Open to fetch the currently retained source. Historical primary and reviewer wire bodies are unavailable; no raw request retention is added.';detail.append(body);
+ detail.addEventListener('toggle',async()=>{
+  if(!detail.isConnected)return;
+  if(!detail.open){transcriptRequests.delete(s.id);return}
+  const requestToken=token;
+  const request={};transcriptRequests.set(s.id,request);
+  const applicable=()=>requestToken===token&&transcriptRequests.get(s.id)===request&&detail.isConnected&&detail.open;
+  const show=text=>{transcriptText.set(s.id,text);body.textContent=text};
+  show('Loading retained transcript…');
+  try{const res=await fetch('/carry/dashboard/transcript/'+encodeURIComponent(s.id),{headers:requestToken?{Authorization:'Bearer '+requestToken}:{},cache:'no-store'});
+   if(!applicable())return;
+   if(!res.ok)throw Error('Transcript unavailable (HTTP '+res.status+'). Access uses the same private dashboard boundary.');
+   const text=JSON.stringify(await res.json(),null,2);if(!applicable())return;
+   show(text);
+  }catch(err){if(applicable())show(err.message)}
+ });return detail;
+}
 function disclosure(key,label,className){
  const detail=document.createElement('details');detail.id='disclosure:'+key;detail.className=className;detail.open=expandedDiagnostics.has(key);
  detail.addEventListener('toggle',()=>{if(detail.isConnected){if(detail.open)expandedDiagnostics.add(key);else expandedDiagnostics.delete(key)}});
@@ -180,6 +255,8 @@ async function refresh(){
   const res=await fetch('/carry/dashboard/stats',{headers,cache:'no-store'});
   if(!res.ok)throw Error(res.status===401?'Enter the scoped proxy token for remote dashboard access.':'Stats request failed (HTTP '+res.status+').');
   const data=await res.json();const sessions=data.sessions;
+  const live=new Set(sessions.map(s=>s.id));
+  for(const cache of [transcriptText,transcriptRequests])for(const id of cache.keys())if(!live.has(id))cache.delete(id);
   const focusedElement=document.activeElement;
   const roots=[$('sessions'),$('background-sessions')];
   const histories=new Map(roots.flatMap(descendants).filter(node=>node.className==='session').map(node=>{
@@ -195,7 +272,8 @@ async function refresh(){
   const primaryUnpriced=sum(primary,'unavailable_cost_calls'),reviewerUnpriced=sum(shadow,'unavailable_cost_calls');
   const unpriced=primaryUnpriced+reviewerUnpriced,unavailable=unpriced+(data.unavailable_sessions||0);
   const subtotal=pricedSubtotal([...primary,...shadow]);
-  $('observed-cost-summary').textContent=unavailable||subtotal==null?'Observed API-equivalent cost: known subtotal '+money(subtotal)+' · '+count(unpriced,'unpriced call')+' ('+fmt(primaryUnpriced)+' primary, '+fmt(reviewerUnpriced)+' reviewer).'+(data.unavailable_sessions?' '+count(data.unavailable_sessions,'unreadable checkpoint')+'.':'')+' Total unavailable.':'Observed API-equivalent total: '+money(subtotal)+'.';
+  $('observed-cost-summary').textContent=unavailable||subtotal==null?count(unpriced,'unpriced call')+' ('+fmt(primaryUnpriced)+' primary, '+fmt(reviewerUnpriced)+' reviewer).'+(data.unavailable_sessions?' '+count(data.unavailable_sessions,'unreadable checkpoint')+'.':'')+' Total unavailable.':'';
+  $('observed-cost-summary').hidden=!$('observed-cost-summary').textContent;
   const estimate=data.cost_estimate||{};
   const included=estimate.included_sessions||0,excluded=estimate.excluded_sessions||0;
   const excludedFailed=estimate.excluded_failed_calls||0;
@@ -206,16 +284,16 @@ async function refresh(){
   const recent=sessions.filter(s=>s.updated_at && Date.now()/1000-s.updated_at<300).length;
   $('activity-summary').textContent=fmt(recent)+' recently active · '+fmt(sum(sessions,'completed_requests'))+' completed requests';
   $('cards').replaceChildren(...[
-   ['With Carry',money(estimate.carry_cost)],
-   ['Traditional',money(estimate.traditional_cost)],
+   [unavailable?'Observed priced subtotal':'Observed cost',money(subtotal)],
    ['Estimated difference',savingsText(estimate)]
   ].map(([label,value])=>card(label,value)));
-  const difference=$('cards').children[2],direction=document.createElement('p');direction.className='card-note';
+  const difference=$('cards').children[1],direction=document.createElement('p');direction.className='card-note';
   direction.textContent=estimate.savings==null?'No comparable estimate':estimate.savings<0?'Higher cost with Carry':estimate.savings>0?'Lower cost with Carry':'No estimated difference';
   if(estimate.savings<0)difference.className='card loss';difference.append(direction);
   $('cost-cards').replaceChildren(...[
-   ['API-equivalent total',unavailable?'Incomplete':money(subtotal)],
-   ['Observed priced subtotal',money(subtotal)],
+   ['With Carry',money(estimate.carry_cost)],
+   ['Traditional',money(estimate.traditional_cost)],
+
    ['Calls excluded from comparison',unpricedText(estimate)]
   ].map(([label,value])=>card(label,value)));
   $('usage').replaceChildren(...[['Primary',primary],['Reviewer',shadow]].map(([name,ledgers])=>{
@@ -224,10 +302,16 @@ async function refresh(){
    const cached=observed?sum(observations,'cached_tokens'):null,observedInput=sum(observations,'input_tokens');
    const complete=observed>0&&observed===calls&&!data.unavailable_sessions;
    const cacheText=cached==null?'Unavailable':fmt(cached)+(complete?' (provider-reported)':' (known subtotal; '+fmt(observed)+' of '+fmt(calls)+' calls)');
-   const usage=row([name,fmt(calls),fmt(input),cacheText,complete&&observedInput?(100*cached/observedInput).toFixed(1)+'%':'—',fmt(sum(ledgers,'cache_write_tokens')),fmt(sum(ledgers,'output_tokens')),missing?'Known subtotal '+money(pricedSubtotal(ledgers))+' · total unavailable':money(pricedSubtotal(ledgers)),fmt(missing)]);
+   const percent=observedInput?(100*cached/observedInput).toFixed(1)+'%':null;
+   const usage=row([name,fmt(calls),fmt(input),cacheText,percent?(complete?percent:percent+' known subset · '+fmt(observed)+' / '+fmt(calls)+' calls'):'—',fmt(sum(ledgers,'cache_write_tokens')),fmt(sum(ledgers,'output_tokens')),missing?'Known subtotal '+money(pricedSubtotal(ledgers))+' · total unavailable':money(pricedSubtotal(ledgers)),fmt(missing)]);
+   usage.children[4].className='cache-share';
+   if(percent){const bar=document.createElement('progress');bar.max=observedInput;bar.value=cached;bar.setAttribute('aria-label',name+' native cache share'+(complete?'':' of known subset'));usage.children[4].append(bar)}
    usage.children[3].title='Provider-reported cache usage from calls with valid input/cache observations. Missing or legacy coverage leaves only a known subtotal and no overall percentage. Zero reads do not mean implicit caching is disabled; the cause of a cache miss is not reported.';
    return usage;
   }));
+  const allLedgers=[...primary,...shadow],observations=allLedgers.map(l=>l.cache_observation||{});
+  const observedCalls=sum(observations,'calls'),settledCalls=sum(allLedgers,'calls'),observedInput=sum(observations,'input_tokens'),cachedInput=sum(observations,'cached_tokens');
+  $('usage-strip').textContent=fmt(settledCalls)+' settled calls ('+fmt(sum(primary,'calls'))+' primary + '+fmt(sum(shadow,'calls'))+' reviewer) · input '+fmt(sum(allLedgers,'input_tokens'))+' · output '+fmt(sum(allLedgers,'output_tokens'))+' · cached '+(observedCalls?fmt(cachedInput):'unknown')+' · cache '+(observedInput?(100*cachedInput/observedInput).toFixed(1)+'%'+(observedCalls===settledCalls&&!data.unavailable_sessions?'':' known subset'):'unknown')+' ('+fmt(observedCalls)+' / '+fmt(settledCalls)+' calls observed) · active '+fmt(sessions.filter(s=>s.processing).length)+' primary / '+fmt(sessions.filter(s=>s.background_review_pending).length)+' reviewer · '+fmt(sum(sessions,'failed_primaries'))+' incomplete primary requests';
   const sorted=[...sessions].sort((a,b)=>a.id.localeCompare(b.id));
   const renderSession=(s,grouped=false)=>{
    const e=s.cost_estimate;
@@ -259,8 +343,8 @@ async function refresh(){
    const el=document.createElement('article');el.className='session';el.id='history:'+s.id;
    const heading=document.createElement('h3');heading.textContent=grouped?sourceLabel(s):backgroundTypes.has(s.client?.kind)?sourceLabel(s):s.title||'Session '+s.id.slice(0,12);heading.title=s.id;
    const status=document.createElement('p');status.className='activity';status.textContent=activity;
-   const requests=document.createElement('p');requests.className='request-counts';requests.textContent=count(s.completed_requests||0,'completed request')+' · '+count(s.compactions||0,'filtered request');
-   requests.title='Lifetime counters, not necessarily the cost window. Filtered requests count nonempty outgoing omissions before completion, not new cleanup jobs; they can include failed requests.';
+   const requests=document.createElement('p');requests.className='request-counts';requests.textContent=count(s.completed_requests||0,'completed request')+' · '+(s.rewrites?count(s.rewrites.dispatched,'distinct rewrite')+' dispatched · '+fmt(s.rewrites.forced)+' forced'+(s.rewrites.prior_unknown?' · prior unknown':''): 'Distinct rewrites unavailable');
+   requests.title='Prospective attempted dispatches that newly shrink versus the valid prior-projection continuation; repeats and restoration do not count. Forced is a subset. Lifetime activity and receipt-cost windows differ; legacy filtered requests: '+fmt(s.compactions||0)+'.';
    const saved=document.createElement('p');saved.className='session-savings';saved.textContent='Estimated difference: '+savingsText(e)+(e?.savings<0?' · higher cost with Carry':'');
    const identity=document.createElement('div');identity.className='session-identity';identity.append(heading,status,requests);el.append(identity,saved);
    const costs=document.createElement('p');costs.className='session-costs';costs.textContent='With Carry '+money(e?.carry_cost)+' · Traditional '+money(e?.traditional_cost);el.append(costs);
@@ -275,6 +359,7 @@ async function refresh(){
    if(s.reviewer_compactions!=null){const cleanup=document.createElement('p');cleanup.textContent=fmt(s.reviewer_compactions)+' reviewer cleanups (legacy replay counter).';details.append(cleanup)}
    const c=s.context||{};
    const p=s.planner||{},contextSummary=disclosure('context:'+s.id,'Context plan','context-summary');
+   el.append(dispatchInputs(s),laneSummary(s),candidateTable(p),transcriptView(s));
    const submitted=document.createElement('p');submitted.className='submitted-items';submitted.textContent=[c.removed_items==null?null:fmt(c.removed_items)+' omitted',c.retained_items==null?null:fmt(c.retained_items)+' kept'].filter(n=>n!=null).join(' · ');
    if(submitted.textContent){submitted.textContent+=' · last submitted request (source items)';contextSummary.append(submitted)}
    const source=document.createElement('p');source.className='source-items';source.textContent=[c.history_items==null?null:fmt(c.history_items)+' source items',c.removable_items==null?null:fmt(c.removable_items)+' eligible to omit',c.protected_items==null?null:fmt(c.protected_items)+' protected',c.memories==null?null:fmt(c.memories)+' memories'].filter(n=>n!=null).join(' · ');
@@ -374,7 +459,7 @@ async function refresh(){
  }catch(err){$('status').textContent=err.message+' Previous stats may be stale.';$('status').className='error';$('login').hidden=false}
  finally{busy=false}
 }
-$('login').addEventListener('submit',event=>{event.preventDefault();token=$('token').value.trim();$('token').value='';refresh()});
+$('login').addEventListener('submit',event=>{event.preventDefault();token=$('token').value.trim();$('token').value='';transcriptText.clear();transcriptRequests.clear();refresh()});
 refresh();setInterval(()=>{if(!document.hidden)refresh()},2000);
 </script>
 </body>

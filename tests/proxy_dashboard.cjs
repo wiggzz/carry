@@ -20,7 +20,9 @@ const element = (tagName = '') => ({
     this.children.splice(index,0,item); item.parentElement=this;
   },
   removeChild(item) { this.children.splice(this.children.indexOf(item),1); item.parentElement=null; },
-  addEventListener() {},
+  listeners: {},
+  addEventListener(name, fn) { (this.listeners[name] ||= []).push(fn); },
+  get isConnected() { return [...elements.values()].some(root => root.contains(this)); },
   get firstElementChild() { return this.children[0] || null; },
   contains(node) { return this === node || this.children.some(child => child.contains(node)); },
   focus() { document.activeElement = this; },
@@ -82,7 +84,7 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   data.sessions[1].title='Newest task'; data.sessions[1].updated_at=2;
   await vm.runInContext('refresh()', sandbox);
   assert.equal(walk(firstSession()).find(n=>n.tagName==='h3').textContent, 'Older task', 'stable history-ID order does not follow polling activity');
-  assert.equal(elements.get('cards').children.length, 3, 'overview compares Carry, traditional and difference');
+  assert.equal(elements.get('cards').children.length, 2, 'observed total and backend difference dominate; comparison costs stay adjacent');
   assert.equal(cards().get('With Carry'), '$4.000000');
   assert.equal(cards().get('Traditional'), '$6.000000');
   assert.equal(cards().get('Estimated difference'), '$2.000000 (33.3%)');
@@ -111,7 +113,8 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   await vm.runInContext('refresh()', sandbox);
   assert.equal(cards().get('Estimated difference'), '$2.000000 (33.3%)');
   assert.equal(cards().get('With Carry'), '$4.000000');
-  assert.equal(cards().get('API-equivalent total'), 'Incomplete', 'excluding failures must not relabel observed usage completeness');
+  assert.equal(cards().get('Observed priced subtotal'), 'Unavailable', 'excluding failures must not invent a complete observed total');
+  assert.match(elements.get('observed-cost-summary').textContent,/Total unavailable/);
   assert.match(elements.get('estimate-coverage').textContent, /successful requests only.*2 failed calls excluded/i);
   assert.match(byClass(firstSession(), 'diagnostics').textContent, /successful requests only/i);
   partial.cost_estimate = {...partial.cost_estimate, savings: null, carry_cost: null, traditional_cost: null, savings_percent: null};
@@ -134,26 +137,27 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.match(elements.get('estimate-coverage').textContent, /5 calls excluded from comparison.*1 reviewer-only/i);
   assert.match(elements.get('estimate-coverage').textContent, /approximate/i);
   assert.match(byClass(firstSession(), 'diagnostics').textContent, /priced calls only.*3 calls excluded from comparison.*1 reviewer-only/i);
-  assert.equal(cards().get('API-equivalent total'), 'Incomplete', 'estimated comparison coverage must not hide unavailable observed usage');
+  assert.match(elements.get('observed-cost-summary').textContent,/Total unavailable/, 'estimated comparison coverage must not hide unavailable observed usage');
   // Native ledgers and comparison accounting deliberately describe different
   // populations. Keep the known observed subtotal visible outside disclosures.
   Object.assign(unpriced.primary, {cost_usd: 7, unavailable_cost_calls: 3});
   Object.assign(unpriced.shadow, {cost_usd: 0.25, unavailable_cost_calls: 2});
   await vm.runInContext('refresh()', sandbox);
   assert.equal(elements.get('observed-cost-summary')?.textContent || '',
-    'Observed API-equivalent cost: known subtotal $7.250000 · 5 unpriced calls (3 primary, 2 reviewer). Total unavailable.');
+    '5 unpriced calls (3 primary, 2 reviewer). Total unavailable.');
   assert.equal(cards().get('Observed priced subtotal'), '$7.250000');
   assert.equal(cards().get('With Carry'), '$1.000000', 'native subtotal does not replace comparison-window money');
   unpriced.primary.cost_usd = null; unpriced.shadow.cost_usd = null;
   await vm.runInContext('refresh()', sandbox);
-  assert.match(elements.get('observed-cost-summary').textContent, /known subtotal Unavailable.*5 unpriced calls.*Total unavailable/);
+  assert.match(elements.get('observed-cost-summary').textContent, /5 unpriced calls.*Total unavailable/);
   assert.equal(cards().get('Observed priced subtotal'), 'Unavailable', 'wholly unknown observed expense never becomes zero');
   assert.equal(elements.get('usage').children[0].children[7].textContent,
     'Known subtotal Unavailable · total unavailable', 'lane detail cannot invent a zero subtotal for null expense');
   unpriced.primary.cost_usd = 0; unpriced.shadow.cost_usd = 0;
   unpriced.primary.unavailable_cost_calls = 0; unpriced.shadow.unavailable_cost_calls = 0;
   await vm.runInContext('refresh()', sandbox);
-  assert.equal(elements.get('observed-cost-summary').textContent, 'Observed API-equivalent total: $0.000000.');
+  assert.equal(cards().get('Observed cost'),'$0.000000','known zero remains distinct from unavailable');
+  assert.equal(elements.get('observed-cost-summary').hidden,true,'complete cost needs no duplicate prose total');
   data.sessions = [session(3, 2)];
   data.cost_estimate = total(3, 2, -1, -50, 1);
   await vm.runInContext('refresh()', sandbox);
@@ -162,7 +166,8 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   data.cost_estimate = total(3, 2, -1, -50, 1, 1);
   await vm.runInContext('refresh()', sandbox);
   assert.equal(cards().get('Traditional'), '$2.000000', 'unreadable checkpoints do not suppress eligible estimates');
-  assert.equal(cards().get('API-equivalent total'), 'Incomplete', 'usage totals must still flag unreadable checkpoints');
+  assert.equal(cards().get('Observed priced subtotal'), 'Unavailable', 'usage totals must still flag unreadable checkpoints');
+  assert.match(elements.get('observed-cost-summary').textContent,/unreadable checkpoint.*Total unavailable/);
   assert.ok(elements.get('estimate-coverage').textContent.includes('Includes 1 of 2 sessions'));
   data.unavailable_sessions = 0;
   data.sessions = [session(100, 200, false), { ...session(1, 2), cost_estimate: undefined }];
@@ -277,9 +282,9 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     assert.match(unsupportedNotes, reason, 'independent coverage reasons coexist');
   }
   assert.doesNotMatch(unsupportedNotes, /image/i, 'missing modality provenance cannot be invented in UI');
-  assert.equal(cards().get('API-equivalent total'), '$9.500000', 'unsupported comparison can still have complete observed cost');
+  assert.equal(cards().get('Observed cost'), '$9.500000', 'unsupported comparison can still have complete observed cost');
   assert.equal(cards().get('Estimated difference'), 'Unavailable');
-  assert.equal(elements.get('observed-cost-summary').textContent, 'Observed API-equivalent total: $9.500000.');
+  assert.equal(elements.get('observed-cost-summary').hidden,true,'complete observed cost has no duplicate prose total');
   // Zero filtering is lifetime activity, not permission to erase backend money
   // or claim that a positive modeled difference was caused by filtering.
   const noFilter = {...session(0.7109506, 0.7601263), compactions: 0, completed_requests: 40};
@@ -312,8 +317,8 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   await vm.runInContext('refresh()', sandbox);
   assert.equal(elements.get('usage').children[1].children[3].textContent,
     '500 (known subtotal; 1 of 2 calls)');
-  assert.equal(elements.get('usage').children[1].children[4].textContent,'—',
-    'partial known cached usage cannot produce an overall percentage');
+  assert.equal(elements.get('usage').children[1].children[4].textContent,'5.0% known subset · 1 / 2 calls',
+    'partial native cache share is explicitly a known subset with call coverage');
   delete noFilter.shadow.cache_observation;
   await vm.runInContext('refresh()', sandbox);
   assert.equal(elements.get('usage').children[1].children[3].textContent,'Unavailable',
@@ -381,7 +386,7 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.ok(!byClass(firstSession(), 'unreviewed'), 'mixed-population residual is not a valid unseen-item classification');
   data.sessions[0].completed_requests=1;data.sessions[0].compactions=1;
   await vm.runInContext('refresh()', sandbox);
-  assert.equal(byClass(firstSession(), 'request-counts').textContent, '1 completed request · 1 filtered request');
+  assert.equal(byClass(firstSession(), 'request-counts').textContent, '1 completed request · Distinct rewrites unavailable');
   for(const [selected_action,mode,expected] of [
     ['reviewer_only','audit',/would select reviewer-only cleanup \(audit\)/],
     ['primary','audit',/would select primary compaction \(audit\)/],
@@ -422,7 +427,7 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.deepEqual(walk(inputBars).filter(n=>n.tagName==='progress').map(n=>[n.value,n.max]),[[864961,864961],[129381,864961]]);
   assert.ok(!walk(byClass(firstSession(), 'session-details')).includes(projectionSummary));
   assert.match(noteTexts(projectionSummary).join('\n'), /865k → 129.4k.*local estimate/i);
-  assert.equal(byClass(firstSession(), 'request-counts').textContent, '28 completed requests · 28 filtered requests');
+  assert.equal(byClass(firstSession(), 'request-counts').textContent, '28 completed requests · Distinct rewrites unavailable');
   assert.match(noteTexts(projectionSummary).join('\n'), /661 omitted.*92 kept.*last submitted/i);
   assert.match(noteTexts(projectionSummary).join('\n'), /753 source items.*661 eligible to omit.*69 protected.*10 memories/i);
   assert.match(noteTexts(projectionSummary).join('\n'), /same.*items.*repeated.*not.*delet/i);
@@ -517,10 +522,10 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     const nativeSubtotal = nativeLedgers.some(l=>l.cost_usd!=null)
       ? nativeLedgers.reduce((n,l)=>n+(l.cost_usd||0),0) : null;
     const nativeUnpriced = nativeLedgers.reduce((n,l)=>n+(l.unavailable_cost_calls||0),0);
-    assert.equal(cards().get('Observed priced subtotal'),amount(nativeSubtotal));
+    assert.equal(cards().get(nativeUnpriced||data.unavailable_sessions?'Observed priced subtotal':'Observed cost'),amount(nativeSubtotal));
     if(nativeUnpriced || data.unavailable_sessions){
-      assert.match(elements.get('observed-cost-summary').textContent, /known subtotal.*Total unavailable/);
-      assert.ok(elements.get('observed-cost-summary').textContent.includes(amount(nativeSubtotal)));
+      assert.match(elements.get('observed-cost-summary').textContent, /Total unavailable/);
+      assert.ok(!elements.get('observed-cost-summary').textContent.includes('$'),'coverage does not duplicate the known-subtotal card');
       assert.ok(elements.get('observed-cost-summary').textContent.includes(nativeUnpriced.toLocaleString()+' unpriced call'));
     }
     for(const history of data.sessions.filter(s=>s.compactions===0&&s.cost_estimate?.savings>0)){
@@ -562,4 +567,4 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   await vm.runInContext('refresh()', sandbox);
   assert.ok(!initialization(), 'missing legacy metadata cannot invent zero initial summaries');
   console.log('proxy dashboard scenarios: ok');
-})().catch(error => { console.error(error); process.exitCode = 1; });
+})().then(() => require('./proxy_dashboard_measurements.cjs')).catch(error => { console.error(error); process.exitCode = 1; });

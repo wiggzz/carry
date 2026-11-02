@@ -63,6 +63,26 @@ fn state_regression(selector: &str) {
     }
 }
 
+#[test]
+fn dashboard_dispatch_contract() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_dashboard_contract.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must run the credential-free dashboard fixture");
+    assert!(
+        output.status.success(),
+        "dashboard fixture failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // Actual request planner regression, independent of traditional-cost accounting.
 #[test]
 fn marginal_planner_preserves_cheaper_valid_warm_projection() {
