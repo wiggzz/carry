@@ -525,12 +525,23 @@ class StateRegressions(unittest.TestCase):
                     raise AssertionError("capacity waiter did not release the held A reviewer")
                 return 200, advice_response({"protected": [], "removable": [2],
                     "memories": [{"text": "CAPACITY_HELD_A_FACT", "source_ids": [2]}]})
-            # A rejected old review may need a fresh blocking capacity review.
+            # A stale old review may need an independently scheduled successor.
             # That actual B review grants no removal or memory authority.
             return 200, advice_response({"protected": [], "removable": [], "memories": []})
 
-        fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
-        options = ["--primary-context-tokens", "4096",
+        def native_input(body):
+            text = wire(body["input"])
+            return 1000 + 3000 * (b"old evidence" in text) + 3000 * (b"new material" in text)
+
+        def primary(body, n):
+            response = completed(response_id=f"resp_{n}")
+            response["usage"]["input_tokens"] = native_input(body)
+            return 200, response
+
+        fixture = self.fixture(primary, review)
+        # Coherent synthetic native units: the old prefix fits, the new block
+        # crosses the policy target, and replacing old evidence fits again.
+        options = ["--primary-context-tokens", "5000",
                    "--min-payback-percent", "100", "--payoff-requests", "1",
                    "--review-replayed-history", "--review-every-requests", "100"]
         proxy = self.proxy(fixture, options, wait_reviews=False)
@@ -549,6 +560,9 @@ class StateRegressions(unittest.TestCase):
         direction = "ORIGINAL_DIRECTION" if change == "unchanged" else (
             "CHANGED_DIRECTION" if change == "changed" else "")
         result, errors = [], []
+        # Actual storage failure is still a legitimate predispatch error;
+        # removing estimate-based rejection must not bypass durable reservation.
+        pressure_status = 500 if publication_failure else 200
         checkpoint = next(self.state.glob("*.json"))
         original_bytes = checkpoint.read_bytes()
         blocked_temporary = self.state / f".{checkpoint.stem}.tmp"
@@ -566,18 +580,21 @@ class StateRegressions(unittest.TestCase):
         waiter = threading.Thread(target=send_pressure, daemon=True)
         waiter.start()
         try:
-            # #163 rejects overflow using already accepted authority; it never
-            # waits for a reviewer or buys rescue advice on the primary path.
+            # Estimated overflow must still reach upstream without waiting
+            # for held advice or granting new source-removal authority.
             waiter.join(timeout=3)
-            self.assertFalse(waiter.is_alive(), "capacity rejection must not wait for held review")
+            self.assertFalse(waiter.is_alive(), "estimated overflow must not wait for held review")
             self.assertEqual(errors, [])
             self.assertEqual(len(result), 1)
-            self.assertEqual(result[0][0], 413)
-            self.assertEqual(len(fixture.primaries), 2, "no capacity-overflow input may reach upstream")
+            self.assertEqual(result[0][0], pressure_status)
+            self.assertEqual(len(fixture.primaries), 2 if publication_failure else 3)
+            if not publication_failure:
+                self.assertEqual(fixture.primaries[-1]["input"], growing,
+                                 "unsettled advice must not remove source content from an oversized request")
             at_wait = proxy.saved()
             if change == "clear_then_restore":
-                # Even two rejected requests must publish both invalidations.
-                self.assertEqual(proxy.send(growing, **fields)[0], 413)
+                # Even two oversized requests must publish both invalidations.
+                self.assertEqual(proxy.send(growing, **fields)[0], pressure_status)
                 direction = "ORIGINAL_DIRECTION"
             before_release = proxy.saved()
             if publication_failure:
@@ -591,7 +608,7 @@ class StateRegressions(unittest.TestCase):
                 if change == "clear_then_restore":
                     # Recover storage and persist A again before releasing A's
                     # old worker. A same-input ingress must not erase the fence.
-                    self.assertEqual(proxy.send(growing, **fields)[0], 413)
+                    self.assertEqual(proxy.send(growing, **fields)[0], 200)
                     before_release = proxy.saved()
         finally:
             if publication_failure and blocked_temporary.is_dir():
@@ -601,7 +618,7 @@ class StateRegressions(unittest.TestCase):
         settled = self.wait_saved(proxy, lambda s: not s["background_review_pending"])
         if change in ("unchanged", "clear_then_restore"):
             # Compatible advice may help only the next request, never turn the
-            # earlier rejected primary into a blocking reviewer-dependent call.
+            # earlier primary into a blocking reviewer-dependent call.
             self.assertEqual(proxy.send(growing, instructions=direction, max_output_tokens=1)[0], 200)
             settled = proxy.saved()
         # Checkpoint replacement precedes its settlement journal append. Wait
@@ -626,7 +643,8 @@ class StateRegressions(unittest.TestCase):
         if not publication_failure or accepted:
             self.assertEqual(any(m["text"] == "CAPACITY_HELD_A_FACT"
                                  for m in (proxy.advice() or {}).get("memories", [])), accepted)
-        self.assertEqual(result[0][0], 413, "an in-flight review cannot hold/rescue that request")
+        self.assertEqual(result[0][0], pressure_status,
+                         "only the injected storage fault, not size estimation, may block this request")
         if accepted:
             self.assertIn(b"CAPACITY_HELD_A_FACT", wire(fixture.primaries[-1]))
             self.assertNotIn(b"old evidence", wire(fixture.primaries[-1]))
@@ -642,6 +660,9 @@ class StateRegressions(unittest.TestCase):
                                      "--min-payback-percent", "100"])
         self.assertEqual(proxy.send(growing, instructions=direction, max_output_tokens=1)[0], 200)
         restarted = proxy.saved()
+        self.assertEqual(restarted["primary"]["calls"], len(fixture.primaries))
+        self.assertEqual(restarted["primary"]["input_tokens"],
+                         sum(native_input(body) for body in fixture.primaries))
         # Changed direction may legitimately acquire a fresh review: compare
         # paid totals with the fixture's actual calls, never forbid that work.
         self.assertEqual(restarted["shadow"]["calls"], len(fixture.reviews))

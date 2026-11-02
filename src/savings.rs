@@ -20,6 +20,10 @@ impl PrimaryHistory {
         self.0 = false;
     }
 
+    pub(crate) fn is_identical(&self) -> bool {
+        self.0
+    }
+
     pub(crate) fn price(
         &self,
         observed: Option<f64>,
@@ -137,6 +141,7 @@ pub struct Coverage {
 #[derive(Clone, Default, Debug, Serialize)]
 pub struct Estimate {
     pub counterfactual_cache_policy: String,
+    pub cache_initializations: crate::proxy_cache::CacheInitializations,
     pub savings: f64,
     pub observed_cost: f64,
     pub carry_cost: f64,
@@ -179,6 +184,7 @@ pub struct Trajectory {
     pending_run: Option<String>,
     previous: Option<Prompt>,
     modeled_cache: crate::proxy_cache::ModeledCache,
+    cache_initialized: bool,
     restored: i128,
     removed: u64,
     summary: u64,
@@ -220,6 +226,7 @@ impl Trajectory {
             pending_run: None,
             previous: None,
             modeled_cache: crate::proxy_cache::ModeledCache::default(),
+            cache_initialized: false,
             restored: 0,
             removed: 0,
             summary: 0,
@@ -451,11 +458,38 @@ impl Trajectory {
 
                     // The local adapter owns projection compatibility; the same
                     // write owner as live receipts owns deadlines and extents.
-                    // Native hits never seed this hypothetical branch.
+                    // Initial identical prompts can inherit receipt coverage;
+                    // subsequent divergent hits never seed this branch.
                     if !compatible || !(append || self.carry_edited) || self.pi_edited {
                         self.modeled_cache.clear();
                     }
                     let minimum = self.cache_minimum_for(&prompt.model);
+                    if !self.cache_initialized
+                        && !self.pi_edited
+                        && prompt.cache_mode == ScenarioCacheMode::Implicit
+                        && let (Some(at), Some(lifetime)) = (
+                            prompt.request_at_ms,
+                            prompt.cache_lifetime_ms.filter(|ttl| *ttl > 0),
+                        )
+                    {
+                        // This adapter uses local quantities. Native coverage
+                        // is comparable only when the receipt agrees with that
+                        // input basis; otherwise keep the ideal baseline explicit.
+                        let observed = (self.primary_history.is_identical()
+                            && usage.input_tokens == prompt.input)
+                            .then_some(usage.cached_input_tokens);
+                        let inherited = self
+                            .result
+                            .cache_initializations
+                            .prefix(pi_input, minimum, observed);
+                        self.modeled_cache.inherit(
+                            prompt.cache_scope.clone(),
+                            at,
+                            lifetime,
+                            inherited,
+                        );
+                    }
+                    self.cache_initialized = true;
                     let pi_cached = if prompt.cache_mode == ScenarioCacheMode::Implicit {
                         prompt.request_at_ms.map_or(Some(0), |at| {
                             self.modeled_cache
@@ -643,11 +677,12 @@ fn valid_usage(value: &Value) -> Option<Usage> {
     value["output_tokens"].as_u64()?;
     serde_json::from_value(value.clone()).ok()
 }
+pub(crate) use crate::prompt_quantity::{local_text_tokens, prompt_has_opaque};
+
 pub(crate) fn token_units(value: &Value) -> u64 {
-    // Rendered JSON is a local text estimate, not provider or multimodal tokenization.
-    tiktoken_rs::o200k_base_singleton()
-        .encode_ordinary(&value.to_string())
-        .len() as u64
+    // Visible local quantity only. Native payloads retain identity but never
+    // acquire a fictitious size from encoded transport bytes.
+    local_text_tokens(value)
 }
 
 /// Authoritative fixed prompt representation for local quantities and history
@@ -662,8 +697,13 @@ fn semantic_prompt(body: &Value) -> Option<Value> {
     Some(json!({"overhead":prompt_overhead(body),"input":input}))
 }
 
-/// Count-only consumers do not need history/cache prefix strings.
+/// Pure projection shorthand for tests; live request quantities belong to
+/// InputMeasurements so native receipts and section memoization are shared.
+#[cfg(test)]
 pub(crate) fn prompt_input_tokens(body: &Value) -> Option<u64> {
+    if prompt_has_opaque(body) {
+        return None;
+    }
     Some(token_units(&semantic_prompt(body)?))
 }
 
@@ -905,8 +945,10 @@ mod tests {
             // selects a tier from local quantities. Neither reprices the other.
             let zero = replay(0_u64);
             let frozen = replay(FROZEN_OUTPUT);
+            // An unobserved inherited prefix starts ideally warm; the tier
+            // test still prices each branch's frozen output independently.
             let input_cost =
-                |input: u64| input as f64 * if input > 272_000 { 5.0 } else { 2.5 } / 1_000_000.0;
+                |input: u64| input as f64 * if input > 272_000 { 0.2 } else { 0.1 } / 1_000_000.0;
             let output_cost = |input: u64| if input > 272_000 { 0.15 } else { 0.10 };
             let carry_output = 0.10;
             let pi_output = output_cost(pi_input);

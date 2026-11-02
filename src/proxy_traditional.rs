@@ -11,6 +11,7 @@ enum QuantityBasis {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 enum ProjectionBasis {
     SignedLocalPromptRestorationV1,
+    ReceiptBlocksOrVisibleTextV2,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -37,7 +38,7 @@ impl HistoryContract {
         Self {
             version: 1,
             quantity: QuantityBasis::ProviderRequestInputTotalV1,
-            projection: ProjectionBasis::SignedLocalPromptRestorationV1,
+            projection: ProjectionBasis::ReceiptBlocksOrVisibleTextV2,
             model: body["model"].as_str().unwrap_or("").into(),
             resolved_model: resolved.map(|r| r.model.clone()),
             source_sha256: format!("{:x}", Sha256::digest(route.as_bytes())),
@@ -124,6 +125,10 @@ impl TraditionalHistoryState {
 
     pub(super) fn diverge(&mut self) {
         self.shared_primary_history.diverge();
+    }
+
+    pub(super) fn is_identical(&self) -> bool {
+        self.shared_primary_history.is_identical()
     }
 
     pub(super) fn compatible(

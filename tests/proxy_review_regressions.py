@@ -214,11 +214,33 @@ class ReviewRegressions(unittest.TestCase):
                 "removable": [4] if releasing else [],
                 "memories": [{"source_ids": [4], "text": fact}] if releasing else []})
 
-        fixture = self.fixture(review)
-        options = ["--classifier-cache-policy", "disabled"]
+        def native_input(body):
+            text = wire(body["input"])
+            return (2000 + 10000 * (b"SUPERSEDED_REASONING" in text)
+                    + 50 * (b"finish verification" in text)
+                    + 100 * (b"VERIFIED_SUCCESSOR" in text)
+                    + 50 * (b"Quoted historical context data" in text))
+
+        def primary(body, n):
+            response = completed(response_id=f"r{n}")
+            response["usage"]["input_tokens"] = native_input(body)
+            return 200, response
+
+        fixture = self.fixture(review, primary)
+        # Native receipts put the full source above this policy target and its
+        # measured whole-cohort replacement below it. This isolates atomic
+        # advice authority without inventing a price for opaque reviewer edits.
+        options = ["--classifier-cache-policy", "disabled",
+                   "--primary-context-tokens", "6000", "--primary-output-reserve-tokens", "1"]
+        proxy = self.harness.proxy(fixture, options + ["--review-every-requests", "100"])
+        # Two genuine provider receipts attribute the complete opaque cohort,
+        # not ciphertext length or a manufactured per-item token allocation.
+        self.assertEqual(proxy.send(history[:3])[0], 200)
+        self.assertEqual(proxy.send(history[:6])[0], 200)
+        self.assertEqual(len(fixture.reviews), 0)
+        proxy.close()
         proxy = self.harness.proxy(fixture, options)
-        for _ in range(2):
-            self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(proxy.send(history)[0], 200)
         protected = proxy.advice()
         self.assertEqual(protected["opinions"].get("2"), "keep")
         for member in (4, 5, 6):
@@ -256,11 +278,13 @@ class ReviewRegressions(unittest.TestCase):
         self.assertEqual([item["value"] for item in saved["history"]], history,
                          "original history is immutable even when the primary omits a source")
         self.assertTrue(all("removed" not in item for item in saved["history"]))
-        self.assertEqual(len(fixture.primaries), 5)
+        self.assertEqual(len(fixture.primaries), 6)
         self.assertEqual(len(fixture.reviews), 4)
-        for role, count in (("primary", 5), ("shadow", 4)):
+        for role, count in (("primary", 6), ("shadow", 4)):
             self.assertEqual(saved[role]["calls"], count)
-            self.assertEqual(saved[role]["input_tokens"], 100 * count)
+            expected_input = (sum(native_input(body) for body in fixture.primaries)
+                              if role == "primary" else 100 * count)
+            self.assertEqual(saved[role]["input_tokens"], expected_input)
             self.assertEqual(saved[role]["output_tokens"], count)
         if release:
             quoted = [(i, json.loads(item["content"].split(": ", 1)[1]))
@@ -469,7 +493,13 @@ class ReviewRegressions(unittest.TestCase):
     def test_selected_source_removal_does_not_starve_due_review(self):
         def review(_body, _n):
             return 200, advice_response({"protected": [1], "removable": [2], "memories": []})
-        fixture = self.fixture(review)
+        def primary(body, n):
+            response = completed(response_id=f"r{n}")
+            response["usage"]["input_tokens"] = (6000 if b"UNIQUE_LIVE_SOURCE" in wire(body["input"])
+                                                  else 1000)
+            return 200, response
+
+        fixture = self.fixture(review, primary)
         proxy = self.harness.proxy(fixture, ["--payoff-requests", "1"])
         history = self.seed()
         history[1]["content"] *= 500
@@ -556,11 +586,17 @@ class ReviewRegressions(unittest.TestCase):
             self.assertEqual(body["stream"], True)
             self.assertEqual(body["store"], False)
         self.assertEqual(status, expected,
-                         "SURFACE-L2: use client reserve for planning before Codex strips cap")
-        self.assertEqual(len(fixture.primaries), int(expected == 200))
+                         "provider decides admission even when the planned output reserve is oversized")
+        self.assertEqual(len(fixture.primaries), 1)
+        planned = proxy.saved()["last_plan"]
+        self.assertEqual(planned["primary_output_reserve_tokens"],
+                         fallback if declared is None else declared,
+                         "planning still honors the client reserve before Codex strips the cap")
+        self.assertEqual(planned["primary_fits"],
+                         (fallback if declared is None else declared) < 2000)
 
     def test_surface_l2_above_fallback_reserve_blocks_before_codex_wire(self):
-        self.output_reserve(3000, 512, 413)
+        self.output_reserve(3000, 512, 200)
 
     def test_surface_l2_below_fallback_reserve_fits_codex_wire(self):
         self.output_reserve(512, 3000, 200)
@@ -569,7 +605,7 @@ class ReviewRegressions(unittest.TestCase):
         self.output_reserve(None, 512, 200)
 
     def test_surface_l2_absent_cap_uses_oversized_fallback_control(self):
-        self.output_reserve(None, 3000, 413)
+        self.output_reserve(None, 3000, 200)
 
     def unknown_capacity(self, known=False, forced=True):
         fixture = self.fixture()
@@ -585,17 +621,22 @@ class ReviewRegressions(unittest.TestCase):
         saved = proxy.saved()
         self.evidence.update(status=status, saved=saved, reviews=fixture.reviews,
                              primaries=fixture.primaries)
-        blocked = known and forced
-        self.assertEqual(status, 413 if blocked else 200)
-        self.assertEqual(len(fixture.primaries), 1 if blocked else 2)
+        self.assertEqual(status, 200, "estimated capacity must not block either known or unknown models")
+        self.assertEqual(len(fixture.primaries), 2)
+        self.assertEqual(fixture.primaries[-1]["input"], history,
+                         "no estimate grants authority to remove protected input")
         if not known:
             self.assertEqual(fixture.primaries[-1]["input"], history,
                              "unknown models bypass Carry context admission unchanged")
             self.assertEqual(saved["primary"]["unavailable_cost_calls"], 2)
-        expected_reviews = int(known and not forced)
+        expected_reviews = int(known)
         self.assertEqual(len(fixture.reviews), expected_reviews,
-                         "no capacity rescue review; unknown prices never authorize paid review")
+                         "forwarding may schedule ordinary due review; unknown prices never authorize paid review")
         self.assertEqual(saved["shadow"]["calls"], expected_reviews)
+        events = [json.loads(line) for path in (proxy.state / "diagnostics").glob("*.jsonl")
+                  for line in path.read_text().splitlines()]
+        self.assertFalse(any(event["event"] == "exceptional_review" for event in events),
+                         "protected overflow cannot authorize a blocking rescue review")
 
     def test_transport_sug06_forced_unknown_primary_never_spends_review(self):
         self.unknown_capacity()

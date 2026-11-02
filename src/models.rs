@@ -584,6 +584,21 @@ impl ResolvedModel {
         self
     }
 
+    /// Prospective comparison uses the destination's cache-population semantics.
+    /// Codex credits have no separate cache-write charge; values remain model
+    /// API-equivalent USD valuations, not subscription invoices. Frozen receipt
+    /// pricing continues to use `rates_for_input` and its reported partitions.
+    pub fn forecast_rates_for_input(&self, input: f64) -> Option<Rates> {
+        let mut rates = self.rates_for_input(input)?;
+        if matches!(
+            self.route.class,
+            RouteClass::CodexSubscription | RouteClass::SyntheticSubscription
+        ) {
+            rates.write = rates.input;
+        }
+        Some(rates)
+    }
+
     pub fn rates_for_input(&self, input: f64) -> Option<Rates> {
         let mut rates = self.rates?;
         if self

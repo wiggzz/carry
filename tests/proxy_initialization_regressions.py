@@ -405,7 +405,8 @@ class InitializationRegressions(unittest.TestCase):
         with self.subTest(boundary="failed attempt never duplicates initialization or money"):
             self.assertEqual(retried["summary_cost"], 0.0)
             self.assertAlmostEqual(retried["traditional_cost"] - continued["traditional_cost"],
-                                   21200 * 2.5 / 1e6, places=12)
+                                   (21100 * 0.1 + 100 * 2.5) / 1e6, places=12,
+                                   msg="failed request preserves the preceding valid cached prefix")
         with self.subTest(boundary="later in-window summary is still charged"):
             self.assertGreater(later["summary_cost"], 0.0)
             self.assertEqual(later["traditional_compactions"], 1,
@@ -463,14 +464,14 @@ class InitializationRegressions(unittest.TestCase):
         self.assertIsNone(failed["receipts"]["anchor"])
         self.assertTrue(first["receipts"]["modeled_cache"]["writes"],
                         "successful initialized history established a modeled write")
-        self.assertEqual(failed["receipts"]["modeled_cache"]["writes"], [],
-                         "failed primary invalidates hypothetical cache, not history")
+        self.assertEqual(failed["receipts"]["modeled_cache"], first["receipts"]["modeled_cache"],
+                         "failed primary neither evicts nor renews existing hypothetical cache coverage")
         self.assertEqual(failed["history_continuity"], first["history_continuity"])
         self.assertEqual(restarted, failed, "restart preserves the failed-attempt boundary")
         self.assertEqual(retry["result"]["initial_compactions"], 1,
-                         "cache-only invalidation cannot repeat free initialization")
+                         "a failed request cannot repeat free initialization")
         self.assertAlmostEqual(retry["result"]["traditional_cost"] - first["result"]["traditional_cost"],
-                               21100 * 2.5 / 1e6, places=12)
+                               (21000 * 0.1 + 100 * 2.5) / 1e6, places=12)
         self.assertEqual(changed["result"]["initial_compactions"], 2,
                          "genuinely unrecognized changed settings require a new prospective assumption")
         self.assertAlmostEqual(changed["result"]["traditional_cost"] - retry["result"]["traditional_cost"],

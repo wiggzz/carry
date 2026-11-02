@@ -603,10 +603,13 @@ class TransparentHistory(unittest.TestCase):
                     "--primary-output-reserve-tokens","1","--context-margin-percent","0",
                     "--classifier-timeout-secs","1"])
                 started = time.monotonic()
-                self.assertEqual(proxy.send(history)[0], 413)
+                self.assertEqual(proxy.send(history)[0], 200,
+                                 "unhelpful review cannot turn a size estimate into primary rejection")
                 self.assertLess(time.monotonic() - started, 4, "one bounded exceptional attempt including planning/persistence")
                 self.assertEqual(len(fixture.reviews), 1)
-                self.assertEqual(len(fixture.primaries), 1, "no unqualified source removal or overflowing primary")
+                self.assertEqual(len(fixture.primaries), 2)
+                self.assertEqual(fixture.primaries[-1]["input"], history,
+                                 "failed or unhelpful review grants no source-removal authority")
                 saved = json.loads(proxy.checkpoint(history)[0].read_text())
                 self.assertEqual(saved["shadow"]["calls"], 1)
                 self.assertEqual(saved["shadow"]["unavailable_cost_calls"], int(outcome != "no_help"))
@@ -1568,8 +1571,11 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(history + [{"role": "user", "content": "FITTING_CHILD"}])[0], 200)
         self.assertNotIn("RAW_A", json.dumps(fixture.primaries[-1]["input"]))
         counts = (len(fixture.primaries), len(fixture.reviews))
-        self.assertEqual(proxy.send(history + [{"role": "user", "content": "PROTECTED_SUFFIX " * 10000}])[0], 413)
-        self.assertEqual((len(fixture.primaries), len(fixture.reviews)), counts)
+        oversized = history + [{"role": "user", "content": "PROTECTED_SUFFIX " * 10000}]
+        self.assertEqual(proxy.send(oversized)[0], 200,
+                         "even an oversized protected suffix must reach the provider")
+        self.assertEqual((len(fixture.primaries), len(fixture.reviews)), (counts[0] + 1, counts[1]))
+        self.assertEqual(fixture.primaries[-1]["input"][-1], oversized[-1])
         fresh = [{"role": "user", "content": "FRESH_NO_ADVICE"}]
         self.assertEqual(proxy.send(fresh)[0], 200)
         self.assertEqual(fixture.primaries[-1]["input"], fresh)

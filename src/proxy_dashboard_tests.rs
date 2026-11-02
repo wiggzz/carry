@@ -124,8 +124,11 @@ fn dashboard_counts_reuse_equivalent_prompts_without_repricing_receipts() {
         crate::savings::prompt_input_tokens(&changed)
     );
     assert_eq!(equivalent.0.len(), 2);
+    crate::prompt_quantity::reset_token_work();
     let dispatched = dispatch_measurement("request", "primary", &base);
-    assert_eq!(dispatched.outgoing_input_tokens, before);
+    assert_eq!(dispatched.outgoing_input_tokens, None,
+        "constructing telemetry must not eagerly count a prompt");
+    assert_eq!(crate::prompt_quantity::token_work(), (0, 0));
     assert_eq!(
         dispatched.receipt_input_tokens, None,
         "an estimate is never a provider receipt"

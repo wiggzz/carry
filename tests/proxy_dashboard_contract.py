@@ -25,6 +25,27 @@ class ImplicitProxy(Proxy):
 
 
 class DashboardDispatchContract(unittest.TestCase):
+    def test_pass_through_dispatch_does_not_count_input_only_for_dashboard(self):
+        with contextlib.ExitStack() as stack:
+            root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            fixture = Fixture(lambda body, n: (200, completed()),
+                              lambda *_: self.fail("off mode must not dispatch a reviewer"))
+            stack.callback(fixture.close)
+            proxy = Proxy(root, fixture, mode="off", wait_reviews=False)
+            stack.callback(proxy.close)
+            source = [{"role": "user", "content": "Forward this unmeasured text unchanged."}]
+            self.assertEqual(proxy.send(source)[0], 200)
+            row = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
+            dispatch = row["last_primary_dispatch"]
+            for field in ("caller_input_tokens", "canonical_input_tokens",
+                          "continuation_input_tokens", "outgoing_input_tokens"):
+                self.assertIsNone(dispatch[field], field)
+            self.assertEqual(dispatch["receipt_input_tokens"], 100)
+            self.assertEqual(dispatch["receipt_output_tokens"], 1)
+            self.assertEqual(row["primary"]["input_tokens"], 100)
+            self.assertEqual(fixture.primaries[0]["input"], source)
+            self.assertEqual(fixture.errors, [])
+
     def test_dashboard_checkpoint_versions_and_snapshot_memories_are_not_advice(self):
         for shared in (False, True):
             with self.subTest(shared=shared), contextlib.ExitStack() as stack:
@@ -214,7 +235,7 @@ class DashboardDispatchContract(unittest.TestCase):
             self.assertEqual(headers["cache-control"], "no-store")
             self.assertEqual(fixture.errors, [])
 
-    def test_response_id_caller_measurement_excludes_restored_ancestors(self):
+    def test_response_id_dispatch_does_not_invent_a_caller_only_quantity(self):
         with contextlib.ExitStack() as stack:
             root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
             fixture = Fixture(lambda body, n: (200, completed(response_id=f"resp_caller_{n}")), lambda body, n: (200, advice_response({"protected": [], "removable": [], "memories": []})))
@@ -228,10 +249,17 @@ class DashboardDispatchContract(unittest.TestCase):
             status, response = proxy.send([{"role": "user", "content": "Continue."}], previous_response_id=response["id"])
             self.assertEqual(status, 200, response)
             row = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["last_primary_dispatch"]
-            self.assertGreater(row["caller_input_tokens"], 0)
-            self.assertLess(row["caller_input_tokens"], first["caller_input_tokens"])
-            self.assertGreaterEqual(row["canonical_input_tokens"], first["canonical_input_tokens"])
-            self.assertLess(row["caller_input_tokens"], row["canonical_input_tokens"])
+            self.assertGreater(first["caller_input_tokens"], 0)
+            # Only the expanded prompt was needed by the planner. Do not
+            # tokenize the caller-only fragment for telemetry or copy the
+            # expanded prompt's anchored quantity into that smaller fragment.
+            self.assertIsNone(row["caller_input_tokens"])
+            self.assertEqual(row["canonical_input_tokens"], row["outgoing_input_tokens"])
+            self.assertEqual(row["continuation_input_tokens"], row["outgoing_input_tokens"])
+            self.assertGreater(row["outgoing_input_tokens"], first["receipt_input_tokens"])
+            self.assertEqual(row["receipt_input_tokens"], 100)
+            self.assertEqual(fixture.primaries[-1]["input"], source + [
+                {"role": "user", "content": "Continue."}])
             self.assertEqual(fixture.errors, [])
 
     def test_private_dashboard_transcript_without_a_configured_bearer(self):
@@ -357,7 +385,11 @@ class DashboardDispatchContract(unittest.TestCase):
             self.assertEqual(proxy.send(source)[0], 200)
             second = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
             self.assertEqual(second["last_primary_dispatch"]["receipt_input_tokens"], 300)
-            self.assertEqual(first["last_primary_dispatch"]["outgoing_input_tokens"], second["last_primary_dispatch"]["outgoing_input_tokens"], "same body estimate must not copy changing native input")
+            # Dispatch quantities use the preceding receipt, and stay frozen
+            # when this request's different native usage arrives afterwards.
+            self.assertEqual(first["last_primary_dispatch"]["outgoing_input_tokens"], 100)
+            self.assertEqual(first["last_primary_dispatch"]["receipt_input_tokens"], 200)
+            self.assertEqual(second["last_primary_dispatch"]["outgoing_input_tokens"], 200)
             fixture.release.set()
             import time
             deadline = time.monotonic() + 10
@@ -414,7 +446,14 @@ class DashboardDispatchContract(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
             def primary(body, n):
-                return (500, {"error": "synthetic attempt failure"}) if n == 3 else (200, completed(response_id=f"resp_forced_{n}"))
+                if n == 3:
+                    return 500, {"error": "synthetic attempt failure"}
+                response = completed(response_id=f"resp_forced_{n}")
+                # The seed fits 4,096 tokens; its next ~2,400-token append
+                # requires the authorized shrink. A 100-token fixture receipt
+                # would contradict the source size and make subtraction unknown.
+                response["usage"]["input_tokens"] = 2500
+                return 200, response
             fixture = Fixture(primary, lambda body, n: (200, advice_response({"protected": [], "removable": [2], "memories": []})))
             stack.callback(fixture.close)
             proxy = Proxy(root, fixture, ["--primary-context-tokens", "4096", "--min-payback-percent", "100", "--payoff-requests", "1"])
@@ -442,7 +481,14 @@ class DashboardDispatchContract(unittest.TestCase):
             def review(body, n):
                 removable = [2] if n == 1 else ([4] if n == 2 else [])
                 return 200, advice_response({"protected": [], "removable": removable, "memories": []})
-            fixture = Fixture(lambda body, n: (200, completed(response_id=f"resp_second_{n}")), review)
+            def primary(body, n):
+                response = completed(response_id=f"resp_second_{n}")
+                # Synthetic native metering varies with the actual projected
+                # input, leaving a positive quantity after either source drops.
+                response["usage"]["input_tokens"] = 1000 + sum(
+                    len(item.get("content", "")) // 3 for item in body["input"])
+                return 200, response
+            fixture = Fixture(primary, review)
             stack.callback(fixture.close)
             options = ["--payoff-requests", "5", "--classifier-cache-policy", "disabled"]
             proxy = Proxy(root, fixture, options)
