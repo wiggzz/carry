@@ -81,8 +81,10 @@ fn reasoning_forecast_planner_continues_after_filtered_receipt_and_restart() {
     config.payoff_requests = 1;
     config.min_payback_percent = 0;
     config.primary_context_tokens = 100_000;
-    let mut session = Session::default();
-    session.model_resolution = config.model_resolution.clone();
+    let mut session = Session {
+        model_resolution: config.model_resolution.clone(),
+        ..Session::default()
+    };
     let mut input = vec![json!({"role":"user","content":"goal"})];
     for id in ["a", "b"] {
         input.extend([
