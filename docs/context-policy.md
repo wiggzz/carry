@@ -3,6 +3,8 @@
 The native Carry agent keeps one chronological context ledger. It makes a context
 rewrite an explicit, inspectable decision instead of a periodic summary. For the
 standalone proxy, see the [proxy overview](../README.md#how-the-proxy-works).
+Its [receipt-anchored reasoning forecasts](reasoning-quantity.md) are selection
+estimates, separate from native receipts and measured savings.
 
 ## Item lifecycle
 

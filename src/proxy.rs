@@ -3570,7 +3570,13 @@ fn resolved_input_costs(
         compact: horizon_cost(
             compact_first,
             ct,
-            if minimum.is_some_and(|min| ct >= min) {
+            // A forecasted quantity is not evidence of a complete future
+            // native write. Charge the upper candidate at the uncached rate;
+            // existing scoped native receipts still price the first request.
+            if compact_input.basis
+                != crate::proxy_quantity::EstimateBasis::ReceiptAnchoredReasoningForecast
+                && minimum.is_some_and(|min| ct >= min)
+            {
                 cr.cached
             } else {
                 cr.input
