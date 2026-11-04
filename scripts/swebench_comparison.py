@@ -85,6 +85,8 @@ def preflight(contract, prepared):
     if version('swebench') != '4.1.0':
         raise ValueError('official evaluator requires swebench==4.1.0')
     source = Path(prepared['source_root'])
+    if source.resolve() != Path(__file__).resolve().parents[1]:
+        raise ValueError('runtime must execute from its pinned source checkout')
     verify_checkout(source, contract['source_commit'])
     records = json.loads(Path(prepared['canonical_dataset']).read_text())
     if records != canonical_records(contract):

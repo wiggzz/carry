@@ -73,6 +73,8 @@ def preflight(contract, prepared, *, execute=subprocess.run, verify_sources=True
             raise ValueError(f'{name} differs from the paired contract')
         execute(['docker', 'image', 'inspect', prepared[name]], check=True, capture_output=True, text=True, timeout=30)
     if verify_sources:
+        if Path(prepared['source_root']).resolve() != Path(__file__).resolve().parents[1]:
+            raise ValueError('runtime must execute from its pinned source checkout')
         for key, commit in [('source_root', 'source_commit'), ('upstream_root', 'runner_commit'),
                             ('problems_root', 'dataset_commit')]:
             verify_checkout(Path(prepared[key]), contract[commit])
@@ -180,6 +182,12 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
                 clean['UV_OFFLINE'] = '1'
                 clean['UV_PYTHON_DOWNLOADS'] = 'never'
                 clean['UV_CACHE_DIR'] = '/tmp/uv-cache'
+                clean.update(HOME='/tmp/scb-home', XDG_DATA_HOME='/tmp/scb-data',
+                             UV_TOOL_DIR='/tmp/scb-tools', UV_TOOL_BIN_DIR='/tmp/scb-bin')
+                limit = prepared.get('evaluation_timeout_seconds', 300)
+                if type(limit) is not int or not 1 <= limit <= 3600:
+                    raise ValueError('evaluation_timeout_seconds must be 1..3600')
+                timeout = min(timeout or limit, limit)
                 command = 'cp -R /opt/scb-uv-cache /tmp/uv-cache && ' + command
                 merged = self.environment.get_full_env({**(kwargs.get('env_vars') or {}), **clean})
                 for key, value in merged.items():

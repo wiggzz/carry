@@ -518,6 +518,7 @@ jobs:
           SCB_FIXTURE_OUTPUT: ${{ runner.temp }}/scb-protected-synthetic
         run: .scb-upstream/.venv/bin/python -m unittest -v scripts.test_slopcodebench_runtime
       - name: Actual paired SWE native worker and official evaluator (synthetic, no model)
+        if: ${{ !cancelled() }}
         timeout-minutes: 10
         env:
           CARRY_SCB_HOSTED_FIXTURE: '1'

@@ -65,7 +65,7 @@ def install_prepared_runtime(images: dict[str, str]) -> None:
         if force_rebuild or expected is None or client.images.get(test_spec.instance_image_key).id != expected:
             raise RuntimeError('official evaluator prepared image missing or changed; builds/pulls forbidden')
         return client.containers.create(image=expected, name=test_spec.get_instance_container_name(run_id),
-            user='root', detach=True, command='tail -f /dev/null', platform=test_spec.platform,
+            user='root', detach=True, entrypoint=[], command='tail -f /dev/null', platform=test_spec.platform,
             network_mode='none', cap_drop=['ALL'], security_opt=['no-new-privileges'],
             pids_limit=512, mem_limit='4g', nano_cpus=2_000_000_000)
     docker_build.build_container = spawn

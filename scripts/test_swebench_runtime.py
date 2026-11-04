@@ -24,6 +24,7 @@ class NativeOfficialSWEAcceptance(unittest.TestCase):
         import docker
         from swebench.harness import run_evaluation as official, docker_build
         from swebench.harness.test_spec.test_spec import TestSpec
+        from swebench.harness.constants import MAP_REPO_VERSION_TO_SPECS
         root = Path(os.environ['SCB_FIXTURE_OUTPUT'])
         scb_contract = json.loads((root/'contract.json').read_text())
         scb_prepared = json.loads((root/'prepared.json').read_text())
@@ -35,7 +36,7 @@ class NativeOfficialSWEAcceptance(unittest.TestCase):
                      ['config', 'user.name', 'synthetic'], ['add', '.'], ['commit', '-m', 'synthetic base']):
             subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True)
         base = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
-        adapter = Path(__file__).resolve().parents[1]/'containers/swebench-harness/adapter.py'
+        adapter = Path(__file__).resolve().parents[1]/'containers/swebench-harness/entrypoint.py'
         bundle = work/'bundle/bin'; bundle.mkdir(parents=True)
         shutil.copyfile(adapter, bundle/'adapter')
         (bundle/'adapter').chmod(0o755)
@@ -44,18 +45,23 @@ class NativeOfficialSWEAcceptance(unittest.TestCase):
         (bundle/'codex').write_text('''#!/usr/bin/env python3
 import http.client,json,os,socket,sys
 from pathlib import Path
+auth=Path(os.environ['HOME'])/'.codex/auth.json'
+if sys.argv[1]=='login':
+    key=sys.stdin.read(); assert not key.startswith('synthetic-provider-')
+    auth.parent.mkdir(parents=True,exist_ok=True); auth.write_text(json.dumps({'OPENAI_API_KEY':key}))
+    raise SystemExit(0)
 assert sys.argv[1]=='exec'
 assert not Path('/var/run/docker.sock').exists()
 assert not Path('/proxy-state').exists()
 assert not Path('test_owned.py').exists()
-assert not os.environ['OPENAI_API_KEY'].startswith('synthetic-provider-')
+assert 'OPENAI_API_KEY' not in os.environ
 assert not any(k in os.environ for k in ('CARRY_PROXY_UPSTREAM_KEY','AWS_SECRET_ACCESS_KEY'))
 try:
     socket.create_connection(('1.1.1.1',443),timeout=0.2).close()
 except OSError: pass
 else: raise AssertionError('external egress')
 c=http.client.HTTPConnection('openai-proxy',8080,timeout=15)
-c.request('POST','/v1/responses',json.dumps({'model':'gpt-6-luna','input':[{'role':'user','content':'synthetic SWE task'}],'stream':False}),{'Authorization':'Bearer '+os.environ['OPENAI_API_KEY'],'Content-Type':'application/json'})
+c.request('POST','/v1/responses',json.dumps({'model':'gpt-6-luna','input':[{'role':'user','content':'synthetic SWE task'}],'stream':False}),{'Authorization':'Bearer '+json.loads(auth.read_text())['OPENAI_API_KEY'],'Content-Type':'application/json'})
 r=c.getresponse(); data=r.read(); assert r.status==200,(r.status,data)
 Path('main.py').write_text('print(1)\\n')
 print(json.dumps({'type':'turn.completed','usage':{'input_tokens':30,'cached_input_tokens':0,'output_tokens':3}}))
@@ -68,10 +74,12 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':30,'cached_inp
         (context/'Dockerfile').write_text(f'''FROM {parent}
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 COPY repo /testbed
+ENV PATH=/opt/swebench-harness/bin:$PATH
 WORKDIR /testbed
 ENTRYPOINT ["python3", "/opt/swebench-harness/bin/adapter"]
 ''')
-        spec = TestSpec(instance_id='owned__synthetic-1', repo='pytest-dev/pytest', version='synthetic',
+        spec = TestSpec(instance_id='owned__synthetic-1', repo='pytest-dev/pytest',
+            version=next(iter(MAP_REPO_VERSION_TO_SPECS['pytest-dev/pytest'])),
             repo_script_list=[], env_script_list=[], arch='x86_64', FAIL_TO_PASS=['test_owned'], PASS_TO_PASS=[],
             language='py', docker_specs={}, namespace='owned-synthetic', eval_script_list=[
                 'cd /testbed', "echo '>>>>> Start Test Output'",
@@ -81,7 +89,7 @@ ENTRYPOINT ["python3", "/opt/swebench-harness/bin/adapter"]
         image = subprocess.check_output(['docker', 'image', 'inspect', '--format', '{{.Id}}', spec.instance_image_key], text=True).strip()
         dataset = work/'dataset.json'
         dataset.write_text(json.dumps([{'instance_id': spec.instance_id, 'repo': spec.repo,
-            'version': 'synthetic', 'base_commit': base, 'problem_statement': 'synthetic: make main.py print 1',
+            'version': spec.version, 'base_commit': base, 'problem_statement': 'synthetic: make main.py print 1',
             'test_patch': 'withheld owned test', 'patch': 'withheld owned gold'}]))
         contract = copy.deepcopy(scb_contract)
         contract.update(benchmark='swebench', runner_commit=contract['source_commit'],
