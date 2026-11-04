@@ -541,6 +541,9 @@ jobs:
             ${{ runner.temp }}/scb-protected-synthetic/contract.json
             ${{ runner.temp }}/scb-protected-synthetic/prepared.json
             ${{ runner.temp }}/scb-protected-synthetic/readiness
+            ${{ runner.temp }}/scb-protected-synthetic/readiness-policy-rejection.json
+            ${{ runner.temp }}/scb-protected-synthetic/late-reviewer
+            ${{ runner.temp }}/scb-protected-synthetic/late-reviewer-final
             ${{ runner.temp }}/scb-protected-synthetic/paired
             ${{ runner.temp }}/scb-protected-synthetic/provider-synthetic.log
             ${{ runner.temp }}/scb-protected-synthetic/swe-native

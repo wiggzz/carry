@@ -90,15 +90,26 @@ class OfficialProtectedRuntimeTests(unittest.TestCase):
         runtime.prepare_readiness(self.contract, self.prepared)
         changed = copy.deepcopy(self.contract)
         changed['settings']['scb_pass_policy'] = 'all-cases'
-        with self.assertRaisesRegex(ValueError, 'readiness'):
+        with self.assertRaisesRegex(ValueError, 'readiness') as rejected:
             runtime.preflight(changed, self.prepared, verify_sources=False)
+        (self.root/'readiness-policy-rejection.json').write_text(json.dumps({
+            'evidence_kind': 'synthetic-fixture', 'performance_qualifier': 'rewrite-unproven',
+            'source_commit': self.contract['source_commit'], 'prepared_policy': self.contract['settings']['scb_pass_policy'],
+            'requested_policy': changed['settings']['scb_pass_policy'], 'error': str(rejected.exception)}, indent=2))
 
     def test_late_owned_reviewer_completion_reconciles_to_first_checkpoint(self):
+        self.check_late_reviewer(1, 'late-reviewer')
+
+    def test_final_capture_reconciles_owned_reviewer_completion_to_first_checkpoint(self):
+        self.check_late_reviewer(2, 'late-reviewer-final')
+
+    def check_late_reviewer(self, release_after, directory):
         contract, prepared = copy.deepcopy(self.contract), self.prepared
         contract['proxy']['CARRY_PROXY_CLASSIFIER_MODEL'] = 'gpt-6.1-sol'
         slot = next(s for s in comparison.build_plan(contract)['slots'] if s['name'] == 'compact')
         original_capture = runtime.proxy_benchmark.capture_evidence
         captures, child = [], None
+        destination = self.root/directory
         def capture(network):
             nonlocal child
             if not captures:
@@ -119,7 +130,7 @@ class OfficialProtectedRuntimeTests(unittest.TestCase):
                         break
                     self.assertLess(time.monotonic(), deadline, 'owned shadow start not observed')
                     time.sleep(.05)
-            else:
+            elif len(captures) >= release_after:
                 release = """fetch('https://api.openai.com/fixture/release-reviewer', {
                   headers:{authorization:'Bearer '+process.env.BENCHMARK_CLASSIFIER_KEY}})
                   .then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1));"""
@@ -128,11 +139,18 @@ class OfficialProtectedRuntimeTests(unittest.TestCase):
                 self.assertEqual(child.returncode, 0, stderr)
                 self.assertEqual(json.loads(stdout)['usage']['input_tokens'], 30)
                 summary = original_capture(network)
-            captures.append(summary)
+            else:
+                summary = original_capture(network)
+            captures.append({'summary': summary, 'events': [json.loads(line) for line in
+                (Path(network['state_dir'])/'benchmark-events.jsonl').read_text().splitlines()]})
+            (destination/'capture-snapshots.json').write_text(json.dumps({
+                'evidence_kind': 'synthetic-fixture', 'performance_qualifier': 'rewrite-unproven',
+                'source_commit': contract['source_commit'], 'release_after': release_after,
+                'captures': captures}, indent=2))
             return summary
         try:
             with fixture.FixtureNetwork(self.provider), patch.object(runtime.proxy_benchmark, 'capture_evidence', side_effect=capture):
-                rows = runtime.run_slot(contract, slot, prepared, self.root/'late-reviewer')
+                rows = runtime.run_slot(contract, slot, prepared, destination)
         finally:
             if child is not None and child.poll() is None:
                 child.kill(); child.communicate(timeout=10)
