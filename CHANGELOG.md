@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.20.0](https://github.com/wiggzz/carry/compare/v0.19.0...v0.20.0) (2026-11-04)
+
+
+### Features
+
+* **proxy:** record content-free monotonic request phase timings ([1b3218e](https://github.com/wiggzz/carry/commit/1b3218e96fc002e436d6d5a6eec62e6f03a03202))
+* **proxy:** revisit old protected context during existing reviews ([d9d3c74](https://github.com/wiggzz/carry/commit/d9d3c743533f22ed5dd1782e0a3e4b3ea28c2b74))
+* **proxy:** rotate old-context reminders in ordinary reviews ([bf358eb](https://github.com/wiggzz/carry/commit/bf358ebaf48b4dcea2cc26ef131809d7da0b5834))
+* record bounded proxy phase timings ([#215](https://github.com/wiggzz/carry/issues/215)) ([d4a1828](https://github.com/wiggzz/carry/commit/d4a1828082cf73dfc78af0fa92872a1b90cb40fa))
+
+
+### Bug Fixes
+
+* **proxy:** defer phase diagnostics and adopt effective timing context ([c3c50f6](https://github.com/wiggzz/carry/commit/c3c50f682b6f092b946f6007d2998291546b0d08))
+* **proxy:** retain censoring before dispatch and document timing boundaries ([0bc5fd6](https://github.com/wiggzz/carry/commit/0bc5fd6485533ca361ef3e398b5b78b99bfd6910))
+* **proxy:** retain legacy journal directory reader boundary ([7a9a6d8](https://github.com/wiggzz/carry/commit/7a9a6d861baa8f76e06373eb2deab37a389cddac))
+
 ## [0.19.0](https://github.com/wiggzz/carry/compare/v0.18.0...v0.19.0) (2026-11-04)
 
 
