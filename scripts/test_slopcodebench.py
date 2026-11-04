@@ -1,6 +1,7 @@
 """Owned protocol fixtures for the SCB adapter. No model, Docker or dataset calls."""
 import os
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -80,11 +81,18 @@ class SlopCodeBenchCommandTest(unittest.TestCase):
             # older two-string convenience method (which rejects ANY_CASE).
             config['settings']['scb_pass_policy'] = 'any-case'
             path.write_text(json.dumps(config))
+            new_plan = json.loads(subprocess.run([sys.executable, str(COMMAND), '--contract', str(path)],
+                capture_output=True, text=True, check=True).stdout)
+            # Policy belongs to contract identity, so copy this owned fixture
+            # into the new contract's independent namespaces before inspecting.
+            for before, after in zip(plan['slots'], new_plan['slots']):
+                shutil.copytree(root/'scores'/before['namespace'], root/'scores'/after['namespace'])
             any_case = subprocess.run(argv, capture_output=True, text=True, timeout=10)
             self.assertEqual(any_case.returncode, 0, any_case.stderr)
             self.assertEqual([r['resolved'] for r in json.loads(any_case.stdout)['checkpoints']],
                              [True, False, True, False])
             # Missing official outcomes remain visible, not silently dropped.
+            cp = root/'scores'/new_plan['slots'][-1]['namespace']/new_plan['slots'][-1]['task_id']/'checkpoint_2'
             (cp / 'evaluation.json').unlink()
             again = subprocess.run(argv, capture_output=True, text=True, timeout=10)
             self.assertEqual(again.returncode, 0, again.stderr)

@@ -511,6 +511,8 @@ jobs:
           SCB_OFFICIAL_REPORT_MODULE: ${{ github.workspace }}/.scb-upstream/src/slop_code/evaluation/report.py
         run: .scb-upstream/.venv/bin/python -B -m unittest -v scripts.test_benchmark_comparison scripts.test_slopcodebench
       - name: Actual official runner, native exec/retry, gold evaluator, containment and paired receipts
+        if: ${{ !cancelled() }}
+        timeout-minutes: 12
         env:
           CARRY_SCB_HOSTED_FIXTURE: '1'
           SCB_UPSTREAM_ROOT: ${{ github.workspace }}/.scb-upstream
