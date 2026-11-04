@@ -129,6 +129,7 @@ docker:
                     'model': 'gpt-6-luna', 'reasoning': 'low', 'auth_mode': 'api-key', 'native_config': {},
                     'timeout_seconds': 30, 'retries': 1, 'concurrency': 1, 'scb_pass_policy': 'any-case'}, 'proxy': {}}
     prepared = {'source_root': str(source), 'upstream_root': str(upstream), 'problems_root': str(root/'problems'),
+                'fixture_provider_image': provider_image,
                 'agent_image': agent, 'evaluator_image': agent, 'gateway_image': gateway, 'carry_image': agent,
                 'prompt': str(prompt), 'environment': str(environment), 'tasks': {'synthetic_evolution': {
                     'definition_sha256': runtime.tree_digest(problem), 'readiness': str(root/'readiness'/'synthetic_evolution.json')}}}

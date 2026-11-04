@@ -34,7 +34,8 @@ class PairedSWEExecutionTests(unittest.TestCase):
         self.prepared = {'canonical_dataset': str(dataset), 'source_root': str(Path(__file__).resolve().parents[1]),
                          'config': {}, 'harness_bundle': str(self.root/'bundle'), 'gateway_image': 'sha256:'+'1'*64,
                          'carry_image': 'sha256:'+'2'*64, 'evaluation_timeout_seconds': 30,
-                         'tasks': {'owned__synthetic-1': {'agent_image': {'image_id': 'sha256:'+'3'*64}}}}
+                         'tasks': {'owned__synthetic-1': {'agent_image': {'image_id': 'sha256:'+'3'*64},
+                             'source_task_image': 'owned-synthetic:prepared', 'evaluator_image': {'image_id': 'sha256:'+'4'*64}}}}
 
     def execute(self, *, evaluator_failure=False, receipt_missing=False):
         launches = []

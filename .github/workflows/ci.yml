@@ -517,7 +517,17 @@ jobs:
           SCB_CARRY_BINARY: ${{ github.workspace }}/.scb-carry/carry
           SCB_FIXTURE_OUTPUT: ${{ runner.temp }}/scb-protected-synthetic
         run: .scb-upstream/.venv/bin/python -m unittest -v scripts.test_slopcodebench_runtime
-      - name: Preserve source-bound synthetic runtime evidence even on failure
+      - name: Actual paired SWE native worker and official evaluator (synthetic, no model)
+        timeout-minutes: 10
+        env:
+          CARRY_SCB_HOSTED_FIXTURE: '1'
+          SCB_FIXTURE_OUTPUT: ${{ runner.temp }}/scb-protected-synthetic
+        run: |
+          python -m venv "$RUNNER_TEMP/swe-paired-contract"
+          "$RUNNER_TEMP/swe-paired-contract/bin/python" -m pip install 'swebench==4.1.0'
+          "$RUNNER_TEMP/swe-paired-contract/bin/python" -B -m unittest -v scripts.test_swebench_runtime
+
+      - name: Upload source-bound synthetic runtime evidence even on failure
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
@@ -528,6 +538,7 @@ jobs:
             ${{ runner.temp }}/scb-protected-synthetic/readiness
             ${{ runner.temp }}/scb-protected-synthetic/paired
             ${{ runner.temp }}/scb-protected-synthetic/provider-synthetic.log
+            ${{ runner.temp }}/scb-protected-synthetic/swe-native
           if-no-files-found: warn
           retention-days: 7
 

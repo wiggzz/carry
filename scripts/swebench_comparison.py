@@ -137,6 +137,7 @@ def run_slot(contract, slot, prepared, output):
     task = prepared['tasks'][slot['task_id']]
     swe.materialize(records=records, selected_ids=[slot['task_id']], root=output/'work', harnesses=('codex',))
     root = output/'work/tasks'/slot['task_id']
+    materialization_seconds = time.monotonic()-started
     agent_output = output/'agent'; agent_output.mkdir()
     values = {**prepared['config'], **contract.get('proxy', {}), 'CARRY_PROXY_MODE': slot['proxy_mode'],
               'BENCHMARK_HARNESS': 'codex', 'BENCHMARK_TRUSTED_DIRECT': '1' if slot['proxy_mode'] == 'disabled' else '0'}
@@ -152,7 +153,7 @@ def run_slot(contract, slot, prepared, output):
            'checkpoint': 'final', 'task_id': slot['task_id'], 'arm': slot['name'],
            'status': 'evaluation-error', 'resolved': None, 'quality': {},
            'events': [], 'agent_seconds': record.get('agent_seconds'),
-           'setup_seconds': agent_done-started-(record.get('agent_seconds') or 0),
+           'setup_seconds': materialization_seconds+record['setup_seconds'] if record.get('setup_seconds') is not None else None,
            'selected_rewrites': None, 'committed_rewrites': None,
            'dispatched_rewrites': record.get('proxy_summary', {}).get('dispatched_rewrites'), 'native_compactions': None}
     event_path = output/'agent-proxy-state/benchmark-events.jsonl'
@@ -169,6 +170,7 @@ def run_slot(contract, slot, prepared, output):
     # No provider credential reaches the official evaluator, even via an ambient
     # secret-file path. Native spend is retained before grading failure.
     evaluator_env = {k: v for k, v in os.environ.items() if not k.startswith(('OPENAI_', 'CARRY_PROXY_'))}
+    evaluator_env['CARRY_SWEBENCH_PREPARED_IMAGES'] = json.dumps({task['source_task_image']: task['evaluator_image']['image_id']})
     try:
         swe.run_official_evaluation(predictions=predictions, canonical_dataset=output/'work/canonical-dataset.json',
             instance_ids=[slot['task_id']], run_id='paired-'+slot['namespace'][:24], output=official,

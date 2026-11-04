@@ -172,7 +172,7 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
                 kwargs = {k: v for k, v in self.kwargs.items()
                           if k in {'mounts', 'static_assets', 'env_vars', 'is_evaluation'}}
                 mounts = dict(kwargs.get('mounts') or {})
-                kwargs.update(mounts=mounts, disable_setup=True, image=image)
+                kwargs.update(mounts=mounts, disable_setup=True, image=image, ports={}, setup_command=None)
                 builder = DockerExecRuntime(spec=self.environment, working_dir=self.working_dir,
                                             command=command, **kwargs)
                 builder._network_mode = 'none'
