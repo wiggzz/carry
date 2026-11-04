@@ -16,6 +16,10 @@ static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static RAW_DROPPED: AtomicU64 = AtomicU64::new(0);
 static JOURNAL_DROPPED: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+#[path = "proxy_phase_sink_fault.rs"]
+pub(super) mod phase_sink_fault;
+
 #[path = "proxy_fingerprint.rs"]
 mod fingerprints;
 pub(super) use fingerprints::{ReviewWire, review_wire};
@@ -226,6 +230,10 @@ fn append(
             &JOURNAL_DROPPED,
         )
     };
+    #[cfg(test)]
+    if event == "phase_timing" {
+        phase_sink_fault::before_append(&service.config.state_dir);
+    }
     let result = (|| -> std::io::Result<()> {
         let _guard = LOG_LOCK
             .lock()
