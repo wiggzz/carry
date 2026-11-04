@@ -96,9 +96,23 @@ async fn old_protected_reminders_rotate_on_real_reviews_without_releasing_silent
             .unwrap();
         assert_eq!(wire, prospective);
         let ledger = reminder_ledger(&wire);
-        let reminders = ledger["reminder_group_ids"]
-            .as_array()
-            .expect("ordinary reviewer request must carry bounded old-context reminder targets");
+        // No old sources exist on initial ingestion. Reach a completed real
+        // keep before requiring reminders, so baseline RED is old-context
+        // behavior, not just a missing optional field on a fresh request.
+        let reminders = if round == 0 {
+            ledger
+                .get("reminder_group_ids")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            ledger["reminder_group_ids"]
+                .as_array()
+                .expect(
+                    "ordinary reviewer request must carry bounded old-protected reminder targets",
+                )
+                .clone()
+        };
         if round == 0 {
             assert!(reminders.is_empty());
         } else {
