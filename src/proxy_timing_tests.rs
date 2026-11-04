@@ -1,4 +1,5 @@
 // Credential-free production forward/relay fixture; no provider calls.
+include!("proxy_timing_terminal_tests.rs");
 #[tokio::test]
 async fn phase_timing_separates_local_transport_body_and_settlement_without_wire_changes() {
     let directory = tempfile::tempdir().unwrap();
@@ -87,6 +88,7 @@ async fn phase_timing_separates_local_transport_body_and_settlement_without_wire
         1,
         "one correlated terminal phase summary is missing"
     );
+    writeln!(std::io::stdout(), "SYNTHETIC_PHASE_TIMING {}", timings[0]).unwrap();
     let t = &timings[0]["data"];
     assert_eq!(timings[0]["request_id"], "timing-fixture");
     assert_eq!(t["role"], "primary");
