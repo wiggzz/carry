@@ -76,6 +76,14 @@ class SlopCodeBenchCommandTest(unittest.TestCase):
             self.assertEqual([r['resolved'] for r in scored['checkpoints']], [True, False, True, False])
             self.assertEqual(scored['checkpoints'][0]['quality']['lines']['loc'], 3)
             self.assertEqual(scored['checkpoints'][0]['evaluation_seconds'], 2.5)
+            # Use the official runner's PassPolicy.check, not the report's
+            # older two-string convenience method (which rejects ANY_CASE).
+            config['settings']['scb_pass_policy'] = 'any-case'
+            path.write_text(json.dumps(config))
+            any_case = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+            self.assertEqual(any_case.returncode, 0, any_case.stderr)
+            self.assertEqual([r['resolved'] for r in json.loads(any_case.stdout)['checkpoints']],
+                             [True, False, True, False])
             # Missing official outcomes remain visible, not silently dropped.
             (cp / 'evaluation.json').unlink()
             again = subprocess.run(argv, capture_output=True, text=True, timeout=10)

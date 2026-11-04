@@ -152,7 +152,9 @@ class FixtureNetwork:
 
     def __enter__(self):
         env = {**os.environ, 'FIXTURE_EXPECTED_KEY': self.secret}
-        command(['docker', 'run', '--detach', '--name', self.name, '--network=none', '--read-only',
+        self.base_network = 'scb-fixture-provider-base-'+uuid.uuid4().hex
+        command(['docker', 'network', 'create', '--internal', self.base_network], capture_output=True)
+        command(['docker', 'run', '--detach', '--name', self.name, '--network', self.base_network, '--read-only',
                  '--cap-drop=ALL', '--security-opt=no-new-privileges', '--env', 'FIXTURE_EXPECTED_KEY',
                  '--entrypoint=python', self.image, '/opt/provider.py'], env=env)
         def execute(args, **kwargs):
@@ -169,7 +171,10 @@ class FixtureNetwork:
         self.patch.start()
         original_stop = swebench_smoke.cleanup_agent_network
         def stop(network, **kwargs):
-            command(['docker', 'network', 'disconnect', network['egress'], self.name], capture_output=True)
+            attached = json.loads(subprocess.check_output(['docker', 'inspect', '--format',
+                '{{json .NetworkSettings.Networks}}', self.name], text=True))
+            if network['egress'] in attached:
+                command(['docker', 'network', 'disconnect', network['egress'], self.name], capture_output=True)
             return original_stop(network, **kwargs)
         self.stop_patch = patch.object(swebench_smoke, 'cleanup_agent_network', stop)
         self.stop_patch.start()
@@ -183,3 +188,4 @@ class FixtureNetwork:
             self.provider_log = subprocess.check_output(['docker', 'logs', self.name], text=True)
         finally:
             swebench_smoke.force_remove_container(self.name, exact_name=True)
+            command(['docker', 'network', 'rm', self.base_network], capture_output=True)

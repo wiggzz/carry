@@ -143,14 +143,19 @@ def run_slot(contract, slot, prepared, output):
     agent_output = output/'agent'; agent_output.mkdir()
     values = {**prepared['config'], **contract.get('proxy', {}), 'CARRY_PROXY_MODE': slot['proxy_mode'],
               'BENCHMARK_HARNESS': 'codex', 'BENCHMARK_TRUSTED_DIRECT': '1' if slot['proxy_mode'] == 'disabled' else '0'}
-    with scoped_env(values):
-        record = swe.run_isolated_agent(instance_id=slot['task_id'], harness='codex',
-            image=task['agent_image']['image_id'], repo=root/'codex/repo',
-            harness_bundle=Path(prepared['harness_bundle']), task_input=root/'input', output=agent_output,
-            model=settings['model'], reasoning=settings['reasoning'], proxy_image=prepared['gateway_image'],
-            proxy_script=Path(prepared['source_root'])/'scripts/openai_proxy.js', carry_image=prepared['carry_image'],
-            timeout_seconds=settings['timeout_seconds'])
-    agent_done = time.monotonic()
+    error = None
+    record = {}
+    try:
+        with scoped_env(values):
+            record = swe.run_isolated_agent(instance_id=slot['task_id'], harness='codex',
+                image=task['agent_image']['image_id'], repo=root/'codex/repo',
+                harness_bundle=Path(prepared['harness_bundle']), task_input=root/'input', output=agent_output,
+                model=settings['model'], reasoning=settings['reasoning'], proxy_image=prepared['gateway_image'],
+                proxy_script=Path(prepared['source_root'])/'scripts/openai_proxy.js', carry_image=prepared['carry_image'],
+                timeout_seconds=settings['timeout_seconds'])
+    except Exception as caught:
+        # Cleanup/transport failures must not discard already captured spend.
+        error = f'{type(caught).__name__}: {caught}'
     row = {'namespace': slot['namespace'], 'contract_sha256': comparison.fingerprint(contract),
            'checkpoint': 'final', 'task_id': slot['task_id'], 'arm': slot['name'],
            'status': 'evaluation-error', 'resolved': None, 'quality': {},
@@ -164,6 +169,11 @@ def run_slot(contract, slot, prepared, output):
         row['events'] = [json.loads(line) for line in event_path.read_text().splitlines()]
     else:
         row['events'] = [{'ledger_capture_incomplete': True}]
+    if error:
+        row.update(status='infrastructure-error', error=error, evaluation_seconds=None,
+                   task_wall_seconds=time.monotonic()-started)
+        (output/'record.json').write_text(json.dumps(row, indent=2)+'\n')
+        return [row]
     official = output/'official'; official.mkdir()
     predictions = official/'predictions.jsonl'
     predictions.write_text(json.dumps({'instance_id': slot['task_id'], 'model_name_or_path': 'codex',

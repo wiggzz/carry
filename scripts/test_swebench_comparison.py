@@ -37,7 +37,7 @@ class PairedSWEExecutionTests(unittest.TestCase):
                          'tasks': {'owned__synthetic-1': {'agent_image': {'image_id': 'sha256:'+'3'*64},
                              'source_task_image': 'owned-synthetic:prepared', 'evaluator_image': {'image_id': 'sha256:'+'4'*64}}}}
 
-    def execute(self, *, evaluator_failure=False, receipt_missing=False):
+    def execute(self, *, evaluator_failure=False, receipt_missing=False, cleanup_failure=False):
         launches = []
         clones = []
         original_materialize = lane.swe.materialize
@@ -52,6 +52,8 @@ class PairedSWEExecutionTests(unittest.TestCase):
             if not receipt_missing:
                 state = kwargs['output'].with_name('agent-proxy-state'); state.mkdir()
                 state.joinpath('benchmark-events.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in events()))
+            if cleanup_failure:
+                raise RuntimeError('synthetic fail-closed cleanup after native billing')
             return {'instance_id': kwargs['instance_id'], 'harness': 'codex', 'status': 'agent-completed',
                     'patch': 'SYNTHETIC GENERATED PATCH', 'agent_seconds': 0.01, 'setup_seconds': 0.01}
         def evaluate(**kwargs):
@@ -103,6 +105,39 @@ class PairedSWEExecutionTests(unittest.TestCase):
         self.assertEqual(len(launches), 1)
         self.assertFalse(report['cost_comparison_complete'])
         self.assertIsNone(report['arms']['direct']['estimated_api_usd'])
+
+    def test_cleanup_failure_retains_native_spend_and_stops_pair(self):
+        report, launches, _ = self.execute(cleanup_failure=True)
+        self.assertEqual(len(launches), 1)
+        self.assertGreater(report['arms']['direct']['estimated_api_usd'], 0)
+        self.assertFalse(report['comparison_valid'])
+        self.assertEqual(report['arms']['compact']['terminal_statuses'], {'not-run': 1})
+
+    def test_preflight_accepts_qualified_inputs_and_rejects_prompt_drift(self):
+        config = copy.deepcopy(self.config)
+        config.update(runner_commit=config['source_commit'], dataset_commit=lane.swe.DATASET_REVISION)
+        config['settings'].update(retries=0, concurrency=1, native_config={},
+            prompt_sha256=comparison.fingerprint([[r['instance_id'], lane.swe.task_prompt(r)] for r in self.records]),
+            gateway_digest=self.prepared['gateway_image'], carry_digest=self.prepared['carry_image'])
+        bundle = Path(self.prepared['harness_bundle']); (bundle/'bin').mkdir(parents=True)
+        for name in ('adapter', 'codex'):
+            (bundle/'bin'/name).write_text('synthetic')
+        prepared = copy.deepcopy(self.prepared)
+        prepared['harness_bundle_sha256'] = lane.bundle_digest(bundle)
+        prepared['config'].update(PREPARED_HARNESS_IMAGES='synthetic-manifest',
+            TASK_IMAGE_CATALOG='owned.invalid/catalog@'+config['settings']['environment_digest'])
+        def output(args, **kwargs):
+            if args[:3] == ['docker', 'image', 'inspect']:
+                return prepared['tasks']['owned__synthetic-1']['evaluator_image']['image_id']+'\n'
+            return 'codex-cli '+config['settings']['codex_version']+'\n'+config['settings']['codex_sha256']+'  codex\n'
+        with patch.object(lane, 'version', return_value='4.1.0'), patch.object(lane, 'verify_checkout'), \
+             patch.object(lane, 'canonical_records', return_value=self.records), \
+             patch.object(lane.swe, 'build_images', return_value={'codex': {'image_id': config['settings']['harness_digest']}}), \
+             patch.object(lane.subprocess, 'check_output', side_effect=output), patch.object(lane.subprocess, 'run'):
+            self.assertEqual(lane.preflight(config, prepared)['expected_records'], 2)
+            config['settings']['prompt_sha256'] = '0'*64
+            with self.assertRaisesRegex(ValueError, 'prompts differ'):
+                lane.preflight(config, prepared)
 
     def test_missing_consent_rejects_before_preflight(self):
         config = self.root/'contract.json'; config.write_text(json.dumps(self.config))

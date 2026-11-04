@@ -36,6 +36,10 @@ def plan(contract, *, include_off=False):
             or contract['runner_commit'] != lock['runner_commit']
             or contract['dataset_commit'] != lock['problems_commit']):
         raise ValueError('SCB contract must match both pinned upstream revisions')
+    if contract['settings'].get('scb_pass_policy') not in {
+            'any', 'any-case', 'all-cases', 'all-non-error-cases',
+            'core-cases', 'any-core-cases', 'all-core-cases'}:
+        raise ValueError('SCB requires an explicit pinned official pass policy')
     return {**build_plan(contract, include_off=include_off), 'upstream': lock,
             'lifecycle': LIFECYCLE,
             'readiness_requirements': ['immutable prepared agent/evaluator/gateway/Carry images',
@@ -78,7 +82,7 @@ def inspect_scores(run_plan, contract, root, module_path):
     policy = contract['settings']['scb_pass_policy']
     # Validate even when every selected checkpoint is missing.
     from_policy = sys.modules[report_type.__module__].PassPolicy
-    from_policy(policy)
+    policy = from_policy(policy)
     checkpoints = []
     for slot in run_plan['slots']:
         for checkpoint in slot['checkpoints']:
@@ -98,7 +102,7 @@ def inspect_scores(run_plan, contract, root, module_path):
                            official_total_counts=official.total_counts)
                 # Collection-only results are evaluator unknown, not failed solves.
                 if not official.infrastructure_failure and official.pytest_collected > 0 and official.tests:
-                    row.update(resolved=official.passes_policy(policy), status='evaluated')
+                    row.update(resolved=policy.check(official.pass_counts, official.total_counts), status='evaluated')
             except (OSError, ValueError, TypeError, KeyError):
                 pass  # Keep this exact denominator slot unknown, never replace it.
             quality = directory / 'quality_analysis/overall_quality.json'

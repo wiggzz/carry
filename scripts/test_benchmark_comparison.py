@@ -27,6 +27,7 @@ def contract(benchmark='swebench'):
             'gateway_digest': 'sha256:' + '8' * 64,
             'carry_digest': 'sha256:' + '9' * 64,
             'timeout_seconds': 1200, 'retries': 0, 'concurrency': 1,
+            **({'scb_pass_policy': 'core-cases'} if benchmark == 'slopcodebench' else {}),
         },
         'proxy': {},
     }

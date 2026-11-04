@@ -348,7 +348,7 @@ def prepare_readiness(contract, prepared):
                     raise ValueError(f'missing prepared gold snapshot for {task["id"]}/{checkpoint.name}')
                 report = run_checkpoint(submission_path=gold, problem=problem, checkpoint=checkpoint, env_spec=environment)
                 report.save(destination.parent/'gold-reports'/task['id']/checkpoint.name)
-                if report.infrastructure_failure or not report.pytest_collected or not report.tests or not report.passes_policy(policy):
+                if report.infrastructure_failure or not report.pytest_collected or not report.tests or not policy.check(report.pass_counts, report.total_counts):
                     raise ValueError('official gold readiness failed; no measured execution is allowed')
                 reports.append({'checkpoint': checkpoint.name, 'tests': len(report.tests), 'passed': True})
         receipt = {'schema_version': 1, 'binding': binding, 'status': 'ready', 'reports': reports,
@@ -455,7 +455,7 @@ def run_slot(contract, slot, prepared, output):
         try:
             report = CorrectnessResults.from_dir(directory)
             if not report.infrastructure_failure and report.pytest_collected > 0 and report.tests:
-                row.update(status='evaluated', resolved=report.passes_policy(policy))
+                row.update(status='evaluated', resolved=policy.check(report.pass_counts, report.total_counts))
             else:
                 row['status'] = 'evaluation-error'
         except (OSError, ValueError, KeyError):

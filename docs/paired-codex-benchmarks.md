@@ -77,7 +77,8 @@ official evaluator alias and prepared-harness export are not reimplemented.
 
 Create a JSON config with the existing worker's `TASK_IMAGE_CATALOG`,
 `TASK_IMAGE_REPOSITORY`, `PREPARED_HARNESS_IMAGES`, `PREPARED_HARNESS_IMAGE`,
-`CODEX_VERSION` and associated preparation controls. The catalog reference must
+`CODEX_VERSION`, absolute `SOURCE_ROOT`, immutable `BASE_IMAGE` (gateway),
+`CARRY_IMAGE` and associated preparation controls. The catalog reference must
 have an immutable OCI digest; `settings.environment_digest` binds that digest,
 while `harness_digest` is the resolved harness config ID. See the existing
 worker for required catalog credentials and namespaces. Do not put provider
@@ -94,12 +95,9 @@ image digest also binds the packaged native binary and dependencies.
 ```sh
 python scripts/swebench_comparison.py --contract /absolute/swe-contract.json \
   --prepare-runtime --config /absolute/worker-config.json \
-  --gateway-image 'REGISTRY/GATEWAY@sha256:ACTUAL_DIGEST' \
-  --carry-image 'REGISTRY/CARRY@sha256:ACTUAL_DIGEST' \
   --output /absolute/new-swe-preparation
 ```
 
-Replace the illustrative registry/digest tokens with actual prepared references.
 Preparation resolves/pulls qualified images and exports the harness, then
 writes `prepared.json`; it never builds missing images or dispatches Codex.
 The manifest contains `source_root`, `canonical_dataset`, `config`,

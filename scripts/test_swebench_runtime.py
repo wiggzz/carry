@@ -131,7 +131,7 @@ ENTRYPOINT ["python3", "/opt/swebench-harness/bin/adapter"]
                        '--output', str(work/'paired'), '--budget-usd', '1'])
         (work/'provider-synthetic.log').write_text(network.provider_log)
         report = json.loads((work/'paired/report.json').read_text())
-        self.assertTrue(report['comparison_valid'], report)
+        self.assertTrue(report['comparison_valid'], (work/'paired/records.jsonl').read_text())
         self.assertTrue(report['cost_comparison_complete'], report)
         self.assertEqual(report['evidence_kind'], 'synthetic-fixture')
         self.assertEqual(report['paired']['both_resolved'], 1)
