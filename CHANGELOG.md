@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.0](https://github.com/wiggzz/carry/compare/v0.18.0...v0.19.0) (2026-11-04)
+
+
+### Features
+
+* **proxy:** anchor conservative reasoning forecasts to native receipts ([#212](https://github.com/wiggzz/carry/issues/212)) ([1729931](https://github.com/wiggzz/carry/commit/17299318704f667f60132b5f1d92cb8a65466da4))
+
 ## [0.18.0](https://github.com/wiggzz/carry/compare/v0.17.1...v0.18.0) (2026-11-02)
 
 
