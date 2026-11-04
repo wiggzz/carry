@@ -461,6 +461,45 @@ impl InputMeasurements {
             })
     }
 
+    /// Economic sizing only. A compatible receipt anchors the unchanged prefix;
+    /// new native reasoning is an empirical, double-charged suffix estimate, not
+    /// an input measurement, cache extent, restoration or capacity proof.
+    pub(crate) fn forecast_estimate(
+        &self,
+        body: &Value,
+        route: &str,
+        resolved: Option<&ResolvedModel>,
+    ) -> Option<InputEstimate> {
+        if let Some(estimate) = self.estimate(body, route, resolved) {
+            return Some(estimate);
+        }
+        if self.reasoning_conflict || self.contract != contract(body, route, resolved) {
+            return None;
+        }
+        let anchor = self.anchor.as_ref()?;
+        let values = items(body)?;
+        let target = prompt(&values);
+        let from = anchor.prompt.items.as_deref()?;
+        let to = target.items.as_deref()?;
+        // No restoration, reordering, edited prefix or invented old source.
+        if to.len() <= from.len() || !same_items(from, &to[..from.len()]) {
+            return None;
+        }
+        // Preserve the existing duplicate-opaque occurrence fence.
+        changes(from, to)?;
+        let mut tokens = anchor.input;
+        for value in &values[from.len()..] {
+            let weight = self.reasoning_weight(value)?;
+            let estimate =
+                u64::try_from(weight.checked_add(9_999_999_999)? / 10_000_000_000).ok()?;
+            tokens = tokens.checked_add(allocated_forecast(estimate, 1, 1, false)?)?;
+        }
+        Some(InputEstimate {
+            tokens,
+            basis: EstimateBasis::ReceiptAnchoredReasoningForecast,
+        })
+    }
+
     /// Telemetry may reuse native or already counted local quantities, never
     /// initiate text tokenization merely to populate a dashboard field.
     pub(crate) fn known_estimate(
@@ -541,7 +580,9 @@ impl InputMeasurements {
         if self.reasoning_conflict {
             return None;
         }
-        let baseline = self.predict(source, route, resolved)?;
+        let baseline = self
+            .forecast_estimate(source, route, resolved)
+            .filter(|estimate| estimate.basis != EstimateBasis::LocalVisibleText)?;
         let source_values = items(source)?;
         let target_values = items(target)?;
         let source_prompt = prompt(&source_values);
@@ -558,7 +599,7 @@ impl InputMeasurements {
         {
             available.insert(identity(&value), value);
         }
-        let mut used_heuristic = false;
+        let mut used_heuristic = baseline.basis == EstimateBasis::ReceiptAnchoredReasoningForecast;
         let mut quantity = |changed: &[&Item], removal: bool| -> Option<u64> {
             let mut used = vec![false; changed.len()];
             let prompt_items = if removal {

@@ -15,6 +15,11 @@ impl Projection {
     }
 }
 
+// Empirical reasoning sizes price alternatives, never prove capacity.
+fn capacity_known(input: crate::proxy_quantity::InputEstimate) -> bool {
+    input.basis != crate::proxy_quantity::EstimateBasis::ReceiptAnchoredReasoningForecast
+}
+
 pub(super) fn plan(
     config: &ProxyCli,
     session: &Session,
@@ -73,9 +78,10 @@ pub(super) fn plan(
     let continuation_input =
         session
             .primary_input
-            .estimate(&continuation_wire, &config.upstream_url, resolved);
-    let continuation_required =
-        continuation_input.map(|input| primary_required_input(config, &retained, input.tokens));
+            .forecast_estimate(&continuation_wire, &config.upstream_url, resolved);
+    let continuation_required = continuation_input
+        .filter(|input| capacity_known(*input))
+        .map(|input| primary_required_input(config, &retained, input.tokens));
     let canonical_input = if retained == original {
         continuation_input
     } else {
@@ -86,8 +92,9 @@ pub(super) fn plan(
             resolved,
         )
     };
-    let canonical_required =
-        canonical_input.map(|input| primary_required_input(config, &original, input.tokens));
+    let canonical_required = canonical_input
+        .filter(|input| capacity_known(*input))
+        .map(|input| primary_required_input(config, &original, input.tokens));
     let continuation_fits = continuation_required
         .is_none_or(|required| required <= config.primary_context_tokens as f64);
     let (baseline, baseline_required, baseline_input, wire) = if !continuation_fits
@@ -182,10 +189,12 @@ pub(super) fn plan(
             &config.upstream_url,
             resolved,
         );
-        let required =
-            compact_input.map(|input| primary_required_input(config, &compact, input.tokens));
-        let feasible =
-            required.is_none_or(|required| required <= config.primary_context_tokens as f64);
+        let required = compact_input
+            .filter(|input| capacity_known(*input))
+            .map(|input| primary_required_input(config, &compact, input.tokens));
+        let feasible = required.map_or(!forced, |required| {
+            required <= config.primary_context_tokens as f64
+        });
         let primary = baseline_input
             .zip(compact_input)
             .and_then(|(keep_input, drop_input)| {
@@ -380,6 +389,7 @@ pub(super) fn acquisition_plausible(config: &ProxyCli, session: &Session, body: 
     let fits = session
         .primary_input
         .projected_estimate(&optimistic_wire, &wire, &config.upstream_url, resolved)
+        .filter(|input| capacity_known(*input))
         .is_some_and(|input| {
             primary_required_input(config, &optimistic, input.tokens)
                 <= config.primary_context_tokens as f64

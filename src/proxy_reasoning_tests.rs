@@ -190,3 +190,223 @@ fn reasoning_forecast_does_not_assume_future_cache_writes() {
         "forecast allocation is not proof that a future cache write covers this prompt: {costs:?}"
     );
 }
+
+#[test]
+fn fresh_reasoning_baseline_is_forecast_only_and_continues_after_restart() {
+    use crate::proxy_quantity::{EstimateBasis, InputMeasurements};
+    let source = json!({"model":"gpt-6.1-sol","input":[
+        {"role":"user","content":"goal"},
+        {"type":"reasoning","summary":[],"encrypted_content":"old synthetic".repeat(1000)},
+        {"role":"assistant","content":"old evidence"},
+        {"role":"user","content":"current"}]});
+    let mut quantities = InputMeasurements::default();
+    quantities.observe(&source, &json!({"input_tokens":10000}), "route", None, 100);
+    let mut appended = source.clone();
+    appended["input"].as_array_mut().unwrap().extend([
+        json!({"type":"reasoning","summary":[],"encrypted_content":"fresh synthetic".repeat(1000)}),
+        json!({"role":"assistant","content":"fresh answer"}),
+        json!({"role":"user","content":"continue"}),
+    ]);
+    for restart in [false, true] {
+        if restart {
+            quantities =
+                serde_json::from_value(serde_json::to_value(&quantities).unwrap()).unwrap();
+        }
+        let frozen = serde_json::to_value(&quantities).unwrap();
+        assert!(quantities.predict(&appended, "route", None).is_none());
+        assert!(quantities.estimate(&appended, "route", None).is_none());
+        assert!(
+            quantities
+                .known_estimate(&appended, "route", None)
+                .is_none()
+        );
+        let baseline = quantities
+            .forecast_estimate(&appended, "route", None)
+            .unwrap();
+        assert_eq!(
+            baseline.basis,
+            EstimateBasis::ReceiptAnchoredReasoningForecast
+        );
+        assert!(baseline.tokens > 10000);
+        let mut target = appended.clone();
+        target["input"].as_array_mut().unwrap().drain(1..3);
+        let candidate = quantities
+            .projected_estimate(&target, &appended, "route", None)
+            .unwrap();
+        assert_eq!(
+            candidate.basis,
+            EstimateBasis::ReceiptAnchoredReasoningForecast
+        );
+        assert!(candidate.tokens < baseline.tokens && candidate.tokens > baseline.tokens - 5000);
+        assert!(
+            quantities
+                .restoration(&appended, &target, "route", None)
+                .is_none()
+        );
+        let costs = resolved_input_costs(
+            &appended,
+            &target,
+            &[],
+            "gpt-6.1-sol",
+            3,
+            None,
+            "synthetic",
+            100,
+            baseline,
+            candidate,
+        )
+        .unwrap();
+        let rates = Rates::for_model("gpt-6.1-sol", baseline.tokens as f64).unwrap();
+        assert!((costs.keep - baseline.tokens as f64 * rates.input * 3.0).abs() < 1e-12);
+        assert!((costs.compact - candidate.tokens as f64 * rates.input * 3.0).abs() < 1e-12);
+        assert_eq!(serde_json::to_value(&quantities).unwrap(), frozen);
+        for key in ["model", "instructions", "tools", "reasoning"] {
+            let mut mismatch = appended.clone();
+            mismatch[key] = json!("changed");
+            assert!(
+                quantities
+                    .forecast_estimate(&mismatch, "route", None)
+                    .is_none()
+            );
+        }
+        assert!(
+            quantities
+                .forecast_estimate(&appended, "other-route", None)
+                .is_none()
+        );
+        for opaque in [
+            json!({"type":"compaction","encrypted_content":"unknown"}),
+            json!({"type":"input_image","image_url":"synthetic"}),
+            json!({"type":"reasoning","encrypted_content":""}),
+        ] {
+            let mut unsupported = appended.clone();
+            unsupported["input"].as_array_mut().unwrap().push(opaque);
+            assert!(
+                quantities
+                    .forecast_estimate(&unsupported, "route", None)
+                    .is_none()
+            );
+        }
+        let mut restored = appended.clone();
+        restored["input"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, json!({"role":"assistant","content":"not an append"}));
+        assert!(
+            quantities
+                .forecast_estimate(&restored, "route", None)
+                .is_none()
+        );
+        let mut duplicate = appended.clone();
+        duplicate["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(source["input"][1].clone());
+        assert!(
+            quantities
+                .forecast_estimate(&duplicate, "route", None)
+                .is_none()
+        );
+    }
+    let mut conflicting = quantities.clone();
+    conflicting.observe(&source, &json!({"input_tokens":11000}), "route", None, 101);
+    assert!(
+        conflicting
+            .forecast_estimate(&appended, "route", None)
+            .is_none()
+    );
+    quantities.observe(
+        &appended,
+        &json!({"input_tokens":12500}),
+        "route",
+        None,
+        101,
+    );
+    assert_eq!(
+        quantities
+            .forecast_estimate(&appended, "route", None)
+            .unwrap()
+            .basis,
+        EstimateBasis::ProviderReceipt
+    );
+}
+
+#[test]
+fn fresh_reasoning_baseline_prices_authorized_projection_without_capacity_authority() {
+    let (mut config, _, _) = fixture(Rates {
+        input: 2.0,
+        cached: 0.2,
+        write: 2.0,
+        output: 0.0,
+    });
+    config.payoff_requests = 1;
+    config.min_payback_percent = 0;
+    let mut session = Session {
+        model_resolution: config.model_resolution.clone(),
+        ..Session::default()
+    };
+    let mut body = json!({"model":"gpt-6-sol","input":[
+        {"role":"user","content":"goal"},
+        {"type":"reasoning","summary":[],"encrypted_content":"old synthetic".repeat(1000)},
+        {"type":"function_call","call_id":"old","name":"inspect","arguments":"{}"},
+        {"type":"function_call_output","call_id":"old","output":"evidence"},
+        {"role":"user","content":"current"}]});
+    session.ingest(body["input"].as_array().unwrap()).unwrap();
+    for item in &mut session.history {
+        item.exposed = true;
+    }
+    session
+        .apply_advice(
+            &session.groups(),
+            &json!({"protected":[],"removable":[2],"memories":[]}),
+        )
+        .unwrap();
+    session.completed_requests = 1;
+    session.primary_input.observe(
+        &primary_wire_body(&config, &body),
+        &json!({"input_tokens":10000}),
+        &config.upstream_url,
+        config.model_resolution.as_ref().map(|p| &p.primary),
+        100,
+    );
+    // A known oversized baseline cannot force an uncertain projected fit.
+    config.primary_context_tokens = 500;
+    let (selected, report) = plan(&config, &session, &body);
+    assert_eq!(report["forced"], true);
+    assert!(selected.is_none());
+    body["input"].as_array_mut().unwrap().extend([
+        json!({"type":"reasoning","summary":[],"encrypted_content":"fresh synthetic".repeat(1000)}),
+        json!({"role":"assistant","content":"fresh answer"}),
+        json!({"role":"user","content":"continue"}),
+    ]);
+    session.ingest(body["input"].as_array().unwrap()).unwrap();
+    for restart in [false, true] {
+        if restart {
+            session = serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        }
+        let frozen = serde_json::to_value(&session).unwrap();
+        let (selected, report) = plan(&config, &session, &body);
+        assert_eq!(
+            selected.unwrap().omitted,
+            HashSet::from([2, 3, 4]),
+            "{report}"
+        );
+        assert_eq!(
+            report["primary_input_basis"],
+            "receipt_anchored_reasoning_forecast"
+        );
+        assert!(report["primary_estimated_tokens"].as_u64().unwrap() > 10000);
+        assert_eq!(report["forced"], false);
+        assert!(report["primary_required_tokens"].is_null());
+        assert!(report["primary_fits"].is_null());
+        assert!(report["primary_receipt_prediction_tokens"].is_null());
+        assert!(report["candidates"][0]["primary_retained_estimated_tokens"].is_number());
+        assert!(report["candidates"][0]["primary_retained_required_tokens"].is_null());
+        assert_eq!(serde_json::to_value(&session).unwrap(), frozen);
+    }
+    session.opinions.insert(2, "keep".into());
+    assert!(
+        plan(&config, &session, &body).0.is_none(),
+        "forecast grants no removal authority"
+    );
+}

@@ -2,7 +2,7 @@
 
 The request-time proxy planner can estimate removal of native encrypted
 `reasoning` items without treating ciphertext as model text. This is a
-**selection/capacity forecast**, not a provider measurement or a savings receipt.
+**economic selection forecast**, not a capacity proof, provider measurement or savings receipt.
 The report basis is `receipt_anchored_reasoning_forecast`; its retained token
 quantity is the conservative decision quantity, not the fitted mean.
 
@@ -42,8 +42,9 @@ The existing price owner applies input tiers, current scoped cache receipts,
 output allowances, scheduled reviewer costs and strict payback requirements.
 Future requests for a reasoning forecast are charged uncached: a heuristic
 quantity does not prove a future whole-input cache write. A nonpositive ordinary
-conservative payoff keeps context. Existing authorized no-fit/capacity handling
-is unchanged.
+conservative payoff keeps context. Heuristic quantities do not establish either
+fit or overflow, cannot force a rewrite and cannot prove a capacity-rescue
+candidate fits. Ordinary unknown-size forwarding remains provider-enforced.
 
 ## Evidence boundaries and continuation
 
@@ -60,11 +61,19 @@ After a filtered request gets its own actual receipt, the surviving unresolved
 pool can be calibrated against that receipt, including after current-format
 checkpoint reload and ordinary visible append. An incomplete older block is not
 reused as though its entire native total belonged to its surviving members.
-Restoring previously omitted **unmeasured** opaque items, or predicting brand-new
-opaque appends before another receipt, remains unsupported. Such a canonical
-restoration alternative may be unknown while a reauthorized continuation remains
-sizeable. No saved omission grants permission: current user protection, atomic
-cohorts and reviewer authorization are always rechecked.
+Restoring previously omitted **unmeasured** opaque items remains unsupported.
+An exact compatible receipt prefix followed only by ordinary visible items and
+supported new native reasoning has a separate `forecast_estimate`: keep the
+receipt total, then double-charge the new suffix's empirical weights, rounded up.
+It does not tokenize ciphertext or claim a measured source total. An unchanged
+replay after settlement still takes its actual receipt first. This forecast
+baseline allows authorized old-history edits to be compared while a newly emitted
+reasoning item is awaiting its first input receipt; it does not make that item
+removable. Other new opaque modalities, edited/reordered prefixes, duplicate
+opaque identities and changed contracts stay unknown. A canonical restoration
+alternative may remain unknown while a reauthorized continuation is sizeable.
+No saved omission grants permission: current user protection, atomic cohorts and
+reviewer authorization are always rechecked.
 
 `predict`, `estimate`, `known_estimate` and `restoration` do not return these
 heuristic allocations. In particular, canonical receipt reconstruction may
