@@ -121,6 +121,9 @@ fn joined191192_unpriced_write_settlement_keeps_independent_cache_observations()
 }
 
 include!("proxy_projection_economics_tests.rs");
+mod reasoning_controls {
+    include!("proxy_reasoning_tests.rs");
+}
 
 #[test]
 fn reviewer_catalog_capacity_and_tier_drive_real_fit_checks_without_role_defaults() {
