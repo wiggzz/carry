@@ -148,7 +148,7 @@ def summarize(plan, records):
                       'estimated_api_usd': total,
                       'observed_api_usd_lower_bound': native['observed_cost_lower_bound_usd']}
         for metric in ('agent_seconds', 'setup_seconds', 'evaluation_seconds', 'task_wall_seconds',
-                       'selected_rewrites', 'committed_rewrites', 'native_compactions'):
+                       'selected_rewrites', 'dispatched_rewrites', 'committed_rewrites', 'native_compactions'):
             arm_report[metric] = measured_sum(selected, metric)
         arm_report['median_agent_seconds'] = (None if arm_report['agent_seconds'] is None
                                                else median(row['agent_seconds'] for row in selected))
@@ -176,6 +176,11 @@ def summarize(plan, records):
         a, b = arms['direct'][metric], arms['compact'][metric]
         paired['compact_minus_direct_' + metric] = None if a is None or b is None else b - a
     return {'schema_version': 1, 'contract_sha256': plan['contract_sha256'],
+            'performance_qualifier': (
+                'invalid-infrastructure-or-unknown-score' if any(a['infrastructure_errors'] or a['unknown_scores'] for a in arms.values())
+                else 'quality-confounded' if paired['direct_only_resolved'] or paired['compact_only_resolved']
+                else 'rewrite-unproven' if not arms['compact']['committed_rewrites']
+                else 'matched-official-outcomes-with-observed-rewrite'),
             'timing_basis': 'summed-checkpoint-intervals-not-cohort-wall',
             'benchmark': plan['benchmark'], 'evidence_kind': plan['evidence_kind'],
             'expected_records': len(expected),
@@ -186,6 +191,55 @@ def summarize(plan, records):
                                     for a in arms.values()),
             'cost_comparison_complete': all(a['estimated_api_usd'] is not None for a in arms.values()),
             'rewrite_efficacy_observed': bool(arms['compact']['committed_rewrites'])}
+
+
+def dispatch(plan, contract, prepared, output, runner, *, budget_usd):
+    """Shared bounded paired execution; the lane supplies its existing runner.
+
+    Budget is a between-slot stop threshold, not an invoice or hard provider cap.
+    Unknown usage stops further dispatch and remains unknown in the denominator.
+    """
+    import time
+    if type(budget_usd) not in (int, float) or not math.isfinite(budget_usd) or budget_usd <= 0:
+        raise ValueError('an explicit positive budget-usd stop threshold is required')
+    output.mkdir(parents=True, exist_ok=False)
+    (output/'plan.json').write_text(json.dumps(plan, indent=2, sort_keys=True)+'\n')
+    (output/'contract.json').write_text(json.dumps(contract, indent=2, sort_keys=True)+'\n')
+    records, spent, stopped = [], Decimal(0), None
+    started = time.monotonic()
+    with (output/'records.jsonl').open('x') as sink:
+        for slot in plan['slots']:
+            if stopped:
+                rows = [{'namespace': slot['namespace'], 'contract_sha256': plan['contract_sha256'],
+                         'checkpoint': checkpoint, 'task_id': slot['task_id'], 'arm': slot['name'],
+                         'status': 'not-run', 'resolved': None, 'quality': {}, 'events': [], 'error': stopped}
+                        for checkpoint in slot['checkpoints']]
+            else:
+                try:
+                    rows = runner(contract, slot, prepared, output/slot['namespace'])
+                except Exception as error:
+                    rows = [{'namespace': slot['namespace'], 'contract_sha256': plan['contract_sha256'],
+                             'checkpoint': checkpoint, 'task_id': slot['task_id'], 'arm': slot['name'],
+                             'status': 'infrastructure-error', 'resolved': None, 'quality': {}, 'events': [],
+                             'error': f'{type(error).__name__}: {error}'} for checkpoint in slot['checkpoints']]
+                if any(row['status'] in {'infrastructure-error', 'evaluation-error'} for row in rows):
+                    stopped = 'infrastructure/evaluation failure; further model dispatch stopped'
+                native = summarize_events([event for row in rows for event in row['events']])
+                cost = native['estimated_total_cost_usd']
+                if cost is None:
+                    stopped = 'trusted usage incomplete; further model dispatch stopped'
+                else:
+                    spent += Decimal(str(cost))
+                    if spent >= Decimal(str(budget_usd)):
+                        stopped = 'between-slot budget threshold reached'
+            for row in rows:
+                sink.write(json.dumps(row, sort_keys=True, allow_nan=False)+'\n'); sink.flush()
+            records.extend(rows)
+    report = summarize(plan, records)
+    report.update(cohort_wall_seconds=time.monotonic()-started, stop_reason=stopped,
+                  budget_usd=budget_usd, budget_kind='between-slot-stop-not-hard-provider-cap')
+    (output/'report.json').write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False)+'\n')
+    return report
 
 
 def main():

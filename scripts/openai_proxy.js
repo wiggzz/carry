@@ -154,7 +154,8 @@ function serve(options = {}) {
       }
       carrySession = require('node:crypto').randomUUID();
       console.log('BENCHMARK_CONVERSATION ' + JSON.stringify({session_id: carrySession}));
-      response.writeHead(204); response.end(); return;
+      response.writeHead(200, {'content-type': 'application/json'});
+      response.end(JSON.stringify({session_id: carrySession})); return;
     }
     if (!isAllowedRequest(request.method, request.url) || !parsed) {
       response.writeHead(403, {'content-type': 'text/plain'});

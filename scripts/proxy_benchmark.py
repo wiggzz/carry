@@ -224,6 +224,7 @@ def summarize_events(events, *, metrics=None):
         'estimated_total_cost_usd': None if not ledger_complete or None in costs else sum(costs),
         'observed_cost_lower_bound_usd': sum(s['observed_cost_usd'] for s in actors.values()),
         'proxy_rewrites': metrics.get('rewrites') if metrics else None,
+        'dispatched_rewrites': metrics.get('dispatched_rewrites') if metrics else None,
         'native_compactions': metrics.get('native_compactions') if metrics else None,
         'effective_mode': metrics.get('mode') if metrics else None}
 
@@ -239,6 +240,8 @@ def read_metrics(network, *, execute=None):
       signal:AbortSignal.timeout(3000)})
       .then(async r => {if (!r.ok) process.exit(1); console.log(JSON.stringify(await r.json()));})
       .catch(() => process.exit(1));"""
+    if network.get('active_session_id'):
+        script = script.replace('process.env.BENCHMARK_SESSION_ID', json.dumps(network['active_session_id']))
     result = execute(['docker', 'exec', network['proxy'], 'node', '-e', script],
                      check=False, capture_output=True, text=True, timeout=10)
     if result.returncode:
@@ -246,7 +249,13 @@ def read_metrics(network, *, execute=None):
     try:
         value = json.loads(result.stdout)
         # Persist only agreed public counters, never arbitrary metric payloads.
-        return {'mode': value.get('mode'), 'rewrites': value.get('compactions', value.get('rewrites')),
+        rewrites = value.get('rewrites')
+        dispatched = (rewrites.get('dispatched') if isinstance(rewrites, dict)
+                      and rewrites.get('prior_unknown') is False else None)
+        if type(dispatched) is not int or dispatched < 0:
+            dispatched = None
+        return {'mode': value.get('mode'), 'rewrites': value.get('compactions'),
+                'dispatched_rewrites': dispatched,
                 'native_compactions': value.get('native_compactions')}
     except (ValueError, AttributeError):
         return None
@@ -279,6 +288,9 @@ def capture_evidence(network, *, execute=None):
         for actor in ('primary', 'shadow'):
             summary[actor]['estimated_cost_usd'] = None
     state_dir = Path(network['state_dir'])
+    # Numeric trusted events and conversation-boundary IDs only; never payloads/keys.
+    if 'result' in locals():
+        (state_dir / 'gateway-events.log').write_text(result.stdout)
     (state_dir / 'benchmark-events.jsonl').write_text(''.join(json.dumps(e, sort_keys=True) + '\n' for e in events))
     (state_dir / 'benchmark-summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
     return summary

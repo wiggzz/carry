@@ -55,11 +55,14 @@ def verify_checkout(root, expected):
 
 def preflight(contract, prepared, *, execute=subprocess.run, verify_sources=True, require_readiness=True):
     """Read-only readiness; never prepares an image on a measured run."""
-    from scripts.slopcodebench import plan
+    try:
+        from scripts.slopcodebench import plan
+    except ModuleNotFoundError:
+        from slopcodebench import plan
     result = plan(contract)
     settings = contract['settings']
-    if settings['concurrency'] != 1 or settings['retries'] != 0:
-        raise ValueError('initial protected SCB lane is serial; runner retries must be zero')
+    if settings['concurrency'] != 1 or not 0 <= settings['retries'] <= 3:
+        raise ValueError('protected SCB is serial with at most three native retries')
     if settings['native_config']:
         raise ValueError('initial SCB native_config must be empty (no ignored native settings)')
     if settings['auth_mode'] != 'api-key':
@@ -122,18 +125,19 @@ def new_conversation(network, *, execute=subprocess.run):
         return
     script = """fetch('http://127.0.0.1:8080/benchmark/new-conversation', {
       method:'POST', headers:{authorization:'Bearer '+process.env.BENCHMARK_CONTROL_TOKEN},
-      signal:AbortSignal.timeout(3000)}).then(r=>{if(r.status!==204)process.exit(1)})
+      signal:AbortSignal.timeout(3000)}).then(async r=>{if(r.status!==200)process.exit(1); console.log(await r.text())})
       .catch(()=>process.exit(1));"""
-    execute(['docker', 'exec', network['proxy'], 'node', '-e', script],
-            check=True, capture_output=True, text=True, timeout=10)
+    result = execute(['docker', 'exec', network['proxy'], 'node', '-e', script],
+                     check=True, capture_output=True, text=True, timeout=10)
+    network['active_session_id'] = json.loads(result.stdout)['session_id']
 
 
 @contextmanager
 def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocation=None):
     """Use SCB's runtime registries and volume builder, not its unrestricted launcher.
 
-    Every native invocation gets a disposable container. Workspace, HOME and the
-    official .codex trace mount persist through checkpoints/retry within one slot.
+    The official streaming runtime, workspace, HOME and .codex mount persist
+    through checkpoints/retry within one slot. Native exec is fresh per spec.
     The evaluator has no network or credentials and uses the official command.
     """
     from slop_code.execution import runtime as registry
@@ -154,7 +158,7 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
             def execute(self, env=None, stdin=None, timeout=None):
                 raise RuntimeError('use the specialized agent/evaluator runtime')
 
-            def invoke(self, command, env, timeout, stdin=None, *, agent=False):
+            def invoke(self, command, env, timeout, stdin=None):
                 from slop_code.execution.runtime import RuntimeResult
                 if (self.environment.type != 'docker' or self.environment.docker.extra_mounts
                         or self.environment.environment.include_os_env
@@ -162,48 +166,31 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
                     raise ValueError('protected SCB requires Docker without environment extra_mounts')
                 if self.kwargs.get('ports'):
                     raise ValueError('protected SCB does not expose agent or evaluator ports')
-                image = prepared['agent_image'] if agent else prepared['evaluator_image']
+                image = prepared['evaluator_image']
                 if self.kwargs.get('image', image) != image:
                     raise ValueError('official runner attempted to replace the prepared image')
                 kwargs = {k: v for k, v in self.kwargs.items()
                           if k in {'mounts', 'static_assets', 'env_vars', 'is_evaluation'}}
                 mounts = dict(kwargs.get('mounts') or {})
-                if agent:
-                    mounts[home] = {'bind': str(HOME_PATH), 'mode': 'rw'}
                 kwargs.update(mounts=mounts, disable_setup=True, image=image)
                 builder = DockerExecRuntime(spec=self.environment, working_dir=self.working_dir,
                                             command=command, **kwargs)
-                builder._network_mode = network['internal'] if agent else 'none'
+                builder._network_mode = 'none'
                 clean = dict(env or {})
-                if agent:
-                    if clean.get('OPENAI_API_KEY') != network['client_token']:
-                        raise ValueError('native runtime did not use its scoped client token')
-                elif any('KEY' in key or 'TOKEN' in key for key in clean):
-                    raise ValueError('evaluator credentials are forbidden')
                 clean['UV_OFFLINE'] = '1'
                 clean['UV_PYTHON_DOWNLOADS'] = 'never'
-                if not agent:
-                    clean['UV_CACHE_DIR'] = '/tmp/uv-cache'
-                    command = 'cp -R /opt/scb-uv-cache /tmp/uv-cache && ' + command
+                clean['UV_CACHE_DIR'] = '/tmp/uv-cache'
+                command = 'cp -R /opt/scb-uv-cache /tmp/uv-cache && ' + command
                 merged = self.environment.get_full_env({**(kwargs.get('env_vars') or {}), **clean})
                 for key, value in merged.items():
                     if any(word in key.upper() for word in ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'CREDENTIAL')):
-                        if not (agent and key == 'OPENAI_API_KEY' and value == network['client_token']):
-                            raise ValueError('credential-bearing environment is forbidden in untrusted runtime')
+                        raise ValueError('credential-bearing environment is forbidden in evaluator runtime')
                 builder._command = command
                 args = builder._build_docker_run_command(clean)
                 name = 'carry-scb-' + uuid.uuid4().hex
                 flags = ['--name', name, '--pull=never', '--read-only', '--cap-drop=ALL',
                          '--security-opt=no-new-privileges', '--pids-limit=512', '--memory=4g',
                          '--cpus=2', '--tmpfs=/tmp:rw,nosuid,nodev,size=512m']
-                if agent:
-                    flags += ['--dns=127.0.0.1', '--add-host', 'openai-proxy:' + network['proxy_ip']]
-                    tokens = shlex.split(command)
-                    resume = tokens[1:4] == ['exec', 'resume', '--last']
-                    if not resume:
-                        new_conversation(network, execute=execute)
-                    if on_invocation:
-                        on_invocation(resume)
                 args[2:2] = flags
                 started = time.monotonic()
                 timed_out = False
@@ -225,13 +212,67 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
             def cleanup(self):
                 pass  # Every synchronous invocation proves its container absent in finally.
 
-        class AgentRuntime(ProtectedExec):
-            def stream(self, command, env=None, timeout=None):
-                from slop_code.execution.runtime import RuntimeEvent
-                result = self.invoke(command, env, timeout, agent=True)
-                yield RuntimeEvent(kind='stdout', text=result.stdout)
-                yield RuntimeEvent(kind='stderr', text=result.stderr)
-                yield RuntimeEvent(kind='finished', result=result)
+        from slop_code.execution.docker_runtime.streaming import DockerStreamingRuntime
+        agents = []
+        class AgentRuntime(DockerStreamingRuntime):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.protected_name = 'carry-scb-' + uuid.uuid4().hex
+                agents.append(self)
+
+            def validate(self, env):
+                if (self.spec.environment.include_os_env or self.spec.docker.extra_mounts
+                        or self.spec.docker.binary != 'docker' or self._ports
+                        or self._image != prepared['agent_image']):
+                    raise ValueError('unprepared or unrestricted agent runtime configuration')
+                merged = self.spec.get_full_env(self._merge_env(env))
+                for key, value in merged.items():
+                    if any(word in key.upper() for word in ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'CREDENTIAL')):
+                        if key != 'OPENAI_API_KEY' or value != network['client_token']:
+                            raise ValueError('provider credentials cannot enter the agent runtime')
+                return merged
+
+            def _create_base_container(self):
+                env = self.validate({})
+                self._mounts[home] = {'bind': str(HOME_PATH), 'mode': 'rw'}
+                # SDK create never pulls an image on miss. No mutable upstream
+                # get_base_image/build path or unrestricted upstream create is used.
+                container = self.client.containers.create(self._image, command='sleep infinity',
+                    name=self.protected_name, tty=False, detach=True, stdin_open=False,
+                    environment=env, volumes=self._build_volumes(), user=self.user,
+                    network_mode=network['internal'], working_dir=self._container_workdir(),
+                    extra_hosts={'openai-proxy': network['proxy_ip']}, dns=['127.0.0.1'],
+                    read_only=True, cap_drop=['ALL'], security_opt=['no-new-privileges'],
+                    pids_limit=512, mem_limit='4g', nano_cpus=2000000000,
+                    tmpfs={'/tmp': 'rw,nosuid,nodev,size=512m'})
+                self._container = container
+                container.start()
+                return container
+
+            def stream(self, command, env, timeout):
+                self.validate(env)
+                if env.get('OPENAI_API_KEY') != network['client_token']:
+                    raise ValueError('native Codex must use its scoped client token')
+                tokens = shlex.split(command)
+                if tokens[:2] != ['codex', 'exec']:
+                    raise ValueError('only the official native Codex exec contract is allowed')
+                resume = tokens[2:4] == ['resume', '--last']
+                if not resume:
+                    new_conversation(network, execute=execute)
+                if on_invocation:
+                    on_invocation(resume)
+                for event in super().stream(command, env, timeout):
+                    if event.kind == 'finished' and event.result.timed_out:
+                        # Killing docker exec alone does not kill its children.
+                        self.kill()
+                        swebench_smoke.force_remove_container(self.protected_name, exact_name=True)
+                    yield event
+
+            def cleanup(self):
+                try:
+                    super().cleanup()
+                finally:
+                    swebench_smoke.force_remove_container(self.protected_name, exact_name=True)
 
         class EvalRuntime(ProtectedExec):
             def execute(self, env=None, stdin=None, timeout=None):
@@ -242,8 +283,16 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
         try:
             yield
         finally:
+            cleanup_errors = []
+            for agent_runtime in agents:
+                try:
+                    agent_runtime.cleanup()
+                except Exception as error:
+                    cleanup_errors.append(str(error))
             registry.STREAMING_RUNTIME_REGISTRY.clear(); registry.STREAMING_RUNTIME_REGISTRY.update(old_stream)
             registry.EXEC_RUNTIME_REGISTRY.clear(); registry.EXEC_RUNTIME_REGISTRY.update(old_exec)
+            if cleanup_errors:
+                raise RuntimeError('protected agent cleanup failed: ' + '; '.join(cleanup_errors))
 
 
 def official_components(prepared, contract, task_id):
@@ -340,7 +389,9 @@ def run_slot(contract, slot, prepared, output):
                 finally:
                     item['evaluation_seconds'] = time.monotonic()-mark
                     item['task_wall_seconds'] = time.monotonic()-item['started'] + (item['setup_seconds'] or 0)
-                    proxy_benchmark.capture_evidence(network)
+                    summary = proxy_benchmark.capture_evidence(network)
+                    item['dispatched_rewrites'] = summary.get('dispatched_rewrites')
+                    item['native_compactions'] = summary.get('native_compactions')
                     events = [json.loads(line) for line in (state/'benchmark-events.jsonl').read_text().splitlines()]
                     item['events'] = [e for e in events if e.get('request_id') not in seen]
                     seen.update(e.get('request_id') for e in events)
@@ -348,7 +399,8 @@ def run_slot(contract, slot, prepared, output):
                                             value=network['client_token'], source='scoped', destination_key='OPENAI_API_KEY')
             settings = contract['settings']
             agent = CodexAgent(problem_name=problem.name, verbose=False, image=prepared['agent_image'],
-                cost_limits=AgentCostLimits(), pricing=None, credential=credential, binary='codex',
+                cost_limits=AgentCostLimits(cost_limit=0, net_cost_limit=0, max_retries=settings['retries']),
+                pricing=None, credential=credential, binary='codex',
                 model=settings['model'], timeout=settings['timeout_seconds'], thinking=settings['reasoning'],
                 max_thinking_tokens=None, extra_args=[], env={},
                 model_provider=CodexModelProvider(provider_id='carry_benchmark', base_url=network['api_base'], env_key='OPENAI_API_KEY'))
@@ -388,7 +440,9 @@ def run_slot(contract, slot, prepared, output):
                'task_id': slot['task_id'], 'arm': slot['name'], 'status': 'not-run', 'resolved': None,
                'quality': {}, 'events': item.get('events', []), 'error': error,
                **{k: item.get(k) for k in ('agent_seconds', 'setup_seconds', 'evaluation_seconds', 'task_wall_seconds')},
-               'selected_rewrites': None, 'committed_rewrites': None, 'native_compactions': None}
+               'selected_rewrites': None, 'committed_rewrites': None,
+               'dispatched_rewrites': 0 if slot['proxy_mode'] == 'disabled' else item.get('dispatched_rewrites'),
+               'native_compactions': item.get('native_compactions')}
         directory = output/'official'/checkpoint
         try:
             report = CorrectnessResults.from_dir(directory)

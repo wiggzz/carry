@@ -478,6 +478,65 @@ jobs:
             target
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
+  scb-protected-fixture:
+    name: Pinned official SCB protected runtime (synthetic, no model)
+    if: github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe
+    needs: native
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Checkout exact official SCB source, not its mutable problem catalog
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: SprocketLab/slop-code-bench
+          ref: af5a9cbc311605b5cceb80200ca9832bdff2d7b1
+          path: .scb-upstream
+          persist-credentials: false
+      - name: Python for pinned official SCB (PEP 695)
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Download this candidate's exact portable binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: carry-linux-amd64-musl-${{ github.sha }}
+          path: .scb-carry
+      - name: Install official locked dependencies only on disposable hosted runner
+        run: |
+          set -euo pipefail
+          python -m pip install uv==0.9.7
+          uv sync --project .scb-upstream --frozen --no-dev
+          chmod +x .scb-carry/carry
+          git rev-parse HEAD
+          git -C .scb-upstream rev-parse HEAD
+          sha256sum .scb-carry/carry
+      - name: Actual official runner, native exec/retry, gold evaluator, containment and paired receipts
+        env:
+          CARRY_SCB_HOSTED_FIXTURE: '1'
+          SCB_UPSTREAM_ROOT: ${{ github.workspace }}/.scb-upstream
+          SCB_CARRY_BINARY: ${{ github.workspace }}/.scb-carry/carry
+          SCB_FIXTURE_OUTPUT: ${{ runner.temp }}/scb-protected-synthetic
+        run: .scb-upstream/.venv/bin/python -m unittest -v scripts.test_slopcodebench_runtime
+      - name: Preserve source-bound synthetic runtime evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: scb-protected-synthetic-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/scb-protected-synthetic/contract.json
+            ${{ runner.temp }}/scb-protected-synthetic/prepared.json
+            ${{ runner.temp }}/scb-protected-synthetic/readiness
+            ${{ runner.temp }}/scb-protected-synthetic/paired
+            ${{ runner.temp }}/scb-protected-synthetic/provider-synthetic.log
+          if-no-files-found: warn
+          retention-days: 7
+
   native:
     name: Portable release and native fixtures
     if: github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe
