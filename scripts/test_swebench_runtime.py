@@ -73,6 +73,7 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':30,'cached_inp
         subprocess.run(['docker', 'tag', scb_prepared['agent_image'], parent], check=True)
         (context/'Dockerfile').write_text(f'''FROM {parent}
 RUN apt-get update && apt-get install -y --no-install-recommends git patch && rm -rf /var/lib/apt/lists/*
+RUN python -m pip install --no-cache-dir pytest==8.4.2
 COPY repo /testbed
 ENV PATH=/opt/swebench-harness/bin:$PATH
 WORKDIR /testbed
@@ -80,10 +81,11 @@ ENTRYPOINT ["python3", "/opt/swebench-harness/bin/adapter"]
 ''')
         spec = TestSpec(instance_id='owned__synthetic-1', repo='pytest-dev/pytest',
             version=next(iter(MAP_REPO_VERSION_TO_SPECS['pytest-dev/pytest'])),
-            repo_script_list=[], env_script_list=[], arch='x86_64', FAIL_TO_PASS=['test_owned'], PASS_TO_PASS=[],
+            repo_script_list=[], env_script_list=[], arch='x86_64', FAIL_TO_PASS=['test_owned.py::test_owned'], PASS_TO_PASS=[],
             language='py', docker_specs={}, namespace='owned-synthetic', eval_script_list=[
                 'cd /testbed', "echo '>>>>> Start Test Output'",
-                "python -c \"import subprocess; assert subprocess.check_output(['python','main.py'],text=True).strip() == '1'; print('test_owned PASSED')\"",
+                "python - <<'PY'\nfrom pathlib import Path\nPath('test_owned.py').write_text(\"import subprocess\\ndef test_owned():\\n    assert subprocess.check_output(['python', 'main.py'], text=True).strip() == '1'\\n\")\nPY",
+                'python -m pytest -rA test_owned.py',
                 "echo '>>>>> End Test Output'"])
         subprocess.run(['docker', 'build', '--tag', spec.instance_image_key, str(context)], check=True)
         image = subprocess.check_output(['docker', 'image', 'inspect', '--format', '{{.Id}}', spec.instance_image_key], text=True).strip()
