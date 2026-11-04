@@ -22,6 +22,34 @@ fn source_ids(session: &Session) -> BTreeSet<u64> {
         .collect()
 }
 
+/// Previously reviewed source is only a reminder, never new drop authority.
+/// Walk native IDs rather than positions so growth cannot keep the oldest batch
+/// at the front forever. Finish the current sweep before wrapping.
+pub(super) fn reminders(session: &Session, groups: &[Group]) -> Vec<u64> {
+    let progress = coverage(session);
+    let eligible = groups
+        .iter()
+        .filter(|g| {
+            g.exposed
+                && g.replayable
+                && !g.pinned
+                && !g.human
+                && !session.drop_authorized(g)
+                && g.members.iter().all(|id| progress.source_ids.contains(id))
+        })
+        .collect::<Vec<_>>();
+    let start = eligible
+        .iter()
+        .position(|g| g.id > progress.reminder_cursor)
+        .unwrap_or(0);
+    eligible
+        .into_iter()
+        .skip(start)
+        .take(4)
+        .map(|g| g.id)
+        .collect()
+}
+
 pub(super) fn multiplier(config: &ProxyCli, session: &Session) -> u64 {
     let mut value = 1u64;
     for _ in 0..coverage(session).no_yield_streak.min(64) {
@@ -218,6 +246,11 @@ pub(super) fn complete(
         return "failed_or_invalid";
     }
     let outcome = outcome(before, after);
+    // Only a completed real review consumes its captured batch. Failed reviews
+    // retry it; new advice cannot change which old batch was actually shown.
+    if let Some(last) = reminders(before, groups).last() {
+        after.review_admission.as_mut().unwrap().reminder_cursor = *last;
+    }
     cover(after, groups);
     let admission = after.review_admission.as_mut().unwrap();
     match outcome {

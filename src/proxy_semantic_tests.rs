@@ -1,5 +1,6 @@
 // Direct controls for the prefix-advice/request-projection model.
 include!("proxy_review_boundary_tests.rs");
+include!("proxy_reminder_tests.rs");
 #[test]
 fn shared_review_indices_are_integers_and_disjoint_across_sources_and_memories() {
     let s = provenance_tool_subject();
