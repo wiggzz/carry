@@ -2,7 +2,7 @@
 use super::*;
 use std::sync::{Condvar, Mutex as StdMutex, mpsc as channel};
 
-pub(crate) static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(in crate::proxy) static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static FAULT: StdMutex<Option<Arc<Stall>>> = StdMutex::new(None);
 struct Stall {
     directory: PathBuf,
@@ -10,14 +10,14 @@ struct Stall {
     released: StdMutex<bool>,
     wake: Condvar,
 }
-pub(crate) struct HeldSink(Arc<Stall>);
+pub(in crate::proxy) struct HeldSink(Arc<Stall>);
 impl HeldSink {
-    pub(crate) fn release(&self) {
+    pub(in crate::proxy) fn release(&self) {
         *self.0.released.lock().unwrap() = true;
         self.0.wake.notify_all();
     }
     // External observation always releases real contention, even on RED.
-    pub(crate) fn observe(
+    pub(in crate::proxy) fn observe(
         self,
         entered: channel::Receiver<()>,
         done: channel::Receiver<()>,
@@ -38,7 +38,7 @@ impl Drop for HeldSink {
         *FAULT.lock().unwrap() = None;
     }
 }
-pub(crate) fn hold(directory: &Path) -> (HeldSink, channel::Receiver<()>) {
+pub(in crate::proxy) fn hold(directory: &Path) -> (HeldSink, channel::Receiver<()>) {
     let (entered, receiver) = channel::channel();
     let stall = Arc::new(Stall {
         directory: directory.into(),
@@ -51,11 +51,11 @@ pub(crate) fn hold(directory: &Path) -> (HeldSink, channel::Receiver<()>) {
     *fault = Some(stall.clone());
     (HeldSink(stall), receiver)
 }
-pub(crate) fn capacity() -> usize {
+pub(in crate::proxy) fn capacity() -> usize {
     PHASE_QUEUE
 }
 
-pub(crate) fn unavailable(disconnected: bool) -> PhaseSink {
+pub(in crate::proxy) fn unavailable(disconnected: bool) -> PhaseSink {
     let sender = disconnected.then(|| {
         let (sender, receiver) = channel::sync_channel(PHASE_QUEUE);
         drop(receiver);
@@ -64,7 +64,7 @@ pub(crate) fn unavailable(disconnected: bool) -> PhaseSink {
     PhaseSink { sender }
 }
 
-pub(crate) fn before_append(directory: &Path) {
+pub(in crate::proxy) fn before_append(directory: &Path) {
     let stall = FAULT
         .lock()
         .unwrap()

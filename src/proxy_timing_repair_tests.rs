@@ -1,5 +1,30 @@
 // Review R1/R2: actual forward/relay owners, synthetic loopback only.
 #[test]
+fn phase_timing_first_drop_and_service_teardown_do_not_flush_stalled_worker() {
+    let _serial = logging::phase_sink_fault::SERIAL.blocking_lock();
+    let directory = tempfile::tempdir().unwrap();
+    let service = Arc::new(checkpoint_service(directory.path()));
+    let (fault, entered) = logging::phase_sink_fault::hold(directory.path());
+    let (done, completion) = std::sync::mpsc::channel();
+    let observer = std::thread::spawn(move || fault.observe(entered, completion));
+    let producer = std::thread::spawn(move || {
+        drop(timing::Phases::new(
+            service.clone(),
+            "first-drop-teardown",
+            None,
+        ));
+        drop(service); // Last Service/sender owner, while real sink is stalled.
+        let _ = done.send(());
+    });
+    let prompt = observer.join().unwrap();
+    producer.join().unwrap();
+    assert!(
+        prompt,
+        "first phase Drop or Service teardown waited for sink drain"
+    );
+}
+
+#[test]
 fn phase_timing_saturated_queue_drops_observations_without_waiting() {
     let _serial = logging::phase_sink_fault::SERIAL.blocking_lock();
     let directory = tempfile::tempdir().unwrap();

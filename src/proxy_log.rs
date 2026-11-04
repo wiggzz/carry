@@ -60,7 +60,11 @@ fn mode(config: &ProxyCli) -> &'static str {
     }
 }
 
-fn directory(state_dir: &Path, raw: bool) -> std::io::Result<PathBuf> {
+fn directory(service: &Service, raw: bool) -> std::io::Result<PathBuf> {
+    directory_at(&service.config.state_dir, raw)
+}
+
+fn directory_at(state_dir: &Path, raw: bool) -> std::io::Result<PathBuf> {
     let path = if raw {
         state_dir.to_path_buf()
     } else {
@@ -167,7 +171,7 @@ pub(super) fn maintain(service: &Service) {
             )
         };
         let result = (|| -> std::io::Result<()> {
-            let directory = directory(&service.config.state_dir, raw)?;
+            let directory = directory(service, raw)?;
             retain(&directory, None, 0, lane, total, dropped)?;
             // Recover legacy/partial files without reading an unbounded line.
             for (path, _, _) in files(&directory)? {
@@ -266,7 +270,7 @@ fn write_record(state_dir: &Path, id: &str, bytes: &[u8], raw: bool) -> std::io:
     } else {
         (JOURNAL_LANE, JOURNAL_TOTAL, &JOURNAL_DROPPED)
     };
-    let directory = directory(state_dir, raw)?;
+    let directory = directory_at(state_dir, raw)?;
     let path = directory.join(format!("{id}.jsonl"));
     match std::fs::symlink_metadata(&path) {
         Ok(meta) if !meta.file_type().is_file() => {
