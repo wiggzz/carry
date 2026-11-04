@@ -182,6 +182,7 @@ impl ProxyCli {
 #[derive(Clone)]
 struct Service {
     catalog: Arc<tokio::sync::OnceCell<SourceCatalog>>,
+    phase_sink: logging::PhaseSink,
     config: ProxyCli,
     client: reqwest::Client,
     upstream_key: Option<String>,
@@ -209,6 +210,8 @@ use planning::plan;
 #[path = "proxy_log.rs"]
 mod logging;
 use logging::journal;
+#[path = "proxy_timing.rs"]
+mod timing;
 
 type Failure = (StatusCode, axum::Json<Value>);
 
@@ -371,6 +374,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
     }
     let service = Arc::new(Service {
         catalog: Arc::new(tokio::sync::OnceCell::new()),
+        phase_sink: logging::PhaseSink::new(config.state_dir.clone()),
         upstream_key,
         classifier_key,
         auth_token,
@@ -1506,12 +1510,41 @@ async fn forward(
 }
 
 async fn forward_request(
-    mut service: Arc<Service>,
+    service: Arc<Service>,
     headers: HeaderMap,
     bytes: Bytes,
     legacy_native: bool,
     request_id: String,
 ) -> Result<Response, Failure> {
+    let mut phases = Some(timing::Phases::new(service.clone(), &request_id, None));
+    let result = forward_timed(
+        service,
+        headers,
+        bytes,
+        legacy_native,
+        request_id,
+        &mut phases,
+    )
+    .await;
+    if let Some(phases) = &mut phases {
+        phases.outcome = if phases.preparation_done_us.is_none() {
+            "rejected"
+        } else {
+            "transport_error"
+        };
+    }
+    result
+}
+
+async fn forward_timed(
+    mut service: Arc<Service>,
+    headers: HeaderMap,
+    bytes: Bytes,
+    legacy_native: bool,
+    request_id: String,
+    phases: &mut Option<timing::Phases>,
+) -> Result<Response, Failure> {
+    let timing = phases.as_mut().unwrap();
     // Responses writes are a native-client interface, not a browser API.
     // This also rejects opaque/null origins and simple text/plain CSRF posts.
     // The dashboard remains GET-only; no Origin header is forwarded upstream.
@@ -1523,6 +1556,9 @@ async fn forward_request(
     }
     authorize(&service, &headers)?;
     let mut id = identity(&headers)?;
+    if let Some(id) = &id {
+        timing.session_id = id.clone();
+    }
     if headers.contains_key("x-carry-fork-parent") || headers.contains_key("x-carry-fork-point") {
         return Err(failure(
             StatusCode::BAD_REQUEST,
@@ -1604,11 +1640,15 @@ async fn forward_request(
         let mut lock;
         let mut session;
         loop {
+            timing.session_id = id.clone();
             // Inspect frozen metadata before waiting on the primary lock, so
             // known-model ancestry errors still fail promptly. Revalidate that
             // snapshot under the lock before committing the request contract.
             let frozen = if configured_review {
-                load(&service, &id)?.model_resolution
+                let started = Instant::now();
+                let loaded = load(&service, &id);
+                timing::Phases::add(&mut timing.state_load_us, started);
+                loaded?.model_resolution
             } else {
                 None
             };
@@ -1650,8 +1690,15 @@ async fn forward_request(
                 }
                 history::expand(&service, namespace.as_ref().unwrap(), &mut body)?;
             }
+            timing.active_phase = "primary_lock_wait";
+            let started = Instant::now();
             lock = session_lock(&service, &id).await;
-            session = load(&service, &id)?;
+            timing::Phases::add(&mut timing.primary_lock_wait_us, started);
+            timing.active_phase = "preparation";
+            let started = Instant::now();
+            let loaded = load(&service, &id);
+            timing::Phases::add(&mut timing.state_load_us, started);
+            session = loaded?;
             if configured_review
                 && serde_json::to_value(&frozen).ok()
                     != serde_json::to_value(&session.model_resolution).ok()
@@ -1700,6 +1747,7 @@ async fn forward_request(
             // This single effective contract governs all downstream gates,
             // projection, reviewers and accounting for the primary attempt.
             service = Arc::new(effective);
+            timing.effective_service(service.clone());
             outbound = body.clone();
             break;
         }
@@ -1889,11 +1937,15 @@ async fn forward_request(
         if active {
             outbound["input"] = json!(session.render_primary());
         }
+        let started = Instant::now();
         let (mut candidate, mut report) = if active {
             plan(&service.config, &session, &outbound)
         } else {
             (None, Value::Null)
         };
+        if active {
+            timing::Phases::add(&mut timing.planning_us, started);
+        }
         let mut acquired = false;
         if active
             && service.config.mode == Mode::Compact
@@ -1919,7 +1971,11 @@ async fn forward_request(
                 ..ReviewRun::default()
             };
             let projection = planning::Projection::canonical(&session);
+            timing.active_phase = "blocking_review";
+            let started = Instant::now();
             run_review(&bounded, &id, &mut session, &projection, &mut run).await;
+            timing::Phases::add(&mut timing.blocking_review_us, started);
+            timing.active_phase = "preparation";
             session.background_review_pending = false;
             if run.accepted {
                 session.completed_review_len = session.history.len();
@@ -1942,7 +1998,9 @@ async fn forward_request(
             if run.accepted {
                 let _ = history::publish(&bounded, &session, &session);
             }
+            let started = Instant::now();
             (candidate, report) = plan(&service.config, &session, &outbound);
+            timing::Phases::add(&mut timing.planning_us, started);
             acquired = true;
             let _ = before;
         }
@@ -2154,7 +2212,7 @@ async fn forward_request(
             request = request.header(name, value);
         }
     }
-    let attempt = Attempt::start(
+    let mut attempt = Attempt::start(
         "primary",
         outbound["model"].as_str().unwrap_or(""),
         native,
@@ -2162,13 +2220,21 @@ async fn forward_request(
         service.config.model_resolution.as_ref().map(|p| &p.primary),
         carry::models::cache_write_tariff_known(&outbound),
     );
+    timing.preparation_done_us = Some(timing.elapsed_us());
+    timing.native_attempt_id = Some(attempt.id.clone());
     let response = if service.config.codex_login {
-        send_codex(&service, &endpoint, &outbound, false, None).await
+        send_codex(&service, &endpoint, &outbound, false, None, Some(timing)).await
     } else {
-        request.send().await.map_err(anyhow::Error::from)
+        timing.dispatch();
+        let response = request.send().await.map_err(anyhow::Error::from);
+        if let Ok(response) = &response {
+            timing.headers(response.status());
+        }
+        response
     };
     match response {
         Ok(upstream) => {
+            attempt.timing = phases.take();
             let success = upstream.status().is_success();
             let (converted, conversion) =
                 if service.config.codex_login && success && body["stream"] != true {
@@ -2200,6 +2266,7 @@ async fn forward_request(
             Ok(response)
         }
         Err(_) => {
+            let started = Instant::now();
             if let Some(mut commit) = commit {
                 commit.reviewed.last_failure = Some(json!({"at": now(),
                     "request_id": commit.request_id, "reason": "upstream transport or timeout"}));
@@ -2243,6 +2310,7 @@ async fn forward_request(
                 );
             }
             attempt.finish(None, "transport_or_timeout");
+            timing::Phases::add(&mut phases.as_mut().unwrap().settlement_us, started);
             Err(failure(
                 StatusCode::BAD_GATEWAY,
                 "upstream transport failed",
@@ -2708,6 +2776,12 @@ async fn review_chunk(
     view: &crate::proxy_state::ReviewedView,
     run: &mut ReviewRun,
 ) -> bool {
+    let review_attempt_id = logging::request_id();
+    let mut timing = timing::Phases::new(
+        Arc::new(service.clone()),
+        &run.request_id,
+        Some((id, &review_attempt_id, run.background)),
+    );
     let before_admission = session.clone();
     let mut request = service
         .client
@@ -2723,7 +2797,6 @@ async fn review_chunk(
     if let Some(key) = &service.classifier_key {
         request = request.bearer_auth(key);
     }
-    let review_attempt_id = logging::request_id();
     logging::journal_attempt(
         service,
         id,
@@ -2784,6 +2857,8 @@ async fn review_chunk(
     measurement.parent_request_id = Some(run.request_id.clone());
     measurement.at = dispatched_at;
     session.last_reviewer_dispatch = Some(measurement);
+    timing.preparation_done_us = Some(timing.elapsed_us());
+    timing.native_attempt_id = Some(attempt.id.clone());
     let observed = async {
         let response = if codex_reviewer {
             send_codex(
@@ -2792,12 +2867,14 @@ async fn review_chunk(
                 body,
                 true,
                 Some(&wire_log),
+                Some(&mut timing),
             )
             .await
         } else {
             match request.build() {
                 Ok(request) => {
                     logging::review_wire(service, &wire_log, &request, body, 0);
+                    timing.dispatch();
                     service
                         .client
                         .execute(request)
@@ -2810,19 +2887,22 @@ async fn review_chunk(
         match response {
             Ok(response) => {
                 let status = response.status();
+                if !codex_reviewer {
+                    timing.headers(status);
+                }
                 diagnostic["http_status"] = json!(status.as_u16());
                 if status.is_success() {
                     if codex_reviewer {
-                        observed_sse(response).await.ok().flatten()
+                        observed_sse(response, &mut timing).await.ok().flatten()
                     } else {
-                        bounded(response, 4 * 1024 * 1024)
+                        bounded_timed(response, 4 * 1024 * 1024, Some(&mut timing))
                             .await
                             .ok()
                             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                     }
                 } else {
                     // Private trace gets only bounded identifier tokens, never provider prose or raw bodies.
-                    if let Ok(bytes) = bounded(response, 16 * 1024).await
+                    if let Ok(bytes) = bounded_timed(response, 16 * 1024, Some(&mut timing)).await
                         && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
                     {
                         for (field, token) in crate::proxy_sse::safe_error(&value["error"])
@@ -2847,6 +2927,13 @@ async fn review_chunk(
     .await
     .ok()
     .flatten();
+    let settlement_started = Instant::now();
+    timing.active_phase = "settlement";
+    timing.outcome = if value.is_some() {
+        "observed"
+    } else {
+        "timeout_transport_or_http_error"
+    };
     let mut valid = false;
     finish_measurement(
         &mut session.last_reviewer_dispatch,
@@ -3051,6 +3138,10 @@ async fn review_chunk(
         "review_finished",
         &json!({"background":run.background,"valid":valid,"accepted_opinions":session.review_feedback["accepted_opinions"].as_u64(),"accepted_memories":session.review_feedback["accepted_memories"].as_u64(),"rejected_count":session.review_feedback["rejected_count"].as_u64()}),
     );
+    if timing.outcome == "observed" {
+        timing.outcome = if valid { "complete" } else { "invalid_review" };
+    }
+    timing::Phases::add(&mut timing.settlement_us, settlement_started);
     valid
 }
 
@@ -3129,6 +3220,7 @@ async fn send_codex(
     body: &Value,
     reviewer: bool,
     wire_log: Option<&logging::ReviewWire<'_>>,
+    mut timing: Option<&mut timing::Phases>,
 ) -> Result<reqwest::Response> {
     let home = service
         .config
@@ -3158,7 +3250,13 @@ async fn send_codex(
         if let Some(context) = wire_log {
             logging::review_wire(service, context, &request, body, attempt);
         }
+        if let Some(timing) = &mut timing {
+            timing.dispatch();
+        }
         let response = service.client.execute(request).await?;
+        if let Some(timing) = &mut timing {
+            timing.headers(response.status());
+        }
         if response.status() != StatusCode::UNAUTHORIZED || attempt == 1 {
             return Ok(response);
         }
@@ -3170,23 +3268,42 @@ async fn send_codex(
     unreachable!()
 }
 
-async fn observed_sse(mut response: reqwest::Response) -> Result<Option<Value>> {
+async fn observed_sse(
+    mut response: reqwest::Response,
+    timing: &mut timing::Phases,
+) -> Result<Option<Value>> {
     let mut observer = Observer::default();
     // Keep the existing request timeout and EOF/transport-failure policy. Only
     // a terminal response is retained; ignored deltas never share an aggregate cap.
     while let Some(chunk) = response.chunk().await? {
+        timing.first_body(&chunk);
         observer.feed(&chunk);
     }
+    timing.body_complete();
     Ok(observer.observed)
 }
 
-async fn bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+async fn bounded(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    bounded_timed(response, limit, None).await
+}
+
+async fn bounded_timed(
+    mut response: reqwest::Response,
+    limit: usize,
+    mut timing: Option<&mut timing::Phases>,
+) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
+        if let Some(timing) = &mut timing {
+            timing.first_body(&chunk);
+        }
         if bytes.len() + chunk.len() > limit {
             bail!("response observation limit exceeded");
         }
         bytes.extend_from_slice(&chunk);
+    }
+    if let Some(timing) = &mut timing {
+        timing.body_complete();
     }
     Ok(bytes)
 }
@@ -3628,6 +3745,7 @@ struct Attempt {
     standard: bool,
     resolved: Option<ResolvedModel>,
     write_tariff_known: bool,
+    timing: Option<timing::Phases>,
 }
 
 impl Attempt {
@@ -3653,6 +3771,7 @@ impl Attempt {
             standard,
             resolved: resolved.cloned(),
             write_tariff_known,
+            timing: None,
         };
         attempt.emit("started", json!({}));
         attempt
@@ -3744,7 +3863,7 @@ impl Attempt {
 async fn relay(
     mut upstream: reqwest::Response,
     commit: Option<Commit>,
-    attempt: Option<Attempt>,
+    mut attempt: Option<Attempt>,
     force_sse: bool,
     mut converted: Option<oneshot::Sender<Option<Value>>>,
 ) -> Response {
@@ -3757,6 +3876,7 @@ async fn relay(
             .is_some_and(|v| v.contains("text/event-stream"));
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
     tokio::spawn(async move {
+        let mut timing = attempt.as_mut().and_then(|attempt| attempt.timing.take());
         let mut observer = Observer::default();
         let mut json_observer = JsonObserver::default();
         let mut complete_transport = false;
@@ -3772,15 +3892,25 @@ async fn relay(
                 } => { stream_end = "client disconnected before completion"; break; },
                 chunk = upstream.chunk() => match chunk {
                     Ok(Some(chunk)) => {
+                        if let Some(timing) = &mut timing { timing.first_body(&chunk); }
                         if is_sse { observer.feed(&chunk); }
                         else { json_observer.feed(&chunk); }
                         if let Some(commit) = &commit
                             && commit.service.config.verbose {
                             logging::raw_chunk(&commit.service, &commit.id, chunk.as_ref());
                         }
-                        if converted.is_none() && sender.send(Ok(chunk)).await.is_err() { stream_end = "client disconnected before completion"; break; }
+                        if converted.is_none() {
+                            let started = Instant::now();
+                            let disconnected = sender.send(Ok(chunk)).await.is_err();
+                            if let Some(timing) = &mut timing { timing::Phases::add(&mut timing.relay_send_wait_us, started); }
+                            if disconnected { stream_end = "client disconnected before completion"; break; }
+                        }
                     }
-                    Ok(None) => { complete_transport = true; break; }
+                    Ok(None) => {
+                        complete_transport = true;
+                        if let Some(timing) = &mut timing { timing.body_complete(); }
+                        break;
+                    }
                     Err(_) => {
                         stream_end = "upstream stream error or timeout";
                         let _ = sender.send(Err(std::io::Error::other("upstream stream failed"))).await;
@@ -3788,6 +3918,19 @@ async fn relay(
                     }
                 }
             }
+        }
+        let settlement_started = Instant::now();
+        if let Some(timing) = &mut timing {
+            timing.active_phase = "settlement";
+            timing.outcome = if !status.is_success() {
+                "http_error"
+            } else if complete_transport {
+                "complete"
+            } else if stream_end == "client disconnected before completion" {
+                "client_disconnected"
+            } else {
+                "stream_error"
+            };
         }
         let mut converted_value = observer.completed;
         let sse_completed = converted_value.is_some();
@@ -4047,6 +4190,10 @@ async fn relay(
                 None
             });
         }
+        if let Some(timing) = &mut timing {
+            timing::Phases::add(&mut timing.settlement_us, settlement_started);
+        }
+        drop(timing);
     });
     let mut response = (status, Body::from_stream(ReceiverStream::new(receiver))).into_response();
     for (name, value) in &headers {
@@ -4105,6 +4252,7 @@ mod tests {
         config.state_dir = directory.to_path_buf();
         Service {
             catalog: Arc::new(tokio::sync::OnceCell::new()),
+            phase_sink: logging::PhaseSink::new(config.state_dir.clone()),
             _directory_lock: Arc::new(private_file(&directory.join(".lock"), true).unwrap()),
             config,
             client: reqwest::Client::new(),
@@ -4856,6 +5004,8 @@ mod tests {
     include!("proxy_noodle_tests.rs");
     include!("proxy_pr154_tests.rs");
     include!("proxy_log_controls.rs");
+    include!("proxy_timing_tests.rs");
+    include!("proxy_timing_repair_tests.rs");
     include!("proxy_admission_tests.rs");
     include!("proxy_dashboard_tests.rs");
 }
