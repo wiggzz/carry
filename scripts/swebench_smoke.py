@@ -620,11 +620,12 @@ def start_agent_network(*, identity: str, proxy_image: str, proxy_script: pathli
                     check=True, env=trusted_env, timeout=60)
             gateway_env = {key: value for key, value in os.environ.items()
                            if not key.startswith(("OPENAI_", "CARRY_PROXY_"))}
-            gateway_env.update(BENCHMARK_CONTEXT_PROXY="1", BENCHMARK_CLIENT_TOKEN=network["client_token"],
+            gateway_env.update(BENCHMARK_CONTROL_TOKEN=secrets.token_urlsafe(32),
+                               BENCHMARK_CONTEXT_PROXY="1", BENCHMARK_CLIENT_TOKEN=network["client_token"],
                                CARRY_PROXY_AUTH_TOKEN=auth, BENCHMARK_SESSION_ID=network["session_id"],
                                BENCHMARK_CONTEXT_HISTORY_POLICY=proxy_config["CARRY_PROXY_HISTORY_POLICY"],
                                BENCHMARK_SHADOW_TOKEN=shadow_token, BENCHMARK_CLASSIFIER_KEY=secret)
-            gateway_env_args = ["--network-alias", "openai-proxy", "--env", "BENCHMARK_CONTEXT_PROXY", "--env", "BENCHMARK_CLIENT_TOKEN",
+            gateway_env_args = ["--network-alias", "openai-proxy", "--env", "BENCHMARK_CONTROL_TOKEN", "--env", "BENCHMARK_CONTEXT_PROXY", "--env", "BENCHMARK_CLIENT_TOKEN",
                                 "--env", "CARRY_PROXY_AUTH_TOKEN", "--env", "BENCHMARK_SESSION_ID",
                                 "--env", "BENCHMARK_SHADOW_TOKEN", "--env", "BENCHMARK_CLASSIFIER_KEY",
                                 "--env", "BENCHMARK_CONTEXT_HISTORY_POLICY"]

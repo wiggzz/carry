@@ -133,14 +133,29 @@ function usageRecords(body) {
 
 function serve(options = {}) {
   const contextProxy = process.env.BENCHMARK_CONTEXT_PROXY === '1';
+  const trustedDirect = process.env.BENCHMARK_TRUSTED_DIRECT === '1';
+  if (trustedDirect && (contextProxy || !process.env.BENCHMARK_PROVIDER_KEY)) {
+    throw new Error('invalid trusted direct gateway configuration');
+  }
+  const trusted = contextProxy || trustedDirect;
   const historyPolicy = process.env.BENCHMARK_CONTEXT_HISTORY_POLICY ?? 'strict';
   if (contextProxy && !['strict', 'reset-on-divergence'].includes(historyPolicy)) {
     throw new Error('invalid trusted CARRY_PROXY_HISTORY_POLICY');
   }
   const primaryTransport = options.request || (contextProxy ? http.request : https.request);
   const shadowTransport = options.request || https.request;
+  let carrySession = process.env.BENCHMARK_SESSION_ID;
   const server = http.createServer((request, response) => {
     const parsed = parsedLocalUrl(request.url);
+    if (contextProxy && request.method === 'POST' && parsed?.pathname === '/benchmark/new-conversation') {
+      if (!process.env.BENCHMARK_CONTROL_TOKEN ||
+          request.headers.authorization !== `Bearer ${process.env.BENCHMARK_CONTROL_TOKEN}`) {
+        response.writeHead(401); response.end(); return;
+      }
+      carrySession = require('node:crypto').randomUUID();
+      console.log('BENCHMARK_CONVERSATION ' + JSON.stringify({session_id: carrySession}));
+      response.writeHead(204); response.end(); return;
+    }
     if (!isAllowedRequest(request.method, request.url) || !parsed) {
       response.writeHead(403, {'content-type': 'text/plain'});
       response.end('request target denied\n');
@@ -165,7 +180,7 @@ function serve(options = {}) {
     }
     const shadow = contextProxy && Boolean(process.env.BENCHMARK_SHADOW_TOKEN) &&
       request.headers.authorization === `Bearer ${process.env.BENCHMARK_SHADOW_TOKEN}`;
-    if (contextProxy && !shadow && (!process.env.BENCHMARK_CLIENT_TOKEN ||
+    if (trusted && !shadow && (!process.env.BENCHMARK_CLIENT_TOKEN ||
         request.headers.authorization !== `Bearer ${process.env.BENCHMARK_CLIENT_TOKEN}`)) {
       response.writeHead(401); response.end(); return;
     }
@@ -173,14 +188,14 @@ function serve(options = {}) {
       response.writeHead(403); response.end(); return;
     }
     const headers = cleanHeaders(request.headers);
-    if (contextProxy) {
+    if (trusted) {
       // Trusted per-slot identity. Never forward a caller-selected tenant or branch.
       for (const name of Object.keys(headers)) {
         if (name.startsWith('x-carry-')) delete headers[name];
       }
-      headers.authorization = `Bearer ${shadow ? process.env.BENCHMARK_CLASSIFIER_KEY : process.env.CARRY_PROXY_AUTH_TOKEN}`;
-      if (!shadow) {
-        headers['x-carry-session'] = process.env.BENCHMARK_SESSION_ID;
+      headers.authorization = `Bearer ${trustedDirect ? process.env.BENCHMARK_PROVIDER_KEY : shadow ? process.env.BENCHMARK_CLASSIFIER_KEY : process.env.CARRY_PROXY_AUTH_TOKEN}`;
+      if (contextProxy && !shadow) {
+        headers['x-carry-session'] = carrySession;
         headers['x-carry-tenant'] = 'benchmark';
         headers['x-carry-branch'] = 'main';
         headers['x-carry-history-policy'] = historyPolicy;
@@ -195,7 +210,7 @@ function serve(options = {}) {
     let nativeCompaction = parsed.pathname === '/v1/responses/compact';
     let ended = false;
     const emit = (event, extra = {}) => {
-      if (contextProxy) console.log('BENCHMARK_CONTEXT_EVENT ' + JSON.stringify({
+      if (trusted) console.log('BENCHMARK_CONTEXT_EVENT ' + JSON.stringify({
         actor, event, request_id: requestId, model, service_tier: serviceTier,
         native_compaction: nativeCompaction, ...extra,
       }));
@@ -236,7 +251,7 @@ function serve(options = {}) {
         upstreamResponse.on('aborted', () => { finish(null); response.destroy(); });
         upstreamResponse.on('end', () => {
           const body = Buffer.concat(chunks).toString('utf8');
-          if (contextProxy) {
+          if (trusted) {
             let nativeUsage = null;
             let toolCalls = null;
             if (!truncated) {
@@ -268,7 +283,7 @@ function serve(options = {}) {
             }
             finish(nativeUsage, {http_status: upstreamResponse.statusCode, tool_calls: toolCalls});
           }
-          if (!contextProxy && captured <= MAX_TELEMETRY_BYTES) {
+          if (!trusted && captured <= MAX_TELEMETRY_BYTES) {
             for (const usage of usageRecords(body)) {
               // Docker logs are outside the model-controlled agent container; retain
               // only aggregate provider accounting, never prompts or responses.

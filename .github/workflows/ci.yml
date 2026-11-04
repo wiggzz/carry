@@ -207,7 +207,7 @@ jobs:
         run: >-
           python3 -m unittest -v
           scripts/test_benchmark_progress.py
-          scripts/test_benchmark_comparison.py scripts/test_benchmark_direct.py
+          scripts/test_benchmark_comparison.py scripts/test_benchmark_direct.py scripts/test_slopcodebench_runtime_cli.py
           scripts/test_benchmark_preparation_telemetry.py
           scripts/test_benchmark_worker_diagnostics.py
           scripts/test_render_swebench_worker_user_data.py
