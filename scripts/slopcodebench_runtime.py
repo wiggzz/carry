@@ -431,7 +431,7 @@ def run_slot(contract, slot, prepared, output):
                     error = f'evidence failure: {caught}; previous: {error}'
                 finally:
                     try:
-                        swebench_smoke.stop_agent_network(network)
+                        swebench_smoke.cleanup_agent_network(network)
                     except Exception as caught:
                         error = f'cleanup failure: {caught}; previous: {error}'
     for checkpoint in slot['checkpoints']:

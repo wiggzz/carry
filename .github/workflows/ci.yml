@@ -238,18 +238,6 @@ jobs:
           scripts/test_run_python_integration.py
           scripts/test_install.py
 
-      - name: Official SCB report component contract (model-free, no Docker)
-        timeout-minutes: 5
-        run: |
-          python3 -m venv "$RUNNER_TEMP/scb-report-contract"
-          "$RUNNER_TEMP/scb-report-contract/bin/python" -m pip install 'pydantic==2.11.7'
-          curl --fail --location --max-time 30 --max-filesize 65536 \
-            'https://raw.githubusercontent.com/SprocketLab/slop-code-bench/af5a9cbc311605b5cceb80200ca9832bdff2d7b1/src/slop_code/evaluation/report.py' \
-            --output "$RUNNER_TEMP/scb-official-report.py"
-          SCB_OFFICIAL_REPORT_MODULE="$RUNNER_TEMP/scb-official-report.py" \
-            "$RUNNER_TEMP/scb-report-contract/bin/python" -B -m unittest -v \
-            scripts.test_benchmark_comparison scripts.test_slopcodebench
-
       - name: Verify preparation against pinned SWE-bench recipes
         run: |
           python3 -m venv "$RUNNER_TEMP/swebench-contract"
@@ -516,6 +504,12 @@ jobs:
           git rev-parse HEAD
           git -C .scb-upstream rev-parse HEAD
           sha256sum .scb-carry/carry
+      # The component contract uses the same Python 3.12 + frozen upstream lock
+      # as the full runner; ambient runner Python is not its dependency owner.
+      - name: Official SCB report component contract (model-free, no Docker)
+        env:
+          SCB_OFFICIAL_REPORT_MODULE: ${{ github.workspace }}/.scb-upstream/src/slop_code/evaluation/report.py
+        run: .scb-upstream/.venv/bin/python -B -m unittest -v scripts.test_benchmark_comparison scripts.test_slopcodebench
       - name: Actual official runner, native exec/retry, gold evaluator, containment and paired receipts
         env:
           CARRY_SCB_HOSTED_FIXTURE: '1'

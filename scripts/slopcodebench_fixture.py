@@ -51,11 +51,22 @@ RUN chmod 755 /usr/local/bin/codex /opt/swebench-harness/bin/carry
         shutil.copyfile(context/name, public_context/name)
     command(['docker', 'build', '--iidfile', str(iid), str(public_context)])
     agent = iid.read_text().strip()
-    dockerfile.write_text(f'''FROM {agent}
+    # BuildKit treats a config ID in FROM as a registry repository. A unique
+    # preparation-only local tag binds the already-built bytes; paid runtimes
+    # still consume only inspected config IDs and never build on a miss.
+    parent_tag = 'scb-fixture-parent:'+uuid.uuid4().hex
+    command(['docker', 'tag', agent, parent_tag])
+    parent_id = subprocess.check_output(['docker', 'image', 'inspect', '--format', '{{.Id}}', parent_tag], text=True).strip()
+    if parent_id != agent:
+        raise ValueError('fixture provider parent image identity mismatch')
+    dockerfile.write_text(f'''FROM {parent_tag}
 COPY provider.py /opt/provider.py
 COPY fixture-key.pem /opt/fixture-key.pem
 ''')
-    command(['docker', 'build', '--iidfile', str(root/'provider.iid'), str(context)])
+    try:
+        command(['docker', 'build', '--pull=false', '--iidfile', str(root/'provider.iid'), str(context)])
+    finally:
+        command(['docker', 'image', 'rm', parent_tag], capture_output=True)
     provider_image = (root/'provider.iid').read_text().strip()
     gateway_context = root/'gateway-context'; gateway_context.mkdir()
     shutil.copyfile(context/'fixture-cert.pem', gateway_context/'fixture-cert.pem')
@@ -154,11 +165,11 @@ class FixtureNetwork:
             return self.original(**kwargs, execute=execute)
         self.patch = patch.object(swebench_smoke, 'start_agent_network', start)
         self.patch.start()
-        original_stop = swebench_smoke.stop_agent_network
+        original_stop = swebench_smoke.cleanup_agent_network
         def stop(network, **kwargs):
             command(['docker', 'network', 'disconnect', network['egress'], self.name], capture_output=True)
             return original_stop(network, **kwargs)
-        self.stop_patch = patch.object(swebench_smoke, 'stop_agent_network', stop)
+        self.stop_patch = patch.object(swebench_smoke, 'cleanup_agent_network', stop)
         self.stop_patch.start()
         self.envpatch = patch.dict(os.environ, {'OPENAI_API_KEY': self.secret})
         self.envpatch.start()
