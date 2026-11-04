@@ -1739,6 +1739,7 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
                        codex_thread: str | None = None,
                        pi_session_dir: pathlib.Path | None = None,
                        carry_image: str | None = None) -> dict[str, Any]:
+    isolated_started = time.monotonic()
     identity = f"{instance_id}\0{harness}\0{output.resolve()}"
     active_proxy = os.environ.get("CARRY_PROXY_MODE", "disabled") != "disabled"
     trusted_receipts = active_proxy or os.environ.get("BENCHMARK_TRUSTED_DIRECT", "0") == "1"
@@ -1749,6 +1750,7 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
     network = start_agent_network(
         identity=identity, proxy_image=proxy_image, proxy_script=proxy_script, **network_kwargs,
     )
+    network_setup_seconds = time.monotonic() - isolated_started
     record = None
     try:
         client_kwargs = {"client_token": network["client_token"]} if trusted_receipts else {}
@@ -1762,6 +1764,8 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
             codex_session=codex_session, codex_thread=codex_thread,
             pi_session_dir=pi_session_dir, **client_kwargs,
         )
+        record['setup_seconds'] = network_setup_seconds
+        record['agent_seconds'] = record.get('elapsed_seconds')
         return record
     finally:
         try:
@@ -1777,6 +1781,8 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
                     record["proxy_session_id"] = network["session_id"]
         finally:
             cleanup_agent_network(network)
+            if record is not None:
+                record['isolated_agent_wall_seconds'] = time.monotonic() - isolated_started
 
 
 def agent_timed_out(error: BaseException) -> bool:
@@ -2194,6 +2200,12 @@ def _clone(repo: str, commit: str, destination: pathlib.Path, mirror: pathlib.Pa
         raise RuntimeError("task checkout contains Git objects unreachable from the base commit")
 
 
+def task_prompt(record: Mapping[str, Any]) -> str:
+    return ("Solve the issue below in the current repository. Work directly in the checkout, "
+            "run relevant tests when practical, and do not commit your changes.\n\n"
+            + record["problem_statement"] + "\n")
+
+
 def materialize(*, records: list[dict[str, Any]], selected_ids: list[str], root: pathlib.Path,
                 clone: Any = None, harnesses: tuple[str, ...] = HARNESSES) -> list[dict[str, Any]]:
     by_id = {record.get("instance_id"): record for record in records}
@@ -2229,12 +2241,7 @@ def materialize(*, records: list[dict[str, Any]], selected_ids: list[str], root:
             "base_commit": record["base_commit"], "problem_statement": record["problem_statement"],
         }
         (input_dir / "task.json").write_text(json.dumps(public, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        (input_dir / "task.md").write_text(
-            "Solve the issue below in the current repository. Work directly in the checkout, "
-            "run relevant tests when practical, and do not commit your changes.\n\n"
-            + record["problem_statement"] + "\n",
-            encoding="utf-8",
-        )
+        (input_dir / "task.md").write_text(task_prompt(record), encoding="utf-8")
         for harness in harnesses:
             clone_impl(record["repo"], record["base_commit"], task_root / harness / "repo")
         tasks.append(public)
@@ -2266,6 +2273,26 @@ def build_images(*, source: pathlib.Path, run_id: str, config: Mapping[str, str]
             "args": ["PACKAGE=@earendil-works/pi-coding-agent", f"PACKAGE_VERSION={validated['PI_VERSION']}"],
         },
     }
+    if config.get("PREPARED_HARNESS_IMAGES"):
+        payload = json.loads(pathlib.Path(config["PREPARED_HARNESS_IMAGES"]).read_text())
+        commit = config.get("SOURCE_COMMIT", "")
+        if not re.fullmatch(r"[0-9a-f]{40}", commit) or payload.get("source_commit") != commit:
+            raise ValueError("prepared harness source must match immutable SOURCE_COMMIT")
+        result = {}
+        for harness in harnesses:
+            spec = specifications[harness]
+            image = payload["images"][harness]
+            if (not re.fullmatch(r"sha256:[0-9a-f]{64}", image.get("image_id", ""))
+                    or image.get("base_resolved_digest") != spec["base"]
+                    or image.get("package_version") != spec["package_version"]
+                    or image.get("dockerfile_sha256") != hashlib.sha256(spec["dockerfile"].read_bytes()).hexdigest()):
+                raise ValueError(f"prepared {harness} harness pin/recipe/version mismatch")
+            inspected = execute(["docker", "image", "inspect", "--format", "{{.Id}}", image["image_id"]],
+                                check=True, text=True, capture_output=True, timeout=30)
+            if inspected.stdout.strip() != image["image_id"]:
+                raise ValueError(f"prepared {harness} image identity mismatch")
+            result[harness] = dict(image, tag=image["image_id"])
+        return result
     result = {}
     for harness in harnesses:
         spec = specifications[harness]

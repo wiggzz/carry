@@ -49,13 +49,15 @@ RUN chmod 755 /usr/local/bin/codex /opt/swebench-harness/bin/carry
     public_context = root/'agent-context'; public_context.mkdir()
     for name in ('codex.py', 'carry', 'fixture-cert.pem', 'Dockerfile'):
         shutil.copyfile(context/name, public_context/name)
-    command(['docker', 'build', '--iidfile', str(iid), str(public_context)])
-    agent = iid.read_text().strip()
+    parent_tag = 'scb-fixture-parent:'+uuid.uuid4().hex
+    command(['docker', 'build', '--tag', parent_tag, '--iidfile', str(iid), str(public_context)])
+    # With Docker's containerd store, --iidfile can contain the OCI index
+    # digest, not the local config ID accepted by inspect/run. Resolve .Id.
+    agent = subprocess.check_output(['docker', 'image', 'inspect', '--format', '{{.Id}}', parent_tag], text=True).strip()
     # BuildKit treats a config ID in FROM as a registry repository. A unique
     # preparation-only local tag binds the already-built bytes; paid runtimes
     # still consume only inspected config IDs and never build on a miss.
-    parent_tag = 'scb-fixture-parent:'+uuid.uuid4().hex
-    command(['docker', 'tag', agent, parent_tag])
+
     parent_id = subprocess.check_output(['docker', 'image', 'inspect', '--format', '{{.Id}}', parent_tag], text=True).strip()
     if parent_id != agent:
         raise ValueError('fixture provider parent image identity mismatch')
@@ -63,19 +65,18 @@ RUN chmod 755 /usr/local/bin/codex /opt/swebench-harness/bin/carry
 COPY provider.py /opt/provider.py
 COPY fixture-key.pem /opt/fixture-key.pem
 ''')
-    try:
-        command(['docker', 'build', '--pull=false', '--iidfile', str(root/'provider.iid'), str(context)])
-    finally:
-        command(['docker', 'image', 'rm', parent_tag], capture_output=True)
-    provider_image = (root/'provider.iid').read_text().strip()
+    provider_tag = 'scb-fixture-provider:'+uuid.uuid4().hex
+    command(['docker', 'build', '--pull=false', '--tag', provider_tag, '--iidfile', str(root/'provider.iid'), str(context)])
+    provider_image = subprocess.check_output(['docker', 'image', 'inspect', '--format', '{{.Id}}', provider_tag], text=True).strip()
     gateway_context = root/'gateway-context'; gateway_context.mkdir()
     shutil.copyfile(context/'fixture-cert.pem', gateway_context/'fixture-cert.pem')
     (gateway_context/'Dockerfile').write_text(f'''FROM {NODE_BASE}
 COPY fixture-cert.pem /opt/fixture-cert.pem
 ENV NODE_EXTRA_CA_CERTS=/opt/fixture-cert.pem
 ''')
-    command(['docker', 'build', '--iidfile', str(root/'gateway.iid'), str(gateway_context)])
-    gateway = (root/'gateway.iid').read_text().strip()
+    gateway_tag = 'scb-fixture-gateway:'+uuid.uuid4().hex
+    command(['docker', 'build', '--tag', gateway_tag, '--iidfile', str(root/'gateway.iid'), str(gateway_context)])
+    gateway = subprocess.check_output(['docker', 'image', 'inspect', '--format', '{{.Id}}', gateway_tag], text=True).strip()
     problem = root/'problems'/'synthetic_evolution'; (problem/'tests').mkdir(parents=True)
     (problem/'config.yaml').write_text('''name: synthetic_evolution
 version: 1
