@@ -436,3 +436,194 @@ fn heuristic_reporting_never_initiates_full_history_tokenization() {
     assert!(measured.known_estimate(&target, "route", None).is_none());
     assert_eq!(tokenized_bytes(), 0);
 }
+
+fn initial_occurrence_pool() -> (InputMeasurements, Value) {
+    let visible = json!({"role":"assistant","content":"repeated visible evidence ".repeat(30)});
+    let source = json!({"model":"gpt-6.1-sol","instructions":"fixed", "input":[
+        {"role":"user","content":"goal"},
+        {"type":"reasoning","summary":[],"encrypted_content":"synthetic-old-a".repeat(1000)},
+        visible.clone(), visible,
+        {"type":"reasoning","summary":[],"encrypted_content":"synthetic-old-b".repeat(1000)}]});
+    let mut measured = InputMeasurements::default();
+    measured.observe(&source, &json!({"input_tokens":10000}), "route", None, 100);
+    (measured, source)
+}
+
+#[test]
+fn initial_pool_counts_repeated_visible_occurrences_without_reusing_removal_credit() {
+    let (measured, anchor) = initial_occurrence_pool();
+    assert!(measured.blocks.is_empty());
+    let measured: InputMeasurements =
+        serde_json::from_value(serde_json::to_value(measured).unwrap()).unwrap();
+    let mut source = anchor.clone();
+    source["input"].as_array_mut().unwrap().push(json!({
+        "type":"reasoning","summary":[],"encrypted_content":"synthetic-fresh".repeat(1000)}));
+    let baseline = measured.forecast_estimate(&source, "route", None).unwrap();
+    assert_eq!(
+        baseline.basis,
+        EstimateBasis::ReceiptAnchoredReasoningForecast
+    );
+    assert!(baseline.tokens > 10000);
+    assert!(measured.predict(&source, "route", None).is_none());
+
+    // Independent occurrence oracle: every visible copy contributes weight,
+    // even though its value/tokenization is safely memoized by identity.
+    let weights = anchor["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| {
+            let chars = value["encrypted_content"]
+                .as_str()
+                .map_or(0, |s| s.chars().count());
+            (measured.visible_text_tokens(value) as u128) * 9_432_105_075
+                + (chars as u128) * 432_732_920
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(weights[2], weights[3]);
+    let sum: u128 = weights.iter().sum();
+    let budget = 10000 - measured.visible_text_tokens(&crate::savings::prompt_overhead(&source));
+    let available = anchor["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| (identity(value), value.clone()))
+        .collect();
+    let (pool, pool_budget) = measured.unmeasured_pool(&available, &source).unwrap();
+    assert_eq!(
+        pool.len(),
+        5,
+        "pool cardinality is occurrences, not unique hashes"
+    );
+    assert_eq!(
+        pool.iter()
+            .filter(|id| **id == identity(&anchor["input"][2]))
+            .count(),
+        2
+    );
+    assert_eq!(pool_budget, budget);
+    let mut forecasts = Vec::new();
+    for removed_copies in 0..=2 {
+        let mut target = source.clone();
+        target["input"].as_array_mut().unwrap().remove(1);
+        for _ in 0..removed_copies {
+            target["input"].as_array_mut().unwrap().remove(1);
+        }
+        let projected = measured
+            .projected_estimate(&target, &source, "route", None)
+            .expect("unmeasured visible occurrences cannot veto calibrated old reasoning removal");
+        let selected = weights[1] + (removed_copies as u128) * weights[2];
+        let credit = ((budget as u128) * selected / (2 * sum)) as u64;
+        assert_eq!(projected.tokens, baseline.tokens - credit);
+        assert!(
+            credit <= budget / 2,
+            "retained occurrences cannot donate their budget"
+        );
+        assert_eq!(
+            projected.basis,
+            EstimateBasis::ReceiptAnchoredReasoningForecast
+        );
+        assert!(measured.predict(&target, "route", None).is_none());
+        assert!(
+            measured
+                .restoration(&source, &target, "route", None)
+                .is_none()
+        );
+        forecasts.push(projected.tokens);
+    }
+    assert!(forecasts.windows(2).all(|pair| pair[0] > pair[1]));
+}
+
+#[test]
+fn repeated_visible_pool_preserves_complete_native_block_budget() {
+    let (mut measured, source) = initial_occurrence_pool();
+    let mut target = source.clone();
+    target["input"].as_array_mut().unwrap().remove(1);
+    let original = measured
+        .projected_estimate(&target, &source, "route", None)
+        .unwrap();
+    let image =
+        json!({"role":"user","content":[{"type":"input_image","image_url":"synthetic-native"}]});
+    let mut appended = source.clone();
+    appended["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(image.clone());
+    measured.observe(
+        &appended,
+        &json!({"input_tokens":60000}),
+        "route",
+        None,
+        101,
+    );
+    assert_eq!(measured.blocks.len(), 1);
+    assert_eq!(measured.blocks[0].input, 50000);
+    target["input"].as_array_mut().unwrap().push(image);
+    assert_eq!(
+        measured
+            .projected_estimate(&target, &appended, "route", None)
+            .unwrap()
+            .tokens,
+        original.tokens + 50000
+    );
+}
+
+#[test]
+fn filtered_older_block_recalibrates_repeated_visible_pool_without_reusing_old_budget() {
+    let (_, expanded) = initial_occurrence_pool();
+    let mut initial = expanded.clone();
+    initial["input"].as_array_mut().unwrap().truncate(1);
+    let mut measured = InputMeasurements::default();
+    measured.observe(&initial, &json!({"input_tokens":1000}), "route", None, 99);
+    measured.observe(
+        &expanded,
+        &json!({"input_tokens":10000}),
+        "route",
+        None,
+        100,
+    );
+    let mut filtered = expanded.clone();
+    filtered["input"].as_array_mut().unwrap().remove(1);
+    measured.observe(&filtered, &json!({"input_tokens":6000}), "route", None, 101);
+    let measured: InputMeasurements =
+        serde_json::from_value(serde_json::to_value(measured).unwrap()).unwrap();
+    let mut target = filtered.clone();
+    target["input"].as_array_mut().unwrap().pop();
+    let forecast = measured
+        .projected_estimate(&target, &filtered, "route", None)
+        .unwrap();
+    assert!(
+        (3000..6000).contains(&forecast.tokens),
+        "an incomplete old 9000-token block cannot donate its budget: {forecast:?}"
+    );
+}
+
+#[test]
+fn duplicate_opaque_pool_members_remain_ambiguous_even_when_another_identity_changes() {
+    let (_, mut source) = initial_occurrence_pool();
+    let duplicate = source["input"][1].clone();
+    source["input"].as_array_mut().unwrap().insert(2, duplicate);
+    let mut measured = InputMeasurements::default();
+    measured.observe(&source, &json!({"input_tokens":10000}), "route", None, 100);
+    // Remove a distinct opaque identity: changes() alone cannot reject the
+    // retained duplicate opaque members, so the pool must still fence them.
+    let mut distinct = source.clone();
+    distinct["input"].as_array_mut().unwrap().pop();
+    assert!(
+        measured
+            .projected_estimate(&distinct, &source, "route", None)
+            .is_none()
+    );
+    // Changing one duplicate is independently refused by changes().
+    let mut duplicate = source.clone();
+    duplicate["input"].as_array_mut().unwrap().remove(1);
+    assert!(
+        measured
+            .projected_estimate(&duplicate, &source, "route", None)
+            .is_none()
+    );
+    assert_eq!(
+        measured.predict(&source, "route", None).unwrap().tokens,
+        10000
+    );
+}

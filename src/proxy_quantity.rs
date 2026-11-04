@@ -785,7 +785,10 @@ impl InputMeasurements {
             if covered {
                 continue;
             }
-            if pool.contains(&item.identity) {
+            // Visible identities share a weight, not an occurrence: every copy
+            // stays in the denominator and allocation consumes changed matches
+            // injectively. Opaque duplicates still have ambiguous native extent.
+            if item.opaque && pool.contains(&item.identity) {
                 return None;
             }
             let value = available.get(&item.identity)?;
