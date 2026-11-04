@@ -2255,7 +2255,7 @@ const REVIEW_INSTRUCTIONS: &str = r#"Your role is to decide which parts of the f
 
 Read native conversation items, including encrypted reasoning, as evidence. Each source-group index covers an atomic source group: a completed tool step couples assistant reasoning, text and calls with the resulting tool outputs, and parallel calls may share one group. A [carry context] annotation identifies the preceding source group. Use the final ledger's current_groups for membership and existing opinions. Source-group indices and memory indices are JSON integers in one shared space for this review only. Only indices in eligible_group_ids or eligible_memory_ids may appear in protected/removable. Never split a coupled group. Omission leaves its current opinion unchanged.
 
-Use protected when any part contains valuable learnings, decisions or outcomes, including failures and negative results. Use removable to release groups after their learnings are preserved elsewhere or are no longer relevant. Never put the same ID in both lists.
+Use protected when any part contains valuable learnings, decisions or outcomes, including failures and negative results. Use removable to release groups after their learnings are preserved elsewhere or are no longer relevant. Never put the same ID in both lists. The ledger's reminder_group_ids highlights a small rotating set of previously reviewed sources to reconsider alongside new history. A reminder is not removal permission: explicitly keep what is still needed or mark it removable only when justified. Silence leaves all existing opinions unchanged.
 
 Prioritize the most recent items in the transcript. For recently completed eligible steps, protect information that still may be needed and has not been preserved elsewhere; otherwise the primary may need to repeat work. Reconsider earlier protection in successive reviews: it is not permanent merely because an earlier review needed the source. Earlier items may become removable as the task progresses, once their useful information is preserved elsewhere or no longer needed. Removable authorizes omission from disposable request views, not deletion from original history. Recency alone does not make still-relevant older constraints, decisions or negative results disposable. A search that finds nothing is meaningful negative evidence. A failed tool call can explain an important constraint or a recovery decision; preserve that learning.
 
@@ -2292,7 +2292,7 @@ fn review_body_for_view(
     projection: &planning::Projection,
     view: &crate::proxy_state::ReviewedView,
 ) -> Value {
-    let groups = view.groups().collect::<Vec<_>>();
+    let groups = view.groups().cloned().collect::<Vec<_>>();
     let mut input = Vec::new();
     let instructions = primary_direction(&session.review_context);
     if !instructions.is_null() {
@@ -2352,6 +2352,7 @@ fn review_body_for_view(
         }
     }
     let ledger = json!({
+        "reminder_group_ids":admission::reminders(session, &groups),
         "eligible_group_ids":groups.iter().filter(|g|g.exposed && !g.pinned && g.replayable).map(|g|g.id).collect::<Vec<_>>(),
         "current_groups":groups.iter().map(|g|json!({"group_id":g.id,"member_ids":g.members,"opinion":session.opinions.get(&g.id)})).collect::<Vec<_>>(),
         "retained_source_groups":view.references.iter().filter_map(|(index,r)| match r { crate::proxy_state::ReviewReference::Source {group,visible:false} => Some(json!({"group_id":index,"member_ids":group.members})),_=>None }).collect::<Vec<_>>(),

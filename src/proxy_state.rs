@@ -155,6 +155,9 @@ pub(super) struct ClientProvenance {
 pub(super) struct ReviewAdmission {
     pub source_ids: BTreeSet<u64>,
     pub no_yield_streak: u32,
+    /// Last native group reminded on a completed review, not a planning preview.
+    #[serde(default)]
+    pub reminder_cursor: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

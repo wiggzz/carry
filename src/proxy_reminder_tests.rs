@@ -143,3 +143,231 @@ async fn old_protected_reminders_rotate_on_real_reviews_without_releasing_silent
     );
     provider.abort();
 }
+
+// Acceptance controls for the unchanged scheduler and background publication.
+#[tokio::test]
+async fn reminders_preserve_background_failure_pending_and_explicit_cohort_authority() {
+    let (sender, mut captures) = tokio::sync::mpsc::unbounded_channel();
+    let router = Router::new().route("/review", post(move |axum::Json(body): axum::Json<Value>| {
+        let sender = sender.clone();
+        async move {
+            let (reply, response) = oneshot::channel::<Option<Value>>();
+            sender.send((body, reply)).unwrap();
+            match response.await.unwrap() {
+                Some(advice) => axum::Json(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":advice.to_string()}]}],"usage":{"input_tokens":100,"output_tokens":7}})).into_response(),
+                None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/review", listener.local_addr().unwrap());
+    let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let make_service = || {
+        let mut service = checkpoint_service(directory.path());
+        service.config.classifier_url = Some(url.clone());
+        service.config.review_every_requests = 1;
+        service.config.review_min_primary_tokens = 0;
+        service.config.review_min_new_tokens = 0;
+        service.config.review_backoff_factor = 1;
+        service
+    };
+    let mut service = Arc::new(make_service());
+    let id = "reminder-background";
+    let mut session = reminder_subject();
+    session.history_shared = true;
+    // Staged completed coverage/advice; the first tracer separately obtains
+    // protection and coverage from an actual completed HTTP review.
+    let groups = session.groups();
+    let eligible = groups
+        .iter()
+        .filter(|g| !g.human && !g.pinned && g.replayable)
+        .cloned()
+        .collect::<Vec<_>>();
+    session.apply_advice(&groups, &json!({"protected":eligible.iter().map(|g| g.id).collect::<Vec<_>>(),"removable":[],"memories":[]})).unwrap();
+    admission::cover(&mut session, &groups);
+    history::publish(&service, &session, &session).unwrap();
+    save(&service, id, &session).unwrap();
+    let old_canonical = session.render_primary();
+    let first =
+        reminder_ledger(&review_body(&service.config, &session))["reminder_group_ids"].clone();
+    assert_eq!(first.as_array().unwrap().len(), 4);
+    // Cadence and oversized preparation must not consume the next batch.
+    let projection = planning::Projection::canonical(&session);
+    dispatch_review_for(
+        service.clone(),
+        id.into(),
+        &mut session,
+        projection,
+        "not-due".into(),
+    )
+    .await;
+    assert!(!session.background_review_pending && captures.try_recv().is_err());
+    session.completed_requests += 1;
+    let mut tiny = make_service();
+    tiny.config.classifier_max_input_tokens = 1;
+    let mut run = ReviewRun::default();
+    let projection = planning::Projection::canonical(&session);
+    assert!(!run_review(&tiny, id, &mut session, &projection, &mut run).await);
+    assert_eq!(
+        reminder_ledger(&review_body(&service.config, &session))["reminder_group_ids"],
+        first
+    );
+    assert_eq!(session.shadow.calls, 0);
+    assert!(captures.try_recv().is_err());
+    let mut dropped = HashSet::new();
+    for round in 0..5 {
+        // Restart the actual service and reload separate indexed advice.
+        service = Arc::new(make_service());
+        save(&service, id, &session).unwrap();
+        session = load_existing(&service, id).unwrap();
+        if let Some(record) =
+            history::advice(&service, "reminder-fixture", &session.render_primary()).unwrap()
+        {
+            record.apply(&mut session);
+        }
+        observe_source(&mut session, &format!("new task direction {round}"));
+        session.completed_requests += 1;
+        let before = session.render_primary();
+        let prospective = review_body(&service.config, &session);
+        let batch = reminder_ledger(&prospective)["reminder_group_ids"].clone();
+        assert!(
+            batch
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|v| !dropped.contains(&v.as_u64().unwrap()))
+        );
+        if round < 2 {
+            assert_eq!(batch, first, "a failed review retries its batch");
+        }
+        let projection = planning::Projection::canonical(&session);
+        dispatch_review_for(
+            service.clone(),
+            id.into(),
+            &mut session,
+            projection,
+            format!("round-{round}"),
+        )
+        .await;
+        let (wire, reply) = tokio::time::timeout(Duration::from_secs(5), captures.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(wire, prospective);
+        assert!(
+            wire["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == before.last().unwrap()),
+            "ordinary new history remains visible beside reminders"
+        );
+        let pending_body = review_body(&service.config, &session);
+        let projection = planning::Projection::canonical(&session);
+        dispatch_review_for(
+            service.clone(),
+            id.into(),
+            &mut session,
+            projection,
+            "pending".into(),
+        )
+        .await;
+        assert!(captures.try_recv().is_err());
+        assert_eq!(review_body(&service.config, &session), pending_body);
+        // Advance the live owner while advice is in flight. Its source must
+        // not retarget the captured batch or get erased at settlement.
+        observe_source(&mut session, &format!("arrived during review {round}"));
+        save(&service, id, &session).unwrap();
+        if round == 0 {
+            reply.send(None).unwrap();
+        } else {
+            let ids = batch.as_array().unwrap();
+            let keeps = vec![ids[0].clone()];
+            let mut removals = ids[1..].to_vec();
+            // Human context is never a reminder, but explicit retirement of an
+            // older human group remains supported by the existing owner.
+            if round == 1 {
+                removals.push(json!(2));
+            }
+            let pinned = session
+                .groups()
+                .into_iter()
+                .find(|g| !g.replayable)
+                .unwrap()
+                .id;
+            removals.push(json!(pinned)); // must be rejected, not authorized
+            reply
+                .send(Some(
+                    json!({"protected":keeps,"removable":removals,"memories":[]}),
+                ))
+                .unwrap();
+            dropped.extend(ids[1..].iter().map(|v| v.as_u64().unwrap()));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while service.background_reviews.lock().await.contains(id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        session = load_existing(&service, id).unwrap();
+        assert!(!session.background_review_pending);
+        assert_eq!(session.shadow.calls, round + 1);
+        assert_eq!(session.shadow.input_tokens, round * 100);
+        if let Some(record) =
+            history::advice(&service, "reminder-fixture", &session.render_primary()).unwrap()
+        {
+            record.apply(&mut session);
+        }
+        assert_eq!(
+            &session.render_primary()[..old_canonical.len()],
+            old_canonical.as_slice()
+        );
+        assert_eq!(
+            session.render_primary().last().unwrap()["content"],
+            format!("arrived during review {round}")
+        );
+        for group in &eligible {
+            assert_eq!(session.drop_authorized(group), dropped.contains(&group.id));
+        }
+        assert!(
+            session
+                .groups()
+                .iter()
+                .filter(|g| g.pinned || !g.replayable)
+                .all(|g| !session.drop_authorized(g))
+        );
+        if round > 0 {
+            let human = session.groups().into_iter().find(|g| g.id == 2).unwrap();
+            assert!(
+                session.drop_authorized(&human),
+                "explicit human retirement is unchanged"
+            );
+        }
+        let omitted = session
+            .groups()
+            .iter()
+            .filter(|g| session.drop_authorized(g))
+            .flat_map(|g| g.members.iter().copied())
+            .collect::<HashSet<_>>();
+        let selected = session.render_projection(&omitted);
+        for group in &eligible {
+            for member in &group.members {
+                let value = &session
+                    .history
+                    .iter()
+                    .find(|i| i.id == *member)
+                    .unwrap()
+                    .value;
+                assert_eq!(
+                    selected.contains(value),
+                    !dropped.contains(&group.id),
+                    "explicit drops still authorize only complete reviewed cohorts"
+                );
+            }
+        }
+    }
+    assert!(captures.try_recv().is_err());
+    provider.abort();
+}
