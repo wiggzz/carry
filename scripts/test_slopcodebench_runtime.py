@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 import unittest
 from unittest.mock import patch
 
@@ -84,6 +85,66 @@ class OfficialProtectedRuntimeTests(unittest.TestCase):
         with patch.object(runtime, 'verify_checkout', side_effect=ValueError('wrong source')):
             with self.assertRaisesRegex(ValueError, 'wrong source'):
                 runtime.preflight(self.contract, self.prepared)
+
+    def test_readiness_cannot_authorize_a_different_official_policy(self):
+        runtime.prepare_readiness(self.contract, self.prepared)
+        changed = copy.deepcopy(self.contract)
+        changed['settings']['scb_pass_policy'] = 'all-cases'
+        with self.assertRaisesRegex(ValueError, 'readiness'):
+            runtime.preflight(changed, self.prepared, verify_sources=False)
+
+    def test_late_owned_reviewer_completion_reconciles_to_first_checkpoint(self):
+        contract, prepared = copy.deepcopy(self.contract), self.prepared
+        contract['proxy']['CARRY_PROXY_CLASSIFIER_MODEL'] = 'gpt-6.1-sol'
+        slot = next(s for s in comparison.build_plan(contract)['slots'] if s['name'] == 'compact')
+        original_capture = runtime.proxy_benchmark.capture_evidence
+        captures, child = [], None
+        def capture(network):
+            nonlocal child
+            if not captures:
+                script = """fetch('http://127.0.0.1:8080/v1/responses', {
+                  method:'POST', headers:{authorization:'Bearer '+process.env.BENCHMARK_SHADOW_TOKEN,
+                    'content-type':'application/json','x-fixture-held-reviewer':'1'},
+                  body:JSON.stringify({model:'gpt-6.1-sol',input:'owned delayed reviewer'})})
+                  .then(async r=>{if(!r.ok)process.exit(1); console.log(await r.text())}).catch(()=>process.exit(1));"""
+                child = subprocess.Popen(['docker', 'exec', network['proxy'], 'node', '-e', script],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                deadline = time.monotonic()+10
+                while True:
+                    summary = original_capture(network)
+                    events = [json.loads(l) for l in (Path(network['state_dir'])/'benchmark-events.jsonl').read_text().splitlines()]
+                    shadow = [e for e in events if e.get('actor') == 'shadow']
+                    if shadow:
+                        self.assertEqual([e['event'] for e in shadow], ['started'])
+                        break
+                    self.assertLess(time.monotonic(), deadline, 'owned shadow start not observed')
+                    time.sleep(.05)
+            else:
+                release = """fetch('https://api.openai.com/fixture/release-reviewer', {
+                  headers:{authorization:'Bearer '+process.env.BENCHMARK_CLASSIFIER_KEY}})
+                  .then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1));"""
+                subprocess.run(['docker', 'exec', network['proxy'], 'node', '-e', release], check=True, timeout=10)
+                stdout, stderr = child.communicate(timeout=10)
+                self.assertEqual(child.returncode, 0, stderr)
+                self.assertEqual(json.loads(stdout)['usage']['input_tokens'], 30)
+                summary = original_capture(network)
+            captures.append(summary)
+            return summary
+        try:
+            with fixture.FixtureNetwork(self.provider), patch.object(runtime.proxy_benchmark, 'capture_evidence', side_effect=capture):
+                rows = runtime.run_slot(contract, slot, prepared, self.root/'late-reviewer')
+        finally:
+            if child is not None and child.poll() is None:
+                child.kill(); child.communicate(timeout=10)
+        flattened = [e for row in rows for e in row['events']]
+        summary = runtime.proxy_benchmark.summarize_events(flattened)
+        self.assertTrue(summary['ledger_complete'], json.dumps(rows, indent=2))
+        self.assertIsNotNone(summary['estimated_total_cost_usd'])
+        self.assertEqual(summary['shadow']['completed_requests'], 1)
+        self.assertGreater(summary['shadow']['observed_cost_usd'], 0)
+        self.assertEqual(summary['primary']['completed_requests'], 3)
+        self.assertEqual([e['event'] for e in rows[0]['events'] if e.get('actor') == 'shadow'], ['started', 'completed'])
+        self.assertFalse([e for e in rows[1]['events'] if e.get('actor') == 'shadow'])
 
 
 if __name__ == '__main__':

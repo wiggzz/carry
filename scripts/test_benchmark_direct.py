@@ -9,6 +9,32 @@ from scripts import swebench_smoke as worker
 
 
 class TrustedDirectTests(unittest.TestCase):
+    def test_protected_tokens_cannot_select_another_model(self):
+        import json
+        from scripts.test_proxy_gateway import Provider
+        from scripts.proxy_gateway_fixture_support import Gateway
+        for direct in (True, False):
+            with self.subTest(direct=direct), Provider() as provider:
+                gateway = Gateway(provider.server.server_port, provider.server.server_port,
+                    direct=direct, expected_models=('gpt-6-luna', 'gpt-6.1-sol'))
+                try:
+                    cases = [('fixture-client', value) for value in (None, '', 'unknown', 'gpt-6.1-sol')]
+                    if not direct:
+                        cases += [('fixture-shadow', value) for value in (None, '', 'unknown', 'gpt-6-luna')]
+                    for token, model in cases:
+                        status, _ = gateway.request(json.dumps({'model': model, 'input': []}).encode(), token=token)
+                        self.assertEqual(status, 403, (direct, token, model))
+                    self.assertEqual(provider.calls, [], 'denied models must never open upstream transport')
+                    body = b' {"model":"gpt-6-luna", "input":[]} '
+                    self.assertEqual(gateway.request(body)[0], 200)
+                    self.assertEqual(provider.calls[-1]['body'], body)
+                    if not direct:
+                        shadow = b'{"model":"gpt-6.1-sol","input":[]}'
+                        self.assertEqual(gateway.request(shadow, token='fixture-shadow')[0], 200)
+                        self.assertEqual(provider.calls[-1]['body'], shadow)
+                finally:
+                    gateway.close()
+
     def test_direct_uses_scoped_token_and_trusted_ledger_without_sidecar(self):
         calls = []
         def execute(argv, **kwargs):

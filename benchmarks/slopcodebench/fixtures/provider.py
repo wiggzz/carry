@@ -2,16 +2,29 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import ssl
+import threading
 import uuid
+
+release_reviewer = threading.Event()
 
 
 class Provider(BaseHTTPRequestHandler):
+    def do_GET(self):
+        import os
+        assert self.headers.get('Authorization') == 'Bearer '+os.environ['FIXTURE_EXPECTED_KEY']
+        assert self.path == '/fixture/release-reviewer'
+        release_reviewer.set()
+        self.send_response(200); self.end_headers()
+
     def do_POST(self):
         import os
         assert self.headers.get('Authorization') == 'Bearer '+os.environ['FIXTURE_EXPECTED_KEY']
         payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         # Fail rather than pretend to implement a paid reviewer response.
-        assert payload.get('model') == 'gpt-6-luna'
+        held = self.headers.get('x-fixture-held-reviewer') == '1'
+        assert payload.get('model') == ('gpt-6.1-sol' if held else 'gpt-6-luna')
+        if held:
+            assert release_reviewer.wait(60), 'owned reviewer release deadline'
         data = {'id': 'resp_'+uuid.uuid4().hex, 'object': 'response', 'status': 'completed',
                 'model': payload['model'],
                 'output': [{'id': 'msg_'+uuid.uuid4().hex, 'type': 'message', 'status': 'completed',
