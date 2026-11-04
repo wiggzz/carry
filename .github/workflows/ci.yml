@@ -207,6 +207,7 @@ jobs:
         run: >-
           python3 -m unittest -v
           scripts/test_benchmark_progress.py
+          scripts/test_benchmark_comparison.py scripts/test_benchmark_direct.py
           scripts/test_benchmark_preparation_telemetry.py
           scripts/test_benchmark_worker_diagnostics.py
           scripts/test_render_swebench_worker_user_data.py
@@ -236,6 +237,18 @@ jobs:
           scripts/test_ci_workflow.py
           scripts/test_run_python_integration.py
           scripts/test_install.py
+
+      - name: Official SCB report component contract (model-free, no Docker)
+        timeout-minutes: 5
+        run: |
+          python3 -m venv "$RUNNER_TEMP/scb-report-contract"
+          "$RUNNER_TEMP/scb-report-contract/bin/python" -m pip install 'pydantic==2.11.7'
+          curl --fail --location --max-time 30 --max-filesize 65536 \
+            'https://raw.githubusercontent.com/SprocketLab/slop-code-bench/af5a9cbc311605b5cceb80200ca9832bdff2d7b1/src/slop_code/evaluation/report.py' \
+            --output "$RUNNER_TEMP/scb-official-report.py"
+          SCB_OFFICIAL_REPORT_MODULE="$RUNNER_TEMP/scb-official-report.py" \
+            "$RUNNER_TEMP/scb-report-contract/bin/python" -B -m unittest -v \
+            scripts.test_benchmark_comparison scripts.test_slopcodebench
 
       - name: Verify preparation against pinned SWE-bench recipes
         run: |

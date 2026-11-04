@@ -12,12 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Gateway:
-    def __init__(self, carry_port, provider_port, policy=None, *, module_path=None):
+    def __init__(self, carry_port, provider_port, policy=None, *, module_path=None, direct=False):
         env = {k:v for k,v in os.environ.items() if not k.startswith(('OPENAI_', 'CARRY_PROXY_', 'BENCHMARK_'))}
         env.update(BENCHMARK_CONTEXT_PROXY='1', BENCHMARK_CLIENT_TOKEN='fixture-client',
             CARRY_PROXY_AUTH_TOKEN='fixture-trusted', BENCHMARK_SESSION_ID='fixture-session',
             BENCHMARK_SHADOW_TOKEN='fixture-shadow', BENCHMARK_CLASSIFIER_KEY='fixture-shadow-provider',
             FIXTURE_CARRY_PORT=str(carry_port), FIXTURE_PROVIDER_PORT=str(provider_port))
+        if direct:
+            env.update(BENCHMARK_CONTEXT_PROXY='0', BENCHMARK_TRUSTED_DIRECT='1',
+                       BENCHMARK_PROVIDER_KEY='fixture-direct-provider')
         if policy is not None:
             env['BENCHMARK_CONTEXT_HISTORY_POLICY'] = policy
         script = "const s=require(process.argv[1]).serve({port:0,host:'127.0.0.1'}); s.on('listening',()=>console.log('PORT '+s.address().port)); process.on('SIGTERM',()=>s.close(()=>process.exit(0)));"

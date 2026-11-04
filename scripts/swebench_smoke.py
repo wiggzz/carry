@@ -578,6 +578,11 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
 def start_agent_network(*, identity: str, proxy_image: str, proxy_script: pathlib.Path,
                         execute: Any = subprocess.run, carry_image: str | None = None,
                         state_dir: pathlib.Path | None = None) -> dict[str, str]:
+    trusted_direct = os.environ.get("BENCHMARK_TRUSTED_DIRECT", "0")
+    if trusted_direct not in {"0", "1"}:
+        raise ValueError("BENCHMARK_TRUSTED_DIRECT must be 0 or 1")
+    if trusted_direct == "1" and os.environ.get("CARRY_PROXY_MODE", "disabled") != "disabled":
+        raise ValueError("trusted direct requires disabled proxy mode")
     digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
     network = {
         "internal": f"carry-agent-internal-{digest}",
@@ -623,6 +628,23 @@ def start_agent_network(*, identity: str, proxy_image: str, proxy_script: pathli
                                 "--env", "CARRY_PROXY_AUTH_TOKEN", "--env", "BENCHMARK_SESSION_ID",
                                 "--env", "BENCHMARK_SHADOW_TOKEN", "--env", "BENCHMARK_CLASSIFIER_KEY",
                                 "--env", "BENCHMARK_CONTEXT_HISTORY_POLICY"]
+            gateway_kwargs = {"env": gateway_env}
+        if trusted_direct == "1":
+            import secrets
+            if state_dir is None:
+                raise ValueError("trusted direct requires a trusted receipt directory")
+            secret = os.environ.get("OPENAI_API_KEY")
+            if not secret:
+                raise ValueError("trusted direct requires the provider credential")
+            state_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
+            network.update(client_token=secrets.token_urlsafe(32), session_id=secrets.token_hex(16),
+                           state_dir=str(state_dir.resolve()))
+            gateway_env = {key: value for key, value in os.environ.items()
+                           if not key.startswith(("OPENAI_", "CARRY_PROXY_", "BENCHMARK_"))}
+            gateway_env.update(BENCHMARK_TRUSTED_DIRECT="1", BENCHMARK_CLIENT_TOKEN=network["client_token"],
+                               BENCHMARK_PROVIDER_KEY=secret)
+            gateway_env_args = ["--env", "BENCHMARK_TRUSTED_DIRECT", "--env", "BENCHMARK_CLIENT_TOKEN",
+                                "--env", "BENCHMARK_PROVIDER_KEY"]
             gateway_kwargs = {"env": gateway_env}
         execute(
             [
@@ -1718,8 +1740,9 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
                        carry_image: str | None = None) -> dict[str, Any]:
     identity = f"{instance_id}\0{harness}\0{output.resolve()}"
     active_proxy = os.environ.get("CARRY_PROXY_MODE", "disabled") != "disabled"
+    trusted_receipts = active_proxy or os.environ.get("BENCHMARK_TRUSTED_DIRECT", "0") == "1"
     network_kwargs = {}
-    if active_proxy:
+    if trusted_receipts:
         network_kwargs = {"carry_image": carry_image,
                           "state_dir": output.with_name(output.name + "-proxy-state")}
     network = start_agent_network(
@@ -1727,7 +1750,7 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
     )
     record = None
     try:
-        client_kwargs = {"client_token": network["client_token"]} if active_proxy else {}
+        client_kwargs = {"client_token": network["client_token"]} if trusted_receipts else {}
         record = run_agent(
             instance_id=instance_id, harness=harness, image=image,
             harness_bundle=harness_bundle,
@@ -1741,8 +1764,10 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
         return record
     finally:
         try:
-            if active_proxy:
+            if trusted_receipts:
                 summary = proxy_benchmark.capture_evidence(network)
+                if not active_proxy:
+                    summary["effective_mode"] = "disabled"
                 if record is not None:
                     record["proxy_summary"] = summary
                     record["client_estimated_cost_usd"] = record.get("estimated_cost_usd")
