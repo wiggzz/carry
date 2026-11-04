@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.21.0](https://github.com/wiggzz/carry/compare/v0.20.0...v0.21.0) (2026-11-04)
+
+
+### Features
+
+* **dashboard:** show relative last-request timestamps ([bb031cc](https://github.com/wiggzz/carry/commit/bb031ccc2abfdfe0aa1867cd43ab733339bf8936))
+* **dashboard:** show relative last-request timestamps ([#217](https://github.com/wiggzz/carry/issues/217)) ([7f8d043](https://github.com/wiggzz/carry/commit/7f8d04331987d6f8541fe377f27c569f05f0765a))
+
 ## [0.20.0](https://github.com/wiggzz/carry/compare/v0.19.0...v0.20.0) (2026-11-04)
 
 
