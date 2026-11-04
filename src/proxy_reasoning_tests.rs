@@ -383,11 +383,29 @@ fn fresh_reasoning_baseline_prices_authorized_projection_without_capacity_author
     for restart in [false, true] {
         if restart {
             session = serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+            // Session JSON deliberately omits index-owned advice. This unit
+            // seam must reload the same current authority after its round-trip;
+            // the real history-index restart is exercised by the HTTP probe.
+            session
+                .apply_advice(
+                    &session.groups(),
+                    &json!({"protected":[],"removable":[2],"memories":[]}),
+                )
+                .unwrap();
         }
         let frozen = serde_json::to_value(&session).unwrap();
         let (selected, report) = plan(&config, &session, &body);
         assert_eq!(
-            selected.unwrap().omitted,
+            selected
+                .unwrap_or_else(|| {
+                    panic!(
+                        "authorized fresh-reasoning projection missing; restart={restart}; report={report}; drop_members={:?}; opinions={:?}; groups={:?}",
+                        session.drop_members,
+                        session.opinions,
+                        session.groups()
+                    )
+                })
+                .omitted,
             HashSet::from([2, 3, 4]),
             "{report}"
         );
