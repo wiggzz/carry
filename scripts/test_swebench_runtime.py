@@ -72,7 +72,7 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':30,'cached_inp
         parent = 'swe-fixture-parent:'+base[:20]
         subprocess.run(['docker', 'tag', scb_prepared['agent_image'], parent], check=True)
         (context/'Dockerfile').write_text(f'''FROM {parent}
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git patch && rm -rf /var/lib/apt/lists/*
 COPY repo /testbed
 ENV PATH=/opt/swebench-harness/bin:$PATH
 WORKDIR /testbed

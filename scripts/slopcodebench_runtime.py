@@ -410,7 +410,7 @@ def run_slot(contract, slot, prepared, output):
                 cost_limits=AgentCostLimits(cost_limit=0, net_cost_limit=0, max_retries=settings['retries']),
                 pricing=None, credential=credential, binary='codex',
                 model=settings['model'], timeout=settings['timeout_seconds'], thinking=settings['reasoning'],
-                max_thinking_tokens=None, extra_args=[], env={},
+                max_thinking_tokens=None, extra_args=['--config', shlex.quote('web_search="disabled"')], env={},
                 model_provider=CodexModelProvider(provider_id='carry_benchmark', base_url=network['api_base'], env_key='OPENAI_API_KEY'))
             spec = AgentRunSpec(seed=0, template=Path(prepared['prompt']).read_text(), problem=problem,
                 environment=environment, image=prepared['agent_image'], pass_policy=policy,
@@ -418,7 +418,9 @@ def run_slot(contract, slot, prepared, output):
                 agent_version=settings['codex_version'], model_name=settings['model'])
             official.evaluate_agent_snapshot = evaluate
             with protected_runtimes(network, prepared, on_invocation=invocation):
-                official.AgentRunner(spec, agent, output/'official', queue.Queue()).run()
+                official_output = output/'official'
+                official_output.mkdir()
+                official.AgentRunner(spec, agent, official_output, queue.Queue()).run()
         except Exception as caught:
             error = f'{type(caught).__name__}: {caught}'
         finally:

@@ -6,6 +6,7 @@ slots never build an image. All accounting/denominators belong to benchmark_comp
 """
 import argparse
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -141,6 +142,14 @@ def run_slot(contract, slot, prepared, output):
     root = output/'work/tasks'/slot['task_id']
     materialization_seconds = time.monotonic()-started
     agent_output = output/'agent'; agent_output.mkdir()
+    # The existing worker runs as root with every capability dropped. Hosted
+    # unprivileged operators therefore must grant its *owned slot mounts*
+    # write access explicitly; never change permissions outside these mounts.
+    agent_output.chmod(0o777)
+    checkout = root/'codex/repo'
+    for path in itertools.chain([checkout], checkout.rglob('*')):
+        if not path.is_symlink():
+            path.chmod(path.stat().st_mode | (0o777 if path.is_dir() else 0o222))
     values = {**prepared['config'], **contract.get('proxy', {}), 'CARRY_PROXY_MODE': slot['proxy_mode'],
               'BENCHMARK_HARNESS': 'codex', 'BENCHMARK_TRUSTED_DIRECT': '1' if slot['proxy_mode'] == 'disabled' else '0'}
     error = None
@@ -194,7 +203,7 @@ def run_slot(contract, slot, prepared, output):
         if not swe.official_evaluation_unknowns(graded):
             row.update(status='evaluated', resolved=graded[0]['resolved'],
                        quality={'official_outcome': graded[0]['status']})
-    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+    except Exception as error:
         row['error'] = f'{type(error).__name__}: {error}'
     row['evaluation_seconds'] = time.monotonic()-evaluation_started
     row['task_wall_seconds'] = time.monotonic()-started

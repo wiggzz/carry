@@ -12,6 +12,7 @@ if '--version' in sys.argv:
     print('codex-cli 0.0.0-synthetic')
     raise SystemExit(0)
 assert sys.argv[1] == 'exec'
+assert any(sys.argv[i:i+2] == ['--config', 'web_search="disabled"'] for i in range(len(sys.argv)-1))
 resume = sys.argv[2:4] == ['resume', '--last']
 prompt = sys.argv[4] if resume else sys.argv[2]
 home = Path(os.environ['HOME'])
