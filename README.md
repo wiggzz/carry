@@ -102,6 +102,7 @@ useful evidence, not a general quality ranking.
 ## More
 
 - [Context-policy design](docs/context-policy.md) and [proxy history contract](docs/proxy-fork-continuity.md)
+- [Content-free proxy phase timings](docs/proxy-phase-timings.md)
 - [Local session cost report and experimental savings scenario](docs/local-session-cost-report.md) (`carry report cost`)
 - [Benchmark isolation and maintainer operations](docs/benchmark-isolation.md)
 

@@ -42,7 +42,10 @@ impl Phases {
         Self {
             service,
             // Pre-identity failures/unscoped off requests share one bounded lane.
-            session_id: format!("{:x}", Sha256::digest(b"carry-unscoped-timing")),
+            session_id: review.map_or_else(
+                || format!("{:x}", Sha256::digest(b"carry-unscoped-timing")),
+                |(id, _, _)| id.into(),
+            ),
             request_id: request_id.into(),
             review_attempt_id: review.map(|(_, attempt, _)| attempt.into()),
             native_attempt_id: None,
@@ -64,14 +67,6 @@ impl Phases {
             relay_send_wait_us: None,
             attempts: Vec::with_capacity(2),
         }
-        .with_review_session(review)
-    }
-
-    fn with_review_session(mut self, review: Option<(&str, &str, bool)>) -> Self {
-        if let Some((id, _, _)) = review {
-            self.session_id = id.into();
-        }
-        self
     }
 
     pub fn elapsed_us(&self) -> u64 {
@@ -89,7 +84,6 @@ impl Phases {
     pub fn dispatch(&mut self) {
         self.active_phase = "upstream_headers";
         // The existing subscription owner allows at most two HTTP attempts.
-        debug_assert!(self.attempts.len() < 2);
         self.attempts.push(Transport {
             ordinal: self.attempts.len(),
             dispatch_us: self.elapsed_us(),
@@ -134,7 +128,7 @@ impl Drop for Phases {
         let data = json!({
             "schema_version":1,"basis":"monotonic_forward_or_review_chunk_entry_us",
             "role":self.role,"background":self.background,"outcome":self.outcome,
-            "incomplete":self.outcome == "cancelled" || last.is_some_and(|a|a.body_complete_us.is_none()),
+            "incomplete":self.outcome == "cancelled" || (self.outcome != "rejected" && last.is_none_or(|a|a.body_complete_us.is_none())),
             "active_phase":self.active_phase,"native_attempt_id":self.native_attempt_id,
             "primary_lock_wait_us":self.primary_lock_wait_us,"state_load_us":self.state_load_us,
             "planning_us":self.planning_us,"blocking_review_us":self.blocking_review_us,

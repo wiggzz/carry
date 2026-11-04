@@ -1638,6 +1638,7 @@ async fn forward_timed(
         let mut lock;
         let mut session;
         loop {
+            timing.session_id = id.clone();
             // Inspect frozen metadata before waiting on the primary lock, so
             // known-model ancestry errors still fail promptly. Revalidate that
             // snapshot under the lock before committing the request contract.
@@ -1687,7 +1688,6 @@ async fn forward_timed(
                 }
                 history::expand(&service, namespace.as_ref().unwrap(), &mut body)?;
             }
-            timing.session_id = id.clone();
             timing.active_phase = "primary_lock_wait";
             let started = Instant::now();
             lock = session_lock(&service, &id).await;

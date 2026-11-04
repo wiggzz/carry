@@ -1,0 +1,46 @@
+{
+  "synthetic": true,
+  "fixture": "proxy::tests::phase_timing_separates_local_transport_body_and_settlement_without_wire_changes",
+  "source_head": "8f000227c65a529064139e4ede1ed420a6acd3f1",
+  "ci_run": 41853519001,
+  "note": "Actual loopback fixture output; not live traffic or provider/model performance. This test passed; a separate timeout-censoring test intentionally failed on this head.",
+  "record": {
+    "at": 1793804616,
+    "data": {
+      "active_phase": "settlement",
+      "attempts": [
+        {
+          "body_complete_us": 254282,
+          "dispatch_us": 70320,
+          "first_body_us": 193753,
+          "headers_us": 133102,
+          "ordinal": 0,
+          "status": 200
+        }
+      ],
+      "background": false,
+      "basis": "monotonic_forward_or_review_chunk_entry_us",
+      "blocking_review_us": null,
+      "body_complete_us": 254282,
+      "first_body_us": 193753,
+      "incomplete": false,
+      "native_attempt_id": "2906-1793804616-27",
+      "outcome": "complete",
+      "planning_us": null,
+      "preparation_done_us": 70319,
+      "primary_lock_wait_us": 62026,
+      "relay_send_wait_us": 8,
+      "role": "primary",
+      "schema_version": 1,
+      "settlement_us": 6720,
+      "state_load_us": 32,
+      "total_us": 261036
+    },
+    "dropped_before": 0,
+    "event": "phase_timing",
+    "mode": "off",
+    "policy_id": "71b56504131457a7af40e7a3f11a7c7b4338fe29e08339d4bf55dc377d7ff310",
+    "request_id": "timing-fixture",
+    "session_id": "6c4148bd4fb319945870aebdb7a3f82ca656cadb31e00bb5ef3b1c88668aa3dd"
+  }
+}

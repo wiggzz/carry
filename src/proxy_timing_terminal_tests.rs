@@ -4,6 +4,39 @@ fn timing_record(directory: &Path, id: &str, request: &str) -> Value {
         .filter(|e| e["event"] == "phase_timing" && e["request_id"] == request)
         .collect();
     assert_eq!(records.len(), 1, "terminal summary must be unique");
+    let t = &records[0]["data"];
+    let total = t["total_us"].as_u64().unwrap();
+    for name in [
+        "preparation_done_us",
+        "first_body_us",
+        "body_complete_us",
+        "primary_lock_wait_us",
+        "state_load_us",
+        "planning_us",
+        "blocking_review_us",
+        "settlement_us",
+        "relay_send_wait_us",
+    ] {
+        if let Some(value) = t[name].as_u64() {
+            assert!(value <= total, "{name} exceeds total");
+        }
+    }
+    let attempts = t["attempts"].as_array().unwrap();
+    assert!(attempts.len() <= 2);
+    let mut previous = 0;
+    for attempt in attempts {
+        for name in [
+            "dispatch_us",
+            "headers_us",
+            "first_body_us",
+            "body_complete_us",
+        ] {
+            if let Some(value) = attempt[name].as_u64() {
+                assert!(previous <= value && value <= total, "nonmonotonic {name}");
+                previous = value;
+            }
+        }
+    }
     records[0].clone()
 }
 
@@ -215,6 +248,49 @@ async fn phase_timing_reviewer_is_correlated_background_and_timeout_is_censored(
     assert_eq!(t["body_complete_us"], Value::Null);
     assert_eq!(session.shadow.calls, 2);
     assert_eq!(session.shadow.unavailable_cost_calls, 1);
+}
+
+#[tokio::test]
+async fn phase_timing_transport_failure_has_no_headers_or_body_and_unknown_cost() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+    let provider = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.mode = Mode::Off;
+    service.config.upstream_url = endpoint;
+    service.client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let service = Arc::new(service);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-carry-session", "transport-failure".parse().unwrap());
+    let id = identity(&headers).unwrap().unwrap();
+    let result = forward_request(
+        service.clone(),
+        headers,
+        Bytes::from_static(br#"{"model":"gpt-6-luna","input":[]}"#),
+        false,
+        "transport".into(),
+    )
+    .await;
+    assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);
+    provider.await.unwrap();
+    let record = timing_record(directory.path(), &id, "transport");
+    let t = &record["data"];
+    assert_eq!(t["outcome"], "transport_error");
+    assert_eq!(t["incomplete"], true);
+    assert_eq!(t["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(t["attempts"][0]["headers_us"], Value::Null);
+    assert_eq!(t["first_body_us"], Value::Null);
+    assert_eq!(t["body_complete_us"], Value::Null);
+    let saved = load(&service, &id).unwrap();
+    assert_eq!(saved.primary.calls, 1);
+    assert_eq!(saved.primary.unavailable_cost_calls, 1);
 }
 
 #[tokio::test]
