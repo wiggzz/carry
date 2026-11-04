@@ -341,9 +341,14 @@ with os.fdopen(artifact_fd('final.patch', os.O_RDWR | os.O_CREAT), 'r+b') as pat
         patch.truncate(0)
         with os.fdopen(artifact_fd('secret-leak-blocked', os.O_WRONLY | os.O_CREAT), 'w') as marker:
             marker.write('agent patch contained the API key\n')
+            os.fchmod(marker.fileno(), 0o644)
         returncode = 86
+    # The container may run as root while its trusted importer is unprivileged.
+    # Publish only the sanitized descriptor, never chmod an agent-selected path.
+    os.fchmod(patch.fileno(), 0o644)
 with os.fdopen(artifact_fd(trace_path.name, os.O_RDWR), 'r+b') as trace:
     clean = trace.read().replace(secret, b'[REDACTED]')
     trace.seek(0); trace.write(clean); trace.truncate()
+    os.fchmod(trace.fileno(), 0o644)
 os.close(directory)
 sys.exit(returncode)
