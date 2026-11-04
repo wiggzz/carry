@@ -45,6 +45,7 @@ h2 { font-size:20px; letter-spacing:-.3px; }
 .activity { display:inline-block; border:1.5px solid; padding:2px 7px; font-size:10px; font-weight:800; text-transform:uppercase; background:var(--blue); }
 .activity[data-active="true"] { background:var(--mint); }
 .request-counts { font-size:12px; color:var(--muted); margin-top:5px; }
+.request-recency { display:block; font-size:12px; color:var(--muted); margin-top:5px; }
 .session-costs,.session-savings { padding-left:18px; border-left:1px solid #22232a35; font-variant-numeric:tabular-nums; }
 .session .value { font-size:24px; letter-spacing:-.6px; }
 .session .card-note { color:var(--muted); font-size:11px; }
@@ -162,6 +163,18 @@ const backgroundTypes=new Set(['background']);
 const sourceNames={conversation:'Conversation',agent:'Agent',background:'Client background'};
 function sourceLabel(s){return sourceNames[s.client?.kind]||'Unclassified'}
 function sessionMeta(s){const agent=s.client?.agent_name?.split('/').filter(Boolean).pop();return sourceLabel(s)+(agent&&agent!=='root'?' · '+agent:'')+' · '+s.id.slice(0,8)+(s.last_primary_dispatch?.model?' · '+s.last_primary_dispatch.model:'')}
+const relativeTime=new Intl.RelativeTimeFormat('en',{numeric:'always'});
+function requestRecency(s){
+ const time=document.createElement('time');time.className='request-recency';
+ const at=s.last_primary_dispatch?.at,date=new Date(at*1000);
+ if(typeof at!=='number'||!Number.isFinite(at)||at<0||!Number.isFinite(date.getTime())){time.textContent='Last request time unavailable';return time}
+ const elapsed=(Date.now()/1000)-at;
+ const [unit,seconds]=Math.abs(elapsed)>=86400?['day',86400]:Math.abs(elapsed)>=3600?['hour',3600]:Math.abs(elapsed)>=60?['minute',60]:['second',1];
+ time.textContent='Last request · '+relativeTime.format(-Math.trunc(elapsed/seconds),unit);
+ time.setAttribute('datetime',date.toISOString());
+ time.title='Primary request started '+date.toLocaleString(undefined,{timeZoneName:'short'});
+ time.setAttribute('aria-label',time.title);return time;
+}
 function row(values){const tr=document.createElement('tr');for(const value of values){const td=document.createElement('td');td.textContent=value;tr.append(td)}return tr}
 function card(label,value){const el=document.createElement('div');el.className='card';const l=document.createElement('div');l.className='label';l.textContent=label;const v=document.createElement('div');v.className='value';v.textContent=value;el.append(l,v);return el}
 // Last-dispatch facts and saved planner rows: no economic recomputation here.
@@ -299,9 +312,11 @@ function renderSession(s){
  const el=document.createElement('article');el.className='session';el.id='history:'+s.id;
  const identity=document.createElement('div');identity.className='session-identity';
  const active=s.processing||s.background_review_pending;
- const status=note(identity,s.processing?'Working':s.background_review_pending?'Reviewing':s.updated_at&&Date.now()/1000-s.updated_at<300?'Recent':'Idle','activity');status.setAttribute('data-active',String(!!active));
+ const age=Date.now()/1000-(s.last_primary_dispatch?.at??-Infinity);
+ const status=note(identity,s.processing?'Working':s.background_review_pending?'Reviewing':age>=0&&age<300?'Recent':'Idle','activity');status.setAttribute('data-active',String(!!active));
  const heading=document.createElement('h3');heading.textContent=s.title||'Untitled session';heading.title=s.id;identity.append(heading);
  note(identity,sessionMeta(s),'session-meta');
+ identity.append(requestRecency(s));
  note(identity,count(s.completed_requests||0,'request')+(s.rewrites?' · '+count(s.rewrites.dispatched,'rewrite')+(s.rewrites.forced?' · '+fmt(s.rewrites.forced)+' forced':''):''),'request-counts');el.append(identity);
  const ledgers=[s.primary||{},s.shadow||{}],missing=sum(ledgers,'unavailable_cost_calls'),e=s.cost_estimate;
  const costs=document.createElement('div');costs.className='session-costs';note(costs,missing?'Priced subtotal':'Observed cost','label');note(costs,money(pricedSubtotal(ledgers)),'value');note(costs,'Primary + reviewer · saved usage','card-note');el.append(costs);

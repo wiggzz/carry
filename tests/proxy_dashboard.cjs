@@ -260,6 +260,68 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   await refresh();
   assert.equal(elements.get('background-traffic').hidden,true);
   assert.ok(byClass(elements.get('sessions'),'empty'),'empty dashboard has an explicit state');
+  // Recency belongs to the primary request, never a later checkpoint/reviewer write.
+  const RealDate=vm.runInContext('Date',sandbox);
+  let clock=Date.parse('2026-11-04T18:00:00Z');
+  sandbox.Date=class extends RealDate {
+    constructor(...args){super(...(args.length?args:[clock]));}
+    static now(){return clock;}
+  };
+  const recent={...session(0,0),id:'recency-a',updated_at:clock/1000,
+    last_primary_dispatch:{at:clock/1000-5},last_reviewer_dispatch:{at:clock/1000}};
+  const old={...session(0,0),id:'recency-b',client:{kind:'background'},updated_at:clock/1000,
+    last_primary_dispatch:{at:clock/1000-3*86400}};
+  data.sessions=[old,recent];
+  await refresh();
+  const recentRow=elements.get('sessions').children[0];
+  const recency=byClass(recentRow,'request-recency');
+  assert.ok(recency,'last primary-request age is visible in the collapsed session row');
+  assert.equal(recency.tagName,'time');
+  assert.equal(recency.textContent,'Last request · 5 seconds ago');
+  assert.equal(recency.getAttribute('datetime'),new RealDate(recent.last_primary_dispatch.at*1000).toISOString());
+  const exact=new RealDate(recent.last_primary_dispatch.at*1000).toLocaleString(undefined,{timeZoneName:'short'});
+  assert.equal(recency.title,'Primary request started '+exact);
+  assert.equal(recency.getAttribute('aria-label'),'Primary request started '+exact);
+  assert.ok(!walk(byClass(recentRow,'session-details')).includes(recency));
+  const oldRow=elements.get('background-sessions').children[0];
+  assert.equal(byClass(oldRow,'request-recency').textContent,'Last request · 3 days ago');
+  assert.equal(byClass(oldRow,'activity').textContent,'Idle','maintenance writes cannot make an old primary recent');
+  const stableDisclosure=byClass(recentRow,'session-details');
+  stableDisclosure.open=true;
+  for(const [seconds,label] of [[0,'0 seconds ago'],[1,'1 second ago'],[59,'59 seconds ago'],
+    [60,'1 minute ago'],[3599,'59 minutes ago'],[3600,'1 hour ago'],[86399,'23 hours ago'],
+    [86400,'1 day ago'],[3*86400,'3 days ago'],[-3600,'in 1 hour']]){
+    recent.last_primary_dispatch.at=clock/1000-seconds;
+    await refresh();
+    assert.equal(recency.textContent,'Last request · '+label);
+  }
+  recent.last_primary_dispatch.at=clock/1000-59;
+  await refresh();
+  clock+=2000;
+  data.sessions.reverse();
+  await refresh();
+  assert.strictEqual(elements.get('sessions').children[0],recentRow,'recency refresh never reorders histories');
+  assert.strictEqual(byClass(recentRow,'request-recency'),recency,'polling updates the existing timestamp');
+  assert.equal(recency.textContent,'Last request · 1 minute ago','age advances without a new request');
+  assert.equal(stableDisclosure.open,true,'recency updates preserve open inspection');
+  for(const active of [{processing:true},{background_review_pending:true}]){
+    Object.assign(recent,{processing:false,background_review_pending:false},active);
+    await refresh();
+    assert.equal(byClass(recentRow,'activity').textContent,active.processing?'Working':'Reviewing');
+    assert.equal(recency.textContent,'Last request · 1 minute ago');
+  }
+  for(const at of [undefined,null,'1700000000',NaN,Infinity,-1,1e20]){
+    recent.last_primary_dispatch={at};
+    await refresh();
+    assert.equal(recency.textContent,'Last request time unavailable','missing/invalid primary time never borrows update or reviewer time');
+    assert.equal(recency.getAttribute('datetime'),null,'old exact time is removed when unavailable');
+    assert.equal(recency.title,'');
+    assert.equal(recency.getAttribute('aria-label'),null);
+  }
+  recent.last_primary_dispatch={at:0};
+  await refresh();
+  assert.equal(recency.getAttribute('datetime'),'1970-01-01T00:00:00.000Z','known epoch zero is not missing');
+  sandbox.Date=RealDate;
   if(process.env.CARRY_DASHBOARD_STATS_FIXTURE){
     data=JSON.parse(fs.readFileSync(process.env.CARRY_DASHBOARD_STATS_FIXTURE,'utf8'));
     await refresh();
