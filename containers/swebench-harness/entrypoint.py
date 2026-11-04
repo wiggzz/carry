@@ -6,6 +6,7 @@ import os
 import pathlib
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -226,10 +227,19 @@ if args.harness == "pi":
     (config / "models.json").write_text(json.dumps(models) + "\n", encoding="utf-8")
 
 trace_path = output / "trace.log"
+directory = os.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+def artifact_fd(name, flags):
+    fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+    if not stat.S_ISREG(os.fstat(fd).st_mode) or os.fstat(fd).st_nlink != 1:
+        os.close(fd)
+        raise RuntimeError('unsafe output artifact')
+    return fd
+
 agent_env = os.environ.copy()
 if args.codex_session:
     agent_env["CODEX_HOME"] = str(args.codex_session)
-with trace_path.open("w", encoding="utf-8") as trace:
+with os.fdopen(artifact_fd('trace.log', os.O_WRONLY | os.O_CREAT), 'w', encoding='utf-8') as trace:
+    trace.truncate(0)
     returncode = 0
     if args.harness == "codex":
         try:
@@ -317,20 +327,23 @@ if args.codex_session:
 
 patch_path = output / "final.patch"
 subprocess.run(["git", "add", "-N", "--", "."], cwd=workspace, check=True)
-with patch_path.open("wb") as patch:
+with os.fdopen(artifact_fd('final.patch', os.O_RDWR | os.O_CREAT), 'r+b') as patch:
+    patch.truncate(0)
     subprocess.run(
         ["git", "diff", "--binary", "--no-ext-diff", baseline],
         cwd=workspace,
         stdout=patch,
         check=True,
     )
-
-secret = os.environ["OPENAI_API_KEY"].encode()
-trace_path.write_bytes(trace_path.read_bytes().replace(secret, b"[REDACTED]"))
-if secret in patch_path.read_bytes():
-    patch_path.write_bytes(b"")
-    (output / "secret-leak-blocked").write_text(
-        "agent patch contained the API key\n", encoding="utf-8"
-    )
-    returncode = 86
+    secret = os.environ["OPENAI_API_KEY"].encode()
+    patch.seek(0)
+    if secret in patch.read():
+        patch.truncate(0)
+        with os.fdopen(artifact_fd('secret-leak-blocked', os.O_WRONLY | os.O_CREAT), 'w') as marker:
+            marker.write('agent patch contained the API key\n')
+        returncode = 86
+with os.fdopen(artifact_fd(trace_path.name, os.O_RDWR), 'r+b') as trace:
+    clean = trace.read().replace(secret, b'[REDACTED]')
+    trace.seek(0); trace.write(clean); trace.truncate()
+os.close(directory)
 sys.exit(returncode)

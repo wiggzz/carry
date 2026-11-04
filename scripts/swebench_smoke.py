@@ -16,6 +16,7 @@ import pathlib
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import time
 from collections import Counter
@@ -31,6 +32,84 @@ except ModuleNotFoundError:
 HARNESSES = ("carry", "codex", "pi")
 OFFICIAL_IMAGE_NAMESPACE = "swebench"
 OFFICIAL_IMAGE_TAG = "latest"
+
+# Host import boundary for files written by the untrusted agent. These are
+# artifact limits, not model-visible tool/trajectory limits.
+AGENT_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024
+AGENT_ARTIFACT_TOTAL_BYTES = 256 * 1024 * 1024
+
+
+class AgentArtifactError(ValueError):
+    pass
+
+
+def agent_artifact_bytes(root, relative, *, limit=AGENT_ARTIFACT_MAX_BYTES):
+    parts = pathlib.PurePath(relative).parts
+    if not parts or pathlib.PurePath(relative).is_absolute() or any(p in {'.', '..'} for p in parts):
+        raise AgentArtifactError('unsafe agent artifact path')
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > limit:
+                raise AgentArtifactError('unsafe or oversized agent artifact')
+            with os.fdopen(fd, 'rb', closefd=False) as stream:
+                data = stream.read(limit + 1)
+            if len(data) > limit:
+                raise AgentArtifactError('oversized agent artifact')
+            return data
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        raise
+    except (OSError, AgentArtifactError) as error:
+        raise AgentArtifactError('unsafe agent artifact') from error
+    finally:
+        os.close(directory)
+
+
+def validate_agent_artifacts(root):
+    """Reject unsafe archive entries too, before any output is published/imported.
+
+    Walk directory descriptors, never resolved agent-selected paths. Remove only
+    rejected entries so subsequent artifact upload cannot follow a hostile link.
+    Readers still open each file no-follow to close check/open races.
+    """
+    total, count, unsafe = 0, 0, False
+    def walk(directory):
+        nonlocal total, count, unsafe
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                count += 1
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    child = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                    try:
+                        walk(child)
+                    finally:
+                        os.close(child)
+                elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    os.unlink(entry.name, dir_fd=directory)
+                    unsafe = True
+                else:
+                    total += info.st_size
+                    if info.st_size > AGENT_ARTIFACT_MAX_BYTES or total > AGENT_ARTIFACT_TOTAL_BYTES or count > 10000:
+                        raise AgentArtifactError('agent artifact import budget exceeded')
+    try:
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            walk(directory)
+            if unsafe:
+                raise AgentArtifactError('unsafe agent artifact entry')
+        finally:
+            os.close(directory)
+    except OSError as error:
+        raise AgentArtifactError('unsafe agent artifact tree') from error
 
 
 def selected_harnesses(values: Mapping[str, str]) -> tuple[str, ...]:
@@ -88,7 +167,7 @@ def load_agent_usage(harness: str, output: pathlib.Path) -> dict[str, int]:
         path = output / "result.json"
         if path.is_file():
             try:
-                raw = json.loads(path.read_text(encoding="utf-8")).get("usage", {})
+                raw = json.loads(agent_artifact_bytes(output, 'result.json')).get("usage", {})
             except (OSError, json.JSONDecodeError):
                 raw = {}
             if isinstance(raw, dict) and any(key in raw for key in USAGE_KEYS):
@@ -97,7 +176,7 @@ def load_agent_usage(harness: str, output: pathlib.Path) -> dict[str, int]:
         if not trace.is_file():
             return usage
         try:
-            lines = trace.read_text(encoding="utf-8").splitlines()
+            lines = agent_artifact_bytes(output, 'trace.jsonl').decode('utf-8').splitlines()
         except OSError:
             return usage
         for line in lines:
@@ -119,7 +198,7 @@ def load_agent_usage(harness: str, output: pathlib.Path) -> dict[str, int]:
     if not path.is_file():
         return usage
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = agent_artifact_bytes(output, 'trace.log').decode('utf-8').splitlines()
     except OSError:
         return usage
     for line in lines:
@@ -577,7 +656,19 @@ def validate_config(values: Mapping[str, str]) -> dict[str, str]:
 
 def start_agent_network(*, identity: str, proxy_image: str, proxy_script: pathlib.Path,
                         execute: Any = subprocess.run, carry_image: str | None = None,
-                        state_dir: pathlib.Path | None = None) -> dict[str, str]:
+                        state_dir: pathlib.Path | None = None,
+                        expected_primary_model: str | None = None) -> dict[str, str]:
+    trusted_direct = os.environ.get("BENCHMARK_TRUSTED_DIRECT", "0")
+    if trusted_direct not in {"0", "1"}:
+        raise ValueError("BENCHMARK_TRUSTED_DIRECT must be 0 or 1")
+    if trusted_direct == "1" and os.environ.get("CARRY_PROXY_MODE", "disabled") != "disabled":
+        raise ValueError("trusted direct requires disabled proxy mode")
+    proxy_config = proxy_benchmark.validate_config(os.environ)
+    if expected_primary_model is not None:
+        if (not (trusted_direct == '1' or proxy_config['CARRY_PROXY_MODE'] != 'disabled')
+                or not proxy_benchmark.model_spec(expected_primary_model)
+                or not proxy_benchmark.model_spec(proxy_config['CARRY_PROXY_CLASSIFIER_MODEL'])):
+            raise ValueError('protected gateway requires exact catalog model expectations')
     digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
     network = {
         "internal": f"carry-agent-internal-{digest}",
@@ -590,7 +681,7 @@ def start_agent_network(*, identity: str, proxy_image: str, proxy_script: pathli
         execute(["docker", "network", "create", network["egress"]], check=True)
         gateway_env_args = []
         gateway_kwargs = {}
-        proxy_config = proxy_benchmark.validate_config(os.environ)
+
         if proxy_config["CARRY_PROXY_MODE"] != "disabled":
             import secrets
             if not carry_image or state_dir is None:
@@ -615,15 +706,40 @@ def start_agent_network(*, identity: str, proxy_image: str, proxy_script: pathli
                     check=True, env=trusted_env, timeout=60)
             gateway_env = {key: value for key, value in os.environ.items()
                            if not key.startswith(("OPENAI_", "CARRY_PROXY_"))}
-            gateway_env.update(BENCHMARK_CONTEXT_PROXY="1", BENCHMARK_CLIENT_TOKEN=network["client_token"],
+            gateway_env.update(BENCHMARK_CONTROL_TOKEN=secrets.token_urlsafe(32),
+                               BENCHMARK_CONTEXT_PROXY="1", BENCHMARK_CLIENT_TOKEN=network["client_token"],
                                CARRY_PROXY_AUTH_TOKEN=auth, BENCHMARK_SESSION_ID=network["session_id"],
                                BENCHMARK_CONTEXT_HISTORY_POLICY=proxy_config["CARRY_PROXY_HISTORY_POLICY"],
                                BENCHMARK_SHADOW_TOKEN=shadow_token, BENCHMARK_CLASSIFIER_KEY=secret)
-            gateway_env_args = ["--network-alias", "openai-proxy", "--env", "BENCHMARK_CONTEXT_PROXY", "--env", "BENCHMARK_CLIENT_TOKEN",
+            gateway_env_args = ["--network-alias", "openai-proxy", "--env", "BENCHMARK_CONTROL_TOKEN", "--env", "BENCHMARK_CONTEXT_PROXY", "--env", "BENCHMARK_CLIENT_TOKEN",
                                 "--env", "CARRY_PROXY_AUTH_TOKEN", "--env", "BENCHMARK_SESSION_ID",
                                 "--env", "BENCHMARK_SHADOW_TOKEN", "--env", "BENCHMARK_CLASSIFIER_KEY",
                                 "--env", "BENCHMARK_CONTEXT_HISTORY_POLICY"]
             gateway_kwargs = {"env": gateway_env}
+        if trusted_direct == "1":
+            import secrets
+            if state_dir is None:
+                raise ValueError("trusted direct requires a trusted receipt directory")
+            secret = os.environ.get("OPENAI_API_KEY")
+            if not secret:
+                raise ValueError("trusted direct requires the provider credential")
+            state_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
+            network.update(client_token=secrets.token_urlsafe(32), session_id=secrets.token_hex(16),
+                           state_dir=str(state_dir.resolve()))
+            gateway_env = {key: value for key, value in os.environ.items()
+                           if not key.startswith(("OPENAI_", "CARRY_PROXY_", "BENCHMARK_"))}
+            gateway_env.update(BENCHMARK_TRUSTED_DIRECT="1", BENCHMARK_CLIENT_TOKEN=network["client_token"],
+                               BENCHMARK_PROVIDER_KEY=secret)
+            gateway_env_args = ["--env", "BENCHMARK_TRUSTED_DIRECT", "--env", "BENCHMARK_CLIENT_TOKEN",
+                                "--env", "BENCHMARK_PROVIDER_KEY"]
+            gateway_kwargs = {"env": gateway_env}
+        if expected_primary_model is not None:
+            gateway_env.update(BENCHMARK_MODEL_BINDING='1',
+                BENCHMARK_EXPECTED_PRIMARY_MODEL=expected_primary_model,
+                BENCHMARK_EXPECTED_CLASSIFIER_MODEL=proxy_config['CARRY_PROXY_CLASSIFIER_MODEL'])
+            for key in ('BENCHMARK_MODEL_BINDING', 'BENCHMARK_EXPECTED_PRIMARY_MODEL',
+                        'BENCHMARK_EXPECTED_CLASSIFIER_MODEL'):
+                gateway_env_args.extend(['--env', key])
         execute(
             [
                 "docker", "run", "--detach", "--name", network["proxy"],
@@ -1687,7 +1803,7 @@ def publish_task_environments(*, records: list[dict[str, Any]], source: pathlib.
 def codex_thread_id(trace_path: pathlib.Path) -> str:
     """Extract one native Codex thread UUID from a JSONL execution trace."""
     thread_ids = set()
-    for line in trace_path.read_text(encoding="utf-8").splitlines():
+    for line in agent_artifact_bytes(trace_path.parent, trace_path.name).decode('utf-8').splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -1715,19 +1831,25 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
                        codex_session: pathlib.Path | None = None,
                        codex_thread: str | None = None,
                        pi_session_dir: pathlib.Path | None = None,
-                       carry_image: str | None = None) -> dict[str, Any]:
+                       carry_image: str | None = None,
+                       expected_primary_model: str | None = None) -> dict[str, Any]:
+    isolated_started = time.monotonic()
     identity = f"{instance_id}\0{harness}\0{output.resolve()}"
     active_proxy = os.environ.get("CARRY_PROXY_MODE", "disabled") != "disabled"
+    trusted_receipts = active_proxy or os.environ.get("BENCHMARK_TRUSTED_DIRECT", "0") == "1"
     network_kwargs = {}
-    if active_proxy:
-        network_kwargs = {"carry_image": carry_image,
-                          "state_dir": output.with_name(output.name + "-proxy-state")}
+    if expected_primary_model is not None:
+        network_kwargs['expected_primary_model'] = expected_primary_model
+    if trusted_receipts:
+        network_kwargs.update(carry_image=carry_image,
+                              state_dir=output.with_name(output.name + "-proxy-state"))
     network = start_agent_network(
         identity=identity, proxy_image=proxy_image, proxy_script=proxy_script, **network_kwargs,
     )
+    network_setup_seconds = time.monotonic() - isolated_started
     record = None
     try:
-        client_kwargs = {"client_token": network["client_token"]} if active_proxy else {}
+        client_kwargs = {"client_token": network["client_token"]} if trusted_receipts else {}
         record = run_agent(
             instance_id=instance_id, harness=harness, image=image,
             harness_bundle=harness_bundle,
@@ -1738,11 +1860,15 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
             codex_session=codex_session, codex_thread=codex_thread,
             pi_session_dir=pi_session_dir, **client_kwargs,
         )
+        record['setup_seconds'] = network_setup_seconds
+        record['agent_seconds'] = record.get('elapsed_seconds')
         return record
     finally:
         try:
-            if active_proxy:
+            if trusted_receipts:
                 summary = proxy_benchmark.capture_evidence(network)
+                if not active_proxy:
+                    summary["effective_mode"] = "disabled"
                 if record is not None:
                     record["proxy_summary"] = summary
                     record["client_estimated_cost_usd"] = record.get("estimated_cost_usd")
@@ -1751,6 +1877,8 @@ def run_isolated_agent(*, instance_id: str, harness: str, image: str,
                     record["proxy_session_id"] = network["session_id"]
         finally:
             cleanup_agent_network(network)
+            if record is not None:
+                record['isolated_agent_wall_seconds'] = time.monotonic() - isolated_started
 
 
 def agent_timed_out(error: BaseException) -> bool:
@@ -1801,24 +1929,26 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
             client_env["OPENAI_API_KEY"] = client_token
             launch_kwargs["env"] = client_env
         subprocess.run(command, check=True, timeout=slot_timeout, **launch_kwargs)
-        patch_file = output / "final.patch"
-        patch = patch_file.read_text(encoding="utf-8") if patch_file.is_file() else ""
-        if not patch_file.is_file():
-            raise RuntimeError("agent did not produce final.patch")
         record = {"instance_id": instance_id, "harness": harness, "status": "agent-completed",
-                  "patch": patch, "error": None, "attempts": 1, "retries": 0,
+                  "patch": "", "error": None, "attempts": 1, "retries": 0,
                   "response_retries": 0}
     except (OSError, RuntimeError, json.JSONDecodeError,
             subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         timed_out = agent_timed_out(error)
         if timed_out:
             force_remove_container(container_name, exact_name=True)
-        patch_file = output / "final.patch"
-        patch = patch_file.read_text(encoding="utf-8") if patch_file.is_file() else ""
         record = {"instance_id": instance_id, "harness": harness, "status": "agent-failed",
-                  "patch": patch, "error": str(error), "attempts": 1, "retries": 0,
+                  "patch": "", "error": str(error), "attempts": 1, "retries": 0,
                   "response_retries": 0,
                   "timed_out": timed_out}
+    # Apply the same host boundary after successful, failed and timed-out workers.
+    # Violations escape as infrastructure errors; never import a fallback patch.
+    validate_agent_artifacts(output)
+    try:
+        record['patch'] = agent_artifact_bytes(output, 'final.patch').decode('utf-8')
+    except FileNotFoundError:
+        if record['status'] == 'agent-completed':
+            record.update(status='agent-failed', error='agent did not produce final.patch')
     # Settle available metrics on every process outcome, including deadlines.
     # Missing metrics on a failed slot may still be covered by a complete trace;
     # present but invalid metrics cannot certify that no retry was lost.
@@ -1827,7 +1957,7 @@ def run_agent(*, instance_id: str, harness: str, image: str, repo: pathlib.Path,
         result_file = output / "result.json"
         try:
             if result_file.is_file():
-                result = json.loads(result_file.read_text(encoding="utf-8"))
+                result = json.loads(agent_artifact_bytes(output, 'result.json'))
                 response_retries = result.get("response_retries") if isinstance(result, dict) else None
                 if (isinstance(response_retries, bool) or not isinstance(response_retries, int)
                         or response_retries < 0):
@@ -2168,6 +2298,12 @@ def _clone(repo: str, commit: str, destination: pathlib.Path, mirror: pathlib.Pa
         raise RuntimeError("task checkout contains Git objects unreachable from the base commit")
 
 
+def task_prompt(record: Mapping[str, Any]) -> str:
+    return ("Solve the issue below in the current repository. Work directly in the checkout, "
+            "run relevant tests when practical, and do not commit your changes.\n\n"
+            + record["problem_statement"] + "\n")
+
+
 def materialize(*, records: list[dict[str, Any]], selected_ids: list[str], root: pathlib.Path,
                 clone: Any = None, harnesses: tuple[str, ...] = HARNESSES) -> list[dict[str, Any]]:
     by_id = {record.get("instance_id"): record for record in records}
@@ -2203,12 +2339,7 @@ def materialize(*, records: list[dict[str, Any]], selected_ids: list[str], root:
             "base_commit": record["base_commit"], "problem_statement": record["problem_statement"],
         }
         (input_dir / "task.json").write_text(json.dumps(public, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        (input_dir / "task.md").write_text(
-            "Solve the issue below in the current repository. Work directly in the checkout, "
-            "run relevant tests when practical, and do not commit your changes.\n\n"
-            + record["problem_statement"] + "\n",
-            encoding="utf-8",
-        )
+        (input_dir / "task.md").write_text(task_prompt(record), encoding="utf-8")
         for harness in harnesses:
             clone_impl(record["repo"], record["base_commit"], task_root / harness / "repo")
         tasks.append(public)
@@ -2240,6 +2371,26 @@ def build_images(*, source: pathlib.Path, run_id: str, config: Mapping[str, str]
             "args": ["PACKAGE=@earendil-works/pi-coding-agent", f"PACKAGE_VERSION={validated['PI_VERSION']}"],
         },
     }
+    if config.get("PREPARED_HARNESS_IMAGES"):
+        payload = json.loads(pathlib.Path(config["PREPARED_HARNESS_IMAGES"]).read_text())
+        commit = config.get("SOURCE_COMMIT", "")
+        if not re.fullmatch(r"[0-9a-f]{40}", commit) or payload.get("source_commit") != commit:
+            raise ValueError("prepared harness source must match immutable SOURCE_COMMIT")
+        result = {}
+        for harness in harnesses:
+            spec = specifications[harness]
+            image = payload["images"][harness]
+            if (not re.fullmatch(r"sha256:[0-9a-f]{64}", image.get("image_id", ""))
+                    or image.get("base_resolved_digest") != spec["base"]
+                    or image.get("package_version") != spec["package_version"]
+                    or image.get("dockerfile_sha256") != hashlib.sha256(spec["dockerfile"].read_bytes()).hexdigest()):
+                raise ValueError(f"prepared {harness} harness pin/recipe/version mismatch")
+            inspected = execute(["docker", "image", "inspect", "--format", "{{.Id}}", image["image_id"]],
+                                check=True, text=True, capture_output=True, timeout=30)
+            if inspected.stdout.strip() != image["image_id"]:
+                raise ValueError(f"prepared {harness} image identity mismatch")
+            result[harness] = dict(image, tag=image["image_id"])
+        return result
     result = {}
     for harness in harnesses:
         spec = specifications[harness]
@@ -2912,7 +3063,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
             source_pi_session_sha256 = None
             if (session_position is not None and harness == "pi"
                     and pi_session_file is not None and pi_session_file.is_file()):
-                source_pi_session_sha256 = hashlib.sha256(pi_session_file.read_bytes()).hexdigest()
+                source_pi_session_sha256 = hashlib.sha256(agent_artifact_bytes(pi_session_file.parent, pi_session_file.name)).hexdigest()
             record = run_isolated_agent(
                 instance_id=task["instance_id"], harness=harness,
                 image=prepared[task["instance_id"]]["agent_image"]["tag"],
@@ -2937,12 +3088,12 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                 record["session_position"] = session_position
                 if harness == "carry":
                     if source_state is not None:
-                        record["source_session_state_sha256"] = hashlib.sha256(source_state.read_bytes()).hexdigest()
+                        record["source_session_state_sha256"] = hashlib.sha256(agent_artifact_bytes(source_state.parent, source_state.name)).hexdigest()
                     if record["status"] == "agent-completed":
                         state = slot_output / "context-state.json"
                         if not state.is_file():
                             raise RuntimeError("completed Carry slot has no context-state.json")
-                        record["session_state_sha256"] = hashlib.sha256(state.read_bytes()).hexdigest()
+                        record["session_state_sha256"] = hashlib.sha256(agent_artifact_bytes(state.parent, state.name)).hexdigest()
                         session_source = slot_output
                 elif harness == "codex" and record["status"] == "agent-completed":
                     if codex_session is None:
@@ -2951,12 +3102,13 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                     if codex_thread is not None and next_thread != codex_thread:
                         raise RuntimeError("resumed Codex task changed its native thread UUID")
                     session_files = sorted(codex_session.rglob("*.jsonl"))
+                    validate_agent_artifacts(codex_session)
                     if not session_files:
                         raise RuntimeError("completed Codex slot persisted no native session JSONL")
                     state_hash = hashlib.sha256()
                     for path in session_files:
                         state_hash.update(path.relative_to(codex_session).as_posix().encode() + b"\0")
-                        state_hash.update(path.read_bytes())
+                        state_hash.update(agent_artifact_bytes(codex_session, path.relative_to(codex_session)))
                     record["session_state_sha256"] = state_hash.hexdigest()
                     record["native_session_id_sha256"] = hashlib.sha256(next_thread.encode()).hexdigest()
                     codex_thread = next_thread
@@ -2968,7 +3120,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
                     if record["status"] == "agent-completed":
                         if pi_session_file is None or not pi_session_file.is_file():
                             raise RuntimeError("completed Pi slot has no session.jsonl")
-                        record["session_file_sha256"] = hashlib.sha256(pi_session_file.read_bytes()).hexdigest()
+                        record["session_file_sha256"] = hashlib.sha256(agent_artifact_bytes(pi_session_file.parent, pi_session_file.name)).hexdigest()
             return record
 
         try:
