@@ -1,4 +1,118 @@
 // Review R1/R2: actual forward/relay owners, synthetic loopback only.
+#[test]
+fn phase_timing_saturated_queue_drops_observations_without_waiting() {
+    let _serial = logging::phase_sink_fault::SERIAL.blocking_lock();
+    let directory = tempfile::tempdir().unwrap();
+    let service = Arc::new(checkpoint_service(directory.path()));
+    let id = pr154_session_id("bounded-phase-queue");
+    let (fault, entered) = logging::phase_sink_fault::hold(directory.path());
+    let mut first = timing::Phases::new(service.clone(), "in-flight", None);
+    first.session_id = id.clone();
+    drop(first);
+    // The actual sink worker owns the first observation, before LOG_LOCK/I/O.
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let count = logging::phase_sink_fault::capacity();
+    let (done, completion) = std::sync::mpsc::channel();
+    let producer = std::thread::spawn({
+        let service = service.clone();
+        let id = id.clone();
+        move || {
+            for n in 0..count * 2 {
+                let mut guard = timing::Phases::new(service.clone(), &format!("queued-{n}"), None);
+                guard.session_id = id.clone();
+                drop(guard); // Actual production Drop + bounded try_send.
+            }
+            let _ = done.send(());
+        }
+    });
+    let prompt = completion.recv_timeout(Duration::from_millis(500)).is_ok();
+    fault.release(); // Always release before joining/asserting, including RED.
+    drop(fault);
+    producer.join().unwrap();
+    let events = timing_journal(directory.path(), &id, &format!("queued-{}", count - 1));
+    assert!(
+        prompt,
+        "saturated phase handoff waited for its stalled sink"
+    );
+    assert_eq!(
+        events.len(),
+        count + 1,
+        "bounded queue must drop overflow observations"
+    );
+    assert!(events.iter().all(|e| e["event"] == "phase_timing"));
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["request_id"] == format!("queued-{count}"))
+    );
+    let bytes = std::fs::read(
+        directory
+            .path()
+            .join("diagnostics")
+            .join(format!("{id}.jsonl")),
+    )
+    .unwrap();
+    assert!(bytes.len() <= 64 * 1024);
+    assert!(
+        bytes
+            .split_inclusive(|b| *b == b'\n')
+            .all(|line| line.len() <= 16 * 1024)
+    );
+}
+
+#[test]
+fn phase_timing_unavailable_and_disconnected_sink_fail_open() {
+    for disconnected in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = checkpoint_service(directory.path());
+        service.phase_sink = logging::phase_sink_fault::unavailable(disconnected);
+        let service = Arc::new(service);
+        let id = pr154_session_id("unavailable-phase-sink");
+        journal(&service, &id, "before", "marker", &json!({}));
+        let before = pr154_journal(directory.path(), &id)[0]["dropped_before"]
+            .as_u64()
+            .unwrap();
+        let mut guard = timing::Phases::new(service.clone(), "unavailable", None);
+        guard.session_id = id.clone();
+        drop(guard);
+        journal(&service, &id, "after", "marker", &json!({}));
+        let events = pr154_journal(directory.path(), &id);
+        assert_eq!(
+            events.len(),
+            2,
+            "unavailable observations must not fall back to synchronous I/O"
+        );
+        assert!(events[1]["dropped_before"].as_u64().unwrap() > before);
+        assert_eq!(load(&service, &id).unwrap().primary.calls, 0);
+    }
+}
+
+#[tokio::test]
+async fn phase_timing_precontract_failure_labels_configured_context_unresolved() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.mode = Mode::Audit;
+    let service = Arc::new(service);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-carry-session", "PRIVATE_UNRESOLVED".parse().unwrap());
+    let id = identity(&headers).unwrap().unwrap();
+    let response = forward_request(
+        service.clone(),
+        headers,
+        Bytes::from_static(b"not JSON"),
+        false,
+        "unresolved".into(),
+    )
+    .await;
+    assert_eq!(response.unwrap_err().0, StatusCode::BAD_REQUEST);
+    let record = timing_record(directory.path(), &id, "unresolved");
+    assert_eq!(record["mode"], "audit");
+    assert_eq!(record["data"]["policy_context"], "configured_unresolved");
+    assert_eq!(record["data"]["attempts"], json!([]));
+    assert_eq!(load(&service, &id).unwrap().primary.calls, 0);
+    assert!(!record.to_string().contains("PRIVATE_"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn phase_timing_stalled_sink_does_not_block_predispatch_cancel() {
     let _serial = logging::phase_sink_fault::SERIAL.lock().await;
@@ -35,6 +149,9 @@ async fn phase_timing_stalled_sink_does_not_block_predispatch_cancel() {
     drop(lock);
     assert!(cancelled);
     assert_eq!(load(&service, &id).unwrap().primary.calls, 0);
+    let record = timing_record(directory.path(), &id, "stalled-cancel");
+    assert_eq!(record["data"]["outcome"], "cancelled");
+    assert!(!record.to_string().contains("PRIVATE_"));
     assert!(
         prompt_join,
         "phase sink contention blocked predispatch cancellation join"
@@ -107,6 +224,9 @@ async fn phase_timing_stalled_sink_does_not_hold_relay_eof_or_settlement() {
     assert_eq!(saved.primary.output_tokens, 5);
     assert_eq!(saved.shadow.calls, 0);
     server.abort();
+    let record = timing_record(directory.path(), &id, "stalled-eof");
+    assert_eq!(record["data"]["outcome"], "complete");
+    assert!(!record.to_string().contains("PRIVATE_"));
     assert!(
         prompt_eof,
         "phase sink contention held client body EOF after settlement"
@@ -182,6 +302,7 @@ async fn timing_policy_case(mode: Mode, model: &str, capacity: Option<u32>) -> (
 }
 
 fn assert_timing_effective_policy(timing: &Value, events: &[Value], mode: &str) {
+    assert_eq!(timing["data"]["policy_context"], "effective");
     for name in ["primary_received", "primary_submitted", "primary_committed"] {
         let records: Vec<_> = events.iter().filter(|e| e["event"] == name).collect();
         assert_eq!(records.len(), 1);

@@ -182,6 +182,7 @@ impl ProxyCli {
 #[derive(Clone)]
 struct Service {
     catalog: Arc<tokio::sync::OnceCell<SourceCatalog>>,
+    phase_sink: logging::PhaseSink,
     config: ProxyCli,
     client: reqwest::Client,
     upstream_key: Option<String>,
@@ -373,6 +374,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
     }
     let service = Arc::new(Service {
         catalog: Arc::new(tokio::sync::OnceCell::new()),
+        phase_sink: logging::PhaseSink::new(config.state_dir.clone()),
         upstream_key,
         classifier_key,
         auth_token,
@@ -1745,6 +1747,7 @@ async fn forward_timed(
             // This single effective contract governs all downstream gates,
             // projection, reviewers and accounting for the primary attempt.
             service = Arc::new(effective);
+            timing.effective_service(service.clone());
             outbound = body.clone();
             break;
         }
@@ -4248,6 +4251,7 @@ mod tests {
         config.state_dir = directory.to_path_buf();
         Service {
             catalog: Arc::new(tokio::sync::OnceCell::new()),
+            phase_sink: logging::PhaseSink::new(config.state_dir.clone()),
             _directory_lock: Arc::new(private_file(&directory.join(".lock"), true).unwrap()),
             config,
             client: reqwest::Client::new(),

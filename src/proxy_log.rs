@@ -60,11 +60,11 @@ fn mode(config: &ProxyCli) -> &'static str {
     }
 }
 
-fn directory(service: &Service, raw: bool) -> std::io::Result<PathBuf> {
+fn directory(state_dir: &Path, raw: bool) -> std::io::Result<PathBuf> {
     let path = if raw {
-        service.config.state_dir.clone()
+        state_dir.to_path_buf()
     } else {
-        service.config.state_dir.join("diagnostics")
+        state_dir.join("diagnostics")
     };
     if !raw {
         match std::fs::symlink_metadata(&path) {
@@ -167,7 +167,7 @@ pub(super) fn maintain(service: &Service) {
             )
         };
         let result = (|| -> std::io::Result<()> {
-            let directory = directory(service, raw)?;
+            let directory = directory(&service.config.state_dir, raw)?;
             retain(&directory, None, 0, lane, total, dropped)?;
             // Recover legacy/partial files without reading an unbounded line.
             for (path, _, _) in files(&directory)? {
@@ -211,6 +211,87 @@ pub(super) fn maintain(service: &Service) {
     }
 }
 
+fn policy_id(config: &ProxyCli) -> String {
+    // Hash effective settings, never persist labels, endpoints, or keys.
+    let mut policy = Sha256::new();
+    policy.update(config.classifier_model.as_bytes());
+    policy.update(format!(
+        "{:?}",
+        (
+            config.mode,
+            config.classifier_cache_policy,
+            &config.classifier_reasoning_effort,
+            config.review_replayed_history,
+            config.bootstrap_min_input_bytes
+        )
+    ));
+    policy.update(format!(
+        "{:?}",
+        (
+            config.primary_context_tokens,
+            config.classifier_max_input_tokens,
+            config.classifier_max_input_bytes,
+            config.review_every_requests,
+            config.payoff_requests,
+            config.min_payback_percent,
+            config.context_margin_percent,
+            config.primary_output_reserve_tokens,
+            config.classifier_max_output_tokens
+        )
+    ));
+    policy.update(format!(
+        "{:?}",
+        (
+            config.review_min_primary_tokens,
+            config.review_min_new_tokens,
+            config.review_backoff_factor,
+            config.review_backoff_max
+        )
+    ));
+    format!("{:x}", policy.finalize())
+}
+
+// Serialize using the same policy owner and hard record cap for both sinks.
+fn encode(record: &Record<'_>, record_max: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Limited(Vec::new(), record_max - 1);
+    serde_json::to_writer(&mut bytes, record)?;
+    bytes.0.push(b'\n');
+    Ok(bytes.0)
+}
+
+// Caller owns LOG_LOCK. No request owner may call this for a phase summary.
+fn write_record(state_dir: &Path, id: &str, bytes: &[u8], raw: bool) -> std::io::Result<()> {
+    let (lane, total, dropped) = if raw {
+        (RAW_LANE, RAW_TOTAL, &RAW_DROPPED)
+    } else {
+        (JOURNAL_LANE, JOURNAL_TOTAL, &JOURNAL_DROPPED)
+    };
+    let directory = directory(state_dir, raw)?;
+    let path = directory.join(format!("{id}.jsonl"));
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(std::io::Error::other("invalid log file"));
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    retain(
+        &directory,
+        Some(&path),
+        bytes.len() as u64,
+        lane,
+        total,
+        dropped,
+    )?;
+    let mut file = private_file(&path, true)?;
+    let before = file.metadata()?.len();
+    if let Err(error) = file.write_all(bytes) {
+        let _ = file.set_len(before);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn append(
     service: &Service,
     id: &str,
@@ -220,103 +301,104 @@ fn append(
     data: &Value,
     raw: bool,
 ) {
-    let (record_max, lane, total, dropped) = if raw {
-        (RAW_RECORD, RAW_LANE, RAW_TOTAL, &RAW_DROPPED)
+    let (record_max, dropped) = if raw {
+        (RAW_RECORD, &RAW_DROPPED)
     } else {
-        (
-            JOURNAL_RECORD,
-            JOURNAL_LANE,
-            JOURNAL_TOTAL,
-            &JOURNAL_DROPPED,
-        )
+        (JOURNAL_RECORD, &JOURNAL_DROPPED)
     };
-    #[cfg(test)]
-    if event == "phase_timing" {
-        phase_sink_fault::before_append(&service.config.state_dir);
-    }
     let result = (|| -> std::io::Result<()> {
         let _guard = LOG_LOCK
             .lock()
             .map_err(|_| std::io::Error::other("log lock poisoned"))?;
-        let config = &service.config;
-        // Hash effective settings, never persist labels, endpoints, or keys.
-        let mut policy = Sha256::new();
-        policy.update(config.classifier_model.as_bytes());
-        policy.update(format!(
-            "{:?}",
-            (
-                config.mode,
-                config.classifier_cache_policy,
-                &config.classifier_reasoning_effort,
-                config.review_replayed_history,
-                config.bootstrap_min_input_bytes
-            )
-        ));
-        policy.update(format!(
-            "{:?}",
-            (
-                config.primary_context_tokens,
-                config.classifier_max_input_tokens,
-                config.classifier_max_input_bytes,
-                config.review_every_requests,
-                config.payoff_requests,
-                config.min_payback_percent,
-                config.context_margin_percent,
-                config.primary_output_reserve_tokens,
-                config.classifier_max_output_tokens
-            )
-        ));
-        policy.update(format!(
-            "{:?}",
-            (
-                config.review_min_primary_tokens,
-                config.review_min_new_tokens,
-                config.review_backoff_factor,
-                config.review_backoff_max
-            )
-        ));
         let record = Record {
             event,
             at: now(),
             session_id: id,
             request_id,
             review_attempt_id,
-            mode: mode(config),
-            policy_id: format!("{:x}", policy.finalize()),
+            mode: mode(&service.config),
+            policy_id: policy_id(&service.config),
             dropped_before: dropped.load(Ordering::Relaxed),
             data,
         };
-        let mut bytes = Limited(Vec::new(), record_max - 1);
-        serde_json::to_writer(&mut bytes, &record)?;
-        bytes.0.push(b'\n');
-        let directory = directory(service, raw)?;
-        let path = directory.join(format!("{id}.jsonl"));
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if !meta.file_type().is_file() => {
-                return Err(std::io::Error::other("invalid log file"));
-            }
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
-        retain(
-            &directory,
-            Some(&path),
-            bytes.0.len() as u64,
-            lane,
-            total,
-            dropped,
-        )?;
-        let mut file = private_file(&path, true)?;
-        let before = file.metadata()?.len();
-        if let Err(error) = file.write_all(&bytes.0) {
-            // Do not leave a partial JSON line after a short/disk-full write.
-            let _ = file.set_len(before);
-            return Err(error);
-        }
-        Ok(())
+        let bytes = encode(&record, record_max)?;
+        write_record(&service.config.state_dir, id, &bytes, raw)
     })();
     if result.is_err() {
         dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// One worker per live Service/directory; clones share its fixed-capacity queue.
+// Start before accepting requests, never lazily in Drop. No teardown join/flush.
+// Queued items retain bounded bytes/opaque IDs only, not Service, keys or locks.
+const PHASE_QUEUE: usize = 16;
+struct PhaseRecord {
+    id: String,
+    bytes: Vec<u8>,
+}
+#[derive(Clone)]
+pub(super) struct PhaseSink {
+    sender: Option<std::sync::mpsc::SyncSender<PhaseRecord>>,
+}
+impl PhaseSink {
+    pub(super) fn new(state_dir: PathBuf) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<PhaseRecord>(PHASE_QUEUE);
+        let worker = std::thread::Builder::new()
+            .name("carry-phase-log".into())
+            .spawn(move || {
+                while let Ok(record) = receiver.recv() {
+                    #[cfg(test)]
+                    phase_sink_fault::before_append(&state_dir);
+                    let result = (|| -> std::io::Result<()> {
+                        let _guard = LOG_LOCK
+                            .lock()
+                            .map_err(|_| std::io::Error::other("log lock poisoned"))?;
+                        write_record(&state_dir, &record.id, &record.bytes, false)
+                    })();
+                    if result.is_err() {
+                        JOURNAL_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        Self {
+            sender: worker.ok().map(|_| sender),
+        }
+    }
+}
+
+// Phase-only handoff: bounded serialization + try_send; no filesystem, log lock,
+// worker startup, await, retry, or flushing on the request/cancel/EOF owner.
+pub(super) fn phase_summary(
+    service: &Service,
+    id: &str,
+    request_id: &str,
+    review_attempt_id: Option<&str>,
+    data: &Value,
+) {
+    let result = (|| -> Option<()> {
+        let sender = service.phase_sink.sender.as_ref()?;
+        let record = Record {
+            event: "phase_timing",
+            at: now(),
+            session_id: id,
+            request_id,
+            review_attempt_id,
+            mode: mode(&service.config),
+            policy_id: policy_id(&service.config),
+            dropped_before: JOURNAL_DROPPED.load(Ordering::Relaxed),
+            data,
+        };
+        let bytes = encode(&record, JOURNAL_RECORD).ok()?;
+        sender
+            .try_send(PhaseRecord {
+                id: id.into(),
+                bytes,
+            })
+            .ok()
+    })();
+    if result.is_none() {
+        JOURNAL_DROPPED.fetch_add(1, Ordering::Relaxed);
     }
 }
 

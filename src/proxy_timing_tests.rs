@@ -78,7 +78,7 @@ async fn phase_timing_separates_local_transport_body_and_settlement_without_wire
     assert_eq!(saved.primary.input_tokens, 100);
     assert_eq!(saved.primary.output_tokens, 5);
     assert_eq!(saved.shadow.calls, 0);
-    let events = pr154_journal(directory.path(), &id);
+    let events = timing_journal(directory.path(), &id, "timing-fixture");
     let timings: Vec<_> = events
         .iter()
         .filter(|e| e["event"] == "phase_timing")

@@ -1,5 +1,34 @@
+// Deferred diagnostics are not a client EOF/return fence. Test observations wait
+// boundedly for their exact record; production cancellation never waits/flushes.
+fn timing_journal(directory: &Path, id: &str, request: &str) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let records =
+            std::fs::read_to_string(directory.join("diagnostics").join(format!("{id}.jsonl")))
+                .ok()
+                .and_then(|text| {
+                    text.lines()
+                        .map(serde_json::from_str::<Value>)
+                        .collect::<Result<Vec<_>, _>>()
+                        .ok()
+                });
+        if let Some(records) = records
+            && records
+                .iter()
+                .any(|e| e["event"] == "phase_timing" && e["request_id"] == request)
+        {
+            return records;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "deferred terminal summary missing: {request}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn timing_record(directory: &Path, id: &str, request: &str) -> Value {
-    let records: Vec<_> = pr154_journal(directory, id)
+    let records: Vec<_> = timing_journal(directory, id, request)
         .into_iter()
         .filter(|e| e["event"] == "phase_timing" && e["request_id"] == request)
         .collect();

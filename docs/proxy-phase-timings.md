@@ -27,6 +27,15 @@ PY
 ```
 
 Request IDs join existing received/submitted/committed/failure records;
+`mode` and `policy_id` use the same journal serializer as those events.
+`data.policy_context=effective` means the guard adopted the authoritative
+per-request forwarding contract (including review→Off fallback and resolved
+capacity) without restarting its clock or losing accumulated spans. Before that
+selection, early review-mode failures say `configured_unresolved`; their outer
+mode/policy describe configuration, not an executed contract. Unresolved Off
+requests say `configured_off` (no review contract was requested). Reviewer chunks
+inherit their effective owner's context.
+
 `review_attempt_id` joins a review chunk and its wire/receipt diagnostics.
 `data.native_attempt_id` joins the existing `BENCHMARK_CONTEXT_EVENT` stdout
 attempt. Never join merely by close timestamps. These IDs are private log fields,
@@ -61,7 +70,10 @@ seconds and is for correlation only.
   Header/body intervals include streaming and reader scheduling, local parsing
   and relay-channel backpressure. Do not label them prefill, decode, pure model
   generation or provider-only latency.
-- **`total_us`:** entry through terminal handling/settlement and local handoff.
+- **`total_us`:** entry through terminal handling/settlement, sampled before
+  summary construction/serialization and its nonblocking diagnostic handoff.
+  Deferred queue delay, sink lock wait, retention and filesystem writes are
+  deliberately outside this measurement; it is not a logging-flush timer.
   A streaming primary may already have handed response bytes to the client-facing
   relay before this ends. Neither channel enqueue nor JSON conversion proves
   client socket flush or client consumption. Primary settlement includes existing
@@ -85,14 +97,27 @@ actual awaited exceptional `run_review` contributes `blocking_review_us` to a
 primary. Ordinary background reviewer durations overlap primaries and must not be
 charged to their critical path or added to elapsed session time.
 
-One request-local guard emits one terminal summary on normal return or dropped
-future, including pre-dispatch rejection, HTTP/transport errors and cancellation.
+One request-local guard offers at most one terminal summary on normal return or
+dropped future, including pre-dispatch rejection, HTTP/transport errors and cancellation.
 `outcome` describes that boundary, while `incomplete` marks censored timing.
 `null` means a phase was not reached/completed/observed; it is not zero. A clean
 HTTP EOF does not itself certify model success, valid advice or durable authority;
 use existing committed/failed/review-finished records for those outcomes.
 `active_phase` identifies the last owned phase on an interrupted path. A cancelled
 lock wait has a nonzero lower-bound total but null completed lock duration.
+
+Only these new summaries use a phase-only bounded handoff: one dedicated worker
+per live Service/directory, shared by effective Service clones, starts before
+request acceptance. The queue holds at most16 serialized16KiB records, plus one
+in-flight record. It retains no request bodies, Service/key material or request
+locks. Drop does bounded serialization and `try_send`, never sink I/O, logger-lock
+waiting, worker creation, an async spawn, retry or flush. Unavailable workers,
+full/disconnected queues, serialization limits and I/O failures lose observations
+fail-open; there is no synchronous fallback. No request, client EOF, cancellation
+or Service teardown waits for a drain/join. A stalled sink may delay older
+synchronous legacy journal calls; this change does not move those calls or claim
+all logging is nonblocking. Deferred records may arrive after EOF/out of order
+relative to other events, or be lost at shutdown; correlate by IDs, not file order.
 
 The guard cannot run on process kill/abort or power loss. Journals remain
 best-effort/fail-open with existing16KiB record,64KiB lane and256KiB global caps;
@@ -119,3 +144,11 @@ usage; rejection/cancellation/HTTP failure; reviewer correlation/deadline; and t
 bounded retry-span owner. The retry-span test is not an OAuth-refresh integration
 claim and never contacts an auth service. Existing full native/HTTP suites remain
 independent wire, cost and authority controls.
+
+Review regressions additionally stall the actual phase sink before its real
+logger-lock acquisition, hold that lock externally, and observe cancellation join
+and body EOF without waiting for sink release. The observer always releases the
+fault even on failure. Real forwarding checks configured Compact/Audit→unsupported
+Off fallback and resolved-capacity policy identity, exact wire/usage and no review.
+Real guard Drops also exercise queue saturation and unavailable/disconnected
+handoffs; test-only bounded diagnostic readers are not production flushes.

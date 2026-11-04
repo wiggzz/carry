@@ -14,6 +14,7 @@ pub(super) struct Transport {
 
 pub(super) struct Phases {
     service: Arc<Service>,
+    policy_context: &'static str,
     pub session_id: String,
     request_id: String,
     review_attempt_id: Option<String>,
@@ -40,6 +41,13 @@ impl Phases {
         review: Option<(&str, &str, bool)>,
     ) -> Self {
         Self {
+            policy_context: if review.is_some() {
+                "effective"
+            } else if service.config.mode == Mode::Off {
+                "configured_off"
+            } else {
+                "configured_unresolved"
+            },
             service,
             // Pre-identity failures/unscoped off requests share one bounded lane.
             session_id: review.map_or_else(
@@ -67,6 +75,11 @@ impl Phases {
             relay_send_wait_us: None,
             attempts: Vec::with_capacity(2),
         }
+    }
+
+    pub fn effective_service(&mut self, service: Arc<Service>) {
+        self.service = service;
+        self.policy_context = "effective";
     }
 
     pub fn elapsed_us(&self) -> u64 {
@@ -124,10 +137,13 @@ impl Phases {
 
 impl Drop for Phases {
     fn drop(&mut self) {
+        // Measurement endpoint precedes diagnostic serialization/handoff/I/O.
+        let total_us = self.elapsed_us();
         let last = self.attempts.last();
         let data = json!({
             "schema_version":1,"basis":"monotonic_forward_or_review_chunk_entry_us",
             "role":self.role,"background":self.background,"outcome":self.outcome,
+            "policy_context":self.policy_context,
             "incomplete":self.outcome == "cancelled" || (self.outcome != "rejected" && last.is_none_or(|a|a.body_complete_us.is_none())),
             "active_phase":self.active_phase,"native_attempt_id":self.native_attempt_id,
             "primary_lock_wait_us":self.primary_lock_wait_us,"state_load_us":self.state_load_us,
@@ -136,25 +152,14 @@ impl Drop for Phases {
             "first_body_us":last.and_then(|a|a.first_body_us),
             "body_complete_us":last.and_then(|a|a.body_complete_us),
             "settlement_us":self.settlement_us,"relay_send_wait_us":self.relay_send_wait_us,
-            "total_us":self.elapsed_us()
+            "total_us":total_us
         });
-        if let Some(attempt) = &self.review_attempt_id {
-            logging::journal_attempt(
-                &self.service,
-                &self.session_id,
-                &self.request_id,
-                attempt,
-                "phase_timing",
-                &data,
-            );
-        } else {
-            journal(
-                &self.service,
-                &self.session_id,
-                &self.request_id,
-                "phase_timing",
-                &data,
-            );
-        }
+        logging::phase_summary(
+            &self.service,
+            &self.session_id,
+            &self.request_id,
+            self.review_attempt_id.as_deref(),
+            &data,
+        );
     }
 }

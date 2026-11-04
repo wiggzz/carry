@@ -51,6 +51,19 @@ pub(crate) fn hold(directory: &Path) -> (HeldSink, channel::Receiver<()>) {
     *fault = Some(stall.clone());
     (HeldSink(stall), receiver)
 }
+pub(crate) fn capacity() -> usize {
+    PHASE_QUEUE
+}
+
+pub(crate) fn unavailable(disconnected: bool) -> PhaseSink {
+    let sender = disconnected.then(|| {
+        let (sender, receiver) = channel::sync_channel(PHASE_QUEUE);
+        drop(receiver);
+        sender
+    });
+    PhaseSink { sender }
+}
+
 pub(crate) fn before_append(directory: &Path) {
     let stall = FAULT
         .lock()
