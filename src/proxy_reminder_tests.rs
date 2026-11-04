@@ -32,6 +32,72 @@ fn reminder_subject() -> Session {
     session
 }
 
+#[test]
+fn reminder_targets_require_old_complete_exposure_and_current_removal_authority() {
+    let config = reviewer_config();
+    let mut session = reminder_subject();
+    let groups = session.groups();
+    admission::cover(&mut session, &groups);
+    let eligible = groups
+        .iter()
+        .filter(|g| g.exposed && !g.pinned && g.replayable && !g.human)
+        .collect::<Vec<_>>();
+    let dropped = eligible[0];
+    session
+        .apply_advice(
+            &groups,
+            &json!({"protected":[],"removable":[dropped.id],"memories":[]}),
+        )
+        .unwrap();
+    let unseen = eligible[1];
+    session
+        .history
+        .iter_mut()
+        .find(|i| i.id == unseen.members[0])
+        .unwrap()
+        .exposed = false;
+    let cohort = eligible.iter().find(|g| g.members.len() > 1).unwrap();
+    // A previously reviewed prefix does not cover a newly completed tool group.
+    session
+        .review_admission
+        .as_mut()
+        .unwrap()
+        .source_ids
+        .remove(cohort.members.last().unwrap());
+    let mut input = session
+        .history
+        .iter()
+        .map(|i| i.value.clone())
+        .collect::<Vec<_>>();
+    input.extend([
+        json!({"role":"user","content":"new direction"}),
+        json!({"role":"assistant","content":"new evidence"}),
+    ]);
+    session.ingest(&input).unwrap();
+    let new = session.history.last_mut().unwrap();
+    new.exposed = true;
+    let new_id = new.id;
+    let targets = reminder_ledger(&review_body(&config, &session))["reminder_group_ids"].clone();
+    let expected = eligible
+        .iter()
+        .filter(|g| g.id != dropped.id && g.id != unseen.id && g.id != cohort.id)
+        .take(4)
+        .map(|g| g.id)
+        .collect::<Vec<_>>();
+    assert_eq!(targets, json!(expected));
+    for invalid in [dropped.id, unseen.id, cohort.id, new_id] {
+        assert!(!targets.as_array().unwrap().contains(&json!(invalid)));
+    }
+    // A projected omission cannot turn retained provenance into a reminder.
+    let omitted = dropped.members.iter().copied().collect();
+    let projection = planning::Projection {
+        input: session.render_projection(&omitted),
+        omitted,
+    };
+    let targets = reminder_ledger(&review_body_projected(&config, &session, &projection))["reminder_group_ids"].clone();
+    assert!(!targets.as_array().unwrap().contains(&json!(dropped.id)));
+}
+
 #[tokio::test]
 async fn old_protected_reminders_rotate_on_real_reviews_without_releasing_silent_keeps() {
     let initial_keeps = reminder_subject()
@@ -96,9 +162,23 @@ async fn old_protected_reminders_rotate_on_real_reviews_without_releasing_silent
             .unwrap();
         assert_eq!(wire, prospective);
         let ledger = reminder_ledger(&wire);
-        let reminders = ledger["reminder_group_ids"]
-            .as_array()
-            .expect("ordinary reviewer request must carry bounded old-context reminder targets");
+        // No old sources exist on initial ingestion. Reach a completed real
+        // keep before requiring reminders, so baseline RED is old-context
+        // behavior, not just a missing optional field on a fresh request.
+        let reminders = if round == 0 {
+            ledger
+                .get("reminder_group_ids")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            ledger["reminder_group_ids"]
+                .as_array()
+                .expect(
+                    "ordinary reviewer request must carry bounded old-protected reminder targets",
+                )
+                .clone()
+        };
         if round == 0 {
             assert!(reminders.is_empty());
         } else {
