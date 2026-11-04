@@ -29,6 +29,6 @@ class Provider(BaseHTTPRequestHandler):
 
 server = ThreadingHTTPServer(('0.0.0.0', 443), Provider)
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-context.load_cert_chain('/opt/fixture-cert.pem', '/opt/fixture-key.pem')
+context.load_cert_chain('/opt/provider-cert.pem', '/opt/fixture-key.pem')
 server.socket = context.wrap_socket(server.socket, server_side=True)
 server.serve_forever()

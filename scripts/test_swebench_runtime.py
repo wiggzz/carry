@@ -22,7 +22,7 @@ from scripts import swebench_evaluator_compat as compat
 class NativeOfficialSWEAcceptance(unittest.TestCase):
     def test_paired_command_native_containment_and_official_grading(self):
         import docker
-        from swebench.harness import run_evaluation as official, docker_build
+        from swebench.harness import run_evaluation as official, docker_build, reporting
         from swebench.harness.test_spec.test_spec import TestSpec
         from swebench.harness.constants import MAP_REPO_VERSION_TO_SPECS
         root = Path(os.environ['SCB_FIXTURE_OUTPUT'])
@@ -121,6 +121,9 @@ ENTRYPOINT ["python3", "/opt/swebench-harness/bin/adapter"]
                 official.run_instance(spec, prediction, False, False, docker.from_env(), kwargs['run_id'], timeout=30)
             report = next((kwargs['output']/'logs/run_evaluation').rglob('report.json'))
             official_reports.append(json.loads(report.read_text()))
+            with patch.object(reporting, 'RUN_EVALUATION_LOG_DIR', kwargs['output']/'logs/run_evaluation'), \
+                 contextlib.chdir(kwargs['output']):
+                reporting.make_run_report({spec.instance_id: prediction}, json.loads(dataset.read_text()), kwargs['run_id'])
         # Preparation source/dataset verification intentionally cannot accept
         # this owned task as the public dataset. Only this fixture injects it.
         with fixture.FixtureNetwork(scb_prepared['fixture_provider_image']) as network, \

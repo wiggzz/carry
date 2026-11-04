@@ -140,7 +140,6 @@ def run_slot(contract, slot, prepared, output):
     task = prepared['tasks'][slot['task_id']]
     swe.materialize(records=records, selected_ids=[slot['task_id']], root=output/'work', harnesses=('codex',))
     root = output/'work/tasks'/slot['task_id']
-    materialization_seconds = time.monotonic()-started
     agent_output = output/'agent'; agent_output.mkdir()
     # The existing worker runs as root with every capability dropped. Hosted
     # unprivileged operators therefore must grant its *owned slot mounts*
@@ -150,6 +149,7 @@ def run_slot(contract, slot, prepared, output):
     for path in itertools.chain([checkout], checkout.rglob('*')):
         if not path.is_symlink():
             path.chmod(path.stat().st_mode | (0o777 if path.is_dir() else 0o222))
+    materialization_seconds = time.monotonic()-started
     values = {**prepared['config'], **contract.get('proxy', {}), 'CARRY_PROXY_MODE': slot['proxy_mode'],
               'BENCHMARK_HARNESS': 'codex', 'BENCHMARK_TRUSTED_DIRECT': '1' if slot['proxy_mode'] == 'disabled' else '0'}
     error = None

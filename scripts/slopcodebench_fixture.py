@@ -32,8 +32,15 @@ def prepare(root, upstream, carry):
         shutil.copyfile(source/'benchmarks/slopcodebench/fixtures'/name, context/name)
     shutil.copyfile(carry, context/'carry')
     command(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
-             '-subj', '/CN=api.openai.com', '-addext', 'subjectAltName=DNS:api.openai.com',
-             '-keyout', str(context/'fixture-key.pem'), '-out', str(context/'fixture-cert.pem')], capture_output=True)
+             '-subj', '/CN=Owned synthetic fixture CA', '-addext', 'basicConstraints=critical,CA:TRUE',
+             '-keyout', str(context/'fixture-ca-key.pem'), '-out', str(context/'fixture-cert.pem')], capture_output=True)
+    command(['openssl', 'req', '-new', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=api.openai.com',
+             '-keyout', str(context/'fixture-key.pem'), '-out', str(context/'fixture-server.csr')], capture_output=True)
+    (context/'fixture-server.ext').write_text('basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:api.openai.com\n')
+    command(['openssl', 'x509', '-req', '-in', str(context/'fixture-server.csr'),
+             '-CA', str(context/'fixture-cert.pem'), '-CAkey', str(context/'fixture-ca-key.pem'),
+             '-CAcreateserial', '-days', '1', '-extfile', str(context/'fixture-server.ext'),
+             '-out', str(context/'provider-cert.pem')], capture_output=True)
     dockerfile = context/'Dockerfile'
     dockerfile.write_text(f'''FROM {PYTHON_BASE}
 RUN pip install --no-cache-dir uv==0.9.7
@@ -64,6 +71,7 @@ RUN chmod 755 /usr/local/bin/codex /opt/swebench-harness/bin/carry
     dockerfile.write_text(f'''FROM {parent_tag}
 COPY provider.py /opt/provider.py
 COPY fixture-key.pem /opt/fixture-key.pem
+COPY provider-cert.pem /opt/provider-cert.pem
 ''')
     provider_tag = 'scb-fixture-provider:'+uuid.uuid4().hex
     command(['docker', 'build', '--pull=false', '--tag', provider_tag, '--iidfile', str(root/'provider.iid'), str(context)])
@@ -171,6 +179,9 @@ class FixtureNetwork:
         self.patch.start()
         original_stop = swebench_smoke.cleanup_agent_network
         def stop(network, **kwargs):
+            if network.get('carry_proxy') and network.get('state_dir'):
+                result = subprocess.run(['docker', 'logs', network['carry_proxy']], capture_output=True, text=True)
+                (Path(network['state_dir'])/'synthetic-sidecar.log').write_text(result.stdout+result.stderr)
             attached = json.loads(subprocess.check_output(['docker', 'inspect', '--format',
                 '{{json .NetworkSettings.Networks}}', self.name], text=True))
             if network['egress'] in attached:
