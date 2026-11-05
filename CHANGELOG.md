@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.21.1](https://github.com/wiggzz/carry/compare/v0.21.0...v0.21.1) (2026-11-05)
+
+
+### Bug Fixes
+
+* **proxy:** share economic sizing with review admission ([ebe6c19](https://github.com/wiggzz/carry/commit/ebe6c1902756985013bab5f147a9d04c0a46ba23))
+* **proxy:** share economic sizing with review admission ([#219](https://github.com/wiggzz/carry/issues/219)) ([7658832](https://github.com/wiggzz/carry/commit/765883224f3ed4e66129965752414e478593ae26))
+
 ## [0.21.0](https://github.com/wiggzz/carry/compare/v0.20.0...v0.21.0) (2026-11-04)
 
 
