@@ -35,6 +35,8 @@ class ArtifactPublication(unittest.TestCase):
             def actor(argv,**kwargs):
                 mount=next(str(x) for x in argv if isinstance(x,str) and x.endswith(',dst=/benchmark/output'))
                 raw=pathlib.Path(mount.split('src=',1)[1].rsplit(',dst=',1)[0]);seen.append(raw)
+                self.assertEqual(raw.stat().st_mode & 0o777, 0o777)
+                self.assertEqual(raw.parent.stat().st_mode & 0o777, 0o700)
                 (raw/'final.patch').write_text('owned patch bytes')
                 (raw/'nested').mkdir();(raw/'nested'/'trace.jsonl').write_text('owned trace bytes')
                 return subprocess.CompletedProcess(argv,0)

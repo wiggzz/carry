@@ -81,6 +81,7 @@ class OfficialProtectedRuntimeTests(unittest.TestCase):
             (raw/'trace.jsonl').write_bytes(payload)
             agent = object.__new__(CodexAgent)
             agent._trace_dir, agent._saved_trace_paths, agent.log = raw, set(), Mock()
+            agent.pricing = None
             expected = old_usage(agent)
             destination = root/'native-copies'; destination.mkdir()
             with runtime.protected_runtimes({}, {}):

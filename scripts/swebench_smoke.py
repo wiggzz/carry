@@ -1931,6 +1931,10 @@ def run_agent(*, output: pathlib.Path, **kwargs) -> dict[str, Any]:
         if raw.is_relative_to(output.resolve()):
             raise AgentArtifactError('private agent scratch overlaps published output')
         raw.mkdir(mode=0o755)
+        # The existing agent contract runs as an unprivileged container UID.
+        # Only its raw bind mount is writable; the enclosing private scratch
+        # remains 0700 and published results remain outside the agent mount.
+        raw.chmod(0o777)
         record = _run_agent(output=raw, **kwargs)
         publish_agent_artifacts(raw, output)
         return record
