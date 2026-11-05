@@ -138,8 +138,9 @@ pub struct ProxyCli {
     /// Ordinary reviews require this many completed primary requests AND native-source growth.
     #[arg(long, env = "CARRY_PROXY_REVIEW_EVERY_REQUESTS", default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=100))]
     review_every_requests: u64,
-    /// Minimum retained primary wire-prompt estimate for ordinary review (0 disables).
-    #[arg(long, env = "CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS", default_value_t = 150000, value_parser = clap::value_parser!(u32).range(0..=2000000))]
+    /// Optional economic floor on known retained primary input (0 disables).
+    /// Unknown sizing falls back to cadence and newly reviewable visible source.
+    #[arg(long, env = "CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS", default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=2000000))]
     review_min_primary_tokens: u32,
     /// Newly reviewable native-source token estimate since successful admission (0 disables).
     #[arg(long, env = "CARRY_PROXY_REVIEW_MIN_NEW_TOKENS", default_value_t = 25000, value_parser = clap::value_parser!(u32).range(0..=2000000))]
@@ -3494,18 +3495,6 @@ fn primary_output_reserve(config: &ProxyCli, body: &Value) -> u64 {
     carry::models::output_allowance(
         body["max_output_tokens"].as_u64(),
         u64::from(config.primary_output_reserve_tokens),
-    )
-}
-
-fn primary_input_estimate(
-    config: &ProxyCli,
-    session: &Session,
-    body: &Value,
-) -> Option<crate::proxy_quantity::InputEstimate> {
-    session.primary_input.estimate(
-        &primary_wire_body(config, body),
-        &config.upstream_url,
-        config.model_resolution.as_ref().map(|p| &p.primary),
     )
 }
 

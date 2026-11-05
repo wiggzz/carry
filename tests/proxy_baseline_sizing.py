@@ -99,7 +99,12 @@ class BaselineSizing(unittest.TestCase):
                     [], f"negative-{n}", input_tokens=10000)))
                 state = self.state / name
                 state.mkdir()
-                proxy = support.Proxy(state, fixture, ['--review-min-primary-tokens', '1000000'])
+                # This tests unknown sizing, not ordinary admission. Unknown is
+                # no longer a primary-floor veto; keep this two-request fixture
+                # below cadence instead of relying on an unknown quantity.
+                proxy = support.Proxy(state, fixture, [
+                    '--review-min-primary-tokens', '1000000',
+                    '--review-every-requests', '100'])
                 self.stack.callback(proxy.close)
                 history = [{"role": "user", "content": "stable negative goal"}]
                 self.assertEqual(proxy.send(history)[0], 200)
