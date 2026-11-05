@@ -121,13 +121,18 @@ empty state directory; there is no checkpoint migration, import-window/replay
 trajectory, lease, fork-point API, or synchronous-review mode.
 
 Ordinary reviews require both completed-primary cadence and newly reviewable
-native-source growth, plus the retained-primary size floor. Defaults are four
-requests, 25,000 new tokens and a 150,000-token primary estimate. Set
-`--review-every-requests`, `--review-min-new-tokens`, and
+visible native-source growth. Defaults are four requests and 25,000 new visible
+source tokens; the optional retained-primary economic floor defaults to zero.
+Set `--review-every-requests`, `--review-min-new-tokens`, and
 `--review-min-primary-tokens` (or their `CARRY_PROXY_REVIEW_*` environment values)
-explicitly for matched experiments. Bounded no-yield backoff does not manufacture
-new source. Review answers, memories and repeated old native content are not new
-source growth. Replay exposure declarations do not make review synchronous.
+explicitly for matched experiments. A positive primary floor uses the same
+qualified receipt-anchored forecast owner as planning: known-below-floor input
+waits, while unknown sizing falls back to cadence and source growth. Encrypted
+payload length never counts toward the new-visible-source threshold, and an
+empirical reasoning forecast is not hard-capacity or cache proof.
+Bounded no-yield backoff does not manufacture new source. Review answers,
+memories and repeated old native content are not new source growth.
+Replay exposure declarations do not make review synchronous.
 
 When primary context capacity or pricing is unknown, the request is forwarded
 without review, rewriting, or Carry context-budget rejection. Unknown tariffs

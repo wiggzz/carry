@@ -113,7 +113,11 @@ fn primary_quantity(
 ) -> Option<crate::proxy_quantity::InputEstimate> {
     let mut retained = main.clone();
     retained["input"] = json!(session.render_primary());
-    primary_input_estimate(config, session, &retained)
+    session.primary_input.forecast_estimate(
+        &primary_wire_body(config, &retained),
+        &config.upstream_url,
+        config.model_resolution.as_ref().map(|p| &p.primary),
+    )
 }
 
 #[cfg(test)]
@@ -155,24 +159,13 @@ pub(super) fn decision_with_primary(
         None
     };
     let primary = primary.or_else(|| quantity.map(|input| input.tokens as f64));
-    let visible = if reason.is_none() && primary.is_none() && config.review_min_primary_tokens > 0 {
-        let mut retained = main.clone();
-        retained["input"] = json!(session.render_primary());
-        session
-            .primary_input
-            .visible_prompt_tokens(&primary_wire_body(config, &retained))
-            .map(|tokens| tokens as f64)
-    } else {
-        None
-    };
+    // A configured floor is an economic hint only when the primary wire has
+    // a qualified quantity. Unknown sizing falls back to cadence/source growth,
+    // not ciphertext length or an unrelated visible-only partial prompt.
     if reason.is_none()
-        && primary.or(visible).unwrap_or(0.0) < config.review_min_primary_tokens as f64
+        && primary.is_some_and(|tokens| tokens < config.review_min_primary_tokens as f64)
     {
-        reason = Some(if primary.is_none() {
-            "primary_quantity_unknown"
-        } else {
-            "primary_floor"
-        });
+        reason = Some("primary_floor");
     }
     // Each newly eligible native item contributes once. Count only these
     // sections, and only when the growth floor can still affect admission.
@@ -195,11 +188,16 @@ pub(super) fn decision_with_primary(
     if reason.is_none() && growth.is_some_and(|growth| growth < tokens as f64) {
         reason = Some("native_source_growth");
     }
-    let reason = reason.unwrap_or("admitted");
-    json!({"admitted": matches!(reason, "admitted" | "pressure_override"),
+    let reason = reason.unwrap_or(
+        if primary.is_none() && config.review_min_primary_tokens > 0 {
+            "admitted_primary_quantity_unknown"
+        } else {
+            "admitted"
+        },
+    );
+    json!({"admitted": matches!(reason, "admitted" | "admitted_primary_quantity_unknown" | "pressure_override"),
         "reason":reason,"primary_estimated_tokens":primary,
         "primary_input_basis":quantity.map(|input|input.basis),
-        "primary_local_visible_text_tokens":visible,
         "source_growth_basis":"local_visible_text_not_encoded_native_payloads",
         "new_native_source_estimated_tokens":growth,"completed_requests_since_review":age,
         "required_requests":requests,"required_new_tokens":tokens,
