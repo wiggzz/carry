@@ -128,12 +128,16 @@ ENTRYPOINT ["python3", "/opt/swebench-harness/bin/adapter"]
                 reporting.make_run_report({spec.instance_id: prediction}, json.loads(dataset.read_text()), kwargs['run_id'])
         # Preparation source/dataset verification intentionally cannot accept
         # this owned task as the public dataset. Only this fixture injects it.
+        # Reuse the same authority already consumed by SCB, never a new lane allowance.
+        budget_state = root/'synthetic-combined-budget.json'
+        self.assertTrue(budget_state.is_file())
         with fixture.FixtureNetwork(scb_prepared['fixture_provider_image']) as network, \
+             patch.dict(os.environ, {'BENCHMARK_BUDGET_STATE': str(budget_state)}), \
              patch.object(lane, 'preflight', side_effect=lambda c,p: lane.comparison.build_plan(c)), \
              patch.object(lane.swe, 'materialize', side_effect=materialize), \
              patch.object(lane.swe, 'run_official_evaluation', side_effect=evaluate), contextlib.redirect_stdout(io.StringIO()):
             lane.main(['--contract', str(config), '--prepared', str(prepared_file), '--run', '--allow-paid',
-                       '--output', str(work/'paired'), '--budget-usd', '1'])
+                       '--output', str(work/'paired'), '--budget-usd', '10'])
         (work/'provider-synthetic.log').write_text(network.provider_log)
         report = json.loads((work/'paired/report.json').read_text())
         self.assertTrue(report['comparison_valid'], (work/'paired/records.jsonl').read_text())

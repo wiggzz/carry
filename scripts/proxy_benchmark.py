@@ -57,7 +57,8 @@ def validate_config(values):
     return config
 
 
-def sidecar_command(*, image, name, network, state_dir, config):
+def sidecar_command(*, image, name, network, state_dir, config,
+                    upstream_url='https://api.openai.com/v1/responses'):
     import os
     return ['docker', 'run', '--detach', '--name', name, '--network', network,
         '--user', f'{os.getuid()}:{os.getgid()}',
@@ -67,7 +68,7 @@ def sidecar_command(*, image, name, network, state_dir, config):
         '--env', 'CARRY_PROXY_UPSTREAM_KEY', '--env', 'CARRY_PROXY_CLASSIFIER_KEY',
         '--env', 'CARRY_PROXY_AUTH_TOKEN', '--entrypoint', '/opt/swebench-harness/bin/carry',
         image, 'proxy', '--verbose', '--listen', '0.0.0.0:8787',
-        '--upstream-url', 'https://api.openai.com/v1/responses',
+        '--upstream-url', upstream_url,
         '--classifier-url', 'http://openai-proxy:8080/v1/responses',
         '--state-dir', '/proxy-state', '--mode', config['CARRY_PROXY_MODE'],
         '--classifier-model', config['CARRY_PROXY_CLASSIFIER_MODEL'],
@@ -77,7 +78,7 @@ def sidecar_command(*, image, name, network, state_dir, config):
         '--min-payback-percent', config['CARRY_PROXY_MIN_PAYBACK_PERCENT']]
 
 
-def native_cost(model, usage, *, service_tier='default'):
+def native_cost_decimal(model, usage, *, service_tier='default'):
     if not isinstance(model, str) or service_tier not in ('default', 'standard', None):
         return None
     spec = model_spec(model)
@@ -111,9 +112,14 @@ def native_cost(model, usage, *, service_tier='default'):
     above = long is not None and usage['input_tokens'] > long['threshold']
     multiplier = Decimal(str(long['input_multiplier'])) if above else Decimal(1)
     output_multiplier = Decimal(str(long['output_multiplier'])) if above else Decimal(1)
-    return float((multiplier * (ordinary * Decimal(str(rates['input'])) +
+    return (multiplier * (ordinary * Decimal(str(rates['input'])) +
         cached * Decimal(str(rates['cached'])) + writes * Decimal(str(rates['write']))) +
-        output_multiplier * usage['output_tokens'] * Decimal(str(rates['output']))) / Decimal(1000000))
+        output_multiplier * usage['output_tokens'] * Decimal(str(rates['output']))) / Decimal(1000000)
+
+
+def native_cost(model, usage, *, service_tier='default'):
+    cost = native_cost_decimal(model, usage, service_tier=service_tier)
+    return None if cost is None else float(cost)
 
 
 def summarize_events(events, *, metrics=None):

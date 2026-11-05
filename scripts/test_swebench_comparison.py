@@ -25,6 +25,11 @@ class PairedSWEExecutionTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        from scripts.benchmark_budget import SpendingAuthority
+        self.budget_state = self.root/'synthetic-budget.json'
+        SpendingAuthority.create(self.budget_state, cap_usd='1', cloud_reserve_usd='0',
+            cloud_bound={'evidence_kind': 'synthetic-fixture', 'rate_usd_per_hour': '0',
+                         'maximum_seconds': 3600, 'cleanup_owner': 'owned-no-cloud-fixture'})
         self.config = contract()
         self.config.update(benchmark='swebench', selection=[{'id': 'owned__synthetic-1', 'checkpoints': ['final']}])
         self.records = [{'instance_id': 'owned__synthetic-1', 'repo': 'owned/synthetic',
@@ -100,7 +105,8 @@ class PairedSWEExecutionTests(unittest.TestCase):
              patch.object(lane.swe, 'materialize', side_effect=materialize), \
              patch.object(lane.swe, 'run_isolated_agent', side_effect=agent), \
              patch.object(lane.swe, 'run_official_evaluation', side_effect=evaluate), \
-             patch.dict(os.environ, {'OPENAI_API_KEY': 'synthetic-secret', 'OPENAI_SECRET_FILE': '/synthetic/private'}), \
+             patch.dict(os.environ, {'OPENAI_API_KEY': 'synthetic-secret', 'OPENAI_SECRET_FILE': '/synthetic/private',
+                                     'BENCHMARK_BUDGET_STATE': str(self.budget_state)}), \
              contextlib.redirect_stdout(io.StringIO()):
             lane.main(['--contract', str(config), '--prepared', str(prepared), '--run', '--allow-paid',
                        '--budget-usd', '1', '--output', str(self.root/'paired')])

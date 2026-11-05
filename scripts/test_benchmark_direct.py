@@ -105,5 +105,10 @@ class TrustedDirectTests(unittest.TestCase):
             self.assertNotIn('fixture-direct-provider', json.dumps(gateway.events))
 
 
+# Imported here so the existing immutable CI module selection executes the
+# spending regressions without a workflow change.
+from scripts.test_benchmark_budget import DispatchBudgetTests, GatewayBudgetTests
+
+
 if __name__ == '__main__':
     unittest.main()

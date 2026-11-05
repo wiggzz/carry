@@ -677,6 +677,21 @@ def start_agent_network(*, identity: str, proxy_image: str, proxy_script: pathli
         "proxy": f"carry-openai-proxy-{digest}",
         "api_base": "http://openai-proxy:8080/v1",
     }
+    budget_state = os.environ.get('BENCHMARK_BUDGET_STATE')
+    if budget_state:
+        try:
+            from benchmark_budget import SpendingAuthority
+        except ModuleNotFoundError:
+            from scripts.benchmark_budget import SpendingAuthority
+        if state_dir is None or expected_primary_model is None:
+            raise ValueError('budgeted network requires trusted capture and exact model binding')
+        lease = SpendingAuthority(budget_state).reserve(identity)
+        budget_dir = state_dir.with_name(state_dir.name + '-budget').resolve()
+        budget_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+        network.update(budget_state=str(pathlib.Path(budget_state).resolve()),
+                       budget_lease=json.dumps(lease), budget_journal=str(budget_dir/'attempts.jsonl'))
+        import secrets
+        upstream_token = secrets.token_urlsafe(32)
     try:
         execute(["docker", "network", "create", "--internal", network["internal"]], check=True)
         execute(["docker", "network", "create", network["egress"]], check=True)
@@ -700,10 +715,11 @@ def start_agent_network(*, identity: str, proxy_image: str, proxy_script: pathli
                 raise ValueError("trusted proxy requires the provider credential")
             trusted_env = {key: value for key, value in os.environ.items()
                            if not key.startswith(("OPENAI_", "CARRY_PROXY_"))}
-            trusted_env.update(CARRY_PROXY_UPSTREAM_KEY=secret, CARRY_PROXY_CLASSIFIER_KEY=shadow_token,
+            trusted_env.update(CARRY_PROXY_UPSTREAM_KEY=upstream_token if budget_state else secret, CARRY_PROXY_CLASSIFIER_KEY=shadow_token,
                                CARRY_PROXY_AUTH_TOKEN=auth)
             execute(proxy_benchmark.sidecar_command(image=carry_image, name=network["carry_proxy"],
-                    network=network["egress"], state_dir=state_dir, config=proxy_config),
+                    network=network["egress"], state_dir=state_dir, config=proxy_config,
+                    upstream_url='http://openai-proxy:8080/v1/responses' if budget_state else 'https://api.openai.com/v1/responses'),
                     check=True, env=trusted_env, timeout=60)
             gateway_env = {key: value for key, value in os.environ.items()
                            if not key.startswith(("OPENAI_", "CARRY_PROXY_"))}
@@ -740,6 +756,15 @@ def start_agent_network(*, identity: str, proxy_image: str, proxy_script: pathli
                 BENCHMARK_EXPECTED_CLASSIFIER_MODEL=proxy_config['CARRY_PROXY_CLASSIFIER_MODEL'])
             for key in ('BENCHMARK_MODEL_BINDING', 'BENCHMARK_EXPECTED_PRIMARY_MODEL',
                         'BENCHMARK_EXPECTED_CLASSIFIER_MODEL'):
+                gateway_env_args.extend(['--env', key])
+        if budget_state:
+            gateway_env.update(BENCHMARK_BUDGET_PICO_USD=lease['pico_usd'],
+                BENCHMARK_BUDGET_LEASE_ID=lease['id'],
+                BENCHMARK_BUDGET_JOURNAL='/budget/attempts.jsonl', BENCHMARK_UPSTREAM_TOKEN=upstream_token)
+            gateway_env_args.extend(['--user', f'{os.getuid()}:{os.getgid()}', '--mount',
+                f'type=bind,src={budget_dir},dst=/budget'])
+            for key in ('BENCHMARK_BUDGET_PICO_USD', 'BENCHMARK_BUDGET_JOURNAL',
+                        'BENCHMARK_BUDGET_LEASE_ID', 'BENCHMARK_UPSTREAM_TOKEN'):
                 gateway_env_args.extend(['--env', key])
         execute(
             [
@@ -885,6 +910,13 @@ def cleanup_agent_network(network: Mapping[str, str], execute: Any = subprocess.
         if egress.returncode == 0:
             leftovers.append("egress network remains")
         if not leftovers:
+            if network.get('budget_state'):
+                try:
+                    from benchmark_budget import SpendingAuthority
+                except ModuleNotFoundError:
+                    from scripts.benchmark_budget import SpendingAuthority
+                SpendingAuthority(network['budget_state']).settle(
+                    json.loads(network['budget_lease']), pathlib.Path(network['budget_journal']))
             return
         if attempt < 2:
             time.sleep(1)

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Gateway:
-    def __init__(self, carry_port, provider_port, policy=None, *, module_path=None, direct=False, expected_models=None):
+    def __init__(self, carry_port, provider_port, policy=None, *, module_path=None, direct=False, expected_models=None, budget=None):
         env = {k:v for k,v in os.environ.items() if not k.startswith(('OPENAI_', 'CARRY_PROXY_', 'BENCHMARK_'))}
         env.update(BENCHMARK_CONTEXT_PROXY='1', BENCHMARK_CLIENT_TOKEN='fixture-client',
             CARRY_PROXY_AUTH_TOKEN='fixture-trusted', BENCHMARK_SESSION_ID='fixture-session',
@@ -26,6 +26,11 @@ class Gateway:
         if expected_models is not None:
             env.update(BENCHMARK_EXPECTED_PRIMARY_MODEL=expected_models[0],
                        BENCHMARK_EXPECTED_CLASSIFIER_MODEL=expected_models[1], BENCHMARK_MODEL_BINDING='1')
+        if budget is not None:
+            env.update(BENCHMARK_UPSTREAM_TOKEN='fixture-upstream',
+                       BENCHMARK_BUDGET_LEASE_ID=budget.get('id', 'fixture-escrow'),
+                       BENCHMARK_BUDGET_PICO_USD=str(budget['limit']),
+                       BENCHMARK_BUDGET_JOURNAL=str(budget['journal']))
         script = "const s=require(process.argv[1]).serve({port:0,host:'127.0.0.1'}); s.on('listening',()=>console.log('PORT '+s.address().port)); process.on('SIGTERM',()=>s.close(()=>process.exit(0)));"
         self.log = tempfile.TemporaryFile()
         self.error_log = tempfile.TemporaryFile()

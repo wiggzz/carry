@@ -31,8 +31,14 @@ class OfficialProtectedRuntimeTests(unittest.TestCase):
         readiness = runtime.prepare_readiness(contract, prepared)
         self.assertEqual(readiness['model_requests'], 0)
         run_plan = runtime.preflight(contract, prepared, verify_sources=False)
-        with fixture.FixtureNetwork(self.provider) as network:
-            report = comparison.dispatch(run_plan, contract, prepared, self.root/'paired', runtime.run_slot, budget_usd=1.0)
+        from scripts.benchmark_budget import SpendingAuthority
+        budget_state = self.root/'synthetic-combined-budget.json'
+        SpendingAuthority.create(budget_state, cap_usd='10', cloud_reserve_usd='0',
+            cloud_bound={'evidence_kind': 'synthetic-fixture', 'rate_usd_per_hour': '0',
+                         'maximum_seconds': 3600, 'cleanup_owner': 'owned-hosted-no-cloud-fixture'})
+        with fixture.FixtureNetwork(self.provider) as network, \
+             patch.dict(os.environ, {'BENCHMARK_BUDGET_STATE': str(budget_state)}):
+            report = comparison.dispatch(run_plan, contract, prepared, self.root/'paired', runtime.run_slot, budget_usd=10.0)
         (self.root/'provider-synthetic.log').write_text(network.provider_log)
         rows = [json.loads(line) for line in (self.root/'paired'/'records.jsonl').read_text().splitlines()]
         self.assertEqual(len(rows), run_plan['expected_records'])
