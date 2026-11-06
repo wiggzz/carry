@@ -386,22 +386,22 @@ impl DashboardTotals {
         // money cannot silently drop a session and leave a full-window headline.
         if estimate.whole_window_incomplete {
             self.unavailable_whole_windows(1);
-        } else if self.whole_window_unavailable_sessions == 0 {
-            if let Some(window) = &estimate.whole_window {
-                if let Some(total) = &mut self.whole_window {
-                    total.carry_cost += window.carry_cost;
-                    total.traditional_cost += window.traditional_cost;
-                    total.primary_responses += window.primary_responses;
-                    total.inferred_primary_responses += window.inferred_primary_responses;
-                    total.inferred_traditional_cost += window.inferred_traditional_cost;
-                    total.savings = total.traditional_cost - total.carry_cost;
-                    total.savings_percent = (total.traditional_cost > 0.0)
-                        .then_some(100.0 * total.savings / total.traditional_cost);
-                    total.reference_cost_ratio = None;
-                    total.assumption = "sum_of_session_whole_window_point_estimates";
-                } else {
-                    self.whole_window = Some(window.clone());
-                }
+        } else if self.whole_window_unavailable_sessions == 0
+            && let Some(window) = &estimate.whole_window
+        {
+            if let Some(total) = &mut self.whole_window {
+                total.carry_cost += window.carry_cost;
+                total.traditional_cost += window.traditional_cost;
+                total.primary_responses += window.primary_responses;
+                total.inferred_primary_responses += window.inferred_primary_responses;
+                total.inferred_traditional_cost += window.inferred_traditional_cost;
+                total.savings = total.traditional_cost - total.carry_cost;
+                total.savings_percent = (total.traditional_cost > 0.0)
+                    .then_some(100.0 * total.savings / total.traditional_cost);
+                total.reference_cost_ratio = None;
+                total.assumption = "sum_of_session_whole_window_point_estimates";
+            } else {
+                self.whole_window = Some(window.clone());
             }
         }
         self.quantity_evidence.observe(estimate);

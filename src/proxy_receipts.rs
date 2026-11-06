@@ -337,15 +337,15 @@ impl Trajectory {
             );
             self.history.diverge();
             self.receipts.cache_initialized = true;
-            if self.history.history_continuity.is_none() {
-                if let (Some(native), Some(items)) = (native.as_ref(), body["input"].as_array()) {
-                    self.history.observe(
-                        HistoryContract::extract(body, route, resolved, self.scenario),
-                        items,
-                        native.input_tokens,
-                        at,
-                    );
-                }
+            if self.history.history_continuity.is_none()
+                && let (Some(native), Some(items)) = (native.as_ref(), body["input"].as_array())
+            {
+                self.history.observe(
+                    HistoryContract::extract(body, route, resolved, self.scenario),
+                    items,
+                    native.input_tokens,
+                    at,
+                );
             }
             return;
         }
@@ -387,30 +387,27 @@ impl Trajectory {
             && self.history.pending_retention.is_none()
             && self.restored == 0
             && !cache_policy_changed
-        {
-            if let Some(prior_at) =
+            && let Some(prior_at) =
                 self.history
                     .recover_projection(&config, body, native.input_tokens, at)
+        {
+            // A single empty-output gap can be resolved by an exact repeat
+            // now known to be canonical (zero restoration). Recover only
+            // its transitions, never its excluded monetary contribution.
+            let prior_input = self.history.input(native.input_tokens, 0);
+            match self
+                .scenario
+                .response_compaction(prior_input, 0, projection_fixed_tokens(body))
             {
-                // A single empty-output gap can be resolved by an exact repeat
-                // now known to be canonical (zero restoration). Recover only
-                // its transitions, never its excluded monetary contribution.
-                let prior_input = self.history.input(native.input_tokens, 0);
-                match self.scenario.response_compaction(
-                    prior_input,
-                    0,
-                    projection_fixed_tokens(body),
-                ) {
-                    Ok(Some(kept)) => {
-                        self.history
-                            .summarize(prior_input, kept, self.scenario.summary);
-                        self.result.traditional_compactions += 1;
-                        self.traditional_edited = true;
-                        self.receipts.modeled_cache.clear();
-                    }
-                    Ok(None) => recovered_cache_request_at = Some(prior_at),
-                    Err(()) => self.history.unresolved_projection = true,
+                Ok(Some(kept)) => {
+                    self.history
+                        .summarize(prior_input, kept, self.scenario.summary);
+                    self.result.traditional_compactions += 1;
+                    self.traditional_edited = true;
+                    self.receipts.modeled_cache.clear();
                 }
+                Ok(None) => recovered_cache_request_at = Some(prior_at),
+                Err(()) => self.history.unresolved_projection = true,
             }
         }
         if self.history.unresolved_projection {
@@ -422,14 +419,11 @@ impl Trajectory {
         }
         if self.history.pending_retention.is_some() {
             let recovered = self.history.resolve_retention(
-                body,
+                primary,
                 native.input_tokens,
                 self.restored,
                 self.carry_edited,
                 self.scenario,
-                measurements,
-                route,
-                resolved,
             );
             let resolved_transition = recovered.and_then(|(retained, fixed)| {
                 self.scenario
@@ -544,21 +538,20 @@ impl Trajectory {
             cache.inherit(cache_scope.clone(), at, ttl, inherited);
         }
         self.receipts.cache_initialized = true;
-        if let Some(prior_at) = recovered_cache_request_at {
-            if mode == carry::models::ScenarioCacheMode::Implicit
-                && minimum.is_some_and(|min| traditional >= min)
-            {
-                let read_refresh = resolved
-                    .and_then(|r| r.scenario_cache_policy.as_ref())
-                    .and_then(|p| p.read_refresh_seconds(model, body));
-                cache.requested(
-                    cache_scope.clone(),
-                    prior_at,
-                    ttl,
-                    traditional,
-                    read_refresh,
-                );
-            }
+        if let Some(prior_at) = recovered_cache_request_at
+            && mode == carry::models::ScenarioCacheMode::Implicit
+            && minimum.is_some_and(|min| traditional >= min)
+        {
+            let read_refresh = resolved
+                .and_then(|r| r.scenario_cache_policy.as_ref())
+                .and_then(|p| p.read_refresh_seconds(model, body));
+            cache.requested(
+                cache_scope.clone(),
+                prior_at,
+                ttl,
+                traditional,
+                read_refresh,
+            );
         }
         let cached = if mode == carry::models::ScenarioCacheMode::Implicit {
             cache

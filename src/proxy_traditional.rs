@@ -311,15 +311,19 @@ impl TraditionalHistoryState {
 
     pub(super) fn resolve_retention(
         &self,
-        body: &Value,
+        primary: PrimaryObservation<'_>,
         native: u64,
         restoration: i128,
         projected: bool,
         scenario: Scenario,
-        measurements: Option<&crate::proxy_quantity::InputMeasurements>,
-        route: &str,
-        resolved: Option<&ResolvedModel>,
     ) -> Option<(u64, u64)> {
+        let PrimaryObservation {
+            body,
+            measurements,
+            route,
+            resolved,
+            ..
+        } = primary;
         let pending = self.pending_retention.as_ref()?;
         let cursor = &self.history_continuity.as_ref()?.cursor;
         let items = body["input"].as_array()?;
@@ -431,15 +435,15 @@ impl TraditionalHistoryState {
         input: u64,
         at: u64,
     ) {
-        if let Some(previous) = &self.history_continuity {
-            if previous.contract.compatible(&contract) {
-                contract.resolved_model = contract
-                    .resolved_model
-                    .or_else(|| previous.contract.resolved_model.clone());
-                contract.source_class = contract
-                    .source_class
-                    .or_else(|| previous.contract.source_class.clone());
-            }
+        if let Some(previous) = &self.history_continuity
+            && previous.contract.compatible(&contract)
+        {
+            contract.resolved_model = contract
+                .resolved_model
+                .or_else(|| previous.contract.resolved_model.clone());
+            contract.source_class = contract
+                .source_class
+                .or_else(|| previous.contract.source_class.clone());
         }
         self.history_continuity = Some(HistoryContinuity {
             contract,
