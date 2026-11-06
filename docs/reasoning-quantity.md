@@ -79,6 +79,52 @@ reviewer authorization are always rechecked.
 heuristic allocations. In particular, canonical receipt reconstruction may
 remain unavailable after an estimated edit; actual paid usage is preserved
 without inventing comparative savings. Forecasts are not serialized as
-`ProviderReceipt`, `MeasuredBlock` or native cache extents. Only existing numeric
-receipt/identity state and the conflict flag persist. Dashboard polling remains
+`ProviderReceipt` or native cache extents. Forecast weights remain separate
+from the neutral accounting allocations below. Dashboard polling remains
 count-only and does not initiate full-history BPE.
+
+## Traditional accounting estimates (residual v1)
+
+The dashboard's traditional-history estimate uses **neutral accounting quantities**,
+not the planner's asymmetric selection forecast. `InputMeasurements` remains the
+single receipt/quantity evidence owner; `TraditionalHistoryState` still owns the
+alternative's retirement, summaries, continuity and cache trajectory.
+
+For a compatible native input increment containing supported encrypted reasoning,
+subtract additive local visible-item quantities (including visible framing) first.
+Divide the nonnegative residual equally among the block's reasoning members,
+assigning integer remainders in source order. All member allocations together
+conserve the measured native block increment. Complete blocks remain measured;
+partial member sizes are explicitly estimated. For an unmeasured initial reasoning
+item, the mean residual per reasoning member from compatible measured increments
+is an explicit exchangeability assumption, **not** an allocation of the initial
+whole-prompt residual. No compatible calibration means unavailable. Encrypted
+length, billed output reasoning and unknown monetary tariffs are never conversion
+rules. Unsupported modalities and inconsistent receipts stay unavailable.
+
+Old-format blocks can gain allocations only when every original member is
+currently available. These numeric allocations persist on their original blocks,
+without copying source bodies. This is prospective calibration, not reconstruction
+of past requests. New opaque retained output uses compatible input-increment
+calibration, or remains unknown; actual output billing is never retained-input
+measurement. A successful but unmodeled output keeps its native cursor and prior
+summary state, not a fresh free-initialization allowance on every following call.
+
+Each dispatch replaces the current signed canonical-minus-sent restoration.
+Repeated omissions never accumulate; larger replacement memories can make it
+negative. Estimated quantities enter the existing continuous alternative, including
+its own summary timing/cost, frozen request tariffs and independent cache expiry.
+Actual receipts and paid money remain independent. A quantity-policy boundary
+freezes the prior cumulative comparison (including exclusions and reviewer money)
+without replaying or repricing it. Old excluded calls do not become contributions.
+
+The dashboard exposes measured, estimated and unavailable quantity coverage,
+legacy provenance and matched-subset scope. These are point estimates: no
+statistically calibrated confidence interval or whole-session bound is claimed.
+The alternative assumes the same outputs and tool sequence, not measured causal
+no-Carry expenditure. Controlled request-time/held-out synthetic receipts are
+exercised in `src/proxy_quantity_accounting_tests.rs`; real-binary loopback
+projection, legacy-checkpoint recovery and summary/restart behavior are exercised
+in `tests/proxy_traditional_estimation.py`. Those controls verify accounting and
+avoid training on held-out receipts; they do not establish accuracy on private
+workloads or with real providers.

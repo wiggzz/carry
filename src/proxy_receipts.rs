@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 pub(super) struct Receipts {
     anchor: Option<Anchor>,
     #[serde(default)]
+    pub(super) quantity_policy_version: Option<u32>,
+    #[serde(default)]
     pub(super) initialization_policy_version: Option<u32>,
     #[serde(default)]
     modeled_cache: crate::proxy_cache::ModeledCache,
@@ -24,6 +26,7 @@ impl Default for Receipts {
     fn default() -> Self {
         Self {
             anchor: None,
+            quantity_policy_version: Some(1),
             initialization_policy_version: Some(1),
             modeled_cache: crate::proxy_cache::ModeledCache::default(),
             cache_initialized: false,
@@ -201,6 +204,7 @@ impl Trajectory {
             standard,
             resolved,
             cost: settled,
+            measurements,
         } = primary;
         if response["status"] != "completed" {
             self.failed_call();
@@ -215,6 +219,15 @@ impl Trajectory {
             }
             self.reset_receipt_epoch();
             self.receipts.initialization_policy_version = Some(1);
+        }
+        if self.receipts.quantity_policy_version != Some(1) {
+            let prior = self.snapshot();
+            if prior.coverage.primary_responses > 0 || prior.coverage.reviewer_responses > 0 {
+                self.result.legacy_quantity_segment = Some(CachePolicySegment::from(&prior));
+            }
+            // Prospective only: retain past sums, exclusions and the existing
+            // history/cache owner. Never replay/reprice old opaque omissions.
+            self.receipts.quantity_policy_version = Some(1);
         }
         let policy_version = resolved
             .map_or(Some(carry::models::ScenarioCachePolicy::VERSION), |r| {
@@ -248,7 +261,22 @@ impl Trajectory {
         let model = body["model"].as_str().unwrap_or("");
         let (native, observed, billable) =
             self.record_primary_observation(body, response, standard, settled);
-        let retained_output = retained_output_tokens(&response["output"]);
+        let retained_extra = if crate::savings::prompt_has_opaque(&response["output"]) {
+            measurements.and_then(|m| m.retained_reasoning_extra(&response["output"]))
+        } else {
+            Some((0, 0))
+        };
+        let retained_output = retained_output_tokens(&response["output"])
+            .zip(retained_extra)
+            .and_then(|(visible, (extra, _))| visible.checked_add(extra));
+        let estimated_quantity = self.estimated_projection
+            || self.history.summary > 0
+            || retained_output.is_some_and(|n| n > 0)
+            || retained_extra.is_some_and(|(_, n)| n > 0)
+            || self.result.coverage.unavailable_quantity_calls > 0;
+        if !self.projection_known || retained_output.is_none() || native.is_none() {
+            self.result.coverage.unavailable_quantity_calls += 1;
+        }
         let allowance = carry::models::output_allowance(
             body["max_output_tokens"].as_u64(),
             resolved.map_or(self.scenario.reserve, |r| {
@@ -259,11 +287,11 @@ impl Trajectory {
             allowance,
             resolved.and_then(|r| r.capacity_tokens.map(u64::from)),
         );
-        // Opaque native input can share a receipt or a whole measured-block
-        // projection, never a ciphertext/base64 length. Summaries still lack a
-        // native allocation for an arbitrary opaque retained slice.
-        let opaque = crate::savings::prompt_has_opaque(body);
-        let opaque_comparable = !opaque
+        // Only reasoning has the neutral residual model. Preserve the existing
+        // unavailable native slice contract for images/unsupported modalities.
+        let unsupported_opaque = crate::savings::prompt_has_opaque(body)
+            && !crate::proxy_quantity::accounting_retirement_supported(body);
+        let opaque_comparable = !unsupported_opaque
             || (self.projection_known
                 && self.history.retired == 0
                 && self.history.summary == 0
@@ -282,15 +310,24 @@ impl Trajectory {
                                         .context_window
                                         .saturating_sub(self.scenario.reserve))
                     }));
-        if !billable || !self.projection_known || !opaque_comparable || retained_output.is_none() {
+        // The provider measured the WHOLE input, opaque members included.
+        // Retirement is the existing scenario's estimated numeric policy, not
+        // a claim that a particular encrypted retained slice was measured.
+        // Known restoration remains required; native expense is independent.
+        if !opaque_comparable
+            && self.projection_known
+            && retained_output.is_some()
+            && native.is_some()
+        {
+            self.result.coverage.unavailable_quantity_calls += 1;
+        }
+        if !billable || !self.projection_known || !opaque_comparable {
             self.result.coverage.unmodeled_calls += 1;
             self.result.excluded_unpriced_calls += 1;
             self.reset_epoch();
             return;
         }
-        let (Some(native), Some(items), Some(retained_output)) =
-            (native, body["input"].as_array(), retained_output)
-        else {
+        let (Some(native), Some(items)) = (native, body["input"].as_array()) else {
             self.result.excluded_unpriced_calls += 1;
             self.reset_epoch();
             return;
@@ -350,6 +387,30 @@ impl Trajectory {
                 self.reset_epoch();
                 return;
             }
+        };
+
+        // Retained output can be unavailable while native current input is
+        // known. Run the SAME continuity/free-initialization owner above first,
+        // preserve its successful cursor, and exclude unknown monetary pairs.
+        let Some(retained_output) = retained_output else {
+            self.result.coverage.unmodeled_calls += 1;
+            self.result.excluded_unpriced_calls += 1;
+            self.result.initial_compactions += u64::from(initialized_now);
+            self.history.last_traditional_input = traditional;
+            self.history
+                .observe(contract, items, native.input_tokens, at);
+            self.receipts.anchor = Some(Anchor {
+                configuration: config,
+                prefix: digest(items),
+                items: items.len(),
+                input: native.input_tokens,
+                at,
+            });
+            // This was a request inside the window, not a later opportunity for
+            // free inherited cache. Existing deadlines still own prior warmth.
+            self.receipts.cache_initialized = true;
+            self.carry_edited = false;
+            return;
         };
 
         // The alternative models an API-equivalent policy, not this route's
@@ -483,6 +544,9 @@ impl Trajectory {
             self.result.traditional_cost += traditional_cost + summary_cost;
             self.result.summary_cost += summary_cost;
             self.priced_primary_responses += 1;
+            let estimated = estimated_quantity || kept.is_some() || initialized_now;
+            self.result.coverage.estimated_quantity_calls += u64::from(estimated);
+            self.result.coverage.measured_quantity_calls += u64::from(!estimated);
         } else {
             self.result.excluded_unpriced_calls += 1;
             if cached.is_none() {

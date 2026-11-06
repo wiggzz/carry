@@ -6,6 +6,50 @@ include!("modeled_refresh_tests.rs");
 include!("legacy_history_tests.rs");
 include!("proxy_unknown_price_history_tests.rs");
 include!("semantic_prompt_tests.rs");
+include!("proxy_calibrated_history_tests.rs");
+
+#[test]
+fn opaque_receipt_history_keeps_paid_summary_progression_across_restart() {
+    let mut t = Trajectory {
+        scenario: Scenario {
+            context_window: 4000,
+            reserve: 100,
+            keep_recent: 1500,
+            summary: 100,
+        },
+        ..Trajectory::default()
+    };
+    let mut request = body();
+    request["max_output_tokens"] = json!(1);
+    request["input"].as_array_mut().unwrap().push(json!({"type":"reasoning", "id":"opaque", "encrypted_content":"not-token-units", "summary":[]}));
+    for (i, input) in [1000, 5000, 5100].into_iter().enumerate() {
+        if i > 0 {
+            request["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user", "content":format!("append {i}")}));
+        }
+        t.primary(
+            &request,
+            &terminal(input, 0, 0, 0),
+            "route",
+            100 + i as u64,
+            true,
+        );
+        t = serde_json::from_value(state(&t)).unwrap();
+    }
+    let result = t.snapshot();
+    assert_eq!(result.coverage.primary_responses, 3);
+    assert!(result.observed_primary_cost > 0.0);
+    assert_eq!(
+        result.matched_primary_responses, 3,
+        "opaque receipt totals must advance the existing continuous history"
+    );
+    assert_eq!(result.traditional_compactions, 1);
+    assert_eq!(result.initial_compactions, 0);
+    assert!(result.summary_cost > 0.0);
+    assert_eq!(t.history.last_traditional_input, 1700);
+}
 
 // Output allowance changes feasibility, not the native-input history contract.
 // Exercise both existing initialization and a real in-window paid summary.

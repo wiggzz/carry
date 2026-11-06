@@ -63,6 +63,25 @@ struct Anchor {
 struct MeasuredBlock {
     items: Vec<String>,
     input: u64,
+    // A joint native increment is measured; its internal allocation is not.
+    // Never persist source bodies or use ciphertext length as a weight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allocation: Option<ResidualAllocation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ResidualAllocation {
+    tokens: Vec<u64>,
+    residual: u64,
+    opaque_items: u64,
+}
+
+/// A point estimate, not a capacity proof, native receipt or confidence bound.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RestorationEstimate {
+    pub tokens: i128,
+    pub measured: bool,
+    pub estimated_opaque_items: u64,
 }
 
 fn identity(value: &impl Serialize) -> String {
@@ -259,7 +278,8 @@ impl InputMeasurements {
         Some(tokens)
     }
 
-    /// Settling a receipt records identities and native deltas, never text sizes.
+    /// Settle native deltas and identities. Only a supported opaque APPEND also
+    /// calibrates neutral residual allocations after its local visible framing.
     pub(crate) fn observe(
         &mut self,
         body: &Value,
@@ -306,6 +326,10 @@ impl InputMeasurements {
                             .map(|item| item.identity.clone())
                             .collect(),
                         input: input - previous.input,
+                        allocation: self.residual_allocation(
+                            &values[previous_items.len()..],
+                            input - previous.input,
+                        ),
                     });
                     while self.blocks.len() > 128
                         || self
@@ -851,6 +875,13 @@ impl InputMeasurements {
         )
     }
 }
+include!("proxy_quantity_accounting.rs");
+
+#[cfg(test)]
+mod accounting_tests {
+    include!("proxy_quantity_accounting_tests.rs");
+}
+
 #[cfg(test)]
 mod reasoning_forecast_tests {
     include!("proxy_quantity_reasoning_tests.rs");

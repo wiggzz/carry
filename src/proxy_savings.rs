@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 
 pub const RECEIPT_BASIS: &str = "receipt_anchored_v2";
 pub const LEGACY_BASIS: &str = "legacy_json_v1";
-const RECEIPT_COUNTERFACTUAL_BASIS: &str = "shared_receipt_input_plus_estimated_restoration_summary_visible_retained_output_conditional_append_cache";
+const LEGACY_RECEIPT_COUNTERFACTUAL_BASIS: &str = "shared_receipt_input_plus_estimated_restoration_summary_visible_retained_output_conditional_append_cache";
+const RECEIPT_COUNTERFACTUAL_BASIS: &str = "shared_receipt_input_plus_neutral_residual_estimated_restoration_summary_retained_input_v1_conditional_append_cache_same_outputs_tools";
 
 pub fn accounting_policy() -> Value {
     json!({"default_basis": RECEIPT_BASIS, "retained_legacy_basis": LEGACY_BASIS,
@@ -19,7 +20,9 @@ pub fn accounting_policy() -> Value {
         "counterfactual_cache_initialization": "observed_identical_else_ideal_eligible_prefix_v1",
         "inherited_cache_remaining_lifetime": "full_modeled_policy_lifetime_favoring_baseline_not_observed_residency",
         "failed_primary_cache": "retain_prior_coverage_until_its_deadline",
-        "opaque_output_retention": "unknown_not_ciphertext_length",
+        "opaque_output_retention": "compatible_native_input_increment_residual_estimate_else_unknown_not_ciphertext_length",
+        "quantity_policy": "receipt_residual_allocation_v1_prospective_only",
+        "quantity_uncertainty": "point_estimate_no_statistical_interval_same_outputs_tools_assumed",
         "claim": "conditional_counterfactual_not_measured_savings"})
 }
 
@@ -46,6 +49,12 @@ pub struct Coverage {
     pub unknown_cache_requests: u64,
     #[serde(default)]
     pub unknown_rate_calls: u64,
+    #[serde(default)]
+    pub estimated_quantity_calls: u64,
+    #[serde(default)]
+    pub measured_quantity_calls: u64,
+    #[serde(default)]
+    pub unavailable_quantity_calls: u64,
 }
 
 /// Immutable historical comparison segment. No replay or historical repricing.
@@ -85,6 +94,10 @@ pub struct CachePolicyBoundary {
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Estimate {
+    #[serde(default)]
+    pub quantity_policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_quantity_segment: Option<CachePolicySegment>,
     #[serde(default)]
     pub cache_initializations: crate::proxy_cache::CacheInitializations,
     #[serde(default)]
@@ -132,6 +145,8 @@ pub struct Estimate {
 /// comparable primary observations exist. Omitted reviewer expense is carry-only.
 #[derive(Debug, Serialize)]
 pub struct DashboardEstimate {
+    quantity_evidence: Value,
+    legacy_quantity_segment: Option<CachePolicySegment>,
     cache_initializations: crate::proxy_cache::CacheInitializations,
     initialization_policy: String,
     initial_compactions: u64,
@@ -163,7 +178,28 @@ pub struct DashboardEstimate {
 impl Estimate {
     pub fn dashboard(self, pending: bool) -> DashboardEstimate {
         let available = self.priced;
+        let quantity_evidence = json!({
+            "version": self.quantity_policy_version,
+            "basis": if self.quantity_policy_version == Some(1) {
+                "receipt_blocks_plus_equal_native_increment_residual_allocation_v1"
+            } else { "legacy_receipt_blocks_and_local_visible_text_v0" },
+            "legacy_priced_calls": self.legacy_quantity_segment.as_ref().map(|s| s.matched_primary_responses),
+            "historical_policy_scope": if self.legacy_quantity_segment.is_some() { "mixed_prospective_only_no_repricing" }
+                else if self.quantity_policy_version == Some(1) { "residual_v1" } else { "legacy_v0" },
+            "estimated_priced_calls": self.coverage.estimated_quantity_calls,
+            "measured_priced_calls": self.coverage.measured_quantity_calls,
+            "unavailable_quantity_calls": self.coverage.unavailable_quantity_calls,
+            "uncertainty": "point_estimate_only_no_calibrated_statistical_interval_or_whole_window_bound",
+            "assumptions": "visible_local_units;equal_joint_residual_shares;compatible_input_increment_mean_for_unmeasured_reasoning;same_outputs_and_tool_sequence",
+            "comparison_scope": if self.matched_primary_responses == self.coverage.primary_responses
+                && self.coverage.primary_responses > 0 && self.coverage.prior_untracked_calls == 0
+                && self.excluded_failed_calls == 0 && self.unavailable_reviewer_cost_calls == 0 {
+                "matched_completed_primary_window"
+            } else { "matched_subset_not_whole_session" },
+        });
         DashboardEstimate {
+            quantity_evidence,
+            legacy_quantity_segment: self.legacy_quantity_segment,
             cache_initializations: self.cache_initializations,
             initialization_policy: self.initialization_policy,
             initial_compactions: self.initial_compactions,
@@ -179,7 +215,11 @@ impl Estimate {
                 && self.coverage.reviewer_responses > self.unavailable_reviewer_cost_calls)
                 .then_some(self.observed_reviewer_cost),
             counterfactual_basis: if self.accounting_basis == RECEIPT_BASIS {
-                RECEIPT_COUNTERFACTUAL_BASIS
+                if self.quantity_policy_version == Some(1) {
+                    RECEIPT_COUNTERFACTUAL_BASIS
+                } else {
+                    LEGACY_RECEIPT_COUNTERFACTUAL_BASIS
+                }
             } else {
                 "legacy_local_json_projection"
             },
@@ -286,6 +326,8 @@ pub struct Trajectory {
     restored: i128,
     #[serde(default = "known_projection")]
     projection_known: bool,
+    #[serde(default)]
+    estimated_projection: bool,
     #[serde(flatten)]
     history: TraditionalHistoryState,
     carry_edited: bool,
@@ -306,6 +348,7 @@ pub struct PrimaryObservation<'a> {
     pub standard: bool,
     pub resolved: Option<&'a ResolvedModel>,
     pub cost: Option<f64>,
+    pub(crate) measurements: Option<&'a crate::proxy_quantity::InputMeasurements>,
 }
 
 fn known_projection() -> bool {
@@ -324,6 +367,7 @@ impl Default for Trajectory {
             },
             restored: 0,
             projection_known: true,
+            estimated_projection: false,
             history: TraditionalHistoryState::identical(),
             carry_edited: false,
             traditional_edited: false,
@@ -370,6 +414,7 @@ impl Trajectory {
                 |v| format!("conditional_model_cache_v{v}"),
             )
         };
+        estimate.quantity_policy_version = self.receipts.quantity_policy_version;
         estimate.accounting_basis = RECEIPT_BASIS.into();
         estimate.matched_primary_responses = self.priced_primary_responses;
         estimate.savings = estimate.traditional_cost - estimate.carry_cost;
@@ -420,6 +465,7 @@ impl Trajectory {
         // Totals survive actual rebases/native summaries; cache and restoration
         // assumptions do not cross an ancestry discontinuity.
         self.restored = 0;
+        self.estimated_projection = false;
         self.history = TraditionalHistoryState::default();
         self.carry_edited = false;
         self.traditional_edited = false;
@@ -430,8 +476,10 @@ impl Trajectory {
     pub(super) fn reset_receipt_epoch(&mut self) {
         let restored = self.restored;
         let edited = self.carry_edited;
+        let estimated = self.estimated_projection;
         self.reset_epoch();
         self.restored = restored;
+        self.estimated_projection = estimated;
         self.carry_edited = edited;
     }
 
@@ -445,6 +493,7 @@ impl Trajectory {
     /// A projection can be unknown without losing the actual billed receipt.
     /// Unknown native payloads must never become a zero-token savings claim.
     pub fn projected_input(&mut self, restored: Option<i128>, edited: bool) {
+        self.estimated_projection = restored.is_some_and(|n| n != 0);
         self.projection_known = restored.is_some();
         let restored = restored.unwrap_or(0);
         if edited || self.restored != restored {
@@ -456,6 +505,16 @@ impl Trajectory {
         }
         // Signed: a replacement memory can be larger than its original source.
         self.restored = restored;
+    }
+
+    pub(crate) fn projected_evidence(
+        &mut self,
+        restored: Option<crate::proxy_quantity::RestorationEstimate>,
+        edited: bool,
+    ) {
+        self.projected_input(restored.map(|e| e.tokens), edited);
+        self.estimated_projection =
+            restored.is_some_and(|e| !e.measured || e.estimated_opaque_items > 0);
     }
 
     #[cfg(test)]
@@ -551,6 +610,7 @@ impl Trajectory {
             standard,
             resolved,
             cost: settled,
+            measurements: None,
         });
     }
 

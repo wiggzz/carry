@@ -1,0 +1,268 @@
+// Neutral accounting estimates owned by InputMeasurements, not planner forecasts.
+// Equal residual shares are an explicit exchangeability assumption. The sum of
+// ALL allocations in one measured block is exactly its native input increment;
+// no member's native size, statistical interval or causal savings is asserted.
+
+impl InputMeasurements {
+    fn residual_allocation(&self, values: &[Value], input: u64) -> Option<ResidualAllocation> {
+        if !values.iter().any(crate::savings::prompt_has_opaque) {
+            return None;
+        }
+        let mut tokens = Vec::new();
+        let mut opaque = Vec::new();
+        let mut visible = 0u64;
+        for (index, value) in values.iter().enumerate() {
+            if crate::savings::prompt_has_opaque(value) {
+                if !accounting_reasoning(value) {
+                    return None;
+                }
+                opaque.push(index);
+            }
+            let count = self.text_tokens(value, true)?;
+            tokens.push(count);
+            visible = visible.checked_add(count)?;
+        }
+        if opaque.is_empty() {
+            return None;
+        }
+        let residual = input.checked_sub(visible)?;
+        let count = u64::try_from(opaque.len()).ok()?;
+        for (rank, index) in opaque.into_iter().enumerate() {
+            tokens[index] = tokens[index]
+                .checked_add(residual / count)?
+                .checked_add(u64::from((rank as u64) < residual % count))?;
+        }
+        Some(ResidualAllocation {
+            tokens,
+            residual,
+            opaque_items: count,
+        })
+    }
+
+    fn fully_measured(&self, changed: &[&Item]) -> bool {
+        let mut used = vec![false; changed.len()];
+        for block in self.blocks.iter().rev() {
+            if block.items.is_empty() || block.items.len() > changed.len() {
+                continue;
+            }
+            if let Some(start) =
+                changed
+                    .windows(block.items.len())
+                    .enumerate()
+                    .find_map(|(start, items)| {
+                        (!used[start..start + items.len()].iter().any(|b| *b)
+                            && items
+                                .iter()
+                                .zip(&block.items)
+                                .all(|(item, id)| item.identity == *id))
+                        .then_some(start)
+                    })
+            {
+                used[start..start + block.items.len()].fill(true);
+            }
+        }
+        used.into_iter().all(|b| b)
+    }
+
+    // All compatible retained native increments contribute; an initial native
+    // total cannot donate its unexplained residual to a selected opaque item.
+    fn calibrated_residual(&self) -> Option<u64> {
+        if self.reasoning_conflict {
+            return None;
+        }
+        let (mut residual, mut count) = (0u64, 0u64);
+        for allocation in self.blocks.iter().filter_map(|b| b.allocation.as_ref()) {
+            residual = residual.checked_add(allocation.residual)?;
+            count = count.checked_add(allocation.opaque_items)?;
+        }
+        residual.checked_div(count)
+    }
+
+    /// Conservative about evidence, neutral about direction: do NOT reuse the
+    /// planner's discounted removals, inflated additions or envelope weights.
+    /// Missing evidence remains None. The result is never a native measurement.
+    pub(crate) fn accounting_restoration(
+        &mut self,
+        canonical: &Value,
+        submitted: &Value,
+        route: &str,
+        resolved: Option<&ResolvedModel>,
+    ) -> Option<RestorationEstimate> {
+        let expected = contract(canonical, route, resolved);
+        if expected != contract(submitted, route, resolved) {
+            return None;
+        }
+        let canonical_values = items(canonical)?;
+        let submitted_values = items(submitted)?;
+        let canonical_prompt = prompt(&canonical_values);
+        let submitted_prompt = prompt(&submitted_values);
+        let (removed, added) = changes(
+            submitted_prompt.items.as_deref()?,
+            canonical_prompt.items.as_deref()?,
+        )?;
+        let mut available = BTreeMap::new();
+        for value in canonical_values.iter().chain(&submitted_values) {
+            available.insert(identity(value), value);
+        }
+        // Recover old-format calibration only from complete CURRENTLY available
+        // block membership. Retain it on the original block owner, so output
+        // retention and later requests use the same evidence after restart.
+        if !self.reasoning_conflict && self.contract == expected {
+            let recovered: Vec<_> = self
+                .blocks
+                .iter()
+                .map(|block| {
+                    if block.allocation.is_some() {
+                        return block.allocation.clone();
+                    }
+                    let values: Option<Vec<_>> = block
+                        .items
+                        .iter()
+                        .map(|id| available.get(id).map(|v| (*v).clone()))
+                        .collect();
+                    self.residual_allocation(&values?, block.input)
+                })
+                .collect();
+            for (block, allocation) in self.blocks.iter_mut().zip(recovered) {
+                block.allocation = allocation;
+            }
+        }
+        if let Some(tokens) = self.restoration(canonical, submitted, route, resolved) {
+            let measured = (removed.is_empty() && added.is_empty())
+                || (self.contract == expected
+                    && self.fully_measured(&removed)
+                    && self.fully_measured(&added));
+            return Some(RestorationEstimate {
+                tokens,
+                measured,
+                estimated_opaque_items: 0,
+            });
+        }
+        if self.reasoning_conflict || self.contract != expected {
+            return None;
+        }
+        let blocks: Vec<_> = self
+            .blocks
+            .iter()
+            .map(|block| (block, &block.allocation))
+            .collect();
+        let mut pool_residual = 0u64;
+        let mut pool_count = 0u64;
+        for (_, allocation) in &blocks {
+            if let Some(allocation) = allocation {
+                pool_residual = pool_residual.checked_add(allocation.residual)?;
+                pool_count = pool_count.checked_add(allocation.opaque_items)?;
+            }
+        }
+        let changed_quantity =
+            |changed: &[&Item]| -> Option<(i128, u64)> {
+                let mut used = vec![false; changed.len()];
+                let mut quantity = 0i128;
+                let mut estimated = 0u64;
+                // Whole measured blocks win over all member allocations.
+                for (block, _) in blocks.iter().rev() {
+                    if block.items.is_empty() || block.items.len() > changed.len() {
+                        continue;
+                    }
+                    if let Some(start) = changed.windows(block.items.len()).enumerate().find_map(
+                        |(start, window)| {
+                            (!used[start..start + window.len()].iter().any(|b| *b)
+                                && window
+                                    .iter()
+                                    .zip(&block.items)
+                                    .all(|(item, id)| item.identity == *id))
+                            .then_some(start)
+                        },
+                    ) {
+                        used[start..start + block.items.len()].fill(true);
+                        quantity = quantity.checked_add(block.input as i128)?;
+                    }
+                }
+                for (item, used) in changed.iter().zip(used) {
+                    if used {
+                        continue;
+                    }
+                    let value = *available.get(&item.identity)?;
+                    if !item.opaque {
+                        quantity = quantity.checked_add(self.text_tokens(value, true)? as i128)?;
+                        continue;
+                    }
+                    if !accounting_reasoning(value) {
+                        return None;
+                    }
+                    let mut native_allocated = None;
+                    for (block, allocation) in &blocks {
+                        if let Some(allocation) = allocation {
+                            for (index, id) in block.items.iter().enumerate() {
+                                if id == &item.identity {
+                                    let n = *allocation.tokens.get(index)?;
+                                    if native_allocated.is_some_and(|prior| prior != n) {
+                                        return None;
+                                    }
+                                    native_allocated = Some(n);
+                                }
+                            }
+                        }
+                    }
+                    let count = match native_allocated {
+                        Some(n) => n,
+                        None => self
+                            .text_tokens(value, true)?
+                            .checked_add(pool_residual.checked_div(pool_count)?)?,
+                    };
+                    quantity = quantity.checked_add(count as i128)?;
+                    estimated = estimated.checked_add(1)?;
+                }
+                Some((quantity, estimated))
+            };
+        let (removed, removed_estimated) = changed_quantity(&removed)?;
+        let (added, added_estimated) = changed_quantity(&added)?;
+        Some(RestorationEstimate {
+            tokens: added.checked_sub(removed)?,
+            measured: false,
+            estimated_opaque_items: added_estimated.checked_add(removed_estimated)?,
+        })
+    }
+
+    /// Hidden retained OUTPUT uses earlier native INPUT-increment calibration,
+    /// not billed reasoning output tokens or ciphertext bytes. A previously
+    /// unseen/initial opaque output without calibration is explicitly unknown.
+    pub(crate) fn retained_reasoning_extra(&self, output: &Value) -> Option<(u64, u64)> {
+        let mut count = 0u64;
+        for value in output.as_array()? {
+            if crate::savings::prompt_has_opaque(value) {
+                if !accounting_reasoning(value) {
+                    return None;
+                }
+                count = count.checked_add(1)?;
+            }
+        }
+        if count == 0 {
+            return Some((0, 0));
+        }
+        Some((self.calibrated_residual()?.checked_mul(count)?, count))
+    }
+}
+
+pub(crate) fn accounting_retirement_supported(body: &Value) -> bool {
+    !crate::savings::prompt_has_opaque(&crate::savings::prompt_overhead(body))
+        && items(body).is_some_and(|values| {
+            values.iter().all(|value| {
+                !crate::savings::prompt_has_opaque(value) || accounting_reasoning(value)
+            })
+        })
+}
+
+// Presence/type validation only. Never count or weight the encrypted payload.
+fn accounting_reasoning(value: &Value) -> bool {
+    if value["type"] != "reasoning"
+        || !value["encrypted_content"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    {
+        return false;
+    }
+    let mut visible = value.clone();
+    visible.as_object_mut().unwrap().remove("encrypted_content");
+    !crate::savings::prompt_has_opaque(&visible)
+}

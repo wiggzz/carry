@@ -300,6 +300,10 @@ function tokenMetrics(s){
 }
 function coverageChips(e){
  const chips=[];
+ const q=e?.quantity_evidence;
+ if(q?.estimated_priced_calls)chips.push(fmt(q.estimated_priced_calls)+' calls use estimated quantities');
+ if(q?.unavailable_quantity_calls)chips.push(fmt(q.unavailable_quantity_calls)+' calls lack quantity evidence');
+ if(q?.comparison_scope==='matched_subset_not_whole_session')chips.push('Matched subtotal · not whole session');
  if(e?.excluded_unpriced_calls)chips.push(fmt(e.excluded_unpriced_calls)+' comparison calls excluded');
  if(e?.excluded_failed_calls)chips.push(fmt(e.excluded_failed_calls)+' failed calls excluded');
  if(e?.legacy_sessions)chips.push(fmt(e.legacy_sessions)+' legacy sessions excluded');
@@ -340,7 +344,7 @@ function renderSession(s){
  if(coverage.length){const tags=document.createElement('div');tags.className='inspection-tags';for(const item of coverage)note(tags,item,'inspection-badge');details.append(tags)}
  if(s.last_failure){const failure=document.createElement('div');failure.className='inspection-failure';note(failure,'Last incomplete request','label');note(failure,s.last_failure.reason||'Reason not recorded','inspection-caption');details.append(failure)}
  details.append(laneSummary(s),candidateTable(p,s.id));
- if(e?.counterfactual_cache_policy||e?.accounting_basis){const accounting=disclosure('accounting:'+s.id,'Accounting details','session-accounting');if(e.counterfactual_cache_policy)inspectionMetric(accounting,'Comparison cache policy',e.counterfactual_cache_policy);if(e.accounting_basis)inspectionMetric(accounting,'Accounting basis',e.accounting_basis);details.append(accounting)}
+ if(e?.counterfactual_cache_policy||e?.accounting_basis){const accounting=disclosure('accounting:'+s.id,'Accounting details','session-accounting');if(e.counterfactual_cache_policy)inspectionMetric(accounting,'Comparison cache policy',e.counterfactual_cache_policy);if(e.accounting_basis)inspectionMetric(accounting,'Accounting basis',e.accounting_basis);if(e.quantity_evidence)inspectionMetric(accounting,'Quantity estimates',e.quantity_evidence.version===1?'Receipt blocks + native-increment residual allocations':'Legacy receipt quantities','No calibrated interval; same outputs and tool sequence assumed');details.append(accounting)}
  details.append(transcriptView(s));el.append(details);return el;
 }
 async function refresh(){
@@ -372,7 +376,7 @@ async function refresh(){
   $('cost-cards').replaceChildren(card('With Carry',money(estimate.carry_cost)),card('Traditional',money(estimate.traditional_cost)),card('Calls excluded from comparison',fmt(estimate.excluded_unpriced_calls||0)));
   $('accounting-detail').textContent=fmt(estimate.matched_primary_responses)+' matched primary responses · completed calls only';
   const scenario=data.cost_scenario;
-  $('assumptions').textContent='Provider receipts + frozen API rates. Traditional is a modeled alternative, not a bill.'+(scenario?' Window '+fmt(scenario.context_window)+' · reserve '+fmt(scenario.reserve)+' · keep '+fmt(scenario.keep_recent)+' · summary '+fmt(scenario.summary):'');
+  $('assumptions').textContent='Provider receipts + frozen API rates. Traditional is a modeled alternative, not a bill. Quantities may be estimated; no calibrated interval. Same outputs and tool sequence assumed. Matched totals are not a whole-session bound.'+(scenario?' Window '+fmt(scenario.context_window)+' · reserve '+fmt(scenario.reserve)+' · keep '+fmt(scenario.keep_recent)+' · summary '+fmt(scenario.summary):'');
   $('config').textContent='Mode '+(data.mode||'—')+' · '+(data.auth||'—')+' auth · reviewer '+(data.classifier_model||'—')+' / '+(data.classifier_effort||'—')+' · cache '+(data.reviewer_cache_mode||'—');
   $('usage').replaceChildren(...[['Primary',primary],['Reviewer',shadow]].map(([name,ledgers])=>{
    const calls=sum(ledgers,'calls'),missing=sum(ledgers,'unavailable_cost_calls');

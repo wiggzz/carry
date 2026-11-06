@@ -2051,9 +2051,13 @@ async fn forward_timed(
         canonical_body["input"] = canonical.clone();
         let canonical_wire = primary_wire_body(&service.config, &canonical_body);
         let restored = if service.config.mode == Mode::Off {
-            Some(0)
+            Some(crate::proxy_quantity::RestorationEstimate {
+                tokens: 0,
+                measured: true,
+                estimated_opaque_items: 0,
+            })
         } else {
-            session.primary_input.restoration(
+            session.primary_input.accounting_restoration(
                 &canonical_wire,
                 &outbound,
                 &service.config.upstream_url,
@@ -2061,7 +2065,7 @@ async fn forward_timed(
             )
         };
         if let Some(t) = &mut session.cost_trajectory {
-            t.projected_input(restored, primary_edited);
+            t.projected_evidence(restored, primary_edited);
         }
         // Numeric snapshots use the shared prompt-bearing projection, never allowance.
         // The planner owns the reauthorized continuation membership.
@@ -4015,6 +4019,7 @@ async fn relay(
                         trajectory.primary_settled(crate::proxy_savings::PrimaryObservation {
                             body: &commit.outbound,
                             response: &value,
+                            measurements: Some(&commit.candidate.primary_input),
                             route: &commit.service.config.upstream_url,
                             at: commit.dispatched_at,
                             standard: standard(&commit.outbound)

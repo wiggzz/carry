@@ -322,6 +322,15 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   await refresh();
   assert.equal(recency.getAttribute('datetime'),'1970-01-01T00:00:00.000Z','known epoch zero is not missing');
   sandbox.Date=RealDate;
+  recent.cost_estimate = {...recent.cost_estimate, accounting_basis:'receipt_anchored_v2',
+    quantity_evidence:{version:1,estimated_priced_calls:3,unavailable_quantity_calls:2,
+      comparison_scope:'matched_subset_not_whole_session'}};
+  await refresh();
+  assert.ok(text(recentRow).includes('3 calls use estimated quantities'));
+  assert.ok(text(recentRow).includes('2 calls lack quantity evidence'));
+  assert.ok(text(recentRow).includes('Matched subtotal · not whole session'));
+  assert.ok(text(recentRow).includes('No calibrated interval; same outputs and tool sequence assumed'));
+  assert.ok(!text(recentRow).includes('95%'), 'do not invent a statistical confidence interval');
   if(process.env.CARRY_DASHBOARD_STATS_FIXTURE){
     data=JSON.parse(fs.readFileSync(process.env.CARRY_DASHBOARD_STATS_FIXTURE,'utf8'));
     await refresh();

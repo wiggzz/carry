@@ -371,6 +371,26 @@ fn fresh_reasoning_baseline_http_regressions() {
 }
 
 #[test]
+fn receipt_calibrated_traditional_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_traditional_estimation.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute receipt-calibrated traditional HTTP regressions");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn repeated_visible_pool_http_regressions() {
     let output = Command::new("python3")
         .arg("-B")
