@@ -85,8 +85,10 @@ count-only and does not initiate full-history BPE.
 
 ## Traditional accounting estimates (residual v1)
 
-The dashboard's traditional-history estimate uses **neutral accounting quantities**,
-not the planner's asymmetric selection forecast. `InputMeasurements` remains the
+The strict quantity diagnostics use **neutral accounting quantities**,
+not the planner's asymmetric selection forecast. These matched diagnostics are
+not the dashboard headline; the full-window point estimate below includes known
+expense omitted by this strict attribution policy. `InputMeasurements` remains the
 single receipt/quantity evidence owner; `TraditionalHistoryState` still owns the
 alternative's retirement, summaries, continuity and cache trajectory.
 
@@ -116,7 +118,8 @@ negative. Estimated quantities enter the existing continuous alternative, includ
 its own summary timing/cost, frozen request tariffs and independent cache expiry.
 Actual receipts and paid money remain independent. A quantity-policy boundary
 freezes the prior cumulative comparison (including exclusions and reviewer money)
-without replaying or repricing it. Old excluded calls do not become contributions.
+without replaying or repricing it. Old excluded calls do not become strict
+contributions; their known expense DOES enter the derived whole-window estimate.
 
 A native block with no valid internal allocation is not an unmeasured item.
 Partial omissions of its members remain unavailable, including legacy blocks
@@ -152,9 +155,10 @@ not a recovered full-window estimate. Off mode's absent resolution metadata is
 not a canonical rebase: exact model/source/settings still fence continuity, known
 resolution contradictions reject, and known metadata is retained across absence.
 
-The dashboard exposes measured, estimated and unavailable quantity coverage,
-legacy provenance and matched-subset scope. These are point estimates: no
-statistically calibrated confidence interval or whole-session bound is claimed.
+The dashboard retains measured, estimated and unavailable **strict quantity**
+coverage and matched-subset provenance as diagnostics. Its headline instead uses
+the whole-window inference below. These are point estimates: no statistically
+calibrated confidence interval or whole-session bound is claimed.
 The alternative assumes the same outputs and tool sequence, not measured causal
 no-Carry expenditure. Controlled request-time/held-out synthetic receipts are
 exercised in `src/proxy_quantity_accounting_tests.rs`; real-binary loopback
@@ -162,3 +166,55 @@ projection, legacy-checkpoint recovery and summary/restart behavior are exercise
 in `tests/proxy_traditional_estimation.py`. Those controls verify accounting and
 avoid training on held-out receipts; they do not establish accuracy on private
 workloads or with real providers.
+
+## Whole accounting-window point estimate (expense imputation v1)
+
+The headline is a new producer-owned **view**, not renamed matched subtotals.
+The existing `primary` and `shadow` paid ledgers supply the accounting window's
+observed dollars and completed-call population, including historical expense
+whose quantity-policy observations are missing. Nothing is copied into another
+actual-money ledger. Lifetime client counters are not this window.
+
+Let `P` and `R` be the whole window's known primary and reviewer expense. The
+continuous receipt trajectory supplies directly modeled traditional expense `T`
+and matched primary expense `M` (matched Carry expense minus its reviewer
+expense). Where `M > 0`, estimate omitted primary expense `P - M` using the
+**dimensionless expense ratio** `T / M`. The whole traditional estimate is
+`T + (P - M) * T / M`. All paid summaries and conditional modeled cache effects
+already present in the reference trajectory enter this ratio. Opaque/unresolved
+historical calls, invalid partial native-block attribution and successful-gap
+latches do not censor their known expense from this view.
+
+If there is no usable receipt reference, assume **neutral primary-expense
+parity net of hypothetical compaction and cache** for the omitted part: add its
+known primary expense once, not its reviewer expense. This is an explicit weak
+fallback assumption, not a measured quantity, hidden token conversion or claim
+that a real alternative must cost the same. It can show zero primary benefit
+and negative net benefit after reviewer expense. Legacy JSON comparison sums are
+not treated as receipt references; known ledger expense still gets this fallback.
+
+The difference is `whole traditional - (P + R)` and percentage is that difference
+divided by **whole traditional**, times 100. Reviewer expense is charged exactly
+once. A zero traditional denominator has no percentage. Aggregates sum the
+per-session whole estimates before computing the difference/percentage; they do
+not average ratios or combine a partial denominator with full observed expense.
+Any unknown actual money, unreadable window or ledger mismatch leaves the whole
+headline unavailable rather than silently dropping that population. Empty
+sessions do not invalidate other known-cost sessions.
+
+This policy assumes omitted expense is exchangeable with the available
+continuous reference's net summary/cache economics; it does **not** reconstruct
+unknown historical quantities, exact summary timing or cache hits. In the
+no-reference case it assumes those effects net to primary-expense parity. As
+reference evidence grows, historical imputation may change; original matched
+subtotals and paid receipts never change. The existing single trajectory's
+retirement, paid-summary and cache ownership remain untouched, including their
+strict unresolved diagnostic state; there is no second simulated history and no
+free reinitialization. Inferred calls/cost and the imputation assumption are
+explicit fields of `whole_window`, separate from measured coverage.
+
+This is intentionally a cost-level approximation, not planner/capacity authority,
+per-call reconstructed provenance, a statistical interval, an accuracy study or
+causal savings. The same outputs/tool sequence and conditional-cache assumptions
+remain essential. Historical inference executes against old snapshots on read;
+it is not limited to calls dispatched after upgrading.

@@ -60,7 +60,7 @@ const sandbox = {
   fetch: async () => ({ok: true, json: async () => data}), setInterval() {},
 };
 vm.createContext(sandbox);
-const html = fs.readFileSync('src/proxy_dashboard.html', 'utf8');
+const html = fs.readFileSync(process.env.CARRY_DASHBOARD_HTML_FIXTURE || 'src/proxy_dashboard.html', 'utf8');
 // Only delivered IDs exist; absent selectors must not invent fixture nodes.
 for (const match of html.matchAll(/\bid="([^"]+)"/g)) {
   const node = element(); node.id = match[1]; elements.set(node.id, node);
@@ -358,6 +358,20 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     assert.match(visibleText(root),/5 \/ 5 primary responses matched/);
     assert.ok(!visibleText(root).includes('Matched subtotal'));
   }
+  // Whole-window producer facts deliberately disagree with strict diagnostics.
+  // The renderer must never derive a total from matched rows or local ratios.
+  recent.cost_estimate.whole_window={carry_cost:15,traditional_cost:24,savings:9,savings_percent:37.5,
+    primary_responses:6,inferred_primary_responses:5,assumption:'matched_cost_ratio'};
+  data.cost_estimate.whole_window={carry_cost:150,traditional_cost:240,savings:90,savings_percent:37.5,
+    primary_responses:60,inferred_primary_responses:50,assumption:'matched_cost_ratio'};
+  await refresh();
+  assert.equal(cards().get('Estimated savings'),'$90.000000 (37.5%)');
+  assert.match(visibleText(byClass(recentRow,'session-savings')),/\$9\.000000 \(37\.5%\)/);
+  assert.match(visibleText(elements.get('cards').children[1]),/Whole accounting window/);
+  assert.match(visibleText(byClass(recentRow,'session-savings')),/5 inferred/);
+  data.cost_estimate.whole_window=null;
+  await refresh();
+  assert.equal(cards().get('Estimated savings'),'—','unknown actual costs must not fall back to a narrower comparison');
   if(process.env.CARRY_DASHBOARD_STATS_FIXTURE){
     data=JSON.parse(fs.readFileSync(process.env.CARRY_DASHBOARD_STATS_FIXTURE,'utf8'));
     await refresh();
@@ -368,8 +382,10 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
       assert.equal(elements.get('usage').children[0].children[4].textContent,percent);
     }
     const amount=n=>n==null?'—':'$'+Number(n).toFixed(6);
-    assert.equal(cards().get('With Carry'),amount(data.cost_estimate.carry_cost));
-    assert.equal(cards().get('Traditional'),amount(data.cost_estimate.traditional_cost));
+    const head=Object.prototype.hasOwnProperty.call(data.cost_estimate,'whole_window')?data.cost_estimate.whole_window:data.cost_estimate;
+    assert.equal(cards().get('With Carry'),amount(head?.carry_cost));
+    assert.equal(cards().get('Traditional'),amount(head?.traditional_cost));
+    if(head) assert.equal(cards().get('Estimated savings'),amount(head.savings)+(head.savings_percent==null?'':` (${Number(head.savings_percent).toFixed(1)}%)`));
     const native=data.sessions.flatMap(s=>[s.primary,s.shadow]);
     const cost=native.some(l=>l.cost_usd!=null)?native.reduce((n,l)=>n+(l.cost_usd||0),0):null;
     const missing=native.some(l=>l.unavailable_cost_calls)||data.unavailable_sessions;
@@ -378,6 +394,11 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
       walk(elements.get('background-sessions')).filter(n=>n.className==='session').length,data.sessions.length);
     const checkVisibleScope=(root,e,total)=>{
       const shown=visibleText(root);
+      if(Object.prototype.hasOwnProperty.call(e,'whole_window')){
+        assert.ok(shown.includes(e.whole_window?'Whole accounting window':'Whole-window estimate unavailable'));
+        if(e.whole_window) assert.ok(shown.includes(`${e.whole_window.inferred_primary_responses.toLocaleString()} inferred`));
+        return;
+      }
       const partial=e.quantity_evidence.comparison_scope==='matched_subset_not_whole_session';
       assert.ok(shown.includes(partial?'Matched subtotal · not whole session':'Matched completed primary window'));
       assert.ok(shown.includes(`${e.matched_primary_responses.toLocaleString()} / ${total.toLocaleString()} primary responses matched`));

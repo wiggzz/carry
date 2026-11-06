@@ -1359,7 +1359,8 @@ async fn dashboard_stats(
             .as_ref()
             .map(|t| t.snapshot())
             .unwrap_or_default()
-            .dashboard(session.background_review_pending || session.primary_pending);
+            .dashboard(session.background_review_pending || session.primary_pending)
+            .with_observed_window(&session.primary, &session.shadow);
         cost_estimate.observe(&estimate);
         let updated_at = entry
             .metadata()
@@ -1404,6 +1405,7 @@ async fn dashboard_stats(
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
     cost_estimate.excluded_sessions += unavailable_sessions;
+    cost_estimate.unavailable_whole_windows(unavailable_sessions);
     let mut response = axum::Json(json!({
         "cost_estimate": cost_estimate,
         "mode": format!("{:?}", service.config.mode).to_lowercase(),

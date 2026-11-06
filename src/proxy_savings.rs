@@ -141,10 +141,30 @@ pub struct Estimate {
     pub coverage: Coverage,
 }
 
-/// Public dashboard projection: a priced matched subset, or null when no
-/// comparable primary observations exist. Omitted reviewer expense is carry-only.
+/// Derived, explicitly imputed full-window view. Never persisted as paid money
+/// or inserted into the native quantity/block evidence.
+#[derive(Clone, Debug, Serialize)]
+pub struct WholeWindowEstimate {
+    carry_cost: f64,
+    traditional_cost: f64,
+    savings: f64,
+    savings_percent: Option<f64>,
+    primary_responses: u64,
+    inferred_primary_responses: u64,
+    inferred_traditional_cost: f64,
+    reference_cost_ratio: Option<f64>,
+    assumption: &'static str,
+}
+
+/// Public strict-evidence projection, plus the full-window headline estimate.
+/// Strict matched subtotals remain diagnostics and are never relabeled whole.
 #[derive(Debug, Serialize)]
 pub struct DashboardEstimate {
+    whole_window: Option<WholeWindowEstimate>,
+    #[serde(skip)]
+    whole_window_incomplete: bool,
+    #[serde(skip)]
+    whole_window_source: Estimate,
     quantity_evidence: Value,
     legacy_quantity_segment: Option<CachePolicySegment>,
     cache_initializations: crate::proxy_cache::CacheInitializations,
@@ -197,7 +217,19 @@ impl Estimate {
                 "matched_completed_primary_window"
             } else { "matched_subset_not_whole_session" },
         });
+        let whole_window = TraditionalHistoryState::whole_window(
+            &self,
+            self.observed_primary_cost,
+            self.observed_reviewer_cost,
+            self.coverage.primary_responses,
+            self.unavailable_primary_cost_calls + self.unavailable_reviewer_cost_calls == 0,
+        );
+        let whole_window_incomplete = whole_window.is_none()
+            && (self.coverage.primary_responses > 0 || self.coverage.reviewer_responses > 0);
         DashboardEstimate {
+            whole_window,
+            whole_window_incomplete,
+            whole_window_source: self.clone(),
             quantity_evidence,
             legacy_quantity_segment: self.legacy_quantity_segment,
             cache_initializations: self.cache_initializations,
@@ -240,6 +272,27 @@ impl Estimate {
             excluded_unpriced_reviewer_calls: self.excluded_unpriced_reviewer_calls,
             coverage: self.coverage,
         }
+    }
+}
+
+impl DashboardEstimate {
+    /// Bind to the existing paid ledgers, including costs predating quantity
+    /// policy fields. This is a read-only view, NOT a replacement expense ledger.
+    pub fn with_observed_window(
+        mut self,
+        primary: &carry::core::UsageLedger,
+        reviewer: &carry::core::UsageLedger,
+    ) -> Self {
+        self.whole_window = TraditionalHistoryState::whole_window(
+            &self.whole_window_source,
+            primary.cost_usd,
+            reviewer.cost_usd,
+            primary.calls,
+            primary.unavailable_cost_calls == 0 && reviewer.unavailable_cost_calls == 0,
+        );
+        self.whole_window_incomplete =
+            self.whole_window.is_none() && (primary.calls > 0 || reviewer.calls > 0);
+        self
     }
 }
 
@@ -295,6 +348,8 @@ impl DashboardQuantityTotals {
 
 #[derive(Default, Debug, Serialize)]
 pub struct DashboardTotals {
+    whole_window: Option<WholeWindowEstimate>,
+    whole_window_unavailable_sessions: u64,
     quantity_evidence: DashboardQuantityTotals,
     legacy_cache_policy_sessions: u64,
     mixed_cache_policy_sessions: u64,
@@ -317,7 +372,36 @@ pub struct DashboardTotals {
 }
 
 impl DashboardTotals {
+    pub fn unavailable_whole_windows(&mut self, count: u64) {
+        self.whole_window_unavailable_sessions += count;
+        if count > 0 {
+            self.whole_window = None;
+        }
+    }
+
     pub fn observe(&mut self, estimate: &DashboardEstimate) {
+        // Aggregate the SAME whole population as observed spend. Unknown actual
+        // money cannot silently drop a session and leave a full-window headline.
+        if estimate.whole_window_incomplete {
+            self.unavailable_whole_windows(1);
+        } else if self.whole_window_unavailable_sessions == 0 {
+            if let Some(window) = &estimate.whole_window {
+                if let Some(total) = &mut self.whole_window {
+                    total.carry_cost += window.carry_cost;
+                    total.traditional_cost += window.traditional_cost;
+                    total.primary_responses += window.primary_responses;
+                    total.inferred_primary_responses += window.inferred_primary_responses;
+                    total.inferred_traditional_cost += window.inferred_traditional_cost;
+                    total.savings = total.traditional_cost - total.carry_cost;
+                    total.savings_percent = (total.traditional_cost > 0.0)
+                        .then_some(100.0 * total.savings / total.traditional_cost);
+                    total.reference_cost_ratio = None;
+                    total.assumption = "sum_of_session_whole_window_point_estimates";
+                } else {
+                    self.whole_window = Some(window.clone());
+                }
+            }
+        }
         self.quantity_evidence.observe(estimate);
         self.in_flight_sessions += u64::from(estimate.in_flight_costs_excluded);
         // Diagnostics cover all sessions, even pending/ineligible comparisons.
@@ -1203,6 +1287,122 @@ mod subscription_pricing_tests {
                 .abs()
                 < 1e-12
         );
+    }
+}
+
+#[cfg(test)]
+mod whole_window_tests {
+    use super::*;
+
+    #[test]
+    fn whole_window_projects_historical_omissions_without_rewriting_evidence() {
+        let e = Estimate {
+            accounting_basis: RECEIPT_BASIS.into(),
+            observed_primary_cost: 12.0,
+            observed_reviewer_cost: 3.0,
+            carry_cost: 5.0,
+            reviewer_cost: 3.0,
+            traditional_cost: 4.0,
+            matched_primary_responses: 1,
+            priced: true,
+            coverage: Coverage {
+                primary_responses: 6,
+                reviewer_responses: 2,
+                ..Coverage::default()
+            },
+            ..Estimate::default()
+        };
+        let d = serde_json::to_value(e.dashboard(false)).unwrap();
+        assert_eq!(d["whole_window"]["carry_cost"], 15.0);
+        assert_eq!(d["whole_window"]["traditional_cost"], 24.0);
+        assert_eq!(d["whole_window"]["savings"], 9.0);
+        assert_eq!(d["whole_window"]["savings_percent"], 37.5);
+        assert_eq!(d["whole_window"]["inferred_primary_responses"], 5);
+        assert_eq!(
+            d["carry_cost"], 5.0,
+            "original evidentiary sums remain immutable"
+        );
+        assert_eq!(d["traditional_cost"], 4.0);
+    }
+
+    #[test]
+    fn old_checkpoint_money_and_mixed_aggregates_are_not_partial_denominators() {
+        let primary = carry::core::UsageLedger {
+            calls: 7,
+            cost_usd: 20.0,
+            ..Default::default()
+        };
+        let reviewer = carry::core::UsageLedger {
+            calls: 2,
+            cost_usd: 3.0,
+            ..Default::default()
+        };
+        // Missing newer observation counters in an old checkpoint do not erase
+        // any dollars already present in the sole existing expense ledger.
+        let old = Estimate::default()
+            .dashboard(false)
+            .with_observed_window(&primary, &reviewer);
+        let mut total = DashboardTotals::default();
+        total.observe(&old);
+        total.observe(&old);
+        let d = serde_json::to_value(&total).unwrap();
+        assert_eq!(d["whole_window"]["carry_cost"], 46.0);
+        assert_eq!(d["whole_window"]["traditional_cost"], 40.0);
+        assert_eq!(d["whole_window"]["savings"], -6.0);
+        assert_eq!(d["whole_window"]["savings_percent"], -15.0);
+        assert_eq!(d["whole_window"]["inferred_primary_responses"], 14);
+        let mut missing = primary;
+        missing.unavailable_cost_calls = 1;
+        let unknown = Estimate::default()
+            .dashboard(false)
+            .with_observed_window(&missing, &reviewer);
+        total.observe(&unknown);
+        total.observe(&old);
+        let d = serde_json::to_value(total).unwrap();
+        assert!(
+            d["whole_window"].is_null(),
+            "mixed known+unknown cannot become a whole total"
+        );
+        assert_eq!(d["whole_window_unavailable_sessions"], 1);
+        let empty = Estimate::default()
+            .dashboard(false)
+            .with_observed_window(&Default::default(), &Default::default());
+        let mut total = DashboardTotals::default();
+        total.observe(&empty);
+        total.observe(&old);
+        assert!(
+            total.whole_window.is_some(),
+            "empty sessions must not censor known sessions"
+        );
+    }
+
+    #[test]
+    fn whole_window_neutral_no_calibration_negative_zero_and_unknown_controls() {
+        for reviewer in [0.0, 3.0] {
+            let e = Estimate {
+                accounting_basis: RECEIPT_BASIS.into(),
+                observed_primary_cost: 12.0,
+                observed_reviewer_cost: reviewer,
+                coverage: Coverage {
+                    primary_responses: 6,
+                    reviewer_responses: u64::from(reviewer > 0.0),
+                    ..Coverage::default()
+                },
+                ..Estimate::default()
+            };
+            let d = serde_json::to_value(e.clone().dashboard(false)).unwrap();
+            assert_eq!(d["whole_window"]["traditional_cost"], 12.0);
+            assert_eq!(d["whole_window"]["savings"], -reviewer);
+            assert_eq!(
+                d["whole_window"]["savings_percent"],
+                -100.0 * reviewer / 12.0
+            );
+            let mut unknown = e;
+            unknown.unavailable_primary_cost_calls = 1;
+            assert!(
+                serde_json::to_value(unknown.dashboard(false)).unwrap()["whole_window"].is_null()
+            );
+        }
     }
 }
 

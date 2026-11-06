@@ -12,9 +12,120 @@ import proxy_state_regressions as support
 
 class TraditionalEstimation(unittest.TestCase):
     setUp = support.StateRegressions.setUp
-    record_evidence = support.StateRegressions.record_evidence
+    def record_evidence(self):
+        support.StateRegressions.record_evidence(self)
+        # Reconcile old subset assertions explicitly: they remain strict evidence
+        # controls, but every frozen known-money HTTP window also has this NEW
+        # full denominator. Includes invalid partial attribution, unknown output,
+        # successful gaps, paid summary/cache continuity and their restarts.
+        def check(value):
+            if isinstance(value, dict):
+                if isinstance(value.get('sessions'), list) and 'cost_estimate' in value:
+                    windows = []
+                    incomplete = bool(value.get('unavailable_sessions'))
+                    for session in value['sessions']:
+                        p, r = session['primary'], session['shadow']
+                        whole = session['cost_estimate']['whole_window']
+                        unknown = p['unavailable_cost_calls'] or r['unavailable_cost_calls'] or (not p['calls'] and r['calls'])
+                        if unknown:
+                            self.assertIsNone(whole)
+                            incomplete = True
+                        elif p['calls']:
+                            self.assertIsInstance(whole, dict)
+                            self.assertEqual(whole['primary_responses'], p['calls'])
+                            self.assertAlmostEqual(whole['carry_cost'], p['cost_usd'] + r['cost_usd'], places=12)
+                            self.assertAlmostEqual(whole['savings'], whole['traditional_cost'] - whole['carry_cost'], places=12)
+                            if whole['traditional_cost']:
+                                self.assertAlmostEqual(whole['savings_percent'], 100 * whole['savings'] / whole['traditional_cost'], places=10)
+                            else:
+                                self.assertIsNone(whole['savings_percent'])
+                            windows.append(whole)
+                    total = value['cost_estimate']['whole_window']
+                    if incomplete:
+                        self.assertIsNone(total)
+                    elif windows:
+                        for field in ['carry_cost','traditional_cost','savings']:
+                            self.assertAlmostEqual(total[field], sum(w[field] for w in windows), places=12)
+                for child in value.values(): check(child)
+            elif isinstance(value, list):
+                for child in value: check(child)
+        check(self.evidence)
     fixture = support.StateRegressions.fixture
     proxy = support.StateRegressions.proxy
+
+    def test_whole_window_opaque_reviewer_expense_is_subtracted_once(self):
+        output = [{'type':'reasoning','summary':[],'encrypted_content':'unresolved-opaque'}]
+        fixture = self.fixture(lambda _b,n:(200,support.completed(output, f'reviewer-whole-{n}', input_tokens=1000)))
+        proxy = self.proxy(fixture, ['--primary-context-tokens','1000000','--min-payback-percent','100'])
+        history = [{'role':'user','content':'goal'}, {'role':'assistant','content':'source once ' + 's' * 8192}, {'role':'user','content':'continue'}]
+        for _ in range(3): self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
+        saved = proxy.saved()
+        stats = proxy.request('GET','/carry/dashboard/stats')[1]
+        self.evidence.update(checkpoint=saved, stats=stats)
+        self.assertGreater(saved['shadow']['cost_usd'], 0)
+        e = stats['sessions'][0]['cost_estimate']
+        w = e['whole_window']
+        self.assertGreater(w['inferred_primary_responses'], 0)
+        self.assertAlmostEqual(w['carry_cost'], saved['primary']['cost_usd'] + saved['shadow']['cost_usd'], places=12)
+        self.assertAlmostEqual(w['savings'], w['traditional_cost'] - saved['primary']['cost_usd'] - saved['shadow']['cost_usd'], places=12)
+        proxy.close()
+        proxy = self.proxy(fixture, ['--primary-context-tokens','1000000','--min-payback-percent','100'])
+        restarted = proxy.request('GET','/carry/dashboard/stats')[1]
+        self.evidence['restarted_stats'] = restarted
+        self.assertEqual(restarted['sessions'][0]['cost_estimate']['whole_window'], w)
+
+    def test_whole_window_includes_uncalibrated_historical_opaque_cost_after_restart(self):
+        output = [{'type':'reasoning','summary':[],'encrypted_content':'no-calibration'}]
+        fixture = self.fixture(lambda _b,n:(200,support.completed(output if n == 1 else [], f'whole-{n}', input_tokens=1000)))
+        options = ['--primary-context-tokens','1000000','--review-min-primary-tokens','1000000']
+        proxy = self.proxy(fixture, options)
+        history = [{'role':'user','content':'goal'}]
+        self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
+        first_stats = proxy.request('GET','/carry/dashboard/stats')[1]
+        self.evidence['no_calibration_stats'] = first_stats
+        first = first_stats['sessions'][0]['cost_estimate']
+        self.assertEqual(first['matched_primary_responses'], 0)
+        self.assertEqual(first['whole_window']['inferred_primary_responses'], 1)
+        self.assertIn('no_reference_neutral', first['whole_window']['assumption'])
+        proxy.close()
+        before = proxy.saved()
+        # This is a genuine checkpoint from an uncalibrated opaque response,
+        # not an edited count or fabricated paid ledger.
+        self.evidence['historical_checkpoint'] = before
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history + output, max_output_tokens=1)[0], 200)
+        after = proxy.saved()
+        stats = proxy.request('GET','/carry/dashboard/stats')[1]
+        self.evidence.update(after_restart=after, stats=stats)
+        estimate = stats['sessions'][0]['cost_estimate']
+        whole = estimate.get('whole_window')
+        self.assertIsInstance(whole, dict, 'producer must estimate the entire known-cost window, including previously omitted opaque calls')
+        actual = after['primary']['cost_usd'] + after['shadow']['cost_usd']
+        self.assertAlmostEqual(whole['carry_cost'], actual, places=12)
+        self.assertEqual(whole['primary_responses'], 2)
+        self.assertEqual(whole['inferred_primary_responses'], 1)
+        self.assertGreater(whole['traditional_cost'], estimate['traditional_cost'], 'old omitted call must contribute actual modeled dollars, not just a caption')
+        self.assertAlmostEqual(whole['traditional_cost'], 2 * estimate['traditional_cost'], places=12)
+        self.assertAlmostEqual(whole['savings'], whole['traditional_cost'] - actual, places=12)
+        self.assertAlmostEqual(whole['savings_percent'], 100 * whole['savings'] / whole['traditional_cost'], places=12)
+        aggregate = stats['cost_estimate']['whole_window']
+        for field in ['carry_cost','traditional_cost','savings','savings_percent']:
+            self.assertAlmostEqual(aggregate[field], whole[field], places=12)
+        target = os.environ.get('CARRY_TRADITIONAL_STATS_PATH')
+        if target:
+            Path(target).write_text(json.dumps(stats, indent=2) + '\n')
+        # Exercise the renderer bytes embedded in this exact archived native
+        # executable, not only a same-named source checkout.
+        import http.client
+        connection = http.client.HTTPConnection(*proxy.address, timeout=10)
+        connection.request('GET', '/carry/dashboard')
+        response = connection.getresponse()
+        delivered = response.read()
+        self.assertEqual(response.status, 200)
+        connection.close()
+        self.assertEqual(delivered, (Path(__file__).resolve().parents[1] / 'src/proxy_dashboard.html').read_bytes())
+        html_target = os.environ.get('CARRY_DASHBOARD_HTML_PATH')
+        if html_target: Path(html_target).write_bytes(delivered)
 
     def test_pending_member_remainder_recovers_prior_summary_through_http_restart(self):
         output = {'type':'reasoning','summary':[],'encrypted_content':'member-a'}
