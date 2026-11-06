@@ -222,6 +222,7 @@ impl Estimate {
             self.observed_primary_cost,
             self.observed_reviewer_cost,
             self.coverage.primary_responses,
+            self.coverage.reviewer_responses,
             self.unavailable_primary_cost_calls + self.unavailable_reviewer_cost_calls == 0,
         );
         let whole_window_incomplete = whole_window.is_none()
@@ -288,6 +289,7 @@ impl DashboardEstimate {
             primary.cost_usd,
             reviewer.cost_usd,
             primary.calls,
+            reviewer.calls,
             primary.unavailable_cost_calls == 0 && reviewer.unavailable_cost_calls == 0,
         );
         self.whole_window_incomplete =
@@ -1374,6 +1376,115 @@ mod whole_window_tests {
             total.whole_window.is_some(),
             "empty sessions must not censor known sessions"
         );
+    }
+
+    #[test]
+    fn reviewer_only_known_money_survives_empty_zero_and_mixed_windows() {
+        let priced = Estimate {
+            accounting_basis: RECEIPT_BASIS.into(),
+            carry_cost: 15.0,
+            reviewer_cost: 3.0,
+            traditional_cost: 24.0,
+            matched_primary_responses: 1,
+            priced: true,
+            coverage: Coverage {
+                primary_responses: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .dashboard(false)
+        .with_observed_window(
+            &carry::core::UsageLedger {
+                calls: 1,
+                cost_usd: 12.0,
+                ..Default::default()
+            },
+            &carry::core::UsageLedger {
+                calls: 1,
+                cost_usd: 3.0,
+                ..Default::default()
+            },
+        );
+        for reviewer_cost in [2.0, 0.0] {
+            let reviewer = carry::core::UsageLedger {
+                calls: 1,
+                cost_usd: reviewer_cost,
+                ..Default::default()
+            };
+            let e = Estimate {
+                accounting_basis: RECEIPT_BASIS.into(),
+                observed_reviewer_cost: reviewer_cost,
+                coverage: Coverage {
+                    reviewer_responses: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            // Both projection paths must recognize a settled zero-dollar reviewer.
+            assert!(e.clone().dashboard(true).whole_window.is_some());
+            let only = e
+                .dashboard(true)
+                .with_observed_window(&Default::default(), &reviewer);
+            let w = only
+                .whole_window
+                .as_ref()
+                .expect("known reviewer-only money must remain numeric");
+            assert_eq!(w.carry_cost, reviewer_cost);
+            assert_eq!(w.traditional_cost, 0.0);
+            assert_eq!(w.savings, -reviewer_cost);
+            assert_eq!(w.savings_percent, None);
+            assert_eq!(w.primary_responses, 0);
+            for reverse in [false, true] {
+                let empty = Estimate::default()
+                    .dashboard(false)
+                    .with_observed_window(&Default::default(), &Default::default());
+                assert!(empty.whole_window.is_none(), "empty is not completed usage");
+                let zero_primary = Estimate::default().dashboard(false).with_observed_window(
+                    &carry::core::UsageLedger {
+                        calls: 1,
+                        ..Default::default()
+                    },
+                    &Default::default(),
+                );
+                assert_eq!(zero_primary.whole_window.as_ref().unwrap().carry_cost, 0.0);
+                let mut total = DashboardTotals::default();
+                total.observe(&empty);
+                total.observe(&zero_primary);
+                for row in if reverse {
+                    [&only, &priced]
+                } else {
+                    [&priced, &only]
+                } {
+                    total.observe(row);
+                }
+                let w = total
+                    .whole_window
+                    .as_ref()
+                    .expect("reviewer overhead must not censor other sessions");
+                assert_eq!(w.carry_cost, 15.0 + reviewer_cost);
+                assert_eq!(w.traditional_cost, 24.0);
+                assert_eq!(w.savings, 9.0 - reviewer_cost);
+                assert_eq!(
+                    w.savings_percent,
+                    Some(100.0 * (9.0 - reviewer_cost) / 24.0)
+                );
+                let unknown = Estimate::default().dashboard(false).with_observed_window(
+                    &Default::default(),
+                    &carry::core::UsageLedger {
+                        unavailable_cost_calls: 1,
+                        ..reviewer.clone()
+                    },
+                );
+                assert!(unknown.whole_window.is_none());
+                total.observe(&unknown);
+                total.observe(&priced);
+                assert!(
+                    total.whole_window.is_none(),
+                    "unknown money remains fail-closed"
+                );
+            }
+        }
     }
 
     #[test]

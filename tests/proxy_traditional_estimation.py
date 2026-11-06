@@ -26,11 +26,11 @@ class TraditionalEstimation(unittest.TestCase):
                     for session in value['sessions']:
                         p, r = session['primary'], session['shadow']
                         whole = session['cost_estimate']['whole_window']
-                        unknown = p['unavailable_cost_calls'] or r['unavailable_cost_calls'] or (not p['calls'] and r['calls'])
+                        unknown = p['unavailable_cost_calls'] or r['unavailable_cost_calls']
                         if unknown:
                             self.assertIsNone(whole)
                             incomplete = True
-                        elif p['calls']:
+                        elif p['calls'] or r['calls']:
                             self.assertIsInstance(whole, dict)
                             self.assertEqual(whole['primary_responses'], p['calls'])
                             self.assertAlmostEqual(whole['carry_cost'], p['cost_usd'] + r['cost_usd'], places=12)
@@ -52,6 +52,124 @@ class TraditionalEstimation(unittest.TestCase):
         check(self.evidence)
     fixture = support.StateRegressions.fixture
     proxy = support.StateRegressions.proxy
+
+    def test_reviewer_before_first_primary_mixed_poll_and_process_restart(self):
+        import threading
+        import time
+        held, release = threading.Event(), threading.Event()
+        self.stack.callback(release.set)
+        def primary(_body, n):
+            if n == 1:
+                held.set()
+                if not release.wait(20):
+                    raise AssertionError('held first primary was not released')
+            return 200, support.completed(response_id=f'first-primary-{n}', input_tokens=1000)
+        fixture = self.fixture(primary)
+        options = ['--review-replayed-history', '--review-every-requests', '100',
+                   '--primary-context-tokens', '1024', '--primary-output-reserve-tokens', '1',
+                   '--context-margin-percent', '0', '--request-timeout-secs', '25']
+        proxy = self.proxy(fixture, options, wait_reviews=False)
+        self.stack.callback(release.set)
+        replies = []
+        errors = []
+        def send_first():
+            try:
+                replies.append(proxy.send([{'role':'user','content':'reviewer-only goal'},
+                    {'role':'assistant','content':'reviewable source ' * 500},
+                    {'role':'user','content':'continue'}]))
+            except Exception as error:
+                errors.append(type(error).__name__)
+        worker = threading.Thread(target=send_first, daemon=True)
+        worker.start()
+        self.assertTrue(held.wait(8), 'actual first primary must reach held loopback transport')
+        deadline = time.monotonic() + 5
+        while True:
+            before = proxy.request('GET', '/carry/dashboard/stats')[1]
+            if before['sessions'] and before['sessions'][0]['shadow']['calls']:
+                break
+            self.assertLess(time.monotonic(), deadline, 'real reviewer must settle before first primary')
+            time.sleep(.02)
+        self.evidence['before_first_primary_stats'] = before
+        row = before['sessions'][0]
+        self.assertEqual(row['primary']['calls'], 0)
+        self.assertEqual(row['primary']['cost_usd'], 0)
+        self.assertTrue(row['processing'], 'pending primary activity remains visible without invented usage')
+        self.assertEqual(row['shadow']['calls'], 1)
+        reviewer_cost = row['shadow']['cost_usd']
+        self.assertGreater(reviewer_cost, 0)
+        only = row['cost_estimate']['whole_window']
+        self.assertIsInstance(only, dict, 'settled reviewer-only expense must remain numeric')
+        self.assertEqual(only['carry_cost'], reviewer_cost)
+        self.assertEqual(only['traditional_cost'], 0)
+        self.assertEqual(only['savings'], -reviewer_cost)
+        self.assertIsNone(only['savings_percent'])
+        self.assertEqual(before['cost_estimate']['whole_window']['carry_cost'], reviewer_cost)
+        self.assertIsNone(before['cost_estimate']['whole_window']['savings_percent'])
+        # A disjoint priced owner must not be censored by the held primary.
+        import http.client
+        connection = http.client.HTTPConnection(*proxy.address, timeout=5)
+        connection.request('POST', '/v1/responses',
+            body=support.wire({'model':'gpt-6-luna','input':[{'role':'user','content':'separate priced goal'}]}),
+            headers={'Content-Type':'application/json','x-carry-session':'separate-priced-owner'})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        response.read()
+        connection.close()
+        mixed = proxy.request('GET', '/carry/dashboard/stats')[1]
+        self.evidence['mixed_stats'] = mixed
+        self.assertEqual(len(mixed['sessions']), 2)
+        total = mixed['cost_estimate']['whole_window']
+        self.assertIsInstance(total, dict)
+        self.assertGreater(total['traditional_cost'], 0)
+        self.assertAlmostEqual(total['carry_cost'], sum(s[l]['cost_usd'] for s in mixed['sessions'] for l in ['primary','shadow']), places=12)
+        for field in ['carry_cost','traditional_cost','savings']:
+            self.assertAlmostEqual(total[field], sum(s['cost_estimate']['whole_window'][field] for s in mixed['sessions']), places=12)
+        self.assertAlmostEqual(total['savings_percent'], 100 * total['savings'] / total['traditional_cost'], places=12)
+        for _ in range(3):
+            self.assertEqual(proxy.request('GET', '/carry/dashboard/stats')[1]['cost_estimate']['whole_window'], total)
+        # Kill only this fixture process while its synthetic primary has no receipt.
+        # No checkpoint money is edited; the real settled reviewer survives reload.
+        proxy.close()
+        release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.evidence.update(aborted_primary_replies=replies, aborted_primary_transport_errors=errors,
+                             lifecycle='real reviewer settled; first primary held without receipt; fixture process killed')
+        proxy = self.proxy(fixture, options, wait_reviews=False)
+        restarted = proxy.request('GET', '/carry/dashboard/stats')[1]
+        self.evidence['restarted_stats'] = restarted
+        self.assertEqual(restarted['cost_estimate']['whole_window'], total)
+        reviewer_only = next(s for s in restarted['sessions'] if s['primary']['calls'] == 0)
+        self.assertEqual(reviewer_only['cost_estimate']['whole_window'], only)
+        for _ in range(3):
+            self.assertEqual(proxy.request('GET', '/carry/dashboard/stats')[1]['cost_estimate']['whole_window'], total)
+        target = os.environ.get('CARRY_TRADITIONAL_STATS_PATH')
+        if target:
+            Path(target).write_text(json.dumps(restarted))
+        html = os.environ.get('CARRY_TRADITIONAL_HTML_PATH')
+        if html:
+            import http.client
+            connection = http.client.HTTPConnection(*proxy.address, timeout=5)
+            connection.request('GET', '/carry/dashboard')
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            Path(html).write_bytes(response.read())
+            connection.close()
+        # Counterfactual uncertainty is not unknown actual money: an unpriced
+        # completed third owner must still invalidate the full aggregate.
+        connection = http.client.HTTPConnection(*proxy.address, timeout=5)
+        connection.request('POST', '/v1/responses',
+            body=support.wire({'model':'fixture-unknown-tariff','input':[{'role':'user','content':'unpriced control'}]}),
+            headers={'Content-Type':'application/json','x-carry-session':'unpriced-owner'})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        response.read()
+        connection.close()
+        unknown = proxy.request('GET', '/carry/dashboard/stats')[1]
+        self.evidence['unknown_money_stats'] = unknown
+        unpriced = next(s for s in unknown['sessions'] if s['primary']['unavailable_cost_calls'])
+        self.assertIsNone(unpriced['cost_estimate']['whole_window'])
+        self.assertIsNone(unknown['cost_estimate']['whole_window'])
 
     def test_whole_window_opaque_reviewer_expense_is_subtracted_once(self):
         output = [{'type':'reasoning','summary':[],'encrypted_content':'unresolved-opaque'}]

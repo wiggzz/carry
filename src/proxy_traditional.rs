@@ -159,10 +159,14 @@ impl TraditionalHistoryState {
         primary: f64,
         reviewer: f64,
         calls: u64,
+        reviewer_calls: u64,
         money_known: bool,
     ) -> Option<WholeWindowEstimate> {
+        // No primary completion is required for settled reviewer expense. A
+        // priced reviewer-only window has a zero traditional denominator, even
+        // when the reviewer itself was free; a truly empty window stays absent.
         if !money_known
-            || calls == 0
+            || (calls == 0 && reviewer_calls == 0)
             || !primary.is_finite()
             || !reviewer.is_finite()
             || primary < 0.0
