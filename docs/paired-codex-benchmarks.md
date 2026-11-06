@@ -199,6 +199,69 @@ scoped gateway tokens and an internal gateway network. Cleanup fails closed.
 The offline `--score-root` plus `--official-report-module` path is inspection
 only, never evidence that tests or models were executed by that command.
 
+## Manual hosted official SCB lane
+
+[`run-slopcodebench.yml`](../.github/workflows/run-slopcodebench.yml) is a
+**new manual-only workflow**. It must first be reviewed and merged onto the default
+branch before GitHub can register/dispatch it. Adding it does not authorize
+publication, merging, preparation, or paid execution. Existing CI workflows and
+synthetic assertions are unchanged.
+
+- Default `execute_paid: false` builds this source's portable Carry, installs the
+  pinned runner via `uv sync --frozen --no-dev`, builds real native Codex **0.147.0**
+  and evaluator images, and invokes the existing `--prepare-readiness` CLI. It does
+  not receive a provider key. All six official gold checkpoints must actually
+  execute tests and pass all tested cases; collection/skips alone cannot qualify.
+- The committed [selection](../benchmarks/slopcodebench/luna-cfgpipe.json) is the
+  original pre-outcome study selection, copied unchanged: full `cfgpipe`, six
+  checkpoints, twelve checkpoint/arm outcomes, Luna/medium primary and Luna/low
+  reviewer. Both arms consume one generated contract and the same inspected image
+  config IDs. There is no fixture Codex, fixture provider, or Sol role override.
+- The helper loads **the pinned CLI `RunConfig` defaults**, official prompt and
+  environment, official Codex checkpoint timeout (7200 seconds), and official
+  pytest dependency list plus task additions. At this pin the default progression
+  policy is `ANY` (`any`, always advance), **not** all-tests correctness. The
+  runner also specifically bypasses failed-test early stopping for `ANY_CASE`;
+  that policy's meaning is at least one passing case, not an all-tests score.
+  New real contracts freeze `scb_correctness_policy: all-cases` independently;
+  official reports expose `progression_passed` separately from `resolved`.
+  Old contracts without that field retain their selected policy's scoring.
+- Images contain public tools/dependencies and the exact built Carry only. The
+  helper warms `/opt/scb-uv-cache` with the official `uvx --with=... pytest` command.
+  Agent images never include the problem tree/tests/gold. The protected adapter
+  still owns provider isolation, fresh per-arm workspace/HOME, native checkpoint
+  execution, offline evaluation and exact resource cleanup. No model/turn/output
+  cap has been added.
+- Only explicit `execute_paid: true`, after successful gold preparation, exposes
+  the existing **`swe-bench` Environment `OPENAI_API_KEY`** to the trusted execution
+  step. Do not replace that secret or put it in a manifest/image/artifact.
+  New real contracts opt into `budget_policy: between-slot-soft`: the ordinary
+  combined stop threshold and unknown-cost/failure stops, **not a hard cap or
+  escrow**. Existing shared-escrow contracts/defaults are unchanged. A native
+  six-checkpoint problem is one dispatch slot; costs can exceed the threshold
+  during either problem-arm. There are zero outer/native retries in this study.
+- An always-upload step retains preparation failures, gold reports, the frozen
+  contract/prepared manifest and all produced native outcomes. A separate
+  no-secret terminal gate rejects missing/duplicate/unknown, evaluator-error or
+  unpriced comparisons. Unresolved-but-officially-evaluated outcomes are valid
+  scores, not grounds for selective retry.
+
+**Qualification still required:** local process-boundary tests are not real
+Docker, native-client, full-runner import, offline dependency, gold, protected
+Environment or Actions proof. After review/merge, first dispatch preparation-only
+and inspect all six actual gold reports and image/native provenance. A later
+separately authorized paid dispatch prepares fresh images/readiness before either
+model-bearing arm. No workflow has been dispatched by this implementation.
+
+The hosted job has GitHub's 360-minute ceiling. This does **not** fit the
+worst-case twelve 7200-second checkpoint timeouts plus setup/evaluation. A slow
+attempt may be cancelled with incomplete evidence; it must not be presented as a
+complete comparison or selectively retried. This minimal path retains native
+limits rather than silently shortening trajectories. If the real task approaches
+that ceiling, the parent must choose a separately reviewed remote execution
+arrangement before spending again. Cancellation can also preempt final receipts;
+`always()` upload is best-effort, not a cleanup/spend guarantee.
+
 ## Outputs, accounting and limits
 
 Both execution commands create a new exclusive output directory with the

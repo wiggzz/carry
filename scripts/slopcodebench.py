@@ -32,6 +32,8 @@ LIFECYCLE = {
 
 def plan(contract, *, include_off=False):
     lock = json.loads(LOCK.read_text())
+    if contract['settings'].get('budget_policy', 'shared-escrow') not in {'shared-escrow', 'between-slot-soft'}:
+        raise ValueError('unsupported SCB budget policy')
     if (contract['benchmark'] != 'slopcodebench'
             or contract['runner_commit'] != lock['runner_commit']
             or contract['dataset_commit'] != lock['problems_commit']):
@@ -40,6 +42,10 @@ def plan(contract, *, include_off=False):
             'any', 'any-case', 'all-cases', 'all-non-error-cases',
             'core-cases', 'any-core-cases', 'all-core-cases'}:
         raise ValueError('SCB requires an explicit pinned official pass policy')
+    if contract['settings'].get('scb_correctness_policy', contract['settings']['scb_pass_policy']) not in {
+            'any', 'any-case', 'all-cases', 'all-non-error-cases',
+            'core-cases', 'any-core-cases', 'all-core-cases'}:
+        raise ValueError('SCB requires a pinned official correctness policy')
     return {**build_plan(contract, include_off=include_off), 'upstream': lock,
             'lifecycle': LIFECYCLE,
             'readiness_requirements': ['immutable prepared agent/evaluator/gateway/Carry images',
@@ -77,12 +83,19 @@ def official_report(module_path):
             sys.modules['slop_code.logging'] = prior
 
 
+def has_executed_tests(report):
+    """Official skipped/collection-only reports do not establish correctness."""
+    return (not report.infrastructure_failure and report.pytest_collected > 0
+            and any(test.status in {'passed', 'failed'} for test in report.tests))
+
+
 def inspect_scores(run_plan, contract, root, module_path):
     report_type = official_report(module_path)
     policy = contract['settings']['scb_pass_policy']
     # Validate even when every selected checkpoint is missing.
     from_policy = sys.modules[report_type.__module__].PassPolicy
     policy = from_policy(policy)
+    correctness = from_policy(contract['settings'].get('scb_correctness_policy', policy.value))
     checkpoints = []
     for slot in run_plan['slots']:
         for checkpoint in slot['checkpoints']:
@@ -101,8 +114,9 @@ def inspect_scores(run_plan, contract, root, module_path):
                            official_pass_counts=official.pass_counts,
                            official_total_counts=official.total_counts)
                 # Collection-only results are evaluator unknown, not failed solves.
-                if not official.infrastructure_failure and official.pytest_collected > 0 and official.tests:
-                    row.update(resolved=policy.check(official.pass_counts, official.total_counts), status='evaluated')
+                if has_executed_tests(official):
+                    row.update(resolved=correctness.check(official.pass_counts, official.total_counts),
+                               progression_passed=policy.check(official.pass_counts, official.total_counts), status='evaluated')
             except (OSError, ValueError, TypeError, KeyError):
                 pass  # Keep this exact denominator slot unknown, never replace it.
             quality = directory / 'quality_analysis/overall_quality.json'

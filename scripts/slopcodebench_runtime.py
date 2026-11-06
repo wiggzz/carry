@@ -23,10 +23,12 @@ from collections import Counter
 try:
     from scripts import proxy_benchmark, swebench_smoke
     from scripts.benchmark_comparison import fingerprint
+    from scripts.slopcodebench import has_executed_tests
 except ModuleNotFoundError:
     import proxy_benchmark
     import swebench_smoke
     from benchmark_comparison import fingerprint
+    from slopcodebench import has_executed_tests
 
 
 def tree_digest(root):
@@ -61,7 +63,10 @@ def readiness_binding(contract, prepared, task):
             'evaluator_image': prepared['evaluator_image'],
             'environment_sha256': hashlib.sha256(Path(prepared['environment']).read_bytes()).hexdigest(),
             'task_id': task['id'], 'checkpoints': task['checkpoints'],
-            'scb_pass_policy': contract['settings']['scb_pass_policy']}
+            'requires_executed_tests': True,
+            'scb_pass_policy': contract['settings']['scb_pass_policy'],
+            **({'scb_correctness_policy': contract['settings']['scb_correctness_policy']}
+               if 'scb_correctness_policy' in contract['settings'] else {})}
 
 
 def preflight(contract, prepared, *, execute=subprocess.run, verify_sources=True, require_readiness=True):
@@ -368,8 +373,10 @@ def activate_upstream(prepared):
 def prepare_readiness(contract, prepared):
     """Generate receipts by actually evaluating prepared reference solutions offline."""
     from slop_code.evaluation import run_checkpoint
+    from slop_code.evaluation import PassPolicy
     for task in contract['selection']:
         problem, environment, policy = official_components(prepared, contract, task['id'])
+        correctness = PassPolicy(contract['settings'].get('scb_correctness_policy', policy.value))
         record = prepared['tasks'][task['id']]
         binding = readiness_binding(contract, prepared, task)
         destination = Path(record['readiness'])
@@ -383,7 +390,7 @@ def prepare_readiness(contract, prepared):
                     raise ValueError(f'missing prepared gold snapshot for {task["id"]}/{checkpoint.name}')
                 report = run_checkpoint(submission_path=gold, problem=problem, checkpoint=checkpoint, env_spec=environment)
                 report.save(destination.parent/'gold-reports'/task['id']/checkpoint.name)
-                if report.infrastructure_failure or not report.pytest_collected or not report.tests or not policy.check(report.pass_counts, report.total_counts):
+                if not has_executed_tests(report) or not correctness.check(report.pass_counts, report.total_counts):
                     raise ValueError('official gold readiness failed; no measured execution is allowed')
                 reports.append({'checkpoint': checkpoint.name, 'tests': len(report.tests), 'passed': True})
         receipt = {'schema_version': 1, 'binding': binding, 'status': 'ready', 'reports': reports,
@@ -417,7 +424,9 @@ def run_slot(contract, slot, prepared, output):
     from slop_code.agent_runner.models import AgentCostLimits, AgentRunSpec
     from slop_code.agent_runner import runner as official
     from slop_code.evaluation import CorrectnessResults
+    from slop_code.evaluation import PassPolicy
     problem, environment, policy = official_components(prepared, contract, slot['task_id'])
+    correctness = PassPolicy(contract['settings'].get('scb_correctness_policy', policy.value))
     output.mkdir(parents=True, exist_ok=False)
     values = {**contract.get('proxy', {}), 'CARRY_PROXY_MODE': slot['proxy_mode'],
               'BENCHMARK_TRUSTED_DIRECT': '1' if slot['proxy_mode'] == 'disabled' else '0',
@@ -508,8 +517,9 @@ def run_slot(contract, slot, prepared, output):
         directory = output/'official'/checkpoint
         try:
             report = CorrectnessResults.from_dir(directory)
-            if not report.infrastructure_failure and report.pytest_collected > 0 and report.tests:
-                row.update(status='evaluated', resolved=policy.check(report.pass_counts, report.total_counts))
+            if has_executed_tests(report):
+                row.update(status='evaluated', resolved=correctness.check(report.pass_counts, report.total_counts),
+                           progression_passed=policy.check(report.pass_counts, report.total_counts))
             else:
                 row['status'] = 'evaluation-error'
         except (OSError, ValueError, KeyError):

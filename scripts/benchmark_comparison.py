@@ -196,8 +196,9 @@ def summarize(plan, records):
 def dispatch(plan, contract, prepared, output, runner, *, budget_usd):
     """Shared bounded paired execution; the lane supplies its existing runner.
 
-    The shared authority escrows every gateway lifetime before paid transport.
-    The CLI threshold is not a second allowance or an invoice.
+    The default shared authority escrows each gateway lifetime. Explicit SCB
+    between-slot-soft contracts use only the combined stop threshold instead;
+    neither path is a provider invoice.
     """
     import time
     import os
@@ -206,9 +207,13 @@ def dispatch(plan, contract, prepared, output, runner, *, budget_usd):
     except ModuleNotFoundError:
         from scripts.benchmark_budget import SpendingAuthority
     authority_path = os.environ.get('BENCHMARK_BUDGET_STATE')
-    if not authority_path:
+    soft_budget = (contract['benchmark'] == 'slopcodebench'
+                   and contract['settings'].get('budget_policy') == 'between-slot-soft')
+    if not authority_path and not soft_budget:
         raise ValueError('shared spending authority is required before paid dispatch')
-    authority = SpendingAuthority(authority_path).validate(cap_usd=budget_usd,
+    if soft_budget and authority_path:
+        raise ValueError('soft-budget SCB must not inherit a separate escrow authority')
+    authority = None if soft_budget else SpendingAuthority(authority_path).validate(cap_usd=budget_usd,
         measured=contract['evidence_kind'] == 'measured-benchmark')
     if type(budget_usd) not in (int, float) or not math.isfinite(budget_usd) or budget_usd <= 0:
         raise ValueError('an explicit positive budget-usd stop threshold is required')
@@ -226,7 +231,8 @@ def dispatch(plan, contract, prepared, output, runner, *, budget_usd):
                         for checkpoint in slot['checkpoints']]
             else:
                 try:
-                    authority.validate()
+                    if authority is not None:
+                        authority.validate()
                     rows = runner(contract, slot, prepared, output/slot['namespace'])
                 except Exception as error:
                     rows = [{'namespace': slot['namespace'], 'contract_sha256': plan['contract_sha256'],
@@ -234,7 +240,8 @@ def dispatch(plan, contract, prepared, output, runner, *, budget_usd):
                              'status': 'infrastructure-error', 'resolved': None, 'quality': {}, 'events': [],
                              'error': f'{type(error).__name__}: {error}'} for checkpoint in slot['checkpoints']]
                 try:
-                    authority.validate()
+                    if authority is not None:
+                        authority.validate()
                 except (ValueError, OSError) as error:
                     stopped = f'spending authority did not settle: {error}'
                 if any(row['status'] in {'infrastructure-error', 'evaluation-error'} for row in rows):
@@ -252,7 +259,8 @@ def dispatch(plan, contract, prepared, output, runner, *, budget_usd):
             records.extend(rows)
     report = summarize(plan, records)
     report.update(cohort_wall_seconds=time.monotonic()-started, stop_reason=stopped,
-                  budget_usd=budget_usd, budget_kind='shared-conservative-inflight-escrow-not-invoice')
+                  budget_usd=budget_usd, budget_kind='between-slot-soft-not-hard-cap' if soft_budget
+                  else 'shared-conservative-inflight-escrow-not-invoice')
     (output/'report.json').write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False)+'\n')
     return report
 
