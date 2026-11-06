@@ -16,6 +16,88 @@ class TraditionalEstimation(unittest.TestCase):
     fixture = support.StateRegressions.fixture
     proxy = support.StateRegressions.proxy
 
+    def test_pending_member_remainder_recovers_prior_summary_through_http_restart(self):
+        output = {'type':'reasoning','summary':[],'encrypted_content':'member-a'}
+        caller = {'type':'reasoning','summary':[],'encrypted_content':'member-b'}
+        # 28 local additive section units, checked below against the real native
+        # allocator. This is fixture input, not an independent tokenizer model.
+        fixture = self.fixture(lambda _b,n:(200,support.completed(
+            [output] if n == 1 else [], f'member-{n}', input_tokens=1000 if n == 1 else 6829)))
+        options = ['--primary-context-tokens','1000000','--review-min-primary-tokens','1000000']
+        proxy = self.proxy(fixture, options)
+        history = [{'role':'user','content':'initial below threshold'}]
+        self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
+        proxy.close()
+        saved = proxy.saved()
+        support.stage_comparison_scenario(saved, {'context_window':4000,'reserve':100,'keep_recent':500,'summary':100})
+        frozen = saved['cost_trajectory']['result'].copy()
+        next(self.state.glob('*.json')).write_text(json.dumps(saved))
+        proxy = self.proxy(fixture, options)
+        history += [output, caller, {'role':'user','content':'caller text'}]
+        self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
+        after = proxy.saved()
+        self.evidence.update(staged_pending=saved, after_restart=after,
+                             stats=proxy.request('GET','/carry/dashboard/stats')[1])
+        allocation = after['primary_input']['blocks'][-1]['allocation']
+        self.assertEqual(allocation['residual'], 5801)
+        self.assertEqual(allocation['opaque_items'], 2)
+        t = after['cost_trajectory']
+        self.assertEqual(t['retired'], 3401, 'recover the 2901-unit member BEFORE pricing the next primary')
+        self.assertEqual(t['last_traditional_input'], 3528)
+        self.assertEqual(t['result']['traditional_compactions'], 1)
+        self.assertEqual(t['result']['initial_compactions'], 0)
+        self.assertEqual(t['result']['summary_cost'], frozen['summary_cost'], 'no excluded historical fee backfill')
+        self.assertEqual(t['priced_primary_responses'], 1)
+        rates = after['model_resolution']['primary']['rates']
+        expected = (3528*rates['write'] + rates['output'])/1000000
+        self.assertAlmostEqual(t['result']['traditional_cost']-frozen['traditional_cost'], expected, places=12)
+        self.assertAlmostEqual(t['result']['observed_primary_cost'], after['primary']['cost_usd'], places=12)
+
+    def test_single_gap_checkpoint_cannot_skip_config_only_success_after_http_restart(self):
+        # Persisted-state seam: stage ONLY a single-gap capability from actual
+        # cursor/configuration bytes. Native tests separately produce the gap
+        # via unknown projection. No historical monetary fields are rewritten.
+        fixture = self.fixture(lambda _b,n:(200,support.completed(
+            [{'type':'message','role':'assistant','content':[{'type':'output_text','text':'word '*1000}]}] if n == 4 else [],
+            f'single-gap-{n}', input_tokens=[1000,5000,7000,7000,7000][n-1])))
+        options = ['--primary-context-tokens','1000000','--review-min-primary-tokens','1000000']
+        proxy = self.proxy(fixture, options)
+        history = [{'role':'user','content':'initial'}]
+        self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
+        proxy.close()
+        saved = proxy.saved()
+        support.stage_comparison_scenario(saved, {'context_window':4000,'reserve':100,'keep_recent':1500,'summary':100})
+        next(self.state.glob('*.json')).write_text(json.dumps(saved))
+        proxy = self.proxy(fixture, options)
+        history.append({'role':'user','content':'paid summary'})
+        self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
+        history.append({'role':'user','content':'gap input'})
+        self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
+        proxy.close()
+        saved = proxy.saved(); t = saved['cost_trajectory']
+        self.assertEqual(t['retired'], 3500)
+        self.assertEqual(t['summary'], 100)
+        t['unresolved_projection'] = True
+        t['projection_recovery'] = {'configuration':t['receipts']['configuration'],
+                                    'cursor':t['history_continuity']['cursor'].copy()}
+        next(self.state.glob('*.json')).write_text(json.dumps(saved))
+        self.evidence['staged_single_gap'] = saved
+        frozen = t['result'].copy(); matched = t['priced_primary_responses']
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history, max_output_tokens=1, temperature=0.5)[0], 200)
+        intervening = proxy.saved(); self.evidence['intervening_success'] = intervening
+        self.assertTrue(intervening['cost_trajectory']['unresolved_projection'])
+        proxy.close(); proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
+        after = proxy.saved(); self.evidence['after_restart'] = after
+        t = after['cost_trajectory']
+        self.assertTrue(t['unresolved_projection'], 'never resurrect a stale gap capability across successful response transitions')
+        self.assertEqual(t['priced_primary_responses'], matched)
+        for field in ['traditional_cost','summary_cost','carry_cost']:
+            self.assertEqual(t['result'][field], frozen[field])
+        self.assertEqual(t['result']['initial_compactions'], 0)
+        self.assertAlmostEqual(t['result']['observed_primary_cost'], after['primary']['cost_usd'], places=12)
+
     def test_partial_opaque_dispatch_prices_current_projection_after_restart(self):
         self.partial_case(False)
 

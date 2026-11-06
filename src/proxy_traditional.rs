@@ -198,6 +198,12 @@ impl TraditionalHistoryState {
         Some(at)
     }
 
+    pub(super) fn invalidate_projection_recovery(&mut self) {
+        // This capability represents exactly ONE successful missing transition.
+        // A later excluded success cannot leave it available for a future repeat.
+        self.projection_recovery = None;
+    }
+
     pub(super) fn defer_retention(
         &mut self,
         body: &Value,
@@ -265,11 +271,23 @@ impl TraditionalHistoryState {
             without_output["input"]
                 .as_array_mut()?
                 .drain(cursor.items..pending.items);
-            m.clone()
-                .accounting_restoration(body, &without_output, route, resolved)?;
-            pending
-                .visible?
-                .checked_add(m.retained_reasoning_units(pending.opaque_items?)?)?
+            let member =
+                m.clone()
+                    .accounting_restoration(body, &without_output, route, resolved)?;
+            // Member input allocations include local input framing. Convert
+            // only their hidden remainder to the retained-output adapter, then
+            // add this output's own visible units. Preserve the admitted block's
+            // integer remainder; a pooled forecast is not this member's share.
+            let visible_input = items[cursor.items..pending.items]
+                .iter()
+                .try_fold(0u64, |sum, item| {
+                    sum.checked_add(m.visible_text_tokens(item))
+                })?;
+            pending.visible?.checked_add(
+                u64::try_from(member.tokens)
+                    .ok()?
+                    .checked_sub(visible_input)?,
+            )?
         };
         Some((retained, pending.fixed))
     }

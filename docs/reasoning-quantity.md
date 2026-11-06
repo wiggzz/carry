@@ -126,8 +126,11 @@ pooled residual. The whole block retains its native quantity authority.
 An unknown retained output leaves a persisted unresolved response transition.
 An exact compatible next input can isolate its native increment; with extra
 caller appends, a native-increment upper bound can prove that no summary was
-possible. Otherwise compatible member attribution and neutral residual calibration
-are required. Resolve any resulting summary **before** pricing the next
+possible. Otherwise compatible member attribution is required: subtract that
+slice's additive visible-input framing from its admitted member quantity, then
+add the output's own visible units. Preserve member-specific residual shares and
+integer remainders; do not substitute the pooled forecast after admission. Resolve
+any resulting summary **before** pricing the next
 primary, never backfill the excluded primary or summary fee. Known successful
 inputs still advance modeled cache writes/read refresh. If that transition cannot
 be resolved, affected later comparisons stay unavailable, not definitely cold
@@ -140,7 +143,9 @@ initialization. Its unknown canonical response transition is explicitly latched
 unavailable unless a single empty-output gap is resolved by an exact repeated
 input/receipt, unchanged frozen configuration and now-zero restoration. Such
 recovery advances summary and cache transitions at the original request clock,
-not historical money. A merely measurable but different projection (including
+not historical money. Every later successful request must resolve this capability
+immediately or invalidate it, including a sampling-only configuration change;
+failed calls do not consume it. A merely measurable but different projection (including
 switching compact to off) cannot establish what happened inside the gap and
 stays unavailable until a genuine rebase. This is a conservative limitation,
 not a recovered full-window estimate. Off mode's absent resolution metadata is

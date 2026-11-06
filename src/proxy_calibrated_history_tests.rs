@@ -1,3 +1,151 @@
+// N1: member-specific residual remainders must survive the retained-output adapter.
+#[test]
+fn pending_mixed_output_uses_admitted_member_remainder_before_primary_price() {
+    for reverse in [false, true] {
+        for residual in [5801u64, 5799] {
+            for roundtrip in [false, true] {
+                for keep_recent in [500, 1500] {
+                    let base = body();
+                    let a = json!({"type":"reasoning","summary":[],"encrypted_content":"member-a"});
+                    let b = json!({"type":"reasoning","summary":[],"encrypted_content":"member-b"});
+                    let (mut output, caller) = if reverse { (b, a) } else { (a, b) };
+                    if roundtrip {
+                        output["summary"] =
+                            json!([{"type":"summary_text","text":"retained visible summary"}]);
+                    }
+                    let visible =
+                        receipts::retained_output_tokens(&json!([output.clone()])).unwrap();
+                    let initial = 1000 - visible;
+                    let mut next = base.clone();
+                    let appended = vec![
+                        output.clone(),
+                        caller.clone(),
+                        json!({"role":"user","content":"caller text"}),
+                    ];
+                    next["input"]
+                        .as_array_mut()
+                        .unwrap()
+                        .extend(appended.clone());
+                    let local: u64 = appended.iter().map(crate::savings::local_text_tokens).sum();
+                    let native = initial + local + residual;
+                    let mut m = crate::proxy_quantity::InputMeasurements::default();
+                    let mut t = Trajectory {
+                        scenario: Scenario {
+                            context_window: 4000,
+                            reserve: 100,
+                            keep_recent,
+                            summary: 100,
+                        },
+                        ..Trajectory::default()
+                    };
+                    let mut response = terminal(initial, 0, 0, 0);
+                    response["output"] = json!([output.clone()]);
+                    // Dispatch settlement observes the current receipt BEFORE trajectory settlement.
+                    m.observe(&base, &response["usage"], "route", None, 1);
+                    t.primary_settled(PrimaryObservation {
+                        body: &base,
+                        response: &response,
+                        route: "route",
+                        at: 1,
+                        standard: true,
+                        resolved: None,
+                        cost: Some(0.123),
+                        measurements: Some(&m),
+                    });
+                    let frozen = t.snapshot();
+                    assert_eq!(frozen.matched_primary_responses, 0);
+                    assert!(t.history.pending_retention.is_some());
+                    if roundtrip {
+                        t = serde_json::from_value(state(&t)).unwrap();
+                        m = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+                    }
+                    let response = terminal(native, 0, 0, 0);
+                    m.observe(&next, &response["usage"], "route", None, 2);
+                    // Verify both members' distinct shares in the admitted source block.
+                    for (index, hidden) in [(0, residual / 2 + residual % 2), (1, residual / 2)] {
+                        let mut without = next.clone();
+                        without["input"]
+                            .as_array_mut()
+                            .unwrap()
+                            .remove(base["input"].as_array().unwrap().len() + index);
+                        let estimate = m
+                            .accounting_restoration(&next, &without, "route", None)
+                            .unwrap();
+                        assert_eq!(
+                            estimate.tokens,
+                            (crate::savings::local_text_tokens(&appended[index]) + hidden) as i128
+                        );
+                    }
+                    t.primary_settled(PrimaryObservation {
+                        body: &next,
+                        response: &response,
+                        route: "route",
+                        at: 2,
+                        standard: true,
+                        resolved: None,
+                        cost: Some(0.456),
+                        measurements: Some(&m),
+                    });
+                    let crossed = residual == 5801;
+                    let prior_retired = if crossed { 3901 - keep_recent } else { 0 };
+                    let priced_input = native - prior_retired + if crossed { 100 } else { 0 };
+                    let current_summary = priced_input > 3900;
+                    assert_eq!(
+                        t.snapshot().traditional_compactions,
+                        u64::from(crossed) + u64::from(current_summary),
+                        "admitted member remainder decides the PRIOR summary: reverse={reverse}, residual={residual}, roundtrip={roundtrip}, keep={keep_recent}"
+                    );
+                    let expected_retired = if current_summary {
+                        native - keep_recent
+                    } else {
+                        prior_retired
+                    };
+                    assert_eq!(t.history.retired, expected_retired);
+                    let expected_summary = if current_summary {
+                        modeled_cost(
+                            "gpt-6.1-sol",
+                            &Usage {
+                                input_tokens: priced_input - keep_recent,
+                                output_tokens: 100,
+                                ..Usage::default()
+                            },
+                            None,
+                        )
+                        .unwrap()
+                    } else {
+                        0.0
+                    };
+                    assert!(
+                        (t.snapshot().summary_cost - frozen.summary_cost - expected_summary).abs()
+                            < 1e-12,
+                        "excluded prior summary money must never be backfilled"
+                    );
+                    let expected_primary = if crossed {
+                        scenario_input_cost("gpt-6.1-sol", priced_input, 0, Some(1024)).unwrap()
+                    } else {
+                        // Until the response summarizes, histories still share
+                        // this request's dispatch-frozen paid contribution.
+                        0.456
+                    };
+                    assert!(
+                        (t.snapshot().traditional_cost
+                            - frozen.traditional_cost
+                            - expected_summary
+                            - expected_primary)
+                            .abs()
+                            < 1e-12,
+                        "the next primary must be priced AFTER the recovered summary"
+                    );
+                    assert_eq!(t.snapshot().matched_primary_responses, 1);
+                    assert_eq!(t.snapshot().observed_primary_cost, 0.123 + 0.456);
+                    assert_eq!(t.snapshot().carry_cost, 0.456);
+                    assert_eq!(t.snapshot().initial_compactions, 0);
+                }
+            }
+        }
+    }
+}
+
 // Independently reviewed R2: delayed quantity evidence must settle transitions,
 // never the excluded historical money.
 #[test]
@@ -373,6 +521,8 @@ fn resolved_zero_projection_gap_recovers_transitions_not_historical_money() {
         .push(json!({"role":"user","content":"paid summary growth"}));
     t.primary(&request, &terminal(5000, 0, 0, 0), "route", 2, true);
     let frozen = t.snapshot();
+    let paid_window = t.clone();
+    let paid_request = request.clone();
     t.projected_input(None, true);
     t.primary(&request, &terminal(5000, 0, 0, 0), "route", 3, true);
     t = serde_json::from_value(state(&t)).unwrap();
@@ -403,6 +553,108 @@ fn resolved_zero_projection_gap_recovers_transitions_not_historical_money() {
     assert_eq!(t.snapshot().traditional_compactions, 2);
     assert_eq!(t.snapshot().initial_compactions, 0);
     assert!(t.snapshot().summary_cost > frozen.summary_cost);
+
+    // N2: the exact-single-gap capability cannot survive another SUCCESSFUL
+    // response. A sampling-only change is not a canonical history rebase.
+    for successful in [true, false] {
+        let mut t = paid_window.clone();
+        let mut request = paid_request.clone();
+        request["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"gap native input 7000"}));
+        t.projected_input(None, true);
+        t.primary_settled(PrimaryObservation {
+            body: &request,
+            response: &terminal(7000, 0, 0, 0),
+            route: "route",
+            at: 3,
+            standard: true,
+            resolved: None,
+            cost: Some(0.7),
+            measurements: None,
+        });
+        let gap = t.snapshot();
+        let mut different = request.clone();
+        different["temperature"] = json!(0.5);
+        assert_eq!(
+            HistoryContract::extract(&request, "route", None, t.scenario),
+            HistoryContract::extract(&different, "route", None, t.scenario)
+        );
+        let output = (900..1100).find_map(|n| {
+            let output = json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"word ".repeat(n)}]}]);
+            (receipts::retained_output_tokens(&output) == Some(1000)).then_some(output)
+        }).expect("fixture has exactly 1000 visible retained units");
+        let mut response = terminal(7000, 0, 0, 0);
+        response["output"] = output;
+        if !successful {
+            response["status"] = json!("failed");
+        }
+        t.projected_input(Some(0), false);
+        t.primary_settled(PrimaryObservation {
+            body: &different,
+            response: &response,
+            route: "route",
+            at: 4,
+            standard: true,
+            resolved: None,
+            cost: successful.then_some(0.8),
+            measurements: None,
+        });
+        assert_eq!(t.snapshot().traditional_cost, gap.traditional_cost);
+        assert_eq!(t.history.retired, 3500);
+        t = serde_json::from_value(state(&t)).unwrap();
+        t.projected_input(Some(0), false);
+        t.primary_settled(PrimaryObservation {
+            body: &request,
+            response: &terminal(7000, 0, 0, 0),
+            route: "route",
+            at: 5,
+            standard: true,
+            resolved: None,
+            cost: Some(0.9),
+            measurements: None,
+        });
+        if successful {
+            assert!(
+                t.history.unresolved_projection,
+                "a stale exact-repeat token must not skip the successful 1000-unit response summary (next input 600, NOT 3600)"
+            );
+            assert_eq!(
+                t.snapshot().matched_primary_responses,
+                gap.matched_primary_responses
+            );
+            assert_eq!(t.snapshot().traditional_cost, gap.traditional_cost);
+            assert_eq!(t.snapshot().carry_cost, gap.carry_cost);
+            assert_eq!(
+                t.snapshot().coverage.unavailable_quantity_calls,
+                gap.coverage.unavailable_quantity_calls + 2
+            );
+        } else {
+            assert!(
+                !t.history.unresolved_projection,
+                "failed calls do not consume the single successful gap"
+            );
+            assert_eq!(
+                t.snapshot().matched_primary_responses,
+                gap.matched_primary_responses + 1
+            );
+            let expected = scenario_input_cost("gpt-6.1-sol", 3600, 3600, Some(1024)).unwrap();
+            assert!(
+                (t.snapshot().traditional_cost - gap.traditional_cost - expected).abs() < 1e-12,
+                "the recovered successful write keeps its original clock"
+            );
+        }
+        assert_eq!(
+            t.snapshot().summary_cost,
+            gap.summary_cost,
+            "never backfill excluded money"
+        );
+        assert_eq!(t.snapshot().initial_compactions, 0);
+        let expected_observed =
+            gap.observed_primary_cost + if successful { 0.8 } else { 0.0 } + 0.9;
+        assert_eq!(t.snapshot().observed_primary_cost, expected_observed);
+    }
 }
 
 #[test]

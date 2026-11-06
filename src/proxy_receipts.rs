@@ -414,6 +414,7 @@ impl Trajectory {
             }
         }
         if self.history.unresolved_projection {
+            self.history.invalidate_projection_recovery();
             self.result.coverage.unavailable_quantity_calls += u64::from(retained_output.is_some());
             self.result.coverage.unmodeled_calls += 1;
             self.result.excluded_unpriced_calls += 1;
