@@ -312,6 +312,13 @@ function coverageChips(e){
  if(e?.unavailable_primary_cost_calls||e?.unavailable_reviewer_cost_calls)chips.push('Comparison costs missing: '+fmt(e.unavailable_primary_cost_calls||0)+' primary / '+fmt(e.unavailable_reviewer_cost_calls||0)+' reviewer');
  return chips;
 }
+function comparisonScopeNote(root,e){
+ const q=e?.quantity_evidence,scope=q?.comparison_scope;
+ const total=q?.total_primary_responses??e?.coverage?.primary_responses;
+ const label=scope==='matched_subset_not_whole_session'?'Matched subtotal · not whole session':scope==='matched_completed_primary_window'?'Matched completed primary window':'Comparison scope unavailable';
+ const coverage=e?.matched_primary_responses!=null&&total!=null?' · '+fmt(e.matched_primary_responses)+' / '+fmt(total)+' primary responses matched':'';
+ note(root,label+coverage,'comparison-scope card-note');
+}
 function renderSession(s){
  const el=document.createElement('article');el.className='session';el.id='history:'+s.id;
  const identity=document.createElement('div');identity.className='session-identity';
@@ -324,7 +331,7 @@ function renderSession(s){
  note(identity,count(s.completed_requests||0,'request')+(s.rewrites?' · '+count(s.rewrites.dispatched,'rewrite')+(s.rewrites.forced?' · '+fmt(s.rewrites.forced)+' forced':''):''),'request-counts');el.append(identity);
  const ledgers=[s.primary||{},s.shadow||{}],missing=sum(ledgers,'unavailable_cost_calls'),e=s.cost_estimate;
  const costs=document.createElement('div');costs.className='session-costs';note(costs,missing?'Priced subtotal':'Observed cost','label');note(costs,money(pricedSubtotal(ledgers)),'value');note(costs,'Primary + reviewer · saved usage','card-note');el.append(costs);
- const saved=document.createElement('div');saved.className='session-savings';saved.setAttribute('data-loss',String(e?.savings<0));note(saved,'Estimated savings','label');note(saved,savingsText(e),'value');note(saved,e?.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');el.append(saved);
+ const saved=document.createElement('div');saved.className='session-savings';saved.setAttribute('data-loss',String(e?.savings<0));note(saved,'Estimated savings','label');note(saved,savingsText(e),'value');note(saved,e?.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');comparisonScopeNote(saved,e);el.append(saved);
  el.append(contextOverview(s.context||{}),tokenMetrics(s));
  const alerts=[];
  if(missing)alerts.push(fmt(missing)+' unpriced calls');
@@ -344,7 +351,7 @@ function renderSession(s){
  if(coverage.length){const tags=document.createElement('div');tags.className='inspection-tags';for(const item of coverage)note(tags,item,'inspection-badge');details.append(tags)}
  if(s.last_failure){const failure=document.createElement('div');failure.className='inspection-failure';note(failure,'Last incomplete request','label');note(failure,s.last_failure.reason||'Reason not recorded','inspection-caption');details.append(failure)}
  details.append(laneSummary(s),candidateTable(p,s.id));
- if(e?.counterfactual_cache_policy||e?.accounting_basis){const accounting=disclosure('accounting:'+s.id,'Accounting details','session-accounting');if(e.counterfactual_cache_policy)inspectionMetric(accounting,'Comparison cache policy',e.counterfactual_cache_policy);if(e.accounting_basis)inspectionMetric(accounting,'Accounting basis',e.accounting_basis);if(e.quantity_evidence)inspectionMetric(accounting,'Quantity estimates',e.quantity_evidence.version===1?'Receipt blocks + native-increment residual allocations':'Legacy receipt quantities','No calibrated interval; same outputs and tool sequence assumed');details.append(accounting)}
+ if(e?.counterfactual_cache_policy||e?.accounting_basis){const accounting=disclosure('accounting:'+s.id,'Accounting details','session-accounting');if(e.counterfactual_cache_policy)inspectionMetric(accounting,'Comparison cache policy',e.counterfactual_cache_policy);if(e.accounting_basis)inspectionMetric(accounting,'Accounting basis',e.accounting_basis);if(e.quantity_evidence){inspectionMetric(accounting,'Quantity estimates',e.quantity_evidence.version===1?'Receipt blocks + native-increment residual allocations':'Legacy receipt quantities','No calibrated interval; same outputs and tool sequence assumed');inspectionMetric(accounting,'Historical quantity policy',e.quantity_evidence.historical_policy_scope,fmt(e.quantity_evidence.legacy_priced_calls||0)+' legacy priced calls · no retrospective repricing')}details.append(accounting)}
  details.append(transcriptView(s));el.append(details);return el;
 }
 async function refresh(){
@@ -365,6 +372,7 @@ async function refresh(){
   $('cards').replaceChildren(card(partial?'Priced subtotal':'Observed cost',money(pricedSubtotal(all))),card('Estimated savings',savingsText(estimate)));
   note($('cards').children[0],'Primary + reviewer · saved usage','card-note');
   note($('cards').children[1],estimate.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');
+  comparisonScopeNote($('cards').children[1],estimate);
   if(estimate.savings<0)$('cards').children[1].className='card loss';
   $('estimate-coverage').textContent=fmt(estimate.included_sessions||0)+' comparable · '+fmt(estimate.excluded_sessions||0)+' excluded';
   const warnings=[];

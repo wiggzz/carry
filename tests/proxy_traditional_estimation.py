@@ -77,6 +77,7 @@ class TraditionalEstimation(unittest.TestCase):
             saved = proxy.saved()
             for block in saved['primary_input']['blocks']:
                 block.pop('allocation', None)
+                block.pop('opaque', None)
             saved['cost_trajectory']['receipts'].pop('quantity_policy_version', None)
             saved['cost_trajectory'].pop('estimated_projection', None)
             saved['cost_trajectory']['result'].pop('quantity_policy_version', None)
@@ -101,6 +102,13 @@ class TraditionalEstimation(unittest.TestCase):
         self.assertEqual(trajectory['priced_primary_responses'], training_calls + 1)
         self.assertGreaterEqual(trajectory['result']['coverage']['estimated_quantity_calls'], 1)
         evidence = stats['sessions'][0]['cost_estimate']['quantity_evidence']
+        aggregate = stats['cost_estimate']['quantity_evidence']
+        self.assertEqual(aggregate['comparison_scope'], 'matched_subset_not_whole_session')
+        self.assertEqual(aggregate['total_primary_responses'], stats['sessions'][0]['cost_estimate']['coverage']['primary_responses'])
+        self.assertEqual(aggregate['estimated_priced_calls'], evidence['estimated_priced_calls'])
+        if legacy:
+            self.assertEqual(aggregate['historical_policy_scope'], 'mixed_prospective_only_no_repricing')
+            self.assertEqual(aggregate['legacy_priced_calls'], training_calls)
         self.assertEqual(evidence['version'], 1)
         self.assertGreaterEqual(evidence['estimated_priced_calls'], 1)
         self.assertIn('no_calibrated_statistical_interval', evidence['uncertainty'])
@@ -157,6 +165,117 @@ class TraditionalEstimation(unittest.TestCase):
         self.assertEqual(t['last_traditional_input'],21100)
         self.assertAlmostEqual(stats['sessions'][0]['cost_estimate']['observed_primary_cost'],after['primary']['cost_usd'],places=12)
         self.assertEqual(fixture.reviews,[])
+
+    def test_unknown_output_crosses_summary_threshold_before_next_http_request(self):
+        opaque={'type':'reasoning','summary':[],'encrypted_content':'unresolved-large-output'}
+        fixture=self.fixture(lambda _b,n:(200,support.completed([opaque] if n==1 else [],f'cross-{n}',input_tokens=1000 if n==1 else 300000)))
+        options=['--primary-context-tokens','1000000','--review-min-primary-tokens','1000000']
+        proxy=self.proxy(fixture,options)
+        history=[{'role':'user','content':'below modeled threshold'}]
+        self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
+        before=proxy.saved(); self.evidence['before_restart']=before
+        self.assertEqual(before['cost_trajectory']['result']['initial_compactions'],0)
+        proxy.close(); proxy=self.proxy(fixture,options)
+        history.append(opaque)
+        self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
+        after=proxy.saved(); stats=proxy.request('GET','/carry/dashboard/stats')[1]
+        self.evidence.update(after_restart=after,stats=stats)
+        t=after['cost_trajectory']
+        self.assertEqual(t['last_traditional_input'],21000)
+        self.assertEqual(t['retired'],280000)
+        self.assertEqual(t['result']['traditional_compactions'],1)
+        self.assertEqual(t['result']['initial_compactions'],0)
+        self.assertEqual(t['result']['summary_cost'],before['cost_trajectory']['result']['summary_cost'],'excluded historical summary fee stays excluded')
+        self.assertEqual(t['priced_primary_responses'],1)
+        self.assertLess(t['result']['traditional_cost'],0.1,'second primary uses post-summary input, never 300000')
+        self.assertAlmostEqual(stats['sessions'][0]['cost_estimate']['observed_primary_cost'],after['primary']['cost_usd'],places=12)
+
+    def test_unknown_output_preserves_divergent_cache_write_through_http_restart(self):
+        opaque={'type':'reasoning','summary':[],'encrypted_content':'cache-unknown-output'}
+        inputs=[1000,300000,300100,300200]
+        fixture=self.fixture(lambda _b,n:(200,support.completed([opaque] if n==3 else [],f'cache-{n}',input_tokens=inputs[n-1])))
+        options=['--primary-context-tokens','1000000','--review-min-primary-tokens','1000000']
+        proxy=self.proxy(fixture,options)
+        history=[{'role':'user','content':'base'}]
+        self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
+        history.append({'role':'user','content':'large paid summary growth'})
+        self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
+        history.append({'role':'user','content':'known divergent request input'})
+        self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
+        before=proxy.saved(); self.evidence['before_restart']=before
+        cache=before['cost_trajectory']['receipts']['modeled_cache']
+        self.assertTrue(cache['writes'],'unknown retained output cannot omit the known input cache write')
+        self.assertEqual(cache['writes'][-1]['end'],21100)
+        proxy.close(); proxy=self.proxy(fixture,options)
+        history.append(opaque)
+        self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
+        after=proxy.saved(); self.evidence.update(after_restart=after,stats=proxy.request('GET','/carry/dashboard/stats')[1])
+        t=after['cost_trajectory']; prior=before['cost_trajectory']
+        self.assertEqual(t['last_traditional_input'],21200)
+        self.assertEqual(t['result']['summary_cost'],prior['result']['summary_cost'])
+        self.assertEqual(t['priced_primary_responses'],prior['priced_primary_responses']+1)
+        rates=after['model_resolution']['primary']['rates']
+        self.assertEqual(after['primary']['output_tokens']-before['primary']['output_tokens'],1)
+        expected=(21100*rates['cached']+100*rates['write']+rates['output'])/1000000
+        self.assertAlmostEqual(t['result']['traditional_cost']-prior['result']['traditional_cost'],expected,places=12)
+        self.assertAlmostEqual(t['result']['observed_primary_cost'],after['primary']['cost_usd'],places=12)
+
+    def test_successful_unknown_partial_projection_keeps_paid_window_through_off_restart(self):
+        self.evidence['advice_observations']=[]
+        def primary(body,n):
+            has_first=any(i.get('encrypted_content')=='initial-first' for i in body['input'])
+            return 200,support.completed([],f'gap-{n}',input_tokens=1000 if n==1 else 300000 if has_first else 200000)
+        def review(body,n):
+            actionable=support.ledger(body); pending=False; removable=[]
+            for item in body['input']:
+                if item.get('encrypted_content')=='initial-first': pending=True
+                content=item.get('content','')
+                text=content if isinstance(content,str) else ''.join(p.get('text','') for p in content if isinstance(p,dict)) if isinstance(content,list) else ''
+                if text.startswith('[carry context] '):
+                    annotation=json.loads(text[len('[carry context] '):])
+                    if pending and annotation['group_id'] in actionable['eligible_group_ids']: removable.append(annotation['group_id'])
+                    pending=False
+            self.evidence['advice_observations'].append({'ledger':actionable,'removable':removable})
+            return 200,support.advice_response({'protected':[],'removable':removable,'memories':[]})
+        fixture=self.fixture(primary,review)
+        options=['--primary-context-tokens','1000000']
+        proxy=self.proxy(fixture,options)
+        history=[{'role':'user','content':'keep original goal'},
+            {'type':'reasoning','summary':[],'encrypted_content':'initial-first'},
+            {'type':'function_call','call_id':'old','name':'lookup','arguments':'{}'},
+            {'type':'function_call_output','call_id':'old','output':'obsolete'},
+            {'role':'user','content':'next task'},
+            {'type':'reasoning','summary':[],'encrypted_content':'initial-second'},
+            {'type':'function_call','call_id':'new','name':'lookup','arguments':'{}'},
+            {'type':'function_call_output','call_id':'new','output':'current'},
+            {'role':'user','content':'preserve current task'}]
+        self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
+        history.append({'role':'user','content':'large in-window growth'})
+        self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
+        paid=proxy.saved(); self.evidence['paid_summary']=paid
+        self.assertEqual(paid['cost_trajectory']['result']['traditional_compactions'],1)
+        proxy.close()
+        options += ['--review-every-requests','100','--review-min-new-tokens','1000000']
+        proxy=self.proxy(fixture,options)
+        for _ in range(3):
+            self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
+            gap=proxy.saved()
+            if not gap['cost_trajectory']['projection_known']: break
+        self.evidence['successful_gap']=gap
+        self.assertFalse(gap['cost_trajectory']['projection_known'],'real reviewer projection reaches quantity-unavailable path')
+        self.assertEqual(gap['cost_trajectory']['retired'],paid['cost_trajectory']['retired'])
+        self.assertEqual(gap['cost_trajectory']['result']['summary_cost'],paid['cost_trajectory']['result']['summary_cost'])
+        proxy.close()
+        proxy=support.Proxy(self.state,fixture,['--primary-context-tokens','1000000','--review-every-requests','100','--review-min-new-tokens','1000000'],mode='off'); self.addCleanup(proxy.close)
+        for suffix in ['off-mode recovery','later growth']:
+            history.append({'role':'user','content':suffix})
+            self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
+        after=proxy.saved();self.evidence.update(after_off_restart=after,stats=proxy.request('GET','/carry/dashboard/stats')[1])
+        self.assertEqual(after['cost_trajectory']['result']['initial_compactions'],0)
+        self.assertGreaterEqual(after['cost_trajectory']['retired'],paid['cost_trajectory']['retired'])
+        self.assertEqual(after['cost_trajectory']['result']['summary_cost'],paid['cost_trajectory']['result']['summary_cost'])
+        self.assertEqual(after['cost_trajectory']['priced_primary_responses'],gap['cost_trajectory']['priced_primary_responses'])
+        self.assertGreater(after['primary']['cost_usd'],gap['primary']['cost_usd'])
 
     def test_unknown_retained_output_keeps_known_free_initialization_once(self):
         opaque = {'type':'reasoning','summary':[],'encrypted_content':'unknown-initial-output'}

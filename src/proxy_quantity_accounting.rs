@@ -125,6 +125,25 @@ impl InputMeasurements {
                 .collect();
             for (block, allocation) in self.blocks.iter_mut().zip(recovered) {
                 block.allocation = allocation;
+                block.opaque |= block.items.iter().any(|id| available.get(id).is_some_and(|v| crate::savings::prompt_has_opaque(v)));
+            }
+        }
+        // A known native block without a valid internal allocation is NOT an
+        // unmeasured item. In particular a rejected visible-floor budget must
+        // never borrow another block's residual. Legacy blocks can recover above
+        // only from complete membership; otherwise partial attribution stays
+        // unavailable. Whole-block native authority is independent of this.
+        for changed in [&removed, &added] {
+            for block in &self.blocks {
+                if block.opaque && block.allocation.is_none()
+                    && changed.iter().any(|item| block.items.contains(&item.identity))
+                    && !changed.windows(block.items.len().max(1)).any(|window| {
+                        window.len() == block.items.len()
+                            && window.iter().zip(&block.items).all(|(item, id)| item.identity == *id)
+                    })
+                {
+                    return None;
+                }
             }
         }
         if let Some(tokens) = self.restoration(canonical, submitted, route, resolved) {
@@ -227,21 +246,26 @@ impl InputMeasurements {
     /// Hidden retained OUTPUT uses earlier native INPUT-increment calibration,
     /// not billed reasoning output tokens or ciphertext bytes. A previously
     /// unseen/initial opaque output without calibration is explicitly unknown.
-    pub(crate) fn retained_reasoning_extra(&self, output: &Value) -> Option<(u64, u64)> {
-        let mut count = 0u64;
-        for value in output.as_array()? {
-            if crate::savings::prompt_has_opaque(value) {
-                if !accounting_reasoning(value) {
-                    return None;
-                }
-                count = count.checked_add(1)?;
-            }
-        }
-        if count == 0 {
-            return Some((0, 0));
-        }
-        Some((self.calibrated_residual()?.checked_mul(count)?, count))
+    pub(crate) fn retained_reasoning_units(&self, count: u64) -> Option<u64> {
+        if count == 0 { return Some(0); }
+        self.calibrated_residual()?.checked_mul(count)
     }
+
+    pub(crate) fn retained_reasoning_extra(&self, output: &Value) -> Option<(u64, u64)> {
+        let count = retained_reasoning_count(output)?;
+        Some((self.retained_reasoning_units(count)?, count))
+    }
+}
+
+pub(crate) fn retained_reasoning_count(output: &Value) -> Option<u64> {
+    let mut count = 0u64;
+    for value in output.as_array()? {
+        if crate::savings::prompt_has_opaque(value) {
+            if !accounting_reasoning(value) { return None; }
+            count = count.checked_add(1)?;
+        }
+    }
+    Some(count)
 }
 
 pub(crate) fn accounting_retirement_supported(body: &Value) -> bool {

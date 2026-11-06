@@ -322,15 +322,42 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   await refresh();
   assert.equal(recency.getAttribute('datetime'),'1970-01-01T00:00:00.000Z','known epoch zero is not missing');
   sandbox.Date=RealDate;
+  const visibleText = root => {
+    if(root.hidden)return '';
+    if(root.tagName?.toLowerCase()==='details'&&!root.open)return root.children[0]?.textContent||'';
+    return [root.textContent,...root.children.map(visibleText)].join('\n');
+  };
   recent.cost_estimate = {...recent.cost_estimate, accounting_basis:'receipt_anchored_v2',
+    matched_primary_responses:3,coverage:{primary_responses:5},
     quantity_evidence:{version:1,estimated_priced_calls:3,unavailable_quantity_calls:2,
+      historical_policy_scope:'mixed_prospective_only_no_repricing',legacy_priced_calls:2,
       comparison_scope:'matched_subset_not_whole_session'}};
+  data.cost_estimate={...data.cost_estimate,matched_primary_responses:3,
+    quantity_evidence:{...recent.cost_estimate.quantity_evidence,total_primary_responses:5}};
+  for(const root of elements.values())for(const n of walk(root))if(n.tagName?.toLowerCase()==='details')n.open=false;
+  vm.runInContext('expandedDiagnostics.clear()',sandbox);
   await refresh();
+  for(const root of [byClass(recentRow,'session-savings'),elements.get('cards').children[1]]) {
+    assert.match(visibleText(root),/Matched subtotal · not whole session/,'scope must be next to the visible percentage, not in closed details');
+    assert.match(visibleText(root),/3 \/ 5 primary responses matched/);
+  }
+  assert.match(text(byClass(recentRow,'session-accounting')),/mixed_prospective_only_no_repricing/);
+  assert.match(text(byClass(recentRow,'session-accounting')),/2 legacy priced calls/);
   assert.ok(text(recentRow).includes('3 calls use estimated quantities'));
   assert.ok(text(recentRow).includes('2 calls lack quantity evidence'));
   assert.ok(text(recentRow).includes('Matched subtotal · not whole session'));
   assert.ok(text(recentRow).includes('No calibrated interval; same outputs and tool sequence assumed'));
   assert.ok(!text(recentRow).includes('95%'), 'do not invent a statistical confidence interval');
+  recent.cost_estimate.quantity_evidence.comparison_scope='matched_completed_primary_window';
+  recent.cost_estimate.matched_primary_responses=5;
+  data.cost_estimate.quantity_evidence={...recent.cost_estimate.quantity_evidence,total_primary_responses:5};
+  data.cost_estimate.matched_primary_responses=5;
+  await refresh();
+  for(const root of [byClass(recentRow,'session-savings'),elements.get('cards').children[1]]) {
+    assert.match(visibleText(root),/Matched completed primary window/);
+    assert.match(visibleText(root),/5 \/ 5 primary responses matched/);
+    assert.ok(!visibleText(root).includes('Matched subtotal'));
+  }
   if(process.env.CARRY_DASHBOARD_STATS_FIXTURE){
     data=JSON.parse(fs.readFileSync(process.env.CARRY_DASHBOARD_STATS_FIXTURE,'utf8'));
     await refresh();
@@ -349,6 +376,18 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     assert.equal(cards().get(missing?'Priced subtotal':'Observed cost'),amount(cost));
     assert.equal(walk(elements.get('sessions')).filter(n=>n.className==='session').length+
       walk(elements.get('background-sessions')).filter(n=>n.className==='session').length,data.sessions.length);
+    const checkVisibleScope=(root,e,total)=>{
+      const shown=visibleText(root);
+      const partial=e.quantity_evidence.comparison_scope==='matched_subset_not_whole_session';
+      assert.ok(shown.includes(partial?'Matched subtotal · not whole session':'Matched completed primary window'));
+      assert.ok(shown.includes(`${e.matched_primary_responses.toLocaleString()} / ${total.toLocaleString()} primary responses matched`));
+    };
+    checkVisibleScope(elements.get('cards').children[1],data.cost_estimate,data.cost_estimate.quantity_evidence.total_primary_responses);
+    for(const s of data.sessions){
+      const row=document.getElementById('history:'+s.id);
+      checkVisibleScope(byClass(row,'session-savings'),s.cost_estimate,s.cost_estimate.coverage.primary_responses);
+      assert.ok(!byClass(row,'session-details').open,'HTTP fixture disclosures remain closed');
+    }
     console.log('private frozen producer smoke: ok (contents not logged)');
   }
   console.log('proxy dashboard scenarios: ok');

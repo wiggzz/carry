@@ -243,8 +243,59 @@ impl Estimate {
     }
 }
 
+/// Producer-owned facts for the exact aggregate comparison scope. Counts also
+/// cover excluded receipt sessions, whose observed money is displayed above.
+#[derive(Default, Debug, Serialize)]
+struct DashboardQuantityTotals {
+    total_primary_responses: u64,
+    estimated_priced_calls: u64,
+    measured_priced_calls: u64,
+    unavailable_quantity_calls: u64,
+    legacy_priced_calls: u64,
+    historical_policy_scope: &'static str,
+    comparison_scope: &'static str,
+    #[serde(skip)]
+    partial: bool,
+    #[serde(skip)]
+    legacy: bool,
+    #[serde(skip)]
+    current: bool,
+}
+impl DashboardQuantityTotals {
+    fn observe(&mut self, e: &DashboardEstimate) {
+        let q = &e.quantity_evidence;
+        self.total_primary_responses += e.coverage.primary_responses;
+        self.estimated_priced_calls += e.coverage.estimated_quantity_calls;
+        self.measured_priced_calls += e.coverage.measured_quantity_calls;
+        self.unavailable_quantity_calls += e.coverage.unavailable_quantity_calls;
+        self.legacy_priced_calls += q["legacy_priced_calls"].as_u64().unwrap_or_else(|| {
+            if q["version"] == 1 {
+                0
+            } else {
+                e.matched_primary_responses
+            }
+        });
+        self.legacy |= q["historical_policy_scope"] != "residual_v1";
+        self.current |= q["version"] == 1;
+        self.historical_policy_scope = match (self.legacy, self.current) {
+            (true, true) => "mixed_prospective_only_no_repricing",
+            (true, false) => "legacy_v0",
+            _ => "residual_v1",
+        };
+        self.partial |= q["comparison_scope"] != "matched_completed_primary_window"
+            || e.accounting_basis == LEGACY_BASIS
+            || e.carry_cost.is_none();
+        self.comparison_scope = if self.partial {
+            "matched_subset_not_whole_session"
+        } else {
+            "matched_completed_primary_window"
+        };
+    }
+}
+
 #[derive(Default, Debug, Serialize)]
 pub struct DashboardTotals {
+    quantity_evidence: DashboardQuantityTotals,
     legacy_cache_policy_sessions: u64,
     mixed_cache_policy_sessions: u64,
     in_flight_sessions: u64,
@@ -267,6 +318,7 @@ pub struct DashboardTotals {
 
 impl DashboardTotals {
     pub fn observe(&mut self, estimate: &DashboardEstimate) {
+        self.quantity_evidence.observe(estimate);
         self.in_flight_sessions += u64::from(estimate.in_flight_costs_excluded);
         // Diagnostics cover all sessions, even pending/ineligible comparisons.
         self.excluded_unpriced_calls += estimate.excluded_unpriced_calls;

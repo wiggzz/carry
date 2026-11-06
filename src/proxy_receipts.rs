@@ -96,7 +96,7 @@ pub(super) fn receipt(usage: &Value) -> Option<Usage> {
 /// Estimate only semantic text that can be retained in the next input. Native
 /// output billing, IDs and encrypted transport envelopes are different units.
 /// Unknown output kinds have no invented retained-context measurement.
-fn retained_output_tokens(output: &Value) -> Option<u64> {
+pub(super) fn retained_output_tokens(output: &Value) -> Option<u64> {
     let mut text = Vec::new();
     for item in output.as_array()? {
         match item["type"].as_str()? {
@@ -321,6 +321,34 @@ impl Trajectory {
         {
             self.result.coverage.unavailable_quantity_calls += 1;
         }
+        if billable && !self.projection_known {
+            self.result.coverage.unmodeled_calls += 1;
+            self.result.excluded_unpriced_calls += 1;
+            // A successful quantity gap is not ancestry evidence. Preserve paid
+            // summaries, the established window and its last trustworthy cursor.
+            // This request's unknown canonical input/output transition cannot be
+            // priced merely because a later projection happens to be measurable.
+            self.history.defer_projection(
+                configuration(body, route, resolved),
+                body,
+                response,
+                native.as_ref().map(|n| n.input_tokens),
+                at,
+            );
+            self.history.diverge();
+            self.receipts.cache_initialized = true;
+            if self.history.history_continuity.is_none() {
+                if let (Some(native), Some(items)) = (native.as_ref(), body["input"].as_array()) {
+                    self.history.observe(
+                        HistoryContract::extract(body, route, resolved, self.scenario),
+                        items,
+                        native.input_tokens,
+                        at,
+                    );
+                }
+            }
+            return;
+        }
         if !billable || !self.projection_known || !opaque_comparable {
             self.result.coverage.unmodeled_calls += 1;
             self.result.excluded_unpriced_calls += 1;
@@ -353,6 +381,86 @@ impl Trajectory {
             // Rewind, edit, configuration switch or negative total-input delta:
             // invalidate historical assumptions, not the current projection.
             self.reset_receipt_epoch();
+        }
+        let mut recovered_cache_request_at = None;
+        if self.history.unresolved_projection
+            && self.history.pending_retention.is_none()
+            && self.restored == 0
+            && !cache_policy_changed
+        {
+            if let Some(prior_at) =
+                self.history
+                    .recover_projection(&config, body, native.input_tokens, at)
+            {
+                // A single empty-output gap can be resolved by an exact repeat
+                // now known to be canonical (zero restoration). Recover only
+                // its transitions, never its excluded monetary contribution.
+                let prior_input = self.history.input(native.input_tokens, 0);
+                match self.scenario.response_compaction(
+                    prior_input,
+                    0,
+                    projection_fixed_tokens(body),
+                ) {
+                    Ok(Some(kept)) => {
+                        self.history
+                            .summarize(prior_input, kept, self.scenario.summary);
+                        self.result.traditional_compactions += 1;
+                        self.traditional_edited = true;
+                        self.receipts.modeled_cache.clear();
+                    }
+                    Ok(None) => recovered_cache_request_at = Some(prior_at),
+                    Err(()) => self.history.unresolved_projection = true,
+                }
+            }
+        }
+        if self.history.unresolved_projection {
+            self.result.coverage.unavailable_quantity_calls += u64::from(retained_output.is_some());
+            self.result.coverage.unmodeled_calls += 1;
+            self.result.excluded_unpriced_calls += 1;
+            return;
+        }
+        if self.history.pending_retention.is_some() {
+            let recovered = self.history.resolve_retention(
+                body,
+                native.input_tokens,
+                self.restored,
+                self.carry_edited,
+                self.scenario,
+                measurements,
+                route,
+                resolved,
+            );
+            let resolved_transition = recovered.and_then(|(retained, fixed)| {
+                self.scenario
+                    .response_compaction(self.history.last_traditional_input, retained, fixed)
+                    .ok()
+                    .map(|kept| (retained, kept))
+            });
+            let Some((retained, kept)) = resolved_transition else {
+                // This successful request itself introduces another transition.
+                // Retaining only the older pending response cannot later replay
+                // this request's summaries/cache/output honestly. Keep the gap
+                // explicitly unavailable rather than resume from a stale cursor.
+                self.history.unresolved_projection = true;
+                self.result.coverage.unavailable_quantity_calls +=
+                    u64::from(retained_output.is_some());
+                self.result.coverage.unmodeled_calls += 1;
+                self.result.excluded_unpriced_calls += 1;
+                return;
+            };
+            if let Some(kept) = kept {
+                self.history.summarize(
+                    self.history.last_traditional_input.saturating_add(retained),
+                    kept,
+                    self.scenario.summary,
+                );
+                self.result.traditional_compactions += 1;
+                self.traditional_edited = true;
+                self.receipts.modeled_cache.clear();
+            }
+            // Recover quantities for FUTURE pricing, never the omitted primary
+            // or summary fee. Their monetary exclusion is immutable.
+            self.history.pending_retention = None;
         }
         self.receipts.last_appended_input = previous
             .as_ref()
@@ -387,30 +495,6 @@ impl Trajectory {
                 self.reset_epoch();
                 return;
             }
-        };
-
-        // Retained output can be unavailable while native current input is
-        // known. Run the SAME continuity/free-initialization owner above first,
-        // preserve its successful cursor, and exclude unknown monetary pairs.
-        let Some(retained_output) = retained_output else {
-            self.result.coverage.unmodeled_calls += 1;
-            self.result.excluded_unpriced_calls += 1;
-            self.result.initial_compactions += u64::from(initialized_now);
-            self.history.last_traditional_input = traditional;
-            self.history
-                .observe(contract, items, native.input_tokens, at);
-            self.receipts.anchor = Some(Anchor {
-                configuration: config,
-                prefix: digest(items),
-                items: items.len(),
-                input: native.input_tokens,
-                at,
-            });
-            // This was a request inside the window, not a later opportunity for
-            // free inherited cache. Existing deadlines still own prior warmth.
-            self.receipts.cache_initialized = true;
-            self.carry_edited = false;
-            return;
         };
 
         // The alternative models an API-equivalent policy, not this route's
@@ -459,6 +543,22 @@ impl Trajectory {
             cache.inherit(cache_scope.clone(), at, ttl, inherited);
         }
         self.receipts.cache_initialized = true;
+        if let Some(prior_at) = recovered_cache_request_at {
+            if mode == carry::models::ScenarioCacheMode::Implicit
+                && minimum.is_some_and(|min| traditional >= min)
+            {
+                let read_refresh = resolved
+                    .and_then(|r| r.scenario_cache_policy.as_ref())
+                    .and_then(|p| p.read_refresh_seconds(model, body));
+                cache.requested(
+                    cache_scope.clone(),
+                    prior_at,
+                    ttl,
+                    traditional,
+                    read_refresh,
+                );
+            }
+        }
         let cached = if mode == carry::models::ScenarioCacheMode::Implicit {
             cache
                 .eligible_at(&cache_scope, at, traditional)
@@ -471,6 +571,43 @@ impl Trajectory {
                 })
         } else {
             Some(0)
+        };
+        // A successful known INPUT evolves the modeled cache even when its
+        // OUTPUT retention is unknown. Capture eligibility before this request
+        // writes/refreshes it; never silently turn a quantity gap into coldness.
+        if mode == carry::models::ScenarioCacheMode::Implicit
+            && minimum.is_some_and(|min| traditional >= min)
+        {
+            let read_refresh = resolved
+                .and_then(|r| r.scenario_cache_policy.as_ref())
+                .and_then(|policy| policy.read_refresh_seconds(model, body));
+            cache.requested(cache_scope, at, ttl, traditional, read_refresh);
+        } else {
+            cache.clear();
+        }
+        let Some(retained_output) = retained_output else {
+            self.result.coverage.unmodeled_calls += 1;
+            self.result.excluded_unpriced_calls += 1;
+            self.result.initial_compactions += u64::from(initialized_now);
+            self.history.last_traditional_input = traditional;
+            self.history.defer_retention(
+                body,
+                &response["output"],
+                self.restored,
+                projection_fixed_tokens(body),
+            );
+            self.history
+                .observe(contract, items, native.input_tokens, at);
+            self.receipts.anchor = Some(Anchor {
+                configuration: config,
+                prefix: digest(items),
+                items: items.len(),
+                input: native.input_tokens,
+                at,
+            });
+            self.carry_edited = false;
+            self.traditional_edited = false;
+            return;
         };
         // Identical execution has one paid contribution. Only a genuinely
         // different history asks the cache/tariff forecast a hypothetical price.
@@ -554,17 +691,6 @@ impl Trajectory {
             }
         }
         self.history.last_traditional_input = traditional;
-        let cache = &mut self.receipts.modeled_cache;
-        if mode == carry::models::ScenarioCacheMode::Implicit
-            && minimum.is_some_and(|min| traditional >= min)
-        {
-            let read_refresh = resolved
-                .and_then(|r| r.scenario_cache_policy.as_ref())
-                .and_then(|policy| policy.read_refresh_seconds(model, body));
-            cache.requested(cache_scope, at, ttl, traditional, read_refresh);
-        } else {
-            cache.clear();
-        }
         self.carry_edited = false;
         self.traditional_edited = false;
         if let Some(kept) = kept {

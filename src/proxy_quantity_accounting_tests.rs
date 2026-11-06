@@ -159,6 +159,108 @@ fn neutral_accounting_request_time_held_out_receipts() {
 }
 
 #[test]
+fn rejected_native_block_never_borrows_an_older_residual() {
+    let mut m = InputMeasurements::default();
+    let base = request(vec![json!({"role":"user", "content":"base"})]);
+    observe(&mut m, &base, 1000, 1);
+    let train = reasoning("training");
+    let trained = request(vec![base["input"][0].clone(), train.clone()]);
+    let input = 2000 + crate::savings::local_text_tokens(&train);
+    observe(&mut m, &trained, input, 2);
+    let block = vec![
+        reasoning("bad-one"),
+        reasoning("bad-two"),
+        json!({"role":"user", "content":"visible floor"}),
+    ];
+    let mut canonical = trained.clone();
+    canonical["input"].as_array_mut().unwrap().extend(block);
+    observe(&mut m, &canonical, input + 1, 3);
+    let mut legacy = serde_json::to_value(&m).unwrap();
+    for block in legacy["blocks"].as_array_mut().unwrap() {
+        block.as_object_mut().unwrap().remove("allocation");
+        block.as_object_mut().unwrap().remove("allocation_rejected");
+        block.as_object_mut().unwrap().remove("opaque");
+    }
+    for mut m in [
+        m.clone(),
+        serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap(),
+        serde_json::from_value(legacy).unwrap(),
+    ] {
+        for index in [2, 3] {
+            let mut partial = canonical.clone();
+            partial["input"].as_array_mut().unwrap().remove(index);
+            assert!(
+                m.accounting_restoration(&canonical, &partial, "route", None)
+                    .is_none(),
+                "partial native budget 1 must not borrow pooled residual"
+            );
+        }
+        assert_eq!(
+            m.accounting_restoration(&canonical, &trained, "route", None)
+                .unwrap()
+                .tokens,
+            1,
+            "whole native block remains authoritative"
+        );
+        let mut restarted: InputMeasurements =
+            serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+        let mut partial = canonical.clone();
+        partial["input"].as_array_mut().unwrap().remove(2);
+        assert!(
+            restarted
+                .accounting_restoration(&canonical, &partial, "route", None)
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn visible_only_native_block_keeps_partial_local_text_attribution() {
+    let mut m = InputMeasurements::default();
+    let base = request(vec![json!({"role":"user","content":"base"})]);
+    observe(&mut m, &base, 1000, 1);
+    let one = json!({"role":"user","content":"first visible"});
+    let two = json!({"role":"user","content":"second visible"});
+    let appended = request(vec![base["input"][0].clone(), one.clone(), two.clone()]);
+    observe(&mut m, &appended, 2000, 2);
+    let partial = request(vec![base["input"][0].clone(), two]);
+    assert_eq!(
+        m.accounting_restoration(&appended, &partial, "route", None)
+            .unwrap()
+            .tokens,
+        crate::savings::local_text_tokens(&one) as i128
+    );
+}
+
+#[test]
+fn rejected_partial_quantity_never_mutates_settled_native_money() {
+    let mut m = InputMeasurements::default();
+    let base = request(vec![json!({"role":"user","content":"base"})]);
+    observe(&mut m, &base, 1000, 1);
+    let trained = request(vec![base["input"][0].clone(), reasoning("train-money")]);
+    observe(&mut m, &trained, 3000, 2);
+    let mut canonical = trained.clone();
+    canonical["input"].as_array_mut().unwrap().extend([
+        reasoning("bad-money-one"),
+        reasoning("bad-money-two"),
+        json!({"role":"user","content":"floor"}),
+    ]);
+    observe(&mut m, &canonical, 3001, 3);
+    let mut partial = canonical.clone();
+    partial["input"].as_array_mut().unwrap().remove(2);
+    let q = m.accounting_restoration(&canonical, &partial, "route", None);
+    assert!(q.is_none());
+    let mut t = crate::proxy_savings::Trajectory::default();
+    t.projected_evidence(q, true);
+    t.primary_settled(crate::proxy_savings::PrimaryObservation {body:&partial,response:&json!({"status":"completed","output":[],"usage":{"input_tokens":2900,"output_tokens":0,"input_tokens_details":{"cached_tokens":0}}}),route:"route",at:4,standard:true,resolved:None,cost:Some(0.125),measurements:Some(&m)});
+    assert_eq!(t.snapshot().observed_primary_cost, 0.125);
+    assert_eq!(t.snapshot().matched_primary_responses, 0);
+    let saved = serde_json::to_vec(&t).unwrap();
+    let restarted: crate::proxy_savings::Trajectory = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(restarted.snapshot().observed_primary_cost, 0.125);
+}
+
+#[test]
 fn neutral_accounting_never_uses_ciphertext_size_or_unknown_modality() {
     let m = InputMeasurements::default();
     let one = reasoning("one");

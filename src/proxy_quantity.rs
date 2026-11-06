@@ -67,6 +67,10 @@ struct MeasuredBlock {
     // Never persist source bodies or use ciphertext length as a weight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     allocation: Option<ResidualAllocation>,
+    // Absence of an internal allocation on an observed opaque block means
+    // unavailable attribution, not absence of native evidence.
+    #[serde(default)]
+    opaque: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -326,6 +330,7 @@ impl InputMeasurements {
                             .map(|item| item.identity.clone())
                             .collect(),
                         input: input - previous.input,
+                        opaque: items[previous_items.len()..].iter().any(|item| item.opaque),
                         allocation: self.residual_allocation(
                             &values[previous_items.len()..],
                             input - previous.input,
