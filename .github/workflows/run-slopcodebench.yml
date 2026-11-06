@@ -28,9 +28,13 @@ jobs:
     # Hosted ceiling, not a reduction to native checkpoint/response/turn limits.
     timeout-minutes: 360
     env:
-      SCB_OUTPUT: ${{ runner.temp }}/official-scb
       SCB_PYTHON: ${{ github.workspace }}/.scb-upstream/.venv/bin/python
     steps:
+      # runner context is unavailable in job-level env expressions.
+      - name: Initialize hosted output directory
+        env:
+          SCB_OUTPUT: ${{ runner.temp }}/official-scb
+        run: printf 'SCB_OUTPUT=%s\n' "$SCB_OUTPUT" >> "$GITHUB_ENV"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false

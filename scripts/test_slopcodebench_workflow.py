@@ -30,6 +30,16 @@ class WorkflowShellTests(unittest.TestCase):
             cwd=SOURCE, env={**os.environ, 'SCB_PYTHON': sys.executable, **env},
             capture_output=True, text=True, timeout=10)
 
+    def test_output_initializer_preserves_spaced_runner_path(self):
+        with tempfile.TemporaryDirectory(prefix='scb output ') as directory:
+            root = Path(directory)
+            env_file = root/'github-env'
+            output = str(root/'official-scb')
+            result = self.shell('Initialize hosted output directory',
+                                {'SCB_OUTPUT': output, 'GITHUB_ENV': str(env_file)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(env_file.read_text(), 'SCB_OUTPUT='+output+'\n')
+
     def test_budget_gate_rejects_nonfinite_unsafe_and_out_of_scope_values(self):
         for value, accepted in [('10', True), ('0.1', True), ('20', True), ('21', False),
                                 ('0', False), ('-1', False), ('nan', False), ('inf', False),
