@@ -129,6 +129,139 @@ class TrustedGatewayTests(unittest.TestCase):
                 self.assertTrue(summary['ledger_complete'])
                 self.assertEqual(summary['primary']['native_compaction_requests'], int(native))
 
+    def test_budgeted_native_compaction_preserves_bytes_reserves_and_settles(self):
+        from scripts.benchmark_budget import SpendingAuthority
+        usage = {'input_tokens': 100, 'output_tokens': 2,
+                 'input_tokens_details': {'cached_tokens': 0}}
+        checkpoint = {'type': 'compaction', 'id': 'fixture-checkpoint',
+                      'encrypted_content': CANARY + '-opaque'}
+        reply = b' {"object":"response.compaction", "model":"gpt-6-luna", "output":' + json.dumps([checkpoint]).encode() + b', "usage":' + json.dumps(usage).encode() + b'} '
+        ordinary = b' {"model":"gpt-6-luna", "input":[]} '
+        continuation = json.dumps({'model': 'gpt-6-luna', 'input': [checkpoint,
+            {'role': 'user', 'content': 'continue'}]}).encode()
+        cases = [('/v1/responses/compact', ordinary),
+                 ('/v1/responses', b' {"model":"gpt-6-luna", "input":[{"type":"compaction_trigger"}]} ')]
+        for direct in (True, False):
+            for path, body in cases:
+                with self.subTest(direct=direct, path=path), tempfile.TemporaryDirectory() as root, Provider(response_bytes=reply) as provider:
+                    state, journal = Path(root) / 'authority', Path(root) / 'journal'
+                    # Four full catalog bounds, irrespective of request/checkpoint size.
+                    SpendingAuthority.create(state, cap_usd='1.434', cloud_reserve_usd='0',
+                        cloud_bound={'evidence_kind': 'synthetic-fixture', 'rate_usd_per_hour': '0',
+                                     'maximum_seconds': 3600, 'cleanup_owner': 'owned-fixture'})
+                    owner = SpendingAuthority(state)
+                    lease = owner.reserve('native-compaction')
+                    arrivals = []
+                    original = provider.server.RequestHandlerClass.do_POST
+                    def observe_arrival(handler):
+                        arrivals.append([json.loads(line) for line in journal.read_text().splitlines()])
+                        original(handler)
+                    provider.server.RequestHandlerClass.do_POST = observe_arrival
+                    gateway = Gateway(provider.server.server_port, provider.server.server_port,
+                        direct=direct, expected_models=('gpt-6-luna', 'gpt-6.1-sol'),
+                        budget={'id': lease['id'], 'limit': lease['pico_usd'], 'journal': journal})
+                    token = 'fixture-client' if direct else 'fixture-upstream'
+                    wires = [(ordinary, '/v1/responses'), (body, path),
+                             (continuation, '/v1/responses'), (body, path)]
+                    try:
+                        for request_body, request_path in wires:
+                            status, raw = self.request_path(gateway, request_body, request_path, token)
+                            self.assertEqual(status, 200)
+                            self.assertEqual(raw, reply)
+                        self.assertEqual(self.request_path(gateway, body, path, token)[0], 402)
+                        expected_wires = wires if direct else [(raw, '/classifier') for raw, _ in wires]
+                        # The backhaul fixture maps its provider credential to this fixed sentinel path.
+                        self.assertEqual([(call['body'], call['path']) for call in provider.calls], expected_wires)
+                    finally:
+                        gateway.close()
+                    self.assertEqual(gateway.process.returncode, 0)
+                    self.assertEqual(len(arrivals), 4)
+                    completed = [event for event in gateway.events if event['event'] == 'completed']
+                    self.assertEqual([event['native_compaction'] for event in completed],
+                                     [False, True, False, True] if direct else [])
+                    for index, events in enumerate(arrivals, 1):
+                        self.assertEqual(events[-1]['event'], 'reserved')
+                        self.assertEqual(sum(event['event'] == 'reserved' for event in events), index)
+                        self.assertEqual(events[-1]['pico_usd'], '358500000000')
+                    events = [json.loads(line) for line in journal.read_text().splitlines()]
+                    self.assertEqual([event['event'] for event in events],
+                                     ['escrow'] + ['reserved', 'completed'] * 4)
+                    reservations, receipts = events[1::2], events[2::2]
+                    self.assertEqual(len({event['request_id'] for event in reservations}), 4)
+                    self.assertEqual([event['request_id'] for event in reservations],
+                                     [event['request_id'] for event in receipts])
+                    self.assertTrue(all(event['usage'] == usage for event in receipts))
+                    owner.settle(lease, journal)
+                    settled = json.loads(state.read_text())
+                    self.assertEqual(settled['settled_pico_usd'], '44000000')
+                    self.assertEqual(settled['available_pico_usd'], '1433956000000')
+                    self.assertIsNone(settled['active'])
+                    with self.assertRaisesRegex(ValueError, 'lease mismatch'):
+                        owner.settle(lease, journal)
+                    self.assertNotIn(CANARY, gateway.stdout + gateway.stderr + journal.read_text())
+
+    def test_budgeted_native_compaction_denies_insufficient_and_unsupported_before_transport(self):
+        cases = [('/v1/responses', {'input': []}),
+                 ('/v1/responses/compact', {'input': []}),
+                 ('/v1/responses', {'input': [{'type': 'compaction_trigger'}]}),
+                 ('/v1/responses', {'input': [{'type': 'compaction', 'encrypted_content': CANARY}]})]
+        invalid = [('/v1/responses/compact?extra=1', {'input': []}),
+                   ('/v1/responses/compact/extra', {'input': []}),
+                   ('/v1/responses/compact', {'input': [{'type': 'input_image', 'image_url': CANARY}]}),
+                   ('/v1/responses', {'input': [{'type': 'compaction_trigger'}, {'type': 'unknown'}]}),
+                   ('/v1/responses', {'input': [{'type': 'compaction', 'content': [{'type': 'input_audio'}]}]})]
+        for direct in (True, False):
+            with self.subTest(direct=direct), tempfile.TemporaryDirectory() as root, Provider() as provider:
+                journal = Path(root) / 'journal'
+                gateway = Gateway(provider.server.server_port, provider.server.server_port,
+                    direct=direct, expected_models=('gpt-6-luna', 'gpt-6.1-sol'),
+                    budget={'limit': '358499999999', 'journal': journal})
+                token = 'fixture-client' if direct else 'fixture-upstream'
+                try:
+                    for expected, requests in ((402, cases), (400, invalid),
+                                               (403, [('/v1/chat/completions', {'input': []})])):
+                        for path, fields in requests:
+                            with self.subTest(path=path, fields=fields):
+                                body = json.dumps({'model': 'gpt-6-luna', **fields}).encode()
+                                self.assertEqual(self.request_path(gateway, body, path, token)[0], expected)
+                finally:
+                    gateway.close()
+                self.assertFalse(provider.calls)
+                self.assertEqual([json.loads(line)['event'] for line in journal.read_text().splitlines()], ['escrow'])
+
+    def test_budgeted_native_compaction_missing_usage_freezes_without_refund(self):
+        from scripts.benchmark_budget import SpendingAuthority
+        reply = b' {"object":"response.compaction", "output":[]} '
+        cases = [('/v1/responses/compact', []),
+                 ('/v1/responses', [{'type': 'compaction_trigger'}])]
+        for path, items in cases:
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as root, Provider(response_bytes=reply) as provider:
+                state, journal = Path(root) / 'authority', Path(root) / 'journal'
+                SpendingAuthority.create(state, cap_usd='0.717', cloud_reserve_usd='0',
+                    cloud_bound={'evidence_kind': 'synthetic-fixture', 'rate_usd_per_hour': '0',
+                                 'maximum_seconds': 3600, 'cleanup_owner': 'owned-fixture'})
+                owner = SpendingAuthority(state)
+                lease = owner.reserve('native-compaction-missing-usage')
+                gateway = Gateway(provider.server.server_port, provider.server.server_port,
+                    direct=True, expected_models=('gpt-6-luna', 'gpt-6.1-sol'),
+                    budget={'id': lease['id'], 'limit': lease['pico_usd'], 'journal': journal})
+                body = json.dumps({'model': 'gpt-6-luna', 'input': items}).encode()
+                try:
+                    self.assertEqual(self.request_path(gateway, body, path), (200, reply))
+                    self.assertEqual(self.request_path(gateway, body, path)[0], 402)
+                finally:
+                    gateway.close()
+                self.assertEqual(len(provider.calls), 1)
+                events = [json.loads(line) for line in journal.read_text().splitlines()]
+                self.assertEqual([event['event'] for event in events], ['escrow', 'reserved', 'censored'])
+                self.assertEqual(events[1]['pico_usd'], '358500000000')
+                with self.assertRaisesRegex(ValueError, 'unknown or incomplete paid attempt'):
+                    owner.settle(lease, journal)
+                unsettled = json.loads(state.read_text())
+                self.assertEqual(unsettled['active'], lease)
+                self.assertEqual(unsettled['available_pico_usd'], '0')
+                self.assertEqual(unsettled['settled_pico_usd'], '0')
+
     def test_tool_telemetry_counts_custom_calls_and_completed_stream_items(self):
         items = [{'type': 'function_call', 'call_id': 'function-a', 'arguments': CANARY},
                  {'type': 'custom_tool_call', 'call_id': 'custom-a', 'input': CANARY}]

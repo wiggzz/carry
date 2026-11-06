@@ -201,7 +201,8 @@ function textOnlyInput(value) {
   if (Array.isArray(value)) return value.every(textOnlyInput);
   if (!isObject(value)) return false;
   const types = new Set(['message', 'input_text', 'output_text', 'reasoning', 'summary_text',
-    'function_call', 'function_call_output', 'custom_tool_call', 'custom_tool_call_output']);
+    'function_call', 'function_call_output', 'custom_tool_call', 'custom_tool_call_output',
+    'compaction_trigger', 'compaction']);
   if (value.type != null && !types.has(value.type)) return false;
   return ['content', 'summary', 'output'].every(key => !Object.hasOwn(value, key) || textOnlyInput(value[key]));
 }
@@ -432,7 +433,7 @@ function serve(options = {}) {
         }
         serviceTier = telemetryTier(value.service_tier);
         if (escrow && !throughCarry) {
-          if (parsed.pathname !== '/v1/responses' || parsed.search ||
+          if (!['/v1/responses', '/v1/responses/compact'].includes(parsed.pathname) || parsed.search ||
               ![null, 'default', 'standard'].includes(serviceTier) ||
               value.background === true || value.modalities != null || value.audio != null ||
               value.previous_response_id != null || value.conversation != null ||
