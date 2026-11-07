@@ -181,6 +181,170 @@ class HistoricalSuccessPrefix(unittest.TestCase):
                     self.assertEqual(probe.saved()['primary'], original['primary'])
                     self.assertEqual(probe.saved()['shadow'], original['shadow'])
 
+    def test_bounded_rollover_preserves_forwarding_and_restart_not_comparison(self):
+        for bound in ('observations', 'references'):
+            for keep_seed in (True, False):
+                case = f'{bound}-seed-{keep_seed}'
+                with self.subTest(case=case):
+                    state = self.state / case
+                    state.mkdir()
+                    fixture = self.fixture(lambda _b, n: (200, support.completed(
+                        response_id=f'rollover-{n}', input_tokens=1000)))
+                    options = ['--review-every-requests', '100',
+                               '--review-min-primary-tokens', '1000000',
+                               '--primary-context-tokens', '1000000']
+                    history = [{'role': 'user', 'content': 'bounded prefix continuity'}]
+                    proxy = IndexedProxy(state, fixture, options)
+                    self.stack.callback(proxy.close)
+                    self.assertEqual(proxy.send(history)[0], 200)
+                    original = proxy.saved()
+                    estimate = copy.deepcopy(proxy.request('GET', '/carry/dashboard/stats')[1]
+                                             ['sessions'][0]['cost_estimate'])
+                    estimate['priced'] = True
+                    estimate.setdefault('quantity_policy_version', None)
+                    for key in ('whole_window', 'quantity_evidence', 'counterfactual_basis',
+                                'in_flight_costs_excluded'):
+                        estimate.pop(key, None)
+                    for key in ('observed_reviewer_cost', 'legacy_quantity_segment',
+                                'legacy_initialization_segment', 'legacy_cache_policy_segment',
+                                'cache_policy_boundaries'):
+                        if estimate.get(key) is None or estimate.get(key) == []:
+                            estimate.pop(key, None)
+                    proxy.close()
+                    checkpoint = next(state.glob('*.json'))
+                    owner = checkpoint.stem
+                    index_path = state / 'history.index'
+                    index = json.loads(index_path.read_text())
+                    prefix = dict(source_sha256='a' * 64, owner=owner,
+                                  history_namespace=original['history_namespace'],
+                                  primary_attempts=1, reviewer_attempts=0, estimate=estimate)
+                    seed_path = state / 'historical-success.seed'
+                    seed_path.write_text(json.dumps(dict(
+                        format='carry-historical-success-seed-v1', prefixes=[prefix])))
+                    imported = copy.deepcopy(original)
+                    imported['request_evidence']['observations'] = []
+                    imported['request_evidence']['prior_untracked'] = 1
+
+                    def stage(saved):
+                        checkpoint.write_text(json.dumps(saved))
+                        index['snapshots'][owner] = copy.deepcopy(saved)
+                        index_path.write_text(json.dumps(index))
+
+                    stage(imported)
+                    # First bind is exact and the proof is persisted by a REAL
+                    # request, before any synthetic saturation is constructed.
+                    with IndexedProxy(state, fixture, options) as proxy:
+                        seeded = proxy.request('GET', '/carry/dashboard/stats')[1]
+                        self.assertIsInstance(seeded['cost_estimate']['whole_window'], dict)
+                        self.assertEqual(proxy.send(history)[0], 200)
+                        bound_state = proxy.saved()
+                    self.assertEqual(bound_state['request_evidence']['historical_success_prefix'], prefix)
+                    saturated = copy.deepcopy(bound_state)
+                    if bound == 'observations':
+                        # Stopped SYNTHETIC suffix at documented 4096 bound,
+                        # not 4096 executed HTTP requests. Counts/paid receipts
+                        # are reconciled; the next real append crosses the cap.
+                        suffix_count = 4096
+                        observations = [{'Unmodeled': {'cost': original['primary']['cost_usd']}}
+                                        for _ in range(suffix_count)]
+                    else:
+                        suffix_count = 1
+                        observation = copy.deepcopy(bound_state['request_evidence']['observations'][0])
+                        facts = observation['Primary']['facts']
+                        facts['reused_input'] = 0
+                        facts['input'] = ['f' * 64] * 32768
+                        facts['semantic_input'] = ['f' * 64] * 32768
+                        facts['semantic_output'] = []
+                        observations = [observation]  # exactly 65536 stored references
+                    saturated['request_evidence']['observations'] = observations
+                    saturated['completed_requests'] = 1 + suffix_count
+                    # Scale only the synthetic native ledger, never an oracle
+                    # copied from the candidate's later result.
+                    def scale(value, factor):
+                        if isinstance(value, dict):
+                            return {k: scale(v, factor) for k, v in value.items()}
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            return value * factor
+                        return value
+                    saturated['primary'] = scale(original['primary'], 1 + suffix_count)
+                    stage(saturated)
+                    if not keep_seed:
+                        seed_path.unlink()
+                    before_hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                                     for p in (checkpoint, index_path)}
+                    record = self.evidence[case] = dict(
+                        staging='stopped synthetic saturated suffix; not thousands of requests',
+                        suffix_count=suffix_count, before_hashes=before_hashes,
+                        prefix=prefix, before_primary=saturated['primary'], statuses=[])
+                    with IndexedProxy(state, fixture, options) as proxy:
+                        before = proxy.request('GET', '/carry/dashboard/stats')[1]
+                        self.assertIsInstance(before['cost_estimate']['whole_window'], dict)
+                        self.assertEqual(before_hashes, {
+                            p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                            for p in (checkpoint, index_path)})
+                        for _ in range(2):
+                            status, response = proxy.send(history)
+                            record['statuses'].append(dict(status=status, response=response,
+                                                           upstream_calls=len(fixture.primaries)))
+                        saved = proxy.saved()
+                        record['after_primary'] = saved['primary']
+                        record['after_evidence'] = saved['request_evidence']
+                        record['after_stats'] = proxy.request('GET', '/carry/dashboard/stats')[1]
+                    # Remove the seed as well for the removed-seed arm; no
+                    # in-process cache can hide a persisted-loader failure.
+                    with IndexedProxy(state, fixture, options) as proxy:
+                        record['restart_stats'] = proxy.request('GET', '/carry/dashboard/stats')[1]
+                        status, response = proxy.send(history)
+                        record['statuses'].append(dict(status=status, response=response,
+                                                       upstream_calls=len(fixture.primaries)))
+                        final = proxy.saved()
+                        record['final_primary'] = final['primary']
+                        record['final_evidence'] = final['request_evidence']
+                        final_index = json.loads(index_path.read_text())
+                    record['wires'] = fixture.primaries
+                    # First finish all reachable accounting/authority controls,
+                    # then grade NEXT request and real-process restart liveness.
+                    successful_appends = sum(r['status'] == 200 for r in record['statuses'])
+                    self.assertEqual(len(fixture.primaries), 2 + successful_appends)
+                    self.assertEqual(fixture.reviews, [])
+                    self.assertTrue(all(w['input'] == history for w in fixture.primaries))
+                    self.assertEqual(final['completed_requests'], 1 + suffix_count + successful_appends)
+                    self.assertEqual(final['primary']['calls'], 1 + suffix_count + successful_appends)
+                    expected_primary = scale(original['primary'], 1 + suffix_count + successful_appends)
+                    actual_primary = copy.deepcopy(final['primary'])
+                    self.assertAlmostEqual(actual_primary.pop('cost_usd'),
+                                           expected_primary.pop('cost_usd'), places=10)
+                    self.assertEqual(actual_primary, expected_primary,
+                                     'all native paid/cache/token counters must continue exactly')
+                    self.assertEqual(final['shadow'], original['shadow'])
+                    self.assertEqual(final['history_namespace'], original['history_namespace'])
+                    self.assertEqual(set(final_index['snapshots']), {owner})
+                    self.assertEqual(final_index['snapshots'][owner]['primary'], final['primary'])
+                    for key in ('history', 'history_frontier', 'compaction_count'):
+                        self.assertEqual(final.get(key), bound_state.get(key), key)
+                    before_input = copy.deepcopy(bound_state['primary_input'])
+                    after_input = copy.deepcopy(final['primary_input'])
+                    self.assertGreaterEqual(after_input['anchor'].pop('at'),
+                                            before_input['anchor'].pop('at'))
+                    self.assertEqual(after_input, before_input,
+                                     'native quantity/history must continue without initialization')
+                    for dashboard in (record['after_stats'], record['restart_stats']):
+                        self.assertIsNone(dashboard['cost_estimate']['whole_window'])
+                    record['accounting_authority_controls_complete'] = True
+                    self.assertEqual([r['status'] for r in record['statuses']], [200, 200, 200],
+                                     'normal retention must not turn optional proof into load/HTTP failure')
+                    for dashboard in (record['after_stats'], record['restart_stats']):
+                        self.assertEqual(len(dashboard['sessions']), 1)
+                        row = dashboard['sessions'][0]['cost_estimate']
+                        self.assertIsNone(row['whole_window'])
+                        self.assertEqual(row['coverage']['prior_untracked_calls'], 1 + suffix_count)
+                        self.assertEqual(row['coverage']['primary_responses'], 2)
+                        self.assertAlmostEqual(row['observed_primary_cost'],
+                                               2 * original['primary']['cost_usd'], places=12,
+                                               msg='partial proof must not price newly lost successes')
+                    self.assertEqual(final['request_evidence']['historical_success_prefix'], prefix)
+                    self.assertEqual(final['request_evidence']['prior_untracked'], 1 + suffix_count)
+
 
 if __name__ == '__main__':
     unittest.main()
