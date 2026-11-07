@@ -1,4 +1,5 @@
 //! Synthetic receipts: the wire body deliberately does not predict provider units.
+use super::Replay as Trajectory;
 use super::*;
 include!("proxy_cache_write_tests.rs");
 include!("primary_parity_tests.rs");
@@ -6,6 +7,50 @@ include!("modeled_refresh_tests.rs");
 include!("legacy_history_tests.rs");
 include!("proxy_unknown_price_history_tests.rs");
 include!("semantic_prompt_tests.rs");
+include!("proxy_calibrated_history_tests.rs");
+
+#[test]
+fn opaque_receipt_history_keeps_paid_summary_progression_across_restart() {
+    let mut t = Trajectory {
+        scenario: Scenario {
+            context_window: 4000,
+            reserve: 100,
+            keep_recent: 1500,
+            summary: 100,
+        },
+        ..Trajectory::default()
+    };
+    let mut request = body();
+    request["max_output_tokens"] = json!(1);
+    request["input"].as_array_mut().unwrap().push(json!({"type":"reasoning", "id":"opaque", "encrypted_content":"not-token-units", "summary":[]}));
+    for (i, input) in [1000, 5000, 5100].into_iter().enumerate() {
+        if i > 0 {
+            request["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user", "content":format!("append {i}")}));
+        }
+        t.primary(
+            &request,
+            &terminal(input, 0, 0, 0),
+            "route",
+            100 + i as u64,
+            true,
+        );
+        t = serde_json::from_value(state(&t)).unwrap();
+    }
+    let result = t.snapshot();
+    assert_eq!(result.coverage.primary_responses, 3);
+    assert!(result.observed_primary_cost.unwrap() > 0.0);
+    assert_eq!(
+        result.matched_primary_responses, 3,
+        "opaque receipt totals must advance the existing continuous history"
+    );
+    assert_eq!(result.traditional_compactions, 1);
+    assert_eq!(result.initial_compactions, 0);
+    assert!(result.summary_cost > 0.0);
+    assert_eq!(t.history.last_traditional_input, 1700);
+}
 
 // Output allowance changes feasibility, not the native-input history contract.
 // Exercise both existing initialization and a real in-window paid summary.
@@ -58,8 +103,8 @@ fn output_allowance_preserves_history(initialized: bool) {
         );
         let after = t.snapshot();
         assert!(
-            (after.observed_primary_cost
-                - before.observed_primary_cost
+            (after.observed_primary_cost.unwrap()
+                - before.observed_primary_cost.unwrap()
                 - (0..=offset)
                     .map(|n| (300300 + n * 100) as f64 * 4.0 / 1e6)
                     .sum::<f64>())
@@ -124,8 +169,8 @@ fn fixed_input_role_comparison(role: &str) {
         );
         let result = t.snapshot();
         assert!(
-            (result.observed_primary_cost
-                - before.observed_primary_cost
+            (result.observed_primary_cost.unwrap()
+                - before.observed_primary_cost.unwrap()
                 - input as f64 * 2.0 / 1e6)
                 .abs()
                 < 1e-12
@@ -428,7 +473,7 @@ fn initialization186_output_trigger_cannot_compact_unallocated_image_input() {
         let mut t = Trajectory::default();
         t.primary(&request, &terminal(201000, 0, 0, 0), "route", 100, true);
         let result = t.snapshot();
-        assert!((result.observed_primary_cost - 0.402).abs() < 1e-12);
+        assert!((result.observed_primary_cost.unwrap() - 0.402).abs() < 1e-12);
         assert_eq!(result.unavailable_primary_cost_calls, 0);
         assert_eq!(result.coverage.primary_responses, 1);
         assert_eq!(
@@ -439,7 +484,9 @@ fn initialization186_output_trigger_cannot_compact_unallocated_image_input() {
         if cap == 1 {
             assert_eq!(result.coverage.unmodeled_calls, 0);
             assert_eq!(result.matched_primary_responses, 1);
-            assert!((result.traditional_cost - result.observed_primary_cost).abs() < 1e-12);
+            assert!(
+                (result.traditional_cost - result.observed_primary_cost.unwrap()).abs() < 1e-12
+            );
         } else {
             assert_eq!(result.coverage.unmodeled_calls, 1);
             assert_eq!(result.excluded_unpriced_calls, 1);
@@ -477,7 +524,7 @@ fn initialization186_resolved_hard_capacity_bounds_the_counterfactual() {
             Some(&resolved),
         );
         let result = t.snapshot();
-        assert!((result.observed_primary_cost - 0.12).abs() < 1e-12);
+        assert!((result.observed_primary_cost.unwrap() - 0.12).abs() < 1e-12);
         assert_eq!(result.unavailable_primary_cost_calls, 0);
         assert_eq!(result.summary_cost, 0.0);
         assert_eq!(result.traditional_compactions, 0);
@@ -531,14 +578,16 @@ fn initialization186_omitted_output_uses_frozen_capacity_reserve() {
             Some(&resolved),
         );
         let result = t.snapshot();
-        assert!((result.observed_primary_cost - 0.08).abs() < 1e-12);
+        assert!((result.observed_primary_cost.unwrap() - 0.08).abs() < 1e-12);
         assert_eq!(result.unavailable_primary_cost_calls, 0);
         assert_eq!(result.summary_cost, 0.0);
         assert_eq!(result.traditional_compactions, 0);
         if cap.is_some() {
             assert_eq!(result.initial_compactions, 0);
             assert_eq!(result.matched_primary_responses, 1);
-            assert!((result.traditional_cost - result.observed_primary_cost).abs() < 1e-12);
+            assert!(
+                (result.traditional_cost - result.observed_primary_cost.unwrap()).abs() < 1e-12
+            );
         } else if reserve == 16384 {
             assert_eq!(
                 result.initial_compactions, 1,
@@ -600,7 +649,7 @@ fn image_receipts_through_write_tariff_gap(breakpoint: bool) {
             matched += 1;
         }
         let snapshot = t.snapshot();
-        assert!((snapshot.observed_primary_cost - expected).abs() < 1e-12);
+        assert!((snapshot.observed_primary_cost.unwrap() - expected).abs() < 1e-12);
         assert_eq!(
             snapshot.unavailable_primary_cost_calls,
             u64::from(index > 0)
@@ -663,7 +712,7 @@ fn receipt_image_input_uses_native_totals_not_encoded_payload_length() {
             quantities.predict(&request, "route", None).unwrap().tokens,
             4000
         );
-        costs.push(first.observed_primary_cost);
+        costs.push(first.observed_primary_cost.unwrap());
         t = serde_json::from_value(state(&t)).unwrap();
         quantities = serde_json::from_value(serde_json::to_value(&quantities).unwrap()).unwrap();
         let receipt = terminal(4000, 3000, 0, 5);
@@ -682,10 +731,10 @@ fn receipt_image_input_uses_native_totals_not_encoded_payload_length() {
         // A changed multimodal projection has no measured allocation for its
         // restored image/material. Keep known expense, omit that comparison.
         t.projected_input(None, true);
-        let before = t.snapshot().observed_primary_cost;
+        let before = t.snapshot().observed_primary_cost.unwrap();
         t.primary(&request, &terminal(3000, 0, 0, 5), "route", 102, true);
         let after = t.snapshot();
-        assert!(after.observed_primary_cost > before);
+        assert!(after.observed_primary_cost.unwrap() > before);
         assert_eq!(after.unavailable_primary_cost_calls, 0);
         assert_eq!(after.matched_primary_responses, 2);
         assert_eq!(after.coverage.unmodeled_calls, 1);
@@ -713,11 +762,10 @@ fn receipt_images_do_not_invent_summary_or_audio_token_tariffs() {
         assert_eq!(result.matched_primary_responses, 0);
         assert_eq!(result.traditional_compactions, 0);
         assert_eq!(result.coverage.unmodeled_calls, 1);
-        assert_eq!(
-            result.unavailable_primary_cost_calls,
-            u64::from(kind != "input_image")
-        );
-        assert_eq!(result.observed_primary_cost > 0.0, kind == "input_image");
+        // These synthetic receipts have a known settled token price, even
+        // though their unsupported projected modality cannot be summarized.
+        assert_eq!(result.unavailable_primary_cost_calls, 0);
+        assert!(result.observed_primary_cost.unwrap() > 0.0);
     }
 }
 
@@ -729,7 +777,7 @@ fn changed_receipt_configuration_preserves_signed_current_projection_not_old_sum
         request["max_output_tokens"] = json!(1);
         t.projected(5000, (5000_i128 - difference) as u64, difference != 0);
         t.primary(&request, &terminal(3000, 0, 0, 0), "route", 100, true);
-        let paid = t.snapshot().observed_primary_cost;
+        let paid = t.snapshot().observed_primary_cost.unwrap();
         t = serde_json::from_value(state(&t)).unwrap();
         request["max_output_tokens"] = json!(2);
         t.projected(5000, (5000_i128 - difference) as u64, difference != 0);
@@ -743,7 +791,7 @@ fn changed_receipt_configuration_preserves_signed_current_projection_not_old_sum
             state(&t)["last_traditional_input"],
             json!(3000_i128 + difference)
         );
-        assert!(t.snapshot().observed_primary_cost > paid);
+        assert!(t.snapshot().observed_primary_cost.unwrap() > paid);
         assert_eq!(t.snapshot().matched_primary_responses, 2);
     }
 }
@@ -798,7 +846,7 @@ fn receipt_current_projection_repeats_changes_and_retains_without_accumulation()
     }
     assert_eq!(projected.snapshot().coverage.primary_responses, 6);
     assert_eq!(projected.snapshot().matched_primary_responses, 6);
-    assert!(projected.snapshot().observed_primary_cost > 0.0);
+    assert!(projected.snapshot().observed_primary_cost.unwrap() > 0.0);
 }
 
 #[test]
@@ -909,8 +957,8 @@ fn receipt_opaque_output_sizes_do_not_retire_native_input_after_replay_and_resta
         assert_eq!(state(&t)["last_traditional_input"], 2100);
         assert_eq!(t.snapshot().traditional_compactions, 0);
         assert_eq!(
-            t.snapshot().observed_primary_cost,
-            control.snapshot().observed_primary_cost
+            t.snapshot().observed_primary_cost.unwrap(),
+            control.snapshot().observed_primary_cost.unwrap()
         );
         assert_eq!(t.snapshot().carry_cost, control.snapshot().carry_cost);
         assert_eq!(
@@ -943,7 +991,7 @@ fn receipt_visible_output_semantics_still_trigger_conventional_summary() {
         t.primary(&body(), &response, "route", 100, true);
         assert_eq!(t.snapshot().traditional_compactions, 1);
         assert!(t.snapshot().summary_cost > 0.0);
-        assert!(t.snapshot().observed_primary_cost > 0.0);
+        assert!(t.snapshot().observed_primary_cost.unwrap() > 0.0);
     }
 }
 
@@ -954,7 +1002,7 @@ fn receipt_unknown_retained_output_does_not_invent_a_context_measurement() {
     response["output"] = json!([{"type":"unmodeled_native_output","payload":"opaque"}]);
     t.primary(&body(), &response, "route", 100, true);
     assert!(
-        t.snapshot().observed_primary_cost > 0.0,
+        t.snapshot().observed_primary_cost.unwrap() > 0.0,
         "paid receipt remains priced independently of retention"
     );
     assert_eq!(t.snapshot().matched_primary_responses, 0);
@@ -990,7 +1038,7 @@ fn receipt_restoration_selects_each_branch_tariff_without_repricing_actuals() {
         "estimated restoration crosses the traditional tariff threshold only"
     );
     assert!((after.carry_cost - 2.0 * before.carry_cost).abs() < 1e-12);
-    assert_eq!(after.observed_primary_cost, after.carry_cost);
+    assert_eq!(after.observed_primary_cost.unwrap(), after.carry_cost);
     assert!(state(&t)["receipts"]["last_appended_input"].is_null());
     // The new request's complete projection survives a receipt-config reset;
     // only historical anchors/summary assumptions belong to the old epoch.
@@ -1195,8 +1243,8 @@ fn receipt_subscription_traditional_cache_uses_model_policy_not_transport_capabi
             resolved.cache, route_cache,
             "scenario policy is not a route entitlement"
         );
-        assert!((warm.observed_primary_cost - 0.0044).abs() < 1e-12);
-        assert_eq!(warm.carry_cost, warm.observed_primary_cost);
+        assert!((warm.observed_primary_cost.unwrap() - 0.0044).abs() < 1e-12);
+        assert_eq!(warm.carry_cost, warm.observed_primary_cost.unwrap());
     }
 }
 
@@ -1730,8 +1778,11 @@ fn receipt_unmodeled_actuals_are_unknown_and_coverage_reconciles() {
     assert_eq!(public["unavailable_reviewer_cost_calls"], 1);
     assert_eq!(public["excluded_unpriced_calls"], 2);
     assert!(public["observed_reviewer_cost"].is_null());
-    assert!(t.snapshot().observed_primary_cost > known.observed_primary_cost);
-    assert_eq!(t.snapshot().observed_primary_cost, t.snapshot().carry_cost);
+    assert!(t.snapshot().observed_primary_cost.unwrap() > known.observed_primary_cost.unwrap());
+    assert_eq!(
+        t.snapshot().observed_primary_cost.unwrap(),
+        t.snapshot().carry_cost
+    );
     let mut totals = DashboardTotals::default();
     totals.observe(&t.snapshot().dashboard(false));
     let aggregate = serde_json::to_value(totals).unwrap();
@@ -1758,7 +1809,7 @@ fn receipt_same_prompt_usage_drift_does_not_invent_an_appended_block() {
 #[test]
 fn receipt_unknown_actuals_are_null_and_persistence_declares_its_version() {
     let mut t = Trajectory::default();
-    t.unmodeled_call();
+    t.unmodeled_call(None);
     let public = serde_json::to_value(t.snapshot().dashboard(false)).unwrap();
     assert!(public["observed_primary_cost"].is_null());
     assert_eq!(public["unavailable_primary_cost_calls"], 1);
@@ -1983,10 +2034,13 @@ fn receipt_priced_subset_recovers_into_paid_summary_after_unknown_quantities() {
     assert_eq!(summary.initial_compactions, 0);
     assert_eq!(summary.traditional_compactions, 1);
     assert!(summary.summary_cost > 0.0);
-    assert!((summary.observed_primary_cost - (4800.0 * 2.0 + 1000.0 * 10.0) / 1e6).abs() < 1e-12);
+    assert!(
+        (summary.observed_primary_cost.unwrap() - (4800.0 * 2.0 + 1000.0 * 10.0) / 1e6).abs()
+            < 1e-12
+    );
     assert_eq!(
-        summary.observed_reviewer_cost,
-        before.observed_reviewer_cost
+        summary.observed_reviewer_cost.unwrap(),
+        before.observed_reviewer_cost.unwrap()
     );
     assert_eq!(t.history.last_traditional_input, 1600);
     let next_native = t.history.retired + 1700 - t.history.summary;
@@ -2052,7 +2106,7 @@ fn unknown_restoration_preserves_expense_without_inventing_a_comparison() {
     t.projected_input(None, true);
     t.primary(&body(), &terminal(4000, 3000, 0, 5), "route", 100, true);
     let measured = t.snapshot();
-    assert!(measured.observed_primary_cost > 0.0);
+    assert!(measured.observed_primary_cost.unwrap() > 0.0);
     assert_eq!(measured.unavailable_primary_cost_calls, 0);
     assert_eq!(
         measured.matched_primary_responses, 0,

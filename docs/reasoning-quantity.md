@@ -1,84 +1,86 @@
-# Receipt-anchored encrypted-reasoning forecasts
+# Receipt-anchored quantities and cost comparisons
 
-The request-time proxy planner can estimate removal of native encrypted
-`reasoning` items without treating ciphertext as model text. This is a
-**economic selection forecast**, not a capacity proof, provider measurement or savings receipt.
-The report basis is `receipt_anchored_reasoning_forecast`; its retained token
-quantity is the conservative decision quantity, not the fitted mean.
+Carry uses provider receipts to estimate context quantities and compare its cost
+with a traditional compaction harness. Estimated quantities are not native
+measurements, capacity proofs, cache receipts or removal authorization. The
+comparison is a counterfactual point estimate, not demonstrated causal savings.
 
-## Sizing order
+## One quantity owner
 
-- An exact compatible receipt for the target wins, including an unchanged prompt.
-- Removing or restoring an entire measured native append block uses its recorded
-  input delta, including blocks containing other opaque modalities.
-- For part of a reasoning-containing measured block, relative item weights are
-  normalized to that block's actual native total. Individual members are still
-  estimated, not measured.
-- For older history without measured append blocks, a compatible whole-prompt
-  receipt supplies a residual budget. Fixed instructions/tools/framing, fixed
-  system/developer messages and disjoint complete measured blocks are accounted
-  for first. The residual is allocated across **all** unresolved visible and
-  reasoning items, not assigned entirely to reasoning. The whole-prompt receipt
-  is never inserted into the additive message-block collection.
+`InputMeasurements` owns the shared quantity rules used by planning and
+traditional accounting. Exact compatible receipts and complete measured append
+blocks take precedence. A whole measured block keeps its native quantity even
+when individual members cannot be attributed.
 
-Relative weights use `0.9432105075 * visible_o200k_JSON_tokens +
-0.0432732920 * encrypted_reasoning_characters`. Visible JSON is sanitized by the
-ordinary local quantity owner; encrypted bytes are not fed to the tokenizer.
-These exploratory coefficients describe mixed native append blocks, not isolated
-reasoning-token truth. They do not establish universal error bounds, independent
-workload accuracy or another model's tokenizer contract.
+For a supported reasoning-containing block, subtract additive visible-item
+quantities, including visible framing, from its native input increment. Divide
+the remaining budget equally among the reasoning members, assigning integer
+remainders in source order. Member allocations conserve that block's native
+budget, but remain estimates of individual sizes. Encrypted length and billed
+output-reasoning tokens are not token-conversion rules.
 
-## Conservative selection
+A complete inherited native prefix can supply another residual cohort after
+fixed/protected overhead and complete measured blocks are accounted for. It is
+not inserted as an additive append block. Compatible residual cohorts can
+calibrate otherwise unmeasured supported reasoning. This is an explicit
+exchangeability assumption, not evidence that every reasoning item has the same
+native size. A known block with an invalid or unrecoverable internal allocation
+cannot borrow another block's residual to price a partial edit.
 
-Every candidate starts from the same available native-anchored source quantity.
-Only changed items contribute a delta, so unchanged-context estimation errors
-cancel. Exact native block deltas remain exact. Estimated removals receive half
-of their allocated quantity as credit; estimated additions (including replacement
-text) are charged twice their allocation. Integer division rounds removal credit
-down and addition charges up. These margins are policy choices, **not guaranteed
-confidence bounds derived from sample maxima**.
+Planning and accounting use these same neutral quantities. There are no separate
+ciphertext-length coefficients or half-credit/double-charge member weights.
+Current pricing, payback requirements and authorization still apply. Whole tool
+cohorts and user protection remain independent constraints; a useful estimate
+does not make a protected or unreviewed item removable.
 
-The existing price owner applies input tiers, current scoped cache receipts,
-output allowances, scheduled reviewer costs and strict payback requirements.
-Future requests for a reasoning forecast are charged uncached: a heuristic
-quantity does not prove a future whole-input cache write. A nonpositive ordinary
-conservative payoff keeps context. Heuristic quantities do not establish either
-fit or overflow, cannot force a rewrite and cannot prove a capacity-rescue
-candidate fits. Ordinary unknown-size forwarding remains provider-enforced.
+## Evidence and unknowns
 
-## Evidence boundaries and continuation
+Route, model/resolved contract and relevant prompt settings must match. Missing
+evidence, unsupported opaque modalities, ambiguous identities, inconsistent
+budgets and arithmetic overflow remain unknown. Conflicting native receipts
+disable heuristic calibration for that contract, including across restart.
+Estimates do not become native cache extents or establish that a candidate fits
+or overflows the provider's context window.
 
-Route, model/resolved contract and prompt settings must match. Missing evidence,
-unknown changed image/audio/file/compaction items, unsupported reasoning shapes,
-ambiguous identities, inconsistent budgets and checked arithmetic overflow remain
-unknown. An unmeasured unknown modality cannot donate residual tokens to adjacent
-reasoning. Conflicting native totals for the same prompt (or a decreasing count
-on an exact append) disable heuristic calibration for that quantity contract,
-including across restart. The latest actual receipt is still retained. A new
-quantity contract starts fresh; there is no guessed count to repair a conflict.
+## Request facts, then stats-time replay
 
-After a filtered request gets its own actual receipt, the surviving unresolved
-pool can be calibrated against that receipt, including after current-format
-checkpoint reload and ordinary visible append. An incomplete older block is not
-reused as though its entire native total belonged to its surviving members.
-Restoring previously omitted **unmeasured** opaque items remains unsupported.
-An exact compatible receipt prefix followed only by ordinary visible items and
-supported new native reasoning has a separate `forecast_estimate`: keep the
-receipt total, then double-charge the new suffix's empirical weights, rounded up.
-It does not tokenize ciphertext or claim a measured source total. An unchanged
-replay after settlement still takes its actual receipt first. This forecast
-baseline allows authorized old-history edits to be compared while a newly emitted
-reasoning item is awaiting its first input receipt; it does not make that item
-removable. Other new opaque modalities, edited/reordered prefixes, duplicate
-opaque identities and changed contracts stay unknown. A canonical restoration
-alternative may remain unknown while a reauthorized continuation is sizeable.
-No saved omission grants permission: current user protection, atomic cohorts and
-reviewer authorization are always rechecked.
+`RequestEvidence` persists bounded request facts: numeric usage and quantities,
+frozen settled money, contracts, dispatch information and content-hash references.
+It does not persist prompt/response bodies or a second ledger of hypothetical
+cost totals. Reviewer usage passes through the same numeric projection for
+background and synchronous review paths.
 
-`predict`, `estimate`, `known_estimate` and `restoration` do not return these
-heuristic allocations. In particular, canonical receipt reconstruction may
-remain unavailable after an estimated edit; actual paid usage is preserved
-without inventing comparative savings. Forecasts are not serialized as
-`ProviderReceipt`, `MeasuredBlock` or native cache extents. Only existing numeric
-receipt/identity state and the conflict flag persist. Dashboard polling remains
-count-only and does not initiate full-history BPE.
+When stats are requested, replay those facts through the existing traditional
+history transition engine. That engine owns retirement, summaries, continuity
+and cache behavior; the dashboard does not maintain a competing trajectory.
+Current-format restart preserves evidence and its explicit limitations. Unknown
+restoration or retained-output transitions cannot grant free reinitialization or
+silently reconstruct missing historical summary/cache events.
+
+## Compare the same successful population
+
+Exclude failed terminal calls from both sides of the comparison. Preserve their
+actual paid expense in the separate all-attempt spending ledger. Successful
+primary and reviewer costs come from successful settlement evidence, not by
+subtracting guessed failed costs from all-attempt totals. Charge included
+reviewer expense once.
+
+The whole-window point estimate extends the directly modeled traditional cost
+to included successful primary expense lacking a usable quantity attribution.
+Where a usable matched reference exists, apply its traditional-to-primary expense
+ratio to that omitted primary expense. Otherwise disclose the weak assumption of
+primary-expense parity net of hypothetical compaction/cache. These assumptions
+do not reconstruct historical quantities or prove cache hits.
+
+Calculate net benefit against included successful primary plus reviewer expense.
+Aggregate comparable session amounts before calculating percentages. Keep strict
+measured/estimated/unavailable quantity coverage separate from inferred expense
+coverage. Missing successful-money evidence, unreadable windows and inconsistent
+populations leave the relevant comparison unavailable. Legacy all-attempt ledgers
+cannot fill those gaps; upgrading does not invent facts for old requests.
+
+The alternative assumes the same outputs and tool sequence. Reference-dependent
+imputation may change as evidence grows, but original paid receipts are never
+repriced. Unit controls and real-binary HTTP/restart fixtures verify accounting,
+privacy and continuity behavior; they do not establish predictive accuracy on
+private workloads, statistical confidence bounds or real-provider causal savings.

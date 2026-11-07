@@ -10,7 +10,7 @@ fn cache_write191_dispatch_frozen_lifetime_censors_only_new_written_receipts() {
         write: 2.5,
         output: 10.0,
     });
-    before.cost_trajectory = Some(crate::proxy_savings::Trajectory::default());
+    before.request_evidence = Some(crate::proxy_savings::RequestEvidence::default());
     let mut current = before.clone();
     let reviewed = before.clone();
     let mut expected = 0.0;
@@ -51,8 +51,8 @@ fn cache_write191_dispatch_frozen_lifetime_censors_only_new_written_receipts() {
         assert_eq!(current.shadow.calls, index as u64 + 1);
         assert_eq!(current.shadow.unavailable_cost_calls, u64::from(index > 0));
         assert!((current.shadow.cost_usd - expected).abs() < 1e-12);
-        let estimate = current.cost_trajectory.as_ref().unwrap().snapshot();
-        assert!((estimate.observed_reviewer_cost - expected).abs() < 1e-12);
+        let estimate = current.request_evidence.as_ref().unwrap().snapshot();
+        assert!((estimate.observed_reviewer_cost.unwrap() - expected).abs() < 1e-12);
         assert_eq!(
             estimate.unavailable_reviewer_cost_calls,
             u64::from(index > 0)
@@ -75,7 +75,7 @@ fn joined191192_unpriced_write_settlement_keeps_independent_cache_observations()
         write: 2.5,
         output: 10.0,
     });
-    before.cost_trajectory = Some(crate::proxy_savings::Trajectory::default());
+    before.request_evidence = Some(crate::proxy_savings::RequestEvidence::default());
     let mut current = before.clone();
     let reviewed = before.clone();
     for (index, written) in [1900, 0].into_iter().enumerate() {
@@ -110,9 +110,9 @@ fn joined191192_unpriced_write_settlement_keeps_independent_cache_observations()
         assert_eq!(current.shadow.cache_observation.input_tokens, calls * 2000);
         assert_eq!(current.shadow.cache_observation.cached_tokens, calls * 100);
         assert_eq!(current.shadow.cost_usd > 0.0, written == 0);
-        let estimate = current.cost_trajectory.as_ref().unwrap().snapshot();
+        let estimate = current.request_evidence.as_ref().unwrap().snapshot();
         assert_eq!(estimate.unavailable_reviewer_cost_calls, 1);
-        assert!((estimate.observed_reviewer_cost - current.shadow.cost_usd).abs() < 1e-12);
+        assert!((estimate.observed_reviewer_cost.unwrap() - current.shadow.cost_usd).abs() < 1e-12);
         current = serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
         assert_eq!(current.shadow.cache_observation.calls, calls);
         assert_eq!(current.shadow.cache_observation.input_tokens, calls * 2000);
@@ -166,7 +166,7 @@ fn stale_background_receipts_keep_the_dispatched_frozen_tariff_not_current_slug_
         write: 9.0,
         output: 21.0,
     });
-    before.cost_trajectory = Some(crate::proxy_savings::Trajectory::default());
+    before.request_evidence = Some(crate::proxy_savings::RequestEvidence::default());
     before.model_resolution.as_mut().unwrap().reviewer.rates = Some(Rates {
         input: 11.0,
         cached: 0.1,
@@ -197,7 +197,7 @@ fn stale_background_receipts_keep_the_dispatched_frozen_tariff_not_current_slug_
     // dispatch-frozen contract, not projected bytes or the newer missing price.
     assert!(
         (current
-            .cost_trajectory
+            .request_evidence
             .as_ref()
             .unwrap()
             .snapshot()
@@ -219,9 +219,9 @@ fn receipt_prediction_uses_measured_prefix_and_preserves_output_reservation() {
     let mut config = config;
     config.model_resolution = session.model_resolution.clone();
     let wire = primary_wire_body(&config, &main);
-    let mut trajectory = crate::proxy_savings::Trajectory::default();
+    let mut trajectory = crate::proxy_savings::RequestEvidence::default();
     trajectory.primary_resolved(&wire, &json!({"status":"completed","output":[],"usage":{"input_tokens":20000,"output_tokens":0,"input_tokens_details":{"cached_tokens":0}}}), &config.upstream_url, now(), true, config.model_resolution.as_ref().map(|p| &p.primary));
-    session.cost_trajectory = Some(trajectory);
+    session.request_evidence = Some(trajectory);
     session.primary_input.observe(
         &wire,
         &json!({"input_tokens":20000}),

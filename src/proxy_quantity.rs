@@ -29,6 +29,13 @@ pub(crate) struct InputEstimate {
     pub basis: EstimateBasis,
 }
 
+impl InputEstimate {
+    /// Economic allocation is never hard capacity or native cache-population proof.
+    pub(crate) fn capacity_tokens(self) -> Option<u64> {
+        (self.basis != EstimateBasis::ReceiptAnchoredReasoningForecast).then_some(self.tokens)
+    }
+}
+
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub(crate) struct InputMeasurements {
     contract: String,
@@ -63,6 +70,29 @@ struct Anchor {
 struct MeasuredBlock {
     items: Vec<String>,
     input: u64,
+    // A joint native increment is measured; its internal allocation is not.
+    // Never persist source bodies or use ciphertext length as a weight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allocation: Option<ResidualAllocation>,
+    // Absence of an internal allocation on an observed opaque block means
+    // unavailable attribution, not absence of native evidence.
+    #[serde(default)]
+    opaque: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ResidualAllocation {
+    tokens: Vec<u64>,
+    residual: u64,
+    opaque_items: u64,
+}
+
+/// A point estimate, not a capacity proof, native receipt or confidence bound.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub(crate) struct RestorationEstimate {
+    pub tokens: i128,
+    pub measured: bool,
+    pub estimated_opaque_items: u64,
 }
 
 fn identity(value: &impl Serialize) -> String {
@@ -176,46 +206,6 @@ fn changes<'a>(from: &'a [Item], to: &'a [Item]) -> Option<(Vec<&'a Item>, Vec<&
     Some((removed, added))
 }
 
-// Only the native top-level encrypted reasoning envelope is eligible. Neither
-// other opaque modalities nor nested/unknown payloads gain a conversion rule.
-fn reasoning_chars(value: &Value) -> Option<u64> {
-    if value["type"] != "reasoning" {
-        return None;
-    }
-    let mut visible = value.clone();
-    let chars = u64::try_from(
-        visible
-            .as_object_mut()?
-            .remove("encrypted_content")?
-            .as_str()?
-            .chars()
-            .count(),
-    )
-    .ok()?;
-    if chars == 0 || crate::savings::prompt_has_opaque(&visible) {
-        return None;
-    }
-    Some(chars)
-}
-
-// Integer-only arithmetic makes nonfinite conversion impossible; checked
-// operations reject impossible budgets/overflow rather than saturating counts.
-fn allocated_forecast(budget: u64, selected: u128, sum: u128, removal: bool) -> Option<u64> {
-    if sum == 0 || selected > sum {
-        return None;
-    }
-    let numerator = (budget as u128).checked_mul(selected)?;
-    let tokens = if removal {
-        numerator.checked_div(sum.checked_mul(2)?)?
-    } else {
-        numerator
-            .checked_mul(2)?
-            .checked_add(sum.checked_sub(1)?)?
-            .checked_div(sum)?
-    };
-    u64::try_from(tokens).ok()
-}
-
 impl InputMeasurements {
     pub(crate) fn use_text_memo(&mut self, memo: &TextMemo) {
         self.text = memo.clone();
@@ -259,7 +249,8 @@ impl InputMeasurements {
         Some(tokens)
     }
 
-    /// Settling a receipt records identities and native deltas, never text sizes.
+    /// Settle native deltas and identities. Only a supported opaque APPEND also
+    /// calibrates neutral residual allocations after its local visible framing.
     pub(crate) fn observe(
         &mut self,
         body: &Value,
@@ -306,6 +297,11 @@ impl InputMeasurements {
                             .map(|item| item.identity.clone())
                             .collect(),
                         input: input - previous.input,
+                        opaque: items[previous_items.len()..].iter().any(|item| item.opaque),
+                        allocation: self.residual_allocation(
+                            &values[previous_items.len()..],
+                            input - previous.input,
+                        ),
                     });
                     while self.blocks.len() > 128
                         || self
@@ -487,15 +483,11 @@ impl InputMeasurements {
         }
         // Preserve the existing duplicate-opaque occurrence fence.
         changes(from, to)?;
-        let mut tokens = anchor.input;
-        for value in &values[from.len()..] {
-            let weight = self.reasoning_weight(value)?;
-            let estimate =
-                u64::try_from(weight.checked_add(9_999_999_999)? / 10_000_000_000).ok()?;
-            tokens = tokens.checked_add(allocated_forecast(estimate, 1, 1, false)?)?;
-        }
+        let mut baseline = body.clone();
+        baseline["input"].as_array_mut()?.truncate(from.len());
+        let quantity = self.accounting_restoration(body, &baseline, route, resolved)?;
         Some(InputEstimate {
-            tokens,
+            tokens: u64::try_from(anchor.input as i128 + quantity.tokens).ok()?,
             basis: EstimateBasis::ReceiptAnchoredReasoningForecast,
         })
     }
@@ -531,216 +523,30 @@ impl InputMeasurements {
         route: &str,
         resolved: Option<&ResolvedModel>,
     ) -> Option<InputEstimate> {
-        if let Some(estimate) = self.reasoning_forecast(target, source, source, route, resolved) {
-            return Some(estimate);
-        }
         if let Some(estimate) = self.predict(target, route, resolved) {
             return Some(estimate);
         }
-        let source_estimate = self.estimate(source, route, resolved)?;
+        let source_estimate = self.forecast_estimate(source, route, resolved)?;
         if source_estimate.basis == EstimateBasis::LocalVisibleText {
-            // Native batch quantities cannot be subtracted from local section
-            // units. Reuse those local sections for a purely local candidate.
             return self.estimate(target, route, resolved);
         }
-        let (restoration, measured) = self.restoration_with(source, target, route, resolved)?;
-        Some(InputEstimate {
-            tokens: u64::try_from(source_estimate.tokens as i128 - restoration).ok()?,
-            basis: if measured {
-                EstimateBasis::ReceiptMeasuredBlockProjection
-            } else {
-                EstimateBasis::ReceiptAnchoredTextDelta
-            },
-        })
-    }
-
-    // Forecast-only: allocations never enter predict(), restoration(), receipt
-    // settlement, measured blocks or native cache extents.
-    fn reasoning_forecast(
-        &self,
-        target: &Value,
-        source: &Value,
-        context: &Value,
-        route: &str,
-        resolved: Option<&ResolvedModel>,
-    ) -> Option<InputEstimate> {
-        let expected = contract(source, route, resolved);
-        if self.contract != expected
-            || contract(target, route, resolved) != expected
-            || contract(context, route, resolved) != expected
+        if let Some((restoration, measured)) =
+            self.restoration_with(source, target, route, resolved)
         {
-            return None;
-        }
-        if let Some(exact) = self
-            .predict(target, route, resolved)
-            .filter(|estimate| estimate.basis == EstimateBasis::ProviderReceipt)
-        {
-            return Some(exact);
-        }
-        if self.reasoning_conflict {
-            return None;
-        }
-        let baseline = self
-            .forecast_estimate(source, route, resolved)
-            .filter(|estimate| estimate.basis != EstimateBasis::LocalVisibleText)?;
-        let source_values = items(source)?;
-        let target_values = items(target)?;
-        let source_prompt = prompt(&source_values);
-        let target_prompt = prompt(&target_values);
-        let (removed, added) = changes(
-            source_prompt.items.as_deref()?,
-            target_prompt.items.as_deref()?,
-        )?;
-        let mut available = BTreeMap::new();
-        for value in items(context)?
-            .into_iter()
-            .chain(source_values)
-            .chain(target_values)
-        {
-            available.insert(identity(&value), value);
-        }
-        let mut used_heuristic = baseline.basis == EstimateBasis::ReceiptAnchoredReasoningForecast;
-        let mut quantity = |changed: &[&Item], removal: bool| -> Option<u64> {
-            let mut used = vec![false; changed.len()];
-            let prompt_items = if removal {
-                source_prompt.items.as_deref()?
-            } else {
-                target_prompt.items.as_deref()?
-            };
-            let mut covered = vec![false; prompt_items.len()];
-            let mut total = 0u64;
-            for block in self.blocks.iter().rev() {
-                if block.items.is_empty() {
-                    continue;
-                }
-                // Locate the native extent before selecting changed members.
-                // Identity alone cannot distinguish repeated visible siblings
-                // within a block or the same visible value in another block.
-                let mut extents =
-                    prompt_items
-                        .windows(block.items.len())
-                        .enumerate()
-                        .filter(|(_, items)| {
-                            items
-                                .iter()
-                                .zip(&block.items)
-                                .all(|(item, id)| item.identity == *id)
-                        });
-                let Some((start, members)) = extents.next() else {
-                    // A filtered old block cannot donate its original budget;
-                    // surviving opaque members need current pool calibration.
-                    continue;
-                };
-                if extents.next().is_some()
-                    || covered[start..start + members.len()]
-                        .iter()
-                        .any(|used| *used)
-                {
-                    return None;
-                }
-                covered[start..start + members.len()].fill(true);
-                let positions = members
-                    .iter()
-                    .map(|member| changed.iter().position(|item| std::ptr::eq(*item, member)))
-                    .collect::<Vec<_>>();
-                let present = positions.iter().flatten().copied().collect::<Vec<_>>();
-                if present.is_empty() {
-                    continue;
-                }
-                if present.iter().any(|index| used[*index]) {
-                    return None;
-                }
-                if present.len() == block.items.len() {
-                    total = total.checked_add(block.input)?;
+            return Some(InputEstimate {
+                tokens: u64::try_from(source_estimate.tokens as i128 - restoration).ok()?,
+                basis: if source_estimate.basis == EstimateBasis::ReceiptAnchoredReasoningForecast {
+                    source_estimate.basis
+                } else if measured {
+                    EstimateBasis::ReceiptMeasuredBlockProjection
                 } else {
-                    let Some(values) = block
-                        .items
-                        .iter()
-                        .map(|id| available.get(id))
-                        .collect::<Option<Vec<_>>>()
-                    else {
-                        // A filtered receipt can calibrate the surviving
-                        // pool; do not reuse a partial old block's budget.
-                        continue;
-                    };
-                    if !values.iter().any(|value| reasoning_chars(value).is_some()) {
-                        continue;
-                    }
-                    let weights = values
-                        .iter()
-                        .map(|value| self.reasoning_weight(value))
-                        .collect::<Option<Vec<_>>>()?;
-                    let sum = weights
-                        .iter()
-                        .try_fold(0u128, |sum, weight| sum.checked_add(*weight))?;
-                    if sum == 0 {
-                        return None;
-                    }
-                    let selected = weights
-                        .iter()
-                        .zip(&positions)
-                        .filter(|(_, position)| position.is_some())
-                        .try_fold(0u128, |sum, (weight, _)| sum.checked_add(*weight))?;
-                    total = total.checked_add(allocated_forecast(
-                        block.input,
-                        selected,
-                        sum,
-                        removal,
-                    )?)?;
-                    used_heuristic = true;
-                }
-                for index in present {
-                    used[index] = true;
-                }
-            }
-            if changed
-                .iter()
-                .zip(&used)
-                .any(|(item, used)| item.opaque && !*used)
-            {
-                let (pool, budget) = self.unmeasured_pool(&available, source)?;
-                let values = pool
-                    .iter()
-                    .map(|id| available.get(id))
-                    .collect::<Option<Vec<_>>>()?;
-                let weights = values
-                    .iter()
-                    .map(|value| self.reasoning_weight(value))
-                    .collect::<Option<Vec<_>>>()?;
-                let sum = weights
-                    .iter()
-                    .try_fold(0u128, |sum, weight| sum.checked_add(*weight))?;
-                let mut selected = 0u128;
-                for (id, weight) in pool.iter().zip(weights) {
-                    if let Some(index) = changed.iter().enumerate().find_map(|(index, item)| {
-                        (!used[index] && item.identity == *id).then_some(index)
-                    }) {
-                        selected = selected.checked_add(weight)?;
-                        used[index] = true;
-                    }
-                }
-                total = total.checked_add(allocated_forecast(budget, selected, sum, removal)?)?;
-                used_heuristic = true;
-            }
-            for (item, used) in changed.iter().zip(used) {
-                if used {
-                    continue;
-                }
-                if item.opaque {
-                    return None;
-                }
-                let tokens = self.text_tokens(available.get(&item.identity)?, true)?;
-                total = total.checked_add(allocated_forecast(tokens, 1, 1, removal)?)?;
-            }
-            Some(total)
-        };
-        let removed = quantity(&removed, true)?;
-        let added = quantity(&added, false)?;
-        if !used_heuristic {
-            return None;
+                    EstimateBasis::ReceiptAnchoredTextDelta
+                },
+            });
         }
+        let restoration = self.accounting_restoration(target, source, route, resolved)?;
         Some(InputEstimate {
-            tokens: baseline.tokens.checked_sub(removed)?.checked_add(added)?,
+            tokens: u64::try_from(source_estimate.tokens as i128 + restoration.tokens).ok()?,
             basis: EstimateBasis::ReceiptAnchoredReasoningForecast,
         })
     }
@@ -750,7 +556,7 @@ impl InputMeasurements {
     // alone. This pool is never stored as an additive native measured block.
     fn unmeasured_pool(
         &self,
-        available: &BTreeMap<String, Value>,
+        available: &BTreeMap<String, &Value>,
         source: &Value,
     ) -> Option<(Vec<String>, u64)> {
         let anchor = self.anchor.as_ref()?;
@@ -801,20 +607,12 @@ impl InputMeasurements {
             }
             // Unsupported opaque members cannot donate an unexplained native
             // residual to neighboring reasoning items.
-            self.reasoning_weight(value)?;
+            if item.opaque && !accounting_reasoning(value) {
+                return None;
+            }
             pool.push(item.identity.clone());
         }
         Some((pool, budget))
-    }
-
-    fn reasoning_weight(&self, value: &Value) -> Option<u128> {
-        let chars = reasoning_chars(value);
-        if crate::savings::prompt_has_opaque(value) && chars.is_none() {
-            return None;
-        }
-        (self.text_tokens(value, true)? as u128)
-            .checked_mul(9_432_105_075)?
-            .checked_add((chars.unwrap_or(0) as u128).checked_mul(432_732_920)?)
     }
 
     pub(crate) fn restoration(
@@ -851,6 +649,67 @@ impl InputMeasurements {
         )
     }
 }
+include!("proxy_quantity_accounting.rs");
+
+#[cfg(test)]
+mod accounting_tests {
+
+    #[test]
+    fn inherited_reasoning_uses_one_neutral_quantity_owner_not_ciphertext_weights() {
+        let mut source = json!({"model":"gpt-6.1-sol","input":[
+            {"role":"user","content":"protected task"},
+            {"type":"reasoning","encrypted_content":"cipher-a"},
+            {"type":"reasoning","encrypted_content":"cipher-b"}
+        ]});
+        let mut measured = InputMeasurements::default();
+        assert!(
+            measured
+                .projected_estimate(&source, &source, "route", None)
+                .is_none()
+        );
+        measured.observe(&source, &json!({"input_tokens":12000}), "route", None, 1);
+        let mut target = source.clone();
+        target["input"].as_array_mut().unwrap().remove(1);
+        let neutral = measured
+            .accounting_restoration(&target, &source, "route", None)
+            .expect("an inherited complete native cohort supplies neutral partial attribution");
+        let candidate = measured
+            .projected_estimate(&target, &source, "route", None)
+            .unwrap();
+        assert_eq!(
+            candidate.basis,
+            EstimateBasis::ReceiptAnchoredReasoningForecast
+        );
+        assert_eq!(candidate.tokens as i128, 12000 + neutral.tokens);
+        assert!(candidate.tokens > 0 && candidate.tokens < 12000);
+        assert!(!neutral.measured);
+        assert_eq!(
+            candidate.capacity_tokens(),
+            None,
+            "a neutral economic allocation is not capacity proof"
+        );
+        let checkpoint = serde_json::to_vec(&measured).unwrap();
+        let mut resumed: InputMeasurements = serde_json::from_slice(&checkpoint).unwrap();
+        assert_eq!(
+            resumed.projected_estimate(&target, &source, "route", None),
+            Some(candidate)
+        );
+        // Encryptions with the same semantic role but arbitrary byte lengths
+        // cannot change the native residual allocation or its capacity authority.
+        source["input"][1]["encrypted_content"] = json!("x".repeat(10000));
+        source["input"][2]["encrypted_content"] = json!("y");
+        target = source.clone();
+        target["input"].as_array_mut().unwrap().remove(1);
+        resumed = InputMeasurements::default();
+        resumed.observe(&source, &json!({"input_tokens":12000}), "route", None, 1);
+        assert_eq!(
+            resumed.projected_estimate(&target, &source, "route", None),
+            Some(candidate)
+        );
+    }
+    include!("proxy_quantity_accounting_tests.rs");
+}
+
 #[cfg(test)]
 mod reasoning_forecast_tests {
     include!("proxy_quantity_reasoning_tests.rs");
@@ -1165,7 +1024,7 @@ mod projection_domain_tests {
     use serde_json::json;
 
     #[test]
-    fn partial_reasoning_block_uses_receipt_normalized_conservative_weights() {
+    fn partial_reasoning_block_uses_shared_neutral_residual() {
         let initial = json!({"model":"gpt-6.1-sol","input":[{"role":"user","content":"initial"}]});
         let reasoning =
             json!({"type":"reasoning","summary":[],"encrypted_content":"synthetic".repeat(1000)});
@@ -1183,7 +1042,9 @@ mod projection_domain_tests {
         let estimate = measured
             .projected_estimate(&partial, &source, "route", None)
             .expect("partial reasoning block must be sizeable for removal forecasting");
-        assert!(estimate.tokens > 3000 && estimate.tokens < 5000);
+        let visible = measured.visible_text_tokens(&partial["input"][1]);
+        assert_eq!(estimate.tokens, 1000 + visible);
+        assert_eq!(estimate.capacity_tokens(), None);
         assert!(measured.predict(&partial, "route", None).is_none());
         assert!(
             measured
@@ -1223,7 +1084,7 @@ mod projection_domain_tests {
                 "whole-prompt receipt should calibrate old reasoning and visible history together",
             );
         assert!(
-            estimate.tokens > 8000 && estimate.tokens < 10000,
+            estimate.tokens > 5000 && estimate.tokens < 10000,
             "{estimate:?}"
         );
         assert_eq!(

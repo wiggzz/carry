@@ -371,7 +371,71 @@ fn fresh_reasoning_baseline_http_regressions() {
 }
 
 #[test]
+fn historical_success_prefix_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_historical_success_prefix.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute historical-success prefix controls");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn successful_comparison_population_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_comparison_population.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute successful-population accounting controls");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn receipt_calibrated_traditional_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_traditional_estimation.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute receipt-calibrated traditional HTTP regressions");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn repeated_visible_pool_http_regressions() {
+    let temporary = tempfile::tempdir().unwrap();
+    let evidence = std::env::var_os("CARRY_TEST_EVIDENCE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| temporary.path().to_owned());
     let output = Command::new("python3")
         .arg("-B")
         .arg(concat!(
@@ -380,6 +444,7 @@ fn repeated_visible_pool_http_regressions() {
         ))
         .arg("-v")
         .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .env("CARRY_TEST_EVIDENCE_DIR", &evidence)
         .output()
         .expect("Python 3 must execute repeated visible occurrence pool regressions");
     assert!(
@@ -388,6 +453,48 @@ fn repeated_visible_pool_http_regressions() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // Independent oracle: additive visible JSON sections plus a neutral native
+    // residual. Count occurrences (including identical visible siblings), never
+    // ciphertext bytes, and do not call the production quantity/planner owner.
+    let units = |value: &serde_json::Value| {
+        let mut visible = value.clone();
+        if let Some(object) = visible.as_object_mut() {
+            object.remove("encrypted_content");
+        }
+        tiktoken_rs::o200k_base_singleton()
+            .encode_ordinary(&visible.to_string())
+            .len() as u64
+    };
+    for method in [
+        "test_distinct_visible_initial_pool_control",
+        "test_repeated_visible_initial_pool_prices_after_indexed_restart",
+    ] {
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(evidence.join(format!("{method}.json"))).unwrap(),
+        )
+        .unwrap();
+        let body = saved["body"].as_array().unwrap();
+        let append = saved["append"].as_array().unwrap();
+        let overhead = units(&json!({"instructions":null,"tools":null,"text":null}));
+        let residual = 10000 - overhead - body.iter().map(&units).sum::<u64>();
+        let source = 10000 + append.iter().map(&units).sum::<u64>() + residual;
+        let marker = json!({"role":"user","content":"[Earlier conversation omitted by Carry; retained messages remain in original order.]"});
+        let retained =
+            source - residual - body[1..4].iter().map(&units).sum::<u64>() + units(&marker);
+        for arm in ["indexed_advice", "without_advice"] {
+            let plan = &saved["arms"][arm]["saved"]["last_plan"];
+            assert_eq!(plan["primary_estimated_tokens"], source, "{method}/{arm}");
+            if arm == "indexed_advice" {
+                assert_eq!(
+                    plan["candidates"][0]["primary_retained_estimated_tokens"], retained,
+                    "{method}"
+                );
+            }
+        }
+        println!(
+            "neutral occurrence oracle {method}: source={source}, retained={retained}, residual={residual}"
+        );
+    }
 }
 
 // Identical-history primary money must be shared, never independently forecast.
@@ -2946,8 +3053,14 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
             assert_eq!(advice["opinions"]["2"], "drop");
             assert_eq!(advice["memories"][0]["text"], "background fact");
         }
+        let stats: serde_json::Value = reqwest::get(format!("{url}/carry/dashboard/stats"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(
-            saved["cost_trajectory"]["result"]["coverage"]["reviewer_responses"],
+            stats["sessions"][0]["cost_estimate"]["coverage"]["reviewer_responses"],
             if scenario == "reviewer_failure" { 0 } else { 1 }
         );
         server.abort();
@@ -3191,12 +3304,29 @@ async fn valid_completed_shadow_and_shared_memory_survive_a_failed_primary() {
         saved["compactions"], 0,
         "failed primary does not commit a speculative removal"
     );
+    let stats: serde_json::Value = reqwest::get(format!("{url}/carry/dashboard/stats"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(
-        saved["cost_trajectory"]["result"]["coverage"]["failed_calls"],
+        stats["sessions"][0]["cost_estimate"]["coverage"]["failed_calls"],
         1
     );
+    let primaries: Vec<_> = saved["request_evidence"]["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|o| o.get("Primary"))
+        .collect();
     assert_eq!(
-        saved["cost_trajectory"]["restored"], 0,
+        primaries.len(),
+        1,
+        "failed rewrite is not a successful observation"
+    );
+    assert_eq!(
+        primaries[0]["restoration"]["tokens"], 0,
         "failed rewrites must not restore hypothetical context"
     );
     assert_eq!(saved["history"][1]["value"], next["input"][1]);

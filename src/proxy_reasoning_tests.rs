@@ -2,8 +2,8 @@
 use super::*;
 
 #[test]
-fn reasoning_forecast_selection_credits_only_conservative_removal() {
-    for (repeats, selected) in [(1, false), (10_000, true)] {
+fn reasoning_selection_uses_native_residual_not_ciphertext_size() {
+    for (repeats, selected) in [(1, true), (10_000, true)] {
         let (mut config, _, _) = fixture(Rates {
             input: 2.0,
             cached: 0.2,
@@ -50,12 +50,22 @@ fn reasoning_forecast_selection_credits_only_conservative_removal() {
             candidate["primary_input_basis"],
             "receipt_anchored_reasoning_forecast"
         );
-        assert!(
-            candidate["primary_retained_estimated_tokens"]
-                .as_u64()
-                .unwrap()
-                > 5000
+        let mut target = wire.clone();
+        target["input"] = json!(projection.as_ref().unwrap().input);
+        let quantity = session
+            .primary_input
+            .accounting_restoration(
+                &target,
+                &wire,
+                &config.upstream_url,
+                config.model_resolution.as_ref().map(|p| &p.primary),
+            )
+            .unwrap();
+        assert_eq!(
+            candidate["primary_retained_estimated_tokens"],
+            u64::try_from(10000 + quantity.tokens).unwrap()
         );
+        assert!(candidate["primary_retained_required_tokens"].is_null());
         assert_eq!(candidate["selection_joint"]["accepted"], selected);
         assert_eq!(
             serde_json::to_value(&session).unwrap(),
@@ -237,7 +247,15 @@ fn fresh_reasoning_baseline_is_forecast_only_and_continues_after_restart() {
             candidate.basis,
             EstimateBasis::ReceiptAnchoredReasoningForecast
         );
-        assert!(candidate.tokens < baseline.tokens && candidate.tokens > baseline.tokens - 5000);
+        let neutral = quantities
+            .accounting_restoration(&target, &appended, "route", None)
+            .unwrap();
+        assert_eq!(
+            candidate.tokens as i128,
+            baseline.tokens as i128 + neutral.tokens
+        );
+        assert_eq!(candidate.capacity_tokens(), None);
+        assert!(candidate.tokens < baseline.tokens);
         assert!(
             quantities
                 .restoration(&appended, &target, "route", None)

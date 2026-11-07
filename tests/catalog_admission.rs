@@ -164,16 +164,23 @@ async fn restarted_primary_receipts_and_scenarios_use_frozen_prices_including_un
         let (child, url) = start(f.home.path(), state.path(), f.address, true, &[]).await;
         let body = json!({"model":"gpt-6-sol","input":[{"role":"user","content":"synthetic frozen economics"}],"max_output_tokens":10});
         assert_eq!(send(&url, "frozen", &body).await, 200);
+        let before: Value = reqwest::get(format!("{url}/carry/dashboard/stats"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         drop(child);
         let (path, mut checkpoint) = saved(state.path());
         let prior_native = checkpoint["primary"]["cost_usd"].as_f64().unwrap();
         let prior_unavailable = checkpoint["primary"]["unavailable_cost_calls"]
             .as_u64()
             .unwrap();
-        let prior_scenario = checkpoint["cost_trajectory"]["result"]["carry_cost"]
+        let prior_evidence = checkpoint["request_evidence"]["observations"].clone();
+        let prior_scenario = before["sessions"][0]["cost_estimate"]["carry_cost"]
             .as_f64()
             .unwrap();
-        let prior_excluded = checkpoint["cost_trajectory"]["result"]["excluded_unpriced_calls"]
+        let prior_excluded = before["sessions"][0]["cost_estimate"]["excluded_unpriced_calls"]
             .as_u64()
             .unwrap();
         checkpoint["model_resolution"]["primary"]["rates"] = if unknown {
@@ -186,6 +193,20 @@ async fn restarted_primary_receipts_and_scenarios_use_frozen_prices_including_un
         let (_child, url) = start(f.home.path(), state.path(), f.address, true, &[]).await;
         assert_eq!(send(&url, "frozen", &body).await, 200);
         let (_, checkpoint) = saved(state.path());
+        let stats: Value = reqwest::get(format!("{url}/carry/dashboard/stats"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let estimate = &stats["sessions"][0]["cost_estimate"];
+        let old = prior_evidence.as_array().unwrap();
+        assert_eq!(
+            &checkpoint["request_evidence"]["observations"]
+                .as_array()
+                .unwrap()[..old.len()],
+            old
+        );
         let delta = checkpoint["primary"]["cost_usd"].as_f64().unwrap() - prior_native;
         if unknown {
             assert_eq!(delta, 0.0, "unpriced receipt adds no invented slug price");
@@ -193,24 +214,15 @@ async fn restarted_primary_receipts_and_scenarios_use_frozen_prices_including_un
                 checkpoint["primary"]["unavailable_cost_calls"],
                 prior_unavailable + 1
             );
-            assert_eq!(
-                checkpoint["cost_trajectory"]["result"]["excluded_unpriced_calls"],
-                prior_excluded + 1
-            );
-            assert_eq!(
-                checkpoint["cost_trajectory"]["result"]["carry_cost"],
-                prior_scenario
-            );
+            assert_eq!(estimate["excluded_unpriced_calls"], prior_excluded + 1);
+            assert_eq!(estimate["carry_cost"], prior_scenario);
         } else {
             assert!(
                 (delta - 721.0 / 1e6).abs() < 1e-12,
                 "actual receipt must use frozen input/output tariff: {delta}"
             );
             assert!(
-                checkpoint["cost_trajectory"]["result"]["carry_cost"]
-                    .as_f64()
-                    .unwrap()
-                    > prior_scenario,
+                estimate["carry_cost"].as_f64().unwrap() > prior_scenario,
                 "unknown cache capability must not prevent a matched uncached priced comparison"
             );
         }

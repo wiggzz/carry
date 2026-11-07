@@ -29,6 +29,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
+    proxy_savings::numeric_review_usage,
     proxy_sse::{JsonObserver, Observer},
     proxy_state::{CacheEvidence, Group, Session},
 };
@@ -528,8 +529,71 @@ async fn session_lock(service: &Service, id: &str) -> OwnedMutexGuard<()> {
 
 const CHECKPOINT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+fn recover_success_prefix(
+    service: &Service,
+    id: &str,
+    mut session: Session,
+) -> Result<Session, Failure> {
+    use std::io::Read as _;
+    let invalid = || {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid historical success seed or accounting window",
+        )
+    };
+    let seed = match File::open(service.config.state_dir.join("historical-success.seed")) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(128 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| invalid())?;
+            if bytes.len() > 128 * 1024 {
+                return Err(invalid());
+            }
+            let seed: crate::proxy_savings::HistoricalSuccessSeed =
+                serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+            if !seed.validate() {
+                return Err(invalid());
+            }
+            seed.prefixes.into_iter().find(|p| p.owner == id)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(invalid()),
+    };
+    if seed.is_some() && session.request_evidence.is_none() {
+        let mut evidence = crate::proxy_savings::RequestEvidence::default();
+        evidence.prior_untracked(
+            session
+                .primary
+                .calls
+                .checked_add(session.shadow.calls)
+                .ok_or_else(invalid)?,
+        );
+        session.request_evidence = Some(evidence);
+    }
+    if let Some(evidence) = &mut session.request_evidence {
+        evidence
+            .bind_success_prefix(
+                crate::proxy_savings::SuccessWindow {
+                    owner: id,
+                    namespace: session.history_namespace.as_deref(),
+                    primary_attempts: session.primary.calls,
+                    reviewer_attempts: session.shadow.calls,
+                    primary_successes: session.completed_requests,
+                },
+                seed,
+            )
+            .map_err(|_| invalid())?;
+    }
+    Ok(session)
+}
+
 fn load(service: &Service, id: &str) -> Result<Session, Failure> {
-    let mut session = load_with_restore(service, id, || history::restore(service, id))?;
+    let mut session = recover_success_prefix(
+        service,
+        id,
+        load_with_restore(service, id, || history::restore(service, id))?,
+    )?;
     session
         .primary_input
         .use_text_memo(&service.text_quantities);
@@ -612,7 +676,7 @@ fn save_paid_accounting(
     durable.failed_primaries = paid.failed_primaries;
     durable.primary_pending = paid.primary_pending;
     durable.background_review_pending = paid.background_review_pending;
-    durable.cost_trajectory = paid.cost_trajectory.clone();
+    durable.request_evidence = paid.request_evidence.clone();
     for (target, source, lane) in [
         (
             &mut durable.last_primary_dispatch,
@@ -640,7 +704,7 @@ fn save_paid_accounting(
         }
     }
     if calls > 0
-        && let Some(trajectory) = &mut durable.cost_trajectory
+        && let Some(trajectory) = &mut durable.request_evidence
     {
         // Receipts remain exact, but the lost observation/replay cannot
         // support a complete counterfactual savings comparison.
@@ -1180,7 +1244,7 @@ fn load_dashboard_session(
         )
     })?;
     match view.shared(id) {
-        Ok(Some(session)) => return Ok(session),
+        Ok(Some(session)) => return recover_success_prefix(service, id, session),
         Err(_) => {
             return Err(failure(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1212,7 +1276,7 @@ fn load_dashboard_session(
             "shared checkpoint authority unavailable",
         ));
     }
-    Ok(session)
+    recover_success_prefix(service, id, session)
 }
 
 async fn dashboard_transcript(
@@ -1355,10 +1419,19 @@ async fn dashboard_stats(
             .sum::<usize>();
         let planner = dashboard_plan(&session);
         let estimate = session
-            .cost_trajectory
+            .request_evidence
             .as_ref()
             .map(|t| t.snapshot())
-            .unwrap_or_default()
+            .unwrap_or_else(|| crate::proxy_savings::Estimate {
+                coverage: crate::proxy_savings::Coverage {
+                    prior_untracked_calls: session
+                        .primary
+                        .calls
+                        .saturating_add(session.shadow.calls),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
             .dashboard(session.background_review_pending || session.primary_pending);
         cost_estimate.observe(&estimate);
         let updated_at = entry
@@ -1404,6 +1477,7 @@ async fn dashboard_stats(
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
     cost_estimate.excluded_sessions += unavailable_sessions;
+    cost_estimate.unavailable_whole_windows(unavailable_sessions);
     let mut response = axum::Json(json!({
         "cost_estimate": cost_estimate,
         "mode": format!("{:?}", service.config.mode).to_lowercase(),
@@ -1781,10 +1855,10 @@ async fn forward_timed(
         if kind.is_some() || agent_name.is_some() {
             session.client = Some(crate::proxy_state::ClientProvenance { kind, agent_name });
         }
-        if session.cost_trajectory.is_none() {
-            let mut trajectory = crate::proxy_savings::Trajectory::default();
+        if session.request_evidence.is_none() {
+            let mut trajectory = crate::proxy_savings::RequestEvidence::default();
             trajectory.prior_untracked(session.primary.calls + session.shadow.calls);
-            session.cost_trajectory = Some(trajectory);
+            session.request_evidence = Some(trajectory);
         }
         if session.primary_pending {
             // The per-owner primary lock excludes a live predecessor. This is
@@ -1792,7 +1866,7 @@ async fn forward_timed(
             session.primary_pending = false;
             session.primary.calls += 1;
             session.primary.unavailable_cost_calls += 1;
-            if let Some(trajectory) = &mut session.cost_trajectory {
+            if let Some(trajectory) = &mut session.request_evidence {
                 trajectory.prior_untracked(1);
             }
             journal(
@@ -1818,7 +1892,7 @@ async fn forward_timed(
             );
             session.shadow.calls += 1;
             session.shadow.unavailable_cost_calls += 1;
-            if let Some(trajectory) = &mut session.cost_trajectory {
+            if let Some(trajectory) = &mut session.request_evidence {
                 trajectory.prior_untracked(1);
             }
         }
@@ -2051,17 +2125,21 @@ async fn forward_timed(
         canonical_body["input"] = canonical.clone();
         let canonical_wire = primary_wire_body(&service.config, &canonical_body);
         let restored = if service.config.mode == Mode::Off {
-            Some(0)
+            Some(crate::proxy_quantity::RestorationEstimate {
+                tokens: 0,
+                measured: true,
+                estimated_opaque_items: 0,
+            })
         } else {
-            session.primary_input.restoration(
+            session.primary_input.accounting_restoration(
                 &canonical_wire,
                 &outbound,
                 &service.config.upstream_url,
                 service.config.model_resolution.as_ref().map(|p| &p.primary),
             )
         };
-        if let Some(t) = &mut session.cost_trajectory {
-            t.projected_input(restored, primary_edited);
+        if let Some(t) = &mut session.request_evidence {
+            t.projected_evidence(restored, primary_edited);
         }
         // Numeric snapshots use the shared prompt-bearing projection, never allowance.
         // The planner owns the reauthorized continuation membership.
@@ -2274,7 +2352,7 @@ async fn forward_timed(
                 commit.reviewed.primary_pending = false;
                 commit.reviewed.failed_primaries += 1;
                 finish_measurement(&mut commit.reviewed.last_primary_dispatch, None, false);
-                if let Some(trajectory) = &mut commit.reviewed.cost_trajectory {
+                if let Some(trajectory) = &mut commit.reviewed.request_evidence {
                     trajectory.failed_call();
                 }
                 commit.reviewed.primary.calls += 1;
@@ -2513,36 +2591,6 @@ fn classifier_cache_enabled(config: &ProxyCli) -> Result<bool> {
     }
 }
 
-fn numeric_review_usage(usage: &Value) -> Value {
-    let mut result = json!({});
-    for field in [
-        "input_tokens",
-        "output_tokens",
-        "cached_input_tokens",
-        "cache_write_input_tokens",
-        "cache_creation_input_tokens",
-    ] {
-        if let Some(value) = usage.get(field) {
-            // Preserve invalid presence as a bounded numeric sentinel. Dropping
-            // an invalid optional partition would falsely turn it into zero.
-            result[field] = value.as_u64().map_or(json!(-1), |n| json!(n));
-        }
-    }
-    for field in ["input_tokens_details", "output_tokens_details"] {
-        for key in [
-            "cached_tokens",
-            "cache_write_tokens",
-            "cache_creation_tokens",
-            "audio_tokens",
-        ] {
-            if let Some(value) = usage[field].get(key) {
-                result[field][key] = value.as_u64().map_or(json!(-1), |n| json!(n));
-            }
-        }
-    }
-    result
-}
-
 static REVIEW_GENERATION: AtomicU64 = AtomicU64::new(0);
 fn next_review_generation() -> u64 {
     let clock = SystemTime::now()
@@ -2689,7 +2737,7 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
             current.shadow.unavailable_cost_calls += 1;
             None
         };
-        if let Some(t) = &mut current.cost_trajectory {
+        if let Some(t) = &mut current.request_evidence {
             if receipt.completed {
                 t.reviewer_usage_settled(
                     receipt.usage.as_ref().unwrap_or(&Value::Null),
@@ -2984,7 +3032,7 @@ async fn review_chunk(
                 dispatched_at,
             );
         }
-        if let Some(trajectory) = &mut session.cost_trajectory {
+        if let Some(trajectory) = &mut session.request_evidence {
             if value["status"] == "completed" {
                 trajectory.reviewer_usage_settled(
                     &value["usage"],
@@ -3104,7 +3152,7 @@ async fn review_chunk(
         }
         session.shadow.calls += 1;
         session.shadow.unavailable_cost_calls += 1;
-        if let Some(trajectory) = &mut session.cost_trajectory {
+        if let Some(trajectory) = &mut session.request_evidence {
             trajectory.failed_reviewer_call();
         }
     }
@@ -3667,10 +3715,7 @@ fn resolved_input_costs(
         keep: horizon_cost(
             keep_first,
             kt,
-            if keep_input.basis
-                != crate::proxy_quantity::EstimateBasis::ReceiptAnchoredReasoningForecast
-                && minimum.is_some_and(|min| kt >= min)
-            {
+            if keep_input.capacity_tokens().is_some() && minimum.is_some_and(|min| kt >= min) {
                 kr.cached
             } else {
                 kr.input
@@ -3683,10 +3728,7 @@ fn resolved_input_costs(
             // A forecasted quantity is not evidence of a complete future
             // native write. Charge the upper candidate at the uncached rate;
             // existing scoped native receipts still price the first request.
-            if compact_input.basis
-                != crate::proxy_quantity::EstimateBasis::ReceiptAnchoredReasoningForecast
-                && minimum.is_some_and(|min| ct >= min)
-            {
+            if compact_input.capacity_tokens().is_some() && minimum.is_some_and(|min| ct >= min) {
                 cr.cached
             } else {
                 cr.input
@@ -4008,13 +4050,14 @@ async fn relay(
                         commit.dispatched_at,
                     );
                 }
-                if let Some(trajectory) = &mut commit.candidate.cost_trajectory {
+                if let Some(trajectory) = &mut commit.candidate.request_evidence {
                     if commit.native {
-                        trajectory.unmodeled_call();
+                        trajectory.unmodeled_call(settled);
                     } else {
                         trajectory.primary_settled(crate::proxy_savings::PrimaryObservation {
                             body: &commit.outbound,
                             response: &value,
+                            measurements: Some(&commit.candidate.primary_input),
                             route: &commit.service.config.upstream_url,
                             at: commit.dispatched_at,
                             standard: standard(&commit.outbound)
@@ -4119,7 +4162,7 @@ async fn relay(
                 );
                 commit.reviewed.primary_pending = false;
                 commit.reviewed.failed_primaries += 1;
-                if let Some(trajectory) = &mut commit.reviewed.cost_trajectory {
+                if let Some(trajectory) = &mut commit.reviewed.request_evidence {
                     trajectory.failed_call();
                 }
                 if let Some(value) = &observed {
@@ -4733,9 +4776,9 @@ mod tests {
             {"id":0,"value":{"role":"user","content":"# AGENTS.md instructions for /workspace\n<INSTRUCTIONS>setup</INSTRUCTIONS>"},"cohort":0,"exposed":true,"removed":true},
             {"id":1,"value":{"role":"user","content":[{"type":"input_text","text":"First task\nwith details"}]},"cohort":1,"exposed":true,"removed":true}
         ]);
-        value["cost_trajectory"] =
-            serde_json::to_value(crate::proxy_savings::Trajectory::default()).unwrap();
-        value["cost_trajectory"]["previous"] = json!({
+        value["request_evidence"] =
+            serde_json::to_value(crate::proxy_savings::RequestEvidence::default()).unwrap();
+        value["request_evidence"]["previous"] = json!({
             "model": "gpt-6-luna", "prefix": "must not leak", "overhead": "private settings",
             "route": "private route", "input": 100, "at": now()
         });

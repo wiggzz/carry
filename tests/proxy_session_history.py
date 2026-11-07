@@ -37,7 +37,7 @@ class SessionHistory(unittest.TestCase):
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "assistant", "content": "owned history before TTL transition"},
                    {"role": "user", "content": "current request"}]
-        snapshots, owner_ids, indexes, wires, ttls = [], [], [], [], []
+        snapshots, estimates, owner_ids, indexes, wires, ttls = [], [], [], [], [], []
         previous_files = {}
         for index, incoming in enumerate(inputs):
             if index:
@@ -55,6 +55,9 @@ class SessionHistory(unittest.TestCase):
                                           prompt_cache_options={"mode": "implicit", "ttl": ttl})
             self.assertEqual(status, 200)
             self.assertEqual(response["id"], f"session-ttl-{index + 1}")
+            stats = proxy.request("GET", "/carry/dashboard/stats")[1]
+            self.assertEqual(len(stats["sessions"]), 1)
+            estimates.append(copy.deepcopy(stats["sessions"][0]["cost_estimate"]))
             proxy.close()
             index_state = json.loads((self.harness.state / "history.index").read_text())
             matches = [ref for ref in index_state["transcripts"].values()
@@ -74,7 +77,7 @@ class SessionHistory(unittest.TestCase):
             previous_files = {path.name: json.loads(path.read_text())
                               for path in self.harness.state.glob("*.json")}
             previous_files["history.index"] = index_state
-        self.evidence.update(snapshots=snapshots, owner_ids=owner_ids, indexes=indexes,
+        self.evidence.update(snapshots=snapshots, estimates=estimates, owner_ids=owner_ids, indexes=indexes,
                              primaries=fixture.primaries, reviews=fixture.reviews,
                              shared=shared, change_ttl=change_ttl, initialized=initialized)
         self.assertEqual(len(fixture.primaries), len(inputs))
@@ -87,41 +90,38 @@ class SessionHistory(unittest.TestCase):
                              {"mode": "implicit", "ttl": ttls[index]})
             owners = (indexes[index]["snapshots"].values() if shared else [saved])
             expected_paid = sum(n * (4 if n > 272000 else 2) / 1e6 for n in inputs[:index + 1])
-            self.assertAlmostEqual(sum(s["cost_trajectory"]["result"]["observed_primary_cost"]
-                                       for s in owners), expected_paid, places=12)
+            self.assertAlmostEqual(estimates[index]["observed_primary_cost"], expected_paid, places=12)
             owners = (indexes[index]["snapshots"].values() if shared else [saved])
             self.assertEqual(sum(s["primary"]["calls"] for s in owners), index + 1)
             self.assertEqual(saved["compactions"], 0)
             self.assertEqual(saved["shadow"]["calls"], 0)
             self.assertEqual(saved["primary"]["unavailable_cost_calls"], 0)
-        before = snapshots[transition - 1]["cost_trajectory"]
-        self.assertEqual((before["retired"], before["summary"], before["last_traditional_input"]),
-                         (280000, 1000, 21200))
-        self.assertEqual(before["result"].get("initial_compactions", 0), int(initialized))
-        self.assertEqual(before["result"]["traditional_compactions"], int(not initialized))
-        self.assertEqual(before["result"]["summary_cost"] > 0, not initialized)
+        before = estimates[transition - 1]
+        self.assertEqual(before.get("initial_compactions", 0), int(initialized))
+        self.assertEqual(before["traditional_compactions"], int(not initialized))
+        self.assertEqual(before["summary_cost"] > 0, not initialized)
         # The native actual charge is known at 12h because reported writes are
         # zero. Do not require a known counterfactual tariff or copy cache hits.
         differences = []
         for offset, saved in enumerate(snapshots[transition:]):
-            after = saved["cost_trajectory"]
-            owners = (indexes[transition + offset]["snapshots"].values() if shared else [saved])
+            after = estimates[transition + offset]
+            facts = [o["Primary"]["facts"] for o in saved["request_evidence"]["observations"] if "Primary" in o]
+            self.assertEqual(facts[-1]["native"]["input_tokens"], inputs[transition + offset])
+            self.assertEqual(saved["request_evidence"]["observations"][:len(snapshots[transition - 1]["request_evidence"]["observations"])],
+                             snapshots[transition - 1]["request_evidence"]["observations"],
+                             "TTL/restart cannot reprice settled dispatch facts")
             observed = {
                 "owner": owner_ids[transition + offset],
-                "quantity": [after["retired"], after["summary"], after["last_traditional_input"]],
-                "initial_compactions": sum(s["cost_trajectory"]["result"].get("initial_compactions", 0)
-                                           for s in owners),
-                "traditional_compactions": after["result"]["traditional_compactions"],
-                "summary_cost": after["result"]["summary_cost"],
-                "contract": after["history_continuity"]["contract"],
+                "initial_compactions": after.get("initial_compactions", 0),
+                "traditional_compactions": after["traditional_compactions"],
+                "summary_cost": after["summary_cost"],
             }
             expected = {
                 "owner": owner_ids[transition - 1],
-                "quantity": [280000, 1000, 21300 + offset * 100],
+
                 "initial_compactions": int(initialized),
                 "traditional_compactions": int(not initialized),
-                "summary_cost": before["result"]["summary_cost"],
-                "contract": before["history_continuity"]["contract"],
+                "summary_cost": before["summary_cost"],
             }
             if observed != expected:
                 differences.append({"append": offset, "observed": observed, "expected": expected})
