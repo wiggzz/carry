@@ -1,0 +1,75 @@
+{
+  "model": "native-model",
+  "max_tokens": 100,
+  "system": [
+    {
+      "type": "text",
+      "text": "system",
+      "cache_control": {
+        "type": "ephemeral",
+        "ttl": "1h"
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "opaque",
+          "signature": "sig+/=="
+        },
+        {
+          "type": "redacted_thinking",
+          "data": "hidden+/=="
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_1",
+          "name": "weather",
+          "input": {
+            "city": "東京"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_1",
+          "content": [
+            {
+              "type": "text",
+              "text": "sunny"
+            },
+            {
+              "type": "image",
+              "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "opaque"
+              }
+            }
+          ],
+          "is_error": false
+        },
+        {
+          "type": "text",
+          "text": "next",
+          "future": {
+            "safe": true
+          }
+        }
+      ]
+    }
+  ],
+  "tool_choice": {
+    "type": "auto"
+  },
+  "future": {
+    "native": true
+  }
+}
