@@ -189,6 +189,10 @@ pub struct RequestEvidence {
     observations: Vec<Observation>,
     #[serde(default)]
     prior_untracked: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    historical_success_prefix: Option<HistoricalSuccessPrefix>,
+    #[serde(skip)]
+    historical_prefix_validated: bool,
     #[serde(skip)]
     restoration: Option<crate::proxy_quantity::RestorationEstimate>,
     #[serde(skip)]
@@ -206,6 +210,8 @@ impl Default for RequestEvidence {
             scenario: Scenario::default(),
             observations: Vec::new(),
             prior_untracked: 0,
+            historical_success_prefix: None,
+            historical_prefix_validated: false,
             restoration: Some(crate::proxy_quantity::RestorationEstimate {
                 tokens: 0,
                 measured: true,
@@ -215,7 +221,131 @@ impl Default for RequestEvidence {
         }
     }
 }
+/// Immutable, externally verified successful-money prefix. Its frozen strict
+/// reference/provenance is retained but never used as current quantity authority.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoricalSuccessPrefix {
+    pub source_sha256: String,
+    pub owner: String,
+    pub history_namespace: String,
+    pub primary_attempts: u64,
+    pub reviewer_attempts: u64,
+    pub estimate: Estimate,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoricalSuccessSeed {
+    format: HistoricalSeedFormat,
+    pub prefixes: Vec<HistoricalSuccessPrefix>,
+}
+#[derive(Deserialize)]
+enum HistoricalSeedFormat {
+    #[serde(rename = "carry-historical-success-seed-v1")]
+    Current,
+}
+impl HistoricalSuccessSeed {
+    pub fn validate(&self) -> bool {
+        let _ = &self.format;
+        self.prefixes.len() <= 9
+            && self.prefixes.iter().enumerate().all(|(i, p)| {
+                self.prefixes[..i]
+                    .iter()
+                    .all(|earlier| earlier.owner != p.owner)
+            })
+    }
+}
+
+pub(crate) struct SuccessWindow<'a> {
+    pub owner: &'a str,
+    pub namespace: Option<&'a str>,
+    pub primary_attempts: u64,
+    pub reviewer_attempts: u64,
+    pub primary_successes: u64,
+}
+
 impl RequestEvidence {
+    /// Called only after restoring the authoritative Session/index owner. No
+    /// paid ledger or replay observations are changed by this one-time import.
+    pub(crate) fn bind_success_prefix(
+        &mut self,
+        window: SuccessWindow<'_>,
+        seed: Option<HistoricalSuccessPrefix>,
+    ) -> Result<(), &'static str> {
+        if let Some(seed) = seed {
+            if let Some(existing) = &self.historical_success_prefix {
+                if serde_json::to_value(existing).unwrap() != serde_json::to_value(&seed).unwrap() {
+                    return Err("conflicting historical successful prefix");
+                }
+            } else {
+                self.historical_success_prefix = Some(seed);
+            }
+        }
+        self.historical_prefix_validated = false;
+        let Some(prefix) = &self.historical_success_prefix else {
+            return Ok(());
+        };
+        let e = &prefix.estimate;
+        let c = &e.coverage;
+        let digest = |s: &str| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        let (mut primary, mut reviewer, mut successes) = (0u64, 0u64, 0u64);
+        for observation in &self.observations {
+            match observation {
+                Observation::Primary { .. } | Observation::Unmodeled { .. } => {
+                    primary += 1;
+                    successes += 1;
+                }
+                Observation::Reviewer { .. } | Observation::FailedReviewer => reviewer += 1,
+                Observation::FailedPrimary => primary += 1,
+                Observation::Boundary => {}
+            }
+        }
+        let money = |cost: Option<f64>, calls: u64, unknown: u64| {
+            unknown <= calls
+                && cost.is_none_or(|v| v.is_finite() && v >= 0.0 && (calls > 0 || v == 0.0))
+        };
+        if !digest(&prefix.source_sha256)
+            || !digest(&prefix.owner)
+            || prefix.owner != window.owner
+            || prefix.history_namespace.is_empty()
+            || Some(prefix.history_namespace.as_str()) != window.namespace
+            || prefix
+                .primary_attempts
+                .checked_add(prefix.reviewer_attempts)
+                != Some(self.prior_untracked)
+            || self.prior_untracked == 0
+            || prefix.primary_attempts.checked_add(primary) != Some(window.primary_attempts)
+            || prefix.reviewer_attempts.checked_add(reviewer) != Some(window.reviewer_attempts)
+            || c.primary_responses.checked_add(successes) != Some(window.primary_successes)
+            || c.primary_responses > prefix.primary_attempts
+            || c.reviewer_responses > prefix.reviewer_attempts
+            || c.prior_untracked_calls != 0
+            || c.failed_calls
+                != prefix.primary_attempts - c.primary_responses + prefix.reviewer_attempts
+                    - c.reviewer_responses
+            || e.matched_primary_responses > c.primary_responses
+            || !money(
+                e.observed_primary_cost,
+                c.primary_responses,
+                e.unavailable_primary_cost_calls,
+            )
+            || !money(
+                e.observed_reviewer_cost,
+                c.reviewer_responses,
+                e.unavailable_reviewer_cost_calls,
+            )
+        {
+            return Err("historical successful prefix does not match accounting window");
+        }
+        self.historical_prefix_validated = true;
+        Ok(())
+    }
+
     const MAX_OBSERVATIONS: usize = 4096;
     const MAX_REFERENCES: usize = 65536;
 
@@ -312,7 +442,18 @@ impl RequestEvidence {
             scenario: self.scenario,
             ..Replay::default()
         };
-        replay.prior_untracked(self.prior_untracked);
+        let prefix = self.historical_success_prefix.as_ref().filter(|prefix| {
+            self.historical_prefix_validated
+                && prefix
+                    .primary_attempts
+                    .checked_add(prefix.reviewer_attempts)
+                    == Some(self.prior_untracked)
+        });
+        replay.prior_untracked(if prefix.is_some() {
+            0
+        } else {
+            self.prior_untracked
+        });
         let (mut wire, mut semantic) = (Vec::new(), Vec::new());
         for observation in &self.observations {
             match observation {
@@ -343,7 +484,36 @@ impl RequestEvidence {
                 Observation::Boundary => replay.reset_epoch(),
             }
         }
-        replay.snapshot()
+        let mut estimate = replay.snapshot();
+        if let Some(prefix) = prefix {
+            let old = &prefix.estimate;
+            let add_money = |current: Option<f64>, old: Option<f64>, calls: u64| {
+                current
+                    .zip(if calls == 0 { Some(0.0) } else { old })
+                    .map(|(a, b)| a + b)
+            };
+            estimate.observed_primary_cost = add_money(
+                estimate.observed_primary_cost,
+                old.observed_primary_cost,
+                old.coverage.primary_responses,
+            );
+            estimate.observed_reviewer_cost = add_money(
+                estimate.observed_reviewer_cost,
+                old.observed_reviewer_cost,
+                old.coverage.reviewer_responses,
+            );
+            estimate.unavailable_primary_cost_calls += old.unavailable_primary_cost_calls;
+            estimate.unavailable_reviewer_cost_calls += old.unavailable_reviewer_cost_calls;
+            estimate.coverage.primary_responses += old.coverage.primary_responses;
+            estimate.coverage.reviewer_responses += old.coverage.reviewer_responses;
+            estimate.coverage.failed_calls += old.coverage.failed_calls;
+            estimate.excluded_failed_calls += old.coverage.failed_calls;
+            // The frozen strict reference is NOT replay/quantity authority.
+            // Existing whole-window inference handles this omitted population.
+            estimate.coverage.unmodeled_calls += old.coverage.primary_responses;
+            estimate.excluded_unpriced_calls += old.coverage.primary_responses;
+        }
+        estimate
     }
     pub fn prior_untracked(&mut self, calls: u64) {
         self.prior_untracked += calls;
@@ -465,6 +635,167 @@ impl RequestEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recovery_prefix() -> HistoricalSuccessPrefix {
+        HistoricalSuccessPrefix {
+            source_sha256: "a".repeat(64),
+            owner: "b".repeat(64),
+            history_namespace: "synthetic-window".into(),
+            primary_attempts: 3,
+            reviewer_attempts: 1,
+            estimate: Estimate {
+                accounting_basis: RECEIPT_BASIS.into(),
+                observed_primary_cost: Some(3.0),
+                observed_reviewer_cost: Some(0.2),
+                matched_primary_responses: 1,
+                carry_cost: 2.1,
+                traditional_cost: 4.0,
+                reviewer_cost: 0.1,
+                counterfactual_cache_policy: "frozen-synthetic-policy".into(),
+                coverage: Coverage {
+                    primary_responses: 2,
+                    reviewer_responses: 1,
+                    failed_calls: 1,
+                    ..Coverage::default()
+                },
+                ..Estimate::default()
+            },
+        }
+    }
+    fn recovery_window() -> SuccessWindow<'static> {
+        SuccessWindow {
+            owner: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            namespace: Some("synthetic-window"),
+            primary_attempts: 4,
+            reviewer_attempts: 2,
+            primary_successes: 3,
+        }
+    }
+    fn recovery_suffix() -> RequestEvidence {
+        let mut evidence = RequestEvidence::default();
+        evidence.prior_untracked(4);
+        evidence.unmodeled_call(Some(4.0));
+        evidence.failed_reviewer_call();
+        evidence
+    }
+
+    #[test]
+    fn historical_success_prefix_is_idempotent_numeric_and_restart_bound() {
+        let mut evidence = recovery_suffix();
+        let prefix = recovery_prefix();
+        let frozen = serde_json::to_value(&prefix).unwrap();
+        evidence
+            .bind_success_prefix(recovery_window(), Some(prefix.clone()))
+            .unwrap();
+        let saved = serde_json::to_value(&evidence).unwrap();
+        let dashboard = serde_json::to_value(evidence.snapshot().dashboard(false)).unwrap();
+        assert_eq!(dashboard["whole_window"]["carry_cost"], 7.2);
+        assert_eq!(dashboard["whole_window"]["traditional_cost"], 7.0);
+        assert_eq!(dashboard["coverage"]["failed_calls"], 2);
+        assert_eq!(dashboard["matched_primary_responses"], 0);
+        evidence
+            .bind_success_prefix(recovery_window(), Some(prefix))
+            .unwrap();
+        assert_eq!(serde_json::to_value(&evidence).unwrap(), saved);
+        evidence = serde_json::from_value(saved).unwrap();
+        assert!(
+            evidence.snapshot().dashboard(false).whole_window.is_none(),
+            "unbound decode cannot grant proof"
+        );
+        evidence
+            .bind_success_prefix(recovery_window(), None)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(evidence.snapshot().dashboard(false)).unwrap(),
+            dashboard
+        );
+        assert_eq!(
+            serde_json::to_value(evidence.historical_success_prefix.as_ref().unwrap()).unwrap(),
+            frozen
+        );
+    }
+
+    #[test]
+    fn historical_success_prefix_rejects_conflict_fork_and_count_mismatch() {
+        let mut evidence = recovery_suffix();
+        evidence
+            .bind_success_prefix(recovery_window(), Some(recovery_prefix()))
+            .unwrap();
+        let saved = serde_json::to_value(&evidence).unwrap();
+        let mut conflicting = recovery_prefix();
+        conflicting.estimate.observed_primary_cost = Some(99.0);
+        assert!(
+            evidence
+                .bind_success_prefix(recovery_window(), Some(conflicting))
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&evidence).unwrap(), saved);
+        for window in [
+            SuccessWindow {
+                owner: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                ..recovery_window()
+            },
+            SuccessWindow {
+                namespace: Some("different-window"),
+                ..recovery_window()
+            },
+            SuccessWindow {
+                primary_attempts: 5,
+                ..recovery_window()
+            },
+            SuccessWindow {
+                primary_successes: 4,
+                ..recovery_window()
+            },
+        ] {
+            assert!(evidence.bind_success_prefix(window, None).is_err());
+        }
+        let p = serde_json::to_string(&recovery_prefix()).unwrap();
+        let duplicate =
+            format!("{{\"format\":\"carry-historical-success-seed-v1\",\"prefixes\":[{p},{p}]}}");
+        assert!(
+            !serde_json::from_str::<HistoricalSuccessSeed>(&duplicate)
+                .unwrap()
+                .validate()
+        );
+        let duplicate_field = p.replacen("{", "{\"owner\":\"duplicate\",", 1);
+        assert!(serde_json::from_str::<HistoricalSuccessPrefix>(&duplicate_field).is_err());
+    }
+
+    #[test]
+    fn historical_success_prefix_never_fills_unknown_success_money() {
+        for missing in [false, true] {
+            let mut evidence = recovery_suffix();
+            assert!(evidence.snapshot().dashboard(false).whole_window.is_none());
+            let mut prefix = recovery_prefix();
+            prefix.estimate.observed_primary_cost = if missing { None } else { Some(3.0) };
+            prefix.estimate.unavailable_primary_cost_calls = u64::from(!missing);
+            evidence
+                .bind_success_prefix(recovery_window(), Some(prefix))
+                .unwrap();
+            assert!(evidence.snapshot().dashboard(false).whole_window.is_none());
+        }
+    }
+
+    #[test]
+    fn historical_success_prefix_cannot_cover_later_bounded_loss() {
+        let mut evidence = recovery_suffix();
+        evidence
+            .bind_success_prefix(recovery_window(), Some(recovery_prefix()))
+            .unwrap();
+        for _ in evidence.observations.len()..=RequestEvidence::MAX_OBSERVATIONS {
+            evidence.failed_call();
+        }
+        assert!(evidence.prior_untracked > 4);
+        assert!(evidence.snapshot().dashboard(false).whole_window.is_none());
+        let mut restored: RequestEvidence =
+            serde_json::from_value(serde_json::to_value(evidence).unwrap()).unwrap();
+        assert!(
+            restored
+                .bind_success_prefix(recovery_window(), None)
+                .is_err()
+        );
+    }
 
     #[test]
     fn reviewer_numeric_boundary_preserves_invalid_presence_and_frozen_money() {

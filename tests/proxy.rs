@@ -371,6 +371,26 @@ fn fresh_reasoning_baseline_http_regressions() {
 }
 
 #[test]
+fn historical_success_prefix_http_regressions() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_historical_success_prefix.py"
+        ))
+        .arg("-v")
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python 3 must execute historical-success prefix controls");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn successful_comparison_population_http_regressions() {
     let output = Command::new("python3")
         .arg("-B")

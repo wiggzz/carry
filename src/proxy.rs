@@ -529,8 +529,71 @@ async fn session_lock(service: &Service, id: &str) -> OwnedMutexGuard<()> {
 
 const CHECKPOINT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+fn recover_success_prefix(
+    service: &Service,
+    id: &str,
+    mut session: Session,
+) -> Result<Session, Failure> {
+    use std::io::Read as _;
+    let invalid = || {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid historical success seed or accounting window",
+        )
+    };
+    let seed = match File::open(service.config.state_dir.join("historical-success.seed")) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(128 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| invalid())?;
+            if bytes.len() > 128 * 1024 {
+                return Err(invalid());
+            }
+            let seed: crate::proxy_savings::HistoricalSuccessSeed =
+                serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+            if !seed.validate() {
+                return Err(invalid());
+            }
+            seed.prefixes.into_iter().find(|p| p.owner == id)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(invalid()),
+    };
+    if seed.is_some() && session.request_evidence.is_none() {
+        let mut evidence = crate::proxy_savings::RequestEvidence::default();
+        evidence.prior_untracked(
+            session
+                .primary
+                .calls
+                .checked_add(session.shadow.calls)
+                .ok_or_else(invalid)?,
+        );
+        session.request_evidence = Some(evidence);
+    }
+    if let Some(evidence) = &mut session.request_evidence {
+        evidence
+            .bind_success_prefix(
+                crate::proxy_savings::SuccessWindow {
+                    owner: id,
+                    namespace: session.history_namespace.as_deref(),
+                    primary_attempts: session.primary.calls,
+                    reviewer_attempts: session.shadow.calls,
+                    primary_successes: session.completed_requests,
+                },
+                seed,
+            )
+            .map_err(|_| invalid())?;
+    }
+    Ok(session)
+}
+
 fn load(service: &Service, id: &str) -> Result<Session, Failure> {
-    let mut session = load_with_restore(service, id, || history::restore(service, id))?;
+    let mut session = recover_success_prefix(
+        service,
+        id,
+        load_with_restore(service, id, || history::restore(service, id))?,
+    )?;
     session
         .primary_input
         .use_text_memo(&service.text_quantities);
@@ -1181,7 +1244,7 @@ fn load_dashboard_session(
         )
     })?;
     match view.shared(id) {
-        Ok(Some(session)) => return Ok(session),
+        Ok(Some(session)) => return recover_success_prefix(service, id, session),
         Err(_) => {
             return Err(failure(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1213,7 +1276,7 @@ fn load_dashboard_session(
             "shared checkpoint authority unavailable",
         ));
     }
-    Ok(session)
+    recover_success_prefix(service, id, session)
 }
 
 async fn dashboard_transcript(

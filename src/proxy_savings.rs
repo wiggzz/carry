@@ -44,6 +44,7 @@ use evidence::PrimaryFacts;
 pub use evidence::RequestEvidence;
 #[cfg(test)]
 use evidence::RequestEvidence as Trajectory;
+pub(crate) use evidence::{HistoricalSuccessSeed, SuccessWindow};
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Coverage {
