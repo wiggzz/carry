@@ -53,6 +53,16 @@ class TraditionalEstimation(unittest.TestCase):
     fixture = support.StateRegressions.fixture
     proxy = support.StateRegressions.proxy
 
+    def snapshot(self, proxy):
+        # Join immutable checkpoint evidence with its real HTTP projection for
+        # assertions/captures only. No persisted prediction state is recreated.
+        saved = proxy.saved()
+        status, stats = proxy.request('GET', '/carry/dashboard/stats')
+        self.assertEqual(status, 200)
+        self.assertEqual(len(stats['sessions']), 1)
+        saved['estimate'] = stats['sessions'][0]['cost_estimate']
+        return saved
+
     def test_reviewer_before_first_primary_mixed_poll_and_process_restart(self):
         import threading
         import time
@@ -177,7 +187,7 @@ class TraditionalEstimation(unittest.TestCase):
         proxy = self.proxy(fixture, ['--primary-context-tokens','1000000','--min-payback-percent','100'])
         history = [{'role':'user','content':'goal'}, {'role':'assistant','content':'source once ' + 's' * 8192}, {'role':'user','content':'continue'}]
         for _ in range(3): self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
-        saved = proxy.saved()
+        saved = self.snapshot(proxy)
         stats = proxy.request('GET','/carry/dashboard/stats')[1]
         self.evidence.update(checkpoint=saved, stats=stats)
         self.assertGreater(saved['shadow']['cost_usd'], 0)
@@ -205,14 +215,14 @@ class TraditionalEstimation(unittest.TestCase):
         self.assertEqual(first['matched_primary_responses'], 0)
         self.assertEqual(first['whole_window']['inferred_primary_responses'], 1)
         self.assertIn('no_reference_neutral', first['whole_window']['assumption'])
+        before = self.snapshot(proxy)
         proxy.close()
-        before = proxy.saved()
         # This is a genuine checkpoint from an uncalibrated opaque response,
         # not an edited count or fabricated paid ledger.
         self.evidence['historical_checkpoint'] = before
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history + output, max_output_tokens=1)[0], 200)
-        after = proxy.saved()
+        after = self.snapshot(proxy)
         stats = proxy.request('GET','/carry/dashboard/stats')[1]
         self.evidence.update(after_restart=after, stats=stats)
         estimate = stats['sessions'][0]['cost_estimate']
@@ -256,31 +266,31 @@ class TraditionalEstimation(unittest.TestCase):
         proxy = self.proxy(fixture, options)
         history = [{'role':'user','content':'initial below threshold'}]
         self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
+        saved = self.snapshot(proxy)
         proxy.close()
-        saved = proxy.saved()
         support.stage_comparison_scenario(saved, {'context_window':4000,'reserve':100,'keep_recent':500,'summary':100})
-        frozen = saved['cost_trajectory']['result'].copy()
+        frozen = saved['estimate'].copy()
         next(self.state.glob('*.json')).write_text(json.dumps(saved))
         proxy = self.proxy(fixture, options)
         history += [output, caller, {'role':'user','content':'caller text'}]
         self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
-        after = proxy.saved()
+        after = self.snapshot(proxy)
         self.evidence.update(staged_pending=saved, after_restart=after,
                              stats=proxy.request('GET','/carry/dashboard/stats')[1])
         allocation = after['primary_input']['blocks'][-1]['allocation']
         self.assertEqual(allocation['residual'], 5801)
         self.assertEqual(allocation['opaque_items'], 2)
-        t = after['cost_trajectory']
-        self.assertEqual(t['retired'], 3401, 'recover the 2901-unit member BEFORE pricing the next primary')
-        self.assertEqual(t['last_traditional_input'], 3528)
-        self.assertEqual(t['result']['traditional_compactions'], 1)
-        self.assertEqual(t['result']['initial_compactions'], 0)
-        self.assertEqual(t['result']['summary_cost'], frozen['summary_cost'], 'no excluded historical fee backfill')
-        self.assertEqual(t['priced_primary_responses'], 1)
+        t = after['estimate']
+        self.assertEqual(t['traditional_compactions'], 1)
+        self.assertEqual(t['initial_compactions'], 0)
+        self.assertIsNone(frozen['summary_cost'], 'unmatched historical output is unavailable, not zero')
+        self.assertEqual(t['summary_cost'], 0, 'no excluded historical fee backfill')
+        self.assertEqual(t['matched_primary_responses'], 1)
         rates = after['model_resolution']['primary']['rates']
         expected = (3528*rates['write'] + rates['output'])/1000000
-        self.assertAlmostEqual(t['result']['traditional_cost']-frozen['traditional_cost'], expected, places=12)
-        self.assertAlmostEqual(t['result']['observed_primary_cost'], after['primary']['cost_usd'], places=12)
+        self.assertIsNone(frozen['traditional_cost'])
+        self.assertAlmostEqual(t['traditional_cost'], expected, places=12)
+        self.assertAlmostEqual(t['observed_primary_cost'], after['primary']['cost_usd'], places=12)
 
     def test_single_gap_checkpoint_cannot_skip_config_only_success_after_http_restart(self):
         # Persisted-state seam: stage ONLY a single-gap capability from actual
@@ -293,8 +303,8 @@ class TraditionalEstimation(unittest.TestCase):
         proxy = self.proxy(fixture, options)
         history = [{'role':'user','content':'initial'}]
         self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
+        saved = self.snapshot(proxy)
         proxy.close()
-        saved = proxy.saved()
         support.stage_comparison_scenario(saved, {'context_window':4000,'reserve':100,'keep_recent':1500,'summary':100})
         next(self.state.glob('*.json')).write_text(json.dumps(saved))
         proxy = self.proxy(fixture, options)
@@ -302,35 +312,38 @@ class TraditionalEstimation(unittest.TestCase):
         self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
         history.append({'role':'user','content':'gap input'})
         self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
+        saved = self.snapshot(proxy)
         proxy.close()
-        saved = proxy.saved(); t = saved['cost_trajectory']
-        self.assertEqual(t['retired'], 3500)
-        self.assertEqual(t['summary'], 100)
-        t['unresolved_projection'] = True
-        t['projection_recovery'] = {'configuration':t['receipts']['configuration'],
-                                    'cursor':t['history_continuity']['cursor'].copy()}
+        self.assertEqual(saved['estimate']['traditional_compactions'], 1)
+        # Explicit missing projection fact on a real successful dispatch. A
+        # later config-only success cannot recover this discarded chronology.
+        gap = saved['request_evidence']['observations'][-1]['Primary']
+        gap['restoration'] = None
+        gap['edited'] = True
         next(self.state.glob('*.json')).write_text(json.dumps(saved))
         self.evidence['staged_single_gap'] = saved
-        frozen = t['result'].copy(); matched = t['priced_primary_responses']
         proxy = self.proxy(fixture, options)
+        frozen = self.snapshot(proxy)['estimate']
+        matched = frozen['matched_primary_responses']
         self.assertEqual(proxy.send(history, max_output_tokens=1, temperature=0.5)[0], 200)
-        intervening = proxy.saved(); self.evidence['intervening_success'] = intervening
-        self.assertTrue(intervening['cost_trajectory']['unresolved_projection'])
+        intervening = self.snapshot(proxy); self.evidence['intervening_success'] = intervening
+        self.assertIsNone(intervening['request_evidence']['observations'][-2]['Primary']['restoration'])
         proxy.close(); proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
-        after = proxy.saved(); self.evidence['after_restart'] = after
-        t = after['cost_trajectory']
-        self.assertTrue(t['unresolved_projection'], 'never resurrect a stale gap capability across successful response transitions')
-        self.assertEqual(t['priced_primary_responses'], matched)
+        after = self.snapshot(proxy); self.evidence['after_restart'] = after
+        t = after['estimate']
+        self.assertIsNone(after['request_evidence']['observations'][-3]['Primary']['restoration'],
+                          'never resurrect missing projection evidence across successful transitions')
+        self.assertEqual(t['matched_primary_responses'], matched)
         for field in ['traditional_cost','summary_cost','carry_cost']:
-            self.assertEqual(t['result'][field], frozen[field])
-        self.assertEqual(t['result']['initial_compactions'], 0)
-        self.assertAlmostEqual(t['result']['observed_primary_cost'], after['primary']['cost_usd'], places=12)
+            self.assertEqual(t[field], frozen[field])
+        self.assertEqual(t['initial_compactions'], 0)
+        self.assertAlmostEqual(t['observed_primary_cost'], after['primary']['cost_usd'], places=12)
 
     def test_partial_opaque_dispatch_prices_current_projection_after_restart(self):
         self.partial_case(False)
 
-    def test_legacy_blocks_calibrate_retained_output_without_repricing_prior_money(self):
+    def test_current_blocks_calibrate_retained_output_without_repricing_prior_money(self):
         self.partial_case(True)
 
     def partial_case(self, legacy):
@@ -374,74 +387,50 @@ class TraditionalEstimation(unittest.TestCase):
             if any(o['removable'] for o in observations):
                 break
             self.assertEqual(proxy.send(full, max_output_tokens=1)[0], 200)
-        trained = proxy.saved()
-        training_calls = trained['cost_trajectory']['priced_primary_responses']
+        trained = self.snapshot(proxy)
+        training_calls = trained['estimate']['matched_primary_responses']
         self.evidence.update(review_observations=observations, trained=trained)
         self.assertTrue(any(o['removable'] for o in observations), observations)
         # Freeze reviewer cadence after accepting real advice. This exercises
         # ordinary projection economics without inventing a price for a changed
         # opaque REVIEW input (a distinct, unsupported planner estimate).
         proxy.close()
-        if legacy:
-            # Exact old checkpoint representation: retain native quantities and
-            # identities, remove ONLY fields that old binaries never wrote.
-            saved = proxy.saved()
-            for block in saved['primary_input']['blocks']:
-                block.pop('allocation', None)
-                block.pop('opaque', None)
-            saved['cost_trajectory']['receipts'].pop('quantity_policy_version', None)
-            saved['cost_trajectory'].pop('estimated_projection', None)
-            saved['cost_trajectory']['result'].pop('quantity_policy_version', None)
-            saved['cost_trajectory']['result'].pop('legacy_quantity_segment', None)
-            for field in ('estimated_quantity_calls','measured_quantity_calls','unavailable_quantity_calls'):
-                saved['cost_trajectory']['result']['coverage'].pop(field, None)
-            self.assertFalse(saved.get('history_shared', False))
-            next(self.state.glob('*.json')).write_text(json.dumps(saved))
+        # Current-format restart preserves the same native blocks and receipts;
+        # the second arm adds an uncalibrated output, not an obsolete decoder.
         options += ['--review-every-requests','100','--review-min-new-tokens','1000000']
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(full, max_output_tokens=1)[0], 200)
-        projected = proxy.saved()
+        projected = self.snapshot(proxy)
         stats = proxy.request('GET','/carry/dashboard/stats')[1]
         self.evidence.update(review_observations=observations, trained=trained,
                              projected=projected, stats=stats,
                              upstream_inputs=[b['input'] for b in fixture.primaries])
         self.assertFalse(any(i.get('encrypted_content') == 'first-opaque' for i in fixture.primaries[-1]['input']))
         self.assertTrue(any(i.get('encrypted_content') == 'second-opaque' for i in fixture.primaries[-1]['input']))
-        trajectory = projected['cost_trajectory']
-        self.assertGreater(trajectory['restored'], 0)
-        self.assertTrue(trajectory['projection_known'])
-        self.assertEqual(trajectory['priced_primary_responses'], training_calls + 1)
-        self.assertGreaterEqual(trajectory['result']['coverage']['estimated_quantity_calls'], 1)
+        observation = projected['request_evidence']['observations'][-1]['Primary']
+        self.assertGreater(observation['restoration']['tokens'], 0)
+        self.assertFalse(observation['restoration']['measured'])
+        self.assertEqual(projected['estimate']['matched_primary_responses'], training_calls + 1)
+        self.assertGreaterEqual(projected['estimate']['coverage']['estimated_quantity_calls'], 1)
+        prior = trained['request_evidence']['observations']
+        self.assertEqual(projected['request_evidence']['observations'][:len(prior)], prior)
         evidence = stats['sessions'][0]['cost_estimate']['quantity_evidence']
         aggregate = stats['cost_estimate']['quantity_evidence']
         self.assertEqual(aggregate['comparison_scope'], 'matched_subset_not_whole_session')
         self.assertEqual(aggregate['total_primary_responses'], stats['sessions'][0]['cost_estimate']['coverage']['primary_responses'])
         self.assertEqual(aggregate['estimated_priced_calls'], evidence['estimated_priced_calls'])
-        if legacy:
-            self.assertEqual(aggregate['historical_policy_scope'], 'mixed_prospective_only_no_repricing')
-            self.assertEqual(aggregate['legacy_priced_calls'], training_calls)
         self.assertEqual(evidence['version'], 1)
         self.assertGreaterEqual(evidence['estimated_priced_calls'], 1)
         self.assertIn('no_calibrated_statistical_interval', evidence['uncertainty'])
         self.assertAlmostEqual(stats['sessions'][0]['cost_estimate']['observed_primary_cost'], projected['primary']['cost_usd'], places=12)
-        if legacy:
-            self.assertTrue(any(block.get('allocation') for block in projected['primary_input']['blocks']))
-            frozen = trajectory['result']['legacy_quantity_segment']
-            self.assertEqual(frozen['carry_cost'], trained['cost_trajectory']['result']['carry_cost'])
-            self.assertEqual(frozen['traditional_cost'], trained['cost_trajectory']['result']['traditional_cost'])
-            self.assertEqual(frozen['coverage']['estimated_quantity_calls'],0,
-                             'absent historical quality facts stay unknown, not inferred')
-            self.assertEqual(trajectory['result']['coverage']['estimated_quantity_calls'],1,
-                             'only the prospective call receives new estimated coverage')
-            return
         proxy.close()
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(full, max_output_tokens=1)[0], 200)
-        restarted = proxy.saved()
+        restarted = self.snapshot(proxy)
         after = proxy.request('GET','/carry/dashboard/stats')[1]
         self.evidence.update(restarted=restarted, after_restart_stats=after)
-        self.assertEqual(restarted['cost_trajectory']['restored'], trajectory['restored'], 'repeated omission replaces, never accumulates')
-        self.assertEqual(restarted['cost_trajectory']['priced_primary_responses'], training_calls + 2)
+        self.assertEqual(restarted['request_evidence']['observations'][-1]['Primary']['restoration'], observation['restoration'], 'repeated omission replaces, never accumulates')
+        self.assertEqual(restarted['estimate']['matched_primary_responses'], training_calls + 2)
         self.assertAlmostEqual(after['sessions'][0]['cost_estimate']['observed_primary_cost'], restarted['primary']['cost_usd'], places=12)
         target = os.environ.get('CARRY_TRADITIONAL_STATS_PATH')
         if target:
@@ -457,23 +446,25 @@ class TraditionalEstimation(unittest.TestCase):
         self.assertEqual(proxy.send(history, max_output_tokens=1)[0],200)
         history += [{'role':'user','content':'Large in-window growth.'}]
         self.assertEqual(proxy.send(history, max_output_tokens=1)[0],200)
-        before = proxy.saved()
+        before = self.snapshot(proxy)
         self.evidence['before_restart'] = before
-        self.assertEqual(before['cost_trajectory']['result']['traditional_compactions'],1)
+        self.assertEqual(before['estimate']['traditional_compactions'],1)
         proxy.close()
         proxy = self.proxy(fixture, options)
         history += [{'role':'user','content':'After restart.'}]
         self.assertEqual(proxy.send(history, max_output_tokens=1)[0],200)
-        after = proxy.saved()
+        after = self.snapshot(proxy)
         stats = proxy.request('GET','/carry/dashboard/stats')[1]
         self.evidence.update(after_restart=after, stats=stats)
-        t = after['cost_trajectory']
-        self.assertEqual(t['priced_primary_responses'],3)
-        self.assertEqual(t['result']['initial_compactions'],0)
-        self.assertEqual(t['result']['traditional_compactions'],1)
-        self.assertEqual(t['result']['summary_cost'],before['cost_trajectory']['result']['summary_cost'])
-        self.assertGreater(t['result']['summary_cost'],0)
-        self.assertEqual(t['last_traditional_input'],21100)
+        t = after['estimate']
+        self.assertEqual(t['matched_primary_responses'],3)
+        self.assertEqual(t['initial_compactions'],0)
+        self.assertEqual(t['traditional_compactions'],1)
+        self.assertEqual(t['summary_cost'],before['estimate']['summary_cost'])
+        self.assertGreater(t['summary_cost'],0)
+        rates = after['model_resolution']['primary']['rates']
+        self.assertAlmostEqual(t['traditional_cost'] - before['estimate']['traditional_cost'],
+                               (21100*rates['write'] + rates['output'])/1e6, places=12)
         self.assertAlmostEqual(stats['sessions'][0]['cost_estimate']['observed_primary_cost'],after['primary']['cost_usd'],places=12)
         self.assertEqual(fixture.reviews,[])
 
@@ -484,21 +475,20 @@ class TraditionalEstimation(unittest.TestCase):
         proxy=self.proxy(fixture,options)
         history=[{'role':'user','content':'below modeled threshold'}]
         self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
-        before=proxy.saved(); self.evidence['before_restart']=before
-        self.assertEqual(before['cost_trajectory']['result']['initial_compactions'],0)
+        before=self.snapshot(proxy); self.evidence['before_restart']=before
+        self.assertEqual(before['estimate']['initial_compactions'],0)
         proxy.close(); proxy=self.proxy(fixture,options)
         history.append(opaque)
         self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
-        after=proxy.saved(); stats=proxy.request('GET','/carry/dashboard/stats')[1]
+        after=self.snapshot(proxy); stats=proxy.request('GET','/carry/dashboard/stats')[1]
         self.evidence.update(after_restart=after,stats=stats)
-        t=after['cost_trajectory']
-        self.assertEqual(t['last_traditional_input'],21000)
-        self.assertEqual(t['retired'],280000)
-        self.assertEqual(t['result']['traditional_compactions'],1)
-        self.assertEqual(t['result']['initial_compactions'],0)
-        self.assertEqual(t['result']['summary_cost'],before['cost_trajectory']['result']['summary_cost'],'excluded historical summary fee stays excluded')
-        self.assertEqual(t['priced_primary_responses'],1)
-        self.assertLess(t['result']['traditional_cost'],0.1,'second primary uses post-summary input, never 300000')
+        t=after['estimate']
+        self.assertEqual(t['traditional_compactions'],1)
+        self.assertEqual(t['initial_compactions'],0)
+        self.assertIsNone(before['estimate']['summary_cost'])
+        self.assertEqual(t['summary_cost'], 0, 'excluded historical summary fee stays excluded')
+        self.assertEqual(t['matched_primary_responses'],1)
+        self.assertLess(t['traditional_cost'],0.1,'second primary uses post-summary input, never 300000')
         self.assertAlmostEqual(stats['sessions'][0]['cost_estimate']['observed_primary_cost'],after['primary']['cost_usd'],places=12)
 
     def test_unknown_output_preserves_divergent_cache_write_through_http_restart(self):
@@ -513,25 +503,24 @@ class TraditionalEstimation(unittest.TestCase):
         self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
         history.append({'role':'user','content':'known divergent request input'})
         self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
-        before=proxy.saved(); self.evidence['before_restart']=before
-        cache=before['cost_trajectory']['receipts']['modeled_cache']
-        self.assertTrue(cache['writes'],'unknown retained output cannot omit the known input cache write')
-        self.assertEqual(cache['writes'][-1]['end'],21100)
+        before=self.snapshot(proxy); self.evidence['before_restart']=before
+        facts = before['request_evidence']['observations'][-1]['Primary']['facts']
+        self.assertEqual(facts['native']['input_tokens'], 300100)
+        self.assertIsNone(facts['retained'], 'opaque output remains unmeasured')
         proxy.close(); proxy=self.proxy(fixture,options)
         history.append(opaque)
         self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
-        after=proxy.saved(); self.evidence.update(after_restart=after,stats=proxy.request('GET','/carry/dashboard/stats')[1])
-        t=after['cost_trajectory']; prior=before['cost_trajectory']
-        self.assertEqual(t['last_traditional_input'],21200)
-        self.assertEqual(t['result']['summary_cost'],prior['result']['summary_cost'])
-        self.assertEqual(t['priced_primary_responses'],prior['priced_primary_responses']+1)
+        after=self.snapshot(proxy); self.evidence.update(after_restart=after,stats=proxy.request('GET','/carry/dashboard/stats')[1])
+        t=after['estimate']; prior=before['estimate']
+        self.assertEqual(t['summary_cost'],prior['summary_cost'])
+        self.assertEqual(t['matched_primary_responses'],prior['matched_primary_responses']+1)
         rates=after['model_resolution']['primary']['rates']
         self.assertEqual(after['primary']['output_tokens']-before['primary']['output_tokens'],1)
         expected=(21100*rates['cached']+100*rates['write']+rates['output'])/1000000
-        self.assertAlmostEqual(t['result']['traditional_cost']-prior['result']['traditional_cost'],expected,places=12)
-        self.assertAlmostEqual(t['result']['observed_primary_cost'],after['primary']['cost_usd'],places=12)
+        self.assertAlmostEqual(t['traditional_cost']-prior['traditional_cost'],expected,places=12)
+        self.assertAlmostEqual(t['observed_primary_cost'],after['primary']['cost_usd'],places=12)
 
-    def test_successful_unknown_partial_projection_keeps_paid_window_through_off_restart(self):
+    def test_missing_partial_projection_evidence_keeps_paid_summary_through_off_restart(self):
         self.evidence['advice_observations']=[]
         def primary(body,n):
             has_first=any(i.get('encrypted_content')=='initial-first' for i in body['input'])
@@ -563,29 +552,39 @@ class TraditionalEstimation(unittest.TestCase):
         self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
         history.append({'role':'user','content':'large in-window growth'})
         self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
-        paid=proxy.saved(); self.evidence['paid_summary']=paid
-        self.assertEqual(paid['cost_trajectory']['result']['traditional_compactions'],1)
+        paid=self.snapshot(proxy); self.evidence['paid_summary']=paid
+        self.assertEqual(paid['estimate']['traditional_compactions'],1)
         proxy.close()
         options += ['--review-every-requests','100','--review-min-new-tokens','1000000']
         proxy=self.proxy(fixture,options)
-        for _ in range(3):
-            self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
-            gap=proxy.saved()
-            if not gap['cost_trajectory']['projection_known']: break
-        self.evidence['successful_gap']=gap
-        self.assertFalse(gap['cost_trajectory']['projection_known'],'real reviewer projection reaches quantity-unavailable path')
-        self.assertEqual(gap['cost_trajectory']['retired'],paid['cost_trajectory']['retired'])
-        self.assertEqual(gap['cost_trajectory']['result']['summary_cost'],paid['cost_trajectory']['result']['summary_cost'])
+        self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
+        gap=self.snapshot(proxy)
+        self.assertTrue(gap['last_plan']['selected'])
+        self.assertFalse(any(i.get('encrypted_content') == 'initial-first' for i in fixture.primaries[-1]['input']))
+        self.assertEqual(gap['estimate']['summary_cost'],paid['estimate']['summary_cost'])
         proxy.close()
+        # Current evidence-loss seam: discard ONLY the projected quantity for
+        # this real selected/paid dispatch. No predictions, ledgers, native
+        # receipts, chronology or paid-summary state are rewritten. Missing
+        # evidence must not be inferred on restart from a later canonical wire.
+        last = gap['request_evidence']['observations'][-1]['Primary']
+        self.assertGreater(last['restoration']['tokens'], 0)
+        last['restoration'] = None
+        next(self.state.glob('*.json')).write_text(json.dumps(gap))
+        self.evidence['missing_projection_checkpoint']=gap
         proxy=support.Proxy(self.state,fixture,['--primary-context-tokens','1000000','--review-every-requests','100','--review-min-new-tokens','1000000'],mode='off'); self.addCleanup(proxy.close)
+        frozen = self.snapshot(proxy)['estimate']
+        self.assertEqual(frozen['summary_cost'], paid['estimate']['summary_cost'])
         for suffix in ['off-mode recovery','later growth']:
             history.append({'role':'user','content':suffix})
             self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
-        after=proxy.saved();self.evidence.update(after_off_restart=after,stats=proxy.request('GET','/carry/dashboard/stats')[1])
-        self.assertEqual(after['cost_trajectory']['result']['initial_compactions'],0)
-        self.assertGreaterEqual(after['cost_trajectory']['retired'],paid['cost_trajectory']['retired'])
-        self.assertEqual(after['cost_trajectory']['result']['summary_cost'],paid['cost_trajectory']['result']['summary_cost'])
-        self.assertEqual(after['cost_trajectory']['priced_primary_responses'],gap['cost_trajectory']['priced_primary_responses'])
+        after=self.snapshot(proxy);self.evidence.update(after_off_restart=after,stats=proxy.request('GET','/carry/dashboard/stats')[1])
+        self.assertEqual(after['estimate']['initial_compactions'],0)
+        self.assertEqual(after['estimate']['traditional_compactions'], paid['estimate']['traditional_compactions'])
+        self.assertEqual(after['estimate']['summary_cost'],paid['estimate']['summary_cost'])
+        self.assertEqual(after['estimate']['matched_primary_responses'], frozen['matched_primary_responses'])
+        old = gap['request_evidence']['observations']
+        self.assertEqual(after['request_evidence']['observations'][:len(old)], old)
         self.assertGreater(after['primary']['cost_usd'],gap['primary']['cost_usd'])
 
     def test_unknown_retained_output_keeps_known_free_initialization_once(self):
@@ -595,20 +594,22 @@ class TraditionalEstimation(unittest.TestCase):
         proxy = self.proxy(fixture, options)
         history = [{'role':'user','content':'Already-large pre-window source.'}]
         self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
-        first = proxy.saved()
+        first = self.snapshot(proxy)
         self.evidence['before_restart'] = first
-        self.assertEqual(first['cost_trajectory']['result']['initial_compactions'],1,
+        self.assertEqual(first['estimate']['initial_compactions'],1,
                          'known native input permits one free pre-window initialization even when retained output is unknown')
         proxy.close()
         proxy = self.proxy(fixture, options)
         history += [opaque,{'role':'user','content':'Continue after unknown output.'}]
         self.assertEqual(proxy.send(history,max_output_tokens=1)[0],200)
-        last = proxy.saved()
+        last = self.snapshot(proxy)
         self.evidence.update(after_restart=last, stats=proxy.request('GET','/carry/dashboard/stats')[1])
-        self.assertEqual(last['cost_trajectory']['result']['initial_compactions'],1)
-        self.assertEqual(last['cost_trajectory']['result']['traditional_compactions'],0)
-        self.assertEqual(last['cost_trajectory']['result']['summary_cost'],0)
-        self.assertEqual(last['cost_trajectory']['last_traditional_input'],21100)
+        self.assertEqual(last['estimate']['initial_compactions'],1)
+        self.assertEqual(last['estimate']['traditional_compactions'],0)
+        self.assertEqual(last['estimate']['summary_cost'],0)
+        rates = last['model_resolution']['primary']['rates']
+        self.assertAlmostEqual(last['estimate']['traditional_cost'],
+                               (21000*rates['cached'] + 100*rates['write'] + rates['output'])/1e6, places=12)
 
 
 if __name__ == '__main__':

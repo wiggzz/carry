@@ -56,14 +56,23 @@ def stage_comparison_scenario(saved, scenario):
     that fixture-only setup; changing production policy still segments history.
     Never use this to relabel already summarized quantities or monetary totals.
     """
-    trajectory = saved['cost_trajectory']
-    assert trajectory['retired'] == 0 and trajectory['summary'] == 0
-    assert trajectory['result']['traditional_compactions'] == 0
-    assert trajectory['result'].get('initial_compactions', 0) == 0
-    trajectory['scenario'] = scenario
-    if continuity := trajectory.get('history_continuity'):
-        continuity['contract']['keep_recent'] = scenario['keep_recent']
-        continuity['contract']['summary_tokens'] = scenario['summary']
+    evidence = saved['request_evidence']
+    facts = [o['Primary']['facts'] for o in evidence['observations'] if 'Primary' in o]
+    assert evidence['prior_untracked'] == 0 and len(facts) == 1
+    # Only one small, unsummarized seed is relabeled. Never alter settled cost.
+    assert facts[0]['native']['input_tokens'] < min(
+        evidence['scenario']['context_window'] - evidence['scenario']['reserve'],
+        scenario['context_window'] - scenario['reserve'])
+    evidence['scenario'] = scenario
+    # Dispatch facts keep their real history identity. The replay scenario owns
+    # this fixture's numeric threshold; rewriting past contracts would invent
+    # a history discontinuity relative to future actual dispatch facts.
+
+
+def cost_estimate(proxy):
+    status, stats = proxy.request('GET', '/carry/dashboard/stats')
+    assert status == 200 and len(stats['sessions']) == 1
+    return stats['sessions'][0]['cost_estimate']
 
 
 class Fixture:
@@ -131,6 +140,11 @@ class Fixture:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+        # Handler closes over this fixture. Release the server->class->fixture
+        # cycle on shutdown instead of retaining whole prior HTTP transcripts
+        # until Python's cyclic collector happens to run in a long native suite.
+        self.server.RequestHandlerClass = None
+        self.primary = self.review = None
 
 
 class Proxy:
@@ -779,27 +793,36 @@ class StateRegressions(unittest.TestCase):
                 self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
                 for index, (carry, traditional, invalid) in enumerate(entries, 1):
                     saved = json.loads(json.dumps(template))
-                    trajectory = saved["cost_trajectory"]
-                    result = trajectory["result"]
-                    result.update(carry_cost=carry, traditional_cost=traditional,
-                                  reviewer_cost=0, summary_cost=0, excluded_failed_calls=1)
-                    result["coverage"]["failed_calls"] = 1
+                    evidence = saved["request_evidence"]
+                    # Frozen synthetic dispatch facts, not accumulated predictions.
+                    # Mark a divergent dispatch with a declared synthetic tariff;
+                    # otherwise exact no-op receipt parity correctly copies carry.
+                    evidence["observations"][0]["Primary"]["edited"] = True
+                    facts = evidence["observations"][0]["Primary"]["facts"]
+                    facts.update(cost=carry, retained=0, fixed=0, protected=0)
+                    facts["native"].update(input_tokens=1000,
+                                           output_tokens=0, cached_input_tokens=0,
+                                           cache_write_input_tokens=0)
+                    facts["resolved"]["rates"].update(input=traditional * 1000,
+                                                       write=traditional * 1000)
+                    evidence["observations"].append("FailedPrimary")
+                    saved["primary"].update(cost_usd=carry, calls=1)
                     if invalid == "unavailable":
-                        trajectory["available"] = False
-                        result["excluded_failed_calls"] = 0
-                    elif invalid in ("missing_usage", "untracked"):
-                        trajectory["available"] = False
-                        result["coverage"]["missing_usage" if invalid == "missing_usage"
-                                           else "prior_untracked_calls"] = 1
+                        facts["billable"] = False
+                    elif invalid == "missing_usage":
+                        facts["native"] = None
+                        facts["cost"] = None
+                    elif invalid == "untracked":
+                        evidence["prior_untracked"] = 1
                     elif invalid == "unknown_cache":
-                        # A readable current trajectory without a priced pair
-                        # is unavailable, not an unsupported receipt shape.
-                        trajectory["priced_primary_responses"] = 0
-                        result["coverage"]["unknown_cache_requests"] = 1
+                        facts["resolved"] = None
+                        facts["model"] = "unknown-tariff"
+                        facts["contract"]["model"] = "unknown-tariff"
+                        facts["cost"] = None
                     elif invalid == "pending":
                         saved["background_review_pending"] = True
                     elif invalid == "no_trajectory":
-                        saved.pop("cost_trajectory")
+                        saved.pop("request_evidence")
                     (self.state / (f"{index:064x}.json")).write_text(json.dumps(saved))
                 if unreadable:
                     (self.state / ("f" * 64 + ".json")).write_text("not a checkpoint")
@@ -844,7 +867,7 @@ class StateRegressions(unittest.TestCase):
     def test_priced_subset_primary_omissions_and_restart(self):
         self.evidence["cases"] = []
         for variant in ("missing_usage", "unknown_model", "unknown_cache", "audio", "nonstandard"):
-            with self.subTest(variant=variant):
+            with self.subTest(variant=variant), contextlib.ExitStack() as arm:
                 self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
 
                 def primary(_body, n):
@@ -859,21 +882,25 @@ class StateRegressions(unittest.TestCase):
                     return 200, value
 
                 fixture = self.fixture(primary)
+                arm.callback(fixture.close)
                 options = ["--review-every-requests", "100"]
                 if variant == "unknown_model":
                     # Unknown price remains unknown; capacity is explicitly
                     # declared instead of silently borrowed from a role default.
                     options += ["--primary-context-tokens", "272000"]
                 proxy = self.proxy(fixture, options)
+                arm.callback(proxy.close)
                 seed = [{"role": "user", "content": "priced prefix " * 600}]
                 self.assertEqual(proxy.send(seed)[0], 200)
-                before_trajectory = proxy.saved()["cost_trajectory"]
-                before = before_trajectory["result"]
+                before_evidence = proxy.saved()["request_evidence"]
+                before = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
                 fields = {"model": "unknown-model" if variant == "unknown_model" else "gpt-6-astra"} if variant in ("unknown_model", "unknown_cache") else {}
                 self.assertEqual(proxy.send(seed, **fields)[0], 200)
-                omitted = proxy.saved()["cost_trajectory"]
+                omitted_evidence = proxy.saved()["request_evidence"]
+                omitted = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
                 proxy.close()
                 proxy = self.proxy(fixture, options)
+                arm.callback(proxy.close)
                 self.assertEqual(proxy.send(seed)[0], 200)
                 stats = proxy.request("GET", "/carry/dashboard/stats")[1]
                 self.evidence["cases"].append({"variant": variant, "before": before,
@@ -887,12 +914,12 @@ class StateRegressions(unittest.TestCase):
                     # Actuals use the zero-cache receipt; the traditional branch
                     # assumes uncached when cache capability is unknown. No
                     # projection is substituted for observed provider input.
-                    result = omitted["result"]
+                    result = omitted
                     delta = result["carry_cost"] - before["carry_cost"]
                     self.assertGreater(delta, 0)
                     self.assertAlmostEqual(result["traditional_cost"] - before["traditional_cost"],
                                            delta, delta=1e-12, msg="matched uncached branches, no invented savings")
-                    self.assertIsNotNone(omitted["receipts"]["anchor"])
+                    self.assertIsNotNone(omitted_evidence["observations"][-1]["Primary"]["facts"]["native"])
                     self.assertEqual(result["excluded_unpriced_calls"], 0)
                     self.assertGreater(result["coverage"]["unknown_cache_requests"],
                                        before["coverage"]["unknown_cache_requests"])
@@ -903,22 +930,20 @@ class StateRegressions(unittest.TestCase):
                                            delta=1e-12, msg="restart preserves frozen totals without repricing")
                     self.assertEqual(stats["cost_estimate"]["excluded_unpriced_calls"], 0)
                     continue
-                self.assertEqual(omitted["result"]["carry_cost"], before["carry_cost"], "omit both branches, never a partial pair")
-                self.assertEqual(omitted["result"]["traditional_cost"], before["traditional_cost"])
+                self.assertEqual(omitted["carry_cost"], before["carry_cost"], "omit both branches, never a partial pair")
+                self.assertEqual(omitted["traditional_cost"], before["traditional_cost"])
+                facts = omitted_evidence["observations"][-1]["Primary"]["facts"]
                 if variant == "unknown_model":
                     # A new model's valid native receipt is a fresh quantity
                     # anchor, even when its tariff is unavailable. It must not
                     # preserve the former model's configuration or price it.
-                    anchor = omitted["receipts"]["anchor"]
-                    self.assertIsNotNone(anchor)
-                    self.assertNotEqual(anchor["configuration"],
-                                        before_trajectory["receipts"]["anchor"]["configuration"])
-                    self.assertEqual(anchor["input"], completed()["usage"]["input_tokens"])
-                    self.assertEqual(omitted["history_continuity"]["cursor"]["input"], anchor["input"])
-                    self.assertEqual(omitted["history_continuity"]["contract"]["model"], "unknown-model")
+                    self.assertIsNotNone(facts["native"])
+                    self.assertNotEqual(facts["configuration"], before_evidence["observations"][0]["Primary"]["facts"]["configuration"])
+                    self.assertEqual(facts["native"]["input_tokens"], completed()["usage"]["input_tokens"])
+                    self.assertEqual(facts["contract"]["model"], "unknown-model")
                 else:
-                    self.assertIsNone(omitted["receipts"]["anchor"],
-                                      "invalid/unmodeled quantities cannot preserve a stale receipt anchor")
+                    self.assertTrue(facts["native"] is None or not facts["billable"],
+                                    "missing/unmodeled dispatch cannot inherit stale pricing authority")
                 estimate = stats["sessions"][0]["cost_estimate"]
                 self.assert_estimate_available(estimate, True, "unpriced calls must not hide priced comparisons")
                 self.assertEqual(estimate.get("excluded_unpriced_calls"), 1)
@@ -943,13 +968,13 @@ class StateRegressions(unittest.TestCase):
         null_stats = proxy.request("GET", "/carry/dashboard/stats")[1]
         self.assertEqual(proxy.send(seed)[0], 200)
         partial = proxy.saved()
+        partial_estimate = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
         proxy.close()
         # Actual producer snapshots plus unavailable/pending variants verify
         # omission counts do not disappear when the monetary scope is excluded.
         entries = [unpriced, partial, json.loads(json.dumps(partial)), json.loads(json.dumps(partial))]
         entries[2]["background_review_pending"] = True
-        entries[3]["cost_trajectory"]["available"] = False
-        entries[3]["cost_trajectory"]["result"]["coverage"]["prior_untracked_calls"] = 1
+        entries[3]["request_evidence"]["prior_untracked"] = 1
         self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         for n, saved in enumerate(entries, 1):
             (self.state / f"{n:064x}.json").write_text(json.dumps(saved))
@@ -966,7 +991,7 @@ class StateRegressions(unittest.TestCase):
         self.assertEqual(aggregate["in_flight_sessions"], 1)
         self.assertEqual(aggregate["excluded_unpriced_calls"], 4)
         self.assertEqual(aggregate["excluded_unpriced_reviewer_calls"], 0)
-        self.assertEqual(aggregate["carry_cost"], 2 * partial["cost_trajectory"]["result"]["carry_cost"])
+        self.assertEqual(aggregate["carry_cost"], 2 * partial_estimate["carry_cost"])
         self.assertEqual(len(fixture.primaries), 2)
         self.assertEqual(fixture.reviews, [])
 
@@ -980,7 +1005,7 @@ class StateRegressions(unittest.TestCase):
         fixture = self.fixture(primary)
         options = ["--review-every-requests", "100"]
         proxy = self.proxy(fixture, options)
-        self.assertEqual(proxy.send([{"role": "user", "content": "initial task"}])[0], 200)
+        self.assertEqual(proxy.send([{"role": "user", "content": "initial task"}], max_output_tokens=1)[0], 200)
         proxy.close()
         # Small owned scenario forces a later threshold crossing without large
         # requests. Real provider endpoints are all loopback fixtures.
@@ -990,13 +1015,14 @@ class StateRegressions(unittest.TestCase):
             "context_window": 2000, "reserve": 100, "keep_recent": 200, "summary": 50})
         path.write_text(json.dumps(saved))
         proxy = self.proxy(fixture, options)
-        delta = [{"role": "user", "content": "evidence " * 3000}]
-        self.assertEqual(proxy.send(delta, previous_response_id="resp_1")[0], 429)
-        self.assertEqual(proxy.send(delta, previous_response_id="resp_1")[0], 200)
+        delta = [{"role": "assistant", "content": "evidence " * 3000},
+                 {"role": "user", "content": "continue after evidence"}]
+        self.assertEqual(proxy.send(delta, previous_response_id="resp_1", max_output_tokens=1)[0], 429)
+        self.assertEqual(proxy.send(delta, previous_response_id="resp_1", max_output_tokens=1)[0], 200)
         proxy.close()
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send([{"role": "user", "content": "after restart"}],
-                                    previous_response_id="resp_3")[0], 200)
+                                    previous_response_id="resp_3", max_output_tokens=1)[0], 200)
         status, stats = proxy.request("GET", "/carry/dashboard/stats")
         self.assertEqual(status, 200)
         session = stats["sessions"][0]
@@ -1024,7 +1050,7 @@ class StateRegressions(unittest.TestCase):
         fixture = self.fixture(primary)
         options = ["--review-every-requests", "100"]
         proxy = self.proxy(fixture, options)
-        self.assertEqual(proxy.send([{"role": "user", "content": "initial task"}])[0], 200)
+        self.assertEqual(proxy.send([{"role": "user", "content": "initial task"}], max_output_tokens=1)[0], 200)
         proxy.close()
         # Owned checkpoint only; force the modeled threshold, not live policy.
         path = next(self.state.glob("*.json"))
@@ -1033,22 +1059,30 @@ class StateRegressions(unittest.TestCase):
             "context_window": 2000, "reserve": 100, "keep_recent": 1500, "summary": 100})
         path.write_text(json.dumps(saved))
         proxy = self.proxy(fixture, options)
-        self.assertEqual(proxy.send([{"role": "user", "content": "evidence " * 2000}],
-                                    previous_response_id="resp_1")[0], 200)
+        self.assertEqual(proxy.send([{"role": "assistant", "content": "evidence " * 2000},
+                                     {"role": "user", "content": "continue after evidence"}],
+                                    previous_response_id="resp_1", max_output_tokens=1)[0], 200)
         estimate = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
         self.evidence["after_tool_call"] = estimate
         self.assertEqual(estimate["traditional_compactions"], 1,
                          "compact the scenario before the tool-result request, not at turn end")
         self.assertGreater(estimate["summary_cost"], 0)
-        self.assertEqual(proxy.saved()["cost_trajectory"]["last_traditional_input"], 1600)
+        tool_fact = proxy.saved()['request_evidence']['observations'][-1]['Primary']['facts']
+        retained = tool_fact['retained']
+        self.assertEqual(retained, 5, 'fixed tool name/arguments retain five local semantic units')
+        self.assertEqual(estimate['matched_primary_responses'], 2)
+        # A charged summary leaves the next request cold. Its native increment
+        # excludes the tool text already admitted at the preceding response.
         proxy.close()
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send([{"type": "function_call_output", "call_id": "call_2", "output": "ok"}],
-                                    previous_response_id="resp_2")[0], 200)
+                                    previous_response_id="resp_2", max_output_tokens=1)[0], 200)
         after = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
         self.evidence["after_restart"] = after
         self.assertEqual(after["traditional_compactions"], 1)
         self.assertEqual(after["summary_cost"], estimate["summary_cost"])
+        self.assertAlmostEqual(after['traditional_cost'] - estimate['traditional_cost'],
+                               ((1600 + 100 - retained) * .125 + .5) / 1e6, places=12)
         self.assertEqual(len(fixture.primaries), 3)
         self.assertEqual(fixture.reviews, [])
         self.assertEqual(fixture.primaries[2]["input"][-2:], [tool, {
@@ -1066,21 +1100,20 @@ class StateRegressions(unittest.TestCase):
                 proxy = self.proxy(fixture, options)
                 seed = [{"role": "user", "content": "successful task"}]
                 self.assertEqual(proxy.send(seed)[0], 200)
-                before = proxy.saved()["cost_trajectory"]
+                before = cost_estimate(proxy)
                 proxy.close()
                 path = next(self.state.glob("*.json"))
                 saved = json.loads(path.read_text())
-                if selector is None:
-                    saved["cost_trajectory"].pop("successful_requests_only", None)
-                else:
-                    saved["cost_trajectory"]["successful_requests_only"] = selector
+                # Obsolete selectors are hostile inert metadata, never a policy owner.
+                saved['cost_trajectory'] = ({} if selector is None else
+                                             {'successful_requests_only':selector})
                 path.write_text(json.dumps(saved))
                 staged = path.read_bytes()
                 proxy = self.proxy(fixture, options)
                 self.assert_estimate_available(proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"], True)
                 self.assertEqual(path.read_bytes(), staged, "dashboard reads cannot rewrite authority")
                 self.assertEqual(proxy.send(seed)[0], 429)
-                failed = proxy.saved()["cost_trajectory"]
+                failed = cost_estimate(proxy)
                 proxy.close()
                 proxy = self.proxy(fixture, options)
                 self.assertEqual(proxy.send(seed)[0], 200)
@@ -1094,14 +1127,14 @@ class StateRegressions(unittest.TestCase):
                 self.assertEqual(fixture.primaries, [fixture.primaries[0]] * 3)
                 self.assertEqual(fixture.reviews, [])
                 for field in ("carry_cost", "traditional_cost", "reviewer_cost", "summary_cost"):
-                    self.assertEqual(failed["result"][field], before["result"][field], field)
+                    self.assertEqual(failed[field], before[field], field)
                 self.assertEqual(session["primary"]["calls"], 3)
                 self.assertEqual(session["primary"]["unavailable_cost_calls"], 1)
                 estimate = session["cost_estimate"]
                 self.assertEqual(estimate["coverage"]["primary_responses"], 2)
                 self.assertEqual(estimate["coverage"]["failed_calls"], 1)
-                result = self.evidence["cases"][-1]["checkpoint"]["cost_trajectory"]["result"]
-                self.assertAlmostEqual(result["carry_cost"], 2 * before["result"]["carry_cost"], delta=1e-12)
+                result = estimate
+                self.assertAlmostEqual(result["carry_cost"], 2 * before["carry_cost"], delta=1e-12)
                 self.assertAlmostEqual(result["traditional_cost"], result["carry_cost"], delta=1e-12)
                 self.assert_estimate_available(estimate, True, "current failed-attempt policy has one owner")
                 self.assertEqual(estimate.get("excluded_failed_calls", 0), 1)
@@ -1128,12 +1161,14 @@ class StateRegressions(unittest.TestCase):
                 proxy = self.proxy(fixture, options)
                 seed = [{"role": "user", "content": "successful prefix " * 1500}]
                 self.assertEqual(proxy.send(seed)[0], 200)
-                before = proxy.saved()["cost_trajectory"]
+                before = cost_estimate(proxy)
+                before_evidence = proxy.saved()['request_evidence']
                 retry = seed + [{"role": "user", "content": "retry delta"}]
                 status, _ = proxy.send(retry)
                 self.assertEqual(status, 502 if terminal == "transport" else
                                  429 if terminal == "http_error" else 200)
-                after = proxy.saved()["cost_trajectory"]
+                after = cost_estimate(proxy)
+                after_evidence = proxy.saved()['request_evidence']
                 proxy.close()
                 proxy = self.proxy(fixture, options)
                 self.assertEqual(proxy.send(retry)[0], 200)
@@ -1144,13 +1179,11 @@ class StateRegressions(unittest.TestCase):
                 proxy.close()
                 fixture.close()
                 self.assertEqual(fixture.errors, [])
-                for field in ("restored", "retired", "summary", "last_traditional_input",
-                              "carry_edited", "traditional_edited"):
-                    self.assertEqual(before[field], after[field], f"failed primary changed {field}")
-                self.assertEqual(before["history_continuity"], after["history_continuity"],
-                                 "failed primary cannot advance the successful native cursor or history contract")
+                self.assertEqual(after_evidence['observations'][:-1], before_evidence['observations'],
+                                 'failure cannot mutate any successful fact or its native cursor/contract')
+                self.assertEqual(after_evidence['observations'][-1], 'FailedPrimary')
                 for field in ("carry_cost", "traditional_cost", "reviewer_cost", "summary_cost"):
-                    self.assertEqual(before["result"][field], after["result"][field], field)
+                    self.assertEqual(before[field], after[field], field)
                 estimate = session["cost_estimate"]
                 self.assertEqual(estimate["coverage"]["primary_responses"], 2)
                 self.assertEqual(estimate["coverage"]["failed_calls"], 1)
@@ -1276,7 +1309,7 @@ class StateRegressions(unittest.TestCase):
                 self.assertGreater(estimate["reviewer_cost"], 0)
                 # Rust/Python JSON roundtrip can differ by one IEEE-754 ULP;
                 # permit only that representation error, not a money tolerance.
-                saved_cost = saved["cost_trajectory"]["result"]["reviewer_cost"]
+                saved_cost = saved['shadow']['cost_usd']
                 self.assertAlmostEqual(estimate["reviewer_cost"], saved_cost,
                                        delta=max(math.ulp(estimate["reviewer_cost"]),
                                                  math.ulp(saved_cost)))
@@ -1321,7 +1354,7 @@ class StateRegressions(unittest.TestCase):
                                 {"role": "user", "content": f"continue {i}"} for i in range(n)
                             ])[0], 200)
                             saved = self.wait_saved(proxy, lambda s: not s.get("background_review_pending", False))
-                            costs.append(saved["cost_trajectory"]["result"]["traditional_cost"])
+                            costs.append(cost_estimate(proxy)['traditional_cost'])
                             if restart and n == 1:
                                 proxy.close()
                                 proxy = self.proxy(fixture, ["--review-every-requests", "100"])
@@ -1364,7 +1397,7 @@ class StateRegressions(unittest.TestCase):
         held = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
         self.assert_estimate_available(held, True, "completed costs remain visible while reviewer is held")
         self.assertTrue(held["in_flight_costs_excluded"])
-        self.assertEqual(held["carry_cost"], pending["cost_trajectory"]["result"]["carry_cost"])
+        self.assertEqual(held['carry_cost'], pending['primary']['cost_usd'])
         proxy.close()
         fixture.release.set()
         proxy = self.proxy(fixture, ["--review-every-requests", "100"])

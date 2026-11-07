@@ -15,7 +15,7 @@ fn seed_namespace(
         "prompt_cache_options":{"mode":"implicit","ttl":"30m"},
         "input":[{"role":"assistant","content":"owned evidence"},
                  {"role":"user","content":"current request"}]});
-    let mut trajectory = crate::proxy_savings::Trajectory::default();
+    let mut trajectory = crate::proxy_savings::RequestEvidence::default();
     let inputs = if initialized {
         vec![300000, 300100, 300200]
     } else {
@@ -39,9 +39,6 @@ fn seed_namespace(
         );
     }
     let frozen = serde_json::to_value(&trajectory).unwrap();
-    assert_eq!(frozen["retired"], 280000);
-    assert_eq!(frozen["summary"], 1000);
-    assert_eq!(frozen["last_traditional_input"], 21200);
     assert_eq!(
         trajectory.snapshot().initial_compactions,
         u64::from(initialized)
@@ -59,7 +56,7 @@ fn seed_namespace(
         history_namespace: Some(namespace.clone()),
         history_shared: shared,
         review_context: cache_base(&body),
-        cost_trajectory: Some(trajectory),
+        request_evidence: Some(trajectory),
         ..Session::default()
     };
     session.ingest(body["input"].as_array().unwrap()).unwrap();
@@ -74,7 +71,7 @@ fn seed_namespace(
     .unwrap();
     let loaded = load(service, &id).unwrap();
     assert_eq!(
-        serde_json::to_value(loaded.cost_trajectory.unwrap()).unwrap(),
+        serde_json::to_value(loaded.request_evidence.unwrap()).unwrap(),
         frozen,
         "storage must preserve every frozen quantity and monetary field"
     );
@@ -113,7 +110,7 @@ fn assert_namespace_fences(
             "rejected expansion must not expose ancestry"
         );
         assert_eq!(
-            serde_json::to_value(load(service, id).unwrap().cost_trajectory.unwrap()).unwrap(),
+            serde_json::to_value(load(service, id).unwrap().request_evidence.unwrap()).unwrap(),
             *frozen,
             "scope rejection must leave all historic quantities and money frozen"
         );
@@ -132,7 +129,7 @@ fn namespace_owner_restart(initialized: bool) {
     drop(service);
     let service = checkpoint_service(directory.path());
     assert_eq!(
-        serde_json::to_value(load(&service, &id).unwrap().cost_trajectory.unwrap()).unwrap(),
+        serde_json::to_value(load(&service, &id).unwrap().request_evidence.unwrap()).unwrap(),
         frozen
     );
     body["input"]
@@ -150,7 +147,7 @@ fn namespace_owner_restart(initialized: bool) {
         serde_json::to_value(
             history::restore(&service, &selected)
                 .unwrap()
-                .cost_trajectory
+                .request_evidence
                 .unwrap()
         )
         .unwrap(),
@@ -182,7 +179,7 @@ fn namespace_transcript_restart(shared: bool) {
     drop(service);
     let service = checkpoint_service(directory.path());
     assert_eq!(
-        serde_json::to_value(load(&service, &id).unwrap().cost_trajectory.unwrap()).unwrap(),
+        serde_json::to_value(load(&service, &id).unwrap().request_evidence.unwrap()).unwrap(),
         frozen
     );
     assert_namespace_fences(&service, &headers, &body, &id, &frozen);
@@ -235,7 +232,7 @@ fn reviewer_contract_changes_invalidate_advice_not_observed_history() {
         let advice = history::advice(&service, &changed_namespace, input).unwrap();
         drop(pin);
         assert_eq!(
-            serde_json::to_value(load(&service, &id).unwrap().cost_trajectory.unwrap()).unwrap(),
+            serde_json::to_value(load(&service, &id).unwrap().request_evidence.unwrap()).unwrap(),
             frozen,
             "reviewer policy cannot rewrite historic money or quantities"
         );
@@ -339,7 +336,7 @@ fn unsupported_receipt_history_rejects_before_loading_persisted_authority() {
                 let service = checkpoint_service(directory.path());
                 let loaded = load(&service, &id).unwrap();
                 assert_eq!(
-                    serde_json::to_value(loaded.cost_trajectory.unwrap()).unwrap(),
+                    serde_json::to_value(loaded.request_evidence.unwrap()).unwrap(),
                     frozen
                 );
                 assert_eq!(std::fs::read(&index_path).unwrap(), index);
@@ -347,56 +344,36 @@ fn unsupported_receipt_history_rejects_before_loading_persisted_authority() {
             }
             for shape in [
                 "unversioned",
-                "missing_cursor_basis",
-                "raw_cursor",
                 "unsupported_format",
-                "missing_receipts",
-                "null_receipts",
-                "missing_priced_count",
-                "null_priced_count",
+                "missing_observations",
+                "null_observations",
+                "missing_scenario",
             ] {
                 let mut unsupported = frozen.clone();
                 match shape {
                     "unversioned" => {
                         unsupported.as_object_mut().unwrap().remove("format");
                     }
-                    "missing_cursor_basis" => {
-                        unsupported["history_continuity"]["cursor"]
-                            .as_object_mut()
-                            .unwrap()
-                            .remove("basis");
-                    }
-                    "raw_cursor" => {
-                        unsupported["history_continuity"]["cursor"]["basis"] = json!("RawV1")
-                    }
                     "unsupported_format" => {
-                        unsupported["format"] = json!("unsupported-accounting-format")
+                        unsupported["format"] = json!("unsupported-request-evidence")
                     }
-                    // A current tag cannot authorize the old proxy arithmetic
-                    // mode or reconstruct an absent matched-primary count.
-                    "missing_receipts" => {
-                        unsupported.as_object_mut().unwrap().remove("receipts");
+                    "missing_observations" => {
+                        unsupported.as_object_mut().unwrap().remove("observations");
                     }
-                    "null_receipts" => unsupported["receipts"] = Value::Null,
-                    "missing_priced_count" => {
-                        unsupported
-                            .as_object_mut()
-                            .unwrap()
-                            .remove("priced_primary_responses");
-                    }
-                    "null_priced_count" => {
-                        unsupported["priced_primary_responses"] = Value::Null;
+                    "null_observations" => unsupported["observations"] = Value::Null,
+                    "missing_scenario" => {
+                        unsupported.as_object_mut().unwrap().remove("scenario");
                     }
                     _ => unreachable!(),
                 }
                 if shared {
                     let mut saved: Value = serde_json::from_slice(&index).unwrap();
-                    saved["snapshots"][&id]["cost_trajectory"] = unsupported;
+                    saved["snapshots"][&id]["request_evidence"] = unsupported;
                     std::fs::write(&index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
                     std::fs::write(&mirror_path, &mirror).unwrap();
                 } else {
                     let mut saved: Value = serde_json::from_slice(&mirror).unwrap();
-                    saved["cost_trajectory"] = unsupported;
+                    saved["request_evidence"] = unsupported;
                     std::fs::write(&mirror_path, serde_json::to_vec(&saved).unwrap()).unwrap();
                     std::fs::write(&index_path, &index).unwrap();
                 }
@@ -463,13 +440,13 @@ fn namespace_preparation_is_read_only_at_exact_capacity() {
         let old: Value = serde_json::from_slice(&before).unwrap();
         assert_eq!(old["tips"].as_object().unwrap().len(), 1);
         assert_eq!(old["transcripts"].as_object().unwrap().len(), 1);
-        assert_eq!(old["snapshots"][&id]["cost_trajectory"], frozen_money);
+        assert_eq!(old["snapshots"][&id]["request_evidence"], frozen_money);
         service.config.history_max_bytes =
             u32::try_from(before.len() + if roomy { 8192 } else { 0 }).unwrap();
         let outcome = history::namespace(&service, &headers, &body);
         let after = std::fs::read(&index_path).unwrap();
         let current: Value = serde_json::from_slice(&after).unwrap();
-        assert_eq!(current["snapshots"][&id]["cost_trajectory"], frozen_money);
+        assert_eq!(current["snapshots"][&id]["request_evidence"], frozen_money);
         assert_eq!(std::fs::read(&mirror_path).unwrap(), mirror);
         let namespace = outcome.unwrap();
         assert_eq!(namespace, old_namespace);
@@ -573,13 +550,13 @@ async fn namespace_restart_alternating_ids_retains_explicit_conversation() {
     )
     .unwrap();
     assert_eq!(
-        serde_json::to_value(seed.cost_trajectory.unwrap()).unwrap(),
+        serde_json::to_value(seed.request_evidence.unwrap()).unwrap(),
         frozen
     );
     drop(service);
     let service = Arc::new(make_service());
     assert_eq!(
-        serde_json::to_value(load(&service, &id).unwrap().cost_trajectory.unwrap()).unwrap(),
+        serde_json::to_value(load(&service, &id).unwrap().request_evidence.unwrap()).unwrap(),
         frozen
     );
     let delta = json!({"role":"user","content":"continue by response id"});
@@ -646,8 +623,8 @@ async fn namespace_restart_alternating_ids_retains_explicit_conversation() {
         );
         let after = load(&service, &id).unwrap();
         assert_eq!(
-            serde_json::to_value(after.cost_trajectory.unwrap()).unwrap(),
-            serde_json::to_value(middle.cost_trajectory.unwrap()).unwrap()
+            serde_json::to_value(after.request_evidence.unwrap()).unwrap(),
+            serde_json::to_value(middle.request_evidence.unwrap()).unwrap()
         );
         assert_eq!(after.primary.calls, 1);
         assert!((after.primary.cost_usd - 0.00021).abs() < 1e-12);

@@ -55,8 +55,7 @@ fn neutral_accounting_joint_residual_conserves_whole_and_partial_blocks() {
             .tokens,
         -q1.tokens
     );
-    let mut m: InputMeasurements =
-        serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+    let m: InputMeasurements = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
     assert_eq!(
         m.accounting_restoration(&canonical, &one, "route", None)
             .unwrap()
@@ -68,7 +67,7 @@ fn neutral_accounting_joint_residual_conserves_whole_and_partial_blocks() {
 }
 
 #[test]
-fn neutral_accounting_initial_opaque_needs_compatible_increment_not_initial_residual() {
+fn neutral_accounting_inherited_cohort_and_increment_have_explicit_evidence() {
     let initial = request(vec![
         reasoning("initial"),
         json!({"role":"user", "content":"base"}),
@@ -76,10 +75,16 @@ fn neutral_accounting_initial_opaque_needs_compatible_increment_not_initial_resi
     let submitted = request(vec![initial["input"][1].clone()]);
     let mut m = InputMeasurements::default();
     observe(&mut m, &initial, 50000, 1);
-    assert!(
-        m.accounting_restoration(&initial, &submitted, "route", None)
-            .is_none()
+    let inherited = m
+        .accounting_restoration(&initial, &submitted, "route", None)
+        .unwrap();
+    let overhead = m.visible_text_tokens(&crate::savings::prompt_overhead(&initial));
+    let visible_retained = m.visible_text_tokens(&submitted["input"][0]);
+    assert_eq!(
+        inherited.tokens,
+        (50000 - overhead - visible_retained) as i128
     );
+    assert!(!inherited.measured);
     let mut appended = initial.clone();
     let new = reasoning("calibration");
     let local = crate::savings::local_text_tokens(&new);
@@ -89,8 +94,8 @@ fn neutral_accounting_initial_opaque_needs_compatible_increment_not_initial_resi
         .accounting_restoration(&initial, &submitted, "route", None)
         .unwrap();
     assert_eq!(
-        q.tokens,
-        (crate::savings::local_text_tokens(&initial["input"][0]) + 2000) as i128
+        q.tokens, inherited.tokens,
+        "the inherited cohort keeps its own residual, not the later block's calibration"
     );
     assert_eq!(q.estimated_opaque_items, 1);
     assert!(
@@ -181,7 +186,7 @@ fn rejected_native_block_never_borrows_an_older_residual() {
         block.as_object_mut().unwrap().remove("allocation_rejected");
         block.as_object_mut().unwrap().remove("opaque");
     }
-    for mut m in [
+    for m in [
         m.clone(),
         serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap(),
         serde_json::from_value(legacy).unwrap(),
@@ -202,7 +207,7 @@ fn rejected_native_block_never_borrows_an_older_residual() {
             1,
             "whole native block remains authoritative"
         );
-        let mut restarted: InputMeasurements =
+        let restarted: InputMeasurements =
             serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
         let mut partial = canonical.clone();
         partial["input"].as_array_mut().unwrap().remove(2);
@@ -250,14 +255,14 @@ fn rejected_partial_quantity_never_mutates_settled_native_money() {
     partial["input"].as_array_mut().unwrap().remove(2);
     let q = m.accounting_restoration(&canonical, &partial, "route", None);
     assert!(q.is_none());
-    let mut t = crate::proxy_savings::Trajectory::default();
+    let mut t = crate::proxy_savings::RequestEvidence::default();
     t.projected_evidence(q, true);
     t.primary_settled(crate::proxy_savings::PrimaryObservation {body:&partial,response:&json!({"status":"completed","output":[],"usage":{"input_tokens":2900,"output_tokens":0,"input_tokens_details":{"cached_tokens":0}}}),route:"route",at:4,standard:true,resolved:None,cost:Some(0.125),measurements:Some(&m)});
-    assert_eq!(t.snapshot().observed_primary_cost, 0.125);
+    assert_eq!(t.snapshot().observed_primary_cost.unwrap(), 0.125);
     assert_eq!(t.snapshot().matched_primary_responses, 0);
     let saved = serde_json::to_vec(&t).unwrap();
-    let restarted: crate::proxy_savings::Trajectory = serde_json::from_slice(&saved).unwrap();
-    assert_eq!(restarted.snapshot().observed_primary_cost, 0.125);
+    let restarted: crate::proxy_savings::RequestEvidence = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(restarted.snapshot().observed_primary_cost.unwrap(), 0.125);
 }
 
 #[test]

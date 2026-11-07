@@ -34,9 +34,16 @@ pub fn accounting_basis_label() -> String {
 
 #[path = "proxy_receipts.rs"]
 mod receipts;
+pub(crate) use receipts::numeric_review_usage;
 #[path = "proxy_traditional.rs"]
 mod traditional;
 use traditional::{HistoryContract, TraditionalHistoryState};
+#[path = "proxy_evidence.rs"]
+mod evidence;
+use evidence::PrimaryFacts;
+pub use evidence::RequestEvidence;
+#[cfg(test)]
+use evidence::RequestEvidence as Trajectory;
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Coverage {
@@ -116,10 +123,12 @@ pub struct Estimate {
     pub accounting_basis: String,
     #[serde(default)]
     pub matched_primary_responses: u64,
-    #[serde(default)]
-    pub observed_primary_cost: f64,
-    #[serde(default)]
-    pub observed_reviewer_cost: f64,
+    /// Successful settlement evidence only. Absence in an older checkpoint is
+    /// not known zero and must not be filled from an all-attempt paid ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_primary_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_reviewer_cost: Option<f64>,
     #[serde(default)]
     pub unavailable_primary_cost_calls: u64,
     #[serde(default)]
@@ -163,8 +172,6 @@ pub struct DashboardEstimate {
     whole_window: Option<WholeWindowEstimate>,
     #[serde(skip)]
     whole_window_incomplete: bool,
-    #[serde(skip)]
-    whole_window_source: Estimate,
     quantity_evidence: Value,
     legacy_quantity_segment: Option<CachePolicySegment>,
     cache_initializations: crate::proxy_cache::CacheInitializations,
@@ -213,24 +220,18 @@ impl Estimate {
             "assumptions": "visible_local_units;equal_joint_residual_shares;compatible_input_increment_mean_for_unmeasured_reasoning;same_outputs_and_tool_sequence",
             "comparison_scope": if self.matched_primary_responses == self.coverage.primary_responses
                 && self.coverage.primary_responses > 0 && self.coverage.prior_untracked_calls == 0
-                && self.excluded_failed_calls == 0 && self.unavailable_reviewer_cost_calls == 0 {
+                && self.unavailable_reviewer_cost_calls == 0 {
                 "matched_completed_primary_window"
             } else { "matched_subset_not_whole_session" },
         });
-        let whole_window = TraditionalHistoryState::whole_window(
-            &self,
-            self.observed_primary_cost,
-            self.observed_reviewer_cost,
-            self.coverage.primary_responses,
-            self.coverage.reviewer_responses,
-            self.unavailable_primary_cost_calls + self.unavailable_reviewer_cost_calls == 0,
-        );
+        let whole_window = TraditionalHistoryState::whole_window(&self);
         let whole_window_incomplete = whole_window.is_none()
-            && (self.coverage.primary_responses > 0 || self.coverage.reviewer_responses > 0);
+            && (self.coverage.primary_responses > 0
+                || self.coverage.reviewer_responses > 0
+                || self.coverage.prior_untracked_calls > 0);
         DashboardEstimate {
             whole_window,
             whole_window_incomplete,
-            whole_window_source: self.clone(),
             quantity_evidence,
             legacy_quantity_segment: self.legacy_quantity_segment,
             cache_initializations: self.cache_initializations,
@@ -243,10 +244,12 @@ impl Estimate {
             in_flight_costs_excluded: pending,
             observed_primary_cost: (self.accounting_basis == RECEIPT_BASIS
                 && self.coverage.primary_responses > self.unavailable_primary_cost_calls)
-                .then_some(self.observed_primary_cost),
+                .then_some(self.observed_primary_cost)
+                .flatten(),
             observed_reviewer_cost: (self.accounting_basis == RECEIPT_BASIS
                 && self.coverage.reviewer_responses > self.unavailable_reviewer_cost_calls)
-                .then_some(self.observed_reviewer_cost),
+                .then_some(self.observed_reviewer_cost)
+                .flatten(),
             counterfactual_basis: if self.accounting_basis == RECEIPT_BASIS {
                 if self.quantity_policy_version == Some(1) {
                     RECEIPT_COUNTERFACTUAL_BASIS
@@ -273,28 +276,6 @@ impl Estimate {
             excluded_unpriced_reviewer_calls: self.excluded_unpriced_reviewer_calls,
             coverage: self.coverage,
         }
-    }
-}
-
-impl DashboardEstimate {
-    /// Bind to the existing paid ledgers, including costs predating quantity
-    /// policy fields. This is a read-only view, NOT a replacement expense ledger.
-    pub fn with_observed_window(
-        mut self,
-        primary: &carry::core::UsageLedger,
-        reviewer: &carry::core::UsageLedger,
-    ) -> Self {
-        self.whole_window = TraditionalHistoryState::whole_window(
-            &self.whole_window_source,
-            primary.cost_usd,
-            reviewer.cost_usd,
-            primary.calls,
-            reviewer.calls,
-            primary.unavailable_cost_calls == 0 && reviewer.unavailable_cost_calls == 0,
-        );
-        self.whole_window_incomplete =
-            self.whole_window.is_none() && (primary.calls > 0 || reviewer.calls > 0);
-        self
     }
 }
 
@@ -456,7 +437,7 @@ enum TrajectoryFormat {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Trajectory {
+struct Replay {
     format: TrajectoryFormat,
     receipts: receipts::Receipts,
     pub scenario: Scenario,
@@ -493,7 +474,7 @@ fn known_projection() -> bool {
     true
 }
 
-impl Default for Trajectory {
+impl Default for Replay {
     fn default() -> Self {
         Self {
             format: TrajectoryFormat::Current,
@@ -501,6 +482,8 @@ impl Default for Trajectory {
             scenario: Scenario::default(),
             result: Estimate {
                 accounting_basis: RECEIPT_BASIS.into(),
+                observed_primary_cost: Some(0.0),
+                observed_reviewer_cost: Some(0.0),
                 ..Estimate::default()
             },
             restored: 0,
@@ -514,7 +497,7 @@ impl Default for Trajectory {
         }
     }
 }
-impl Trajectory {
+impl Replay {
     pub fn snapshot(&self) -> Estimate {
         let mut estimate = self.result.clone();
         estimate.initialization_policy =
@@ -589,9 +572,8 @@ impl Trajectory {
         self.result.excluded_failed_calls += 1;
     }
 
-    pub fn unmodeled_call(&mut self) {
-        self.result.unavailable_primary_cost_calls += 1;
-        self.result.coverage.primary_responses += 1;
+    pub fn unmodeled_call(&mut self, settled: Option<f64>) {
+        self.record_primary_cost(settled);
         self.result.coverage.unmodeled_calls += 1;
         self.result.excluded_unpriced_calls += 1;
         // Opaque/native boundaries cannot supply a trustworthy text projection.
@@ -704,6 +686,7 @@ impl Trajectory {
     }
 
     /// Money is already frozen by the paid ledger, including delayed reviews.
+    #[cfg(test)]
     pub fn reviewer_usage_settled(&mut self, usage: &Value, standard: bool, settled: Option<f64>) {
         self.observed_reviewer(usage, standard, settled);
     }
@@ -752,8 +735,19 @@ impl Trajectory {
         });
     }
 
+    #[cfg(test)]
     pub fn primary_settled(&mut self, primary: PrimaryObservation<'_>) {
-        self.observed_primary(primary);
+        if primary.response["status"] != "completed" {
+            self.failed_call();
+            return;
+        }
+        let facts = PrimaryFacts::extract(
+            primary,
+            self.history.retention_member(),
+            self.scenario,
+            self.projection_known.then_some(self.restored),
+        );
+        self.observed_facts(&facts);
     }
 }
 
@@ -792,6 +786,7 @@ fn request_cache_mode(
     }
 }
 
+#[cfg(test)]
 fn scenario_request_input_cost_resolved(
     body: &Value,
     model: &str,
@@ -891,6 +886,7 @@ mod receipt_tests;
 
 #[cfg(test)]
 mod tests {
+    use super::Replay as Trajectory;
     use super::*;
 
     fn request(text: &str) -> Value {
@@ -1163,7 +1159,7 @@ mod tests {
             let mut trajectory = Trajectory::default();
             match variant {
                 0 => trajectory.prior_untracked(1),
-                1 => trajectory.unmodeled_call(),
+                1 => trajectory.unmodeled_call(None),
                 2 => trajectory.primary(
                     &request("task"),
                     &json!({"status":"completed","output":[]}),
@@ -1300,8 +1296,8 @@ mod whole_window_tests {
     fn whole_window_projects_historical_omissions_without_rewriting_evidence() {
         let e = Estimate {
             accounting_basis: RECEIPT_BASIS.into(),
-            observed_primary_cost: 12.0,
-            observed_reviewer_cost: 3.0,
+            observed_primary_cost: Some(12.0),
+            observed_reviewer_cost: Some(3.0),
             carry_cost: 5.0,
             reviewer_cost: 3.0,
             traditional_cost: 4.0,
@@ -1328,23 +1324,34 @@ mod whole_window_tests {
     }
 
     #[test]
-    fn old_checkpoint_money_and_mixed_aggregates_are_not_partial_denominators() {
-        let primary = carry::core::UsageLedger {
-            calls: 7,
-            cost_usd: 20.0,
+    fn absent_success_scope_is_unknown_and_empty_sessions_do_not_censor() {
+        let known = Estimate {
+            accounting_basis: RECEIPT_BASIS.into(),
+            observed_primary_cost: Some(20.0),
+            observed_reviewer_cost: Some(3.0),
+            coverage: Coverage {
+                primary_responses: 7,
+                reviewer_responses: 2,
+                ..Default::default()
+            },
             ..Default::default()
         };
-        let reviewer = carry::core::UsageLedger {
-            calls: 2,
-            cost_usd: 3.0,
-            ..Default::default()
-        };
-        // Missing newer observation counters in an old checkpoint do not erase
-        // any dollars already present in the sole existing expense ledger.
-        let old = Estimate::default()
-            .dashboard(false)
-            .with_observed_window(&primary, &reviewer);
+        let mut absent = serde_json::to_value(&known).unwrap();
+        absent
+            .as_object_mut()
+            .unwrap()
+            .remove("observed_primary_cost");
+        absent
+            .as_object_mut()
+            .unwrap()
+            .remove("observed_reviewer_cost");
+        let absent: Estimate = serde_json::from_value(absent).unwrap();
+        let missing = absent.dashboard(false);
+        assert!(missing.whole_window.is_none());
+        assert!(missing.whole_window_incomplete);
+        let old = known.dashboard(false);
         let mut total = DashboardTotals::default();
+        total.observe(&Estimate::default().dashboard(false));
         total.observe(&old);
         total.observe(&old);
         let d = serde_json::to_value(&total).unwrap();
@@ -1353,35 +1360,19 @@ mod whole_window_tests {
         assert_eq!(d["whole_window"]["savings"], -6.0);
         assert_eq!(d["whole_window"]["savings_percent"], -15.0);
         assert_eq!(d["whole_window"]["inferred_primary_responses"], 14);
-        let mut missing = primary;
-        missing.unavailable_cost_calls = 1;
-        let unknown = Estimate::default()
-            .dashboard(false)
-            .with_observed_window(&missing, &reviewer);
-        total.observe(&unknown);
+        total.observe(&missing);
         total.observe(&old);
         let d = serde_json::to_value(total).unwrap();
-        assert!(
-            d["whole_window"].is_null(),
-            "mixed known+unknown cannot become a whole total"
-        );
+        assert!(d["whole_window"].is_null());
         assert_eq!(d["whole_window_unavailable_sessions"], 1);
-        let empty = Estimate::default()
-            .dashboard(false)
-            .with_observed_window(&Default::default(), &Default::default());
-        let mut total = DashboardTotals::default();
-        total.observe(&empty);
-        total.observe(&old);
-        assert!(
-            total.whole_window.is_some(),
-            "empty sessions must not censor known sessions"
-        );
     }
 
     #[test]
     fn reviewer_only_known_money_survives_empty_zero_and_mixed_windows() {
         let priced = Estimate {
             accounting_basis: RECEIPT_BASIS.into(),
+            observed_primary_cost: Some(12.0),
+            observed_reviewer_cost: Some(3.0),
             carry_cost: 15.0,
             reviewer_cost: 3.0,
             traditional_cost: 24.0,
@@ -1389,64 +1380,44 @@ mod whole_window_tests {
             priced: true,
             coverage: Coverage {
                 primary_responses: 1,
+                reviewer_responses: 1,
                 ..Default::default()
             },
             ..Default::default()
         }
-        .dashboard(false)
-        .with_observed_window(
-            &carry::core::UsageLedger {
-                calls: 1,
-                cost_usd: 12.0,
-                ..Default::default()
-            },
-            &carry::core::UsageLedger {
-                calls: 1,
-                cost_usd: 3.0,
-                ..Default::default()
-            },
-        );
+        .dashboard(false);
         for reviewer_cost in [2.0, 0.0] {
-            let reviewer = carry::core::UsageLedger {
-                calls: 1,
-                cost_usd: reviewer_cost,
-                ..Default::default()
-            };
             let e = Estimate {
                 accounting_basis: RECEIPT_BASIS.into(),
-                observed_reviewer_cost: reviewer_cost,
+                observed_reviewer_cost: Some(reviewer_cost),
                 coverage: Coverage {
                     reviewer_responses: 1,
                     ..Default::default()
                 },
                 ..Default::default()
             };
-            // Both projection paths must recognize a settled zero-dollar reviewer.
-            assert!(e.clone().dashboard(true).whole_window.is_some());
-            let only = e
-                .dashboard(true)
-                .with_observed_window(&Default::default(), &reviewer);
+            let only = e.clone().dashboard(true);
             let w = only
                 .whole_window
                 .as_ref()
-                .expect("known reviewer-only money must remain numeric");
+                .expect("settled reviewer is not empty");
             assert_eq!(w.carry_cost, reviewer_cost);
             assert_eq!(w.traditional_cost, 0.0);
             assert_eq!(w.savings, -reviewer_cost);
             assert_eq!(w.savings_percent, None);
             assert_eq!(w.primary_responses, 0);
             for reverse in [false, true] {
-                let empty = Estimate::default()
-                    .dashboard(false)
-                    .with_observed_window(&Default::default(), &Default::default());
-                assert!(empty.whole_window.is_none(), "empty is not completed usage");
-                let zero_primary = Estimate::default().dashboard(false).with_observed_window(
-                    &carry::core::UsageLedger {
-                        calls: 1,
+                let empty = Estimate::default().dashboard(false);
+                assert!(empty.whole_window.is_none());
+                let zero_primary = Estimate {
+                    observed_primary_cost: Some(0.0),
+                    coverage: Coverage {
+                        primary_responses: 1,
                         ..Default::default()
                     },
-                    &Default::default(),
-                );
+                    ..Default::default()
+                }
+                .dashboard(false);
                 assert_eq!(zero_primary.whole_window.as_ref().unwrap().carry_cost, 0.0);
                 let mut total = DashboardTotals::default();
                 total.observe(&empty);
@@ -1458,10 +1429,7 @@ mod whole_window_tests {
                 } {
                     total.observe(row);
                 }
-                let w = total
-                    .whole_window
-                    .as_ref()
-                    .expect("reviewer overhead must not censor other sessions");
+                let w = total.whole_window.as_ref().unwrap();
                 assert_eq!(w.carry_cost, 15.0 + reviewer_cost);
                 assert_eq!(w.traditional_cost, 24.0);
                 assert_eq!(w.savings, 9.0 - reviewer_cost);
@@ -1469,20 +1437,13 @@ mod whole_window_tests {
                     w.savings_percent,
                     Some(100.0 * (9.0 - reviewer_cost) / 24.0)
                 );
-                let unknown = Estimate::default().dashboard(false).with_observed_window(
-                    &Default::default(),
-                    &carry::core::UsageLedger {
-                        unavailable_cost_calls: 1,
-                        ..reviewer.clone()
-                    },
-                );
+                let mut unknown = e.clone();
+                unknown.unavailable_reviewer_cost_calls = 1;
+                let unknown = unknown.dashboard(false);
                 assert!(unknown.whole_window.is_none());
                 total.observe(&unknown);
                 total.observe(&priced);
-                assert!(
-                    total.whole_window.is_none(),
-                    "unknown money remains fail-closed"
-                );
+                assert!(total.whole_window.is_none());
             }
         }
     }
@@ -1492,8 +1453,8 @@ mod whole_window_tests {
         for reviewer in [0.0, 3.0] {
             let e = Estimate {
                 accounting_basis: RECEIPT_BASIS.into(),
-                observed_primary_cost: 12.0,
-                observed_reviewer_cost: reviewer,
+                observed_primary_cost: Some(12.0),
+                observed_reviewer_cost: Some(reviewer),
                 coverage: Coverage {
                     primary_responses: 6,
                     reviewer_responses: u64::from(reviewer > 0.0),

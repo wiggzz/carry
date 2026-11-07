@@ -78,11 +78,11 @@ impl InputMeasurements {
         residual.checked_div(count)
     }
 
-    /// Conservative about evidence, neutral about direction: do NOT reuse the
-    /// planner's discounted removals, inflated additions or envelope weights.
+    /// One neutral quantity owner for planning and accounting. Whole measured
+    /// extents win; partial/inherited residual shares remain explicit estimates.
     /// Missing evidence remains None. The result is never a native measurement.
     pub(crate) fn accounting_restoration(
-        &mut self,
+        &self,
         canonical: &Value,
         submitted: &Value,
         route: &str,
@@ -104,30 +104,6 @@ impl InputMeasurements {
         for value in canonical_values.iter().chain(&submitted_values) {
             available.insert(identity(value), value);
         }
-        // Recover old-format calibration only from complete CURRENTLY available
-        // block membership. Retain it on the original block owner, so output
-        // retention and later requests use the same evidence after restart.
-        if !self.reasoning_conflict && self.contract == expected {
-            let recovered: Vec<_> = self
-                .blocks
-                .iter()
-                .map(|block| {
-                    if block.allocation.is_some() {
-                        return block.allocation.clone();
-                    }
-                    let values: Option<Vec<_>> = block
-                        .items
-                        .iter()
-                        .map(|id| available.get(id).map(|v| (*v).clone()))
-                        .collect();
-                    self.residual_allocation(&values?, block.input)
-                })
-                .collect();
-            for (block, allocation) in self.blocks.iter_mut().zip(recovered) {
-                block.allocation = allocation;
-                block.opaque |= block.items.iter().any(|id| available.get(id).is_some_and(|v| crate::savings::prompt_has_opaque(v)));
-            }
-        }
         // A known native block without a valid internal allocation is NOT an
         // unmeasured item. In particular a rejected visible-floor budget must
         // never borrow another block's residual. Legacy blocks can recover above
@@ -135,11 +111,17 @@ impl InputMeasurements {
         // unavailable. Whole-block native authority is independent of this.
         for changed in [&removed, &added] {
             for block in &self.blocks {
-                if block.opaque && block.allocation.is_none()
-                    && changed.iter().any(|item| block.items.contains(&item.identity))
+                if block.opaque
+                    && block.allocation.is_none()
+                    && changed
+                        .iter()
+                        .any(|item| block.items.contains(&item.identity))
                     && !changed.windows(block.items.len().max(1)).any(|window| {
                         window.len() == block.items.len()
-                            && window.iter().zip(&block.items).all(|(item, id)| item.identity == *id)
+                            && window
+                                .iter()
+                                .zip(&block.items)
+                                .all(|(item, id)| item.identity == *id)
                     })
                 {
                     return None;
@@ -165,6 +147,18 @@ impl InputMeasurements {
             .iter()
             .map(|block| (block, &block.allocation))
             .collect();
+        // A complete inherited native prefix is also one residual cohort.
+        // Account for fixed overhead/protected items and complete measured
+        // blocks first. No ciphertext length or planner-specific weighting.
+        let inherited = self
+            .unmeasured_pool(&available, canonical)
+            .and_then(|(ids, budget)| {
+                let values = ids
+                    .iter()
+                    .map(|id| available.get(id).map(|v| (*v).clone()))
+                    .collect::<Option<Vec<_>>>()?;
+                Some((ids, self.residual_allocation(&values, budget)?))
+            });
         let mut pool_residual = 0u64;
         let mut pool_count = 0u64;
         for (_, allocation) in &blocks {
@@ -172,6 +166,10 @@ impl InputMeasurements {
                 pool_residual = pool_residual.checked_add(allocation.residual)?;
                 pool_count = pool_count.checked_add(allocation.opaque_items)?;
             }
+        }
+        if let Some((_, allocation)) = &inherited {
+            pool_residual = pool_residual.checked_add(allocation.residual)?;
+            pool_count = pool_count.checked_add(allocation.opaque_items)?;
         }
         let changed_quantity =
             |changed: &[&Item]| -> Option<(i128, u64)> {
@@ -223,6 +221,14 @@ impl InputMeasurements {
                             }
                         }
                     }
+                    if native_allocated.is_none()
+                        && let Some((ids, allocation)) = &inherited
+                    {
+                        native_allocated = ids
+                            .iter()
+                            .position(|id| id == &item.identity)
+                            .and_then(|index| allocation.tokens.get(index).copied());
+                    }
                     let count = match native_allocated {
                         Some(n) => n,
                         None => self
@@ -247,7 +253,9 @@ impl InputMeasurements {
     /// not billed reasoning output tokens or ciphertext bytes. A previously
     /// unseen/initial opaque output without calibration is explicitly unknown.
     pub(crate) fn retained_reasoning_units(&self, count: u64) -> Option<u64> {
-        if count == 0 { return Some(0); }
+        if count == 0 {
+            return Some(0);
+        }
         self.calibrated_residual()?.checked_mul(count)
     }
 
@@ -261,7 +269,9 @@ pub(crate) fn retained_reasoning_count(output: &Value) -> Option<u64> {
     let mut count = 0u64;
     for value in output.as_array()? {
         if crate::savings::prompt_has_opaque(value) {
-            if !accounting_reasoning(value) { return None; }
+            if !accounting_reasoning(value) {
+                return None;
+            }
             count = count.checked_add(1)?;
         }
     }

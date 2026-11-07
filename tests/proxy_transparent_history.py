@@ -417,7 +417,9 @@ class TransparentHistory(unittest.TestCase):
         self.assertIn(history[1], fixture.primaries[-1]["input"],
                       "genuine compatible cache evidence must make the same original H retainable again")
         self.assertIn(history[0], fixture.primaries[-1]["input"])
-        self.assertEqual(proxy.checkpoint(history)[1]["cost_trajectory"]["restored"], 0,
+        observations = proxy.checkpoint(history)[1]["request_evidence"]["observations"]
+        latest = next(o["Primary"] for o in reversed(observations) if "Primary" in o)
+        self.assertEqual(latest["restoration"]["tokens"], 0,
                          "retaining canonical source replaces the old omission quantity with zero")
         self.assertEqual(len(fixture.reviews), 1, "reversibility needs no paid semantic recovery")
 
@@ -487,38 +489,28 @@ class TransparentHistory(unittest.TestCase):
         self.assertNotIn(history[1], fixture.primaries[-1]["input"])
         first_wire = fixture.primaries[-1]
         _, first = proxy.checkpoint(history)
-        before = first["cost_trajectory"]
-        self.assertGreater(before["restored"], 0)
-        self.assertEqual(before["last_traditional_input"], 100 + before["restored"])
+        before = next(o["Primary"] for o in reversed(first["request_evidence"]["observations"]) if "Primary" in o)
+        restored = before["restoration"]["tokens"]
+        self.assertGreater(restored, 0)
+        before_stats = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
         proxy.close()
-        # Owned synthetic scenario only: one legitimate restoration fits, two
-        # copies cross. No receipt, source, tariff, or semantic advice is staged.
-        path = self.state / "history.index"
-        index = json.loads(path.read_text())
-        owner = next(k for k,v in index["snapshots"].items() if v["primary"]["calls"] == 2)
-        threshold = 100 + before["restored"] + before["restored"] // 2
-        regressions.stage_comparison_scenario(index["snapshots"][owner], {
-            "context_window":threshold + 100,"reserve":100,"keep_recent":100,"summary":50})
-        path.write_bytes(wire(index))
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
         _, second = proxy.checkpoint(history)
-        after = second["cost_trajectory"]
-        self.evidence.update(first=first, second=second, threshold=threshold,
+        after = next(o["Primary"] for o in reversed(second["request_evidence"]["observations"]) if "Primary" in o)
+        after_stats = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
+        self.evidence.update(first=first, second=second, before_stats=before_stats, after_stats=after_stats,
                              primary_wires=fixture.primaries, review_wires=fixture.reviews)
         self.assertEqual(fixture.primaries[-1], first_wire, "same canonical H chooses the same omission")
         self.assertEqual(second["primary"]["calls"], 3)
         self.assertEqual(second["primary"]["input_tokens"], 10200)
         self.assertEqual(second["shadow"]["calls"], 1)
-        self.assertEqual(after["last_traditional_input"], before["last_traditional_input"],
-                         "repeated disposable omission must not accumulate restoration")
-        self.assertEqual(after["result"]["traditional_compactions"], 0,
-                         "duplicate restoration must not cross the modeled summary boundary")
-        self.assertEqual(after["result"]["summary_cost"], 0)
-        self.assertEqual(after["restored"], before["restored"])
+        self.assertEqual(after["restoration"], before["restoration"], "the current projection is evidence, not an accumulated prediction")
+        self.assertEqual(after_stats["traditional_compactions"], 0)
+        self.assertEqual(after_stats["summary_cost"], 0)
         rates = first["model_resolution"]["primary"]["rates"]
-        expected = (before["last_traditional_input"] * rates["cached"] + rates["output"]) / 1_000_000
-        self.assertAlmostEqual(after["result"]["traditional_cost"] - before["result"]["traditional_cost"],
+        expected = ((100 + restored) * rates["cached"] + rates["output"]) / 1_000_000
+        self.assertAlmostEqual(after_stats["traditional_cost"] - before_stats["traditional_cost"],
                                expected, delta=1e-12, msg="the repeated request uses one current restoration at frozen rates")
         self.assertEqual(second["model_resolution"], first["model_resolution"])
 

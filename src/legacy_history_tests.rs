@@ -50,7 +50,7 @@ fn current_history_continuation(initialized: bool) {
     assert_eq!(before.initial_compactions, u64::from(initialized));
     assert_eq!(before.traditional_compactions, u64::from(!initialized));
     assert_eq!(before.summary_cost > 0.0, !initialized);
-    assert!(before.observed_reviewer_cost > 0.0);
+    assert!(before.observed_reviewer_cost.unwrap() > 0.0);
     assert!(!before.cache_policy_boundaries.is_empty());
     assert_eq!(t.history.retired, 280000);
     assert_eq!(t.history.summary, 1000);
@@ -62,8 +62,14 @@ fn current_history_continuation(initialized: bool) {
     for _ in 0..2 {
         t = serde_json::from_value(saved.clone()).unwrap();
         let loaded = t.snapshot();
-        assert_eq!(loaded.observed_primary_cost, before.observed_primary_cost);
-        assert_eq!(loaded.observed_reviewer_cost, before.observed_reviewer_cost);
+        assert_eq!(
+            loaded.observed_primary_cost.unwrap(),
+            before.observed_primary_cost.unwrap()
+        );
+        assert_eq!(
+            loaded.observed_reviewer_cost.unwrap(),
+            before.observed_reviewer_cost.unwrap()
+        );
         assert_eq!(loaded.carry_cost, before.carry_cost);
         assert_eq!(loaded.traditional_cost, before.traditional_cost);
         assert_eq!(loaded.summary_cost, before.summary_cost);
@@ -83,7 +89,7 @@ fn current_history_continuation(initialized: bool) {
         assert_eq!(saved, frozen);
     }
     let mut mismatches = Vec::new();
-    let mut observed = before.observed_primary_cost;
+    let mut observed = before.observed_primary_cost.unwrap();
     let mut comparison = before.traditional_cost;
     for step in 0..2_u64 {
         t = serde_json::from_value(state(&t)).unwrap();
@@ -104,13 +110,16 @@ fn current_history_continuation(initialized: bool) {
         observed += input as f64 * 4.0 / 1e6;
         // These controls precede grading unknown continuation. Actual expense
         // and existing reviewer money are known even if comparison is not.
-        assert!((after.observed_primary_cost - observed).abs() < 1e-12);
+        assert!((after.observed_primary_cost.unwrap() - observed).abs() < 1e-12);
         assert_eq!(after.unavailable_primary_cost_calls, 0);
         assert_eq!(
             after.coverage.primary_responses,
             before.coverage.primary_responses + step + 1
         );
-        assert_eq!(after.observed_reviewer_cost, before.observed_reviewer_cost);
+        assert_eq!(
+            after.observed_reviewer_cost.unwrap(),
+            before.observed_reviewer_cost.unwrap()
+        );
         assert_eq!(after.reviewer_cost, before.reviewer_cost);
         assert_eq!(
             serde_json::to_value(&after.cache_policy_boundaries).unwrap(),
@@ -136,8 +145,9 @@ fn current_history_continuation(initialized: bool) {
             || after.matched_primary_responses != expected_matched
             || after.excluded_unpriced_calls != expected_excluded
             || (after.traditional_cost - comparison).abs() >= 1e-12
-            || (after.carry_cost - (before.carry_cost + observed - before.observed_primary_cost))
-                .abs()
+            || (after.carry_cost
+                - (before.carry_cost + observed - before.observed_primary_cost.unwrap()))
+            .abs()
                 >= 1e-12
         {
             mismatches.push(

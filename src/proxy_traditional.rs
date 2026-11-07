@@ -29,6 +29,13 @@ pub(super) struct HistoryContract {
     initialization_version: u32,
 }
 impl HistoryContract {
+    pub(super) fn for_scenario(&self, scenario: Scenario) -> Self {
+        Self {
+            keep_recent: scenario.keep_recent,
+            summary_tokens: scenario.summary,
+            ..self.clone()
+        }
+    }
     fn compatible(&self, other: &Self) -> bool {
         // Off mode omits resolved metadata; that absence is not evidence of a
         // new canonical history. Exact model/body/source hashes still fence
@@ -80,18 +87,13 @@ enum InputBasis {
     SemanticV1,
 }
 impl NativeInputCursor {
-    fn prefix(items: &[Value]) -> String {
-        format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&crate::openai::semantic_prompt_input(items)).unwrap()
-            )
-        )
+    fn prefix(items: &[String]) -> String {
+        format!("{:x}", Sha256::digest(serde_json::to_vec(items).unwrap()))
     }
-    fn matches(&self, body: &Value, input: u64, at: u64, projected: bool) -> bool {
+    fn matches(&self, body: &PrimaryFacts, input: u64, at: u64, projected: bool) -> bool {
         at >= self.at
             && (projected
-                || body["input"].as_array().is_some_and(|items| {
+                || body.semantic_input.as_ref().is_some_and(|items| {
                     items.len() >= self.items
                         && Self::prefix(&items[..self.items]) == self.prefix
                         && input >= self.input
@@ -146,6 +148,14 @@ pub(super) struct TraditionalHistoryState {
     projection_recovery: Option<ProjectionRecovery>,
 }
 impl TraditionalHistoryState {
+    #[cfg(test)]
+    pub(super) fn retention_member(&self) -> Option<(usize, usize, u64)> {
+        Some((
+            self.history_continuity.as_ref()?.cursor.items,
+            self.pending_retention.as_ref()?.items,
+            self.pending_retention.as_ref()?.visible?,
+        ))
+    }
     /// Whole-window cost imputation, not a replay or a second simulator. The
     /// continuous trajectory remains authoritative for directly modeled calls.
     /// Its traditional/observed-primary expense ratio includes paid summaries,
@@ -154,18 +164,28 @@ impl TraditionalHistoryState {
     /// reference, use neutral PRIMARY expense parity (reviewer never cancels).
     /// This exchangeability/net-compaction-parity assumption is deliberately
     /// weaker than reconstructing unknown quantities or inventing native units.
-    pub(super) fn whole_window(
-        evidence: &Estimate,
-        primary: f64,
-        reviewer: f64,
-        calls: u64,
-        reviewer_calls: u64,
-        money_known: bool,
-    ) -> Option<WholeWindowEstimate> {
+    pub(super) fn whole_window(evidence: &Estimate) -> Option<WholeWindowEstimate> {
+        let calls = evidence.coverage.primary_responses;
+        let reviewer_calls = evidence.coverage.reviewer_responses;
+        // The same successful population owns both amounts and counts. Missing
+        // historical scope is unknown; a lane with no successes contributes zero.
+        let primary = if calls == 0 {
+            0.0
+        } else {
+            evidence.observed_primary_cost?
+        };
+        let reviewer = if reviewer_calls == 0 {
+            0.0
+        } else {
+            evidence.observed_reviewer_cost?
+        };
+        let money_known = evidence.unavailable_primary_cost_calls == 0
+            && evidence.unavailable_reviewer_cost_calls == 0;
         // No primary completion is required for settled reviewer expense. A
         // priced reviewer-only window has a zero traditional denominator, even
         // when the reviewer itself was free; a truly empty window stays absent.
         if !money_known
+            || evidence.coverage.prior_untracked_calls > 0
             || (calls == 0 && reviewer_calls == 0)
             || !primary.is_finite()
             || !reviewer.is_finite()
@@ -228,16 +248,15 @@ impl TraditionalHistoryState {
     pub(super) fn defer_projection(
         &mut self,
         configuration: String,
-        body: &Value,
-        response: &Value,
+        body: &PrimaryFacts,
         input: Option<u64>,
         at: u64,
     ) {
         self.projection_recovery = if !self.unresolved_projection
-            && response["output"].as_array().is_some_and(Vec::is_empty)
+            && body.semantic_output.as_ref().is_some_and(Vec::is_empty)
         {
             input
-                .zip(body["input"].as_array())
+                .zip(body.semantic_input.as_ref())
                 .map(|(input, items)| ProjectionRecovery {
                     configuration,
                     cursor: NativeInputCursor {
@@ -257,12 +276,12 @@ impl TraditionalHistoryState {
     pub(super) fn recover_projection(
         &mut self,
         configuration: &str,
-        body: &Value,
+        body: &PrimaryFacts,
         input: u64,
         at: u64,
     ) -> Option<u64> {
         let prior = self.projection_recovery.as_ref()?;
-        let items = body["input"].as_array()?;
+        let items = body.semantic_input.as_ref()?;
         if prior.configuration != configuration
             || input != prior.cursor.input
             || at < prior.cursor.at
@@ -283,15 +302,9 @@ impl TraditionalHistoryState {
         self.projection_recovery = None;
     }
 
-    pub(super) fn defer_retention(
-        &mut self,
-        body: &Value,
-        output: &Value,
-        restoration: i128,
-        fixed: u64,
-    ) {
-        let mut next = body["input"].as_array().unwrap().clone();
-        let output = output.as_array();
+    pub(super) fn defer_retention(&mut self, body: &PrimaryFacts, restoration: i128, fixed: u64) {
+        let mut next = body.semantic_input.as_ref().unwrap().clone();
+        let output = body.semantic_output.as_ref();
         if let Some(output) = output {
             next.extend(output.iter().cloned());
         }
@@ -300,33 +313,22 @@ impl TraditionalHistoryState {
             items: next.len(),
             restoration: restoration.to_string(),
             fixed,
-            visible: receipts::retained_output_tokens(&Value::Array(
-                output.cloned().unwrap_or_default(),
-            )),
-            opaque_items: output.and_then(|output| {
-                crate::proxy_quantity::retained_reasoning_count(&Value::Array(output.clone()))
-            }),
+            visible: body.retained_visible,
+            opaque_items: body.retained_opaque,
         });
     }
 
     pub(super) fn resolve_retention(
         &self,
-        primary: PrimaryObservation<'_>,
+        body: &PrimaryFacts,
         native: u64,
         restoration: i128,
         projected: bool,
         scenario: Scenario,
     ) -> Option<(u64, u64)> {
-        let PrimaryObservation {
-            body,
-            measurements,
-            route,
-            resolved,
-            ..
-        } = primary;
         let pending = self.pending_retention.as_ref()?;
         let cursor = &self.history_continuity.as_ref()?.cursor;
-        let items = body["input"].as_array()?;
+        let items = body.semantic_input.as_ref()?;
         if projected
             || restoration.to_string() != pending.restoration
             || items.len() < pending.items
@@ -349,28 +351,12 @@ impl TraditionalHistoryState {
             // Extra caller input prevents exact attribution. Admit the same
             // neutral residual estimator only when this output's member slice
             // has valid attribution; never bypass a rejected native block.
-            let m = measurements?;
-            let mut without_output = body.clone();
-            without_output["input"]
-                .as_array_mut()?
-                .drain(cursor.items..pending.items);
-            let member =
-                m.clone()
-                    .accounting_restoration(body, &without_output, route, resolved)?;
+
             // Member input allocations include local input framing. Convert
             // only their hidden remainder to the retained-output adapter, then
             // add this output's own visible units. Preserve the admitted block's
             // integer remainder; a pooled forecast is not this member's share.
-            let visible_input = items[cursor.items..pending.items]
-                .iter()
-                .try_fold(0u64, |sum, item| {
-                    sum.checked_add(m.visible_text_tokens(item))
-                })?;
-            pending.visible?.checked_add(
-                u64::try_from(member.tokens)
-                    .ok()?
-                    .checked_sub(visible_input)?,
-            )?
+            body.retained_member?
         };
         Some((retained, pending.fixed))
     }
@@ -401,7 +387,7 @@ impl TraditionalHistoryState {
     pub(super) fn compatible(
         &self,
         contract: &HistoryContract,
-        body: &Value,
+        body: &PrimaryFacts,
         input: u64,
         at: u64,
         projected: bool,
@@ -431,7 +417,7 @@ impl TraditionalHistoryState {
     pub(super) fn observe(
         &mut self,
         mut contract: HistoryContract,
-        items: &[Value],
+        items: &[String],
         input: u64,
         at: u64,
     ) {

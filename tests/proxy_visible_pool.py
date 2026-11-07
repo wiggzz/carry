@@ -61,7 +61,7 @@ class VisiblePool(unittest.TestCase):
         self.assertTrue(all(not b['items'] for b in seed['primary_input'].get('blocks', [])))
         proxy.close()
         observations = {}
-        self.evidence.update(seed=seed, advice=advice, arms=observations)
+        self.evidence.update(seed=seed, advice=advice, arms=observations, body=body, append=append)
         for name in ['indexed_advice', 'without_advice']:
             directory = self.state / name
             shutil.copytree(seed_dir, directory)
@@ -101,7 +101,8 @@ class VisiblePool(unittest.TestCase):
             self.assertAlmostEqual(saved['shadow']['cost_usd'], 0.0000105, places=12)
             self.assertFalse(saved['primary_input']['reasoning_conflict'])
             self.assertEqual(plan['primary_input_basis'], 'receipt_anchored_reasoning_forecast')
-            self.assertEqual(plan['primary_estimated_tokens'], 11354)
+            # Native registration checks the independent neutral occurrence oracle.
+            self.assertGreater(plan['primary_estimated_tokens'], 10000)
             self.assertIsNone(plan['primary_receipt_prediction_tokens'])
             self.assertIsNone(plan['primary_required_tokens'])
             self.assertIsNone(plan['primary_fits'])

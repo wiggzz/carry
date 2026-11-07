@@ -388,7 +388,7 @@ pub struct ScenarioCachePolicy {
     pub ttl_seconds: u64,
 }
 /// Request-level population contract, separate from eligibility and tariffs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum ScenarioCacheMode {
     Implicit,
     Disabled,

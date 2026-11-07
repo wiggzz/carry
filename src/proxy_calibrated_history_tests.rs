@@ -137,7 +137,7 @@ fn pending_mixed_output_uses_admitted_member_remainder_before_primary_price() {
                         "the next primary must be priced AFTER the recovered summary"
                     );
                     assert_eq!(t.snapshot().matched_primary_responses, 1);
-                    assert_eq!(t.snapshot().observed_primary_cost, 0.123 + 0.456);
+                    assert_eq!(t.snapshot().observed_primary_cost.unwrap(), 0.123 + 0.456);
                     assert_eq!(t.snapshot().carry_cost, 0.456);
                     assert_eq!(t.snapshot().initial_compactions, 0);
                 }
@@ -219,8 +219,8 @@ fn unknown_retention_resolves_summary_before_next_primary_after_restart() {
             < 1e-12
     );
     assert_eq!(
-        unknown.snapshot().observed_primary_cost,
-        known.snapshot().observed_primary_cost
+        unknown.snapshot().observed_primary_cost.unwrap(),
+        known.snapshot().observed_primary_cost.unwrap()
     );
 }
 
@@ -313,8 +313,8 @@ fn unknown_retention_advances_known_divergent_cache_before_restart() {
             < 1e-12
     );
     assert_eq!(
-        unknown.snapshot().observed_primary_cost,
-        known.snapshot().observed_primary_cost
+        unknown.snapshot().observed_primary_cost.unwrap(),
+        known.snapshot().observed_primary_cost.unwrap()
     );
 }
 
@@ -347,6 +347,9 @@ fn successful_unknown_projection_cannot_reopen_free_initialization() {
     partial["input"].as_array_mut().unwrap().remove(0);
     let mut m = crate::proxy_quantity::InputMeasurements::default();
     m.observe(&full, &json!({"input_tokens":5000}), "route", None, 2);
+    // Contradictory counts, not lack of an inherited allocation, make this
+    // successful transition genuinely unknowable under the shared owner.
+    m.observe(&full, &json!({"input_tokens":5001}), "route", None, 3);
     let unavailable = m.accounting_restoration(&full, &partial, "route", None);
     assert!(unavailable.is_none());
     t.projected_evidence(unavailable, true);
@@ -375,7 +378,7 @@ fn successful_unknown_projection_cannot_reopen_free_initialization() {
     assert!(t.snapshot().traditional_cost >= before.traditional_cost);
     assert!(t.snapshot().summary_cost >= before.summary_cost);
     assert_eq!(t.snapshot().coverage.primary_responses, 5);
-    assert!(t.snapshot().observed_primary_cost > before.observed_primary_cost);
+    assert!(t.snapshot().observed_primary_cost.unwrap() > before.observed_primary_cost.unwrap());
     assert!(t.snapshot().matched_primary_responses >= 2);
     if t.snapshot().matched_primary_responses == 2 {
         assert_eq!(
@@ -438,7 +441,7 @@ fn unavailable_intervening_retention_cannot_later_skip_successful_transitions() 
     assert_eq!(t.snapshot().traditional_cost, frozen.traditional_cost);
     assert_eq!(t.snapshot().coverage.unavailable_quantity_calls, 3);
     assert_eq!(t.snapshot().initial_compactions, 0);
-    assert!(t.snapshot().observed_primary_cost > frozen.observed_primary_cost);
+    assert!(t.snapshot().observed_primary_cost.unwrap() > frozen.observed_primary_cost.unwrap());
 }
 
 #[test]
@@ -652,8 +655,11 @@ fn resolved_zero_projection_gap_recovers_transitions_not_historical_money() {
         );
         assert_eq!(t.snapshot().initial_compactions, 0);
         let expected_observed =
-            gap.observed_primary_cost + if successful { 0.8 } else { 0.0 } + 0.9;
-        assert_eq!(t.snapshot().observed_primary_cost, expected_observed);
+            gap.observed_primary_cost.unwrap() + if successful { 0.8 } else { 0.0 } + 0.9;
+        assert_eq!(
+            t.snapshot().observed_primary_cost.unwrap(),
+            expected_observed
+        );
     }
 }
 
@@ -783,7 +789,7 @@ fn calibrated_partial_projection_replaces_omission_through_summary_restart_and_f
     let dashboard = serde_json::to_value(t.snapshot().dashboard(false)).unwrap();
     assert_eq!(
         dashboard["quantity_evidence"]["comparison_scope"],
-        "matched_subset_not_whole_session"
+        "matched_completed_primary_window"
     );
     // A larger replacement memory is a NEGATIVE current restoration, not zero
     // and not the previous omission plus a new edit.

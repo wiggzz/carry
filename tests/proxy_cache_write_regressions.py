@@ -54,7 +54,7 @@ class CacheWriteRegressions(unittest.TestCase):
             saved = proxy.saved()
             snapshots.append(copy.deepcopy({
                 "estimate": stats["sessions"][0]["cost_estimate"],
-                "trajectory": saved["cost_trajectory"]}))
+                "evidence": saved['request_evidence']}))
             self.assertEqual(saved["compactions"], 0)
             self.assertEqual(fixture.primaries[-1]["input"], history)
             proxy.close()
@@ -66,9 +66,8 @@ class CacheWriteRegressions(unittest.TestCase):
 
     def assert_summary_survives_policy(self, snapshots, *, migrate):
         first, second, third = snapshots
-        self.assertEqual(first["trajectory"]["retired"], 280000)
-        self.assertEqual(first["trajectory"]["summary"], 1000)
-        self.assertEqual(first["trajectory"]["last_traditional_input"], 21000)
+        self.assertAlmostEqual(first['estimate']['traditional_cost'], 21000 * 2.5 / 1e6, places=12)
+        self.assertEqual(first['evidence']['observations'][0]['Primary']['facts']['native']['input_tokens'], 300000)
         for index, snapshot in enumerate(snapshots):
             estimate = snapshot["estimate"]
             self.assertEqual(estimate["initial_compactions"], 1,
@@ -76,8 +75,8 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertEqual(estimate["traditional_compactions"], 0)
             self.assertEqual(estimate["summary_cost"], 0.0)
             self.assertEqual(estimate["summary_cost"], first["estimate"]["summary_cost"])
-            self.assertEqual(snapshot["trajectory"]["retired"], 280000)
-            self.assertEqual(snapshot["trajectory"]["summary"], 1000)
+            self.assertEqual(snapshot['evidence']['observations'][0], first['evidence']['observations'][0],
+                             'later policy/restart cannot rewrite frozen native history')
             self.assertEqual(estimate["matched_primary_responses"], index + 1)
             self.assertEqual(estimate["excluded_unpriced_calls"], 0)
         # Free initialization precedes the first primary, so its next append is
@@ -109,8 +108,8 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertEqual(snapshot["estimate"]["traditional_compactions"], 0)
             self.assertEqual(snapshot["estimate"]["summary_cost"], 0.0)
             self.assertEqual(snapshot["estimate"]["summary_cost"], first["estimate"]["summary_cost"])
-            self.assertEqual(snapshot["trajectory"]["retired"], 280000)
-            self.assertEqual(snapshot["trajectory"]["summary"], 1000)
+            self.assertEqual(snapshot['evidence']['observations'][0], first['evidence']['observations'][0],
+                             'later policy/restart cannot rewrite frozen native history')
         # The summarized branch is already warm before the transition. Thus its
         # cold request cannot be explained by traditional_edited from a summary.
         for index, expected in [
@@ -404,7 +403,7 @@ class CacheWriteRegressions(unittest.TestCase):
                     self.harness.stack.callback(proxy.close)
                     if index:
                         history.append({"role": "user", "content": f"continue {index}"})
-                    self.assertEqual(proxy.send(history, model="gpt-6.1-sol",
+                    self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1,
                         prompt_cache_options={"mode": mode, "ttl": "30m"},
                         prompt_cache_key="summary-tiers")[0], 200)
                     cached = 300000 if mode == "implicit" and index > 1 else 0

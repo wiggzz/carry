@@ -368,6 +368,8 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.equal(cards().get('Estimated savings'),'$90.000000 (37.5%)');
   assert.match(visibleText(byClass(recentRow,'session-savings')),/\$9\.000000 \(37\.5%\)/);
   assert.match(visibleText(elements.get('cards').children[1]),/Whole accounting window/);
+  assert.match(visibleText(elements.get('cards').children[1]),/successful completions only/);
+  assert.match(visibleText(elements.get('cards').children[0]),/all paid attempts/);
   assert.match(visibleText(byClass(recentRow,'session-savings')),/5 inferred/);
   data.cost_estimate.whole_window=null;
   await refresh();

@@ -316,7 +316,7 @@ function coverageChips(e){
 function comparisonScopeNote(root,e){
  if(e&&Object.prototype.hasOwnProperty.call(e,'whole_window')){
   const w=e.whole_window;
-  note(root,w?'Whole accounting window · '+fmt(w.primary_responses)+' primary responses · '+fmt(w.inferred_primary_responses)+' inferred':'Whole-window estimate unavailable · actual money/window incomplete','comparison-scope card-note');
+  note(root,w?'Whole accounting window · successful completions only · '+fmt(w.primary_responses)+' primary responses · '+fmt(w.inferred_primary_responses)+' inferred':'Whole-window estimate unavailable · actual money/window incomplete','comparison-scope card-note');
   return;
  }
  const q=e?.quantity_evidence,scope=q?.comparison_scope;
@@ -336,7 +336,7 @@ function renderSession(s){
  identity.append(requestRecency(s));
  note(identity,count(s.completed_requests||0,'request')+(s.rewrites?' · '+count(s.rewrites.dispatched,'rewrite')+(s.rewrites.forced?' · '+fmt(s.rewrites.forced)+' forced':''):''),'request-counts');el.append(identity);
  const ledgers=[s.primary||{},s.shadow||{}],missing=sum(ledgers,'unavailable_cost_calls'),e=s.cost_estimate,h=headlineEstimate(e);
- const costs=document.createElement('div');costs.className='session-costs';note(costs,missing?'Priced subtotal':'Observed cost','label');note(costs,money(pricedSubtotal(ledgers)),'value');note(costs,'Primary + reviewer · saved usage','card-note');el.append(costs);
+ const costs=document.createElement('div');costs.className='session-costs';note(costs,missing?'Priced subtotal':'Observed cost','label');note(costs,money(pricedSubtotal(ledgers)),'value');note(costs,'Primary + reviewer · all paid attempts','card-note');el.append(costs);
  const saved=document.createElement('div');saved.className='session-savings';saved.setAttribute('data-loss',String(h?.savings<0));note(saved,'Estimated savings','label');note(saved,savingsText(e),'value');note(saved,h?.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');comparisonScopeNote(saved,e);el.append(saved);
  el.append(contextOverview(s.context||{}),tokenMetrics(s));
  const alerts=[];
@@ -360,7 +360,7 @@ function renderSession(s){
  if(e?.counterfactual_cache_policy||e?.accounting_basis){const accounting=disclosure('accounting:'+s.id,'Accounting details','session-accounting');if(e.counterfactual_cache_policy)inspectionMetric(accounting,'Comparison cache policy',e.counterfactual_cache_policy);if(e.accounting_basis)inspectionMetric(accounting,'Accounting basis',e.accounting_basis);if(e.quantity_evidence){inspectionMetric(accounting,'Quantity estimates',e.quantity_evidence.version===1?'Receipt blocks + native-increment residual allocations':'Legacy receipt quantities','No calibrated interval; same outputs and tool sequence assumed');inspectionMetric(accounting,'Historical quantity policy',e.quantity_evidence.historical_policy_scope,fmt(e.quantity_evidence.legacy_priced_calls||0)+' legacy priced calls · no retrospective repricing')}details.append(accounting)}
  if(e&&Object.prototype.hasOwnProperty.call(e,'whole_window')){
  const whole=disclosure('whole:'+s.id,'Whole-window estimate assumptions','whole-window-assumptions');
- inspectionMetric(whole,'Historical inference',e.whole_window?.assumption?.replaceAll('_',' ')||'Actual money unavailable', 'Same outputs and tool sequence; conditional cache; summary/cache costs amortized through reference ratio, or neutral net compaction expense parity without a reference. Not measured or causal savings; no calibrated interval.');
+ inspectionMetric(whole,'Historical inference',e.whole_window?.assumption?.replaceAll('_',' ')||'Actual money unavailable', 'Successful completed primary/reviewer outcomes only; failed attempts excluded symmetrically. Observed cost separately includes all paid attempts. Same outputs and tool sequence; conditional cache; summary/cache costs amortized through reference ratio, or neutral net compaction expense parity without a reference. Not measured or causal savings; no calibrated interval.');
  inspectionMetric(whole,'Strict matched diagnostics',money(e.carry_cost)+' Carry / '+money(e.traditional_cost)+' traditional','Original subset evidence; not the headline');details.append(whole);
  }
  details.append(transcriptView(s));el.append(details);return el;
@@ -381,7 +381,7 @@ async function refresh(){
   const unpriced=sum(all,'unavailable_cost_calls'),unreadable=data.unavailable_sessions||0,partial=unpriced>0||unreadable>0;
   const estimate=data.cost_estimate||{},headline=headlineEstimate(estimate);
   $('cards').replaceChildren(card(partial?'Priced subtotal':'Observed cost',money(pricedSubtotal(all))),card('Estimated savings',savingsText(estimate)));
-  note($('cards').children[0],'Primary + reviewer · saved usage','card-note');
+  note($('cards').children[0],'Primary + reviewer · all paid attempts','card-note');
   note($('cards').children[1],headline?.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');
   comparisonScopeNote($('cards').children[1],estimate);
   if(headline?.savings<0)$('cards').children[1].className='card loss';
