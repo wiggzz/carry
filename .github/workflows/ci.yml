@@ -207,6 +207,7 @@ jobs:
         run: >-
           python3 -m unittest -v
           scripts/test_benchmark_progress.py
+          scripts/test_benchmark_comparison.py scripts/test_benchmark_direct.py scripts/test_slopcodebench_runtime_cli.py scripts/test_swebench_comparison.py
           scripts/test_benchmark_preparation_telemetry.py
           scripts/test_benchmark_worker_diagnostics.py
           scripts/test_render_swebench_worker_user_data.py
@@ -250,7 +251,7 @@ jobs:
   ci-status:
     name: test
     if: always() && (github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe)
-    needs: [test, integration, native, python, infra]
+    needs: [test, integration, native, python, infra, scb-protected-fixture]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -261,12 +262,14 @@ jobs:
           INTEGRATION_RESULT: ${{ needs.integration.result }}
           NATIVE_RESULT: ${{ needs.native.result }}
           INFRA_RESULT: ${{ needs.infra.result }}
+          SCB_RESULT: ${{ needs.scb-protected-fixture.result }}
         run: |
           test "$RUST_RESULT" = success
           test "$PYTHON_RESULT" = success
           test "$INFRA_RESULT" = success
           test "$INTEGRATION_RESULT" = success
           test "$NATIVE_RESULT" = success
+          test "$SCB_RESULT" = success
 
   test:
     name: Rust unit tests and lint
@@ -464,6 +467,88 @@ jobs:
             ~/.cargo/git/db
             target
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+  scb-protected-fixture:
+    name: Pinned official SCB protected runtime (synthetic, no model)
+    if: github.event_name != 'workflow_dispatch' || !inputs.preparation_solver_probe
+    needs: native
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Checkout exact official SCB source, not its mutable problem catalog
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: SprocketLab/slop-code-bench
+          ref: af5a9cbc311605b5cceb80200ca9832bdff2d7b1
+          path: .scb-upstream
+          persist-credentials: false
+      - name: Python for pinned official SCB (PEP 695)
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Download this candidate's exact portable binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: carry-linux-amd64-musl-${{ github.sha }}
+          path: .scb-carry
+      - name: Install official locked dependencies only on disposable hosted runner
+        run: |
+          set -euo pipefail
+          python -m pip install uv==0.9.7
+          uv sync --project .scb-upstream --frozen --no-dev
+          chmod +x .scb-carry/carry
+          git rev-parse HEAD
+          git -C .scb-upstream rev-parse HEAD
+          sha256sum .scb-carry/carry
+      # The component contract uses the same Python 3.12 + frozen upstream lock
+      # as the full runner; ambient runner Python is not its dependency owner.
+      - name: Official SCB report component contract (model-free, no Docker)
+        env:
+          SCB_OFFICIAL_REPORT_MODULE: ${{ github.workspace }}/.scb-upstream/src/slop_code/evaluation/report.py
+        run: .scb-upstream/.venv/bin/python -B -m unittest -v scripts.test_benchmark_comparison scripts.test_slopcodebench
+      - name: Actual official runner, native exec/retry, gold evaluator, containment and paired receipts
+        if: ${{ !cancelled() }}
+        timeout-minutes: 12
+        env:
+          CARRY_SCB_HOSTED_FIXTURE: '1'
+          SCB_UPSTREAM_ROOT: ${{ github.workspace }}/.scb-upstream
+          SCB_CARRY_BINARY: ${{ github.workspace }}/.scb-carry/carry
+          SCB_FIXTURE_OUTPUT: ${{ runner.temp }}/scb-protected-synthetic
+        run: .scb-upstream/.venv/bin/python -m unittest -v scripts.test_slopcodebench_runtime
+      - name: Actual paired SWE native worker and official evaluator (synthetic, no model)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        env:
+          CARRY_SCB_HOSTED_FIXTURE: '1'
+          SCB_FIXTURE_OUTPUT: ${{ runner.temp }}/scb-protected-synthetic
+        run: |
+          python -m venv "$RUNNER_TEMP/swe-paired-contract"
+          "$RUNNER_TEMP/swe-paired-contract/bin/python" -m pip install 'swebench==4.1.0'
+          "$RUNNER_TEMP/swe-paired-contract/bin/python" -B -m unittest -v scripts.test_swebench_runtime
+
+      - name: Upload source-bound synthetic runtime evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: scb-protected-synthetic-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/scb-protected-synthetic/contract.json
+            ${{ runner.temp }}/scb-protected-synthetic/prepared.json
+            ${{ runner.temp }}/scb-protected-synthetic/readiness
+            ${{ runner.temp }}/scb-protected-synthetic/readiness-policy-rejection.json
+            ${{ runner.temp }}/scb-protected-synthetic/late-reviewer
+            ${{ runner.temp }}/scb-protected-synthetic/late-reviewer-final
+            ${{ runner.temp }}/scb-protected-synthetic/paired
+            ${{ runner.temp }}/scb-protected-synthetic/provider-synthetic.log
+            ${{ runner.temp }}/scb-protected-synthetic/swe-native
+          if-no-files-found: warn
+          retention-days: 7
 
   native:
     name: Portable release and native fixtures

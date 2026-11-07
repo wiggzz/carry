@@ -30,12 +30,14 @@ class DeadlineAccountingTests(unittest.TestCase):
             if pending:
                 events.append({'event': 'model_request', 'data': {'step': 2}})
             output = root / 'output'
-            (output / 'trace.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in events))
-            (output / 'result.json').write_text(json.dumps({'usage': usage,
-                'response_retries': retries if result_retries is None else result_retries}))
-            (output / 'final.patch').write_text('')
             def launch(command, **kwargs):
                 if command[:2] == ['docker', 'run']:
+                    mount = next(value for value in command if value.endswith(',dst=/benchmark/output'))
+                    raw = pathlib.Path(mount.split('src=', 1)[1].rsplit(',dst=', 1)[0])
+                    (raw / 'trace.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in events))
+                    (raw / 'result.json').write_text(json.dumps({'usage': usage,
+                        'response_retries': retries if result_retries is None else result_retries}))
+                    (raw / 'final.patch').write_text('')
                     if launch_timeout:
                         raise subprocess.TimeoutExpired(command, 1200)
                     if timed_out or exit_code:

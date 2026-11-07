@@ -1,0 +1,145 @@
+name: Official SCB paired Codex (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      execute_paid:
+        description: 'Run BOTH frozen Luna arms after official gold readiness (model spend)'
+        type: boolean
+        required: true
+        default: false
+      budget_usd:
+        description: 'Combined between-problem stop threshold; NOT a hard spend cap'
+        type: string
+        required: true
+        default: '10'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: official-scb-paired
+  cancel-in-progress: false
+
+jobs:
+  official-scb:
+    runs-on: ubuntu-latest
+    environment: swe-bench
+    # Hosted ceiling, not a reduction to native checkpoint/response/turn limits.
+    timeout-minutes: 360
+    env:
+      SCB_PYTHON: ${{ github.workspace }}/.scb-upstream/.venv/bin/python
+    steps:
+      # runner context is unavailable in job-level env expressions.
+      - name: Initialize hosted output directory
+        env:
+          SCB_OUTPUT: ${{ runner.temp }}/official-scb
+        run: printf 'SCB_OUTPUT=%s\n' "$SCB_OUTPUT" >> "$GITHUB_ENV"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Pinned official runner
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: SprocketLab/slop-code-bench
+          ref: af5a9cbc311605b5cceb80200ca9832bdff2d7b1
+          path: .scb-upstream
+          persist-credentials: false
+      - name: Pinned official problems (never mounted into agent)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gabeorlanski/scb-problems
+          ref: 9cd9ca3a51c3d3e2a99d2488a25baf73a2204451
+          path: .scb-problems
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Validate requested stop threshold (no secrets)
+        env:
+          BUDGET_USD: ${{ inputs.budget_usd }}
+        run: |
+          python - <<'PY'
+          import math, os
+          value = float(os.environ['BUDGET_USD'])
+          if not math.isfinite(value) or not 0 < value <= 20:
+              raise SystemExit('budget_usd must be positive and at most 20; not a hard cap')
+          PY
+      - name: Build this exact source portable Carry (no secrets)
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cargo build --locked --release --target x86_64-unknown-linux-musl
+          target/x86_64-unknown-linux-musl/release/carry --version
+      - name: Install official locked runner (no secrets)
+        run: |
+          set -euo pipefail
+          python -m pip install uv==0.9.7
+          uv sync --project .scb-upstream --frozen --no-dev
+      - name: Preparation and scorer behavior tests (no model or Docker)
+        env:
+          SCB_OFFICIAL_REPORT_MODULE: ${{ github.workspace }}/.scb-upstream/src/slop_code/evaluation/report.py
+        run: '"$SCB_PYTHON" -B -m unittest -v scripts.test_slopcodebench_prepare scripts.test_slopcodebench_workflow scripts.test_slopcodebench scripts.test_slopcodebench_runtime_cli'
+      - name: Real native images and ALL six official offline gold evaluations (no secrets)
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          mkdir -p "$SCB_OUTPUT"
+          "$SCB_PYTHON" -B -m scripts.slopcodebench_prepare \
+            --output "$SCB_OUTPUT/prepared" --upstream "$PWD/.scb-upstream" \
+            --problems "$PWD/.scb-problems" \
+            --carry "$PWD/target/x86_64-unknown-linux-musl/release/carry" \
+            2>&1 | tee "$SCB_OUTPUT/preparation.log"
+      # The Environment key is exposed ONLY after genuine offline gold readiness.
+      # Neither the agent image nor evaluator receives this provider credential.
+      - name: Explicitly authorized real paired execution
+        if: ${{ inputs.execute_paid }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BUDGET_USD: ${{ inputs.budget_usd }}
+        run: |
+          set -euo pipefail
+          test -n "$OPENAI_API_KEY"
+          "$SCB_PYTHON" -B -m scripts.slopcodebench \
+            --contract "$SCB_OUTPUT/prepared/contract.json" \
+            --prepared "$SCB_OUTPUT/prepared/prepared.json" \
+            --run --allow-paid --budget-usd "$BUDGET_USD" --output "$SCB_OUTPUT/paired" \
+            > "$SCB_OUTPUT/paired-summary.json"
+      - name: Reject incomplete or unpriced comparison (no secrets)
+        if: ${{ inputs.execute_paid }}
+        run: |
+          "$SCB_PYTHON" - <<'PY'
+          import json, os
+          from pathlib import Path
+          from scripts.benchmark_comparison import summarize
+          root = Path(os.environ['SCB_OUTPUT'])/'paired'
+          plan = json.loads((root/'plan.json').read_text())
+          rows = [json.loads(line) for line in (root/'records.jsonl').read_text().splitlines()]
+          report = summarize(plan, rows)
+          if plan['expected_records'] != 12 or len(rows) != 12:
+              raise SystemExit('missing frozen checkpoint-arm outcomes')
+          if any(row['status'] != 'evaluated' for row in rows):
+              raise SystemExit('incomplete official evaluation; retain all slots, do not selectively retry')
+          if any(arm['estimated_api_usd'] is None for arm in report['arms'].values()):
+              raise SystemExit('native accounting is incomplete')
+          PY
+      - name: Retain bounded public receipts and raw outcome evidence on failure
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: official-scb-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/official-scb/preparation.log
+            ${{ runner.temp }}/official-scb/prepared/contract.json
+            ${{ runner.temp }}/official-scb/prepared/prepared.json
+            ${{ runner.temp }}/official-scb/prepared/selection.json
+            ${{ runner.temp }}/official-scb/prepared/readiness
+            ${{ runner.temp }}/official-scb/paired
+            ${{ runner.temp }}/official-scb/paired-summary.json
+          if-no-files-found: warn
+          retention-days: 14

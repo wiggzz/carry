@@ -365,15 +365,18 @@ upstream.listen(0, '127.0.0.1', () => {
         received = []
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            (root / 'final.patch').write_text('')
-            (root / 'trace.log').write_text('')
             def docker(command, **kwargs):
                 received.append((command, kwargs))
+                if command[:2] == ['docker', 'run']:
+                    mount = next(value for value in command if value.endswith(',dst=/benchmark/output'))
+                    raw = pathlib.Path(mount.split('src=', 1)[1].rsplit(',dst=', 1)[0])
+                    (raw / 'final.patch').write_text('')
+                    (raw / 'trace.log').write_text('')
                 return subprocess.CompletedProcess(command, 0, '', '')
             with patch.dict(os.environ, {'OPENAI_API_KEY':'real-provider-key'}), \
                     patch.object(worker.subprocess, 'run', side_effect=docker):
                 worker.run_agent(instance_id='test', harness='pi', image='image', repo=root,
-                    harness_bundle=root, task_input=root, output=root, model='gpt-6-luna', reasoning='medium',
+                    harness_bundle=root, task_input=root, output=root/'output', model='gpt-6-luna', reasoning='medium',
                     network='internal', proxy_ip='172.20.0.2', api_base='http://openai-proxy:8080/v1',
                     client_token='scoped-slot-token')
             launch = next(kw for cmd, kw in received if cmd[:2] == ['docker', 'run'])
