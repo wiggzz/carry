@@ -185,13 +185,10 @@ fn numeric_selected_path(directory: &Path, session: &Session) -> PathBuf {
     let generation = mark["generation"]
         .as_str()
         .map_or(String::new(), |g| format!("-g{g}"));
+    let namespace = Sha256::digest(serde_json::to_vec(&mark["namespace"]).unwrap());
     directory.join(format!(
-        ".request-evidence-{}-{}{generation}.jsonl",
+        ".request-evidence-{}-{namespace:x}{generation}.jsonl",
         mark["owner"].as_str().unwrap(),
-        format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&mark["namespace"]).unwrap())
-        )
     ))
 }
 

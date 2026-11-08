@@ -868,6 +868,93 @@ async fn proxy_cli_serves_health_and_forwards_opaque_json() {
     provider.await.unwrap();
 }
 
+// This deliberately covers only the off-mode, unknown-model fixture below.
+// Exact record equality pins the numeric schema; no arbitrary JSONL/prefix or
+// raw request/response field is admitted as an authoritative archive.
+fn private_numeric_journal(bytes: &[u8], saved: &serde_json::Value, completed: u64) -> bool {
+    use sha2::{Digest, Sha256};
+    let digest = |value: &serde_json::Value| {
+        format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap()))
+    };
+    let valid = || -> Option<()> {
+        let mark = &saved["request_evidence"]["archive"];
+        if mark["events"] != completed
+            || mark["bytes"].as_u64()? != bytes.len() as u64
+            || mark["namespace"] != ""
+            || mark["prior_untracked"] != 0
+        {
+            return None;
+        }
+        let mut previous = String::new();
+        let lines = bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        if lines.len() as u64 != completed {
+            return None;
+        }
+        let refs = json!([digest(&json!({"role":"user","content":"hello"}))]);
+        for (sequence, line) in lines.iter().enumerate() {
+            if line.last() != Some(&b'\n') {
+                return None;
+            }
+            let record: serde_json::Value = serde_json::from_slice(line).ok()?;
+            let facts = &record["event"]["Primary"]["facts"];
+            for value in [
+                &mark["owner"],
+                &facts["configuration"],
+                &facts["cache_scope"],
+                &facts["contract"]["source_sha256"],
+                &facts["contract"]["prompt_settings_sha256"],
+            ] {
+                let hash = value.as_str()?;
+                if hash.len() != 64
+                    || !hash
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                {
+                    return None;
+                }
+            }
+            let prefix = if sequence == 0 {
+                json!([])
+            } else {
+                refs.clone()
+            };
+            let expected_facts = json!({
+                "configuration": facts["configuration"],
+                "contract": {"version":1,"quantity":"ProviderRequestInputTotalV1",
+                    "projection":"ReceiptBlocksOrVisibleTextV2","model":"fixture-model",
+                    "resolved_model":null,"source_sha256":facts["contract"]["source_sha256"],
+                    "source_class":null,"prompt_settings_sha256":facts["contract"]["prompt_settings_sha256"],
+                    "keep_recent":20000,"summary_tokens":1000,"initialization_version":1},
+                "model":"fixture-model","resolved":null,"at":facts["at"].as_u64()?,
+                "reused_input":0,"input":null,"semantic_input":null,"semantic_output":null,
+                "native":null,
+                "cost":null,"billable":true,"retained":0,"retained_visible":0,"retained_opaque":0,
+                "retained_member":null,"estimated_retained":false,"unsupported_opaque":false,
+                "allowance":null,"fixed":facts["fixed"].as_u64()?,"protected":facts["protected"].as_u64()?,
+                "cache_scope":facts["cache_scope"],"cache_mode":"Implicit","read_refresh":null,
+                "native_summary":false,
+                "prompt":{"items":1,"wire":digest(&refs),"semantic":digest(&refs),
+                    "prior_prefix":[usize::from(sequence != 0),digest(&prefix),digest(&prefix)]}
+            });
+            if record
+                != json!({"version":1,"owner":mark["owner"],"namespace":mark["namespace"],
+                "sequence":sequence,"previous":previous,
+                "event":{"Primary":{"facts":expected_facts,
+                    "restoration":{"tokens":0,"measured":true,"estimated_opaque_items":0},"edited":false}}})
+            {
+                return None;
+            }
+            previous = format!("{:x}", Sha256::digest(line));
+        }
+        (mark["sha256"] == previous
+            && mark["last_record_bytes"].as_u64()? == lines.last()?.len() as u64)
+            .then_some(())
+    };
+    valid().is_some()
+}
+
 #[tokio::test]
 async fn proxy_does_not_write_session_traces_by_default() {
     use axum::{Router, routing::post};
@@ -903,16 +990,57 @@ async fn proxy_does_not_write_session_traces_by_default() {
         let saved = settled(state.path()).await.remove(0);
         assert_eq!(saved["completed_requests"], completed);
         assert_eq!(saved["primary"]["input_tokens"], completed * 7);
+        use sha2::{Digest, Sha256};
+        let mark = &saved["request_evidence"]["archive"];
         assert!(
+            mark.get("generation").is_none(),
+            "no journal conflict in this fixture"
+        );
+        let namespace = Sha256::digest(serde_json::to_vec(&mark["namespace"]).unwrap());
+        let numeric = state.path().join(format!(
+            ".request-evidence-{}-{namespace:x}.jsonl",
+            mark["owner"].as_str().unwrap()
+        ));
+        let only_selected_journal = || {
             std::fs::read_dir(state.path()).unwrap().all(|entry| {
-                entry
-                    .unwrap()
-                    .path()
-                    .extension()
-                    .is_none_or(|ext| ext != "jsonl")
-            }),
+                let path = entry.unwrap().path();
+                path.extension().is_none_or(|ext| ext != "jsonl") || path == numeric
+            })
+        };
+        assert!(
+            only_selected_journal(),
             "default proxy must not create verbose session traces"
         );
+        let bytes = std::fs::read(&numeric).unwrap();
+        assert!(private_numeric_journal(&bytes, &saved, completed));
+        for name in ["unexpected.jsonl", ".request-evidence-unselected.jsonl"] {
+            let decoy = state.path().join(name);
+            std::fs::write(&decoy, &bytes).unwrap();
+            assert!(
+                !only_selected_journal(),
+                "a prefix is not archive authority"
+            );
+            std::fs::remove_file(decoy).unwrap();
+        }
+        // Re-sign a content leak so rejection depends on the strict schema,
+        // not merely a broken chain or watermark checksum.
+        if completed == 1 {
+            let mut leaked: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            leaked["event"]["Primary"]["facts"]["raw_request"] = json!({"input":"hello"});
+            let mut leaked_bytes = serde_json::to_vec(&leaked).unwrap();
+            leaked_bytes.push(b'\n');
+            let mut resigned = saved.clone();
+            resigned["request_evidence"]["archive"]["bytes"] = json!(leaked_bytes.len());
+            resigned["request_evidence"]["archive"]["last_record_bytes"] =
+                json!(leaked_bytes.len());
+            resigned["request_evidence"]["archive"]["sha256"] =
+                json!(format!("{:x}", Sha256::digest(&leaked_bytes)));
+            assert!(!private_numeric_journal(
+                &leaked_bytes,
+                &resigned,
+                completed
+            ));
+        }
     }
     server.abort();
 }
@@ -956,12 +1084,17 @@ async fn proxy_verbose_traces_streams_and_default_restart_leaves_them_untouched(
         assert_eq!(response.text().await.unwrap(), expected);
         let saved = settled(state.path()).await.remove(0);
         assert_eq!(saved["completed_requests"], if verbose { 1 } else { 2 });
-        let trace_path = std::fs::read_dir(state.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-            .unwrap();
+        let trace_path = state.path().join(format!(
+            "{}.jsonl",
+            saved["request_evidence"]["archive"]["owner"]
+                .as_str()
+                .unwrap()
+        ));
         let trace = std::fs::read_to_string(trace_path).unwrap();
+        assert!(
+            !private_numeric_journal(trace.as_bytes(), &saved, if verbose { 1 } else { 2 }),
+            "an actual verbose trace is never a numeric archive"
+        );
         if let Some(previous) = &previous_trace {
             assert_eq!(
                 &trace, previous,

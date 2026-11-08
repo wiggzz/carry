@@ -451,12 +451,33 @@ class InitializationRegressions(unittest.TestCase):
                          "a failed request cannot repeat free initialization")
         self.assertAlmostEqual(retry["result"]["traditional_cost"] - first["result"]["traditional_cost"],
                                (21000 * 0.1 + 100 * 2.5) / 1e6, places=12)
-        self.assertEqual(changed["result"]["initial_compactions"], 2,
-                         "genuinely unrecognized changed settings require a new prospective assumption")
+        # Only the first tracked oversized success may initialize for free.
+        # A settings fence makes the matched branch cold/unrecognized, so its
+        # full input is charged and the later summary is paid, not a new start.
+        self.assertEqual(changed["result"]["initial_compactions"], 1)
+        keep_recent, summary = 20000, 1000
+        changed_input = inputs[-1]
+        paid_summary = ((changed_input - keep_recent) * 2 + summary * 10) / 1e6
         self.assertAlmostEqual(changed["result"]["traditional_cost"] - retry["result"]["traditional_cost"],
-                               0.0525, places=12)
-        self.assertEqual(changed["result"]["summary_cost"], 0.0)
-        self.assertEqual(changed["result"]["traditional_compactions"], 0)
+                               changed_input * 2.5 / 1e6 + paid_summary, places=12)
+        self.assertAlmostEqual(changed["result"]["summary_cost"], paid_summary, places=12)
+        self.assertEqual(changed["result"]["traditional_compactions"], 1)
+
+        # Independent chronological oracle: preserve retired history through
+        # failure/restart/settings, reuse the warm retry prefix, then cool only
+        # the cache at the settings change. This branch never repeats history.
+        retained = keep_recent + summary
+        retry_growth = inputs[2] - inputs[0]
+        changed_growth = inputs[3] - inputs[2]
+        expected = [retained * 2.5 / 1e6] * 3
+        expected.append(expected[-1] + (retained * 0.1 + retry_growth * 2.5) / 1e6)
+        expected.append(expected[-1] + (retained + retry_growth + changed_growth) * 2.5 / 1e6)
+        for snapshot, cost in zip((first, failed, restarted, retry, changed), expected):
+            trajectory = snapshot["result"]["whole_window"]["trajectory"]
+            self.assertAlmostEqual(trajectory["traditional_cost"], cost, places=12)
+            self.assertEqual(trajectory["initial_compactions"], 1)
+            self.assertEqual(trajectory["traditional_compactions"], 0)
+            self.assertEqual(trajectory["summary_cost"], 0.0)
 
     def initialized_policy_restart_control(self, *, migrate):
         import json

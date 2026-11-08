@@ -759,9 +759,6 @@ impl RequestEvidence {
     pub fn failed_reviewer_call(&mut self) {
         self.append(Observation::FailedReviewer);
     }
-    pub fn unmodeled_call(&mut self, cost: Option<f64>) {
-        self.append(Observation::Unmodeled { cost });
-    }
     pub fn reset_epoch(&mut self) {
         self.append(Observation::Boundary);
         self.restoration = Some(crate::proxy_quantity::RestorationEstimate {
@@ -909,7 +906,7 @@ mod tests {
     fn recovery_suffix() -> RequestEvidence {
         let mut evidence = RequestEvidence::default();
         evidence.prior_untracked(4);
-        evidence.unmodeled_call(Some(4.0));
+        evidence.append(Observation::Unmodeled { cost: Some(4.0) });
         evidence.failed_reviewer_call();
         evidence
     }
@@ -1072,7 +1069,7 @@ mod tests {
                 facts.reused_input = 0;
             } else {
                 while evidence.observations.len() < RequestEvidence::MAX_OBSERVATIONS {
-                    evidence.unmodeled_call(Some(1.0));
+                    evidence.append(Observation::Unmodeled { cost: Some(1.0) });
                     window.primary_attempts += 1;
                     window.primary_successes += 1;
                 }
