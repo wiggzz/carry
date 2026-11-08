@@ -102,6 +102,12 @@ pub struct CachePolicyBoundary {
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Estimate {
+    /// Read-time replay only; never an authoritative persisted prediction.
+    #[serde(skip)]
+    pub chronological: Option<ChronologicalEstimate>,
+    /// Read-time archive integrity failure, not an invented missing call.
+    #[serde(skip)]
+    pub archive_unavailable: bool,
     #[serde(default)]
     pub quantity_policy_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,7 +157,23 @@ pub struct Estimate {
     pub coverage: Coverage,
 }
 
-/// Derived, explicitly imputed full-window view. Never persisted as paid money
+/// A second evidence policy through the SAME transition engine, not an expense
+/// ratio or a persistent simulator. Missing opaque retention uses billed output
+/// as an explicitly estimated proxy; missing restoration carries the last known
+/// projection. These assumptions never grant strict quantity/removal authority.
+#[derive(Clone, Default, Debug, Serialize)]
+pub struct ChronologicalEstimate {
+    traditional_cost: f64,
+    primary_responses: u64,
+    inferred_primary_responses: u64,
+    inferred_traditional_cost: f64,
+    initial_compactions: u64,
+    traditional_compactions: u64,
+    summary_cost: f64,
+    quantity_assumptions: &'static str,
+}
+
+/// Derived full-window view. Never persisted as paid money
 /// or inserted into the native quantity/block evidence.
 #[derive(Clone, Debug, Serialize)]
 pub struct WholeWindowEstimate {
@@ -162,8 +184,9 @@ pub struct WholeWindowEstimate {
     primary_responses: u64,
     inferred_primary_responses: u64,
     inferred_traditional_cost: f64,
-    reference_cost_ratio: Option<f64>,
     assumption: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trajectory: Option<ChronologicalEstimate>,
 }
 
 /// Public strict-evidence projection, plus the full-window headline estimate.
@@ -204,9 +227,100 @@ pub struct DashboardEstimate {
 }
 
 impl Estimate {
+    /// Pair the chronological alternative with the same successful observed
+    /// population. Strict partial sums stay diagnostic; they cannot impute
+    /// missing requests by expense parity or a reference cost ratio.
+    fn whole_window(&self) -> Option<WholeWindowEstimate> {
+        let evidence = self;
+        if evidence.archive_unavailable {
+            return None;
+        }
+        let calls = evidence.coverage.primary_responses;
+        let reviewer_calls = evidence.coverage.reviewer_responses;
+        // The same successful population owns both amounts and counts. Missing
+        // historical scope is unknown; a lane with no successes contributes zero.
+        let primary = if calls == 0 {
+            0.0
+        } else {
+            evidence.observed_primary_cost?
+        };
+        let reviewer = if reviewer_calls == 0 {
+            0.0
+        } else {
+            evidence.observed_reviewer_cost?
+        };
+        let money_known = evidence.unavailable_primary_cost_calls == 0
+            && evidence.unavailable_reviewer_cost_calls == 0;
+        // No primary completion is required for settled reviewer expense. A
+        // priced reviewer-only window has a zero traditional denominator, even
+        // when the reviewer itself was free; a truly empty window stays absent.
+        if !money_known
+            || evidence.coverage.prior_untracked_calls > 0
+            || (calls == 0 && reviewer_calls == 0)
+            || !primary.is_finite()
+            || !reviewer.is_finite()
+            || primary < 0.0
+            || reviewer < 0.0
+            || (evidence.matched_primary_responses > 0
+                && (evidence.carry_cost - evidence.reviewer_cost).max(0.0) > primary + 1e-9)
+        {
+            return None;
+        }
+        if let Some(trajectory) = &evidence.chronological
+            && trajectory.primary_responses == calls
+        {
+            let traditional = trajectory.traditional_cost;
+            let carry = primary + reviewer;
+            let savings = traditional - carry;
+            return Some(WholeWindowEstimate {
+                carry_cost: carry,
+                traditional_cost: traditional,
+                savings,
+                savings_percent: (traditional > 0.0).then_some(100.0 * savings / traditional),
+                primary_responses: calls,
+                inferred_primary_responses: trajectory.inferred_primary_responses,
+                inferred_traditional_cost: trajectory.inferred_traditional_cost,
+                assumption: if trajectory.inferred_primary_responses > 0 {
+                    "chronological_native_inputs_with_explicit_quantity_and_same_owner_continuity_estimates"
+                } else {
+                    "continuous_receipt_trajectory"
+                },
+                trajectory: Some(trajectory.clone()),
+            });
+        }
+        // An immutable legacy strict subtotal is usable only when it already
+        // covers every primary. Missing chronological inputs cannot be repaired
+        // by multiplying observed expense by another request's cost ratio.
+        let traditional = if calls == 0 {
+            0.0
+        } else if evidence.accounting_basis == RECEIPT_BASIS
+            && evidence.matched_primary_responses == calls
+        {
+            evidence.traditional_cost
+        } else {
+            return None;
+        };
+        let carry = primary + reviewer;
+        let savings = traditional - carry;
+        if !traditional.is_finite() || traditional < 0.0 || !carry.is_finite() {
+            return None;
+        }
+        Some(WholeWindowEstimate {
+            carry_cost: carry,
+            traditional_cost: traditional,
+            savings,
+            savings_percent: (traditional > 0.0).then_some(100.0 * savings / traditional),
+            primary_responses: calls,
+            inferred_primary_responses: 0,
+            inferred_traditional_cost: 0.0,
+            trajectory: None,
+            assumption: "complete_strict_receipt_window_without_chronological_reconstruction",
+        })
+    }
+
     pub fn dashboard(self, pending: bool) -> DashboardEstimate {
         let available = self.priced;
-        let quantity_evidence = json!({
+        let mut quantity_evidence = json!({
             "version": self.quantity_policy_version,
             "basis": if self.quantity_policy_version == Some(1) {
                 "receipt_blocks_plus_equal_native_increment_residual_allocation_v1"
@@ -225,7 +339,10 @@ impl Estimate {
                 "matched_completed_primary_window"
             } else { "matched_subset_not_whole_session" },
         });
-        let whole_window = TraditionalHistoryState::whole_window(&self);
+        if self.archive_unavailable {
+            quantity_evidence["numeric_archive_unavailable"] = json!(true);
+        }
+        let whole_window = self.whole_window();
         let whole_window_incomplete = whole_window.is_none()
             && (self.coverage.primary_responses > 0
                 || self.coverage.reviewer_responses > 0
@@ -380,7 +497,18 @@ impl DashboardTotals {
                 total.savings = total.traditional_cost - total.carry_cost;
                 total.savings_percent = (total.traditional_cost > 0.0)
                     .then_some(100.0 * total.savings / total.traditional_cost);
-                total.reference_cost_ratio = None;
+                match (&mut total.trajectory, &window.trajectory) {
+                    (Some(total), Some(next)) => {
+                        total.traditional_cost += next.traditional_cost;
+                        total.primary_responses += next.primary_responses;
+                        total.inferred_primary_responses += next.inferred_primary_responses;
+                        total.inferred_traditional_cost += next.inferred_traditional_cost;
+                        total.initial_compactions += next.initial_compactions;
+                        total.traditional_compactions += next.traditional_compactions;
+                        total.summary_cost += next.summary_cost;
+                    }
+                    _ => total.trajectory = None,
+                }
                 total.assumption = "sum_of_session_whole_window_point_estimates";
             } else {
                 self.whole_window = Some(window.clone());
@@ -453,6 +581,10 @@ struct Replay {
     carry_edited: bool,
     traditional_edited: bool,
     available: bool,
+    #[serde(skip)]
+    chronological: bool,
+    #[serde(skip)]
+    inferred_continuity: bool,
     priced_primary_responses: u64,
 }
 /// A terminal observation with money already settled under dispatch-frozen
@@ -494,6 +626,8 @@ impl Default for Replay {
             carry_edited: false,
             traditional_edited: false,
             available: true,
+            chronological: false,
+            inferred_continuity: false,
             priced_primary_responses: 0,
         }
     }
@@ -587,6 +721,17 @@ impl Replay {
         // assumptions do not cross an ancestry discontinuity.
         self.restored = 0;
         self.estimated_projection = false;
+        if self.chronological {
+            // Same owner, different recognition/config/cache evidence. This
+            // revokes cache/semantic attribution, not the alternative's already
+            // retired history. The numeric native-input/restoration trajectory
+            // remains explicitly approximate from this boundary onward.
+            self.inferred_continuity = true;
+            self.history.diverge();
+            self.carry_edited = true;
+            self.traditional_edited = true;
+            return;
+        }
         self.history = TraditionalHistoryState::default();
         self.carry_edited = false;
         self.traditional_edited = false;
@@ -1294,8 +1439,15 @@ mod whole_window_tests {
     use super::*;
 
     #[test]
-    fn whole_window_projects_historical_omissions_without_rewriting_evidence() {
+    fn whole_window_uses_chronological_total_without_rewriting_strict_evidence() {
         let e = Estimate {
+            chronological: Some(ChronologicalEstimate {
+                traditional_cost: 30.0,
+                primary_responses: 6,
+                inferred_primary_responses: 5,
+                inferred_traditional_cost: 26.0,
+                ..Default::default()
+            }),
             accounting_basis: RECEIPT_BASIS.into(),
             observed_primary_cost: Some(12.0),
             observed_reviewer_cost: Some(3.0),
@@ -1313,9 +1465,9 @@ mod whole_window_tests {
         };
         let d = serde_json::to_value(e.dashboard(false)).unwrap();
         assert_eq!(d["whole_window"]["carry_cost"], 15.0);
-        assert_eq!(d["whole_window"]["traditional_cost"], 24.0);
-        assert_eq!(d["whole_window"]["savings"], 9.0);
-        assert_eq!(d["whole_window"]["savings_percent"], 37.5);
+        assert_eq!(d["whole_window"]["traditional_cost"], 30.0);
+        assert_eq!(d["whole_window"]["savings"], 15.0);
+        assert_eq!(d["whole_window"]["savings_percent"], 50.0);
         assert_eq!(d["whole_window"]["inferred_primary_responses"], 5);
         assert_eq!(
             d["carry_cost"], 5.0,
@@ -1327,6 +1479,13 @@ mod whole_window_tests {
     #[test]
     fn absent_success_scope_is_unknown_and_empty_sessions_do_not_censor() {
         let known = Estimate {
+            chronological: Some(ChronologicalEstimate {
+                traditional_cost: 20.0,
+                primary_responses: 7,
+                inferred_primary_responses: 7,
+                inferred_traditional_cost: 20.0,
+                ..Default::default()
+            }),
             accounting_basis: RECEIPT_BASIS.into(),
             observed_primary_cost: Some(20.0),
             observed_reviewer_cost: Some(3.0),
@@ -1411,6 +1570,10 @@ mod whole_window_tests {
                 let empty = Estimate::default().dashboard(false);
                 assert!(empty.whole_window.is_none());
                 let zero_primary = Estimate {
+                    chronological: Some(ChronologicalEstimate {
+                        primary_responses: 1,
+                        ..Default::default()
+                    }),
                     observed_primary_cost: Some(0.0),
                     coverage: Coverage {
                         primary_responses: 1,
@@ -1450,7 +1613,7 @@ mod whole_window_tests {
     }
 
     #[test]
-    fn whole_window_neutral_no_calibration_negative_zero_and_unknown_controls() {
+    fn missing_chronology_cannot_be_replaced_by_neutral_expense_parity() {
         for reviewer in [0.0, 3.0] {
             let e = Estimate {
                 accounting_basis: RECEIPT_BASIS.into(),
@@ -1464,11 +1627,14 @@ mod whole_window_tests {
                 ..Estimate::default()
             };
             let d = serde_json::to_value(e.clone().dashboard(false)).unwrap();
-            assert_eq!(d["whole_window"]["traditional_cost"], 12.0);
-            assert_eq!(d["whole_window"]["savings"], -reviewer);
-            assert_eq!(
-                d["whole_window"]["savings_percent"],
-                -100.0 * reviewer / 12.0
+            assert!(d["whole_window"].is_null());
+            let mut partial = e.clone();
+            partial.matched_primary_responses = 1;
+            partial.carry_cost = 2.0;
+            partial.traditional_cost = 7.0;
+            assert!(
+                partial.dashboard(false).whole_window.is_none(),
+                "a matched subtotal is not six chronological primaries"
             );
             let mut unknown = e;
             unknown.unavailable_primary_cost_calls = 1;
@@ -1492,13 +1658,48 @@ mod quantity_owner_migration_tests {
             "input_tokens":2000,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}
         }});
         let mut trajectory = Trajectory::default();
+        let measurements = crate::proxy_quantity::InputMeasurements::default();
         crate::prompt_quantity::reset_token_work();
-        trajectory.primary(&body, &response, "route", 100, true);
+        let observation = PrimaryObservation {
+            body: &body,
+            response: &response,
+            route: "route",
+            at: 100,
+            standard: true,
+            resolved: None,
+            cost: Some(0.00401),
+            measurements: Some(&measurements),
+        };
+        trajectory.primary_settled(observation);
         assert_eq!(trajectory.snapshot().matched_primary_responses, 1);
+        let first_work = crate::prompt_quantity::token_work();
+        assert!(
+            first_work.1 < 1000,
+            "capture only the small fixed floor, never tokenize the huge measured input"
+        );
+        trajectory.primary_settled(observation);
+        let _ = trajectory.snapshot();
         assert_eq!(
             crate::prompt_quantity::token_work(),
-            (0, 0),
-            "native totals below compaction thresholds need no input tokenization"
+            first_work,
+            "the quantity owner's memo reuses the unchanged numeric floor"
+        );
+
+        let mut large_fixed = body.clone();
+        large_fixed["instructions"] = json!("huge fixed instructions ".repeat(20000));
+        let observation = PrimaryObservation {
+            body: &large_fixed,
+            ..observation
+        };
+        trajectory.primary_settled(observation);
+        let fixed_work = crate::prompt_quantity::token_work();
+        assert!(fixed_work.1 > first_work.1);
+        trajectory.primary_settled(observation);
+        let _ = trajectory.snapshot();
+        assert_eq!(
+            crate::prompt_quantity::token_work(),
+            fixed_work,
+            "an unchanged huge fixed prompt is not retokenized per request"
         );
     }
 

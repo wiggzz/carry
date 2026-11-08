@@ -73,6 +73,8 @@ class HistoricalSuccessPrefix(unittest.TestCase):
         # Paid ledgers, authority graph, history and all other fields stay exact.
         staged = copy.deepcopy(original)
         staged['request_evidence']['observations'] = []
+        staged['request_evidence'].pop('archive', None)  # pre-journal legacy loss, not suffix-only rollover
+        staged['request_evidence'].pop('numeric_pending', None)
         staged['request_evidence']['prior_untracked'] = 2  # success + failed review
         checkpoint.write_text(json.dumps(staged))
         index_path = self.state / 'history.index'
@@ -122,21 +124,19 @@ class HistoricalSuccessPrefix(unittest.TestCase):
         self.assertEqual(restarted['cost_estimate'], stats['cost_estimate'])
         self.evidence['native_guards_complete'] = True
         whole = stats['sessions'][0]['cost_estimate']['whole_window']
-        self.assertIsInstance(whole, dict, 'verified successful numeric prefix must restore whole-window estimate')
+        self.assertIsNone(whole, 'successful expense proof cannot invent missing chronological inputs')
         expected = 3 * original['primary']['cost_usd']
         for snapshot in (stats, restarted):
             for estimate in (snapshot['sessions'][0]['cost_estimate'], snapshot['cost_estimate']):
-                self.assertEqual(estimate['whole_window']['primary_responses'], 3)
-                self.assertAlmostEqual(estimate['whole_window']['carry_cost'], expected, places=12)
-                self.assertAlmostEqual(estimate['whole_window']['traditional_cost'], expected, places=12)
-                self.assertAlmostEqual(estimate['whole_window']['savings'], 0, places=12)
+                self.assertIsNone(estimate['whole_window'])
+            self.assertAlmostEqual(snapshot['sessions'][0]['cost_estimate']['observed_primary_cost'], expected, places=12)
             row = snapshot['sessions'][0]['cost_estimate']
             self.assertEqual(row['coverage']['failed_calls'], 2)
             self.assertEqual(row['coverage']['prior_untracked_calls'], 0)
             self.assertEqual(row['matched_primary_responses'], 2,
                              'frozen historical strict reference is retained, not re-used')
         self.assertEqual(saved['request_evidence']['historical_success_prefix'], prefix)
-        self.assertEqual(seeded['sessions'][0]['cost_estimate']['whole_window']['primary_responses'], 1)
+        self.assertIsNone(seeded['sessions'][0]['cost_estimate']['whole_window'])
         proxy.close()
         self.evidence['loader_controls'] = {}
         # Exercise the real no-evidence legacy loader as well as hard refusal;
@@ -168,8 +168,7 @@ class HistoricalSuccessPrefix(unittest.TestCase):
                     self.assertEqual(len(fixture.primaries), before_wire)
                     self.assertGreater(dashboard['cost_estimate']['whole_window_unavailable_sessions'], 0)
                 elif case == 'legacy-no-evidence':
-                    self.assertAlmostEqual(dashboard['cost_estimate']['whole_window']['carry_cost'],
-                                           original['primary']['cost_usd'], places=12)
+                    self.assertIsNone(dashboard['cost_estimate']['whole_window'])
                     self.assertEqual(probe.send(history)[0], 200)
                     normal_save = probe.saved()
                     self.assertEqual(normal_save['request_evidence']['historical_success_prefix'], prefix)
@@ -223,9 +222,19 @@ class HistoricalSuccessPrefix(unittest.TestCase):
                         format='carry-historical-success-seed-v1', prefixes=[prefix])))
                     imported = copy.deepcopy(original)
                     imported['request_evidence']['observations'] = []
+                    imported['request_evidence'].pop('archive', None)
+                    imported['request_evidence'].pop('numeric_pending', None)
                     imported['request_evidence']['prior_untracked'] = 1
 
                     def stage(saved):
+                        # This stopped fixture declares a legacy, never-journaled
+                        # suffix. Remove its earlier synthetic journal as well as
+                        # the watermark; immutable-prefix saves must not rewrite
+                        # an unrelated generation left by fixture setup.
+                        saved['request_evidence'].pop('numeric_primary_items', None)
+                        for archive in state.glob('.request-evidence-*.jsonl'):
+                            archive.unlink()
+                        self.assertEqual(list(state.glob('.request-evidence-*.jsonl')), [])
                         checkpoint.write_text(json.dumps(saved))
                         index['snapshots'][owner] = copy.deepcopy(saved)
                         index_path.write_text(json.dumps(index))
@@ -235,7 +244,8 @@ class HistoricalSuccessPrefix(unittest.TestCase):
                     # request, before any synthetic saturation is constructed.
                     with IndexedProxy(state, fixture, options) as proxy:
                         seeded = proxy.request('GET', '/carry/dashboard/stats')[1]
-                        self.assertIsInstance(seeded['cost_estimate']['whole_window'], dict)
+                        self.assertIsNone(seeded['cost_estimate']['whole_window'],
+                            'aggregate-only proof preserves money, not lost chronological inputs')
                         self.assertEqual(proxy.send(history)[0], 200)
                         bound_state = proxy.saved()
                     self.assertEqual(bound_state['request_evidence']['historical_success_prefix'], prefix)
@@ -257,6 +267,10 @@ class HistoricalSuccessPrefix(unittest.TestCase):
                         facts['semantic_output'] = []
                         observations = [observation]  # exactly 65536 stored references
                     saturated['request_evidence']['observations'] = observations
+                    # Stage a legacy suffix that has never had numeric capture;
+                    # the real next append must journal its available raw facts.
+                    saturated['request_evidence'].pop('archive', None)
+                    saturated['request_evidence'].pop('numeric_pending', None)
                     saturated['completed_requests'] = 1 + suffix_count
                     # Scale only the synthetic native ledger, never an oracle
                     # copied from the candidate's later result.
@@ -278,7 +292,8 @@ class HistoricalSuccessPrefix(unittest.TestCase):
                         prefix=prefix, before_primary=saturated['primary'], statuses=[])
                     with IndexedProxy(state, fixture, options) as proxy:
                         before = proxy.request('GET', '/carry/dashboard/stats')[1]
-                        self.assertIsInstance(before['cost_estimate']['whole_window'], dict)
+                        self.assertIsNone(before['cost_estimate']['whole_window'],
+                            'saturated synthetic evidence is not a chronological replay')
                         self.assertEqual(before_hashes, {
                             p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                             for p in (checkpoint, index_path)})
@@ -337,11 +352,12 @@ class HistoricalSuccessPrefix(unittest.TestCase):
                         self.assertEqual(len(dashboard['sessions']), 1)
                         row = dashboard['sessions'][0]['cost_estimate']
                         self.assertIsNone(row['whole_window'])
-                        self.assertEqual(row['coverage']['prior_untracked_calls'], 1 + suffix_count)
-                        self.assertEqual(row['coverage']['primary_responses'], 2)
+                        self.assertEqual(row['coverage']['prior_untracked_calls'], 0,
+                                         'numeric capture preserves future money; seed proves only original legacy money')
+                        self.assertEqual(row['coverage']['primary_responses'], 1 + suffix_count + 2)
                         self.assertAlmostEqual(row['observed_primary_cost'],
-                                               2 * original['primary']['cost_usd'], places=12,
-                                               msg='partial proof must not price newly lost successes')
+                                               (1 + suffix_count + 2) * original['primary']['cost_usd'], places=10,
+                                               msg='captured future successful receipts survive semantic rollover; legacy input chronology is still missing')
                     self.assertEqual(final['request_evidence']['historical_success_prefix'], prefix)
                     self.assertEqual(final['request_evidence']['prior_untracked'], 1 + suffix_count)
 

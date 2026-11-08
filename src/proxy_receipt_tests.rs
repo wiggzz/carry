@@ -434,12 +434,13 @@ fn receipt_policy_transition_does_not_bypass_trajectory_guards() {
         );
         assert_eq!(
             t.snapshot().initial_compactions,
-            if matches!(change, "rates" | "tier") {
-                1
-            } else {
-                2
-            },
-            "{change}: pricing is not a history contract; ancestry guards remain"
+            1,
+            "{change}: recognition/cache boundaries cannot grant another free start"
+        );
+        assert_eq!(
+            t.snapshot().traditional_compactions,
+            u64::from(!matches!(change, "rates" | "tier")),
+            "{change}: a later oversized rebase requires a paid summary"
         );
         if matches!(change, "rates" | "tier") {
             assert_eq!(t.history.retired, 3500);

@@ -93,11 +93,10 @@ impl NativeInputCursor {
     fn matches(&self, body: &PrimaryFacts, input: u64, at: u64, projected: bool) -> bool {
         at >= self.at
             && (projected
-                || body.semantic_input.as_ref().is_some_and(|items| {
-                    items.len() >= self.items
-                        && Self::prefix(&items[..self.items]) == self.prefix
+                || body.input_len().is_some_and(|items| {
+                    body.prompt_digest(true, self.items).as_deref() == Some(self.prefix.as_str())
                         && input >= self.input
-                        && (items.len() > self.items || input == self.input)
+                        && (items > self.items || input == self.input)
                 }))
     }
 }
@@ -127,8 +126,8 @@ struct ProjectionRecovery {
     cursor: NativeInputCursor,
 }
 
-/// Kept in the existing atomic trajectory. Cache eligibility and monetary
-/// interpretation have no mutable access through this API.
+/// Read-time traditional quantities. Physical recognition and provider cache
+/// affinity do not own these retired-history/summary coordinates.
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub(super) struct TraditionalHistoryState {
     // Proof for the entire comparison history, not a last-plan/no-op flag.
@@ -138,6 +137,11 @@ pub(super) struct TraditionalHistoryState {
     pub(super) retired: u64,
     pub(super) summary: u64,
     pub(super) last_traditional_input: u64,
+    // Disposable read-time coordinates, never persisted predictions.
+    #[serde(skip)]
+    canonical_offset: i128,
+    #[serde(skip)]
+    last_canonical: Option<i128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) history_continuity: Option<HistoryContinuity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,6 +152,24 @@ pub(super) struct TraditionalHistoryState {
     projection_recovery: Option<ProjectionRecovery>,
 }
 impl TraditionalHistoryState {
+    /// Preserve the untouched alternative when this owner's canonical input
+    /// rebases downward. New growth at that ambiguous boundary is estimated as
+    /// zero; future positive native increments continue in the new coordinates.
+    pub(super) fn bridge_canonical(&mut self, native: u64, restoration: i128) -> (i128, bool) {
+        let canonical = i128::from(native)
+            .saturating_add(restoration)
+            .saturating_add(self.canonical_offset);
+        let rebased = self.last_canonical.is_some_and(|prior| prior > canonical);
+        if let Some(prior) = self.last_canonical.filter(|prior| *prior > canonical) {
+            self.canonical_offset = self
+                .canonical_offset
+                .saturating_add(prior.saturating_sub(canonical));
+        }
+        let restoration = restoration.saturating_add(self.canonical_offset);
+        self.last_canonical = Some(i128::from(native).saturating_add(restoration));
+        (restoration, rebased)
+    }
+
     #[cfg(test)]
     pub(super) fn retention_member(&self) -> Option<(usize, usize, u64)> {
         Some((
@@ -156,95 +178,6 @@ impl TraditionalHistoryState {
             self.pending_retention.as_ref()?.visible?,
         ))
     }
-    /// Whole-window cost imputation, not a replay or a second simulator. The
-    /// continuous trajectory remains authoritative for directly modeled calls.
-    /// Its traditional/observed-primary expense ratio includes paid summaries,
-    /// cache and tariff effects. Apply that dimensionless ratio to the known
-    /// primary expense omitted by strict quantity attribution. With no usable
-    /// reference, use neutral PRIMARY expense parity (reviewer never cancels).
-    /// This exchangeability/net-compaction-parity assumption is deliberately
-    /// weaker than reconstructing unknown quantities or inventing native units.
-    pub(super) fn whole_window(evidence: &Estimate) -> Option<WholeWindowEstimate> {
-        let calls = evidence.coverage.primary_responses;
-        let reviewer_calls = evidence.coverage.reviewer_responses;
-        // The same successful population owns both amounts and counts. Missing
-        // historical scope is unknown; a lane with no successes contributes zero.
-        let primary = if calls == 0 {
-            0.0
-        } else {
-            evidence.observed_primary_cost?
-        };
-        let reviewer = if reviewer_calls == 0 {
-            0.0
-        } else {
-            evidence.observed_reviewer_cost?
-        };
-        let money_known = evidence.unavailable_primary_cost_calls == 0
-            && evidence.unavailable_reviewer_cost_calls == 0;
-        // No primary completion is required for settled reviewer expense. A
-        // priced reviewer-only window has a zero traditional denominator, even
-        // when the reviewer itself was free; a truly empty window stays absent.
-        if !money_known
-            || evidence.coverage.prior_untracked_calls > 0
-            || (calls == 0 && reviewer_calls == 0)
-            || !primary.is_finite()
-            || !reviewer.is_finite()
-            || primary < 0.0
-            || reviewer < 0.0
-        {
-            return None;
-        }
-        let receipt_reference = evidence.accounting_basis == RECEIPT_BASIS
-            && evidence.matched_primary_responses > 0
-            && evidence.matched_primary_responses <= calls;
-        let matched_primary = if receipt_reference {
-            (evidence.carry_cost - evidence.reviewer_cost).max(0.0)
-        } else {
-            0.0
-        };
-        // A ledger/window mismatch is not counterfactual uncertainty.
-        if matched_primary > primary + 1e-9 {
-            return None;
-        }
-        let ratio = (receipt_reference && matched_primary > 0.0)
-            .then(|| evidence.traditional_cost / matched_primary)
-            .filter(|r| r.is_finite() && *r >= 0.0);
-        let omitted = (primary - matched_primary).max(0.0);
-        let inferred = omitted * ratio.unwrap_or(1.0);
-        let modeled = if receipt_reference {
-            evidence.traditional_cost
-        } else {
-            0.0
-        };
-        let traditional = modeled + inferred;
-        let carry = primary + reviewer;
-        let savings = traditional - carry;
-        if !traditional.is_finite() || !carry.is_finite() {
-            return None;
-        }
-        Some(WholeWindowEstimate {
-            carry_cost: carry,
-            traditional_cost: traditional,
-            savings,
-            savings_percent: (traditional > 0.0).then_some(100.0 * savings / traditional),
-            primary_responses: calls,
-            inferred_primary_responses: calls.saturating_sub(if receipt_reference {
-                evidence.matched_primary_responses
-            } else {
-                0
-            }),
-            inferred_traditional_cost: inferred,
-            reference_cost_ratio: ratio,
-            assumption: if omitted == 0.0 && receipt_reference {
-                "continuous_receipt_trajectory"
-            } else if ratio.is_some() {
-                "omitted_primary_expense_exchangeable_with_continuous_trajectory_cost_ratio_including_summary_and_conditional_cache"
-            } else {
-                "no_reference_neutral_primary_expense_parity_net_of_hypothetical_compaction_and_cache"
-            },
-        })
-    }
-
     pub(super) fn defer_projection(
         &mut self,
         configuration: String,
@@ -417,7 +350,7 @@ impl TraditionalHistoryState {
     pub(super) fn observe(
         &mut self,
         mut contract: HistoryContract,
-        items: &[String],
+        body: &PrimaryFacts,
         input: u64,
         at: u64,
     ) {
@@ -435,8 +368,8 @@ impl TraditionalHistoryState {
             contract,
             cursor: NativeInputCursor {
                 basis: InputBasis::SemanticV1,
-                prefix: NativeInputCursor::prefix(items),
-                items: items.len(),
+                prefix: body.prompt_digest(true, body.input_len().unwrap()).unwrap(),
+                items: body.input_len().unwrap(),
                 input,
                 at,
             },

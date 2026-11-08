@@ -584,6 +584,11 @@ fn recover_success_prefix(
                 seed,
             )
             .map_err(|_| invalid())?;
+        evidence.bind_archive(
+            &service.config.state_dir,
+            id,
+            session.history_namespace.as_deref(),
+        );
     }
     Ok(session)
 }
@@ -706,9 +711,10 @@ fn save_paid_accounting(
     if calls > 0
         && let Some(trajectory) = &mut durable.request_evidence
     {
-        // Receipts remain exact, but the lost observation/replay cannot
-        // support a complete counterfactual savings comparison.
-        trajectory.prior_untracked(calls);
+        // The publication lost semantic material, not these captured numeric
+        // dispatch/receipt facts. Cool attribution without inventing a missing
+        // successful event or granting removal authority to its numeric journal.
+        trajectory.reset_epoch();
     }
     save(service, id, &durable)
 }
@@ -719,6 +725,17 @@ fn save_observed(
     session: &Session,
     observation: Option<(&[Value], &Value)>,
 ) -> std::io::Result<()> {
+    let mut persisted = session.clone();
+    if let Some(evidence) = &mut persisted.request_evidence
+        && evidence.archive_tracking()
+    {
+        evidence.prepare_archive(
+            &service.config.state_dir,
+            id,
+            persisted.history_namespace.as_deref(),
+        );
+    }
+    let session = &persisted;
     if !session.history_shared {
         // The explicit checkpoint is authority, not a diagnostic mirror. Stage
         // its exact bounded bytes first, then admit history before replacing it.
@@ -1858,6 +1875,11 @@ async fn forward_timed(
         if session.request_evidence.is_none() {
             let mut trajectory = crate::proxy_savings::RequestEvidence::default();
             trajectory.prior_untracked(session.primary.calls + session.shadow.calls);
+            trajectory.bind_archive(
+                &service.config.state_dir,
+                &id,
+                session.history_namespace.as_deref(),
+            );
             session.request_evidence = Some(trajectory);
         }
         if session.primary_pending {
@@ -2652,6 +2674,10 @@ async fn dispatch_review_for(
     tokio::spawn(async move {
         let _pin = pin;
         let mut reviewed = before.clone();
+        // This disposable worker owns advice, not numeric persistence. Its
+        // receipts settle once into freshly loaded authority under the owner
+        // lock below; a saturated snapshot must not flush before that lock.
+        reviewed.request_evidence = None;
         let mut run = ReviewRun {
             background: true,
             request_id,
@@ -4051,21 +4077,27 @@ async fn relay(
                     );
                 }
                 if let Some(trajectory) = &mut commit.candidate.request_evidence {
-                    if commit.native {
-                        trajectory.unmodeled_call(settled);
+                    // Transport/terminal/one-anchor validation above is the
+                    // authority for V1's omitted status, not a fabricated output.
+                    let mut native_value;
+                    let response = if commit.native && value.get("status").is_none() {
+                        native_value = value.clone();
+                        native_value["status"] = json!("completed");
+                        &native_value
                     } else {
-                        trajectory.primary_settled(crate::proxy_savings::PrimaryObservation {
-                            body: &commit.outbound,
-                            response: &value,
-                            measurements: Some(&commit.candidate.primary_input),
-                            route: &commit.service.config.upstream_url,
-                            at: commit.dispatched_at,
-                            standard: standard(&commit.outbound)
-                                && value.get("service_tier").is_none_or(|v| v == "default"),
-                            resolved,
-                            cost: settled,
-                        });
-                    }
+                        &value
+                    };
+                    trajectory.primary_settled(crate::proxy_savings::PrimaryObservation {
+                        body: &commit.outbound,
+                        response,
+                        measurements: Some(&commit.candidate.primary_input),
+                        route: &commit.service.config.upstream_url,
+                        at: commit.dispatched_at,
+                        standard: standard(&commit.outbound)
+                            && value.get("service_tier").is_none_or(|v| v == "default"),
+                        resolved,
+                        cost: settled,
+                    });
                 }
                 if commit.native {
                     commit.candidate.reset_active();
@@ -5040,4 +5072,5 @@ mod tests {
     include!("proxy_timing_repair_tests.rs");
     include!("proxy_admission_tests.rs");
     include!("proxy_dashboard_tests.rs");
+    include!("proxy_archive_lifecycle_tests.rs");
 }

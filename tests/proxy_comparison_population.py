@@ -203,10 +203,14 @@ class ComparisonPopulation(unittest.TestCase):
         self.assertEqual(saved['primary']['unavailable_cost_calls'], 0)
         self.assertEqual(estimate['coverage']['primary_responses'], 1)
         self.assertEqual(estimate['coverage']['unmodeled_calls'], 1)
-        self.assertEqual(estimate['matched_primary_responses'], 0)
+        self.assertEqual(estimate['matched_primary_responses'], 0,
+                         'unknown native-summary retention is not strict quantity evidence')
         self.assertEqual(estimate['observed_primary_cost'], saved['primary']['cost_usd'])
-        self.assertEqual(estimate['whole_window']['carry_cost'], saved['primary']['cost_usd'])
-        self.assertEqual(estimate['whole_window']['inferred_primary_responses'], 1)
+        whole = estimate['whole_window']
+        self.assertIsNotNone(whole, 'G2 available native request and response must contribute chronologically')
+        self.assertEqual(whole['primary_responses'], 1)
+        self.assertAlmostEqual(whole['traditional_cost'], saved['primary']['cost_usd'], places=12)
+        self.assertEqual(whole['trajectory']['inferred_primary_responses'], 1)
         self.assertEqual(fixture.reviews, [])
         proxy.close()
         proxy = support.Proxy(self.state, fixture, options)
@@ -377,6 +381,11 @@ class ComparisonPopulation(unittest.TestCase):
                     if missing == 'trajectory':
                         saved.pop('request_evidence', None)
                     else:
+                        # A legacy missing-money fixture must remove the raw
+                        # numeric archive reference too; suffix loss alone no
+                        # longer means the actual receipt was discarded.
+                        saved['request_evidence'].pop('archive', None)
+                        saved['request_evidence'].pop('numeric_pending', None)
                         for observation in saved['request_evidence']['observations']:
                             if 'Primary' in observation:
                                 observation['Primary']['facts']['cost'] = None

@@ -111,9 +111,7 @@ pub(super) fn configuration(body: &Value, route: &str, resolved: Option<&Resolve
 
 fn append_compatible(anchor: &Anchor, body: &PrimaryFacts, configuration: &str) -> bool {
     anchor.configuration == configuration
-        && body.input.as_ref().is_some_and(|items| {
-            items.len() >= anchor.items && digest(&items[..anchor.items]) == anchor.prefix
-        })
+        && body.prompt_digest(false, anchor.items).as_deref() == Some(anchor.prefix.as_str())
 }
 
 /// Explicit numeric partitions only. Absent optional write counts mean no
@@ -257,30 +255,47 @@ impl Replay {
         let previous_version = self.receipts.scenario_cache_policy_version;
         let cache_policy_changed = previous_version != policy_version;
         if cache_policy_changed {
-            // Freeze cumulative provenance before ANY version transition. Cache
-            // becomes cold, but ancestry checks still own summary invalidation.
-            let prior = self.snapshot();
-            if prior.coverage.primary_responses > 0 || prior.coverage.reviewer_responses > 0 {
-                let cumulative = CachePolicySegment::from(&prior);
-                if previous_version.is_none()
-                    && policy_version.is_some()
-                    && self.result.legacy_cache_policy_segment.is_none()
-                    && self.result.cache_policy_boundaries.is_empty()
-                {
-                    self.result.legacy_cache_policy_segment = Some(cumulative.clone());
+            if !self.chronological {
+                // Freeze cumulative provenance before ANY version transition. Cache
+                // becomes cold, but ancestry checks still own summary invalidation.
+                let prior = self.snapshot();
+                if prior.coverage.primary_responses > 0 || prior.coverage.reviewer_responses > 0 {
+                    let cumulative = CachePolicySegment::from(&prior);
+                    if previous_version.is_none()
+                        && policy_version.is_some()
+                        && self.result.legacy_cache_policy_segment.is_none()
+                        && self.result.cache_policy_boundaries.is_empty()
+                    {
+                        self.result.legacy_cache_policy_segment = Some(cumulative.clone());
+                    }
+                    self.result
+                        .cache_policy_boundaries
+                        .push(CachePolicyBoundary {
+                            previous_version,
+                            next_version: policy_version,
+                            cumulative,
+                        });
                 }
-                self.result
-                    .cache_policy_boundaries
-                    .push(CachePolicyBoundary {
-                        previous_version,
-                        next_version: policy_version,
-                        cumulative,
-                    });
             }
+            // Chronological replay consumes full factual policy provenance on
+            // disk, but does not retain unused lifetime diagnostic snapshots.
             self.receipts.scenario_cache_policy_version = policy_version;
         }
         let model = body.model.as_str();
         let (native, observed, billable) = self.record_primary_observation(body, settled);
+        if self.chronological
+            && self.projection_known
+            && let Some(native) = &native
+        {
+            let (restored, rebased) = self
+                .history
+                .bridge_canonical(native.input_tokens, self.restored);
+            if rebased {
+                self.reset_receipt_epoch();
+            }
+            self.estimated_projection |= restored != self.restored;
+            self.restored = restored;
+        }
         let retained_output = body.retained;
         let estimated_quantity = self.estimated_projection
             || self.history.summary > 0
@@ -303,7 +318,8 @@ impl Replay {
         // Only reasoning has the neutral residual model. Preserve the existing
         // unavailable native slice contract for images/unsupported modalities.
         let unsupported_opaque = body.unsupported_opaque;
-        let opaque_comparable = !unsupported_opaque
+        let opaque_comparable = self.chronological
+            || !unsupported_opaque
             || (self.projection_known
                 && self.history.retired == 0
                 && self.history.summary == 0
@@ -349,11 +365,11 @@ impl Replay {
             self.history.diverge();
             self.receipts.cache_initialized = true;
             if self.history.history_continuity.is_none()
-                && let (Some(native), Some(items)) = (native.as_ref(), body.semantic_input.as_ref())
+                && let (Some(native), Some(_)) = (native.as_ref(), body.input_len())
             {
                 self.history.observe(
                     body.contract.for_scenario(self.scenario),
-                    items,
+                    body,
                     native.input_tokens,
                     at,
                 );
@@ -366,7 +382,7 @@ impl Replay {
             self.reset_epoch();
             return;
         }
-        let (Some(native), Some(items)) = (native, body.semantic_input.as_ref()) else {
+        let (Some(native), Some(item_count)) = (native, body.input_len()) else {
             self.result.excluded_unpriced_calls += 1;
             self.reset_epoch();
             return;
@@ -384,7 +400,7 @@ impl Replay {
             append_compatible(a, body, &config)
                 && at >= a.at
                 && native.input_tokens >= a.input
-                && (items.len() > a.items || native.input_tokens == a.input)
+                && (item_count > a.items || native.input_tokens == a.input)
         });
 
         let history_compatible = continuity.unwrap_or(false);
@@ -406,19 +422,21 @@ impl Replay {
             // now known to be canonical (zero restoration). Recover only
             // its transitions, never its excluded monetary contribution.
             let prior_input = self.history.input(native.input_tokens, 0);
-            match self
-                .scenario
-                .response_compaction(prior_input, 0, projection_fixed_tokens(body))
-            {
-                Ok(Some(kept)) => {
+            let transition = body.fixed.and_then(|fixed| {
+                self.scenario
+                    .response_compaction(prior_input, 0, fixed)
+                    .ok()
+            });
+            match transition {
+                Some(Some(kept)) => {
                     self.history
                         .summarize(prior_input, kept, self.scenario.summary);
                     self.result.traditional_compactions += 1;
                     self.traditional_edited = true;
                     self.receipts.modeled_cache.clear();
                 }
-                Ok(None) => recovered_cache_request_at = Some(prior_at),
-                Err(()) => self.history.unresolved_projection = true,
+                Some(None) => recovered_cache_request_at = Some(prior_at),
+                None => self.history.unresolved_projection = true,
             }
         }
         if self.history.unresolved_projection {
@@ -482,7 +500,8 @@ impl Replay {
             0
         };
         let initialized_now = match self.scenario.initial_compaction(
-            history_compatible,
+            self.result.coverage.primary_responses > 1
+                || self.result.coverage.prior_untracked_calls > 0,
             traditional,
             protected,
             allowance,
@@ -587,14 +606,17 @@ impl Replay {
             self.result.excluded_unpriced_calls += 1;
             self.result.initial_compactions += u64::from(initialized_now);
             self.history.last_traditional_input = traditional;
+            let Some(fixed) = body.fixed.filter(|_| body.semantic_input.is_some()) else {
+                self.history.unresolved_projection = true;
+                return;
+            };
+            self.history.defer_retention(body, self.restored, fixed);
             self.history
-                .defer_retention(body, self.restored, projection_fixed_tokens(body));
-            self.history
-                .observe(contract, items, native.input_tokens, at);
+                .observe(contract, body, native.input_tokens, at);
             self.receipts.anchor = Some(Anchor {
                 configuration: config,
-                prefix: digest(body.input.as_ref().unwrap()),
-                items: items.len(),
+                prefix: body.prompt_digest(false, item_count).unwrap(),
+                items: item_count,
                 input: native.input_tokens,
                 at,
             });
@@ -637,7 +659,15 @@ impl Replay {
                     .context_window
                     .saturating_sub(self.scenario.reserve)
         {
-            projection_fixed_tokens(body)
+            let Some(fixed) = body.fixed else {
+                // An old uncaptured floor is unknown, not permission to retire
+                // protected instructions merely because replay rebased input.
+                self.result.coverage.unavailable_quantity_calls += 1;
+                self.result.excluded_unpriced_calls += 1;
+                self.history.unresolved_projection = true;
+                return;
+            };
+            fixed
         } else {
             0
         };
@@ -693,11 +723,11 @@ impl Replay {
             self.receipts.modeled_cache.clear();
         }
         self.history
-            .observe(contract, items, native.input_tokens, at);
+            .observe(contract, body, native.input_tokens, at);
         let anchor = Anchor {
             configuration: config,
-            prefix: digest(body.input.as_ref().unwrap()),
-            items: items.len(),
+            prefix: body.prompt_digest(false, item_count).unwrap(),
+            items: item_count,
             input: native.input_tokens,
             at,
         };
@@ -737,9 +767,4 @@ impl Replay {
             self.result.unavailable_primary_cost_calls += 1;
         }
     }
-}
-
-fn projection_fixed_tokens(body: &PrimaryFacts) -> u64 {
-    // The receipt boundary has already validated the input array.
-    body.fixed.unwrap_or(0)
 }

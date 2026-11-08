@@ -214,8 +214,14 @@ class TraditionalEstimation(unittest.TestCase):
         first = first_stats['sessions'][0]['cost_estimate']
         self.assertEqual(first['matched_primary_responses'], 0)
         self.assertEqual(first['whole_window']['inferred_primary_responses'], 1)
-        self.assertIn('no_reference_neutral', first['whole_window']['assumption'])
         before = self.snapshot(proxy)
+        # The old neutral-reference caption described the retired fallback.
+        # Check the actual first chronological contribution instead: unchanged
+        # input, known paid usage, and no hypothetical compaction or rewrite.
+        self.assertEqual(first['whole_window']['primary_responses'], 1)
+        actual_first = before['primary']['cost_usd'] + before['shadow']['cost_usd']
+        self.assertAlmostEqual(first['whole_window']['carry_cost'], actual_first, places=12)
+        self.assertAlmostEqual(first['whole_window']['traditional_cost'], actual_first, places=12)
         proxy.close()
         # This is a genuine checkpoint from an uncalibrated opaque response,
         # not an edited count or fabricated paid ledger.
@@ -231,7 +237,9 @@ class TraditionalEstimation(unittest.TestCase):
         actual = after['primary']['cost_usd'] + after['shadow']['cost_usd']
         self.assertAlmostEqual(whole['carry_cost'], actual, places=12)
         self.assertEqual(whole['primary_responses'], 2)
-        self.assertEqual(whole['inferred_primary_responses'], 1)
+        # Both contributions depend on the initially inferred opaque history;
+        # the later measured input does not retroactively make it measured.
+        self.assertEqual(whole['inferred_primary_responses'], 2)
         self.assertGreater(whole['traditional_cost'], estimate['traditional_cost'], 'old omitted call must contribute actual modeled dollars, not just a caption')
         self.assertAlmostEqual(whole['traditional_cost'], 2 * estimate['traditional_cost'], places=12)
         self.assertAlmostEqual(whole['savings'], whole['traditional_cost'] - actual, places=12)
