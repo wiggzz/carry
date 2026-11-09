@@ -180,7 +180,15 @@ fn changes<'a>(from: &'a [Item], to: &'a [Item]) -> Option<(Vec<&'a Item>, Vec<&
             let count = remaining.entry(&item.identity).or_default();
             if *count > 0 {
                 *count -= 1;
-                retained.push(item.identity.as_str());
+                // Equal visible occurrences have the same additive quantity;
+                // assigning the first copies an exact position invents a reorder.
+                // Opaque occurrences retain their order/ambiguity fences.
+                if item.opaque
+                    || (from_counts[item.identity.as_str()] == 1
+                        && to_counts[item.identity.as_str()] == 1)
+                {
+                    retained.push(item.identity.as_str());
+                }
             } else {
                 changed.push(item);
             }
@@ -719,6 +727,63 @@ mod reasoning_forecast_tests {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn repeated_visible_occurrences_do_not_erase_candidate_quantity() {
+        let repeated = json!({"role":"user","content":"identical visible separator"});
+        let old = json!({"role":"assistant","content":"old removable evidence ".repeat(100)});
+        let source = json!({"model":"gpt-6.1-sol","input":[
+            {"role":"user","content":"task"}, old,
+            {"role":"user","content":"protected middle"}, repeated,
+            {"role":"user","content":"latest"}
+        ]});
+        let mut target = source.clone();
+        target["input"][1] = repeated.clone();
+        let mut measured = InputMeasurements::default();
+        measured.observe(&source, &usage(10000), "route", None, 100);
+        let expected = 10000 - crate::savings::local_text_tokens(&old)
+            + crate::savings::local_text_tokens(&repeated);
+        assert_eq!(
+            measured
+                .projected_estimate(&target, &source, "route", None)
+                .unwrap()
+                .tokens,
+            expected
+        );
+        let mut restored = InputMeasurements::default();
+        restored.observe(&target, &usage(expected), "route", None, 101);
+        assert_eq!(
+            restored
+                .projected_estimate(&source, &target, "route", None)
+                .unwrap()
+                .tokens,
+            10000,
+            "restoring one occurrence must not match the wrong repeated separator"
+        );
+    }
+
+    #[test]
+    fn interchangeable_visible_occurrences_do_not_relax_unique_or_opaque_order() {
+        let item = |id: &str, opaque| Item {
+            identity: id.into(),
+            opaque,
+        };
+        assert!(
+            changes(
+                &[item("a", false), item("native", true)],
+                &[item("native", true), item("a", false)]
+            )
+            .is_none()
+        );
+        assert!(
+            changes(
+                &[item("same-native", true), item("same-native", true)],
+                &[item("same-native", true)]
+            )
+            .is_none()
+        );
+    }
+
     fn body() -> Value {
         json!({"model":"gpt-6.1-sol","instructions":"stable", "input":[{"role":"user","content":"initial"}]})
     }

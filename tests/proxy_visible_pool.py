@@ -16,6 +16,61 @@ class VisiblePool(unittest.TestCase):
     def test_distinct_visible_initial_pool_control(self):
         self.check_initial_pool(repeated=False)
 
+    def test_additional_removal_across_existing_gap_remains_estimable(self):
+        history = [
+            {'role': 'user', 'content': 'Keep the task'},
+            {'role': 'assistant', 'content': 'old A evidence ' * 1000},
+            {'role': 'user', 'content': 'protected separator'},
+            {'role': 'assistant', 'content': 'old B evidence ' * 1000},
+            {'role': 'user', 'content': 'current task'},
+        ]
+        gap = {'role': 'user', 'content':
+               '[Earlier conversation omitted by Carry; retained messages remain in original order.]'}
+        def review(_body, n):
+            return 200, support.advice_response({
+                'protected': [3], 'removable': [4] if n == 1 else [2], 'memories': []})
+        fixture = self.fixture(lambda _b, n: (200, support.completed(
+            [], f'gap-{n}', input_tokens=10000)), review)
+        options = ['--classifier-cache-policy', 'disabled', '--payoff-requests', '1',
+                   '--primary-context-tokens', '1000000', '--context-margin-percent', '0']
+        proxy = support.Proxy(self.state, fixture, options)
+        self.stack.callback(proxy.close)
+        plans = []
+        self.evidence.update(history=history, plans=plans)
+        for index in range(4):
+            if index == 3:
+                proxy.close()
+                proxy = support.Proxy(self.state, fixture, options)
+                self.stack.callback(proxy.close)
+            self.assertEqual(proxy.send(history, model='gpt-6-sol')[0], 200)
+            saved = proxy.saved()
+            plans.append(saved['last_plan'])
+        self.evidence.update(wires=fixture.primaries, saved=saved, advice=proxy.advice())
+        final = plans[-1]
+        candidate = max(final['candidates'], key=lambda c: len(c['omitted_members']))
+        baseline = [history[0], history[1], history[2], gap, history[4]]
+        compact = [history[0], gap, history[2], gap, history[4]]
+        self.assertEqual(fixture.primaries[:2], [{'model': 'gpt-6-sol', 'input': history}] * 2)
+        self.assertEqual(fixture.primaries[2], {'model': 'gpt-6-sol', 'input': baseline})
+        self.assertEqual(candidate['omitted_members'], [2, 4])
+        self.assertEqual(fixture.primaries[3], {'model': 'gpt-6-sol', 'input':
+            compact if final['selected_candidate_id'] == candidate['candidate_id'] else baseline})
+        self.assertEqual(len(fixture.reviews), 3)
+        self.assertEqual(fixture.errors, [])
+        self.assertEqual(saved['primary']['calls'], 4)
+        self.assertEqual(saved['primary']['input_tokens'], 40000)
+        self.assertEqual(saved['primary']['output_tokens'], 4)
+        self.assertEqual(saved['primary']['unavailable_cost_calls'], 0)
+        self.assertAlmostEqual(saved['primary']['cost_usd'], 0.08004, places=12)
+        self.assertIsNotNone(candidate['primary_retained_estimated_tokens'],
+                             'adding an interchangeable visible gap must not erase candidate sizing')
+        self.assertGreater(candidate['primary_retained_estimated_tokens'], 0)
+        self.assertLess(candidate['primary_retained_estimated_tokens'], 10000)
+        self.assertFalse(final['forced'])
+        self.assertTrue(candidate['selection_joint']['accepted'])
+        self.assertEqual(final['selected_candidate_id'], candidate['candidate_id'])
+        self.assertEqual(fixture.primaries[3], {'model': 'gpt-6-sol', 'input': compact})
+
     def check_initial_pool(self, repeated):
         visible = {'role': 'assistant', 'content': 'identical synthetic evidence ' * 30}
         sibling = visible if repeated else {**visible, 'content': visible['content'] + 'distinct'}
