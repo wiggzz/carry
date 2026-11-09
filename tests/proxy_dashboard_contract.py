@@ -528,8 +528,11 @@ class DashboardDispatchContract(unittest.TestCase):
             row = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
             self.assertNotIn(seed[1], fixture.primaries[-1]["input"])
             self.assertIn(opaque[1], fixture.primaries[-1]["input"])
-            self.assertIsNone(row["last_primary_dispatch"]["outgoing_input_tokens"])
-            self.assertIsNone(row["last_primary_dispatch"]["continuation_input_tokens"])
+            self.assertIsNotNone(row["last_primary_dispatch"]["outgoing_input_tokens"])
+            self.assertEqual(row["last_primary_dispatch"]["continuation_input_tokens"],
+                             row["planner"]["primary_estimated_tokens"])
+            self.assertGreater(row["last_primary_dispatch"]["continuation_input_tokens"],
+                               row["last_primary_dispatch"]["outgoing_input_tokens"])
             self.assertGreater(row["context"]["removed_items"], 0)
             self.assertEqual(row["primary"]["calls"], 3)
             self.assertEqual(fixture.errors, [])
@@ -539,6 +542,18 @@ class DashboardDispatchContract(unittest.TestCase):
             self.assertEqual(row["rewrites"]["dispatched"], 1,
                              "a newly dispatched cleanup exists independently of token sizing")
             self.assertFalse(row["rewrites"]["prior_unknown"])
+            # A newly appended image has no comparable native allocation or
+            # reasoning-growth forecast. Unknown sizes must remain unknown,
+            # without erasing an already dispatched, still-applied cleanup.
+            history.append({"role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,synthetic"}]})
+            self.assertEqual(proxy.send(history)[0], 200)
+            row = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
+            self.assertNotIn(seed[1], fixture.primaries[-1]["input"])
+            self.assertIsNone(row["last_primary_dispatch"]["outgoing_input_tokens"])
+            self.assertIsNone(row["last_primary_dispatch"]["continuation_input_tokens"])
+            self.assertEqual(row["rewrites"]["dispatched"], 1)
+            self.assertEqual(row["primary"]["calls"], 4)
             before = copy.deepcopy(row["primary"])
             proxy.close()
             proxy = Proxy(root, fixture, options)
