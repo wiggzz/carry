@@ -121,8 +121,21 @@ class NoodleRegressions(unittest.TestCase):
                 self.assertEqual(prior["facts"]["allowance"], 1)
                 self.assertEqual(current["facts"]["allowance"], cap)
                 self.assertEqual(current["facts"]["configuration"] == prior["facts"]["configuration"], cap == 1)
-                self.assertEqual(after["request_evidence"]["observations"][:-1],
-                                 baseline["request_evidence"]["observations"])
+                original = baseline["request_evidence"]["observations"]
+                observations = after["request_evidence"]["observations"]
+                self.assertEqual(observations[:len(original)], original)
+                appended = observations[len(original):]
+                self.assertEqual(len(appended), 2, 'one dispatch followed by one successful terminal')
+                self.assertEqual(set(appended[0]), {'Dispatch'})
+                dispatch = appended[0]['Dispatch']
+                self.assertTrue(dispatch['request_id'])
+                self.assertEqual(dispatch['selection'], dispatch['continuation'])
+                self.assertEqual(dispatch['omitted_members'], 1)
+                self.assertEqual(dispatch['newly_omitted_members'], 0,
+                                 'repeating the authorized projection is not a new omission')
+                self.assertIs(dispatch['forced'], False)
+                self.assertEqual(dispatch['input_reduction_estimate'], 0)
+                self.assertEqual(appended[1], {'Primary': current})
                 result, staged = after["estimate"], baseline["estimate"]
                 self.assertEqual(result["matched_primary_responses"], 3)
                 self.assertEqual(result["coverage"]["unmodeled_calls"], 0)

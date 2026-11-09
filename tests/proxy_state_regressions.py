@@ -1180,9 +1180,22 @@ class StateRegressions(unittest.TestCase):
                 proxy.close()
                 fixture.close()
                 self.assertEqual(fixture.errors, [])
-                self.assertEqual(after_evidence['observations'][:-1], before_evidence['observations'],
+                original = before_evidence['observations']
+                observations = after_evidence['observations']
+                self.assertEqual(observations[:len(original)], original,
                                  'failure cannot mutate any successful fact or its native cursor/contract')
-                self.assertEqual(after_evidence['observations'][-1], 'FailedPrimary')
+                appended = observations[len(original):]
+                self.assertEqual(len(appended), 2, 'one dispatch followed by one failed terminal')
+                self.assertEqual(set(appended[0]), {'Dispatch'})
+                dispatch = appended[0]['Dispatch']
+                self.assertTrue(dispatch['request_id'])
+                self.assertEqual(dispatch['selection'], dispatch['continuation'])
+                self.assertEqual(dispatch['omitted_members'], 0)
+                self.assertEqual(dispatch['newly_omitted_members'], 0)
+                self.assertIs(dispatch['forced'], False)
+                self.assertEqual(dispatch['input_reduction_estimate'], 0)
+                # A dispatched attempt is not a successful fact or cursor advance.
+                self.assertEqual(appended[1], 'FailedPrimary')
                 for field in ("carry_cost", "traditional_cost", "reviewer_cost", "summary_cost"):
                     self.assertEqual(before[field], after[field], field)
                 estimate = session["cost_estimate"]

@@ -1532,7 +1532,12 @@ mod whole_window_tests {
         total.observe(&missing);
         total.observe(&old);
         let d = serde_json::to_value(total).unwrap();
-        assert!(d["whole_window"].is_null());
+        // The missing window stays unavailable; it cannot erase or enter the
+        // explicitly scoped aggregate of the three complete windows.
+        assert_eq!(d["whole_window"]["carry_cost"], 3.0 * 23.0);
+        assert_eq!(d["whole_window"]["traditional_cost"], 3.0 * 20.0);
+        assert_eq!(d["whole_window_included_sessions"], 3);
+        assert_eq!(d["whole_window_scope"], "available_session_windows_only");
         assert_eq!(d["whole_window_unavailable_sessions"], 1);
     }
 
@@ -1616,7 +1621,12 @@ mod whole_window_tests {
                 assert!(unknown.whole_window.is_none());
                 total.observe(&unknown);
                 total.observe(&priced);
-                assert!(total.whole_window.is_none());
+                let w = total.whole_window.as_ref().unwrap();
+                assert_eq!(w.carry_cost, 2.0 * 15.0 + reviewer_cost);
+                assert_eq!(w.traditional_cost, 2.0 * 24.0);
+                assert_eq!(w.savings, 2.0 * 9.0 - reviewer_cost);
+                assert_eq!(total.whole_window_included_sessions, 4);
+                assert_eq!(total.whole_window_unavailable_sessions, 1);
             }
         }
     }

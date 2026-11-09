@@ -371,6 +371,29 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.match(visibleText(elements.get('cards').children[1]),/successful completions only/);
   assert.match(visibleText(elements.get('cards').children[0]),/all paid attempts/);
   assert.match(visibleText(byClass(recentRow,'session-savings')),/5 inferred/);
+  // An explicitly scoped complete-window subtotal is not an all-history total.
+  data.cost_estimate.whole_window_scope='available_session_windows_only';
+  data.cost_estimate.whole_window_included_sessions=2;
+  data.cost_estimate.whole_window_unavailable_sessions=1;
+  await refresh();
+  assert.equal(cards().get('Estimated savings'),'$90.000000 (37.5%)');
+  assert.match(visibleText(elements.get('cards').children[1]),/2 histories included · 1 excluded/);
+  assert.match(elements.get('estimate-coverage').textContent,/2 complete histories · 1 excluded/);
+  assert.ok(!visibleText(elements.get('cards').children[1]).includes('Whole accounting window'));
+  // Preserve a real signed loss and disclose the free pre-window initialization.
+  recent.cost_estimate.whole_window={carry_cost:1.3372388,traditional_cost:0.04222,
+    savings:-1.2950188,savings_percent:-3067.311226906679,primary_responses:1,
+    inferred_primary_responses:0,trajectory:{initial_compactions:1}};
+  await refresh();
+  assert.match(visibleText(byClass(recentRow,'session-savings')),/\(-3067\.3%\)/);
+  assert.match(visibleText(byClass(recentRow,'session-savings')),/Traditional starts after a free initial compaction/);
+  recent.rewrites={dispatched:0,forced:0,prior_unknown:true};
+  await refresh();
+  assert.match(visibleText(byClass(recentRow,'request-counts')),/0 recorded rewrites · earlier history unknown/);
+  recent.rewrites.prior_unknown=false;
+  await refresh();
+  assert.match(visibleText(byClass(recentRow,'request-counts')),/0 rewrites/);
+  assert.ok(!visibleText(byClass(recentRow,'request-counts')).includes('earlier history unknown'));
   data.cost_estimate.whole_window=null;
   await refresh();
   assert.equal(cards().get('Estimated savings'),'—','unknown actual costs must not fall back to a narrower comparison');
@@ -397,7 +420,11 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     const checkVisibleScope=(root,e,total)=>{
       const shown=visibleText(root);
       if(Object.prototype.hasOwnProperty.call(e,'whole_window')){
-        assert.ok(shown.includes(e.whole_window?'Whole accounting window':'Whole-window estimate unavailable'));
+        if(e.whole_window_scope==='available_session_windows_only'&&e.whole_window){
+          assert.ok(shown.includes('Complete session windows'));
+          assert.ok(shown.includes(`${e.whole_window_included_sessions.toLocaleString()} histories included`));
+          assert.ok(shown.includes(`${e.whole_window_unavailable_sessions.toLocaleString()} excluded`));
+        }else assert.ok(shown.includes(e.whole_window?'Whole accounting window':'Whole-window estimate unavailable'));
         if(e.whole_window) assert.ok(shown.includes(`${e.whole_window.inferred_primary_responses.toLocaleString()} inferred`));
         return;
       }

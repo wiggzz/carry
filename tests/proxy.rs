@@ -878,7 +878,8 @@ fn private_numeric_journal(bytes: &[u8], saved: &serde_json::Value, completed: u
     };
     let valid = || -> Option<()> {
         let mark = &saved["request_evidence"]["archive"];
-        if mark["events"] != completed
+        let events = completed.checked_mul(2)?;
+        if mark["events"] != events
             || mark["bytes"].as_u64()? != bytes.len() as u64
             || mark["namespace"] != ""
             || mark["prior_untracked"] != 0
@@ -889,60 +890,82 @@ fn private_numeric_journal(bytes: &[u8], saved: &serde_json::Value, completed: u
         let lines = bytes
             .split_inclusive(|byte| *byte == b'\n')
             .collect::<Vec<_>>();
-        if lines.len() as u64 != completed {
+        if lines.len() as u64 != events {
             return None;
         }
         let refs = json!([digest(&json!({"role":"user","content":"hello"}))]);
+        let mut request_ids = std::collections::HashSet::new();
         for (sequence, line) in lines.iter().enumerate() {
             if line.last() != Some(&b'\n') {
                 return None;
             }
             let record: serde_json::Value = serde_json::from_slice(line).ok()?;
-            let facts = &record["event"]["Primary"]["facts"];
-            for value in [
-                &mark["owner"],
-                &facts["configuration"],
-                &facts["cache_scope"],
-                &facts["contract"]["source_sha256"],
-                &facts["contract"]["prompt_settings_sha256"],
-            ] {
-                let hash = value.as_str()?;
-                if hash.len() != 64
-                    || !hash
-                        .bytes()
-                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            let expected_event = if sequence % 2 == 0 {
+                let dispatch = &record["event"]["Dispatch"];
+                let request_id = dispatch["request_id"].as_str()?;
+                let mut parts = request_id.split('-');
+                let pid = parts.next()?.parse::<u32>().ok()?;
+                let epoch = parts.next()?.parse::<u128>().ok()?;
+                let counter = parts.next()?.parse::<u64>().ok()?;
+                if parts.next().is_some()
+                    || pid == 0
+                    || epoch == 0
+                    || request_id != format!("{pid}-{epoch}-{counter}")
+                    || !request_ids.insert(request_id.to_owned())
                 {
                     return None;
                 }
-            }
-            let prefix = if sequence == 0 {
-                json!([])
+                // Off mode has no planner continuation or quantity comparison.
+                json!({"Dispatch":{"request_id":request_id,"selection":digest(&json!([])),
+                    "continuation":null,"omitted_members":0,"newly_omitted_members":0,
+                    "forced":false,"input_reduction_estimate":null}})
             } else {
-                refs.clone()
+                let facts = &record["event"]["Primary"]["facts"];
+                for value in [
+                    &mark["owner"],
+                    &facts["configuration"],
+                    &facts["cache_scope"],
+                    &facts["contract"]["source_sha256"],
+                    &facts["contract"]["prompt_settings_sha256"],
+                ] {
+                    let hash = value.as_str()?;
+                    if hash.len() != 64
+                        || !hash
+                            .bytes()
+                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                    {
+                        return None;
+                    }
+                }
+                let prefix = if sequence == 1 {
+                    json!([])
+                } else {
+                    refs.clone()
+                };
+                let expected_facts = json!({
+                    "configuration": facts["configuration"],
+                    "contract": {"version":1,"quantity":"ProviderRequestInputTotalV1",
+                        "projection":"ReceiptBlocksOrVisibleTextV2","model":"fixture-model",
+                        "resolved_model":null,"source_sha256":facts["contract"]["source_sha256"],
+                        "source_class":null,"prompt_settings_sha256":facts["contract"]["prompt_settings_sha256"],
+                        "keep_recent":20000,"summary_tokens":1000,"initialization_version":1},
+                    "model":"fixture-model","resolved":null,"at":facts["at"].as_u64()?,
+                    "reused_input":0,"input":null,"semantic_input":null,"semantic_output":null,
+                    "native":null,
+                    "cost":null,"billable":true,"retained":0,"retained_visible":0,"retained_opaque":0,
+                    "retained_member":null,"estimated_retained":false,"unsupported_opaque":false,
+                    "allowance":null,"fixed":facts["fixed"].as_u64()?,"protected":facts["protected"].as_u64()?,
+                    "cache_scope":facts["cache_scope"],"cache_mode":"Implicit","read_refresh":null,
+                    "native_summary":false,
+                    "prompt":{"items":1,"wire":digest(&refs),"semantic":digest(&refs),
+                        "prior_prefix":[usize::from(sequence != 1),digest(&prefix),digest(&prefix)]}
+                });
+                json!({"Primary":{"facts":expected_facts,
+                    "restoration":{"tokens":0,"measured":true,"estimated_opaque_items":0},"edited":false}})
             };
-            let expected_facts = json!({
-                "configuration": facts["configuration"],
-                "contract": {"version":1,"quantity":"ProviderRequestInputTotalV1",
-                    "projection":"ReceiptBlocksOrVisibleTextV2","model":"fixture-model",
-                    "resolved_model":null,"source_sha256":facts["contract"]["source_sha256"],
-                    "source_class":null,"prompt_settings_sha256":facts["contract"]["prompt_settings_sha256"],
-                    "keep_recent":20000,"summary_tokens":1000,"initialization_version":1},
-                "model":"fixture-model","resolved":null,"at":facts["at"].as_u64()?,
-                "reused_input":0,"input":null,"semantic_input":null,"semantic_output":null,
-                "native":null,
-                "cost":null,"billable":true,"retained":0,"retained_visible":0,"retained_opaque":0,
-                "retained_member":null,"estimated_retained":false,"unsupported_opaque":false,
-                "allowance":null,"fixed":facts["fixed"].as_u64()?,"protected":facts["protected"].as_u64()?,
-                "cache_scope":facts["cache_scope"],"cache_mode":"Implicit","read_refresh":null,
-                "native_summary":false,
-                "prompt":{"items":1,"wire":digest(&refs),"semantic":digest(&refs),
-                    "prior_prefix":[usize::from(sequence != 0),digest(&prefix),digest(&prefix)]}
-            });
             if record
                 != json!({"version":1,"owner":mark["owner"],"namespace":mark["namespace"],
-                "sequence":sequence,"previous":previous,
-                "event":{"Primary":{"facts":expected_facts,
-                    "restoration":{"tokens":0,"measured":true,"estimated_opaque_items":0},"edited":false}}})
+                "sequence":sequence,"previous":previous,"event":expected_event})
             {
                 return None;
             }
@@ -1025,16 +1048,26 @@ async fn proxy_does_not_write_session_traces_by_default() {
         // Re-sign a content leak so rejection depends on the strict schema,
         // not merely a broken chain or watermark checksum.
         if completed == 1 {
-            let mut leaked: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let records = bytes
+                .split_inclusive(|byte| *byte == b'\n')
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 2);
+            let mut leaked: serde_json::Value = serde_json::from_slice(records[1]).unwrap();
+            assert_eq!(
+                leaked["previous"],
+                format!("{:x}", Sha256::digest(records[0]))
+            );
             leaked["event"]["Primary"]["facts"]["raw_request"] = json!({"input":"hello"});
-            let mut leaked_bytes = serde_json::to_vec(&leaked).unwrap();
-            leaked_bytes.push(b'\n');
+            let mut leaked_primary = serde_json::to_vec(&leaked).unwrap();
+            leaked_primary.push(b'\n');
+            let mut leaked_bytes = records[0].to_vec();
+            leaked_bytes.extend_from_slice(&leaked_primary);
             let mut resigned = saved.clone();
             resigned["request_evidence"]["archive"]["bytes"] = json!(leaked_bytes.len());
             resigned["request_evidence"]["archive"]["last_record_bytes"] =
-                json!(leaked_bytes.len());
+                json!(leaked_primary.len());
             resigned["request_evidence"]["archive"]["sha256"] =
-                json!(format!("{:x}", Sha256::digest(&leaked_bytes)));
+                json!(format!("{:x}", Sha256::digest(&leaked_primary)));
             assert!(!private_numeric_journal(
                 &leaked_bytes,
                 &resigned,
@@ -2005,12 +2038,13 @@ async fn failed_classifier_records_only_bounded_content_free_provider_fields() {
     assert_eq!(saved["invalid_reviews"], 3);
     assert_eq!(saved["shadow"]["unavailable_cost_calls"], 3);
     assert_eq!(saved["compactions"], 0);
-    let trace_file = std::fs::read_dir(state.path())
-        .unwrap()
-        .filter_map(Result::ok)
-        .find(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
-        .unwrap();
-    let trace = std::fs::read_to_string(trace_file.path()).unwrap();
+    let trace_file = state.path().join(format!(
+        "{}.jsonl",
+        saved["request_evidence"]["archive"]["owner"]
+            .as_str()
+            .unwrap()
+    ));
+    let trace = std::fs::read_to_string(trace_file).unwrap();
     assert!(!trace.contains("PRIVATE_"));
     assert!(!trace.contains("fixture-shadow"));
     let failed = trace

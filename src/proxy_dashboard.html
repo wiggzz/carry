@@ -307,6 +307,7 @@ function coverageChips(e){
  if(q?.comparison_scope==='matched_subset_not_whole_session')chips.push(Object.prototype.hasOwnProperty.call(e,'whole_window')?'Strict quantity reference is partial (diagnostic)':'Matched subtotal · not whole session');
  if(e?.excluded_unpriced_calls)chips.push(fmt(e.excluded_unpriced_calls)+(Object.prototype.hasOwnProperty.call(e,'whole_window')?' calls outside strict reference':' comparison calls excluded'));
  if(e?.excluded_failed_calls)chips.push(fmt(e.excluded_failed_calls)+' failed calls excluded');
+ if(e?.coverage?.prior_untracked_calls)chips.push(fmt(e.coverage.prior_untracked_calls)+' prior attempts lack complete outcome/history evidence');
  if(e?.legacy_sessions)chips.push(fmt(e.legacy_sessions)+(Object.prototype.hasOwnProperty.call(e,'whole_window')?' legacy diagnostic sessions':' legacy sessions excluded'));
  if(e?.in_flight_sessions)chips.push('In-flight costs pending');
  if(e?.legacy_cache_policy_sessions||e?.mixed_cache_policy_sessions)chips.push('Legacy / mixed cache assumptions');
@@ -336,7 +337,7 @@ function renderSession(s){
  const heading=document.createElement('h3');heading.textContent=s.title||'Untitled session';heading.title=s.id;identity.append(heading);
  note(identity,sessionMeta(s),'session-meta');
  identity.append(requestRecency(s));
- note(identity,count(s.completed_requests||0,'request')+(s.rewrites?' · '+count(s.rewrites.dispatched,'rewrite')+(s.rewrites.forced?' · '+fmt(s.rewrites.forced)+' forced':''):''),'request-counts');el.append(identity);
+ note(identity,count(s.completed_requests||0,'request')+(s.rewrites?' · '+count(s.rewrites.dispatched,s.rewrites.prior_unknown?'recorded rewrite':'rewrite')+(s.rewrites.forced?' · '+fmt(s.rewrites.forced)+' forced':'')+(s.rewrites.prior_unknown?' · earlier history unknown':''):''),'request-counts');el.append(identity);
  const ledgers=[s.primary||{},s.shadow||{}],missing=sum(ledgers,'unavailable_cost_calls'),e=s.cost_estimate,h=headlineEstimate(e);
  const costs=document.createElement('div');costs.className='session-costs';note(costs,missing?'Priced subtotal':'Observed cost','label');note(costs,money(pricedSubtotal(ledgers)),'value');note(costs,'Primary + reviewer · all paid attempts','card-note');el.append(costs);
  const saved=document.createElement('div');saved.className='session-savings';saved.setAttribute('data-loss',String(h?.savings<0));note(saved,'Estimated savings','label');note(saved,savingsText(e),'value');note(saved,h?.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');comparisonScopeNote(saved,e);el.append(saved);

@@ -443,9 +443,21 @@ class InitializationRegressions(unittest.TestCase):
         self.assertEqual(failed["result"]["traditional_cost"], first["result"]["traditional_cost"])
         self.assertAlmostEqual(first["result"]["traditional_cost"], 0.0525, places=12)
         self.assertEqual(first["result"]["initial_compactions"], 1)
-        self.assertEqual(failed['request_evidence']['observations'][:-1],
-                         first['request_evidence']['observations'])
-        self.assertEqual(failed['request_evidence']['observations'][-1], 'FailedPrimary')
+        original = first['request_evidence']['observations']
+        observations = failed['request_evidence']['observations']
+        self.assertEqual(observations[:len(original)], original,
+                         'failure preserves successful initialization facts and native cursor/contract')
+        appended = observations[len(original):]
+        self.assertEqual(len(appended), 2, 'one dispatch followed by one failed terminal')
+        self.assertEqual(set(appended[0]), {'Dispatch'})
+        dispatch = appended[0]['Dispatch']
+        self.assertTrue(dispatch['request_id'])
+        self.assertEqual(dispatch['selection'], dispatch['continuation'])
+        self.assertEqual(dispatch['omitted_members'], 0)
+        self.assertEqual(dispatch['newly_omitted_members'], 0)
+        self.assertIs(dispatch['forced'], False)
+        self.assertEqual(dispatch['input_reduction_estimate'], 0)
+        self.assertEqual(appended[1], 'FailedPrimary')
         self.assertEqual(restarted, failed, "restart preserves the failed-attempt boundary")
         self.assertEqual(retry["result"]["initial_compactions"], 1,
                          "a failed request cannot repeat free initialization")

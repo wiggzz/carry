@@ -1,6 +1,56 @@
 // Real held loopback transport, cancelled caller future, durable settlement.
 
 #[tokio::test]
+async fn cancelled_queued_caller_never_dispatches_after_owner_unlock() {
+    let (url, mut received, _, provider) = timing_loopback().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.mode = Mode::Off;
+    service.config.upstream_url = url;
+    let (tx, mut waits) = mpsc::unbounded_channel();
+    *service.lock_waits.lock().unwrap() = Some(tx);
+    let service = Arc::new(service);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-carry-session", "queued-cancellation".parse().unwrap());
+    let id = identity(&headers).unwrap().unwrap();
+    let lock = session_lock(&service, &id).await;
+    waits.recv().await.unwrap();
+    let caller = tokio::spawn(forward_request(
+        service.clone(),
+        headers,
+        Bytes::from_static(br#"{"model":"gpt-6-luna","input":[]}"#),
+        false,
+        "queued-cancel".into(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), waits.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    drop(lock);
+    // Cross the lock boundary again so a detached queued request cannot hide
+    // behind its earlier wait, then inspect the actual loopback provider.
+    let available = tokio::time::timeout(Duration::from_secs(5), session_lock(&service, &id))
+        .await
+        .unwrap();
+    drop(available);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), received.recv())
+            .await
+            .is_err()
+    );
+    let session = load(&service, &id).unwrap();
+    assert_eq!(session.primary.calls, 0);
+    assert_eq!(session.shadow.calls, 0);
+    assert!(!session.primary_pending);
+    let record = timing_record(directory.path(), &id, "queued-cancel");
+    assert_eq!(record["data"]["outcome"], "cancelled");
+    assert_eq!(record["data"]["attempts"], json!([]));
+    provider.abort();
+}
+
+#[tokio::test]
 async fn cancelled_preheader_caller_does_not_leave_an_unresolved_attempt() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let arrived = Arc::new(tokio::sync::Notify::new());

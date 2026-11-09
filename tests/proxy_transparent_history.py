@@ -1225,7 +1225,10 @@ class TransparentHistory(unittest.TestCase):
         self.assertFalse((self.state / "history.index").exists())
         self.assertEqual(list(self.state.glob("*.json")), [])
         proxy.close()
-        env["CARRY_PROXY_HISTORY_MAX_BYTES"] = "16384"
+        # The roomy arm must fit a completed selected snapshot, including its
+        # numeric dispatch evidence. Keep the 4 KiB no-dispatch rejection above;
+        # every publication below must still obey this declared byte bound.
+        env["CARRY_PROXY_HISTORY_MAX_BYTES"] = "32768"
         proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"], env)
         self.stack.callback(proxy.close)
         for n in range(8):

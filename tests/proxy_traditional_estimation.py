@@ -40,12 +40,23 @@ class TraditionalEstimation(unittest.TestCase):
                             else:
                                 self.assertIsNone(whole['savings_percent'])
                             windows.append(whole)
-                    total = value['cost_estimate']['whole_window']
-                    if incomplete:
-                        self.assertIsNone(total)
-                    elif windows:
+                    aggregate = value['cost_estimate']
+                    total = aggregate['whole_window']
+                    self.assertEqual(aggregate['whole_window_scope'], 'available_session_windows_only')
+                    self.assertEqual(aggregate['whole_window_included_sessions'], len(windows))
+                    if windows:
+                        self.assertIsInstance(total, dict)
                         for field in ['carry_cost','traditional_cost','savings']:
                             self.assertAlmostEqual(total[field], sum(w[field] for w in windows), places=12)
+                        self.assertEqual(total['primary_responses'], sum(w['primary_responses'] for w in windows))
+                        if total['traditional_cost']:
+                            self.assertAlmostEqual(total['savings_percent'], 100 * total['savings'] / total['traditional_cost'], places=10)
+                        else:
+                            self.assertIsNone(total['savings_percent'])
+                    else:
+                        self.assertIsNone(total)
+                    if incomplete:
+                        self.assertGreater(aggregate['whole_window_unavailable_sessions'], 0)
                 for child in value.values(): check(child)
             elif isinstance(value, list):
                 for child in value: check(child)
@@ -179,7 +190,12 @@ class TraditionalEstimation(unittest.TestCase):
         self.evidence['unknown_money_stats'] = unknown
         unpriced = next(s for s in unknown['sessions'] if s['primary']['unavailable_cost_calls'])
         self.assertIsNone(unpriced['cost_estimate']['whole_window'])
-        self.assertIsNone(unknown['cost_estimate']['whole_window'])
+        # A genuinely unpriced owner remains excluded; complete peers retain
+        # their explicitly scoped subtotal without importing its actual money.
+        self.assertEqual(unknown['cost_estimate']['whole_window'], total)
+        self.assertEqual(unknown['cost_estimate']['whole_window_scope'], 'available_session_windows_only')
+        self.assertEqual(unknown['cost_estimate']['whole_window_included_sessions'], 2)
+        self.assertEqual(unknown['cost_estimate']['whole_window_unavailable_sessions'], 1)
 
     def test_whole_window_opaque_reviewer_expense_is_subtracted_once(self):
         output = [{'type':'reasoning','summary':[],'encrypted_content':'unresolved-opaque'}]
@@ -325,7 +341,8 @@ class TraditionalEstimation(unittest.TestCase):
         self.assertEqual(saved['estimate']['traditional_compactions'], 1)
         # Explicit missing projection fact on a real successful dispatch. A
         # later config-only success cannot recover this discarded chronology.
-        gap = saved['request_evidence']['observations'][-1]['Primary']
+        gap_index = len(saved['request_evidence']['observations']) - 1
+        gap = saved['request_evidence']['observations'][gap_index]['Primary']
         gap['restoration'] = None
         gap['edited'] = True
         next(self.state.glob('*.json')).write_text(json.dumps(saved))
@@ -335,12 +352,12 @@ class TraditionalEstimation(unittest.TestCase):
         matched = frozen['matched_primary_responses']
         self.assertEqual(proxy.send(history, max_output_tokens=1, temperature=0.5)[0], 200)
         intervening = self.snapshot(proxy); self.evidence['intervening_success'] = intervening
-        self.assertIsNone(intervening['request_evidence']['observations'][-2]['Primary']['restoration'])
+        self.assertIsNone(intervening['request_evidence']['observations'][gap_index]['Primary']['restoration'])
         proxy.close(); proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history, max_output_tokens=1)[0], 200)
         after = self.snapshot(proxy); self.evidence['after_restart'] = after
         t = after['estimate']
-        self.assertIsNone(after['request_evidence']['observations'][-3]['Primary']['restoration'],
+        self.assertIsNone(after['request_evidence']['observations'][gap_index]['Primary']['restoration'],
                           'never resurrect missing projection evidence across successful transitions')
         self.assertEqual(t['matched_primary_responses'], matched)
         for field in ['traditional_cost','summary_cost','carry_cost']:
