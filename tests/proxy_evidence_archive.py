@@ -49,7 +49,7 @@ class EvidenceArchive(unittest.TestCase):
         if bound == 'observations':
             observations.extend(['Boundary'] * (4096 - len(observations)))
         else:
-            facts = observations[0]['Primary']['facts']
+            facts = next(o['Primary']['facts'] for o in observations if isinstance(o, dict) and 'Primary' in o)
             facts.update(input=['f'*64]*32768, semantic_input=['e'*64]*32768,
                          semantic_output=[], reused_input=0)
         checkpoint.write_text(json.dumps(saturated))
@@ -163,8 +163,9 @@ class EvidenceArchive(unittest.TestCase):
                 for sentinel in (b'raw-body-storage-sentinel',b'traditional_cost',b'summary_cost',b'canonical_offset'):
                     self.assertNotIn(sentinel, raw)
                 records = [json.loads(line) for line in raw.splitlines()]
-                self.assertEqual(len(records), 1)
-                facts = records[0]['event']['Primary']['facts']
+                self.assertEqual(len(records), 2)
+                self.assertIn('Dispatch', records[0]['event'])
+                facts = records[1]['event']['Primary']['facts']
                 self.assertIsNone(facts['input'])
                 self.assertIsNone(facts['semantic_input'])
                 self.assertIsNone(facts['semantic_output'])
@@ -219,12 +220,12 @@ class EvidenceArchive(unittest.TestCase):
                     # committed publication. Preserve bytes, replay only the
                     # checkpoint watermark and genuine bounded pending facts.
                     self.assertEqual(archive.read_bytes(), raw + b'orphan bytes must not be replayed\n')
-                    self.assertEqual(current['request_evidence']['archive']['events'], 2)
+                    self.assertEqual(current['request_evidence']['archive']['events'], 4)
                     self.assertFalse(current['request_evidence'].get('numeric_pending'))
                     self.assertNotEqual(selected_archive(proxy), archive)
                 else:
                     self.assertIsNone(after['whole_window'])
-                    self.assertEqual(len(current['request_evidence']['numeric_pending']), 1)
+                    self.assertEqual(len(current['request_evidence']['numeric_pending']), 2)
                 self.evidence['cases'][case] = dict(before=before, loaded=loaded, after=after, restarted=restarted,
                                                    primary=current['primary'], archive_bytes=len(raw))
                 proxy.close()
@@ -250,7 +251,7 @@ class EvidenceArchive(unittest.TestCase):
             self.assertEqual(saved['primary']['calls'], n+2)
             self.assertAlmostEqual(saved['primary']['cost_usd'], (n+2)*before['primary']['cost_usd'], places=12)
             self.assertEqual(after['whole_window']['primary_responses'], n+2)
-            self.assertEqual(saved['request_evidence']['archive']['events'], n+2)
+            self.assertEqual(saved['request_evidence']['archive']['events'], 2*(n+2))
             self.assertFalse(saved['request_evidence'].get('numeric_pending'))
             self.assertFalse(saved['request_evidence'].get('numeric_lost', False))
             self.assertEqual(archive.read_bytes(), orphan)
@@ -320,8 +321,8 @@ class EvidenceArchive(unittest.TestCase):
             self.assertAlmostEqual(saved['primary']['cost_usd'], paid, places=10)
             evidence = saved['request_evidence']
             observations = evidence['observations']
-            self.assertTrue(all('Primary' in o for o in observations), 'no hidden epoch boundary')
-            facts = [o['Primary']['facts'] for o in observations]
+            self.assertTrue(all('Primary' in o or 'Dispatch' in o for o in observations), 'no hidden epoch boundary')
+            facts = [o['Primary']['facts'] for o in observations if 'Primary' in o]
             actual_refs = sum(2*len(f['input'])+len(f['semantic_output']) for f in facts)
             demanded_refs = retained_refs + 2 + output_items
             crossed = demanded_refs > 65536
@@ -343,7 +344,7 @@ class EvidenceArchive(unittest.TestCase):
                 self.assertEqual(evidence['prior_untracked'], 0)
                 self.assertEqual(actual_refs, demanded_refs)
             retained_refs = actual_refs
-            self.assertEqual(evidence['archive']['events'], i+1)
+            self.assertEqual(evidence['archive']['events'], 2*(i+1))
             self.assertFalse(evidence.get('numeric_pending'))
             self.assertFalse(evidence.get('numeric_lost', False))
             snapshot = support.cost_estimate(proxy)

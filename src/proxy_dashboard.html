@@ -316,7 +316,9 @@ function coverageChips(e){
 function comparisonScopeNote(root,e){
  if(e&&Object.prototype.hasOwnProperty.call(e,'whole_window')){
   const w=e.whole_window;
-  note(root,w?'Whole accounting window · successful completions only · '+fmt(w.primary_responses)+' primary responses · '+fmt(w.inferred_primary_responses)+' inferred':'Whole-window estimate unavailable · actual money/window incomplete','comparison-scope card-note');
+  const subset=e.whole_window_scope==='available_session_windows_only';
+  note(root,w?(subset?'Complete session windows · '+fmt(e.whole_window_included_sessions)+' histories included · '+fmt(e.whole_window_unavailable_sessions)+' excluded':'Whole accounting window · successful completions only')+' · '+fmt(w.primary_responses)+' primary responses · '+fmt(w.inferred_primary_responses)+' inferred':'Whole-window estimate unavailable · actual money/window incomplete','comparison-scope card-note');
+  if(w&&(w.trajectory?.initial_compactions??e.initial_compactions)>0)note(root,'Traditional starts after a free initial compaction','comparison-scope card-note');
   return;
  }
  const q=e?.quantity_evidence,scope=q?.comparison_scope;
@@ -360,7 +362,7 @@ function renderSession(s){
  if(e?.counterfactual_cache_policy||e?.accounting_basis){const accounting=disclosure('accounting:'+s.id,'Accounting details','session-accounting');if(e.counterfactual_cache_policy)inspectionMetric(accounting,'Comparison cache policy',e.counterfactual_cache_policy);if(e.accounting_basis)inspectionMetric(accounting,'Accounting basis',e.accounting_basis);if(e.quantity_evidence){inspectionMetric(accounting,'Quantity estimates',e.quantity_evidence.version===1?'Receipt blocks + native-increment residual allocations':'Legacy receipt quantities','No calibrated interval; same outputs and tool sequence assumed');inspectionMetric(accounting,'Historical quantity policy',e.quantity_evidence.historical_policy_scope,fmt(e.quantity_evidence.legacy_priced_calls||0)+' legacy priced calls · no retrospective repricing')}details.append(accounting)}
  if(e&&Object.prototype.hasOwnProperty.call(e,'whole_window')){
  const whole=disclosure('whole:'+s.id,'Whole-window estimate assumptions','whole-window-assumptions');
- inspectionMetric(whole,'Historical inference',e.whole_window?.assumption?.replaceAll('_',' ')||'Actual money unavailable', 'Successful completed primary/reviewer outcomes only; failed attempts excluded symmetrically. Observed cost separately includes all paid attempts. Same outputs and tool sequence; conditional cache; summary/cache costs amortized through reference ratio, or neutral net compaction expense parity without a reference. Not measured or causal savings; no calibrated interval.');
+ inspectionMetric(whole,'Historical inference',e.whole_window?.assumption?.replaceAll('_',' ')||'Actual money/window unavailable', 'Continuous request-by-request traditional trajectory; successful completed outcomes only, failed attempts excluded symmetrically. At most one free initial compaction for an already oversized first tracked input; subsequent summaries are charged. Same outputs and tool sequence; conditional cache and explicit quantity estimates. Observed cost separately includes all paid attempts. Not measured or causal savings; no calibrated interval.');
  inspectionMetric(whole,'Strict matched diagnostics',money(e.carry_cost)+' Carry / '+money(e.traditional_cost)+' traditional','Original subset evidence; not the headline');details.append(whole);
  }
  details.append(transcriptView(s));el.append(details);return el;
@@ -385,7 +387,7 @@ async function refresh(){
   note($('cards').children[1],headline?.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');
   comparisonScopeNote($('cards').children[1],estimate);
   if(headline?.savings<0)$('cards').children[1].className='card loss';
-  $('estimate-coverage').textContent=Object.prototype.hasOwnProperty.call(estimate,'whole_window')?(headline?fmt(headline.inferred_primary_responses)+' inferred calls · full cost window':fmt(estimate.whole_window_unavailable_sessions||0)+' windows with incomplete observed money'):fmt(estimate.included_sessions||0)+' comparable · '+fmt(estimate.excluded_sessions||0)+' excluded';
+  $('estimate-coverage').textContent=estimate.whole_window_scope==='available_session_windows_only'?fmt(estimate.whole_window_included_sessions)+' complete histories · '+fmt(estimate.whole_window_unavailable_sessions)+' excluded':Object.prototype.hasOwnProperty.call(estimate,'whole_window')?(headline?fmt(headline.inferred_primary_responses)+' inferred calls · full cost window':fmt(estimate.whole_window_unavailable_sessions||0)+' windows with incomplete observed money'):fmt(estimate.included_sessions||0)+' comparable · '+fmt(estimate.excluded_sessions||0)+' excluded';
   const warnings=[];
   if(unpriced)warnings.push(count(unpriced,'unpriced call'));
   if(unreadable)warnings.push(count(unreadable,'unreadable checkpoint'));

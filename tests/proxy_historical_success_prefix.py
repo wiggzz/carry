@@ -259,7 +259,7 @@ class HistoricalSuccessPrefix(unittest.TestCase):
                                         for _ in range(suffix_count)]
                     else:
                         suffix_count = 1
-                        observation = copy.deepcopy(bound_state['request_evidence']['observations'][0])
+                        observation = copy.deepcopy(next(o for o in bound_state['request_evidence']['observations'] if isinstance(o, dict) and 'Primary' in o))
                         facts = observation['Primary']['facts']
                         facts['reused_input'] = 0
                         facts['input'] = ['f' * 64] * 32768

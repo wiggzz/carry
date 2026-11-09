@@ -234,6 +234,15 @@ impl PrimaryFacts {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 enum Observation {
+    Dispatch {
+        request_id: String,
+        selection: String,
+        continuation: Option<String>,
+        omitted_members: u64,
+        newly_omitted_members: u64,
+        forced: bool,
+        input_reduction_estimate: Option<i128>,
+    },
     Primary {
         facts: Box<PrimaryFacts>,
         restoration: Option<crate::proxy_quantity::RestorationEstimate>,
@@ -253,6 +262,14 @@ enum Observation {
         calls: u64,
     },
     Boundary,
+}
+
+/// Derived from dispatched selections, independently of quantity availability.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RewriteCount {
+    pub dispatched: u64,
+    pub forced: u64,
+    pub prior_unknown: bool,
 }
 
 /// One owner for successful receipts, failed terminal outcomes and input
@@ -396,7 +413,7 @@ impl RequestEvidence {
                 }
                 Observation::Reviewer { .. } | Observation::FailedReviewer => reviewer += 1,
                 Observation::FailedPrimary => primary += 1,
-                Observation::Boundary | Observation::Gap { .. } => {}
+                Observation::Boundary | Observation::Gap { .. } | Observation::Dispatch { .. } => {}
             }
         }
         let money = |cost: Option<f64>, calls: u64, unknown: u64| {
@@ -501,7 +518,12 @@ impl RequestEvidence {
         self.prior_untracked += self
             .observations
             .iter()
-            .filter(|observation| !matches!(observation, Observation::Boundary))
+            .filter(|observation| {
+                !matches!(
+                    observation,
+                    Observation::Boundary | Observation::Dispatch { .. }
+                )
+            })
             .count() as u64;
         self.observations.clear();
     }
@@ -593,6 +615,7 @@ impl RequestEvidence {
             strict.excluded_failed_calls = numeric.excluded_failed_calls;
         }
         strict.chronological = numeric.chronological;
+        strict.rewrites = numeric.rewrites;
         if numeric.archive_unavailable || self.numeric_lost {
             strict.chronological = None;
             strict.archive_unavailable = true;
@@ -627,14 +650,32 @@ impl RequestEvidence {
                     == Some(prior_untracked)
         });
         replay.prior_untracked(if prefix.is_some() { 0 } else { prior_untracked });
+        let mut rewrites = RewriteCount {
+            prior_unknown: prior_untracked > 0,
+            ..Default::default()
+        };
+        let mut dispatched = false;
         let (mut wire, mut semantic) = (Vec::new(), Vec::new());
         let mut observe = |observation: &Observation| {
             match observation {
+                Observation::Dispatch {
+                    newly_omitted_members,
+                    forced,
+                    ..
+                } => {
+                    dispatched = true;
+                    if *newly_omitted_members > 0 {
+                        rewrites.dispatched = rewrites.dispatched.saturating_add(1);
+                        rewrites.forced = rewrites.forced.saturating_add(u64::from(*forced));
+                    }
+                }
                 Observation::Primary {
                     facts,
                     restoration,
                     edited,
                 } => {
+                    rewrites.prior_unknown |= !dispatched;
+                    dispatched = false;
                     let mut expanded = facts.as_ref().clone();
                     if Self::expand(facts, &mut wire, &mut semantic) {
                         expanded.input = Some(wire.clone());
@@ -681,10 +722,21 @@ impl RequestEvidence {
                     standard,
                     cost,
                 } => replay.observed_reviewer(usage, *standard, *cost),
-                Observation::FailedPrimary => replay.failed_call(),
+                Observation::FailedPrimary => {
+                    rewrites.prior_unknown |= !dispatched;
+                    dispatched = false;
+                    replay.failed_call();
+                }
                 Observation::FailedReviewer => replay.failed_reviewer_call(),
-                Observation::Unmodeled { cost } => replay.unmodeled_call(*cost),
-                Observation::Gap { calls } => replay.prior_untracked(*calls),
+                Observation::Unmodeled { cost } => {
+                    rewrites.prior_unknown |= !dispatched;
+                    dispatched = false;
+                    replay.unmodeled_call(*cost);
+                }
+                Observation::Gap { calls } => {
+                    rewrites.prior_unknown |= *calls > 0;
+                    replay.prior_untracked(*calls);
+                }
                 Observation::Boundary => replay.reset_epoch(),
             }
         };
@@ -697,6 +749,14 @@ impl RequestEvidence {
             true
         };
         let mut estimate = replay.snapshot();
+        estimate.rewrites = if archive_complete && !self.numeric_lost {
+            rewrites
+        } else {
+            RewriteCount {
+                prior_unknown: true,
+                ..Default::default()
+            }
+        };
         estimate.archive_unavailable = !archive_complete;
         if infer
             && archive_complete
@@ -755,6 +815,37 @@ impl RequestEvidence {
     }
     pub fn failed_call(&mut self) {
         self.append(Observation::FailedPrimary);
+    }
+    /// Record only the primary selection submitted at the dispatch boundary.
+    /// The planner supplies the currently reauthorized prior projection plus
+    /// appends. Old omissions are never semantic authority or new cleanups.
+    pub fn dispatched_selection(
+        &mut self,
+        request_id: &str,
+        omitted: &std::collections::HashSet<u64>,
+        continuation: Option<&std::collections::HashSet<u64>>,
+        forced: bool,
+        input_reduction_estimate: Option<i128>,
+    ) {
+        let identity = |ids: &std::collections::HashSet<u64>| {
+            hash(
+                &ids.iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
+        };
+        self.append(Observation::Dispatch {
+            request_id: request_id.into(),
+            selection: identity(omitted),
+            continuation: continuation.map(identity),
+            omitted_members: omitted.len() as u64,
+            newly_omitted_members: omitted
+                .iter()
+                .filter(|id| continuation.is_none_or(|prior| !prior.contains(id)))
+                .count() as u64,
+            forced,
+            input_reduction_estimate,
+        });
     }
     pub fn failed_reviewer_call(&mut self) {
         self.append(Observation::FailedReviewer);

@@ -191,7 +191,8 @@ class PlannerMarginalBaseline(unittest.TestCase):
                 self.assertEqual(saved["primary"]["input_tokens"], before["primary"]["input_tokens"] + 60000)
             captured.update(primaries=copy.deepcopy(fixture.primaries), decision_checkpoint=decision,
                             reviews=copy.deepcopy(fixture.reviews),
-                            fixture_errors=copy.deepcopy(fixture.errors), final_checkpoint=saved)
+                            fixture_errors=copy.deepcopy(fixture.errors), final_checkpoint=saved,
+                            final_stats=proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0])
             self.assertEqual(fixture.errors, [])
             self.assertEqual(len(fixture.primaries), 9 if followups else (7 if audit_guard else 5))
             calls = len(fixture.primaries)

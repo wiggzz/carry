@@ -102,6 +102,9 @@ pub struct CachePolicyBoundary {
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Estimate {
+    /// Disposable view of the applied-selection timeline, not a saved counter.
+    #[serde(skip)]
+    pub rewrites: evidence::RewriteCount,
     /// Read-time replay only; never an authoritative persisted prediction.
     #[serde(skip)]
     pub chronological: Option<ChronologicalEstimate>,
@@ -450,6 +453,8 @@ impl DashboardQuantityTotals {
 #[derive(Default, Debug, Serialize)]
 pub struct DashboardTotals {
     whole_window: Option<WholeWindowEstimate>,
+    whole_window_included_sessions: u64,
+    whole_window_scope: WholeWindowScope,
     whole_window_unavailable_sessions: u64,
     quantity_evidence: DashboardQuantityTotals,
     legacy_cache_policy_sessions: u64,
@@ -472,22 +477,26 @@ pub struct DashboardTotals {
     excluded_unpriced_reviewer_calls: u64,
 }
 
+#[derive(Default, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WholeWindowScope {
+    #[default]
+    AvailableSessionWindowsOnly,
+}
+
 impl DashboardTotals {
     pub fn unavailable_whole_windows(&mut self, count: u64) {
         self.whole_window_unavailable_sessions += count;
-        if count > 0 {
-            self.whole_window = None;
-        }
     }
 
     pub fn observe(&mut self, estimate: &DashboardEstimate) {
-        // Aggregate the SAME whole population as observed spend. Unknown actual
-        // money cannot silently drop a session and leave a full-window headline.
+        // Sum complete session windows only, with explicit included/excluded
+        // coverage. Neither strict partial sums nor all-attempt observed spend
+        // may fill an unavailable peer or enter this comparison denominator.
         if estimate.whole_window_incomplete {
             self.unavailable_whole_windows(1);
-        } else if self.whole_window_unavailable_sessions == 0
-            && let Some(window) = &estimate.whole_window
-        {
+        } else if let Some(window) = &estimate.whole_window {
+            self.whole_window_included_sessions += 1;
             if let Some(total) = &mut self.whole_window {
                 total.carry_cost += window.carry_cost;
                 total.traditional_cost += window.traditional_cost;

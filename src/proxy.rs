@@ -1448,8 +1448,12 @@ async fn dashboard_stats(
                     ..Default::default()
                 },
                 ..Default::default()
-            })
-            .dashboard(session.background_review_pending || session.primary_pending);
+            });
+        let mut rewrites = estimate.rewrites.clone();
+        rewrites.prior_unknown |= session.request_evidence.is_none()
+            && (session.primary.calls > 0 || session.completed_requests > 0);
+        let estimate =
+            estimate.dashboard(session.background_review_pending || session.primary_pending);
         cost_estimate.observe(&estimate);
         let updated_at = entry
             .metadata()
@@ -1474,7 +1478,7 @@ async fn dashboard_stats(
             "completed_requests": session.completed_requests,
             "last_primary_dispatch": session.last_primary_dispatch,
             "last_reviewer_dispatch": session.last_reviewer_dispatch,
-            "rewrites": session.rewrites,
+            "rewrites": rewrites,
             "compactions": session.compactions, "native_compactions": session.native_compactions,
             "history_rebases": session.history_rebases, "invalid_reviews": session.invalid_reviews, "partial_reviews": session.partial_reviews,
             "failed_primaries": session.failed_primaries,
@@ -2215,26 +2219,17 @@ async fn forward_timed(
                 resolved,
             )
         });
-        let shrink = baseline.as_ref().is_some_and(|prior| {
-            projection.omitted.iter().any(|id| !prior.contains(id))
-                && measurement
-                    .outgoing_input_tokens
-                    .zip(measurement.continuation_input_tokens)
-                    .is_some_and(|(out, before)| out < before)
-        });
-        let rewrites = session
-            .rewrites
-            .get_or_insert_with(|| crate::proxy_state::RewriteCount {
-                prior_unknown: session.primary.calls > 0
-                    || session.completed_requests > 0
-                    || session.compactions > 1,
-                ..Default::default()
-            });
-        if shrink {
-            rewrites.dispatched = rewrites.dispatched.saturating_add(1);
-            rewrites.forced = rewrites
-                .forced
-                .saturating_add(u64::from(report["forced"] == true));
+        if let Some(evidence) = &mut session.request_evidence {
+            evidence.dispatched_selection(
+                &request_id,
+                &projection.omitted,
+                baseline.as_ref(),
+                report["forced"] == true,
+                measurement
+                    .continuation_input_tokens
+                    .zip(measurement.outgoing_input_tokens)
+                    .map(|(before, out)| i128::from(before) - i128::from(out)),
+            );
         }
         session.last_primary_dispatch = Some(measurement);
         session.last_submitted_ids = session
@@ -5060,6 +5055,7 @@ mod tests {
     include!("proxy_catalog_isolation_tests.rs");
     include!("proxy_qualified_producer_tests.rs");
     include!("proxy_settlement_tests.rs");
+    include!("proxy_cancellation_tests.rs");
     mod namespace_controls {
         include!("proxy_namespace_tests.rs");
     }

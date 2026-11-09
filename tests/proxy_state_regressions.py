@@ -797,8 +797,9 @@ class StateRegressions(unittest.TestCase):
                     # Frozen synthetic dispatch facts, not accumulated predictions.
                     # Mark a divergent dispatch with a declared synthetic tariff;
                     # otherwise exact no-op receipt parity correctly copies carry.
-                    evidence["observations"][0]["Primary"]["edited"] = True
-                    facts = evidence["observations"][0]["Primary"]["facts"]
+                    primary = next(o["Primary"] for o in evidence["observations"] if isinstance(o, dict) and "Primary" in o)
+                    primary["edited"] = True
+                    facts = primary["facts"]
                     facts.update(cost=carry, retained=0, fixed=0, protected=0)
                     facts["native"].update(input_tokens=1000,
                                            output_tokens=0, cached_input_tokens=0,
@@ -938,7 +939,7 @@ class StateRegressions(unittest.TestCase):
                     # anchor, even when its tariff is unavailable. It must not
                     # preserve the former model's configuration or price it.
                     self.assertIsNotNone(facts["native"])
-                    self.assertNotEqual(facts["configuration"], before_evidence["observations"][0]["Primary"]["facts"]["configuration"])
+                    self.assertNotEqual(facts["configuration"], next(o["Primary"]["facts"]["configuration"] for o in before_evidence["observations"] if isinstance(o, dict) and "Primary" in o))
                     self.assertEqual(facts["native"]["input_tokens"], completed()["usage"]["input_tokens"])
                     self.assertEqual(facts["contract"]["model"], "unknown-model")
                 else:

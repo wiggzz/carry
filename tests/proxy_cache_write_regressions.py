@@ -67,7 +67,7 @@ class CacheWriteRegressions(unittest.TestCase):
     def assert_summary_survives_policy(self, snapshots, *, migrate):
         first, second, third = snapshots
         self.assertAlmostEqual(first['estimate']['traditional_cost'], 21000 * 2.5 / 1e6, places=12)
-        self.assertEqual(first['evidence']['observations'][0]['Primary']['facts']['native']['input_tokens'], 300000)
+        self.assertEqual(next(o['Primary']['facts']['native']['input_tokens'] for o in first['evidence']['observations'] if isinstance(o, dict) and 'Primary' in o), 300000)
         for index, snapshot in enumerate(snapshots):
             estimate = snapshot["estimate"]
             self.assertEqual(estimate["initial_compactions"], 1,
@@ -75,7 +75,7 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertEqual(estimate["traditional_compactions"], 0)
             self.assertEqual(estimate["summary_cost"], 0.0)
             self.assertEqual(estimate["summary_cost"], first["estimate"]["summary_cost"])
-            self.assertEqual(snapshot['evidence']['observations'][0], first['evidence']['observations'][0],
+            self.assertEqual(snapshot['evidence']['observations'][:len(first['evidence']['observations'])], first['evidence']['observations'],
                              'later policy/restart cannot rewrite frozen native history')
             self.assertEqual(estimate["matched_primary_responses"], index + 1)
             self.assertEqual(estimate["excluded_unpriced_calls"], 0)
@@ -108,7 +108,7 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertEqual(snapshot["estimate"]["traditional_compactions"], 0)
             self.assertEqual(snapshot["estimate"]["summary_cost"], 0.0)
             self.assertEqual(snapshot["estimate"]["summary_cost"], first["estimate"]["summary_cost"])
-            self.assertEqual(snapshot['evidence']['observations'][0], first['evidence']['observations'][0],
+            self.assertEqual(snapshot['evidence']['observations'][:len(first['evidence']['observations'])], first['evidence']['observations'],
                              'later policy/restart cannot rewrite frozen native history')
         # The summarized branch is already warm before the transition. Thus its
         # cold request cannot be explained by traditional_edited from a summary.

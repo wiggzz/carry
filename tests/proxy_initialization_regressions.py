@@ -557,7 +557,7 @@ class InitializationRegressions(unittest.TestCase):
             self.assertEqual(boundaries[0]["next_version"], 3)
             for key in ["carry_cost", "traditional_cost", "summary_cost", "traditional_compactions"]:
                 self.assertEqual(boundaries[0]["cumulative"][key], snapshots[2]["result"][key])
-            self.assertEqual(snapshots[2]['request_evidence']['observations'][0]['Primary']['facts']['contract'],
+            self.assertEqual(next(o['Primary']['facts']['contract'] for o in snapshots[2]['request_evidence']['observations'] if isinstance(o, dict) and 'Primary' in o),
                              snapshots[3]['request_evidence']['observations'][-1]['Primary']['facts']['contract'],
                              "cache policy must not rekey traditional history")
         self.assertEqual(snapshots[4]["result"].get("cache_policy_boundaries", []), boundaries)
