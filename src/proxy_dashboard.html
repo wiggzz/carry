@@ -295,7 +295,7 @@ function contextOverview(c){
 }
 function tokenMetrics(s){
  const wrap=document.createElement('div');wrap.className='token-metrics';const d=s.last_primary_dispatch;
- const values=[['Raw context · est.',fmt(d?.canonical_input_tokens),'Restored source · local estimate'],['Sent input · est.',fmt(d?.outgoing_input_tokens),'Last dispatch · local estimate'],['Last request · provider',fmt(d?.receipt_input_tokens)+' / '+fmt(d?.receipt_output_tokens),'Input / output tokens'+(d?.outcome?' · '+d.outcome:'')],['Session total · provider',fmt(s.primary?.input_tokens)+' / '+fmt(s.primary?.output_tokens),'Input / output · primary only']];
+ const values=[['Raw context · est.',fmt(d?.canonical_input_tokens),'Restored source · estimate'],['Sent input · est.',fmt(d?.outgoing_input_tokens),'Last dispatch · estimate'],['Last request · provider',fmt(d?.receipt_input_tokens)+' / '+fmt(d?.receipt_output_tokens),'Input / output tokens'+(d?.outcome?' · '+d.outcome:'')],['Session total · provider',fmt(s.primary?.input_tokens)+' / '+fmt(s.primary?.output_tokens),'Input / output · primary only']];
  for(const [label,value,caption] of values){const block=document.createElement('div');block.className='token-metric';note(block,label,'label');note(block,value,'token-value');note(block,caption,'token-note');wrap.append(block)}
  return wrap;
 }

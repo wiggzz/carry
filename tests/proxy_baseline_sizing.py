@@ -104,7 +104,13 @@ class BaselineSizing(unittest.TestCase):
         self.assertGreater(saved['last_plan']['primary_estimated_tokens'], 10100)
         self.assertIsNone(saved['last_plan']['primary_required_tokens'])
         self.assertIsNone(saved['last_plan']['primary_fits'])
-        self.assertIsNone(saved['last_primary_dispatch']['outgoing_input_tokens'])
+        dispatch = saved['last_primary_dispatch']
+        for field in ['canonical_input_tokens', 'continuation_input_tokens', 'outgoing_input_tokens']:
+            self.assertEqual(dispatch[field], saved['last_plan']['primary_estimated_tokens'],
+                             'dispatch size estimates must reuse the supported planning quantity')
+        self.assertEqual(dispatch['receipt_input_tokens'], 10200)
+        self.assertEqual(saved['primary']['input_tokens'], 30300)
+        self.assertEqual(saved['primary']['calls'], 3)
 
     def test_unsupported_or_changed_contract_append_remains_unknown(self):
         reasoning = {"type": "reasoning", "summary": [],

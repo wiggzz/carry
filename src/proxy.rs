@@ -2188,32 +2188,34 @@ async fn forward_timed(
             .model_resolution
             .as_ref()
             .map(|pair| &pair.primary);
+        let source = baseline
+            .as_ref()
+            .map(|_| continuation_wire.as_ref().unwrap_or(&canonical_wire));
         let mut measurement = dispatch_measurement(&request_id, "primary", &outbound);
-        measurement.outgoing_input_tokens = session
+        measurement.outgoing_input_tokens = counts.projected(
+            &outbound,
+            source,
+            &session.primary_input,
+            &service.config.upstream_url,
+            resolved,
+        );
+        measurement.basis = "shared_input_estimates_not_native_usage_or_capacity".into();
+        // A caller fragment must not inherit an expanded prompt's quantity.
+        measurement.caller_input_tokens = session
             .primary_input
-            .known_estimate(&outbound, &service.config.upstream_url, resolved)
+            .known_estimate(&original_body, &service.config.upstream_url, resolved)
             .map(|input| input.tokens);
-        measurement.basis =
-            "receipt_first_or_local_visible_text_not_encoded_native_payloads".into();
-        // Seed with the outgoing measurement already computed at the boundary.
-        counts
-            .0
-            .push((&outbound, measurement.outgoing_input_tokens));
-        measurement.caller_input_tokens = counts.measured(
-            &original_body,
-            &session.primary_input,
-            &service.config.upstream_url,
-            resolved,
-        );
-        measurement.canonical_input_tokens = counts.measured(
+        measurement.canonical_input_tokens = counts.projected(
             &canonical_wire,
+            source,
             &session.primary_input,
             &service.config.upstream_url,
             resolved,
         );
-        measurement.continuation_input_tokens = baseline.as_ref().and_then(|_| {
-            counts.measured(
-                continuation_wire.as_ref().unwrap_or(&canonical_wire),
+        measurement.continuation_input_tokens = source.and_then(|source| {
+            counts.projected(
+                source,
+                Some(source),
                 &session.primary_input,
                 &service.config.upstream_url,
                 resolved,
@@ -3490,17 +3492,22 @@ impl<'a> PromptTokenCounts<'a> {
         self.count_with(body, || crate::savings::prompt_input_tokens(body))
     }
 
-    fn measured(
+    fn projected(
         &mut self,
         body: &'a Value,
+        source: Option<&Value>,
         measured: &crate::proxy_quantity::InputMeasurements,
         route: &str,
         resolved: Option<&ResolvedModel>,
     ) -> Option<u64> {
         self.count_with(body, || {
-            measured
-                .known_estimate(body, route, resolved)
-                .map(|input| input.tokens)
+            // Planning already requested these quantities. Pass-through must
+            // not initiate tokenization just to populate dashboard telemetry.
+            match source {
+                Some(source) => measured.projected_estimate(body, source, route, resolved),
+                None => measured.known_estimate(body, route, resolved),
+            }
+            .map(|input| input.tokens)
         })
     }
 

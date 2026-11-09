@@ -161,7 +161,15 @@ class VisiblePool(unittest.TestCase):
             self.assertIsNone(plan['primary_receipt_prediction_tokens'])
             self.assertIsNone(plan['primary_required_tokens'])
             self.assertIsNone(plan['primary_fits'])
-            self.assertIsNone(saved['last_primary_dispatch']['outgoing_input_tokens'])
+            dispatch = saved['last_primary_dispatch']
+            self.assertEqual(dispatch['canonical_input_tokens'], plan['primary_estimated_tokens'])
+            self.assertEqual(dispatch['continuation_input_tokens'], plan['primary_estimated_tokens'])
+            selected = next((c for c in plan['candidates']
+                             if c['candidate_id'] == plan['selected_candidate_id']), None)
+            self.assertEqual(dispatch['outgoing_input_tokens'],
+                             selected['primary_retained_estimated_tokens'] if selected
+                             else plan['primary_estimated_tokens'])
+            self.assertEqual(dispatch['receipt_input_tokens'], 10000)
             self.assertFalse(plan['forced'])
             if name == 'without_advice':
                 self.assertFalse(plan['selected'])
