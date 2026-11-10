@@ -412,17 +412,23 @@ impl ReadView {
     }
     pub(super) fn advice(&self, namespace: &str, input: &[Value]) -> Option<semantic::Record> {
         let store = self.store.lock().unwrap();
-        path(namespace, input)
-            .iter()
-            .rev()
-            .find_map(|key| {
-                store
-                    .live("reviews", key)
-                    .ok()?
-                    .then(|| store.get::<semantic::Record>("reviews", key).ok().flatten())
-                    .flatten()
-            })
-            .filter(|r| r.policy.as_deref() == Some(self.policy.as_str()))
+        // Presence of the newest applicable cut is a revocation barrier. Only
+        // absence/expiry permits looking at an older cut; unreadable authority
+        // (including a lowered decode bound) never revives older permission.
+        for key in path(namespace, input).iter().rev() {
+            match store.live("reviews", key) {
+                Ok(false) => continue,
+                Ok(true) => {
+                    return store
+                        .get::<semantic::Record>("reviews", key)
+                        .ok()
+                        .flatten()
+                        .filter(|r| r.policy.as_deref() == Some(self.policy.as_str()));
+                }
+                Err(_) => return None,
+            }
+        }
+        None
     }
 }
 pub(super) fn committed(

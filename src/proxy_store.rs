@@ -63,7 +63,7 @@ fn free_bytes(directory: &Path) -> std::io::Result<u64> {
         return Err(std::io::Error::last_os_error());
     }
     let stat = unsafe { stat.assume_init() };
-    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
 }
 pub(super) fn admit_owner(service: &Service, owners: usize) -> std::io::Result<()> {
     let reserve = (service.config.history_max_bytes as u64)
@@ -112,11 +112,7 @@ fn import_v4(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
     if index["format"] != "carry-prefix-history-v4" {
         return Err(invalid());
     }
-    for kind in ["nodes", "tips", "reviews", "transcripts", "snapshots"] {
-        if !index[kind].is_object() {
-            return Err(invalid());
-        }
-    }
+    validate_predecessor(&index).map_err(|_| invalid())?;
     let temporary = service.config.state_dir.join(".history-import.tmp");
     if std::fs::symlink_metadata(&temporary).is_ok_and(|m| !m.is_file()) {
         return Err(invalid());
@@ -130,7 +126,9 @@ fn import_v4(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
         }
     }
     let _cleanup = Cleanup(temporary.clone());
-    drop(private_file(&temporary, false)?);
+    if temporary.exists() {
+        std::fs::remove_file(&temporary)?;
+    }
     let store = Store::open_path(service, pins, true, &temporary)?;
     store.begin()?;
     let at = index["tips"]
@@ -199,6 +197,121 @@ fn import_v4(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
     std::fs::rename(&temporary, &path)?;
     File::open(&service.config.state_dir)?.sync_all()
 }
+// The bounded predecessor generation is validated as a graph before any staging
+// database is created. A successful rename must never replace readable JSON by
+// rows that the new reader cannot decode or whose ancestry is incomplete.
+fn validate_predecessor(value: &Value) -> Result<(), ()> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Node {
+        parent: String,
+        value: Value,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Predecessor {
+        #[serde(rename = "format")]
+        _format: String,
+        nodes: BTreeMap<String, Node>,
+        tips: BTreeMap<String, Reference>,
+        reviews: BTreeMap<String, semantic::Record>,
+        #[serde(default)]
+        transcripts: BTreeMap<String, Transcript>,
+        #[serde(default)]
+        snapshots: BTreeMap<String, Session>,
+        #[serde(rename = "upstream_cache")]
+        _cache: Vec<CacheEvidence>,
+    }
+    let index: Predecessor = serde_json::from_value(value.clone()).map_err(|_| ())?;
+    let mut roots: HashMap<String, (String, usize)> = HashMap::new();
+    for (key, node) in &index.nodes {
+        if *key != super::hash(&(&node.parent, &node.value)) {
+            return Err(());
+        }
+    }
+    // Memoize each ancestry once. Migration is bounded by predecessor bytes,
+    // rather than repeatedly walking every shared prefix of every record.
+    for key in index.nodes.keys() {
+        let mut cursor = key.as_str();
+        let mut trail = Vec::new();
+        let mut seen = HashSet::new();
+        while !roots.contains_key(cursor) {
+            let Some(node) = index.nodes.get(cursor) else {
+                break;
+            };
+            if !seen.insert(cursor) {
+                return Err(());
+            }
+            trail.push(cursor);
+            cursor = &node.parent;
+        }
+        let (root, mut depth) = roots.get(cursor).cloned().unwrap_or((cursor.to_owned(), 0));
+        if root.len() == 64 && root.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(());
+        }
+        for key in trail.into_iter().rev() {
+            depth += 1;
+            roots.insert(key.to_owned(), (root.clone(), depth));
+        }
+    }
+    let extent = |key: &str, namespace: &str| -> Result<usize, ()> {
+        if key == namespace {
+            return Ok(0);
+        }
+        let (root, depth) = roots.get(key).ok_or(())?;
+        if root != namespace {
+            return Err(());
+        }
+        Ok(*depth)
+    };
+    for (key, reference) in &index.tips {
+        if reference.session.is_empty() || reference.namespace.is_empty() {
+            return Err(());
+        }
+        extent(key, &reference.namespace)?;
+    }
+    for (key, reference) in &index.transcripts {
+        if reference.session.is_empty() || reference.external_id.is_empty() {
+            return Err(());
+        }
+        extent(&reference.frontier, &reference.namespace)?;
+        if !["response", "conversation"]
+            .into_iter()
+            .any(|kind| *key == super::hash(&(&reference.namespace, kind, &reference.external_id)))
+        {
+            return Err(());
+        }
+    }
+    for (key, record) in &index.reviews {
+        let depth = roots.get(key).map(|(_, depth)| *depth).unwrap_or(0);
+        if depth != record.len
+            || (depth == 0 && key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(());
+        }
+    }
+    for (id, snapshot) in &index.snapshots {
+        let namespace = snapshot.history_namespace.as_deref().ok_or(())?;
+        if !snapshot.history_shared
+            || !matches!(snapshot.version, 0 | 3)
+            || !index
+                .tips
+                .values()
+                .any(|r| r.session == *id && r.namespace == namespace)
+        {
+            return Err(());
+        }
+        let depth = extent(
+            snapshot.history_frontier.as_deref().unwrap_or(namespace),
+            namespace,
+        )?;
+        if depth != snapshot.history.len() {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
 impl Store {
     fn charge(&self, bytes: u64) -> std::io::Result<()> {
         // Reserve index/overflow pages and WAL copies before SQLite can spill.
@@ -233,7 +346,7 @@ impl Store {
         write: bool,
         path: &Path,
     ) -> std::io::Result<Self> {
-        let exists = match std::fs::symlink_metadata(&path) {
+        let exists = match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => true,
             Ok(_) => {
                 return Err(std::io::Error::other(
@@ -244,10 +357,12 @@ impl Store {
             Err(e) => return Err(e),
         };
         if !exists && write {
-            drop(private_file(&path, false)?);
+            drop(private_file(path, false)?);
         }
-        let connection = if exists || write {
-            Connection::open(&path)
+        let connection = if exists && !write {
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        } else if exists || write {
+            Connection::open(path)
         } else {
             Connection::open_in_memory()
         }
@@ -259,8 +374,11 @@ impl Store {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(error)?;
-        if version != 0 && version != 1 {
-            return Err(std::io::Error::other("unsupported history store version"));
+        if version != 1 && (exists || version != 0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsupported history store version",
+            ));
         }
         if version == 0 {
             connection.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; CREATE TABLE records(kind TEXT NOT NULL, key TEXT NOT NULL, data BLOB NOT NULL, at INTEGER NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(kind,key)) WITHOUT ROWID;
@@ -268,10 +386,12 @@ impl Store {
                 CREATE INDEX records_owner ON records(kind,owner);
                 PRAGMA user_version=1;").map_err(error)?;
         }
-        let pages = (service.config.history_disk_bytes / 4096).max(16);
-        connection
-            .pragma_update(None, "max_page_count", pages)
-            .map_err(error)?;
+        if write {
+            let pages = (service.config.history_disk_bytes / 4096).max(16);
+            connection
+                .pragma_update(None, "max_page_count", pages)
+                .map_err(error)?;
+        }
         Ok(Self {
             connection,
             max_record: service.config.history_max_bytes as usize,
@@ -291,18 +411,33 @@ impl Store {
         kind: &str,
         key: &str,
     ) -> std::io::Result<Option<T>> {
-        let bytes: Option<Vec<u8>> = self
+        let bytes: Option<(usize, Option<Vec<u8>>)> = self
             .connection
             .query_row(
-                "SELECT data FROM records WHERE kind=?1 AND key=?2 AND length(data)<=?3",
+                "SELECT length(data), CASE WHEN length(data)<=?3 THEN data ELSE NULL END FROM records WHERE kind=?1 AND key=?2",
                 params![kind, key, self.max_record as i64],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(error)?;
-        bytes
-            .map(|b| serde_json::from_slice(&b).map_err(std::io::Error::other))
-            .transpose()
+        let Some((length, data)) = bytes else {
+            return Ok(None);
+        };
+        if length > self.max_record {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "retained history record exceeds working-set bound",
+            ));
+        }
+        let data = data.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing history record data",
+            )
+        })?;
+        serde_json::from_slice(&data)
+            .map(Some)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
     pub(super) fn live(&self, kind: &str, key: &str) -> std::io::Result<bool> {
         let row: Option<(u64, String)> = self
