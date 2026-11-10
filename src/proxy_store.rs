@@ -161,18 +161,13 @@ fn import_v4(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
             };
             store.put(kind, key, value, age, owner)?;
             if kind == "snapshots" {
-                let mut session: Session =
+                let session: Session =
                     serde_json::from_value(value.clone()).map_err(|_| invalid())?;
-                if !matches!(session.version, 0 | 3) {
-                    return Err(invalid());
-                }
-                if let Some(evidence) = &mut session.request_evidence {
-                    evidence.bind_archive(
-                        &service.config.state_dir,
-                        key,
-                        session.history_namespace.as_deref(),
-                    );
-                }
+                // Decode drops the runtime validation flag. Rebind the same
+                // successful-window authority as normal load before observing
+                // any historical money or coverage in the replacement store.
+                let session =
+                    recover_success_prefix(service, key, session).map_err(|_| invalid())?;
                 store.put(
                     "owners",
                     key,
@@ -533,9 +528,32 @@ impl Store {
         if session.primary.calls == 0 && session.shadow.calls == 0 {
             return Ok(());
         }
-        // Cumulative observations are immutable and deduplicated by native paid
-        // state, not by checkpoint time. They are NOT additive receipt amounts.
-        let identity = super::hash(&(id, &session.primary, &session.shadow));
+        let mut provenance = session
+            .request_evidence
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        if let Some(Value::Object(fields)) = &mut provenance {
+            // Retain the journal binding and latest fact, not the entire suffix.
+            let last = fields
+                .remove("observations")
+                .and_then(|v| v.as_array().and_then(|a| a.last()).cloned());
+            fields.insert("latest_observation".into(), last.unwrap_or(Value::Null));
+            fields.remove("numeric_pending");
+        }
+        let estimate = session
+            .request_evidence
+            .as_ref()
+            .map(|e| e.snapshot().dashboard(false));
+        // New validated evidence is a new immutable observation, even when no
+        // native money changed. These cumulative snapshots are never additive.
+        let identity = super::hash(&(
+            id,
+            &session.primary,
+            &session.shadow,
+            &estimate,
+            &provenance,
+        ));
         if self.contains("accounted", &identity)? {
             return Ok(());
         }
@@ -582,24 +600,6 @@ impl Store {
             order_at,
             "",
         )?;
-        let mut provenance = session
-            .request_evidence
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()?;
-        if let Some(Value::Object(fields)) = &mut provenance {
-            // Keep the independently streamed numeric journal's authority and
-            // latest frozen facts, never copy an entire suffix at every sample.
-            let last = fields
-                .remove("observations")
-                .and_then(|v| v.as_array().and_then(|a| a.last()).cloned());
-            fields.insert("latest_observation".into(), last.unwrap_or(Value::Null));
-            fields.remove("numeric_pending");
-        }
-        let estimate = session
-            .request_evidence
-            .as_ref()
-            .map(|e| e.snapshot().dashboard(false));
         self.put("accounting", &key, &json!({
             "version":1, "owner":id, "at":self.at, "sequence":sequence, "order_at":order_at,
             "basis":"immutable_cumulative_observation_not_additive_receipts",
