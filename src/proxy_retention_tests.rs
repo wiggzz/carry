@@ -1021,6 +1021,91 @@ fn retention_expired_near_limit_records_recover_without_a_cap_increase() {
     expired_full_store_recovery(62000);
 }
 
+#[test]
+fn retention_expiry_deletes_old_physical_rows_after_lowering_decode_bound() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.history_max_bytes = 65536;
+    service.config.history_disk_bytes = 8 * 1024 * 1024;
+    let start = 10_000_000;
+    let mut old = Session {
+        history_shared: true,
+        history_namespace: Some("lowered-bound-old".into()),
+        request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+        ..Session::default()
+    };
+    old.ingest(&[json!({"role":"user","content":"x".repeat(62000)})])
+        .unwrap();
+    numeric_primary(&mut old, 0);
+    at_decision_clock(&[start], || {
+        history::committed(&service, "lowered-bound-old", &old, None).unwrap();
+        let restored = history::restore(&service, "lowered-bound-old").unwrap();
+        assert_eq!(restored.render_primary(), old.render_primary());
+        assert_eq!(restored.primary.calls, 1);
+        assert!((restored.primary.cost_usd - 0.002).abs() < 1e-12);
+    });
+    let key: String = rusqlite::Connection::open_with_flags(
+        directory.path().join("history.index"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT key FROM records WHERE kind='nodes' AND length(data)>62000 AND length(data)<=65536",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap();
+    let frozen = at_decision_clock(&[start], || {
+        history::accounting(&service, 0, "", 100).unwrap()["records"].clone()
+    });
+    let raw_exists = || {
+        rusqlite::Connection::open_with_flags(
+            directory.path().join("history.index"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM records WHERE kind='nodes' AND key=?1)",
+            [&key],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    };
+    assert!(raw_exists(), "qualify a real legal near-limit physical row");
+    service.config.history_max_bytes = 8192;
+    let mut small = Session {
+        history_shared: true,
+        history_namespace: Some("lowered-bound-new".into()),
+        ..Session::default()
+    };
+    small
+        .ingest(&[json!({"role":"user","content":"small new publication"})])
+        .unwrap();
+    at_decision_clock(&[start + 604799], || {
+        history::committed(&service, "lowered-bound-new", &small, None).unwrap();
+        assert!(raw_exists(), "decode reduction must not shorten retention");
+    });
+    at_decision_clock(&[start + 604800], || {
+        for _ in 0..64 {
+            history::committed(&service, "lowered-bound-new", &small, None).unwrap();
+        }
+        assert_eq!(
+            history::accounting(&service, 0, "", 100).unwrap()["records"],
+            frozen
+        );
+        assert_eq!(
+            history::restore(&service, "lowered-bound-new")
+                .unwrap()
+                .render_primary(),
+            small.render_primary()
+        );
+        assert!(
+            !raw_exists(),
+            "physical expiry must not inherit the smaller decode bound and strand an older legal row"
+        );
+    });
+}
+
 fn expired_full_store_recovery(source_bytes: usize) {
     let directory = tempfile::tempdir().unwrap();
     let mut service = checkpoint_service(directory.path());
@@ -1166,6 +1251,73 @@ fn expired_full_store_recovery(source_bytes: usize) {
             serde_json::to_value(&protected.primary).unwrap()
         );
     });
+    drop(pin);
+}
+
+#[test]
+fn retention_shared_mirror_never_exceeds_physical_admission_before_sql() {
+    external_checkpoint_admission_control(true);
+}
+
+#[test]
+fn retention_explicit_checkpoint_never_exceeds_physical_admission_before_sql() {
+    external_checkpoint_admission_control(false);
+}
+
+fn external_checkpoint_admission_control(shared: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.history_max_bytes = 65536;
+    service.config.history_disk_bytes = 2 * 1024 * 1024;
+    let owner = "external-admission";
+    let mut session = Session {
+        history_shared: shared,
+        history_namespace: Some(owner.into()),
+        request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+        ..Session::default()
+    };
+    session
+        .ingest(&[json!({"role":"user","content":"frozen paid source"})])
+        .unwrap();
+    numeric_primary(&mut session, 0);
+    let pin = history::pin(&service, owner).unwrap();
+    save(&service, owner, &session).unwrap();
+    let frozen = load_existing(&service, owner).unwrap();
+    let accounting = history::accounting(&service, 0, "", 100).unwrap();
+    let bytes = || -> u64 {
+        std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum()
+    };
+    let mut peak = bytes();
+    assert!(peak < service.config.history_disk_bytes);
+    let mut candidate = frozen.clone();
+    candidate.pending_output = vec![
+        json!({"role":"assistant","content":"x".repeat(service.config.history_disk_bytes as usize + 4096)}),
+    ];
+    let publication = save_published(&service, owner, &candidate, |persisted| {
+        // Observe the real staged-file boundary before SQLite admission, not a
+        // timer sample that can miss a transient peak or after-the-fact cleanup.
+        peak = peak.max(bytes());
+        history::committed(&service, owner, persisted, None)
+    });
+    peak = peak.max(bytes());
+    let restored = load_existing(&service, owner).unwrap();
+    assert_eq!(restored.render_primary(), frozen.render_primary());
+    assert_eq!(
+        serde_json::to_value(&restored.primary).unwrap(),
+        serde_json::to_value(&frozen.primary).unwrap()
+    );
+    assert_eq!(
+        history::accounting(&service, 0, "", 100).unwrap(),
+        accounting
+    );
+    assert!(
+        publication.is_err() && peak <= service.config.history_disk_bytes,
+        "unfit external checkpoint must be refused before exceeding admission: shared={shared} peak={peak} cap={} publication={publication:?}",
+        service.config.history_disk_bytes
+    );
     drop(pin);
 }
 
