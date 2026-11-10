@@ -544,10 +544,7 @@ pub(super) fn committed(
             }
         }
     }
-    store
-        .connection
-        .execute("DELETE FROM records WHERE kind='tips' AND owner=?1", [id])
-        .map_err(storage::error)?;
+    store.replace_tip(id);
     let key = observed_keys.last().unwrap_or(namespace);
     store.put(
         "tips",

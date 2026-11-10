@@ -28,6 +28,16 @@ pub(super) struct Store {
     disk_limit: u64,
     projected_bytes: std::cell::Cell<u64>,
     reserved_bytes: std::cell::Cell<u64>,
+    pending: std::cell::RefCell<BTreeMap<(String, String), Pending>>,
+    pending_bytes: std::cell::Cell<usize>,
+    path_roots: std::cell::RefCell<HashSet<String>>,
+    replaced_tips: std::cell::RefCell<HashSet<String>>,
+    settlement: std::cell::Cell<bool>,
+}
+struct Pending {
+    bytes: Vec<u8>,
+    at: u64,
+    owner: String,
 }
 // A paid-only transaction writes at most a bounded checkpoint and accounting
 // observation, two small sequence rows, and a staged checkpoint file. Ordinary
@@ -108,7 +118,7 @@ pub(super) fn maintain(service: &Service, pins: HashSet<String>) -> std::io::Res
     if !service.config.state_dir.join("history.index").exists() {
         return Ok(());
     }
-    Store::open(service, pins, true)?.maintain()
+    Store::open(service, pins, true)?.maintain().map(|_| ())
 }
 pub(super) fn initialize(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
     let path = service.config.state_dir.join("history.index");
@@ -448,6 +458,11 @@ impl Store {
             retired: Default::default(),
             disk_limit: service.config.history_disk_bytes,
             projected_bytes: Default::default(),
+            pending: Default::default(),
+            pending_bytes: Default::default(),
+            path_roots: Default::default(),
+            replaced_tips: Default::default(),
+            settlement: Default::default(),
         })
     }
     pub(super) fn get<T: DeserializeOwned>(
@@ -455,6 +470,11 @@ impl Store {
         kind: &str,
         key: &str,
     ) -> std::io::Result<Option<T>> {
+        if let Some(record) = self.pending.borrow().get(&(kind.into(), key.into())) {
+            return serde_json::from_slice(&record.bytes)
+                .map(Some)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+        }
         let bytes: Option<(usize, Option<Vec<u8>>)> = self
             .connection
             .query_row(
@@ -498,6 +518,13 @@ impl Store {
         }))
     }
     pub(super) fn contains(&self, kind: &str, key: &str) -> std::io::Result<bool> {
+        if self
+            .pending
+            .borrow()
+            .contains_key(&(kind.into(), key.into()))
+        {
+            return Ok(true);
+        }
         self.connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM records WHERE kind=?1 AND key=?2)",
@@ -521,10 +548,35 @@ impl Store {
                 "history record exceeds working-set bound",
             ));
         }
-        self.charge(bytes.len() as u64)?;
-        self.connection.execute("INSERT INTO records VALUES(?1,?2,?3,?4,?5) ON CONFLICT(kind,key) DO UPDATE SET data=excluded.data,at=excluded.at,owner=excluded.owner",
-            params![kind,key,bytes,at,owner]).map_err(error)?;
+        // The publication working set is bounded independently of the retained
+        // corpus: two paths, checkpoint, accounting and their small metadata.
+        // Stage bytes once so admission and SQLite consume the same payloads.
+        let key = (kind.to_owned(), key.to_owned());
+        let mut pending = self.pending.borrow_mut();
+        let old = pending.get(&key).map_or(0, |record| {
+            record.bytes.len() + record.owner.len() + key.0.len() + key.1.len()
+        });
+        let next = self
+            .pending_bytes
+            .get()
+            .saturating_sub(old)
+            .saturating_add(bytes.len() + owner.len() + key.0.len() + key.1.len());
+        if next > self.max_record.saturating_mul(8) {
+            return Err(full());
+        }
+        self.pending_bytes.set(next);
+        pending.insert(
+            key,
+            Pending {
+                bytes,
+                at,
+                owner: owner.into(),
+            },
+        );
         Ok(())
+    }
+    pub(super) fn replace_tip(&self, owner: &str) {
+        self.replaced_tips.borrow_mut().insert(owner.into());
     }
     pub(super) fn insert(&self, namespace: &str, input: &[Value]) -> std::io::Result<Vec<String>> {
         if input.len() > self.max_nodes {
@@ -534,6 +586,9 @@ impl Store {
             ));
         }
         let keys = super::path(namespace, input);
+        // Include existing intermediate nodes too: a newly staged frontier is
+        // not in SQL yet, so maintenance cannot follow its parent from SQL.
+        self.path_roots.borrow_mut().extend(keys.iter().cloned());
         let mut parent = namespace.to_owned();
         for (key, value) in keys.iter().zip(input) {
             // Nodes are content-addressed and immutable. Republishing a path
@@ -778,6 +833,7 @@ impl Store {
             SELECT json_extract(CAST(data AS TEXT),'$.history_frontier') FROM records WHERE kind='snapshots' AND (at>?2 OR owner IN (SELECT id FROM pins))
             UNION SELECT key FROM records WHERE kind IN ('tips','reviews') AND (at>?2 OR owner IN (SELECT id FROM pins))
             UNION SELECT json_extract(CAST(data AS TEXT),'$.frontier') FROM records WHERE kind='transcripts' AND (at>?2 OR owner IN (SELECT id FROM pins))
+            UNION SELECT key FROM publication_roots
             UNION SELECT json_extract(CAST(r.data AS TEXT),'$.parent') FROM records r JOIN ancestry a ON r.key=a.key WHERE r.kind='nodes')
             SELECT key,length(data) FROM records WHERE kind=?1 AND at<=?2 AND (?1 IN ('accounting','accounted') OR owner NOT IN (SELECT id FROM pins)) AND (?1!='nodes' OR key NOT IN (SELECT key FROM ancestry WHERE key IS NOT NULL)) ORDER BY at,key LIMIT 8").map_err(error)?;
         let entries = statement
@@ -805,28 +861,36 @@ impl Store {
         }
         Ok(keys)
     }
-    fn collect(&self, budget: &mut u64) -> std::io::Result<()> {
+    fn collect(&self, budget: &mut u64) -> std::io::Result<bool> {
         self.connection
-            .execute_batch("CREATE TEMP TABLE IF NOT EXISTS pins(id TEXT PRIMARY KEY) WITHOUT ROWID; DELETE FROM pins;")
+            .execute_batch("CREATE TEMP TABLE IF NOT EXISTS pins(id TEXT PRIMARY KEY) WITHOUT ROWID; DELETE FROM pins;
+                CREATE TEMP TABLE IF NOT EXISTS publication_roots(key TEXT PRIMARY KEY) WITHOUT ROWID; DELETE FROM publication_roots;")
             .map_err(error)?;
         for id in &self.pins {
             self.connection
                 .execute("INSERT INTO pins VALUES(?1)", [id])
                 .map_err(error)?;
         }
+        for key in self.path_roots.borrow().iter() {
+            self.connection
+                .execute("INSERT INTO publication_roots VALUES(?1)", [key])
+                .map_err(error)?;
+        }
+        let mut changed = false;
         if let Some(cutoff) = self.at.checked_sub(self.age) {
             *self.retired.borrow_mut() = self.expire("snapshots", cutoff, budget)?;
+            changed |= !self.retired.borrow().is_empty();
             for kind in ["tips", "transcripts", "reviews", "nodes"] {
-                self.expire(kind, cutoff, budget)?;
+                changed |= !self.expire(kind, cutoff, budget)?.is_empty();
             }
         }
         if let Some(cutoff) = self.at.checked_sub(self.accounting_age) {
-            self.expire("accounting", cutoff, budget)?;
-            self.expire("accounted", cutoff, budget)?;
+            changed |= !self.expire("accounting", cutoff, budget)?.is_empty();
+            changed |= !self.expire("accounted", cutoff, budget)?.is_empty();
         }
-        Ok(())
+        Ok(changed)
     }
-    fn maintain(&self) -> std::io::Result<()> {
+    fn maintain(&self) -> std::io::Result<bool> {
         let allowance = maintenance_reserve(self.max_record as u64, self.disk_limit);
         let reserved = self.reserved_bytes.get();
         // Spend maintenance's promise only; every paid owner keeps its full
@@ -835,8 +899,8 @@ impl Store {
         let result = (|| {
             self.start()?;
             let mut budget = allowance.saturating_sub(65536 + write_charge(0));
-            self.collect(&mut budget)?;
-            self.commit()?;
+            let changed = self.collect(&mut budget)?;
+            self.finish()?;
             // Without TRUNCATE a checkpoint merely recycles the WAL. Vacuum
             // reclaims a bounded number of freelist pages; active read views
             // may defer reclamation, never force eviction or exceed admission.
@@ -855,7 +919,8 @@ impl Store {
             drop(vacuum);
             self.connection
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                .map_err(error)
+                .map_err(error)?;
+            Ok(changed)
         })();
         self.reserved_bytes.set(reserved);
         self.connection
@@ -873,7 +938,8 @@ impl Store {
                     .saturating_sub(settlement_reserve(self.max_record as u64)),
             );
         }
-        self.start()
+        self.settlement.set(true);
+        Ok(())
     }
     fn start(&self) -> std::io::Result<()> {
         self.projected_bytes
@@ -884,10 +950,58 @@ impl Store {
             .map_err(error)
     }
     pub(super) fn begin(&self) -> std::io::Result<()> {
-        self.maintain()?;
-        self.start()
+        self.maintain().map(|_| ())
     }
     pub(super) fn commit(&self) -> std::io::Result<()> {
+        let demand = self
+            .pending
+            .borrow()
+            .values()
+            .fold(65536u64.saturating_add(write_charge(0)), |sum, record| {
+                sum.saturating_add(write_charge(record.bytes.len() as u64))
+            })
+            .saturating_add(
+                write_charge(0).saturating_mul(self.replaced_tips.borrow().len() as u64),
+            );
+        // Admission is about this complete publication, not just a pin or an
+        // empty transaction. Maintenance never spends another owner's promise.
+        // Bound each call to eight batches (64 vacuum pages, eight row batches
+        // per kind); continued pressure returns backpressure, not unbounded GC.
+        for pass in 0..=8 {
+            let physical = disk_bytes(&self.directory, 0)?;
+            if physical
+                .saturating_add(demand)
+                .saturating_add(self.reserved_bytes.get())
+                <= self.disk_limit
+            {
+                break;
+            }
+            if self.settlement.get() || pass == 8 {
+                return Err(full());
+            }
+            let changed = self.maintain()?;
+            if !changed && disk_bytes(&self.directory, 0)? >= physical {
+                return Err(full());
+            }
+        }
+        self.start()?;
+        for owner in self.replaced_tips.borrow().iter() {
+            self.charge(0)?;
+            self.connection
+                .execute(
+                    "DELETE FROM records WHERE kind='tips' AND owner=?1",
+                    [owner],
+                )
+                .map_err(error)?;
+        }
+        for ((kind, key), record) in self.pending.borrow().iter() {
+            self.charge(record.bytes.len() as u64)?;
+            self.connection.execute("INSERT INTO records VALUES(?1,?2,?3,?4,?5) ON CONFLICT(kind,key) DO UPDATE SET data=excluded.data,at=excluded.at,owner=excluded.owner",
+                params![kind,key,record.bytes,record.at,record.owner]).map_err(error)?;
+        }
+        self.finish()
+    }
+    fn finish(&self) -> std::io::Result<()> {
         self.connection.execute_batch("COMMIT").map_err(error)?;
         for id in self.retired.take() {
             if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
