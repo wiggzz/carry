@@ -1024,6 +1024,7 @@ fn expired_full_store_recovery(source_bytes: usize) {
                 break;
             }
         }
+        let after_admission = bytes();
         let retained = history::restore(&service, "expiry-pinned").unwrap();
         assert_eq!(retained.render_primary(), protected.render_primary());
         assert_eq!(
@@ -1050,7 +1051,22 @@ fn expired_full_store_recovery(source_bytes: usize) {
         };
         next.ingest(&[json!({"role":"user","content":"writable after expiry"})])
             .unwrap();
-        history::committed(&service, "expiry-new", &next, None).unwrap();
+        let before_publication = bytes();
+        let publication = history::committed(&service, "expiry-new", &next, None);
+        let files = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.metadata().unwrap().len(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(
+            publication.is_ok(),
+            "expiry writable publication failed: source_bytes={source_bytes} before_pressure={before} after_admission={after_admission} before_publication={before_publication} files_after={files:?} publication={publication:?}"
+        );
         assert_eq!(
             history::restore(&service, "expiry-new")
                 .unwrap()
