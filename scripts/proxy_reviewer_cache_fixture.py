@@ -12,6 +12,9 @@ import http.server
 import json
 import os
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+from history_store import read_index
 import socket
 import subprocess
 import threading
@@ -443,7 +446,7 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
                             reviewer['explicit_cache_transport'] = enabled
                             checkpoints[0].write_text(json.dumps(snapshot))
                         if case == 'missing-usage':
-                            index = json.loads((directory / 'state' / 'history.index').read_text())
+                            index = read_index(directory / 'state' / 'history.index')
                             credit_snapshots.append({'turn': turn,
                                 'native_cached_tokens': sum(e.get('native_read_tokens', 0)
                                                            for e in index['upstream_cache']),
@@ -486,7 +489,7 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
                 assert credit_snapshots[3]['forecast_prefix_units'] == credit_snapshots[2]['forecast_prefix_units'], \
                     'a partial read must not grow full-write coverage'
             assert state['shadow']['unavailable_cost_calls'] >= 1, 'missing usage must remain unknown in metering'
-        records = json.loads((directory / 'state' / 'history.index').read_text())['upstream_cache']
+        records = read_index(directory / 'state' / 'history.index')['upstream_cache']
         if policy_arg == 'auto':
             assert not records, 'unknown generic capability cannot confer cache evidence'
         else:

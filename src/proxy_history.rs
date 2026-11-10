@@ -75,7 +75,8 @@ fn reserve(service: &Service, key: String, store: &Store) -> Result<(String, Pin
     }
     let mut id = key.clone();
     let mut generation = 0u64;
-    while store.contains("snapshots", &id).map_err(read_failure)?
+    while store.contains("owners", &id).map_err(read_failure)?
+        || store.contains("snapshots", &id).map_err(read_failure)?
         || pins.contains_key(&(service.config.state_dir.clone(), id.clone()))
         || service.config.state_dir.join(format!("{id}.json")).exists()
     {
@@ -375,6 +376,12 @@ impl ReadView {
         {
             let store = self.store.lock().unwrap();
             let Some(session) = store.get::<Session>("snapshots", id)? else {
+                if store
+                    .get::<Value>("owners", id)?
+                    .is_some_and(|o| o["shared"] == true)
+                {
+                    return Err(std::io::Error::other("selected history unavailable"));
+                }
                 return Ok(None);
             };
             if !session.history_shared {
@@ -409,12 +416,26 @@ pub(super) fn committed(
     session: &Session,
     observation: Option<(&[Value], &Value)>,
 ) -> std::io::Result<()> {
-    let Some(namespace) = &session.history_namespace else {
+    if session.history_namespace.is_none()
+        && session.primary.calls == 0
+        && session.shadow.calls == 0
+    {
         return Ok(());
-    };
+    }
     let _guard = IO.lock().unwrap();
     let store = Store::open(service, pinned(service), true)?;
     store.begin()?;
+    store.put(
+        "owners",
+        id,
+        &json!({"shared":session.history_shared}),
+        now(),
+        id,
+    )?;
+    store.account(id, session)?;
+    let Some(namespace) = &session.history_namespace else {
+        return store.commit();
+    };
     let input = session
         .history
         .iter()

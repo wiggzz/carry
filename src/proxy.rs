@@ -179,6 +179,9 @@ pub struct ProxyCli {
     /// Detailed history age. Disk/reference pressure cannot shorten this window.
     #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_AGE_SECS", default_value_t = 604800, value_parser = clap::value_parser!(u64).range(0..=31536000))]
     history_max_age_secs: u64,
+    /// Numeric observations outlive raw history; default six months.
+    #[arg(long, env = "CARRY_PROXY_ACCOUNTING_MAX_AGE_SECS", default_value_t = 15552000, value_parser = clap::value_parser!(u64).range(7776000..=315360000))]
+    accounting_max_age_secs: u64,
 }
 
 impl ProxyCli {

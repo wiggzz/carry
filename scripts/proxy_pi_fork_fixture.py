@@ -4,6 +4,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+from history_store import read_index
 import queue
 import select
 import subprocess
@@ -166,7 +169,7 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
                 target = native_observer.bodies()[-1]['input']
                 index_path = state_dir/'history.index'
                 if index_path.exists():
-                    index = json.loads(index_path.read_text())
+                    index = read_index(index_path)
                     for ref in index['tips'].values():
                         path = state_dir/(ref['session']+'.json')
                         if not path.exists(): continue
@@ -202,7 +205,7 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         native = rpc.call('get_state')
         rpc.prompt('PROTECTED_A: run the scripted tools and finish A.')
         a = wait_transparent(3)[1]
-        a_advice = completed_advice(json.loads((state_dir/'history.index').read_text()), a)
+        a_advice = completed_advice(read_index(state_dir/'history.index'), a)
         assert a_advice and a_advice['len'] <= len(a['history']), 'real completed original-prefix advice must commit'
         assert any(m['text']=='ACCEPTED_A_FACT' for m in a_advice['memories']), 'actual A advice required'
         a_tree = rpc.call('get_entries')
@@ -214,10 +217,10 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         rpc.prompt('B_ONLY: verify later disposable reviewer cleanup.')
         parent_path, b = wait_transparent(5)
         parent_snapshot = json.loads(parent_path.read_text())
-        assert json.loads((state_dir/'history.index').read_text())['snapshots'][parent_path.stem] == parent_snapshot
+        assert read_index(state_dir/'history.index')['snapshots'][parent_path.stem] == parent_snapshot
         parent_proof = ParentCheckpointProof(root, parent_path, parent_snapshot)
         assert b['compactions']>0, 'actual parent disposable primary cleanup'
-        b_advice = completed_advice(json.loads((state_dir/'history.index').read_text()), b)
+        b_advice = completed_advice(read_index(state_dir/'history.index'), b)
         assert any(m['text']=='B_ONLY_FACT' for m in b_advice['memories']), 'B-only advice must really exist on parent'
         (root/'b-checkpoint.json').write_text(json.dumps(b)+'\n')
         assert 'DROP_COHORT_PAYLOAD_A' not in json.dumps(fixture.reviews[-1]), 'later real review must prune A'
@@ -268,10 +271,10 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         # reviewer caches. Actual child receipt/call assertions above prove cold
         # ownership; this synthetic provider never issued a positive read receipt.
         assert all(e['native_cached_fraction']==0 for e in
-                   json.loads((state_dir/'history.index').read_text())['upstream_cache'])
+                   read_index(state_dir/'history.index')['upstream_cache'])
         (root/'child-checkpoint.json').write_text(json.dumps(child)+'\n')
         assert json.loads(parent_path.read_text())==parent_snapshot, 'parent B unchanged'
-        assert json.loads((state_dir/'history.index').read_text())['snapshots'][parent_path.stem] == parent_snapshot
+        assert read_index(state_dir/'history.index')['snapshots'][parent_path.stem] == parent_snapshot
         parent_proof.check('after-child')
         # Restart the native process; the server owns lineage without mapping glue.
         resumed = rpc.call('get_state')
@@ -287,7 +290,7 @@ def run_case(*, carry, pi, output, fixture_class, observer_class):
         assert 'B_ONLY' not in json.dumps(fixture.calls[-1])
         assert len(fixture.reviews)==before_reviews and not fixture.summary_calls
         assert json.loads(parent_path.read_text())==parent_snapshot
-        assert json.loads((state_dir/'history.index').read_text())['snapshots'][parent_path.stem] == parent_snapshot
+        assert read_index(state_dir/'history.index')['snapshots'][parent_path.stem] == parent_snapshot
         parent_proof.check('after-resume')
         incoming = observer.bodies()
         assert native_observer.bodies()==incoming, 'ordinary native forwarding must preserve complete caller body'

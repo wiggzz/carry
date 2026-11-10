@@ -22,6 +22,9 @@ pub(super) struct Store {
     at: u64,
     age: u64,
     pins: HashSet<String>,
+    accounting_age: u64,
+    directory: PathBuf,
+    retired: std::cell::RefCell<Vec<String>>,
 }
 impl Store {
     pub(super) fn open(
@@ -76,6 +79,9 @@ impl Store {
             at: now(),
             age: service.config.history_max_age_secs,
             pins,
+            accounting_age: service.config.accounting_max_age_secs,
+            directory: service.config.state_dir.clone(),
+            retired: Default::default(),
         })
     }
     pub(super) fn get<T: DeserializeOwned>(
@@ -185,12 +191,100 @@ impl Store {
         values.reverse();
         Ok(values)
     }
+    pub(super) fn account(&self, id: &str, session: &Session) -> std::io::Result<()> {
+        if session.primary.calls == 0 && session.shadow.calls == 0 {
+            return Ok(());
+        }
+        // Cumulative observations are immutable and deduplicated by native paid
+        // state, not by checkpoint time. They are NOT additive receipt amounts.
+        let key = super::hash(&(id, &session.primary, &session.shadow));
+        if self.contains("accounting", &key)? {
+            return Ok(());
+        }
+        let mut provenance = session
+            .request_evidence
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        if let Some(Value::Object(fields)) = &mut provenance {
+            // Keep the independently streamed numeric journal's authority and
+            // latest frozen facts, never copy an entire suffix at every sample.
+            let last = fields
+                .remove("observations")
+                .and_then(|v| v.as_array().and_then(|a| a.last()).cloned());
+            fields.insert("latest_observation".into(), last.unwrap_or(Value::Null));
+            fields.remove("numeric_pending");
+        }
+        let estimate = session
+            .request_evidence
+            .as_ref()
+            .map(|e| e.snapshot().dashboard(false));
+        self.put("accounting", &key, &json!({
+            "version":1, "owner":id, "at":self.at,
+            "basis":"immutable_cumulative_observation_not_additive_receipts",
+            "producer_version":env!("CARGO_PKG_VERSION"),
+            "estimator_policy":crate::proxy_savings::accounting_policy(),
+            "primary":session.primary, "reviewer":session.shadow,
+            "completed_requests":session.completed_requests, "failed_primaries":session.failed_primaries,
+            "estimate":estimate, "numeric_provenance":provenance,
+            "last_primary_dispatch":session.last_primary_dispatch,
+            "last_reviewer_dispatch":session.last_reviewer_dispatch
+        }), self.at, id)
+    }
+    fn collect(&self) -> std::io::Result<()> {
+        self.connection
+            .execute_batch("CREATE TEMP TABLE pins(id TEXT PRIMARY KEY) WITHOUT ROWID;")
+            .map_err(error)?;
+        for id in &self.pins {
+            self.connection
+                .execute("INSERT INTO pins VALUES(?1)", [id])
+                .map_err(error)?;
+        }
+        if let Some(cutoff) = self.at.checked_sub(self.age) {
+            // Old in-flight owners retain their ancestry until paid settlement.
+            // This walk is only for expired pinned checkpoints, not the corpus.
+            self.connection.execute("WITH RECURSIVE ancestry(key) AS (
+                SELECT json_extract(CAST(data AS TEXT),'$.history_frontier') FROM records
+                WHERE kind='snapshots' AND at<=?1 AND owner IN (SELECT id FROM pins)
+                UNION SELECT json_extract(CAST(r.data AS TEXT),'$.parent') FROM records r JOIN ancestry a ON r.key=a.key WHERE r.kind='nodes')
+                UPDATE records SET at=max(at,?2) WHERE kind='nodes' AND key IN (SELECT key FROM ancestry)",params![cutoff,self.at]).map_err(error)?;
+            let mut statement=self.connection.prepare("SELECT key FROM records WHERE kind='snapshots' AND at<=?1 AND owner NOT IN (SELECT id FROM pins) LIMIT 128").map_err(error)?;
+            let retired = statement
+                .query_map([cutoff], |r| r.get::<_, String>(0))
+                .map_err(error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(error)?;
+            for id in &retired {
+                self.connection
+                    .execute(
+                        "DELETE FROM records WHERE kind='snapshots' AND key=?1",
+                        [id],
+                    )
+                    .map_err(error)?;
+            }
+            *self.retired.borrow_mut() = retired;
+            for kind in ["nodes", "tips", "transcripts", "reviews"] {
+                self.connection.execute("DELETE FROM records WHERE kind=?1 AND key IN (SELECT key FROM records WHERE kind=?1 AND at<=?2 AND owner NOT IN (SELECT id FROM pins) LIMIT 512)",params![kind,cutoff]).map_err(error)?;
+            }
+        }
+        if let Some(cutoff) = self.at.checked_sub(self.accounting_age) {
+            self.connection.execute("DELETE FROM records WHERE kind='accounting' AND key IN (SELECT key FROM records WHERE kind='accounting' AND at<=?1 LIMIT 512)",[cutoff]).map_err(error)?;
+        }
+        Ok(())
+    }
     pub(super) fn begin(&self) -> std::io::Result<()> {
         self.connection
             .execute_batch("BEGIN IMMEDIATE")
-            .map_err(error)
+            .map_err(error)?;
+        self.collect()
     }
     pub(super) fn commit(&self) -> std::io::Result<()> {
-        self.connection.execute_batch("COMMIT").map_err(error)
+        self.connection.execute_batch("COMMIT").map_err(error)?;
+        for id in self.retired.borrow().iter() {
+            if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                let _ = std::fs::remove_file(self.directory.join(format!("{id}.json")));
+            }
+        }
+        Ok(())
     }
 }

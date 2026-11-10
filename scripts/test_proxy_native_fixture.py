@@ -7,6 +7,9 @@ import http.server
 import os
 from pathlib import Path
 import select
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+from history_store import read_index
 import subprocess
 import tempfile
 import threading
@@ -160,7 +163,7 @@ def contract_advice(directory):
     """Read the completed original-prefix record, not its paid-owner mirror."""
     import hashlib
     state = contract_state(directory)
-    index = json.loads((Path(directory) / 'history.index').read_text())
+    index = read_index(Path(directory) / 'history.index')
     values = [item['value'] for item in state['history']]
     if state.get('history_frontier'):
         values, frontier = [], state['history_frontier']
