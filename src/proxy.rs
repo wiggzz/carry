@@ -772,13 +772,16 @@ fn save_publication(
         evidence.start_archive(&policy, id, persisted.history_namespace.as_deref());
     }
     let publication = policy.acquire()?;
-    if paid_only {
-        publication.settlement(id)?;
-    }
     if let Some(evidence) = &mut persisted.request_evidence
         && evidence.archive_tracking()
     {
+        // Optional lifetime-prefix staging cannot borrow mandatory paid
+        // settlement capacity. If it cannot fit, the bounded pending suffix
+        // remains in the authoritative checkpoint instead.
         evidence.stage_archive(&publication);
+    }
+    if paid_only {
+        publication.settlement(id)?;
     }
     let session = &persisted;
     if !session.history_shared {
