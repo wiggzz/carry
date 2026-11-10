@@ -728,8 +728,9 @@ class TransparentHistory(unittest.TestCase):
         import zlib
         root = self.state
         outcomes = []
-        for arm in ("direct", "sibling", "sibling_restart"):
+        for arm in ("direct", "sibling_completed", "sibling", "sibling_restart"):
             with self.subTest(arm=arm):
+                cancelled = arm in ("sibling", "sibling_restart")
                 self.state = root / arm
                 self.state.mkdir()
                 held, release = threading.Event(), threading.Event()
@@ -744,11 +745,17 @@ class TransparentHistory(unittest.TestCase):
                 c = a + [{"role": "user", "content": "R8_FOREGROUND_C"}]
                 receipts = []
                 def primary(body, n):
-                    if arm != "direct" and n == 5:
+                    if cancelled and n == 5:
                         held.set()
                         self.assertTrue(release.wait(10), "release cancelled auxiliary after publication")
                     tokens = 50000 if a[1] in body["input"] else 20000 if b[-2] in body["input"] else 10000
                     value = completed(response_id=f"r8_{arm}_{n}", input_tokens=tokens)
+                    if cancelled and n == 5:
+                        # No native usage was delivered before cancellation.
+                        # A scripted provider completion is not an owned receipt;
+                        # keep this attempt explicitly unknown, never priced zero.
+                        value.pop("usage")
+                        value["status"] = "incomplete"
                     receipts.append(value)
                     return 200, value
                 def review(body, _n):
@@ -792,19 +799,23 @@ class TransparentHistory(unittest.TestCase):
                     # The provider arrival follows Carry's durable input frontier
                     # publication. Disconnect before headers, then let the real
                     # attempted-dispatch receipt owner finish and cold-read it.
-                    connection = http.client.HTTPConnection(*proxy.address, timeout=10)
-                    self.stack.callback(connection.close)
-                    connection.request("POST", "/v1/responses", wire({"model": "gpt-6-luna", "input": b}),
-                                       headers={"Content-Type": "application/json"})
-                    self.assertTrue(held.wait(3), "auxiliary must reach actual provider before cancellation")
+                    if cancelled:
+                        connection = http.client.HTTPConnection(*proxy.address, timeout=10)
+                        self.stack.callback(connection.close)
+                        connection.request("POST", "/v1/responses", wire({"model": "gpt-6-luna", "input": b}),
+                                           headers={"Content-Type": "application/json"})
+                        self.assertTrue(held.wait(3), "auxiliary must reach actual provider before cancellation")
+                    else:
+                        self.assertEqual(proxy.send(b)[0], 200)
                     self.assertEqual(proxy.checkpoint(b)[0], owner_a)
                     self.assertNotIn(a[1], fixture.primaries[-1]["input"], "B retains A's applied projection")
                     self.assertNotIn(a[2], fixture.primaries[-1]["input"], "B's changed shared-prefix advice must actually apply")
                     self.assertIn("R8_B_ONLY_FACT", json.dumps(fixture.primaries[-1]["input"]))
                     self.assertNotIn(b[-2], fixture.primaries[-1]["input"], "B-only projection must really apply")
-                    connection.sock.shutdown(socket.SHUT_RDWR)
-                    connection.close()
-                    release.set()
+                    if cancelled:
+                        connection.sock.shutdown(socket.SHUT_RDWR)
+                        connection.close()
+                        release.set()
                     deadline = time.monotonic() + 5
                     while proxy.checkpoint(b)[1]["primary"]["calls"] != 5:
                         self.assertLess(time.monotonic(), deadline, "cancelled auxiliary must settle its actual receipt")
@@ -820,17 +831,25 @@ class TransparentHistory(unittest.TestCase):
                 owner_c, child = proxy.checkpoint(c)
                 index = read_index(self.state / "history.index")
                 states = index["snapshots"]
+                outcome = {"arm": arm, "owner_a": owner_a.name, "owner_c": owner_c.name,
+                           "applied_a": applied, "child": child, "states": states,
+                           "primaries": fixture.primaries, "reviews": fixture.reviews, "receipts": receipts}
+                outcomes.append(outcome)
+                print("R8_EVIDENCE_ZLIB_BASE64=" + base64.b64encode(zlib.compress(wire(outcome))).decode(), flush=True)
+                self.evidence[arm] = outcome
                 expected_calls = 3 if arm == "direct" else 6
                 self.assertEqual(len(fixture.primaries), expected_calls)
                 self.assertEqual(len(receipts), expected_calls)
                 self.assertEqual(sum(s["primary"]["calls"] for s in states.values()), expected_calls)
                 self.assertAlmostEqual(sum(s["primary"]["cost_usd"] for s in states.values()),
-                    sum(v["usage"]["input_tokens"] * .10 / 1e6 + .50 / 1e6 for v in receipts), places=12)
+                    sum(v["usage"]["input_tokens"] * .10 / 1e6 + .50 / 1e6 for v in receipts if "usage" in v), places=12)
                 self.assertEqual(sum(s["shadow"]["calls"] for s in states.values()), before_reviews)
                 self.assertAlmostEqual(sum(s["shadow"]["cost_usd"] for s in states.values()),
                                        before_reviews * (100 * .10 + .50) / 1e6, places=12)
                 self.assertEqual(len(fixture.reviews), before_reviews, "no paid rescue review")
-                self.assertTrue(all(s["primary"]["unavailable_cost_calls"] == 0 for s in states.values()))
+                self.assertEqual(sum(s["primary"]["unavailable_cost_calls"] for s in states.values()), int(cancelled))
+                self.assertEqual(child["primary"]["unavailable_cost_calls"], 0,
+                                 "B's unknown attempted expense cannot contaminate C")
                 sent = fixture.primaries[-1]["input"]
                 self.assertIn(a[0], sent)
                 self.assertIn(a[2], sent, "B-only removal of A's separator cannot leak into C")
@@ -842,12 +861,7 @@ class TransparentHistory(unittest.TestCase):
                     self.assertNotEqual(owner_c, owner_a, "genuine siblings remain separate accounting owners")
                     self.assertEqual(child["primary"]["calls"], 1)
                     self.assertEqual(child["shadow"]["calls"], 0)
-                outcome = {"arm": arm, "owner_a": owner_a.name, "owner_c": owner_c.name,
-                           "applied_a": applied, "child": child, "primaries": fixture.primaries,
-                           "reviews": fixture.reviews, "receipts": receipts}
-                outcomes.append(outcome)
-                print("R8_EVIDENCE_ZLIB_BASE64=" + base64.b64encode(zlib.compress(wire(outcome))).decode(), flush=True)
-                self.evidence[arm] = outcome
+
                 # Complete money/wire/isolation guards before the reported seam.
                 self.assertNotIn(a[1], sent, "shared A's applied projection/native sizing must survive B's sole-tip advance")
                 self.assertIn("R8_A_FACT", json.dumps(sent))
