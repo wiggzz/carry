@@ -187,10 +187,13 @@ class BrowserRetention(unittest.TestCase):
                             caches=evaluate("({text:transcriptText.size,requests:transcriptRequests.size,rows:document.querySelectorAll('.session').length})")))
                     if page < pages - 1:
                         previous = evaluate("document.querySelector('.session').id")
-                        evaluate("document.getElementById('next-sessions').click()")
+                        # A periodic refresh can disable navigation between
+                        # separate CDP calls. Wait and click in one browser turn;
+                        # retain the same deadline and exact next-owner guard.
+                        wait("!busy && !document.getElementById('next-sessions').disabled && (document.getElementById('next-sessions').click(),true)")
                         wait('!busy && document.querySelector(".session").id!==' + json.dumps(previous))
                 self.assertTrue(evaluate("document.getElementById('next-sessions').disabled"))
-                evaluate("document.getElementById('first-sessions').click()")
+                wait("!busy && !document.getElementById('first-sessions').disabled && (document.getElementById('first-sessions').click(),true)")
                 wait("!busy && document.querySelector('.session').id.endsWith('0001')")
                 self.assertEqual(evaluate("document.querySelectorAll('details.session-details[open],details.transcript-view[open]').length"), 0)
                 self.assertEqual(evaluate('transcriptText.size'), 0)

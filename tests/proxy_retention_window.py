@@ -101,9 +101,20 @@ class NativeFailureWindow(unittest.TestCase):
         for _ in range(2):
             proxy = TransparentProxy(state, fixture, extra=extra)
             self.addCleanup(proxy.close)
+            read_started = int(time.time())
             status, after = proxy.request("GET", query)
+            read_finished = int(time.time())
             self.assertEqual(status, 200)
-            self.assertEqual(after, before)
+            # The advertised rolling retention horizon is read-time metadata,
+            # not a frozen accounting fact. Validate its own clock domain and
+            # compare every other field without altering any paid observation.
+            horizon = after["window"]["retention_start_at"]
+            retention = records["accounting_retention_secs"]
+            self.assertGreaterEqual(horizon, read_started - retention)
+            self.assertLessEqual(horizon, read_finished - retention)
+            comparable = json.loads(json.dumps(after))
+            comparable["window"]["retention_start_at"] = before["window"]["retention_start_at"]
+            self.assertEqual(comparable, before)
             status, population = proxy.request("GET", "/carry/dashboard/stats?limit=1")
             self.assertEqual(status, 200)
             self.assertEqual(population["sessions"], [])
