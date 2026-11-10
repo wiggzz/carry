@@ -234,3 +234,115 @@ fn pr154_usage_diagnostics_are_numeric_and_preserve_censoring() {
     assert_eq!(data[3]["cost_censored"], true);
     assert!(!serde_json::to_string(&events).unwrap().contains("PRIVATE_"));
 }
+
+// R2: sink-local ceilings are not authority to spend a paid owner's promise.
+#[test]
+fn diagnostic_writers_leave_paid_and_maintenance_promises_intact() {
+    let mut violations = Vec::new();
+    for raw in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = checkpoint_service(directory.path());
+        service.config.verbose = true;
+        service.config.history_max_bytes = 65536;
+        service.config.history_disk_bytes = 8 * 1024 * 1024;
+        let id = pr154_session_id("diagnostic-promise");
+        let mut session = Session {
+            request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+            ..Session::default()
+        };
+        numeric_primary(&mut session, 0);
+        session.primary_pending = true;
+        save(&service, &id, &session).unwrap();
+        let pin = history::pin(&service, &id).unwrap();
+        // Pre-create the diagnostic directory through the normal writer, before
+        // filling ordinary headroom. This isolates append from mkdir admission.
+        journal(&service, &id, "setup", "fixture", &json!({}));
+        let policy = history::FilePolicy::new(&service.config);
+        let publication = policy.acquire().unwrap();
+        let mut low = 0;
+        let mut high = service.config.history_disk_bytes;
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if publication.admit_file(directory.path(), mid).is_ok() {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        File::create(directory.path().join("pressure.bin"))
+            .unwrap()
+            .set_len(low)
+            .unwrap();
+        assert!(publication.admit_file(directory.path(), 0).is_ok());
+        assert!(publication.admit_file(directory.path(), 1).is_err());
+        drop(publication);
+        let data = json!({"counts":vec![123u64; 1000]});
+        if raw {
+            logging::raw(&service, &id, "fixture", &data);
+        } else {
+            journal(&service, &id, "request", "fixture", &data);
+        }
+        let publication = policy.acquire().unwrap();
+        let promises_intact = publication.admit_file(directory.path(), 0).is_ok();
+        drop(publication);
+        // Complete the genuinely captured native receipt even on the old bad
+        // writer, then verify cold monetary/count/pending controls before RED.
+        numeric_primary(&mut session, 1);
+        session.primary_pending = false;
+        save_paid_accounting(&service, &id, &session, "diagnostic-promise").unwrap();
+        drop(pin);
+        let cold = checkpoint_service(directory.path());
+        let restored = load(&cold, &id).unwrap();
+        assert_eq!(restored.primary.calls, 2);
+        assert!((restored.primary.cost_usd - 0.004).abs() < 1e-12);
+        assert!(!restored.primary_pending);
+        assert_eq!(restored.completed_requests, 2);
+        if !promises_intact {
+            violations.push(if raw { "raw" } else { "journal" });
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "diagnostic writers consumed protected paid/maintenance capacity: {violations:?}"
+    );
+}
+
+#[test]
+fn diagnostic_writers_cannot_race_a_held_physical_publication() {
+    let mut raced = Vec::new();
+    for raw in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = checkpoint_service(directory.path());
+        service.config.verbose = true;
+        let id = pr154_session_id("diagnostic-race");
+        journal(&service, &id, "setup", "fixture", &json!({}));
+        let publication = history::FilePolicy::new(&service.config).acquire().unwrap();
+        let (started, start) = std::sync::mpsc::channel();
+        let (done, finish) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                started.send(()).unwrap();
+                if raw {
+                    logging::raw(&service, &id, "fixture", &json!({"count":1}));
+                } else {
+                    journal(&service, &id, "request", "fixture", &json!({"count":1}));
+                }
+                done.send(()).unwrap();
+            });
+            start.recv_timeout(Duration::from_secs(5)).unwrap();
+            let completed_while_held = finish.recv_timeout(Duration::from_millis(500)).is_ok();
+            drop(publication); // Always release real ownership before grading.
+            if !completed_while_held {
+                finish.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            worker.join().unwrap();
+            if completed_while_held {
+                raced.push(if raw { "raw" } else { "journal" });
+            }
+        });
+    }
+    assert!(
+        raced.is_empty(),
+        "writers bypassed held physical owner: {raced:?}"
+    );
+}
