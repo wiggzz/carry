@@ -55,8 +55,11 @@ fn settlement_reserve(max_record: u64) -> u64 {
 // Maintenance has its own bounded promise. Ordinary writes and paid settlement
 // both leave it intact, so expiry never depends on admitting another owner.
 fn maintenance_reserve(max_record: u64, disk_limit: u64) -> u64 {
+    // Keep the transaction's startup charge separate from the complete charge
+    // of one deletion. Otherwise the largest admitted rows never fit, even in
+    // an empty batch, and the oldest such row permanently blocks collection.
     write_charge(max_record)
-        .saturating_add(65536)
+        .saturating_add(65536 + write_charge(0))
         .min(disk_limit / 2)
 }
 fn full() -> std::io::Error {
