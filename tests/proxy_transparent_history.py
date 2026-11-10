@@ -860,6 +860,110 @@ class TransparentHistory(unittest.TestCase):
                 self.assertEqual(outcomes[arm]["estimate"]["traditional_compactions"], 1)
                 self.assertGreater(outcomes[arm]["estimate"]["summary_cost"], 0)
 
+    def test_shared_prefix_preserves_already_summarized_context_without_inheriting_paid_totals(self):
+        """A's summarized quantity survives B; A's and B's money stays owned."""
+        root = self.state
+        outcomes = {}
+        for seed_kind in ("free", "paid"):
+            for arm in ("direct", "sibling", "sibling_restart"):
+                key = seed_kind + "_" + arm
+                with self.subTest(setup=key):
+                    self.state = root / ("summarized_" + key)
+                    self.state.mkdir()
+                    seed = [{"role": "user", "content": "SUMMARIZED_TRACKED_GOAL"}]
+                    a = seed + [{"role": "user", "content": "SUMMARY_AT_A"}]
+                    b = a + [{"role": "user", "content": "SUMMARY_B_ONLY"}]
+                    c = a + [{"type": "reasoning", "summary": [],
+                              "encrypted_content": "SUMMARY_C_OPAQUE"},
+                             {"role": "user", "content": "SUMMARY_FOREGROUND_C"}]
+                    receipts = []
+                    def primary(body, n):
+                        tokens = (300040 if body["input"] == c else
+                                  600000 if body["input"] == b else
+                                  300000 if body["input"] == a else 100)
+                        value = completed([], response_id=f"summarized_{key}_{n}", input_tokens=tokens)
+                        receipts.append(value)
+                        return 200, value
+                    fixture = self.fixture(primary)
+                    options = ["--review-every-requests", "100", "--classifier-cache-policy", "disabled"]
+                    proxy = self.proxy(fixture, options)
+                    # Freeze an uncached scenario so the absolute quantity
+                    # oracle is independent of modeled prefix warmth.
+                    fields = {"max_output_tokens": 1, "prompt_cache_options": {"mode": "explicit"}}
+                    if seed_kind == "paid":
+                        self.assertEqual(proxy.send(seed, **fields)[0], 200)
+                    self.assertEqual(proxy.send(a, **fields)[0], 200)
+                    owner_a, _ = proxy.checkpoint(a)
+                    status, stats = proxy.request("GET", "/carry/dashboard/stats")
+                    self.assertEqual(status, 200)
+                    before = next(row["cost_estimate"] for row in stats["sessions"] if row["id"] == owner_a.stem)
+                    if arm.startswith("sibling"):
+                        self.assertEqual(proxy.send(b, **fields)[0], 200)
+                        self.assertEqual(proxy.checkpoint(b)[0], owner_a)
+                        if arm == "sibling_restart":
+                            proxy.close()
+                            proxy = self.proxy(fixture, options)
+                    self.assertEqual(proxy.send(c, **fields)[0], 200)
+                    owner_c, child = proxy.checkpoint(c)
+                    states = read_index(self.state / "history.index")["snapshots"]
+                    status, stats = proxy.request("GET", "/carry/dashboard/stats")
+                    self.assertEqual(status, 200)
+                    after = next(row["cost_estimate"] for row in stats["sessions"] if row["id"] == owner_c.stem)
+                    row = {"before": before, "after": after, "receipts": receipts,
+                           "primaries": fixture.primaries, "states": states, "child": child}
+                    outcomes[key] = row
+                    self.evidence["summarized_" + key] = row
+                    expected_calls = 2 + int(seed_kind == "paid") + int(arm.startswith("sibling"))
+                    self.assertEqual(len(fixture.primaries), expected_calls)
+                    self.assertEqual(len(receipts), expected_calls)
+                    self.assertEqual(sum(s["primary"]["calls"] for s in states.values()), expected_calls)
+                    self.assertAlmostEqual(sum(s["primary"]["cost_usd"] for s in states.values()),
+                        sum((v["usage"]["input_tokens"] * .20 + .75) / 1e6
+                            if v["usage"]["input_tokens"] > 272000 else
+                            (v["usage"]["input_tokens"] * .10 + .50) / 1e6
+                            for v in receipts), places=12)
+                    self.assertEqual(sum(s["primary"]["unavailable_cost_calls"] for s in states.values()), 0)
+                    self.assertEqual(fixture.reviews, [], "no paid reviewer or rescue")
+                    self.assertEqual(fixture.primaries[-1]["input"], c, "exact C wire, no B-only content")
+                    if arm.startswith("sibling"):
+                        self.assertNotEqual(owner_a, owner_c)
+                        self.assertEqual(child["primary"]["calls"], 1)
+                        self.assertEqual(child["primary"]["input_tokens"], 300040)
+                        self.assertAlmostEqual(child["primary"]["cost_usd"], .06000875, places=12)
+                        self.assertEqual(child["shadow"]["calls"], 0)
+                    row["native_controls_passed"] = True
+                    print("R8_SUMMARIZED=" + json.dumps({"key": key, "before": before, "after": after,
+                        "total_calls": expected_calls, "owner_primary_calls": child["primary"]["calls"]}, sort_keys=True), flush=True)
+                    proxy.close()
+        self.state = root
+        self.assertEqual(set(outcomes), {kind + "_" + arm for kind in ("free", "paid")
+                                        for arm in ("direct", "sibling", "sibling_restart")})
+        self.assertTrue(all(row.get("native_controls_passed", False) for row in outcomes.values()),
+                        "no context grading after a failed native control")
+        for kind in ("free", "paid"):
+            direct = outcomes[kind + "_direct"]
+            before, after = direct["before"], direct["after"]
+            self.assertEqual(before["initial_compactions"], int(kind == "free"))
+            self.assertEqual(before["traditional_compactions"], int(kind == "paid"))
+            self.assertEqual(after["initial_compactions"], before["initial_compactions"])
+            self.assertEqual(after["traditional_compactions"], before["traditional_compactions"])
+            marginal = after["traditional_cost"] - before["traditional_cost"]
+            self.assertAlmostEqual(marginal, .00210405, places=12,
+                                   msg="A's 21k summary plus 40 native append; short-tier continuation")
+            for arm in ("sibling", "sibling_restart"):
+                with self.subTest(context=kind + "_" + arm):
+                    estimate = outcomes[kind + "_" + arm]["after"]
+                    # Check quantity/money independently of the initialization
+                    # counter so suppressing that counter alone cannot pass.
+                    self.assertAlmostEqual(estimate["traditional_cost"], marginal, places=12,
+                        msg="inherit A's retired context, not a fresh summary or B's 600k extent")
+                    self.assertEqual(estimate["initial_compactions"], 0)
+                    self.assertEqual(estimate["traditional_compactions"], 0)
+                    self.assertEqual(estimate["summary_cost"], 0)
+                    self.assertEqual(estimate["coverage"]["primary_responses"], 1)
+                    self.assertAlmostEqual(estimate["carry_cost"], .06000875, places=12,
+                                           msg="ancestor paid totals must not enter the child window")
+
     def test_shared_prefix_preserves_applied_projection_and_native_sizing_after_auxiliary_cancel(self):
         """Real wires/receipts: applied A is not B's current mutable tip."""
         import base64
