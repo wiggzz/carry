@@ -729,7 +729,7 @@ impl Store {
             return Ok(false);
         }
         self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM records WHERE kind='accounting' AND owner=?1 AND at>=?2)",
+            "SELECT EXISTS(SELECT 1 FROM records INDEXED BY records_owner WHERE kind='accounting' AND owner=?1 AND at>=?2)",
             params![id, self.at.saturating_sub(self.accounting_age)],
             |row| row.get(0),
         ).map_err(error)

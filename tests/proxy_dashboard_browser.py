@@ -213,6 +213,8 @@ class BrowserRetention(unittest.TestCase):
                     screenshot = cdp('Page.captureScreenshot', {'format': 'png', 'captureBeyondViewport': False})['data']
                     report['screenshots'].append(dict(width=width, png_base64=screenshot,
                         sha256=hashlib.sha256(base64.b64decode(screenshot)).hexdigest()))
+                    layout['amount_lines'] = evaluate("[...document.querySelectorAll('.card .value')].map(x=>{const r=document.createRange();r.selectNodeContents(x);return r.getClientRects().length})")
+                    self.assertTrue(all(lines <= 1 for lines in layout['amount_lines']), layout)
                 report['console_before_expected_507'] = command(session + '/log', {'type': 'browser'})
                 self.assertFalse([x for x in report['console_before_expected_507'] if x['level'] == 'SEVERE'], report['console_before_expected_507'])
                 failing = True
