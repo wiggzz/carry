@@ -536,13 +536,18 @@ impl Store {
         let keys = super::path(namespace, input);
         let mut parent = namespace.to_owned();
         for (key, value) in keys.iter().zip(input) {
-            self.put(
-                "nodes",
-                key,
-                &json!({"parent":parent,"value":value}),
-                self.at,
-                "",
-            )?;
+            // Nodes are content-addressed and immutable. Republishing a path
+            // must neither reserve another write nor refresh its original age;
+            // live references, not node rewrites, keep ancestry reachable.
+            if !self.contains("nodes", key)? {
+                self.put(
+                    "nodes",
+                    key,
+                    &json!({"parent":parent,"value":value}),
+                    self.at,
+                    "",
+                )?;
+            }
             parent = key.clone();
         }
         Ok(keys)
