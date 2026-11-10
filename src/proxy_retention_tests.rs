@@ -1409,7 +1409,25 @@ fn numeric_file_admission_control(fork: bool) {
     // Frozen catalog: 1000 ordinary (below 272000) input tokens at $2/million;
     // no writes, hits or output. The earlier $0.004 oracle was a tier mistake.
     assert!((session.primary.cost_usd - (events + 1) as f64 * 0.002).abs() < 1e-9);
-    let publication = save(&service, id, &session);
+    let mut fork_created = false;
+    let publication = save_published(&service, id, &session, |persisted| {
+        // Capture the real archive/staging boundary while SQLite sidecars still
+        // coexist, before the later writer close can remove them and hide peak.
+        peak = peak.max(bytes());
+        fork_created = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".request-evidence-")
+            })
+            .count()
+            > 1;
+        history::committed(&service, id, persisted, None)
+    });
     peak = peak.max(bytes());
     let restored = load_existing(&service, id).unwrap();
     assert_eq!(restored.render_primary(), frozen.render_primary());
@@ -1424,7 +1442,7 @@ fn numeric_file_admission_control(fork: bool) {
     assert!(std::fs::read(&path).unwrap().starts_with(&original));
     assert!(
         publication.is_err() && peak <= service.config.history_disk_bytes,
-        "numeric files must be admitted before append/fork/queue flush: fork={fork} peak={peak} cap={} publication={publication:?}",
+        "numeric files must be admitted before append/fork/queue flush: fork={fork} fork_created={fork_created} peak={peak} cap={} publication={publication:?}",
         service.config.history_disk_bytes
     );
     drop(pin);
