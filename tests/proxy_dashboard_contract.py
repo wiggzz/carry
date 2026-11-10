@@ -197,12 +197,18 @@ class DashboardDispatchContract(unittest.TestCase):
                     self.assertEqual(transcript["canonical_input"], source)
                     self.assertEqual((root / "history.index").read_bytes(), index)
             mirror.write_bytes(saved)
+            # A WAL is committed authority too. With the publisher joined and
+            # no outstanding readers, invalidate the entire SQLite generation,
+            # not only a main file recoverable from its still-valid WAL pages.
+            for suffix in ("-wal", "-shm"):
+                (root / ("history.index" + suffix)).unlink(missing_ok=True)
             (root / "history.index").write_bytes(b"invalid actual authority")
             code, after = proxy.request("GET", "/carry/dashboard/stats")
             self.assertEqual(code, 200)
             self.assertEqual(after["unavailable_sessions"], 1)
             self.assertEqual(after["sessions"], [])
             self.assertNotEqual(proxy.request("GET", "/carry/dashboard/transcript/" + owner["id"])[0], 200)
+            self.assertEqual((root / "history.index").read_bytes(), b"invalid actual authority")
             self.assertEqual(fixture.errors, [])
 
     def test_private_dashboard_transcript_needs_no_separate_login(self):
