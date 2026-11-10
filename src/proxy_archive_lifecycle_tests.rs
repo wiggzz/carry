@@ -99,19 +99,23 @@ fn archive_optional_conflict_fork_cannot_spend_paid_settlement_promise() {
         );
         // Grow a genuine committed numeric prefix larger than an emergency
         // transaction's startup, without manufacturing a watermark or receipt.
-        let mut n = 0;
+        // Real epoch boundaries keep this lifetime journal large while its raw
+        // observation vector remains within the unchanged shared-record bound.
+        numeric_primary(&mut session, 0);
+        let n = 1;
+        let mut rounds = 0;
         loop {
             for _ in 0..8 {
-                numeric_primary(&mut session, n);
-                n += 1;
+                session.request_evidence.as_mut().unwrap().reset_epoch();
             }
+            rounds += 1;
             save(&service, &id, &session).unwrap();
             session = load(&service, &id).unwrap();
             let path = numeric_selected_path(directory.path(), &session);
             if std::fs::metadata(path).unwrap().len() >= 740000 {
                 break;
             }
-            assert!(n < 2000, "bounded fixture prefix construction");
+            assert!(rounds < 1000, "bounded fixture prefix construction");
         }
         let archive = numeric_selected_path(directory.path(), &session);
         let committed = std::fs::read(&archive).unwrap();
