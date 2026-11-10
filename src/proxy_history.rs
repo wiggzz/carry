@@ -409,6 +409,28 @@ impl ReadView {
         session.history_frontier = None;
         Ok(session)
     }
+    pub(super) fn current_accounting(&self, id: &str) -> std::io::Result<Option<Session>> {
+        let store = self.store.lock().unwrap();
+        let Some(view) = store.get::<crate::proxy_state::AccountingView>("snapshots", id)? else {
+            if store
+                .get::<Value>("owners", id)?
+                .is_some_and(|o| o["shared"] == true)
+            {
+                return Err(std::io::Error::other("selected history unavailable"));
+            }
+            return Ok(None);
+        };
+        let session = view.into_session();
+        if !session.history_shared {
+            return Ok(None);
+        }
+        if !matches!(session.version, 0 | 3) || !store.live("snapshots", id)? {
+            return Err(std::io::Error::other("selected history unavailable"));
+        }
+        // Numeric coverage is checkpoint authority, not an ancestry query. A
+        // smaller raw decode bound must not hide already settled native money.
+        Ok(Some(session))
+    }
     pub(super) fn shared(&self, id: &str) -> std::io::Result<Option<Session>> {
         {
             let store = self.store.lock().unwrap();

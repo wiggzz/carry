@@ -1272,6 +1272,58 @@ fn dashboard_plan(session: &Session) -> Value {
     })
 }
 
+fn load_dashboard_accounting(
+    service: &Service,
+    id: &str,
+    history: &std::io::Result<history::ReadView>,
+) -> Result<Session, Failure> {
+    use std::io::Read as _;
+    let unavailable = || {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "accounting authority unavailable",
+        )
+    };
+    let view = history.as_ref().map_err(|_| unavailable())?;
+    if let Some(session) = view.current_accounting(id).map_err(|_| unavailable())? {
+        return recover_success_prefix(service, id, session);
+    }
+    // Explicit checkpoints are authoritative, but a compact/shared mirror is
+    // never a substitute for its absent indexed owner. Ignore source/planner
+    // fields during numeric decoding instead of allocating their raw values.
+    let file = File::open(service.config.state_dir.join(format!("{id}.json")))
+        .map_err(|_| unavailable())?;
+    if file.metadata().map_err(|_| unavailable())?.len() > CHECKPOINT_MAX_BYTES as u64 {
+        return Err(unavailable());
+    }
+    let numbers: crate::proxy_state::AccountingView = serde_json::from_reader(
+        std::io::BufReader::new(file.take(CHECKPOINT_MAX_BYTES as u64 + 1)),
+    )
+    .map_err(|_| unavailable())?;
+    let session = numbers.into_session();
+    if !matches!(session.version, 0 | 3)
+        || session.history_shared
+        || session.history_frontier.is_some()
+    {
+        return Err(unavailable());
+    }
+    recover_success_prefix(service, id, session)
+}
+
+fn dashboard_session_estimate(session: &Session) -> crate::proxy_savings::Estimate {
+    session
+        .request_evidence
+        .as_ref()
+        .map(|t| t.snapshot())
+        .unwrap_or_else(|| crate::proxy_savings::Estimate {
+            coverage: crate::proxy_savings::Coverage {
+                prior_untracked_calls: session.primary.calls.saturating_add(session.shadow.calls),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+}
+
 fn load_dashboard_session(
     service: &Service,
     id: &str,
@@ -1476,6 +1528,7 @@ async fn dashboard_stats(
     })?;
     let mut sessions = Vec::new();
     let mut unavailable_sessions = 0u64;
+    let mut unavailable_accounting = 0u64;
     let history = history::ReadView::new(&service);
     let mut cost_estimate = match &history {
         Ok(view) => view.expired_accounting_totals().map_err(|_| {
@@ -1491,6 +1544,7 @@ async fn dashboard_stats(
     for entry in entries {
         let Ok(entry) = entry else {
             unavailable_sessions += 1;
+            unavailable_accounting += 1;
             continue;
         };
         let path = entry.path();
@@ -1505,31 +1559,16 @@ async fn dashboard_stats(
         }
         if !entry.file_type().is_ok_and(|t| t.is_file()) {
             unavailable_sessions += 1;
+            unavailable_accounting += 1;
             continue;
         }
-        let Ok(mut session) = load_dashboard_session(&service, id, &history) else {
+        let Ok(accounting) = load_dashboard_accounting(&service, id, &history) else {
             unavailable_sessions += 1;
+            unavailable_accounting += 1;
             continue;
         };
-        let estimate = session
-            .request_evidence
-            .as_ref()
-            .map(|t| t.snapshot())
-            .unwrap_or_else(|| crate::proxy_savings::Estimate {
-                coverage: crate::proxy_savings::Coverage {
-                    prior_untracked_calls: session
-                        .primary
-                        .calls
-                        .saturating_add(session.shadow.calls),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-        let mut rewrites = estimate.rewrites.clone();
-        rewrites.prior_unknown |= session.request_evidence.is_none()
-            && (session.primary.calls > 0 || session.completed_requests > 0);
-        let estimate =
-            estimate.dashboard(session.background_review_pending || session.primary_pending);
+        let pending = accounting.background_review_pending || accounting.primary_pending;
+        let estimate = dashboard_session_estimate(&accounting).dashboard(pending);
         if history
             .as_ref()
             .unwrap()
@@ -1541,8 +1580,7 @@ async fn dashboard_stats(
                 )
             })?
         {
-            cost_estimate
-                .observe_activity(session.background_review_pending || session.primary_pending);
+            cost_estimate.observe_activity(pending);
         } else {
             // Current authoritative numeric coverage owns a live window. The
             // frozen independent projection takes over only after raw expiry,
@@ -1552,6 +1590,16 @@ async fn dashboard_stats(
         if !selected.contains(id) {
             continue;
         }
+        let Ok(mut session) = load_dashboard_session(&service, id, &history) else {
+            unavailable_sessions += 1;
+            continue;
+        };
+        let estimate = dashboard_session_estimate(&session);
+        let mut rewrites = estimate.rewrites.clone();
+        rewrites.prior_unknown |= session.request_evidence.is_none()
+            && (session.primary.calls > 0 || session.completed_requests > 0);
+        let estimate =
+            estimate.dashboard(session.background_review_pending || session.primary_pending);
         if let Some(namespace) = &session.history_namespace {
             let input = session
                 .history
@@ -1635,8 +1683,8 @@ async fn dashboard_stats(
         }));
     }
     sessions.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-    cost_estimate.excluded_sessions += unavailable_sessions;
-    cost_estimate.unavailable_whole_windows(unavailable_sessions);
+    cost_estimate.excluded_sessions += unavailable_accounting;
+    cost_estimate.unavailable_whole_windows(unavailable_accounting);
     let mut response = axum::Json(json!({
         "cost_estimate": cost_estimate,
         "mode": format!("{:?}", service.config.mode).to_lowercase(),
