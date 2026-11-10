@@ -935,6 +935,15 @@ fn retention_unchanged_long_path_remains_writable_under_other_owner_pressure() {
 #[test]
 fn retention_expired_full_store_recovers_admission_and_reclaims_disk_without_losing_pinned_ancestry()
  {
+    expired_full_store_recovery(48000);
+}
+
+#[test]
+fn retention_expired_near_limit_records_recover_without_a_cap_increase() {
+    expired_full_store_recovery(62000);
+}
+
+fn expired_full_store_recovery(source_bytes: usize) {
     let directory = tempfile::tempdir().unwrap();
     let mut service = checkpoint_service(directory.path());
     service.config.history_max_bytes = 65536;
@@ -977,7 +986,9 @@ fn retention_expired_full_store_recovers_admission_and_reclaims_disk_without_los
                 ..Session::default()
             };
             pressure
-                .ingest(&[json!({"role":"user","content":format!("{n} {}", "x".repeat(48000))})])
+                .ingest(&[
+                    json!({"role":"user","content":format!("{n} {}", "x".repeat(source_bytes))}),
+                ])
                 .unwrap();
             match history::committed(&service, "expiry-pressure", &pressure, None) {
                 Ok(()) => accepted += 1,
