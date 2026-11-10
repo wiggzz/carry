@@ -1,4 +1,70 @@
 #[test]
+fn dashboard_month_window_retains_a_return_to_an_earlier_cumulative_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = checkpoint_service(directory.path());
+    let start = 20_000_000;
+    let end = start + 30 * 86400;
+    let id = "returning-cumulative-owner";
+    let mut state_a = Session {
+        history_shared: true,
+        history_namespace: Some("returning-cumulative".into()),
+        request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+        ..Session::default()
+    };
+    state_a
+        .ingest(&[json!({"role":"user","content":"retained source"})])
+        .unwrap();
+    numeric_primary(&mut state_a, 0);
+    at_decision_clock(&[start - 1], || {
+        history::committed(&service, id, &state_a, None).unwrap();
+        history::committed(&service, id, &state_a, None).unwrap();
+        assert_eq!(
+            history::accounting(&service, 0, "", 100).unwrap()["records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    });
+    let mut state_b = state_a.clone();
+    numeric_primary(&mut state_b, 1);
+    at_decision_clock(&[start + 100], || {
+        history::committed(&service, id, &state_b, None).unwrap();
+    });
+    at_decision_clock(&[start + 200], || {
+        // An explicit cumulative rollback is incompatible, not a second copy
+        // of the original observation and not evidence of compatible spend.
+        history::committed(&service, id, &state_a, None).unwrap();
+        history::committed(&service, id, &state_a, None).unwrap();
+        assert_eq!(
+            serde_json::to_value(history::restore(&service, id).unwrap().primary).unwrap(),
+            serde_json::to_value(&state_a.primary).unwrap()
+        );
+    });
+    at_decision_clock(&[end + 60 * 86400], || {
+        let restarted = checkpoint_service(directory.path());
+        assert!(history::restore(&restarted, id).is_err());
+        let frozen = history::accounting(&restarted, 0, "", 100).unwrap();
+        let report = history::accounting_window(&restarted, start, end).unwrap();
+        eprintln!(
+            "returning cumulative observation: records={} window={report}",
+            frozen["records"].as_array().unwrap().len()
+        );
+        assert_eq!(
+            frozen["records"].as_array().unwrap().len(),
+            3,
+            "only consecutive duplicates may be suppressed"
+        );
+        assert_eq!(report["coverage"]["included_owners"], 0);
+        assert_eq!(report["coverage"]["incompatible_owners"], 1);
+        assert_eq!(report["usage"]["unavailable_owners"], 1);
+        assert!(report["comparison"]["carry_cost"].is_null());
+        assert!(report["comparison"]["traditional_cost"].is_null());
+        assert_eq!(history::accounting(&restarted, 0, "", 100).unwrap(), frozen);
+    });
+}
+
+#[test]
 fn dashboard_month_window_exposes_missing_decreasing_and_backward_boundaries() {
     for case in ["missing", "decreasing", "backward"] {
         let directory = tempfile::tempdir().unwrap();
