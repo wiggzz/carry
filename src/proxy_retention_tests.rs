@@ -1406,7 +1406,9 @@ fn numeric_file_admission_control(fork: bool) {
         peak = peak.max(bytes());
     }
     assert_eq!(session.primary.calls, events + 1);
-    assert!((session.primary.cost_usd - (events + 1) as f64 * 0.004).abs() < 1e-9);
+    // Frozen catalog: 1000 ordinary (below 272000) input tokens at $2/million;
+    // no writes, hits or output. The earlier $0.004 oracle was a tier mistake.
+    assert!((session.primary.cost_usd - (events + 1) as f64 * 0.002).abs() < 1e-9);
     let publication = save(&service, id, &session);
     peak = peak.max(bytes());
     let restored = load_existing(&service, id).unwrap();
