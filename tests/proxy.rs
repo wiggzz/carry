@@ -2514,6 +2514,46 @@ async fn fixture_with_input_tokens(advice: serde_json::Value, input_tokens: u64)
     }
 }
 
+#[test]
+fn checkpoint_polling_waits_for_schema_without_creating_authority() {
+    let state = tempfile::tempdir().unwrap();
+    let path = state.path().join("history.index");
+    assert!(checkpoint_states(state.path()).is_empty());
+    assert!(
+        !path.exists(),
+        "readiness polling must not create authority"
+    );
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TABLE unrelated(value TEXT)")
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(checkpoint_states(state.path()).is_empty());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "polling must not initialize an incomplete schema"
+    );
+    let snapshot = json!({"history_shared":true,"completed_requests":1});
+    std::fs::write(
+        state.path().join("owner.json"),
+        serde_json::to_vec(&snapshot).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        checkpoint_states(state.path()).is_empty(),
+        "a mirror cannot stand in for unpublished shared authority"
+    );
+    db.execute_batch("CREATE TABLE records(kind TEXT,key TEXT,data BLOB)")
+        .unwrap();
+    assert!(checkpoint_states(state.path()).is_empty());
+    db.execute(
+        "INSERT INTO records VALUES('snapshots','owner',?1)",
+        [serde_json::to_vec(&snapshot).unwrap()],
+    )
+    .unwrap();
+    assert_eq!(checkpoint_states(state.path()), vec![snapshot]);
+}
+
 fn checkpoint_states(path: &std::path::Path) -> Vec<serde_json::Value> {
     // Advice becomes authority at the atomic index publication, not at its
     // earlier per-session diagnostic mirror write. Explicit legacy sessions

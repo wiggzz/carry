@@ -207,6 +207,54 @@ fn retention_import_accounts_validated_historical_success_prefix() {
 }
 
 #[test]
+fn retention_unchanged_coverage_dispatch_does_not_duplicate_accounting() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = checkpoint_service(directory.path());
+    let owner = "b".repeat(64);
+    let mut session = historical_retention_fixture(&service, &owner, false);
+    save(&service, &owner, &session).unwrap();
+    let first = history::accounting(&service, 0, "", 100).unwrap()["records"][0].clone();
+    session
+        .request_evidence
+        .as_mut()
+        .unwrap()
+        .dispatched_selection(
+            "next-unsettled-request",
+            &HashSet::new(),
+            None,
+            false,
+            Some(0),
+        );
+    assert_eq!(
+        serde_json::to_value(
+            session
+                .request_evidence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .dashboard(false)
+        )
+        .unwrap(),
+        first["estimate"],
+        "dispatch alone did not change settled numeric coverage"
+    );
+    save(&service, &owner, &session).unwrap();
+    let records = history::accounting(&service, 0, "", 100).unwrap()["records"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        records.len(),
+        1,
+        "dispatch provenance is not another settled accounting observation"
+    );
+    assert_eq!(
+        records[0], first,
+        "the original observation remains immutable"
+    );
+}
+
+#[test]
 fn retention_evidence_transition_adds_observation_without_rewriting_money() {
     let directory = tempfile::tempdir().unwrap();
     let service = checkpoint_service(directory.path());
