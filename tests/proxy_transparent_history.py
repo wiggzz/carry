@@ -744,7 +744,7 @@ class TransparentHistory(unittest.TestCase):
                 c = a + [{"role": "user", "content": "R8_FOREGROUND_C"}]
                 receipts = []
                 def primary(body, n):
-                    if arm != "direct" and n == 4:
+                    if arm != "direct" and n == 5:
                         held.set()
                         self.assertTrue(release.wait(10), "release cancelled auxiliary after publication")
                     tokens = 50000 if a[1] in body["input"] else 20000 if b[-2] in body["input"] else 10000
@@ -753,9 +753,16 @@ class TransparentHistory(unittest.TestCase):
                     return 200, value
                 def review(body, _n):
                     is_b = "R8_B_BOUNDARY" in json.dumps(body)
+                    source = 6 if is_b else 2
+                    # An appended B source is not consumed replay. Its first
+                    # successful primary exposes it; only the next review can
+                    # grant removal/fact authority. Repeated A advice likewise
+                    # must not try to replace an already invisible source.
+                    eligible = source in ledger(body)["eligible_group_ids"]
                     return 200, advice_response({"protected": [1],
-                        "removable": [3, 6] if is_b else [2], "memories": [
-                            {"source_ids": [6 if is_b else 2], "text": "R8_B_ONLY_FACT" if is_b else "R8_A_FACT"}]})
+                        "removable": ([3, source] if is_b else [source]) if eligible else [],
+                        "memories": [{"source_ids": [source],
+                            "text": "R8_B_ONLY_FACT" if is_b else "R8_A_FACT"}] if eligible else []})
                 fixture = self.fixture(primary, review)
                 seed_options = ["--review-replayed-history", "--payoff-requests", "1",
                                 "--classifier-cache-policy", "disabled"]
@@ -770,7 +777,14 @@ class TransparentHistory(unittest.TestCase):
                 self.assertIn(a[3], fixture.primaries[-1]["input"], "opaque native member remains exact")
                 self.assertTrue(applied["last_submitted_ids"], "actual submitted selection is established")
                 if arm != "direct":
-                    self.assertEqual(proxy.send(b)[0], 200)
+                    self.assertEqual(proxy.send(b)[0], 200)  # expose the appended source
+                    self.assertEqual(proxy.send(b)[0], 200)  # accept its now-eligible advice
+                    setup = {"arm": arm, "phase": "B_advice", "primaries": fixture.primaries,
+                             "reviews": fixture.reviews, "receipts": receipts,
+                             "saved": proxy.checkpoint(b)[1], "advice": proxy.advice()}
+                    print("R8_SETUP_ZLIB_BASE64=" + base64.b64encode(zlib.compress(wire(setup))).decode(), flush=True)
+                    self.assertIn(6, ledger(fixture.reviews[-1])["eligible_group_ids"],
+                                  "B fact source must be exposed before review acceptance")
                     self.assertTrue(any(m["text"] == "R8_B_ONLY_FACT" for m in proxy.advice()["memories"]),
                                     "B-only fact must be genuinely accepted, not an unused canary")
                     proxy.close()
@@ -792,7 +806,7 @@ class TransparentHistory(unittest.TestCase):
                     connection.close()
                     release.set()
                     deadline = time.monotonic() + 5
-                    while proxy.checkpoint(b)[1]["primary"]["calls"] != 4:
+                    while proxy.checkpoint(b)[1]["primary"]["calls"] != 5:
                         self.assertLess(time.monotonic(), deadline, "cancelled auxiliary must settle its actual receipt")
                         time.sleep(.01)
                     if arm == "sibling_restart":
@@ -806,7 +820,7 @@ class TransparentHistory(unittest.TestCase):
                 owner_c, child = proxy.checkpoint(c)
                 index = read_index(self.state / "history.index")
                 states = index["snapshots"]
-                expected_calls = 3 if arm == "direct" else 5
+                expected_calls = 3 if arm == "direct" else 6
                 self.assertEqual(len(fixture.primaries), expected_calls)
                 self.assertEqual(len(receipts), expected_calls)
                 self.assertEqual(sum(s["primary"]["calls"] for s in states.values()), expected_calls)
