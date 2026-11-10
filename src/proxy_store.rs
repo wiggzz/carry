@@ -15,6 +15,39 @@ pub(super) fn error(e: rusqlite::Error) -> std::io::Error {
     std::io::Error::new(kind, e)
 }
 
+/// The same capacity policy governs SQL and every external numeric/checkpoint
+/// write. It contains no provider, authentication, or client configuration.
+#[derive(Clone, Debug)]
+pub(crate) struct Policy {
+    directory: PathBuf,
+    max_record: usize,
+    max_nodes: usize,
+    age: u64,
+    accounting_age: u64,
+    disk_limit: u64,
+}
+impl Policy {
+    pub(crate) fn new(config: &ProxyCli) -> Self {
+        Self {
+            directory: config.state_dir.clone(),
+            max_record: config.history_max_bytes as usize,
+            max_nodes: config.history_max_nodes as usize,
+            age: config.history_max_age_secs,
+            accounting_age: config.accounting_max_age_secs,
+            disk_limit: config.history_disk_bytes,
+        }
+    }
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture(directory: &Path) -> Self {
+        let mut config = <ProxyCli as clap::Parser>::parse_from(["carry"]);
+        config.state_dir = directory.to_owned();
+        Self::new(&config)
+    }
+}
+
 pub(super) struct Store {
     pub(super) connection: Connection,
     max_record: usize,
@@ -179,7 +212,7 @@ fn import_v4(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
     if temporary.exists() {
         std::fs::remove_file(&temporary)?;
     }
-    let store = Store::open_path(service, pins, true, &temporary)?;
+    let store = Store::open_path(&Policy::new(&service.config), pins, true, &temporary)?;
     store.begin()?;
     let at = index["tips"]
         .as_object()
@@ -361,6 +394,34 @@ fn validate_predecessor(value: &Value) -> Result<Value, ()> {
 }
 
 impl Store {
+    pub(super) fn admit_file(&self, directory: &Path, additional: u64) -> std::io::Result<()> {
+        if directory != self.directory.as_path() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "physical write owner directory mismatch",
+            ));
+        }
+        // External files consume exact new bytes, not SQL page/WAL charges.
+        // Keep the connected footprint and the very same paid/maintenance
+        // promises used by transaction admission until the writer is finished.
+        let reserved = self.reserved_bytes.get();
+        if disk_bytes(&self.directory, 0)?
+            .saturating_add(additional)
+            .saturating_add(reserved)
+            > self.disk_limit
+        {
+            return Err(full());
+        }
+        #[cfg(unix)]
+        if free_bytes(&self.directory)?
+            < additional
+                .saturating_add(reserved)
+                .saturating_add(16 * 1024 * 1024)
+        {
+            return Err(full());
+        }
+        Ok(())
+    }
     fn charge(&self, bytes: u64) -> std::io::Result<()> {
         // Reserve index/overflow pages and WAL copies before SQLite can spill.
         // Refusal rolls back the transaction; it never deletes a younger row.
@@ -393,15 +454,17 @@ impl Store {
         pins: HashSet<String>,
         write: bool,
     ) -> std::io::Result<Self> {
-        Self::open_path(
-            service,
-            pins,
-            write,
-            &service.config.state_dir.join("history.index"),
-        )
+        Self::open_policy(&Policy::new(&service.config), pins, write)
+    }
+    pub(super) fn open_policy(
+        policy: &Policy,
+        pins: HashSet<String>,
+        write: bool,
+    ) -> std::io::Result<Self> {
+        Self::open_path(policy, pins, write, &policy.directory.join("history.index"))
     }
     fn open_path(
-        service: &Service,
+        policy: &Policy,
         pins: HashSet<String>,
         write: bool,
         path: &Path,
@@ -447,7 +510,7 @@ impl Store {
                 PRAGMA user_version=1;").map_err(error)?;
         }
         if write {
-            let pages = (service.config.history_disk_bytes / 4096).max(16);
+            let pages = (policy.disk_limit / 4096).max(16);
             connection
                 .pragma_update(None, "max_page_count", pages)
                 .map_err(error)?;
@@ -479,28 +542,28 @@ impl Store {
                 )
                 .map_err(error)?,
         };
-        let physical_record_bound = retained_bound.max(service.config.history_max_bytes as u64);
+        let physical_record_bound = retained_bound.max(policy.max_record as u64);
         Ok(Self {
             connection,
-            max_record: service.config.history_max_bytes as usize,
+            max_record: policy.max_record,
             physical_record_bound,
             publish_record_bound: recorded != Some(physical_record_bound),
-            max_nodes: service.config.history_max_nodes as usize,
+            max_nodes: policy.max_nodes,
             at: now(),
-            age: service.config.history_max_age_secs,
+            age: policy.age,
             reserved_bytes: std::cell::Cell::new(
-                settlement_reserve(service.config.history_max_bytes as u64)
+                settlement_reserve(policy.max_record as u64)
                     .saturating_mul(pins.len() as u64)
                     .saturating_add(maintenance_reserve(
                         physical_record_bound,
-                        service.config.history_disk_bytes,
+                        policy.disk_limit,
                     )),
             ),
             pins,
-            accounting_age: service.config.accounting_max_age_secs,
-            directory: service.config.state_dir.clone(),
+            accounting_age: policy.accounting_age,
+            directory: policy.directory.clone(),
             retired: Default::default(),
-            disk_limit: service.config.history_disk_bytes,
+            disk_limit: policy.disk_limit,
             projected_bytes: Default::default(),
             pending: Default::default(),
             pending_bytes: Default::default(),

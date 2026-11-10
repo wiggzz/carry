@@ -8,7 +8,7 @@ fn archive_actual_over_limit_numeric_frontier_grows_through_session_restart() {
     let mut session = load(&service, &id).unwrap();
     session.request_evidence = Some(crate::proxy_savings::RequestEvidence::default());
     session.request_evidence.as_mut().unwrap().bind_archive(
-        directory.path(),
+        &history::FilePolicy::new(&service.config),
         &id,
         session.history_namespace.as_deref(),
     );
@@ -89,7 +89,7 @@ async fn archive_sync_reviewer_stale_reservation_and_primary_fault_preserve_comm
         session.history_shared = false;
         session.request_evidence = Some(crate::proxy_savings::RequestEvidence::default());
         session.request_evidence.as_mut().unwrap().bind_archive(
-            directory.path(),
+            &history::FilePolicy::new(&service.config),
             &id,
             session.history_namespace.as_deref(),
         );
@@ -229,7 +229,7 @@ fn archive_orphan_generation_publication_failure_keeps_canonical_cut_and_reuses_
         session.history_shared = shared;
         session.request_evidence = Some(crate::proxy_savings::RequestEvidence::default());
         session.request_evidence.as_mut().unwrap().bind_archive(
-            directory.path(),
+            &history::FilePolicy::new(&service.config),
             &id,
             session.history_namespace.as_deref(),
         );
@@ -246,7 +246,11 @@ fn archive_orphan_generation_publication_failure_keeps_canonical_cut_and_reuses_
         } else {
             format!(".{id}.tmp")
         });
-        if shared { history::fixture::checkpoint_fault(&directory.path().join("history.index"), true); } else { std::fs::create_dir(&fault).unwrap(); }
+        if shared {
+            history::fixture::checkpoint_fault(&directory.path().join("history.index"), true);
+        } else {
+            std::fs::create_dir(&fault).unwrap();
+        }
         assert!(save(&service, &id, &session).is_err());
         let prior = load(&checkpoint_service(directory.path()), &id).unwrap();
         assert_eq!(prior.primary.calls, 1);
@@ -277,7 +281,11 @@ fn archive_orphan_generation_publication_failure_keeps_canonical_cut_and_reuses_
             })
             .count();
         assert_eq!(branches, 2); // complete orphan fork exists, not authority
-        if shared { history::fixture::checkpoint_fault(&directory.path().join("history.index"), false); } else { std::fs::remove_dir(&fault).unwrap(); }
+        if shared {
+            history::fixture::checkpoint_fault(&directory.path().join("history.index"), false);
+        } else {
+            std::fs::remove_dir(&fault).unwrap();
+        }
         save(&service, &id, &session).unwrap();
         let current = load(&checkpoint_service(directory.path()), &id).unwrap();
         assert_eq!(current.primary.calls, 2);
@@ -343,7 +351,7 @@ async fn archive_orphan_delayed_async_receipts_merge_into_fresh_generation_once(
         session.bootstrap_review_pending = true;
         session.request_evidence = Some(crate::proxy_savings::RequestEvidence::default());
         session.request_evidence.as_mut().unwrap().bind_archive(
-            directory.path(),
+            &history::FilePolicy::new(&service.config),
             &id,
             session.history_namespace.as_deref(),
         );
@@ -418,7 +426,7 @@ fn archive_orphan_genuine_capture_beyond_pending_bound_and_cold_authority_restar
         session.history_namespace = Some("fixture-orphan".into());
         session.request_evidence = Some(crate::proxy_savings::RequestEvidence::default());
         session.request_evidence.as_mut().unwrap().bind_archive(
-            directory.path(),
+            &history::FilePolicy::new(&service.config),
             &id,
             session.history_namespace.as_deref(),
         );
@@ -463,9 +471,9 @@ fn archive_orphan_genuine_capture_beyond_pending_bound_and_cold_authority_restar
         assert_eq!(after["archive"]["events"], 4098);
         // Shared indexed authority, not its diagnostic mirror, selects the fork.
         if shared {
-            let index: Value = serde_json::from_slice(
-                &history::fixture::read_index(&directory.path().join("history.index")),
-            )
+            let index: Value = serde_json::from_slice(&history::fixture::read_index(
+                &directory.path().join("history.index"),
+            ))
             .unwrap();
             assert_eq!(
                 index["snapshots"][&id]["request_evidence"]["archive"],

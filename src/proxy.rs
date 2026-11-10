@@ -215,7 +215,7 @@ mod accounting;
 #[path = "proxy_admission.rs"]
 mod admission;
 #[path = "proxy_history.rs"]
-mod history;
+pub(crate) mod history;
 #[path = "proxy_plan.rs"]
 mod planning;
 #[path = "proxy_advice.rs"]
@@ -599,7 +599,7 @@ fn recover_success_prefix(
             )
             .map_err(|_| invalid())?;
         evidence.bind_archive(
-            &service.config.state_dir,
+            &history::FilePolicy::new(&service.config),
             id,
             session.history_namespace.as_deref(),
         );
@@ -730,8 +730,8 @@ fn save_paid_accounting(
         // successful event or granting removal authority to its numeric journal.
         trajectory.reset_epoch();
     }
-    save_published(service, id, &durable, |session| {
-        history::settled(service, id, session)
+    save_publication(service, id, &durable, true, |session, publication| {
+        publication.settled(service, id, session)
     })
 }
 
@@ -741,8 +741,8 @@ fn save_observed(
     session: &Session,
     observation: Option<(&[Value], &Value)>,
 ) -> std::io::Result<()> {
-    save_published(service, id, session, |session| {
-        history::committed(service, id, session, observation)
+    save_published(service, id, session, |session, publication| {
+        publication.committed(service, id, session, observation)
     })
 }
 
@@ -750,51 +750,88 @@ fn save_published(
     service: &Service,
     id: &str,
     session: &Session,
-    publish: impl FnOnce(&Session) -> std::io::Result<()>,
+    publish: impl FnOnce(&Session, &history::Publication) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    save_publication(service, id, session, false, publish)
+}
+
+fn save_publication(
+    service: &Service,
+    id: &str,
+    session: &Session,
+    paid_only: bool,
+    publish: impl FnOnce(&Session, &history::Publication) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let mut persisted = session.clone();
+    let policy = history::FilePolicy::new(&service.config);
     if let Some(evidence) = &mut persisted.request_evidence
         && evidence.archive_tracking()
     {
-        evidence.prepare_archive(
-            &service.config.state_dir,
-            id,
-            persisted.history_namespace.as_deref(),
-        );
+        // A legacy upgrade may saturate its bounded queue. Its flush acquires
+        // the same owner independently, before the composed save owns IO.
+        evidence.start_archive(&policy, id, persisted.history_namespace.as_deref());
+    }
+    let publication = policy.acquire()?;
+    if paid_only {
+        publication.settlement(id)?;
+    }
+    if let Some(evidence) = &mut persisted.request_evidence
+        && evidence.archive_tracking()
+    {
+        evidence.stage_archive(&publication);
     }
     let session = &persisted;
     if !session.history_shared {
-        // The explicit checkpoint is authority, not a diagnostic mirror. Stage
-        // its exact bounded bytes first, then admit history before replacing it.
-        // A rejected reservation must never become an abandoned paid attempt.
-        return save_checkpoint(service, id, session, CHECKPOINT_MAX_BYTES, || {
-            publish(session)
-        });
+        return save_checkpoint(
+            service,
+            id,
+            session,
+            CHECKPOINT_MAX_BYTES,
+            &publication,
+            || publish(session, &publication),
+        );
     }
+    // Preserve the shared discovery lifecycle, but admit its entire staged
+    // mirror under the same physical-write owner before creating any bytes.
     let mirror = service.config.state_dir.join(format!("{id}.json"));
     let new_shared_mirror = !mirror.exists();
-    save_with_limit(
+    save_checkpoint(
         service,
         id,
         &history::compact(session),
         CHECKPOINT_MAX_BYTES,
+        &publication,
+        || Ok(()),
     )?;
-    let published = publish(session);
+    let published = publish(session, &publication);
     if published.is_err() && new_shared_mirror {
-        // A rejected fresh admission owns no authoritative state. Repeated
-        // capacity backpressure must not accumulate unindexed diagnostics.
         let _ = std::fs::remove_file(mirror);
     }
     published
 }
 
+#[cfg(test)]
 fn save_with_limit(
     service: &Service,
     id: &str,
     session: &Session,
     max_bytes: usize,
 ) -> std::io::Result<()> {
-    save_checkpoint(service, id, session, max_bytes, || Ok(()))
+    let publication = history::FilePolicy::new(&service.config).acquire()?;
+    save_checkpoint(service, id, session, max_bytes, &publication, || Ok(()))
+}
+
+struct CheckpointSize(u64);
+impl Write for CheckpointSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_add(bytes.len() as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::StorageFull, "checkpoint size overflow")
+        })?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn save_checkpoint(
@@ -802,10 +839,26 @@ fn save_checkpoint(
     id: &str,
     session: &Session,
     max_bytes: usize,
+    publication: &history::Publication,
     admit: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    // Count without retaining another potentially large serialized allocation.
+    // The full staged file coexists with its old target through SQL publication.
+    let mut size = CheckpointSize(0);
+    serde_json::to_writer(&mut size, session)?;
     let path = service.config.state_dir.join(format!("{id}.json"));
     let temporary = service.config.state_dir.join(format!(".{id}.tmp"));
+    let reusable = match std::fs::symlink_metadata(&temporary) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => {
+            return Err(std::io::Error::other(
+                "checkpoint staging is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    publication.admit_file(&service.config.state_dir, size.0.saturating_sub(reusable))?;
     let mut file = private_file(&temporary, false)?;
     serde_json::to_writer(&mut file, session)?;
     // Never replace a loadable checkpoint with one the loader would reject.
@@ -2198,7 +2251,7 @@ async fn forward_timed(
             let mut trajectory = crate::proxy_savings::RequestEvidence::default();
             trajectory.prior_untracked(session.primary.calls + session.shadow.calls);
             trajectory.bind_archive(
-                &service.config.state_dir,
+                &history::FilePolicy::new(&service.config),
                 &id,
                 session.history_namespace.as_deref(),
             );

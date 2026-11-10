@@ -2,6 +2,7 @@
 //! predicted costs. Disk grows with tracked events; state-directory lifecycle
 //! owns deletion (no semantic-rollover GC). Replay streams one bounded record.
 use super::*;
+use crate::proxy::history::{FilePolicy, Publication};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -97,6 +98,7 @@ fn generation<'de, D: serde::Deserializer<'de>>(
 #[derive(Clone, Debug)]
 pub(super) struct Access {
     directory: PathBuf,
+    policy: FilePolicy,
     owner: String,
     namespace: String,
     prior_untracked: u64,
@@ -247,7 +249,12 @@ fn write_numeric(access: &Access, file: &mut File, bytes: &[u8]) -> std::io::Res
 impl RequestEvidence {
     /// Bind only after the canonical Session/index owner has loaded. Archive
     /// failures never reject core state or ordinary forwarding.
-    pub(crate) fn bind_archive(&mut self, directory: &Path, owner: &str, namespace: Option<&str>) {
+    pub(crate) fn bind_archive(
+        &mut self,
+        policy: &FilePolicy,
+        owner: &str,
+        namespace: Option<&str>,
+    ) {
         if self.archive_access.is_some() {
             return;
         }
@@ -260,7 +267,8 @@ impl RequestEvidence {
             |mark| mark.namespace.clone(),
         );
         self.archive_access = Some(Access {
-            directory: directory.to_owned(),
+            directory: policy.directory().to_owned(),
+            policy: policy.clone(),
             owner: owner.into(),
             namespace,
             prior_untracked: self.prior_untracked,
@@ -403,18 +411,33 @@ impl RequestEvidence {
     /// Repeated saves are deterministic/idempotent.
     /// On I/O failure retain the bounded numeric suffix in the core checkpoint;
     /// missing/corrupt history remains explicitly unknown, never forwarding 500.
-    pub(crate) fn prepare_archive(
+    pub(crate) fn start_archive(
         &mut self,
-        directory: &Path,
+        policy: &FilePolicy,
         owner: &str,
         namespace: Option<&str>,
     ) {
-        self.bind_archive(directory, owner, namespace);
+        self.bind_archive(policy, owner, namespace);
         self.start_numeric();
+    }
+
+    pub(crate) fn stage_archive(&mut self, publication: &Publication) {
+        let _ = self.flush_numeric_locked(publication);
+    }
+
+    #[cfg(test)]
+    fn prepare_archive(&mut self, policy: &FilePolicy, owner: &str, namespace: Option<&str>) {
+        self.start_archive(policy, owner, namespace);
         let _ = self.flush_numeric();
     }
 
     fn flush_numeric(&mut self) -> std::io::Result<()> {
+        let policy = &self.archive_access.as_ref().ok_or_else(unavailable)?.policy;
+        let publication = policy.acquire()?;
+        self.flush_numeric_locked(&publication)
+    }
+
+    fn flush_numeric_locked(&mut self, publication: &Publication) -> std::io::Result<()> {
         if self.numeric_lost {
             return Err(unavailable());
         }
@@ -456,19 +479,33 @@ impl RequestEvidence {
         }
         let existing_bytes = file.metadata()?.len();
         file.seek(SeekFrom::Start(base.bytes))?;
-        let mut mark = base.clone();
+        // Plan the complete suffix before mutating anything. Otherwise a
+        // later conflicting record can require a full fork after an earlier
+        // append has already consumed physical capacity.
+        let mut desired = base.clone();
         for event in &self.numeric_pending {
-            let offset = mark.bytes;
-            let line = encode(&mut mark, event)?;
+            let offset = desired.bytes;
+            let line = encode(&mut desired, event)?;
             let reused = existing_bytes.saturating_sub(offset).min(line.len() as u64) as usize;
             if reused > 0 {
                 let mut existing = vec![0; reused];
                 file.read_exact(&mut existing)?;
                 if existing != line[..reused] {
                     // Possibly committed elsewhere: NEVER mutate these bytes.
-                    return self.fork_numeric(&base);
+                    return self.fork_numeric(&base, publication);
                 }
             }
+        }
+        publication.admit_file(
+            &access.directory,
+            desired.bytes.saturating_sub(existing_bytes),
+        )?;
+        let mut mark = base.clone();
+        for event in &self.numeric_pending {
+            let offset = mark.bytes;
+            let line = encode(&mut mark, event)?;
+            let reused = existing_bytes.saturating_sub(offset).min(line.len() as u64) as usize;
+            file.seek(SeekFrom::Start(offset + reused as u64))?;
             write_numeric(access, &mut file, &line[reused..])?;
         }
         file.sync_all()?;
@@ -483,7 +520,7 @@ impl RequestEvidence {
         self.archive_access.as_mut().unwrap().pending_bytes = 0;
     }
 
-    fn fork_numeric(&mut self, base: &Watermark) -> std::io::Result<()> {
+    fn fork_numeric(&mut self, base: &Watermark, publication: &Publication) -> std::io::Result<()> {
         let access = self.archive_access.as_ref().ok_or_else(unavailable)?;
         let mut desired = base.clone();
         for event in &self.numeric_pending {
@@ -500,6 +537,22 @@ impl RequestEvidence {
             ))?)
         ));
         let target = access.path(&desired)?;
+        match std::fs::symlink_metadata(&target) {
+            Ok(_) => {
+                // An identical abandoned publication already installed this
+                // branch. Validate both committed authority and the reused
+                // branch; a healthy target must not launder a corrupt base.
+                access.scan(base, |_, _| Ok(()))?;
+                access.scan(&desired, |_, _| Ok(()))?;
+                self.finish_numeric(desired);
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+        }
+        // The temporary fork contains the entire committed prefix as well as
+        // its new suffix. Admit that full peak before creating/copying it.
+        publication.admit_file(&access.directory, desired.bytes)?;
         let mut temporary = tempfile::NamedTempFile::new_in(&access.directory)?;
         access.scan(base, |line, _| {
             write_numeric(access, temporary.as_file_mut(), line)
@@ -545,7 +598,11 @@ mod tests {
 
     fn restored(bytes: &[u8], directory: &Path) -> RequestEvidence {
         let mut result: RequestEvidence = serde_json::from_slice(bytes).unwrap();
-        result.bind_archive(directory, "fixture-owner", Some("fixture-namespace"));
+        result.bind_archive(
+            &FilePolicy::fixture(directory),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         result
     }
 
@@ -553,9 +610,17 @@ mod tests {
     fn watermark_retry_ignores_uncommitted_tail_and_repeated_saves_are_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let mut evidence = RequestEvidence::default();
-        evidence.bind_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.bind_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         primary(&mut evidence, 0);
-        evidence.prepare_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.prepare_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         let committed = serde_json::to_vec(&evidence).unwrap();
         let path = evidence
             .archive_access
@@ -564,20 +629,32 @@ mod tests {
             .path(evidence.archive.as_ref().unwrap())
             .unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        evidence.prepare_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.prepare_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         // Journal sync succeeded, but the checkpoint/index publish did not.
         // Restore precisely the last committed watermark as a crashed process
         // would; orphan bytes are not another successful accounting event.
         primary(&mut evidence, 1);
-        evidence.prepare_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.prepare_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         let tail = std::fs::read(&path).unwrap();
         assert!(tail.len() > bytes.len());
         let mut retry = restored(&committed, dir.path());
         assert_eq!(retry.snapshot().chronological.unwrap().primary_responses, 1);
         // Retry the same uncommitted receipt by reusing its exact bytes.
         primary(&mut retry, 1);
-        retry.prepare_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        retry.prepare_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         let mut count = 0;
         retry.scan_numeric(|_| count += 1).unwrap();
         assert_eq!(count, 2);
@@ -595,7 +672,11 @@ mod tests {
     fn conflict_fork_faults_reuse_and_generation_integrity() {
         let dir = tempfile::tempdir().unwrap();
         let mut evidence = RequestEvidence::default();
-        evidence.bind_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.bind_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         primary(&mut evidence, 0);
         evidence.flush_numeric().unwrap();
         primary(&mut evidence, 1);
@@ -712,19 +793,35 @@ mod tests {
     fn censored_gap_and_same_owner_namespace_changes_survive_numeric_restart() {
         let dir = tempfile::tempdir().unwrap();
         let mut evidence = RequestEvidence::default();
-        evidence.bind_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.bind_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         primary(&mut evidence, 0);
-        evidence.prepare_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.prepare_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         let bytes = serde_json::to_vec(&evidence).unwrap();
         let mut next: RequestEvidence = serde_json::from_slice(&bytes).unwrap();
-        next.bind_archive(dir.path(), "fixture-owner", Some("changed-H-settings"));
+        next.bind_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("changed-H-settings"),
+        );
         assert_eq!(
             serde_json::to_value(next.snapshot()).unwrap(),
             serde_json::to_value(evidence.snapshot()).unwrap()
         );
         next.prior_untracked(1); // an actual censored attempt, not semantic rollover
         primary(&mut next, 1);
-        next.prepare_archive(dir.path(), "fixture-owner", Some("changed-H-settings"));
+        next.prepare_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("changed-H-settings"),
+        );
         let restarted = restored(&serde_json::to_vec(&next).unwrap(), dir.path());
         let estimate = restarted.snapshot();
         assert_eq!(estimate.coverage.prior_untracked_calls, 1);
@@ -736,7 +833,11 @@ mod tests {
     fn byte_saturated_numeric_chunks_seal_without_losing_real_appends() {
         let dir = tempfile::tempdir().unwrap();
         let mut evidence = RequestEvidence::default();
-        evidence.bind_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.bind_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         let body = json!({"model":"model-alias-".repeat(9000),"max_output_tokens":1,
             "input":[{"role":"user","content":"source"}]});
         let response = json!({"status":"completed","output":[],"usage":{"input_tokens":1000,"output_tokens":0,"input_tokens_details":{"cached_tokens":0}}});
@@ -770,7 +871,11 @@ mod tests {
                 .is_some_and(|mark| mark.events > 0),
             "real appends sealed a bounded numeric chunk"
         );
-        evidence.prepare_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.prepare_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         let restarted = restored(&serde_json::to_vec(&evidence).unwrap(), dir.path());
         let mut count = 0;
         restarted.scan_numeric(|_| count += 1).unwrap();
@@ -789,7 +894,11 @@ mod tests {
     fn oversized_numeric_record_is_explicitly_unknown_not_an_unbounded_checkpoint_suffix() {
         let dir = tempfile::tempdir().unwrap();
         let mut evidence = RequestEvidence::default();
-        evidence.bind_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.bind_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         let body = json!({"model":"x".repeat(MAX_RECORD as usize),"max_output_tokens":1,
             "input":[{"role":"user","content":"source"}]});
         let response = json!({"status":"completed","output":[],"usage":{"input_tokens":1000,"output_tokens":0,"input_tokens_details":{"cached_tokens":0}}});
@@ -812,7 +921,11 @@ mod tests {
     fn chronological_archive_does_not_collect_lifetime_policy_boundaries() {
         let dir = tempfile::tempdir().unwrap();
         let mut evidence = RequestEvidence::default();
-        evidence.bind_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.bind_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         let mut resolved = carry::models::resolve_model(
             "gpt-6.1-sol",
             carry::models::Route::new("https://api.openai.com/v1/responses", false),
@@ -836,7 +949,11 @@ mod tests {
                 cost: Some(0.002),
                 measurements: None,
             });
-            evidence.prepare_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+            evidence.prepare_archive(
+                &FilePolicy::fixture(dir.path()),
+                "fixture-owner",
+                Some("fixture-namespace"),
+            );
         }
         let mut versions = Vec::new();
         evidence
@@ -877,10 +994,18 @@ mod tests {
     fn failed_replay_cannot_be_certified_by_a_later_healthy_scan() {
         let dir = tempfile::tempdir().unwrap();
         let mut evidence = RequestEvidence::default();
-        evidence.bind_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.bind_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         primary(&mut evidence, 0);
         primary(&mut evidence, 1);
-        evidence.prepare_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.prepare_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         let before = evidence.snapshot();
         std::fs::write(
             dir.path().join(".numeric-read-fault"),
@@ -904,9 +1029,17 @@ mod tests {
     fn numeric_storage_has_no_bodies_vectors_or_saved_predictions() {
         let dir = tempfile::tempdir().unwrap();
         let mut evidence = RequestEvidence::default();
-        evidence.bind_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.bind_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         primary(&mut evidence, 0);
-        evidence.prepare_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.prepare_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         let bytes = std::fs::read(
             evidence
                 .archive_access
@@ -945,9 +1078,17 @@ mod tests {
     fn corrupt_missing_foreign_and_truncated_archives_are_unknown_not_core_errors() {
         let dir = tempfile::tempdir().unwrap();
         let mut evidence = RequestEvidence::default();
-        evidence.bind_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.bind_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         primary(&mut evidence, 0);
-        evidence.prepare_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+        evidence.prepare_archive(
+            &FilePolicy::fixture(dir.path()),
+            "fixture-owner",
+            Some("fixture-namespace"),
+        );
         let checkpoint = serde_json::to_vec(&evidence).unwrap();
         let path = evidence
             .archive_access
@@ -981,7 +1122,11 @@ mod tests {
                 "case {case}"
             );
             primary(&mut current, 1);
-            current.prepare_archive(dir.path(), "fixture-owner", Some("fixture-namespace"));
+            current.prepare_archive(
+                &FilePolicy::fixture(dir.path()),
+                "fixture-owner",
+                Some("fixture-namespace"),
+            );
             assert_eq!(
                 current.numeric_pending.len(),
                 1,

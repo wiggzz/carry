@@ -5,7 +5,57 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 #[path = "proxy_store.rs"]
 mod storage;
+pub(crate) use storage::Policy as FilePolicy;
 use storage::Store;
+
+/// One serialized physical-write owner, shared by numeric archives, checkpoint
+/// staging and SQL publication. Holding the connected view preserves sidecars
+/// in admission measurements; it does not hold a SQLite read transaction.
+pub(crate) struct Publication {
+    store: Store,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+impl FilePolicy {
+    pub(crate) fn acquire(&self) -> std::io::Result<Publication> {
+        let guard = IO.lock().unwrap();
+        let pins = PINS
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(directory, _)| directory.as_path() == self.directory())
+            .map(|(_, id)| id.clone())
+            .collect();
+        Ok(Publication {
+            _guard: guard,
+            store: Store::open_policy(self, pins, false)?,
+        })
+    }
+}
+impl Publication {
+    pub(crate) fn admit_file(&self, directory: &Path, additional: u64) -> std::io::Result<()> {
+        self.store.admit_file(directory, additional)
+    }
+    pub(super) fn settlement(&self, id: &str) -> std::io::Result<()> {
+        self.store.begin_settlement(id)
+    }
+    pub(super) fn committed(
+        &self,
+        service: &Service,
+        id: &str,
+        session: &Session,
+        observation: Option<(&[Value], &Value)>,
+    ) -> std::io::Result<()> {
+        committed_locked(service, id, session, observation)
+    }
+    pub(super) fn settled(
+        &self,
+        service: &Service,
+        id: &str,
+        session: &Session,
+    ) -> std::io::Result<()> {
+        settled_locked(service, id, session)
+    }
+}
 #[cfg(test)]
 #[allow(dead_code)]
 #[path = "../tests/history_store.rs"]
@@ -489,8 +539,12 @@ impl ReadView {
 /// Publish captured paid facts against existing authority without replaying its
 /// ancestry, transcript bindings or advice. The caller constructs this Session
 /// by merging only numeric settlement into the durable predecessor.
+#[cfg(test)]
 pub(super) fn settled(service: &Service, id: &str, session: &Session) -> std::io::Result<()> {
     let _guard = IO.lock().unwrap();
+    settled_locked(service, id, session)
+}
+fn settled_locked(service: &Service, id: &str, session: &Session) -> std::io::Result<()> {
     let store = Store::open(service, pinned(service), true)?;
     store.begin_settlement(id)?;
     if session.history_shared && !store.contains("snapshots", id)? {
@@ -503,7 +557,17 @@ pub(super) fn settled(service: &Service, id: &str, session: &Session) -> std::io
     store.commit()
 }
 
+#[cfg(test)]
 pub(super) fn committed(
+    service: &Service,
+    id: &str,
+    session: &Session,
+    observation: Option<(&[Value], &Value)>,
+) -> std::io::Result<()> {
+    let _guard = IO.lock().unwrap();
+    committed_locked(service, id, session, observation)
+}
+fn committed_locked(
     service: &Service,
     id: &str,
     session: &Session,
@@ -515,7 +579,6 @@ pub(super) fn committed(
     {
         return Ok(());
     }
-    let _guard = IO.lock().unwrap();
     let store = Store::open(service, pinned(service), true)?;
     store.begin()?;
     store.put(

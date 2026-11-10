@@ -1316,11 +1316,11 @@ fn external_checkpoint_admission_control(shared: bool) {
     candidate.pending_output = vec![
         json!({"role":"assistant","content":"x".repeat(service.config.history_disk_bytes as usize + 4096)}),
     ];
-    let publication = save_published(&service, owner, &candidate, |persisted| {
+    let publication = save_published(&service, owner, &candidate, |persisted, publication| {
         // Observe the real staged-file boundary before SQLite admission, not a
         // timer sample that can miss a transient peak or after-the-fact cleanup.
         peak = peak.max(bytes());
-        history::committed(&service, owner, persisted, None)
+        publication.committed(&service, owner, persisted, None)
     });
     peak = peak.max(bytes());
     let restored = load_existing(&service, owner).unwrap();
@@ -1367,7 +1367,7 @@ fn numeric_file_admission_control(fork: bool) {
         .ingest(&[json!({"role":"user","content":"frozen numeric source"})])
         .unwrap();
     session.request_evidence.as_mut().unwrap().bind_archive(
-        directory.path(),
+        &history::FilePolicy::new(&service.config),
         id,
         session.history_namespace.as_deref(),
     );
@@ -1410,7 +1410,7 @@ fn numeric_file_admission_control(fork: bool) {
     // no writes, hits or output. The earlier $0.004 oracle was a tier mistake.
     assert!((session.primary.cost_usd - (events + 1) as f64 * 0.002).abs() < 1e-9);
     let mut fork_created = false;
-    let publication = save_published(&service, id, &session, |persisted| {
+    let publication = save_published(&service, id, &session, |persisted, publication| {
         // Capture the real archive/staging boundary while SQLite sidecars still
         // coexist, before the later writer close can remove them and hide peak.
         peak = peak.max(bytes());
@@ -1426,7 +1426,7 @@ fn numeric_file_admission_control(fork: bool) {
             })
             .count()
             > 1;
-        history::committed(&service, id, persisted, None)
+        publication.committed(&service, id, persisted, None)
     });
     peak = peak.max(bytes());
     let restored = load_existing(&service, id).unwrap();
