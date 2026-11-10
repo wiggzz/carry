@@ -1,3 +1,162 @@
+#[test]
+fn dashboard_month_window_subtracts_owner_boundaries_after_raw_expiry() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = 20_000_000;
+    let end = start + 30 * 86400;
+    let ids = [format!("{:064x}", 921), format!("{:064x}", 922)];
+    let mut sessions = ids
+        .iter()
+        .map(|id| {
+            let mut session = Session {
+                history_shared: true,
+                history_namespace: Some(format!("month-window-{id}")),
+                request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+                ..Session::default()
+            };
+            session
+                .ingest(&[json!({"role":"user","content":"month private source"})])
+                .unwrap();
+            session
+        })
+        .collect::<Vec<_>>();
+    // The interval is (start,end], by recorded observation time. There are
+    // multiple nonadditive cumulative snapshots on both sides of its bounds.
+    let stages = [
+        (start - 1, [2, 1]),
+        (start, [1, 1]),
+        (start + 15 * 86400, [1, 2]),
+        (end, [1, 1]),
+        (end + 1, [2, 1]),
+    ];
+    for (at, counts) in stages {
+        at_decision_clock(&[at], || {
+            let service = checkpoint_service(directory.path());
+            for (n, (id, session)) in ids.iter().zip(sessions.iter_mut()).enumerate() {
+                for _ in 0..counts[n] {
+                    let turn = session.completed_requests;
+                    numeric_primary(session, turn);
+                    if at == end && session.shadow.calls == 0 {
+                        let usage = json!({"input_tokens":1000,"output_tokens":0,
+                            "input_tokens_details":{"cached_tokens":0}});
+                        session.shadow.observe_with_rates(
+                            "gpt-6.1-sol",
+                            &usage,
+                            true,
+                            if n == 0 {
+                                receipt_rates("gpt-6.1-sol", &usage, None, true)
+                            } else {
+                                None
+                            },
+                        );
+                    }
+                    save(&service, id, session).unwrap();
+                    save(&service, id, session).unwrap();
+                }
+                let restored = history::restore(&service, id).unwrap();
+                assert_eq!(restored.primary.calls, session.primary.calls);
+                assert_eq!(restored.primary.cost_usd, session.primary.cost_usd);
+            }
+        });
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    at_decision_clock(&[end + 60 * 86400], || {
+        let service = checkpoint_service(directory.path());
+        let frozen = history::accounting(&service, 0, "", 100).unwrap()["records"].clone();
+        assert_eq!(frozen.as_array().unwrap().len(), 13);
+        for (id, session) in ids.iter().zip(&sessions) {
+            assert!(
+                history::restore(&service, id).is_err(),
+                "raw retention expired independently"
+            );
+            let rows = frozen
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["owner"] == *id)
+                .collect::<Vec<_>>();
+            let last = rows.last().unwrap();
+            assert_eq!(
+                last["primary"],
+                serde_json::to_value(&session.primary).unwrap()
+            );
+            assert_eq!(
+                last["reviewer"],
+                serde_json::to_value(&session.shadow).unwrap()
+            );
+            assert_eq!(
+                last["estimate"],
+                serde_json::to_value(
+                    session
+                        .request_evidence
+                        .as_ref()
+                        .unwrap()
+                        .snapshot()
+                        .dashboard(false)
+                )
+                .unwrap()
+            );
+            assert!(!last["numeric_provenance"].is_null());
+        }
+        let authority = std::fs::read(directory.path().join("history.index")).unwrap();
+        let mut reports = Vec::new();
+        for _ in 0..2 {
+            let restarted = Arc::new(checkpoint_service(directory.path()));
+            let report = runtime.block_on(async {
+                let response = dashboard_accounting(
+                    State(restarted.clone()),
+                    ConnectInfo("127.0.0.1:1".parse().unwrap()),
+                    HeaderMap::new(),
+                    axum::extract::Query(
+                        serde_json::from_value(json!({"start_at":start,"end_at":end,"limit":1}))
+                            .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.headers()["cache-control"], "no-store");
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            });
+            assert_eq!(
+                history::accounting(&restarted, 0, "", 100).unwrap()["records"],
+                frozen
+            );
+            assert_eq!(
+                std::fs::read(directory.path().join("history.index")).unwrap(),
+                authority
+            );
+            reports.push(report);
+        }
+        assert_eq!(
+            reports[0], reports[1],
+            "restart and repeat are read-only and idempotent"
+        );
+        let window = &reports[0]["window"];
+        assert_eq!(
+            window["coverage"]["included_owners"], 2,
+            "month reporting needs independently differenced owner contributions, not a latest lifetime subtotal: {}",
+            reports[0]
+        );
+        assert_eq!(window["start_at"], start);
+        assert_eq!(window["end_at"], end);
+        assert_eq!(window["usage"]["primary"]["calls"], 5);
+        assert_eq!(window["usage"]["primary"]["input_tokens"], 5000);
+        assert_eq!(window["usage"]["primary"]["unavailable_cost_calls"], 0);
+        assert!((window["usage"]["primary"]["cost_usd"].as_f64().unwrap() - 0.010).abs() < 1e-12);
+        assert_eq!(window["usage"]["reviewer"]["calls"], 2);
+        assert_eq!(window["usage"]["reviewer"]["input_tokens"], 2000);
+        assert_eq!(window["usage"]["reviewer"]["unavailable_cost_calls"], 1);
+        assert!((window["usage"]["reviewer"]["cost_usd"].as_f64().unwrap() - 0.002).abs() < 1e-12);
+        assert_eq!(window["completed_requests"], 5);
+        assert_eq!(window["failed_primaries"], 0);
+    });
+}
+
 #[tokio::test]
 async fn dashboard_session_pages_bound_serialized_bytes_and_keep_cursor_progress() {
     let directory = tempfile::tempdir().unwrap();
