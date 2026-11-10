@@ -632,6 +632,138 @@ async fn retention_concurrent_paid_reviews_keep_reserved_headroom_under_long_pat
 }
 
 #[test]
+fn retention_expired_full_store_recovers_admission_and_reclaims_disk_without_losing_pinned_ancestry()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.history_max_bytes = 65536;
+    service.config.history_max_nodes = 512;
+    service.config.history_disk_bytes = 8 * 1024 * 1024;
+    let start = 10_000_000;
+    let bytes = || -> u64 {
+        std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum()
+    };
+    let mut protected = Session {
+        history_shared: true,
+        history_namespace: Some("expiry-pinned".into()),
+        request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+        ..Session::default()
+    };
+    protected
+        .ingest(&[json!({"role":"user","content":"pinned paid ancestry"})])
+        .unwrap();
+    numeric_primary(&mut protected, 0);
+    let pin = at_decision_clock(&[start], || {
+        save(&service, "expiry-pinned", &protected).unwrap();
+        history::pin(&service, "expiry-pinned").unwrap()
+    });
+    let mut frozen = Vec::new();
+    let before = at_decision_clock(&[start], || {
+        frozen = history::accounting(&service, 0, "", 100).unwrap()["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(frozen.len(), 1);
+        let mut rejected = false;
+        let mut accepted = 0;
+        for n in 0..256 {
+            let mut pressure = Session {
+                history_shared: true,
+                history_namespace: Some("expiry-pressure".into()),
+                ..Session::default()
+            };
+            pressure
+                .ingest(&[json!({"role":"user","content":format!("{n} {}", "x".repeat(48000))})])
+                .unwrap();
+            match history::committed(&service, "expiry-pressure", &pressure, None) {
+                Ok(()) => accepted += 1,
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            accepted > 0 && rejected,
+            "qualify real unchanged-cap disk pressure"
+        );
+        assert!(bytes() <= service.config.history_disk_bytes);
+        assert!(
+            history::pin(&service, "expiry-new").is_err(),
+            "qualify owner-admission pressure before expiry"
+        );
+        bytes()
+    });
+    at_decision_clock(&[start + 604799], || {
+        assert!(history::pin(&service, "expiry-new").is_err());
+        assert!(history::restore(&service, "expiry-pressure").is_ok());
+    });
+    at_decision_clock(&[start + 604800], || {
+        // Admission itself must allow bounded maintenance to make progress: a
+        // refused new owner cannot be required to publish the cleanup first.
+        let mut recovered = None;
+        for _ in 0..64 {
+            if let Ok(pin) = history::pin(&service, "expiry-new") {
+                recovered = Some(pin);
+                break;
+            }
+        }
+        let retained = history::restore(&service, "expiry-pinned").unwrap();
+        assert_eq!(retained.render_primary(), protected.render_primary());
+        assert_eq!(
+            serde_json::to_value(&retained.primary).unwrap(),
+            serde_json::to_value(&protected.primary).unwrap()
+        );
+        assert_eq!(
+            history::accounting(&service, 0, "", 100).unwrap()["records"],
+            json!(frozen)
+        );
+        assert!(
+            recovered.is_some(),
+            "seven-day expiry must recover admission without a cap increase or manual deletion; before={before}, after={}",
+            bytes()
+        );
+        assert!(
+            bytes() < before,
+            "maintenance must physically reclaim expired pages"
+        );
+        let mut next = Session {
+            history_shared: true,
+            history_namespace: Some("expiry-new".into()),
+            ..Session::default()
+        };
+        next.ingest(&[json!({"role":"user","content":"writable after expiry"})])
+            .unwrap();
+        history::committed(&service, "expiry-new", &next, None).unwrap();
+        assert_eq!(
+            history::restore(&service, "expiry-new")
+                .unwrap()
+                .render_primary(),
+            next.render_primary()
+        );
+        assert!(bytes() <= service.config.history_disk_bytes);
+        // A fresh service must retain the paid owner too, not merely the live
+        // decoded Session held by this fixture. Keep its pin through settlement.
+        history::settled(&service, "expiry-pinned", &retained).unwrap();
+        let mut restarted = checkpoint_service(directory.path());
+        restarted.config.history_max_bytes = service.config.history_max_bytes;
+        restarted.config.history_max_nodes = service.config.history_max_nodes;
+        restarted.config.history_disk_bytes = service.config.history_disk_bytes;
+        let restored = history::restore(&restarted, "expiry-pinned").unwrap();
+        assert_eq!(restored.render_primary(), protected.render_primary());
+        assert_eq!(
+            serde_json::to_value(&restored.primary).unwrap(),
+            serde_json::to_value(&protected.primary).unwrap()
+        );
+    });
+    drop(pin);
+}
+
+#[test]
 fn retention_disk_admission_bounds_wal_and_preserves_prior_generation() {
     let directory = tempfile::tempdir().unwrap();
     let mut service = checkpoint_service(directory.path());
