@@ -5411,4 +5411,5 @@ mod tests {
     include!("proxy_dashboard_tests.rs");
     include!("proxy_archive_lifecycle_tests.rs");
     include!("proxy_retention_tests.rs");
+    include!("proxy_resource_tests.rs");
 }
