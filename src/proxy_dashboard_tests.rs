@@ -1,4 +1,144 @@
 #[test]
+fn dashboard_month_window_keeps_evidence_corrections_out_of_comparison_spend() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = 20_000_000;
+    let end = start + 30 * 86400;
+    let current_id = format!("{:064x}", 931);
+    let corrected_id = format!("{:064x}", 932);
+    let mut current = Session {
+        history_shared: true,
+        history_namespace: Some("compatible-month-model".into()),
+        request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+        ..Session::default()
+    };
+    current
+        .ingest(&[json!({"role":"user","content":"private monthly model source"})])
+        .unwrap();
+    let mut original = Value::Null;
+    let mut original_session = None;
+    at_decision_clock(&[start - 1], || {
+        let service = checkpoint_service(directory.path());
+        numeric_primary(&mut current, 0);
+        save(&service, &current_id, &current).unwrap();
+        let historical = historical_retention_fixture(&service, &corrected_id, false);
+        save(&service, &corrected_id, &historical).unwrap();
+        original_session = Some(historical);
+        original = history::accounting(&service, 0, "", 100).unwrap()["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["owner"] == corrected_id)
+            .unwrap()
+            .clone();
+        assert!(original["estimate"]["whole_window"].is_null());
+    });
+    let mut corrected = Value::Null;
+    at_decision_clock(&[start + 15 * 86400], || {
+        let service = checkpoint_service(directory.path());
+        historical_retention_fixture(&service, &corrected_id, true);
+        // The old raw owner has expired. Rebind the independently validated
+        // historical prefix against the original saved session seam, not a
+        // fabricated opening balance or a newly dispatched paid request.
+        let historical =
+            recover_success_prefix(&service, &corrected_id, original_session.take().unwrap())
+                .unwrap();
+        save(&service, &corrected_id, &historical).unwrap();
+        numeric_primary(&mut current, 1);
+        save(&service, &current_id, &current).unwrap();
+        corrected = history::accounting(&service, 0, "", 100).unwrap()["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|r| r["owner"] == corrected_id)
+            .unwrap()
+            .clone();
+        assert_eq!(corrected["primary"], original["primary"]);
+        assert_eq!(corrected["reviewer"], original["reviewer"]);
+        assert_eq!(
+            corrected["completed_requests"],
+            original["completed_requests"]
+        );
+        assert_eq!(corrected["estimate"]["observed_primary_cost"], 0.002);
+        assert_ne!(
+            corrected["numeric_provenance"],
+            original["numeric_provenance"]
+        );
+        save(&service, &corrected_id, &historical).unwrap();
+    });
+    at_decision_clock(&[end], || {
+        let service = checkpoint_service(directory.path());
+        numeric_primary(&mut current, 2);
+        save(&service, &current_id, &current).unwrap();
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    at_decision_clock(&[end + 60 * 86400], || {
+        let service = checkpoint_service(directory.path());
+        let frozen = history::accounting(&service, 0, "", 100).unwrap()["records"].clone();
+        assert_eq!(frozen.as_array().unwrap().len(), 5);
+        assert!(frozen.as_array().unwrap().contains(&original));
+        assert!(frozen.as_array().unwrap().contains(&corrected));
+        assert!(history::restore(&service, &current_id).is_err());
+        assert!(history::restore(&service, &corrected_id).is_err());
+        let authority = std::fs::read(directory.path().join("history.index")).unwrap();
+        let mut reports = Vec::new();
+        for _ in 0..2 {
+            let restarted = Arc::new(checkpoint_service(directory.path()));
+            let report = runtime.block_on(async {
+                let response = dashboard_accounting(
+                    State(restarted.clone()),
+                    ConnectInfo("127.0.0.1:1".parse().unwrap()),
+                    HeaderMap::new(),
+                    axum::extract::Query(
+                        serde_json::from_value(json!({"start_at":start,"end_at":end})).unwrap(),
+                    ),
+                )
+                .await
+                .unwrap();
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            });
+            assert_eq!(
+                history::accounting(&restarted, 0, "", 100).unwrap()["records"],
+                frozen
+            );
+            assert_eq!(
+                std::fs::read(directory.path().join("history.index")).unwrap(),
+                authority
+            );
+            assert_eq!(report["window"]["coverage"]["included_owners"], 2);
+            assert_eq!(report["window"]["usage"]["primary"]["calls"], 2);
+            assert!(
+                (report["window"]["usage"]["primary"]["cost_usd"]
+                    .as_f64()
+                    .unwrap()
+                    - 0.004)
+                    .abs()
+                    < 1e-12
+            );
+            reports.push(report);
+        }
+        assert_eq!(reports[0], reports[1]);
+        let comparison = &reports[0]["window"]["comparison"];
+        assert_eq!(
+            comparison["included_owners"], 1,
+            "historical model contributions need compatible boundaries; corrected old evidence is not new monthly spend: {}",
+            reports[0]
+        );
+        assert_eq!(comparison["unavailable_owners"], 1);
+        assert_eq!(comparison["primary_responses"], 2);
+        assert!((comparison["carry_cost"].as_f64().unwrap() - 0.004).abs() < 1e-12);
+        assert!((comparison["traditional_cost"].as_f64().unwrap() - 0.004).abs() < 1e-12);
+        assert!(comparison["savings"].as_f64().unwrap().abs() < 1e-12);
+    });
+}
+
+#[test]
 fn dashboard_month_window_subtracts_owner_boundaries_after_raw_expiry() {
     let directory = tempfile::tempdir().unwrap();
     let start = 20_000_000;
