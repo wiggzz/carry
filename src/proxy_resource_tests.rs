@@ -144,6 +144,7 @@ fn retention_many_owner_resource_child() {
     let mut maintenance_us = Vec::new();
     let mut report_us = Vec::new();
     let mut page_sizes = Vec::new();
+    let mut stats_phase_us = Value::Null;
     let elapsed = std::time::Instant::now();
     at_decision_clock(&[start], || {
         for n in 0..owners {
@@ -221,6 +222,35 @@ fn retention_many_owner_resource_child() {
                 );
             }
         }
+        // Diagnose subcomponents only AFTER the unchanged real handler timing,
+        // so these additional reads cannot prewarm that latency grader.
+        let diagnostic = reopen();
+        let began = std::time::Instant::now();
+        let view = history::ReadView::new(&diagnostic);
+        let read_view_us = began.elapsed().as_micros();
+        let began = std::time::Instant::now();
+        view.as_ref().unwrap().expired_accounting_totals().unwrap();
+        let frozen_totals_us = began.elapsed().as_micros();
+        let began = std::time::Instant::now();
+        for n in 0..owners {
+            view.as_ref()
+                .unwrap()
+                .expired_accounting_has_owner(&format!("{n:064x}"))
+                .unwrap();
+        }
+        let expired_membership_us = began.elapsed().as_micros();
+        let began = std::time::Instant::now();
+        for n in 0..owners {
+            assert!(load_dashboard_accounting(&diagnostic, &format!("{n:064x}"), &view).is_err());
+        }
+        stats_phase_us = json!({
+            "scope":"post-handler diagnostic reads; not part of handler timing",
+            "read_view":read_view_us,"frozen_totals":frozen_totals_us,
+            "expired_membership":expired_membership_us,
+            "expired_current_numeric":began.elapsed().as_micros(),
+        });
+        drop(view);
+        drop(diagnostic);
         // A native maintenance publication expires bounded batches; do not
         // substitute a mass SQL DELETE or call this full physical reclamation.
         for n in 0..8 {
@@ -263,7 +293,7 @@ fn retention_many_owner_resource_child() {
         "working_set_bytes":256*1024,"disk_admission_bytes":512*1024*1024,
         "warm_after_owners":32,"warm_rss_bytes":warm_rss,
         "final_rss_bytes":final_rss,"kernel_peak_rss_bytes":peak_rss,
-        "max_save_us":max_save_us,"report_us":report_us,
+        "max_save_us":max_save_us,"report_us":report_us,"stats_phase_us":stats_phase_us,
         "maintenance_publication_us":maintenance_us,"response_bytes":page_sizes,
         "retained_accounting":accounting,"remaining_snapshots":snapshots,
         "elapsed_ms":elapsed.elapsed().as_millis(),
